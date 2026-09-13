@@ -3,7 +3,7 @@
 # Avila Node
 
 A personal, MIT-licensed Bitcoin full-node project by **Connor Avila**, written in
-Rust with a native **egui** desktop interface. Avila Node is independent of Avila Labs.
+Rust with a native **egui** desktop interface.
 
 The goal is a complete, independently usable node that someone could choose as
 their primary node, while exploring better implementations of validation, storage,
