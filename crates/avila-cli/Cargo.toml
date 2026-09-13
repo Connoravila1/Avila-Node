@@ -12,6 +12,8 @@ publish.workspace = true
 [[bin]]
 name = "avila-node"
 path = "src/main.rs"
+# The library owns the avila_node rustdoc path; CLI usage is exposed by --help.
+doc = false
 
 [dependencies]
 avila-node.workspace = true

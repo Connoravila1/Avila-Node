@@ -7,7 +7,11 @@ use avila_node::config::load_config;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "avila-node", version, about = "Avila Node — a Bitcoin full node in development")]
+#[command(
+    name = "avila-node",
+    version,
+    about = "Avila Node — a Bitcoin full node in development"
+)]
 struct Args {
     /// Explicit TOML configuration file; otherwise use development defaults.
     #[arg(long, global = true)]
@@ -34,7 +38,10 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
     match args.command {
         Command::CheckConfig => {
             println!("Configuration valid: {}", config.get().network);
-            println!("Network data directory: {}", config.network_data_dir().display());
+            println!(
+                "Network data directory: {}",
+                config.network_data_dir().display()
+            );
         }
         Command::Inspect { json } => {
             let node = Node::new(config)?;

@@ -62,7 +62,9 @@ impl Node {
 
 #[derive(Debug, Error)]
 pub enum NodeError {
-    #[error("node startup is not implemented: consensus validation, persistent chainstate, and peer networking are still required; see ROADMAP.md")]
+    #[error(
+        "node startup is not implemented: consensus validation, persistent chainstate, and peer networking are still required; see ROADMAP.md"
+    )]
     MissingSubsystems,
     #[error(transparent)]
     Journal(#[from] JournalError),
@@ -86,7 +88,12 @@ mod tests {
 
     #[test]
     fn all_networks_refuse_unimplemented_startup() {
-        for network in [Network::Mainnet, Network::Testnet4, Network::Signet, Network::Regtest] {
+        for network in [
+            Network::Mainnet,
+            Network::Testnet4,
+            Network::Signet,
+            Network::Regtest,
+        ] {
             let config = NodeConfig {
                 network,
                 ..NodeConfig::default()

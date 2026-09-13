@@ -33,6 +33,7 @@ eframe = { version = "=0.36.2", default-features = false, features = [
     "wayland",
     "x11",
 ] }
+egui_extras = { version = "=0.36.2", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

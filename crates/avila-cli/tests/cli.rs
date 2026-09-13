@@ -39,7 +39,11 @@ fn unknown_arguments_are_errors() {
 #[test]
 fn missing_config_is_an_error_not_a_silent_default() {
     let output = cli()
-        .args(["--config", "missing-configuration-fixture.toml", "check-config"])
+        .args([
+            "--config",
+            "missing-configuration-fixture.toml",
+            "check-config",
+        ])
         .output()
         .unwrap();
     assert!(!output.status.success());

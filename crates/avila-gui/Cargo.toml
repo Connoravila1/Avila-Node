@@ -10,9 +10,11 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+avila-core.workspace = true
 avila-node.workspace = true
 clap.workspace = true
 eframe.workspace = true
+egui_extras.workspace = true
 
 [lints]
 workspace = true

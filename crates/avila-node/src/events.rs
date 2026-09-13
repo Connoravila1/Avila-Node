@@ -38,7 +38,9 @@ impl EventJournal {
 
     pub fn push(&mut self, event: NodeEvent) -> Result<(), JournalError> {
         let sequence = self.next_sequence;
-        let next_sequence = sequence.checked_add(1).ok_or(JournalError::SequenceExhausted)?;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(JournalError::SequenceExhausted)?;
         if self.entries.len() == self.capacity.get() {
             self.entries.pop_front();
         }
@@ -79,7 +81,10 @@ mod tests {
         journal.push(NodeEvent::ConfigurationLoaded).unwrap();
         journal.push(NodeEvent::StartupBlocked).unwrap();
         assert_eq!(journal.entries().count(), 1);
-        assert_eq!(journal.entries().next().unwrap().event, NodeEvent::StartupBlocked);
+        assert_eq!(
+            journal.entries().next().unwrap().event,
+            NodeEvent::StartupBlocked
+        );
     }
 
     #[test]

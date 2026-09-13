@@ -129,19 +129,24 @@ mod tests {
                 event_capacity,
                 ..NodeConfig::default()
             };
-            assert!(matches!(config.validate(), Err(ConfigError::EventCapacity(_))));
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::EventCapacity(_))
+            ));
         }
     }
 
     #[test]
     fn accepts_capacity_boundaries() {
         for event_capacity in [1, MAX_EVENT_CAPACITY] {
-            assert!(NodeConfig {
-                event_capacity,
-                ..NodeConfig::default()
-            }
-            .validate()
-            .is_ok());
+            assert!(
+                NodeConfig {
+                    event_capacity,
+                    ..NodeConfig::default()
+                }
+                .validate()
+                .is_ok()
+            );
         }
     }
 
@@ -151,7 +156,10 @@ mod tests {
             schema_version: 2,
             ..NodeConfig::default()
         };
-        assert!(matches!(config.validate(), Err(ConfigError::SchemaVersion(2))));
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::SchemaVersion(2))
+        ));
     }
 
     #[test]
@@ -160,7 +168,10 @@ mod tests {
             data_dir: PathBuf::new(),
             ..NodeConfig::default()
         };
-        assert!(matches!(config.validate(), Err(ConfigError::EmptyDataDirectory)));
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::EmptyDataDirectory)
+        ));
     }
 
     #[test]

@@ -39,10 +39,7 @@ pub fn parse_config(contents: &str) -> Result<ValidatedConfig, LoadConfigError> 
 #[derive(Debug, Error)]
 pub enum LoadConfigError {
     #[error("could not read configuration {path}: {source}")]
-    Read {
-        path: PathBuf,
-        source: io::Error,
-    },
+    Read { path: PathBuf, source: io::Error },
     #[error("configuration exceeds the 64 KiB limit")]
     TooLarge,
     #[error("invalid TOML configuration: {0}")]
