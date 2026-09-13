@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {
+      "file": "mainnet-headers-000000-004031.bin",
+      "network": "mainnet",
+      "kind": "headers",
+      "first_height": 0,
+      "last_height": 4031,
+      "count": 4032,
+      "first_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+      "last_hash": "00000000f037ad09d0b05ee66b8c1da83030abaf909d2b1bf519c3c7d2cd3fdf",
+      "bytes": 322560,
+      "sha256": "75b29397f5b03b556c281ad0086f9e53e5388cc475e179297b04ea5264be184c",
+      "source": {
+        "transport": "p2p",
+        "peer": "90.92.142.46:8333",
+        "user_agent_of_peer": "/Satoshi:31.1.0/",
+        "dns_seed": "seed.bitcoin.sipa.be"
+      },
+      "notes": "Genesis through two full difficulty periods (2016 blocks each)."
+    },
+    {
+      "file": "mainnet-headers-030229-032257.bin",
+      "network": "mainnet",
+      "kind": "headers",
+      "first_height": 30229,
+      "last_height": 32257,
+      "count": 2029,
+      "first_hash": "00000000a3e008fc688b82c7513b5870909fbd86cf43026130a569043d737756",
+      "last_hash": "0000000078bb40a0a5aae645f86e144cab79209726b98d74e2f311c6d31aa52e",
+      "bytes": 162320,
+      "sha256": "4189dc608549f63687df7b78d31734ac3f27bbfe8718d70e608472750fd44145",
+      "source": {
+        "transport": "p2p",
+        "peer": "86.249.136.210:8333",
+        "user_agent_of_peer": "/Satoshi:30.0.0/",
+        "dns_seed": "seed.bitcoin.sipa.be"
+      },
+      "notes": "Window containing mainnet's first real difficulty retarget: height 32256 nBits 0x1d00d86a (down from 0x1d00ffff at 32255)."
+    },
+    {
+      "file": "testnet4-headers-000000-004031.bin",
+      "network": "testnet4",
+      "kind": "headers",
+      "first_height": 0,
+      "last_height": 4031,
+      "count": 4032,
+      "first_hash": "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043",
+      "last_hash": "000000002ad661157c553c0bbbb2490407adb1c8ac09f2b2a7174f87eeeb64bf",
+      "bytes": 322560,
+      "sha256": "06b1abd80973283ced03bb45687eaa8439dfd5ce9ca74fdd519213d149270dee",
+      "source": {
+        "transport": "p2p",
+        "peer": "65.108.141.219:48333",
+        "user_agent_of_peer": "/Satoshi:31.1.0/",
+        "dns_seed": "seed.testnet4.bitcoin.sprovoost.nl"
+      },
+      "notes": "testnet4 genesis through height 4031."
+    },
+    {
+      "file": "signet-headers-000000-002047.bin",
+      "network": "signet",
+      "kind": "headers",
+      "first_height": 0,
+      "last_height": 2047,
+      "count": 2048,
+      "first_hash": "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
+      "last_hash": "000000257b6ce53187f1adf352ef64a6b992632a1a51aa6fefc2aefd7831723e",
+      "bytes": 163840,
+      "sha256": "1ffdee5616b0f1b5ef799fdbc032fdf8e4ffc1d2fc5ee57f3514a78907f812ea",
+      "source": {
+        "transport": "p2p",
+        "peer": "45.94.168.5:38333",
+        "user_agent_of_peer": "/Satoshi:29.4.0(inquisition)/",
+        "dns_seed": "seed.signet.bitcoin.sprovoost.nl"
+      },
+      "notes": "Default signet genesis through height 2047."
+    },
+    {
+      "file": "mainnet-block-000000.bin",
+      "network": "mainnet",
+      "kind": "block",
+      "height": 0,
+      "hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+      "tx_count": 1,
+      "size": 285,
+      "weight": 1140,
+      "bytes": 285,
+      "sha256": "5299fac924b5a2fc19a88876a0042c19ac4d11fe69c3f66e47516e26185f9e99",
+      "source": {
+        "transport": "https",
+        "url": "https://blockstream.info/api/block/000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f/raw"
+      },
+      "notes": "Mainnet genesis block."
+    },
+    {
+      "file": "mainnet-block-000001.bin",
+      "network": "mainnet",
+      "kind": "block",
+      "height": 1,
+      "hash": "00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048",
+      "tx_count": 1,
+      "size": 215,
+      "weight": 860,
+      "bytes": 215,
+      "sha256": "9c192c128fac3ded236ffed725ae19b3ecef7828e09ed9e633d2e5370550dae0",
+      "source": {
+        "transport": "https",
+        "url": "https://blockstream.info/api/block/00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048/raw"
+      },
+      "notes": "Mainnet height 1."
+    },
+    {
+      "file": "mainnet-block-000170.bin",
+      "network": "mainnet",
+      "kind": "block",
+      "height": 170,
+      "hash": "00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee",
+      "tx_count": 2,
+      "size": 490,
+      "weight": 1960,
+      "bytes": 490,
+      "sha256": "32b4d091e14125788d35a2dfd2ed559994262e8f34c0edfdb510f605900c661e",
+      "source": {
+        "transport": "https",
+        "url": "https://blockstream.info/api/block/00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee/raw"
+      },
+      "notes": "First non-coinbase transaction on mainnet (Satoshi -> Hal Finney)."
+    },
+    {
+      "file": "mainnet-block-100000.bin",
+      "network": "mainnet",
+      "kind": "block",
+      "height": 100000,
+      "hash": "000000000003ba27aa200b1cecaad478d2b00432346c3f1f3986da1afd33e506",
+      "tx_count": 4,
+      "size": 957,
+      "weight": 3828,
+      "bytes": 957,
+      "sha256": "b02256f05ce2fc0d152394b5cd2fa28fe4ab61100844c389581c4cffad88a2b1",
+      "source": {
+        "transport": "https",
+        "url": "https://blockstream.info/api/block/000000000003ba27aa200b1cecaad478d2b00432346c3f1f3986da1afd33e506/raw"
+      },
+      "notes": "Classic test vector block; 4 transactions."
+    },
+    {
+      "file": "mainnet-block-segwit-small.bin",
+      "network": "mainnet",
+      "kind": "block",
+      "height": 482229,
+      "hash": "00000000000000000136ce1ea2813e3980c69ba6d1030e55910730edde2e43ea",
+      "tx_count": 31,
+      "size": 9246,
+      "weight": 36876,
+      "bytes": 9246,
+      "sha256": "1311b06a56f300a73d53106a084e229b8d060ce76c952fe124d546c811318357",
+      "source": {
+        "transport": "https",
+        "url": "https://blockstream.info/api/block/00000000000000000136ce1ea2813e3980c69ba6d1030e55910730edde2e43ea/raw"
+      },
+      "notes": "Selected: smallest early block at/after segwit activation (height>=481824) with 2<=tx_count<=60, size<=32768, and weight<4*size (proves witness data present). Selection result: height=482229, tx_count=31, size=9246, weight=36876."
+    },
+    {
+      "file": "mainnet-block-taproot-era-small.bin",
+      "network": "mainnet",
+      "kind": "block",
+      "height": 709645,
+      "hash": "000000000000000000093c20b1a0cb944a26b22de731aa1be7cc6aa941d5122c",
+      "tx_count": 15,
+      "size": 9183,
+      "weight": 24576,
+      "bytes": 9183,
+      "sha256": "03b827ce195ca2b943142511b3dace05ce0e4784b1e0d14ddc8acfced285223d",
+      "source": {
+        "transport": "https",
+        "url": "https://blockstream.info/api/block/000000000000000000093c20b1a0cb944a26b22de731aa1be7cc6aa941d5122c/raw"
+      },
+      "notes": "Selected: smallest early block at/after taproot activation (height>=709632) with 2<=tx_count<=60, size<=32768, and weight<4*size. Selection result: height=709645, tx_count=15, size=9183, weight=24576."
+    },
+    {
+      "file": "testnet4-block-000000.bin",
+      "network": "testnet4",
+      "kind": "block",
+      "height": 0,
+      "hash": "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043",
+      "tx_count": 1,
+      "size": 261,
+      "weight": 1044,
+      "bytes": 261,
+      "sha256": "0ce0108cbbf0eefaa6e34ca6e3005afc6083ac68a8543166ecfd1095c233908b",
+      "source": {
+        "transport": "https",
+        "url": "https://mempool.space/testnet4/api/block/00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043/raw"
+      },
+      "notes": "testnet4 genesis block."
+    },
+    {
+      "file": "signet-block-000000.bin",
+      "network": "signet",
+      "kind": "block",
+      "height": 0,
+      "hash": "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
+      "tx_count": 1,
+      "size": 285,
+      "weight": 1140,
+      "bytes": 285,
+      "sha256": "c8abc5554d8a4e1134b27050f0a6a8fc616196bfdd381fb49f49fdea6a811675",
+      "source": {
+        "transport": "https",
+        "url": "https://mempool.space/signet/api/block/00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6/raw"
+      },
+      "notes": "Default signet genesis block."
+    },
+    {
+      "file": "signet-block-000001.bin",
+      "network": "signet",
+      "kind": "block",
+      "height": 1,
+      "hash": "00000086d6b2636cb2a392d45edc4ec544a10024d30141c9adf4bfd9de533b53",
+      "tx_count": 1,
+      "size": 329,
+      "weight": 1208,
+      "bytes": 329,
+      "sha256": "85b2a673710c23cb88dd37c6b742900627bb0a7a4df65a2f44d0c91a2b45f50d",
+      "source": {
+        "transport": "https",
+        "url": "https://mempool.space/signet/api/block/00000086d6b2636cb2a392d45edc4ec544a10024d30141c9adf4bfd9de533b53/raw"
+      },
+      "notes": "Signet height 1; coinbase carries the signet solution."
+    }
+  ],
+  "observed": {
+    "mainnet_headers_0_to_32257_sha256": "7392b8e1a8701a7db4745224e23823c772c5533988b34ad3e56f772781d1e9b3",
+    "mainnet_nbits_at_32255": "0x1d00ffff",
+    "mainnet_nbits_at_32256": "0x1d00d86a"
+  },
+  "generator": "tools/fetch_fixtures.py",
+  "generated_at_utc": "2026-09-13T23:50:31Z"
+}
