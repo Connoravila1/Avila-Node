@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/avila-core",
+    "crates/avila-node",
+    "crates/avila-cli",
+    "crates/avila-gui",
+]
+default-members = ["crates/avila-cli"]
+
+[workspace.package]
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+authors = ["Connor Avila"]
+repository = "https://github.com/Connoravila1/Avila-Node"
+publish = false
+
+[workspace.dependencies]
+avila-core = { path = "crates/avila-core" }
+avila-node = { path = "crates/avila-node" }
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+toml = "1.1"
+# Native GUI only. No web renderer, remote inspection, or automatic persistence.
+eframe = { version = "=0.36.2", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+overflow-checks = true
+lto = "thin"
+codegen-units = 1
+debug = 1

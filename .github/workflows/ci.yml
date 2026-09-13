@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'LICENSE', 'docs/**', 'experiments/**']
+  pull_request:
+    paths-ignore: ['**.md', 'LICENSE', 'docs/**', 'experiments/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  linux:
+    name: Linux workspace
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Native GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev libudev-dev
+      - name: Pinned Rust toolchain
+        run: rustup show
+      - name: Resolve application lockfile
+        id: lock
+        run: |
+          if [ -f Cargo.lock ]; then
+            cargo metadata --locked --format-version 1 > /dev/null
+          else
+            cargo generate-lockfile
+          fi
+      - name: Preserve dependency resolution
+        if: ${{ !cancelled() && steps.lock.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dependency-lock
+          path: Cargo.lock
+      - name: Formatting
+        if: ${{ !cancelled() && steps.lock.outcome == 'success' }}
+        run: cargo fmt --all -- --check
+      - name: Clippy, including the GUI
+        if: ${{ !cancelled() && steps.lock.outcome == 'success' }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Unit and integration tests
+        if: ${{ !cancelled() && steps.lock.outcome == 'success' }}
+        run: cargo test --workspace --locked
+      - name: Documentation
+        if: ${{ !cancelled() && steps.lock.outcome == 'success' }}
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+      - name: CLI smoke test
+        if: ${{ !cancelled() && steps.lock.outcome == 'success' }}
+        run: |
+          cargo run --locked -p avila-cli -- --config config/default.toml check-config
+          cargo run --locked -p avila-cli -- inspect --json

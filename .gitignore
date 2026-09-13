@@ -1,0 +1,7 @@
+/target/
+/data/
+/config/local.toml
+*.log
+.env
+.DS_Store
+# Cargo.lock belongs in version control for this application workspace.

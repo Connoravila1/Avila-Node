@@ -1,0 +1,8 @@
+# Development configuration. Network selection is not yet network support.
+# Mainnet, testnet4, signet, and regtest are recognized configuration values.
+schema_version = 1
+network = "regtest"
+# Relative to this configuration file, NOT the current working directory.
+# The selected network is appended, e.g. ../data/regtest.
+data_dir = "../data"
+event_capacity = 256
