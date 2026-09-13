@@ -1,0 +1,23 @@
+[package]
+name = "avila-consensus"
+description = "Independent, pure Bitcoin consensus primitives for Avila Node: bounded decoding, hashing, target arithmetic, proof of work and header-chain validation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The only trusted third-party code in the validation path: RustCrypto SHA-2.
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Differential references only. Neither crate is used by the validation path.
+bitcoin.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

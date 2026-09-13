@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/avila-core",
+    "crates/avila-consensus",
     "crates/avila-node",
     "crates/avila-cli",
     "crates/avila-gui",
@@ -19,11 +20,16 @@ publish = false
 
 [workspace.dependencies]
 avila-core = { path = "crates/avila-core" }
+avila-consensus = { path = "crates/avila-consensus" }
 avila-node = { path = "crates/avila-node" }
 clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
+sha2 = { version = "0.11", default-features = false }
+# Development-only differential references for the consensus crate.
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
+proptest = { version = "1.11", default-features = false, features = ["std"] }
 toml = "1.1"
 # Native GUI only. Persistence is limited by the app to appearance preferences.
 eframe = { version = "=0.36.2", default-features = false, features = [
