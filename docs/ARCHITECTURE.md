@@ -76,9 +76,14 @@ as an automatic rule for resolving a consensus disagreement.
 
 Pin the toolchain and commit the application lockfile. Keep native GUI features
 explicit. The current desktop has no HTTP image loader, remote inspection server,
-telemetry, or automatic persistence. It embeds the supplied logo in the executable.
-UI layout persistence may be added separately from wallet/node state after its
-storage schema and privacy behavior are defined.
+or telemetry. It embeds the supplied logo in the executable.
+
+The desktop persists only a versioned appearance record (Light/Dark/Black and scale)
+using eframe's local application storage. Invalid records fall back to defaults;
+scale is finite and bounded. `--theme` overrides the saved choice. Generic egui
+memory and native window persistence are disabled, so searches, paths, events and
+node state are not included in this record. Future layout persistence needs its
+own schema and privacy review. Node configuration remains a separate TOML file.
 
 Review new dependencies for actual purpose, license compatibility, supported Rust
 version, feature activation, and effect on the trusted code. Workspace source

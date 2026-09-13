@@ -1,8 +1,9 @@
 # Development
 
 Read the [scope](docs/SCOPE.md), [architecture](docs/ARCHITECTURE.md) and
-[roadmap](ROADMAP.md) before changing behavior. This is Connor Avila's personal
-MIT-licensed project. Work in this repository is consolidated on `main`; do not
+[roadmap](ROADMAP.md) before changing behavior. This is an MIT-licensed project
+intended for public use, hosted under Connor Avila's personal GitHub account.
+Work in this repository is consolidated on `main`; do not
 create extra branches as an automatic scaffolding step.
 
 Use the pinned toolchain and committed `Cargo.lock`. Keep dependency updates
@@ -32,6 +33,8 @@ and errors. Rendering tests complement native interaction checks.
 
 Document concrete before/after behavior, validation, and remaining limitations.
 Update capabilities only when their implementation and acceptance tests exist.
-Use the [experiment template](experiments/TEMPLATE.md) for performance or behavior
-comparisons. Do not commit personal configuration, chain data, wallet material,
-raw traffic captures or unrestricted diagnostic logs.
+Use the [experiment template](experiments/TEMPLATE.md) and
+[scorecard](docs/SCORECARD.md) for performance or behavior comparisons. Identify
+the matched operating profile and complete verification workload; publish regressions
+and external helper costs alongside wins. Do not commit personal configuration,
+chain data, wallet material, raw traffic captures or unrestricted diagnostic logs.

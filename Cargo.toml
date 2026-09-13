@@ -25,11 +25,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 toml = "1.1"
-# Native GUI only. No web renderer, remote inspection, or automatic persistence.
+# Native GUI only. Persistence is limited by the app to appearance preferences.
 eframe = { version = "=0.36.2", default-features = false, features = [
     "accesskit",
     "default_fonts",
     "glow",
+    "persistence",
     "wayland",
     "x11",
 ] }

@@ -1,4 +1,5 @@
 mod app;
+mod appearance;
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -16,6 +17,9 @@ struct Args {
     /// Explicit TOML configuration file; otherwise use development defaults.
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Start with a specific appearance instead of the saved preference.
+    #[arg(long, value_enum)]
+    theme: Option<appearance::AppearanceMode>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -27,6 +31,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &icon.rgba,
     );
     let options = eframe::NativeOptions {
+        persist_window: false,
         viewport: egui::ViewportBuilder::default()
             .with_icon(icon)
             .with_inner_size([1120.0, 760.0])
@@ -36,7 +41,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     eframe::run_native(
         "Avila Node",
         options,
-        Box::new(move |cc| Ok(Box::new(app::AvilaApp::new(&cc.egui_ctx, node, logo)))),
+        Box::new(move |cc| {
+            let mut appearance = appearance::AppearanceConfig::load(cc.storage);
+            if let Some(theme) = args.theme {
+                appearance.theme = theme;
+            }
+            Ok(Box::new(app::AvilaApp::new(
+                &cc.egui_ctx,
+                node,
+                logo,
+                appearance,
+            )))
+        }),
     )?;
     Ok(())
 }

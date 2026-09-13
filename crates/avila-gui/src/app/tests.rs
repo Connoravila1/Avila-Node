@@ -2,6 +2,7 @@
 
 use super::*;
 use avila_core::NodeConfig;
+use eframe::egui::Color32;
 
 struct Desktop {
     ctx: egui::Context,
@@ -13,7 +14,7 @@ impl Desktop {
         let ctx = egui::Context::default();
         let node = Node::new(NodeConfig::default().validate().unwrap()).unwrap();
         let logo = egui::ColorImage::new([1, 1], vec![Color32::BLACK]);
-        let app = AvilaApp::new(&ctx, node, logo);
+        let app = AvilaApp::new(&ctx, node, logo, AppearanceConfig::default());
         let mut desktop = Self { ctx, app };
         desktop.frame(vec![]);
         desktop

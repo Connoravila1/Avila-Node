@@ -17,7 +17,17 @@ their explanation. Configuration inspection offers explicit copy actions.
 
 The event retention indicator measures the actual diagnostic buffer's occupancy.
 It does not represent chain synchronization. No peer graph or block chart is fed
-invented measurements. UI settings apply to the current desktop session.
+invented measurements. **View → Appearance** provides Light, Dark and Black themes
+and 75–200% interface scaling. Black uses `#000000` for panel and window backgrounds;
+controls retain visible boundaries and interaction states. Theme and scale persist
+locally in a versioned appearance record. `--theme light|dark|black` selects a startup
+theme. Generic egui memory, search terms, node data and window state are not saved.
+
+The default is Dark at 100% scale. On Linux, appearance is stored in
+`$XDG_DATA_HOME/avilanode/app.ron`, or `~/.local/share/avilanode/app.ron` when that
+environment variable is unset. eframe chooses the application-data directory on
+other platforms. Changes are saved on normal close and periodic autosave; a forced
+termination can lose the most recent change. A malformed record resets to defaults.
 
 ## Capabilities and their intended uses
 
@@ -38,7 +48,7 @@ invented measurements. UI settings apply to the current desktop session.
 | Drag and drop | Rearrange workspace panes; import bounded local fixtures/config with validation | When those workflows exist |
 | Multiple native viewports | Detach an event, peer, transaction or comparison inspector | When operators need simultaneous inspection |
 | Modal dialogs | Confirm destructive commands and explain resulting state changes | When those commands exist |
-| Local persistence | Window layout, selected view, appearance; versioned separately from node state | After persistence design and migration tests |
+| Local persistence | Theme and scale; later workspace layout with a separate schema | Appearance implemented; layout after design and migration tests |
 | Animation and profiling integrations | Explain measured changes and identify GUI overhead | When useful; reduced-motion/static alternatives |
 
 Review the [egui demo source](https://github.com/emilk/egui/tree/main/crates/egui_demo_lib/src/demo)
@@ -57,7 +67,8 @@ adding them. Enabling every Cargo feature is not a product requirement.
 - Long lists render visible rows and retained data has defined limits. Hidden/idle
   views should not force continuous repainting.
 - Test the smallest supported viewport, increased text scale, long identifiers,
-  empty lists, unavailable measurements, stale data and failures.
+  empty lists, unavailable measurements, stale data and failures. Check all three
+  themes for readable text, selected/hover/focus states and visible boundaries.
 - Graphs reflect Bitcoin behavior: blocks arrive independently of the local mempool,
   local relay rejection does not imply block invalidity, and confirmations can be
   affected by reorganizations.

@@ -1,13 +1,12 @@
+use crate::appearance::{AppearanceConfig, AppearanceMode};
 use avila_core::CapabilityState;
 use avila_node::Node;
 use avila_node::events::{EventRecord, NodeEvent};
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
 
 #[cfg(test)]
 mod tests;
-
-const ACCENT: Color32 = Color32::from_rgb(247, 147, 26);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Page {
@@ -47,17 +46,21 @@ pub struct AvilaApp {
     implemented_only: bool,
     show_appearance: bool,
     show_help: bool,
+    appearance: AppearanceConfig,
     #[cfg(debug_assertions)]
     show_egui_tools: bool,
 }
 
 impl AvilaApp {
-    pub fn new(ctx: &egui::Context, node: Node, logo: egui::ColorImage) -> Self {
-        ctx.set_theme(egui::ThemePreference::Dark);
+    pub fn new(
+        ctx: &egui::Context,
+        node: Node,
+        logo: egui::ColorImage,
+        appearance: AppearanceConfig,
+    ) -> Self {
+        appearance.apply(ctx);
         ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-            style.visuals.selection.bg_fill = Color32::from_rgb(135, 74, 6);
-            style.visuals.selection.stroke = egui::Stroke::new(1.0, Color32::WHITE);
         });
         Self {
             node,
@@ -70,6 +73,7 @@ impl AvilaApp {
             implemented_only: false,
             show_appearance: false,
             show_help: false,
+            appearance,
             #[cfg(debug_assertions)]
             show_egui_tools: false,
         }
@@ -102,6 +106,7 @@ impl AvilaApp {
 
     pub fn render(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.appearance.scale = ctx.zoom_factor();
         self.shortcuts(&ctx);
         egui::Panel::top("menu").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -200,8 +205,8 @@ impl AvilaApp {
         }
         ui.add_space(24.0);
         ui.separator();
-        ui.label(RichText::new("Development foundation").color(ACCENT));
-        ui.small("Personal project · MIT");
+        ui.label(RichText::new("Development foundation").color(self.appearance.theme.accent()));
+        ui.small("Open source · MIT");
         ui.small(format!("Build {}", env!("CARGO_PKG_VERSION")));
     }
 
@@ -412,28 +417,37 @@ impl AvilaApp {
                 self.selected_event = None;
             }
         }
+        let previous_appearance = self.appearance;
         egui::Window::new("Appearance")
             .open(&mut self.show_appearance)
             .default_width(380.0)
             .vscroll(true)
             .show(ctx, |ui| {
-                egui::global_theme_preference_buttons(ui);
-                let mut zoom = ctx.zoom_factor();
-                if ui
-                    .add(egui::Slider::new(&mut zoom, 0.75..=2.0).text("Interface scale"))
-                    .changed()
-                {
-                    ctx.set_zoom_factor(zoom);
-                }
+                ui.heading("Color theme");
+                ui.horizontal_wrapped(|ui| {
+                    for theme in AppearanceMode::ALL {
+                        ui.radio_value(&mut self.appearance.theme, theme, theme.label())
+                            .on_hover_text(theme.description());
+                    }
+                });
+                ui.label(self.appearance.theme.description());
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Slider::new(&mut self.appearance.scale, 0.75..=2.0)
+                        .text("Interface scale"),
+                );
                 if ui.button("Reset scale").clicked() {
-                    ctx.set_zoom_factor(1.0);
+                    self.appearance.scale = 1.0;
                 }
-                ui.label("Appearance changes apply to this desktop session.");
+                ui.small("Your theme and scale are remembered on this device.");
             });
+        if self.appearance != previous_appearance {
+            self.appearance.apply(ctx);
+        }
         egui::Window::new("About Avila Node").open(&mut self.show_help)
             .default_width(430.0).vscroll(true).show(ctx, |ui| {
                 ui.heading("Avila Node");
-                ui.label("Connor Avila's personal Bitcoin full-node project.");
+                ui.label("An open-source Bitcoin full node by Connor Avila.");
                 ui.label("Rust · egui · MIT license");
                 ui.separator();
                 ui.label("Ctrl/Cmd + 1–4: switch pages");
@@ -460,6 +474,18 @@ impl AvilaApp {
 impl eframe::App for AvilaApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.render(ui);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.appearance.save(storage);
+    }
+
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
     }
 }
 

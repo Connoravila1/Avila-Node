@@ -8,11 +8,32 @@ as their primary node, independently of another node implementation or hosted se
 That is a target to demonstrate through implementation and testing, not a statement
 about the current scaffold's capabilities.
 
-This is Connor Avila's personal project, under the MIT license, independent of
-Avila Labs. Experimental describes its maturity, novel implementation ideas, and
-the maintenance assurances a personal project can offer. The integrated node is
-the primary deliverable. Other projects incorporating useful components or findings
-is also a successful outcome.
+The project is hosted under Connor Avila's personal GitHub account, under the MIT
+license, independent of Avila Labs. It is intended for other people to use once
+ready. Personal describes account ownership; it does not set a feature, quality,
+maintenance, or distribution ceiling. Experimental describes the current maturity
+and novel implementation ideas. The integrated node is the primary deliverable;
+other projects incorporating useful components or findings is an additional success.
+
+## What leadership means
+
+The ambition is to lead across correctness, security, validation speed, memory,
+storage, bandwidth, energy use, privacy, resilience, wallet and mining services,
+interoperability, usability, accessibility, and maintainability. Matching Core's
+functionality or Floresta's resource use is an intermediate comparison, not the
+destination. The [roadmap](../ROADMAP.md) specifies the engineering and research
+program; the [scorecard](SCORECARD.md) defines how results will be judged.
+
+Different operating requirements need different configurations of one coherent
+node: archival and pruned storage, compact verification, wallet infrastructure,
+mining, constrained hardware, and privacy-sensitive operation. Comparisons must
+match guarantees and count total costs, including required helpers. Pursue better
+tradeoffs across these profiles and make configuration changes understandable.
+No single aggregate score should hide a regression or an unsupported workflow.
+
+Best by every metric is the direction of work, not a provable permanent ranking.
+Correctness and privacy evidence has a stated scope; faster code does not compensate
+for missing checks. There are no measured node-performance results in this scaffold.
 
 ## Product requirements
 
@@ -30,6 +51,10 @@ is also a successful outcome.
 - Use egui as both a practical operator interface and an instrument for explaining
   node behavior, comparing approaches, and inspecting evidence.
 - Make improvements measurable and components reusable without requiring the GUI.
+- Deliver documented, accessible public releases, installation and upgrade paths,
+  recovery procedures, compatibility tests, and a sustainable contribution process.
+- Develop resource-efficient wallet and mining services as first-class workflows,
+  with explicit permissions and optional operating costs.
 
 ## Engineering principles
 
@@ -50,13 +75,15 @@ Reorganizations must invalidate or update affected conclusions.
 Maintain owner control: local operation, optional services with bounded resources,
 deliberate upgrades, and no required vendor account or cloud dependency.
 
-## Longer-term directions
+## Research alongside implementation
 
-The complete node provides the foundation for optional shadow validation, event
-replay, policy comparison, advanced wallet scanning, mining services, accumulator
-storage, accelerated synchronization, and proof-assisted verification. Each needs
-its own question, assumptions, implementation, comparison, and acceptance evidence.
-These directions do not substitute for the working full-node path.
+Shadow validation, deterministic replay, policy comparison, advanced wallet scanning,
+mining services, accumulator storage, accelerated synchronization, and proof-assisted
+verification have explicit workstreams and entry points in the roadmap. Begin their
+experiments when the required fixtures and interfaces exist; do not defer every
+potential advantage until a conventional node is finished. Each needs a hypothesis,
+assumptions, a runnable comparison, and acceptance evidence. Integrate successful
+approaches into the complete node while retaining a usable full-validation path.
 
 ## Decisions still requiring engineering evidence
 
@@ -75,6 +102,9 @@ the deliverable must be a complete node usable as a primary node. The earlier
 Zatoshi attachments were not supplied in this repository; the conversation's
 discussion of them is context, not an independently audited specification.
 
-The current instruction adds consolidation on `main`, the supplied orange AN logo,
-and deliberate use of egui's relevant capabilities. The planning conversation's
-external research claims must be rechecked before they become implementation requirements.
+The owner's latest clarification on September 13, 2026 confirms public use under
+the personal GitHub account and ambition beyond Core/Floresta parity across all
+metrics. Instructions also require consolidation on `main`, the supplied orange
+AN logo, Light/Dark/Black appearance, and deliberate use of egui's relevant
+capabilities. The planning conversation's external research claims must be rechecked
+before they become implementation requirements.

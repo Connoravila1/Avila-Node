@@ -3,6 +3,8 @@
 Experiments support the integrated full node and produce results others can reuse.
 No experiment or benchmark is implemented yet. Use [TEMPLATE.md](TEMPLATE.md) when
 there is a concrete question and runnable workload.
+Use the [scorecard](../docs/SCORECARD.md) to select matched profiles, metric IDs,
+baselines and reporting requirements. Its targets are goals, not existing results.
 
 Record baseline and candidate revisions, build flags, hardware, datasets and their
 provenance, commands, repetitions, and correctness/verification assumptions. Report

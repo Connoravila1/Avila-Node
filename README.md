@@ -2,14 +2,21 @@
 
 # Avila Node
 
-A personal, MIT-licensed Bitcoin full-node project by **Connor Avila**, written in
-Rust with a native **egui** desktop interface.
+An open-source, MIT-licensed Bitcoin full node by **Connor Avila**, written in Rust
+with a native **egui** desktop interface. Hosted under Connor's personal GitHub
+account, Avila Node is intended for public use once its release requirements are met.
 
-The goal is a complete, independently usable node that someone could choose as
-their primary node, while exploring better implementations of validation, storage,
-networking, privacy, policy, and usability. Experimental describes development
-maturity and novel engineering. The complete node is the deliverable; reusable
-components and reproducible findings are additional contributions to other projects.
+The ambition is to build the best complete node across correctness, validation
+speed, resource efficiency, privacy, resilience, wallet and mining services, and
+usability. Feature parity is an intermediate step. We will pursue improvements
+against the strongest reproducible alternatives in each operating profile, and
+publish the tradeoffs and remaining gaps in a [measurement scorecard](docs/SCORECARD.md).
+This is a goal to earn through evidence, not a claim about today's implementation.
+
+The deliverable is an independently usable primary node. Reusable components and
+reproducible findings are additional contributions to other projects. Experimental
+describes the current development maturity and research, not a limit on the ambition
+or an intention to keep the software for its author alone.
 
 ## Current state
 
@@ -45,6 +52,17 @@ requires a native graphical session. Its menus, resizable navigation, searchable
 tables, event details, appearance controls, and keyboard shortcuts operate on the
 available local state. Further egui capabilities are mapped to their intended uses
 in the [GUI plan](docs/GUI.md).
+
+Choose **View → Appearance** for **Light**, **Dark**, or **Black** (fully black panel
+and window backgrounds), plus interface scaling. Theme and scale are remembered
+on this device. To choose a theme at startup:
+
+```sh
+cargo run --locked -p avila-gui -- --theme black
+```
+
+`--theme light|dark|black` overrides the saved theme and becomes the new preference
+when the application saves. Appearance is stored separately from node configuration.
 
 Copy `config/default.toml` to the ignored `config/local.toml` for personal settings.
 Relative data paths resolve against the configuration file's directory; without a

@@ -25,6 +25,8 @@ dependency graph does not include egui or eframe.
 
 ## Validation
 
+The initial foundation commit (`bf8ed43`) was checked with:
+
 - Workspace compilation, formatting, Clippy with warnings denied, and rustdoc with
   warnings denied.
 - 24 tests: the original 22 configuration, journal, coordinator and CLI tests, plus
@@ -40,3 +42,23 @@ These checks establish the application foundation, not Bitcoin node correctness.
 There is still no consensus validator, persistent chainstate, P2P synchronization,
 mempool/relay or wallet backend. Native Wayland, Windows/macOS packaging, screen-reader
 behavior and extended operational testing remain future validation work.
+
+## Appearance and scope follow-up
+
+The owner's public-use clarification is now reflected in the scope, README and
+desktop. The roadmap has six integration gates and thirteen explicit workstreams,
+with research beginning alongside implementation. The scorecard defines matched
+profiles, baseline selection and provisional stretch targets; no node benchmarks
+are claimed to have run.
+
+Light, Dark and Black themes now persist with interface scale in a versioned local
+record. Generic egui memory and native window persistence remain disabled. Workspace
+formatting, Clippy, rustdoc, build and all 26 tests passed, including preference
+round-trip and malformed/out-of-range preference coverage.
+
+Native Linux/X11 checks launched all three themes with temporary settings, closed
+them normally and restarted without a theme argument. Captured panel backgrounds
+were `(248, 248, 248)` for Light, `(27, 27, 27)` for Dark and `(0, 0, 0)` for Black;
+Black was restored on restart. Saved state contained only the appearance record.
+Screenshots were visually inspected. These checks do not qualify other platforms
+or replace the planned accessibility and operational tests.
