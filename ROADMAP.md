@@ -91,14 +91,23 @@ Storage and synchronization research can use this implementation before P2P is r
       Proven live: `examples/peer_probe` completed a real handshake and a
       120-block headers-first sync against a Bitcoin Knots v29.3 regtest
       peer, validating every block through `Chainstate`.
-- [~] Peer discovery and lifecycle: `avila-p2p::addrman` (bounded,
-      recency-ordered gossip table) and `avila-p2p::manager` (bounded
-      multi-peer `PeerManager` driving session+sync pairs over one
-      `Chainstate`, with `getaddr`/`addr`/`addrv2` service and
-      `maintain_outbounds` dialing) are in place; DNS-seed bootstrap and
-      disconnect→redial scheduling remain.
-- [ ] Multi-peer download scheduling and restart/resume of interrupted
-      downloads.
+- [x] Peer discovery and lifecycle: `avila-p2p::addrman` (bounded,
+      recency-ordered gossip table with tried/attempt marks) feeds
+      `avila-p2p::manager` (`PeerManager` — a bounded multi-peer set
+      driving session+sync pairs over one `Chainstate`). `getaddr` is
+      served from the book, `addr`/`addrv2` gossip is ingested, DNS-seed
+      bootstrap resolves `vSeeds` per network, and `tick_net` redials
+      from the book on disconnect. Proven live: `examples/mainnet_probe`
+      resolved 291 mainnet candidates, dialed four real Core/Knots
+      peers, and validated 4000 mainnet headers — including the h2016
+      retarget — through `Chainstate`.
+- [x] Multi-peer download scheduling and restart/resume: the per-tick
+      fill pass hands each established peer `getdata` for
+      indexed-but-unfetched blocks, skipping hashes reserved by any peer
+      — no duplicate fetches, and a stalling/disconnecting peer's
+      reservations release automatically so its blocks are reassigned
+      next tick. Proven live: two Knots regtest peers fed one chainstate
+      to h120 with zero duplicate requests.
 - [ ] Global budgets, eviction scoring, and cancellation.
 - [ ] Exercise regtest, signet, testnet4 and mainnet with their required rules.
 - [ ] Implement selected transport/privacy constraints together with traffic paths.

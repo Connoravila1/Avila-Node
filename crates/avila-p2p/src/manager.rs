@@ -398,6 +398,37 @@ impl PeerManager<TcpStream> {
         Ok(self.add(session, Some(crate::addrman::net_addr_of(addr, 0))))
     }
 
+    /// Resolves `params.dns_seeds` into the address book — the bootstrap
+    /// path for real networks (regtest ships no seeds). Returns how many
+    /// addresses were learned. Blocking DNS; run before the tick loop.
+    pub fn seed_from_dns(&mut self, params: &avila_consensus::params::Params, now: u32) -> usize {
+        let addrs = addrman::resolve_seeds(params.dns_seeds, params.default_port);
+        let n = addrs.len();
+        self.addrbook
+            .add_many(addrs.into_iter().map(|a| (a, now)), now);
+        n
+    }
+
+    /// `tick` plus connectivity maintenance: any disconnect this round
+    /// immediately triggers `maintain_outbounds`, so the peer set
+    /// self-heals from the address book.
+    pub fn tick_net(
+        &mut self,
+        cs: &mut Chainstate,
+        now: u32,
+        magic: [u8; 4],
+        start_height: i32,
+    ) -> Vec<NetEvent> {
+        let events = self.tick(cs, now);
+        if events
+            .iter()
+            .any(|e| matches!(e, NetEvent::Disconnected { .. }))
+        {
+            self.maintain_outbounds(magic, start_height);
+        }
+        events
+    }
+
     /// Dials address-book candidates until the peer set is full or the
     /// book runs dry — the caller runs this between `tick`s to keep
     /// outbound connectivity up. Returns the endpoints attempted.

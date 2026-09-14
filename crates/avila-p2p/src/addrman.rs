@@ -12,6 +12,8 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use std::net::ToSocketAddrs;
+
 use crate::message::NetAddr;
 
 /// Table cap — Core's `ADDRMAN_NEW_BUCKETS*TRIES` space is far larger;
@@ -167,6 +169,24 @@ impl AddrBook {
             self.seq.remove(&victim);
         }
     }
+}
+
+/// Resolves a network's `vSeeds` DNS names into address-book entries.
+/// Each seed is queried at the network's `default_port`; failed names are
+/// skipped (Core treats seed resolution the same way — partial failure is
+/// normal). Blocking: call at startup or off the sync loop.
+#[must_use]
+pub fn resolve_seeds(seeds: &[&str], default_port: u16) -> Vec<NetAddr> {
+    let mut out = Vec::new();
+    for host in seeds {
+        let Ok(resolved) = (*host, default_port).to_socket_addrs() else {
+            continue;
+        };
+        for sock in resolved {
+            out.push(net_addr_of(sock, 0));
+        }
+    }
+    out
 }
 
 /// `NetAddr` → `SocketAddr` (v4-mapped addresses become real v4).
