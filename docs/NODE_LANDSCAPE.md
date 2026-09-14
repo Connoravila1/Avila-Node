@@ -20,7 +20,7 @@ a node rather than being one.
 | Implementation | Lang | Status (survey date) | Validation/storage model | Distinctive properties |
 | --- | --- | --- | --- | --- |
 | **Bitcoin Core 31.1** | C++ | Latest release (2026-07-08); >95% of reachable network | Archival or pruned; assumevalid (script checks skipped below a hardcoded height), headers-first IBD | The de facto spec. Cluster mempool work in flight; libbitcoinkernel extracted for reuse; Guix reproducible releases; `-blockfilterindex`, mining RPC. The reference for nearly every row. |
-| **Bitcoin Knots 29.3** (`.knots20260508`) | C++ | Active; Core 29.3 base | Identical consensus | Policy-divergence laboratory: configurable `datacarrier*`, `rejecttokens`, `rejectparasites`, ephemeral-anchor and bare-pubkey policy, `spkreuse`, `-maxtxlegacysigops`, RAM-aware `dbcache`, retained legacy wallet, NAT-PMP. Ships an optional **BIP-110/RDTS** build — a *consensus* divergence gated on miner signaling; if it ever activates it is a network rules change, otherwise it is a policy+signaling curiosity. Proof that policy ≠ consensus in practice. |
+| **Bitcoin Knots 29.3** (`.knots20260508`) | C++ | Active; Core 29.3 base | Identical consensus on the main chain | Policy-divergence laboratory: configurable `datacarrier*`, `rejecttokens`, `rejectparasites`, ephemeral-anchor and bare-pubkey policy, `spkreuse`, `-maxtxlegacysigops`, RAM-aware `dbcache`, retained legacy wallet, NAT-PMP. Its **BIP-110/RDTS** build is now the canonical case study in consensus divergence: the mandatory-signaling window opened at height 961,632 (2026-08-08) with 2.53% signaling vs. the 55% threshold; the enforcing chain stalled after 2 blocks at full difficulty and supporters revived it by changing the PoW to Blake2b and cutting blocks to 300 kB — a separate coin, not Bitcoin. Divergence without adoption is a different network. |
 | **btcd v0.26** | Go | Active; in production since 2013 | Archival or pruned (v0.26 added `--prune`) | Clean-room modular Go packages (wire/tx/script/utxo separable) — the model our crate boundaries emulate. v0.26 claims IBD ~45 h → ~6 h and `testmempoolaccept`. Had security-critical UTXO/reorg cache bugs in the v0.25 era — a reminder that independent implementations pay a correctness tax; mitigated for us by the differential adapter. No built-in wallet (btcwallet). |
 | **Gocoin** | Go | Active | Archival; **whole UTXO set in RAM** | The maximal-speed design point: custom non-GC UTXO memory module, published sync charts vs Core 30.2 (Hetzner i7-7700/64 GB), `LastTrustedBlock` sync speedup, optional `libsecp256k1` acceleration. The opposite end of the memory axis from Floresta — useful as the RAM-spend reference for P1/P3. |
 | **Floresta v0.9.0** | Rust | Active; self-described experimental | **Utreexo accumulator** — UTXO set is a small commitment; pruned-only (<1 GB); PoW fraud proofs | The proof-assisted design point: BIP-183 Utreexo messaging, script validation via `libbitcoinkernel` (shared C++ validation code — a hybrid, not an independent engine; claims ~15× over libbitcoinconsensus), watch-only wallet + Electrum server, Core RPC-compat test rig. Different guarantees → separate scorecard rows where the UTXO model changes the check set. |
@@ -43,7 +43,7 @@ a node rather than being one.
 
 | Row | Primary reference | Secondary / notes |
 | --- | --- | --- |
-| C1 correctness | **Bitcoin Core** (pinned release; functional-test corpus, `submitheader` adapter) | rust-bitcoin dev-differential; Knots consensus-identical until RDTS |
+| C1 correctness | **Bitcoin Core** (pinned release; functional-test corpus, `submitheader` adapter) | rust-bitcoin dev-differential; Knots consensus-identical on the main chain (its BIP-110 build enforces a different, non-adopted ruleset) |
 | P1 initial validation | **Core 31.1** | Gocoin (RAM-resident extreme); Floresta/Utreexo in a *separate* row (different check set via proofs) |
 | P2 tip/reorg latency | **Core** | btcd for a second independent implementation |
 | P3 memory | **Core** | Gocoin (max-RAM) and Floresta (min-RAM) as the axis ends |
@@ -86,5 +86,5 @@ Deliberately differ:
 
 Re-check this table when: a scorecard row actually runs (pin exact revisions
 then), a referenced project ships a validation-model change (e.g. assumeutxo
-in a Core release, Utreexo in Core, an RDTS activation), or a new serious
-implementation appears.
+in a Core release, Utreexo in Core, or a new soft-fork deployment reaching
+activation), or a new serious implementation appears.
