@@ -163,8 +163,9 @@ operation. Compare complete initial download and catch-up, not only local replay
       `inv` announces to tx-relay peers (wtxid for BIP339 peers), `inv`
       announcements fetch as `MSG_WITNESS_TX`, `getdata` serves pooled
       txs, and connected blocks purge confirmed/conflicted entries.
-      Orphan pool, descendant-package limits, and disconnected-block
-      reinsertion remain open.
+      Orphan pool and disconnected-block reinsertion landed with it;
+      ancestor/descendant package limits (Core's 25-entry / 101 kvB
+      caps) are enforced at admission.
 - [ ] Provide replayable policy explanations and isolated shadow-policy evaluation.
 - [ ] Deliver authenticated/versioned control, a tested Core RPC compatibility matrix,
   watch-only descriptors, wallet broadcast, fee information and scoped service access.

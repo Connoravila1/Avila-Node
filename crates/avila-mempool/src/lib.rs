@@ -9,7 +9,7 @@
 //! Nothing in this crate can make a block invalid — it only decides
 //! which unconfirmed transactions we keep and relay.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use avila_consensus::check::{TxRuleError, check_transaction};
 use avila_consensus::connect::{
@@ -95,7 +95,22 @@ pub enum MempoolReject {
     /// lowest-fee-rate entry.
     #[error("mempool full")]
     Full,
+    /// Ancestor or descendant package limits exceeded — Core reports
+    /// both as `too-long-mempool-chain`.
+    #[error("too-long-mempool-chain")]
+    PackageLimits,
 }
+
+/// Core's `DEFAULT_ANCESTOR_LIMIT` — a candidate may not bring its
+/// in-pool ancestor set (parents, grandparents, …) past 25 entries.
+pub const ANCESTOR_LIMIT: usize = 25;
+/// Core's `DEFAULT_ANCESTOR_SIZE_LIMIT_KVB` — candidate + ancestors.
+pub const ANCESTOR_SIZE_LIMIT_KVB: usize = 101;
+/// Core's `DEFAULT_DESCENDANT_LIMIT` — adding the candidate must not
+/// push any in-pool ancestor's descendant set past 25.
+pub const DESCENDANT_LIMIT: usize = 25;
+/// Core's `DEFAULT_DESCENDANT_SIZE_LIMIT_KVB`.
+pub const DESCENDANT_SIZE_LIMIT_KVB: usize = 101;
 
 /// Core's `MAX_ORPHAN_TRANSACTIONS` — orphan entries bound separately
 /// from the pool so orphan flooding can't crowd out confirmed-parent
@@ -270,6 +285,30 @@ impl Mempool {
             }
         }
 
+        // 3.5 Package limits — Core's CalculateMemPoolAncestors. The
+        //    candidate's in-pool ancestor set (count and total vsize)
+        //    is bounded, and no ancestor's descendant set may overflow
+        //    by accepting it.
+        let vsize = tx.weight().div_ceil(4);
+        let ancestors = self.ancestors_of(&tx);
+        if ancestors.len() + 1 > ANCESTOR_LIMIT {
+            return Err(MempoolReject::PackageLimits);
+        }
+        let ancestor_vsize: usize = ancestors
+            .iter()
+            .filter_map(|id| self.map.get(id))
+            .map(|e| e.vsize)
+            .sum();
+        if ancestor_vsize + vsize > ANCESTOR_SIZE_LIMIT_KVB * 1000 {
+            return Err(MempoolReject::PackageLimits);
+        }
+        for ancestor in &ancestors {
+            let (count, size) = self.descendants_of(ancestor);
+            if count + 1 > DESCENDANT_LIMIT || size + vsize > DESCENDANT_SIZE_LIMIT_KVB * 1000 {
+                return Err(MempoolReject::PackageLimits);
+            }
+        }
+
         // 4. Consensus input checks against an overlay containing exactly
         //    this tx's resolved coins — identical logic to block connect.
         let tip = cs.tip_hash();
@@ -283,7 +322,6 @@ impl Mempool {
 
         // 5. BIP125 fee rule: replacement must pay the conflicts' fees
         //    plus incremental relay for its own size.
-        let vsize = tx.weight().div_ceil(4);
         if !conflicts.is_empty() {
             let conflict_fees: i64 = conflicts
                 .iter()
@@ -383,6 +421,58 @@ impl Mempool {
             }
         }
         Ok(txid)
+    }
+
+    /// All in-pool ancestors of a candidate — the transitive closure of
+    /// its pooled parents (parents of parents of …).
+    fn ancestors_of(&self, tx: &Transaction) -> HashSet<Txid> {
+        let mut ancestors = HashSet::new();
+        let mut stack: Vec<Txid> = tx
+            .inputs
+            .iter()
+            .map(|i| i.previous_output.txid)
+            .filter(|id| self.map.contains_key(id))
+            .collect();
+        while let Some(id) = stack.pop() {
+            if !ancestors.insert(id) {
+                continue;
+            }
+            if let Some(parent) = self.map.get(&id) {
+                stack.extend(
+                    parent
+                        .tx
+                        .inputs
+                        .iter()
+                        .map(|i| i.previous_output.txid)
+                        .filter(|pid| self.map.contains_key(pid)),
+                );
+            }
+        }
+        ancestors
+    }
+
+    /// All in-pool descendants of a pooled tx, as `(count, total vsize)`.
+    fn descendants_of(&self, txid: &Txid) -> (usize, usize) {
+        let mut descendants = HashSet::new();
+        let mut stack = vec![*txid];
+        while let Some(id) = stack.pop() {
+            let Some(entry) = self.map.get(&id) else {
+                continue;
+            };
+            for vout in 0..entry.tx.outputs.len() as u32 {
+                if let Some(child) = self.spends.get(&OutPoint { txid: id, vout })
+                    && descendants.insert(*child)
+                {
+                    stack.push(*child);
+                }
+            }
+        }
+        let vsize: usize = descendants
+            .iter()
+            .filter_map(|id| self.map.get(id))
+            .map(|e| e.vsize)
+            .sum();
+        (descendants.len(), vsize)
     }
 
     /// Parks a tx whose inputs don't resolve, bounded and expiring —
@@ -803,5 +893,77 @@ mod tests {
         cs.accept_block(&block, NOW + 200).unwrap();
         pool.on_block_connected(&block);
         assert!(pool.is_empty());
+    }
+
+    /// A tx spending `op` and fanning out to `n` outputs (descendant
+    /// tests need one parent with many children).
+    fn fan_tx(op: OutPoint, n: u32, value_each: i64) -> Transaction {
+        Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: op,
+                script_sig: Script::new(vec![]),
+                sequence: SEQ_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: (0..n)
+                .map(|_| TxOut {
+                    value: value_each,
+                    script_pubkey: Script::new(vec![script::OP_1]),
+                })
+                .collect(),
+            lock_time: 0,
+        }
+    }
+
+    #[test]
+    fn ancestor_chain_is_capped_at_25() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let mut op = mature_outpoint(&blocks, 1);
+        let mut value = 4_999_000_000i64;
+        // 25 chained accepts — the 25th has 24 ancestors (within limit).
+        for _ in 0..25 {
+            let tx = spend_tx(op, value, SEQ_FINAL);
+            op = OutPoint {
+                txid: tx.txid(),
+                vout: 0,
+            };
+            value -= 10_000;
+            pool.accept_tx(tx, &cs, NOW).unwrap();
+        }
+        // The 26th would have 25 ancestors + itself → over the limit.
+        let over = spend_tx(op, value, SEQ_FINAL);
+        assert_eq!(
+            pool.accept_tx(over, &cs, NOW),
+            Err(MempoolReject::PackageLimits)
+        );
+    }
+
+    #[test]
+    fn descendant_fanout_is_capped_at_25() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        // One parent with 30 outputs, each child spends a distinct one.
+        let parent = fan_tx(mature_outpoint(&blocks, 1), 30, 10_000_000);
+        let pid = parent.txid();
+        pool.accept_tx(parent, &cs, NOW).unwrap();
+        for vout in 0..25 {
+            let child = spend_tx(OutPoint { txid: pid, vout }, 9_000_000, SEQ_FINAL);
+            pool.accept_tx(child, &cs, NOW).unwrap();
+        }
+        // Child 26 pushes the parent's descendant set to 26.
+        let over = spend_tx(
+            OutPoint {
+                txid: pid,
+                vout: 25,
+            },
+            9_000_000,
+            SEQ_FINAL,
+        );
+        assert_eq!(
+            pool.accept_tx(over, &cs, NOW),
+            Err(MempoolReject::PackageLimits)
+        );
     }
 }
