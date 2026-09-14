@@ -46,6 +46,20 @@ segwit/taproot activation heights for the first block satisfying
 condition proves at least one non-coinbase transaction carries witness
 data). See `fixtures/manifest.json` for the exact selection notes.
 
+### Block-segment fixtures
+
+Contiguous real chains in `blk.dat` framing (4-byte network magic + 4-byte
+little-endian length + raw block, repeated) — the input format for
+`check_blocks replay` / the `segment-*` differential suites, which feed the
+whole segment through `Chainstate::accept_block` in order.
+
+| File | Network | Heights | Blocks | Bytes |
+|---|---|---|---|---|
+| `mainnet-blocks-000000-000500.dat` | mainnet | 0..=500 | 501 | 114278 |
+
+Regenerate or fetch a different range with
+`python3 tools/fetch_fixtures.py --segment <network> <first> <last>`.
+
 ### Provenance and integrity
 
 - `manifest.json` — machine-readable provenance for every fixture above:

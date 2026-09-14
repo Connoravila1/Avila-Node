@@ -6,6 +6,7 @@
 //! Usage:
 //!   `check-blocks check <network> <block.bin> <now>`
 //!   `check-blocks check-many <network> <now> <block.bin>...`
+//!   `check-blocks replay <network> <blocks.dat> <now>`
 //!   `check-blocks gen-corpus <outdir>`
 //!
 //! The pipeline mirrors Core's `ProcessNewBlock` order: header insertion
@@ -31,7 +32,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use avila_consensus::arith::CompactTarget;
-use avila_consensus::block::Block;
+use avila_consensus::block::{Block, MAX_BLOCK_SERIALIZED_SIZE};
 use avila_consensus::chainstate::{Acceptance, Chainstate};
 use avila_consensus::check;
 use avila_consensus::connect;
@@ -1312,6 +1313,7 @@ fn emit_signed_spends(
             txout(100_000, p2tr_script_spk.as_bytes().to_vec()), // v4
             txout(100_000, p2sh_p2wpkh_spk.as_bytes().to_vec()), // v5
             txout(100_000, p2sh_spk2.as_bytes().to_vec()),    // v6
+            txout(100_000, p2pkh_spk.as_bytes().to_vec()),    // v7
             txout(4_900_000_000, vec![script::OP_1]),         // change
         ],
         lock_time: 0,
@@ -1568,6 +1570,62 @@ fn emit_signed_spends(
         );
         emit(manifest, outdir, "81-p2sh-badsig", &block, state, now)?;
     }
+
+    // 82-high-s-p2pkh: a valid P2PKH spend whose signature carries a *high* S
+    // (s -> n - s). LOW_S is mempool policy, not a block flag, so Core's
+    // CPubKey::Verify normalizes before verifying (pubkey.cpp:283) — both
+    // sides must accept. This case exists because real mainnet history
+    // contains high-S signatures (e.g. block 183's spend).
+    {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![txin(spent_outs(7), vec![])],
+            outputs: vec![txout(99_000, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let sighash = bitcoin::sighash::SighashCache::new(&btc_tx(&tx))
+            .legacy_signature_hash(
+                0,
+                &bitcoin::ScriptBuf::from_bytes(p2pkh_spk.as_bytes().to_vec()),
+                1,
+            )
+            .unwrap()
+            .to_byte_array();
+        let mut sig = sign_ecdsa(&secp, &sk, &sighash, 1);
+        // Flip S to n - S: compact r||s, subtract s from the group order,
+        // re-encode DER, re-append the sighash byte.
+        let low = bitcoin::secp256k1::ecdsa::Signature::from_der(&sig[..sig.len() - 1]).unwrap();
+        let compact = low.serialize_compact();
+        const ORDER: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
+            0xd0, 0x36, 0x41, 0x41,
+        ];
+        let mut high = [0u8; 64];
+        high[..32].copy_from_slice(&compact[..32]);
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let d = ORDER[i] as i16 - compact[32 + i] as i16 - borrow;
+            if d < 0 {
+                high[32 + i] = (d + 256) as u8;
+                borrow = 1;
+            } else {
+                high[32 + i] = d as u8;
+                borrow = 0;
+            }
+        }
+        let high_sig = bitcoin::secp256k1::ecdsa::Signature::from_compact(&high).unwrap();
+        sig = high_sig.serialize_der().to_vec();
+        sig.push(1);
+        let mut script_sig = script::push_slice(&sig);
+        script_sig.extend_from_slice(&script::push_slice(&pk_bytes));
+        tx.inputs[0].script_sig = Script::new(script_sig);
+        let block = finish(
+            draft_on(&signed_parent, vec![regtest_coinbase(111), tx]),
+            params,
+        );
+        emit(manifest, outdir, "82-high-s-p2pkh", &block, state, now)?;
+    }
     Ok(())
 }
 
@@ -1636,6 +1694,78 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Some("replay") if args.len() == 4 => {
+            let Some(net) = network(&args[1]) else {
+                eprintln!("unknown network {:?}", args[1]);
+                return ExitCode::FAILURE;
+            };
+            let Ok(now) = args[3].parse::<u32>() else {
+                eprintln!("invalid <now> timestamp {:?}", args[3]);
+                return ExitCode::FAILURE;
+            };
+            let data = match fs::read(&args[2]) {
+                Ok(data) => data,
+                Err(err) => {
+                    eprintln!("cannot read {}: {err}", args[2]);
+                    return ExitCode::FAILURE;
+                }
+            };
+            // blk.dat framing: 4-byte network magic + 4-byte LE length +
+            // raw block, repeated. One Chainstate across the stream — this is
+            // the offline-import/replay path: every block runs the full
+            // accept pipeline (CheckBlock -> header insert -> contextual ->
+            // connect/reorg) in file order.
+            let expected_magic = match net {
+                Network::Mainnet => [0xf9, 0xbe, 0xb4, 0xd9],
+                Network::Testnet4 => [0x1c, 0x16, 0x3f, 0x28],
+                Network::Signet => [0x0a, 0x03, 0xcf, 0x40],
+                Network::Regtest => [0xfa, 0xbf, 0xb5, 0xda],
+            };
+            let mut state = Chainstate::new(&net.params());
+            let mut cursor = 0usize;
+            let mut index = 0u64;
+            while cursor + 8 <= data.len() {
+                let magic = [
+                    data[cursor],
+                    data[cursor + 1],
+                    data[cursor + 2],
+                    data[cursor + 3],
+                ];
+                let len = u32::from_le_bytes([
+                    data[cursor + 4],
+                    data[cursor + 5],
+                    data[cursor + 6],
+                    data[cursor + 7],
+                ]) as usize;
+                cursor += 8;
+                if magic != expected_magic {
+                    println!("#{index}\trejected:bad-frame-magic\t{magic:02x?}");
+                    break;
+                }
+                if len > MAX_BLOCK_SERIALIZED_SIZE || cursor + len > data.len() {
+                    println!("#{index}\trejected:bad-frame-length\t{len}");
+                    break;
+                }
+                let payload = &data[cursor..cursor + len];
+                cursor += len;
+                let verdict_line = match Block::decode(payload) {
+                    Ok(block) => {
+                        let (verdict, detail) = validate(&block, &mut state, now);
+                        format!("{verdict}\t{detail}")
+                    }
+                    Err(err) => format!("rejected:decode\t{err}"),
+                };
+                println!("#{index}\t{verdict_line}");
+                index += 1;
+            }
+            if cursor != data.len() {
+                eprintln!(
+                    "warning: {} trailing byte(s) after last frame",
+                    data.len() - cursor
+                );
+            }
+            ExitCode::SUCCESS
+        }
         Some("gen-corpus") if args.len() == 2 => {
             let outdir = Path::new(&args[1]);
             if let Err(err) = fs::create_dir_all(outdir) {
@@ -1663,6 +1793,7 @@ fn main() -> ExitCode {
             eprintln!("usage:");
             eprintln!("  check-blocks check <network> <block.bin> <now>");
             eprintln!("  check-blocks check-many <network> <now> <block.bin>...");
+            eprintln!("  check-blocks replay <network> <blocks.dat> <now>");
             eprintln!("  check-blocks gen-corpus <outdir>");
             ExitCode::FAILURE
         }

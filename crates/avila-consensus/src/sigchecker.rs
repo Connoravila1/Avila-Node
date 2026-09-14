@@ -537,14 +537,19 @@ impl<'a> TransactionSignatureChecker<'a> {
     }
 
     /// `VerifyECDSASignature` — `CPubKey::Verify`: parse the pubkey
-    /// (`secp256k1_ec_pubkey_parse`), lax-DER-parse the signature, verify.
+    /// (`secp256k1_ec_pubkey_parse`), lax-DER-parse the signature, normalize
+    /// low-S, verify. libsecp256k1's verification requires lower-S
+    /// signatures, which have not historically been enforced in Bitcoin —
+    /// `CPubKey::Verify` normalizes first (`secp256k1_ecdsa_signature_normalize`),
+    /// so we do the same (pubkey.cpp:283).
     fn verify_ecdsa_signature(sig: &[u8], pubkey: &[u8], sighash: &[u8; 32]) -> bool {
         let Ok(pk) = secp256k1::PublicKey::from_slice(pubkey) else {
             return false;
         };
-        let Ok(sig) = secp256k1::ecdsa::Signature::from_der_lax(sig) else {
+        let Ok(mut sig) = secp256k1::ecdsa::Signature::from_der_lax(sig) else {
             return false;
         };
+        sig.normalize_s();
         let Ok(msg) = secp256k1::Message::from_digest_slice(sighash) else {
             return false;
         };

@@ -718,12 +718,20 @@ def fetch_headers_https_fallback(net: NetParams, first_height: int, last_height:
     return headers, source
 
 
-def fetch_block_raw(net: NetParams, height: int, expected_display_hash: Optional[str] = None):
+def fetch_block_raw(net: NetParams, height: int, expected_display_hash: Optional[str] = None,
+                    want_meta: bool = True, preferred_base: Optional[str] = None):
     """
     Fetch a full raw block by height over HTTPS. Returns
     (raw_bytes, block_hash_display_hex, meta_dict, source_dict).
+    `meta_dict` is {} when want_meta is False (segment fetching skips the
+    extra metadata round trip per block). `preferred_base` is tried first —
+    long segment fetches pass the last-working base so a rate-limited base
+    is not retried on every block.
     """
-    bases = ESPLORA_BASE[net.name]
+    bases = list(ESPLORA_BASE[net.name])
+    if preferred_base in bases:
+        bases.remove(preferred_base)
+        bases.insert(0, preferred_base)
     last_exc = None
     for base in bases:
         try:
@@ -734,7 +742,7 @@ def fetch_block_raw(net: NetParams, height: int, expected_display_hash: Optional
                     f"expected {expected_display_hash}"
                 )
             raw = http_get(f"{base}/block/{block_hash}/raw")
-            meta = http_get(f"{base}/block/{block_hash}", as_json=True)
+            meta = http_get(f"{base}/block/{block_hash}", as_json=True) if want_meta else {}
             computed_hash = to_display_hex(dsha256(raw[:80]))
             if computed_hash != block_hash:
                 raise RuntimeError(
@@ -1132,6 +1140,111 @@ def generate_block_fixture(spec: BlockFixtureSpec, manifest_dict: dict):
     return entry
 
 
+def segment_file_name(network: str, first_height: int, last_height: int) -> str:
+    return f"{network}-blocks-{first_height:06d}-{last_height:06d}.dat"
+
+
+def generate_segment_fixture(network: str, first_height: int, last_height: int,
+                             manifest_dict: dict):
+    """Fetch a contiguous range of full blocks and write them as one
+    blk.dat-framed stream (4-byte network magic + 4-byte LE length + raw
+    block, repeated). This is the replay/offline-import format: the
+    differential driver feeds the file to `check_blocks replay` while the
+    reference daemon gets the same blocks through `submitblock`."""
+    net = NETWORKS[network]
+    file_name = segment_file_name(network, first_height, last_height)
+    print(f"[segment] {file_name}: fetching {network} blocks "
+          f"{first_height}..={last_height}")
+
+    prev_header_hash: Optional[bytes] = None
+    if first_height > 0:
+        # Anchor the linkage check: the segment's first block must point at
+        # the real block at first_height - 1.
+        bases = ESPLORA_BASE[net.name]
+        prev_display = None
+        for base in bases:
+            try:
+                prev_display = http_get(f"{base}/block-height/{first_height - 1}",
+                                        as_hex_text=True)
+                break
+            except Exception:
+                continue
+        if prev_display is None:
+            raise RuntimeError(f"could not resolve height {first_height - 1} hash")
+        prev_header_hash = from_display_hex(prev_display)
+
+    frames = []
+    sources = set()
+    working_base = None
+    for height in range(first_height, last_height + 1):
+        raw, block_hash, _meta, source = fetch_block_raw(
+            net, height, want_meta=False, preferred_base=working_base)
+        working_base = source["url"].split("/block/")[0]
+        header = raw[:HEADER_SIZE]
+        computed = dsha256(header)
+        if to_display_hex(computed) != block_hash:
+            raise RuntimeError(f"segment height {height}: hash mismatch")
+        if prev_header_hash is not None and header[4:36] != prev_header_hash:
+            raise RuntimeError(
+                f"segment height {height}: prev_hash does not link to "
+                f"height {height - 1}"
+            )
+        if height == first_height == 0 and computed != net.genesis_internal_hash:
+            raise RuntimeError("segment height 0 is not the network genesis")
+        prev_header_hash = computed
+        frames.append(raw)
+        sources.add(source["url"].split("/block/")[0])
+        if height % 100 == 0 or height == last_height:
+            print(f"[segment] {file_name}: height {height} "
+                  f"({len(frames)}/{last_height - first_height + 1})", flush=True)
+
+    data = b"".join(net.magic + struct.pack("<I", len(raw)) + raw for raw in frames)
+    out_path = os.path.join(FIXTURES_DIR, file_name)
+    write_bytes(out_path, data)
+    sha256_hex = hashlib.sha256(data).hexdigest()
+
+    entry = {
+        "file": file_name,
+        "network": network,
+        "kind": "block-segment",
+        "first_height": first_height,
+        "last_height": last_height,
+        "count": len(frames),
+        "first_hash": to_display_hex(dsha256(frames[0][:HEADER_SIZE])),
+        "last_hash": to_display_hex(dsha256(frames[-1][:HEADER_SIZE])),
+        "bytes": len(data),
+        "sha256": sha256_hex,
+        "source": {
+            "transport": "https",
+            "url": f"{sorted(sources)[0]}/block-height/<h> + /block/<hash>/raw",
+            "bases_used": sorted(sources),
+        },
+        "notes": "blk.dat-framed contiguous segment for chainstate replay.",
+    }
+    upsert_fixture_entry(manifest_dict, entry)
+    print(f"[segment] {file_name}: OK ({len(frames)} blocks, {len(data)} bytes, "
+          f"sha256={sha256_hex[:16]}...)")
+    return entry
+
+
+def iter_segment_frames(data: bytes, expected_magic: bytes):
+    """Yield raw block payloads from a blk.dat-framed stream; raises
+    RuntimeError on bad magic, absurd length, or truncation."""
+    cursor = 0
+    while cursor < len(data):
+        if cursor + 8 > len(data):
+            raise RuntimeError("truncated frame header")
+        magic = data[cursor:cursor + 4]
+        if magic != expected_magic:
+            raise RuntimeError(f"bad frame magic {magic.hex()} at offset {cursor}")
+        length = struct.unpack_from("<I", data, cursor + 4)[0]
+        cursor += 8
+        if length > 4 * 1024 * 1024 or cursor + length > len(data):
+            raise RuntimeError(f"bad frame length {length} at offset {cursor - 4}")
+        yield data[cursor:cursor + length]
+        cursor += length
+
+
 # ---------------------------------------------------------------------------
 # Post-hoc independent verification
 # ---------------------------------------------------------------------------
@@ -1195,6 +1308,39 @@ def verify_all(manifest_dict: dict) -> bool:
             else:
                 print(f"  [ok] {entry['file']} block header hash verified ({len(data)} bytes)")
 
+        elif entry["kind"] == "block-segment":
+            with open(path, "rb") as f:
+                data = f.read()
+            try:
+                frames = list(iter_segment_frames(data, NETWORKS[entry["network"]].magic))
+            except RuntimeError as e:
+                print(f"  [FRAME ERROR] {entry['file']}: {e}")
+                ok = False
+                continue
+            if len(frames) != entry["count"]:
+                print(f"  [COUNT MISMATCH] {entry['file']}: "
+                      f"{len(frames)} != {entry['count']}")
+                ok = False
+            prev_hash = None
+            seg_ok = True
+            for i, raw in enumerate(frames):
+                h_hash = dsha256(raw[:HEADER_SIZE])
+                if i > 0 and raw[4:36] != prev_hash:
+                    print(f"  [LINKAGE BROKEN] {entry['file']} at frame {i}")
+                    seg_ok = ok = False
+                    break
+                prev_hash = h_hash
+            if seg_ok:
+                if to_display_hex(dsha256(frames[0][:HEADER_SIZE])) != entry["first_hash"]:
+                    print(f"  [FIRST HASH MISMATCH] {entry['file']}")
+                    ok = False
+                if to_display_hex(dsha256(frames[-1][:HEADER_SIZE])) != entry["last_hash"]:
+                    print(f"  [LAST HASH MISMATCH] {entry['file']}")
+                    ok = False
+            if seg_ok:
+                print(f"  [ok] {entry['file']} segment linkage verified "
+                      f"({len(frames)} blocks)")
+
     total_bytes = sum(
         os.path.getsize(os.path.join(FIXTURES_DIR, e["file"]))
         for e in manifest_dict["fixtures"]
@@ -1243,6 +1389,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--only", metavar="NAME", help="regenerate only this fixture file")
     parser.add_argument("--list", action="store_true", help="list fixture names and exit")
+    parser.add_argument(
+        "--segment",
+        nargs=3,
+        metavar=("NETWORK", "FIRST", "LAST"),
+        help="fetch a contiguous block range into a blk.dat-framed "
+             "fixtures/<net>-blocks-<first>-<last>.dat, then exit",
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -1257,6 +1410,29 @@ def main():
     manifest_dict.setdefault("fixtures", [])
     manifest_dict.setdefault("observed", {})
     manifest_dict["generator"] = "tools/fetch_fixtures.py"
+
+    if args.segment:
+        network, first_s, last_s = args.segment
+        if network not in NETWORKS:
+            print(f"error: unknown network {network!r} "
+                  f"(known: {', '.join(NETWORKS)})", file=sys.stderr)
+            return 2
+        first, last = int(first_s), int(last_s)
+        if first < 0 or last < first:
+            print(f"error: bad range {first}..{last}", file=sys.stderr)
+            return 2
+        try:
+            generate_segment_fixture(network, first, last, manifest_dict)
+        except Exception as e:
+            print(f"[ERROR] segment {network} {first}..{last}: {e}", file=sys.stderr)
+            return 1
+        manifest_dict["generated_at_utc"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        save_manifest(manifest_dict)
+        write_sha256sums(manifest_dict)
+        ok = verify_all(manifest_dict) and run_sha256sum_check()
+        print("\nRESULT: " + ("SUCCESS" if ok else "FAILURE"), file=sys.stderr)
+        return 0 if ok else 1
 
     header_specs = HEADER_FIXTURES
     block_specs = BLOCK_FIXTURES

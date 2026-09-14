@@ -6,14 +6,14 @@ installed reference daemon's `submitblock` RPC.
 
 WHAT THIS DOES
 --------------
-Two suites:
+Suites:
 
   regtest-corpus — `cargo run --example check_blocks -- gen-corpus` emits one
       block per implemented rule violation plus valid controls (a height-1
       block, a height-2 child, a witness-committed block, and a duplicate
       resubmission). An isolated `bitcoind -regtest` judges each block through
       `submitblock` in manifest order; the same files run through
-      `check_blocks check-many`, which shares one HeaderTree across the corpus
+      `check_blocks check-many`, which shares one Chainstate across the corpus
       the way the daemon shares its block index.
 
   fixtures-{mainnet,testnet4,signet} — every committed real block fixture for
@@ -24,6 +24,14 @@ Two suites:
       BIP325 block solution while `check_block` returns the explicit
       `bad-signet-blksig-unchecked` stub — the documented gap, surfaced as
       evidence rather than hidden.
+
+  segment-{mainnet} — a blk.dat-framed contiguous real-chain segment (see
+      SEGMENT_FIXTURES, produced by `fetch_fixtures.py --segment`). The daemon
+      receives each block through `submitblock` in order; our side replays the
+      file through `check_blocks replay`, one Chainstate across the stream.
+      Every block in the deployed chain is valid by construction, so each
+      verdict must be "accepted" on both sides — a rejection anywhere means
+      a real discrepancy in our accept path.
 
 VERDICT NORMALIZATION
 ---------------------
@@ -72,6 +80,7 @@ import json
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -102,8 +111,20 @@ BLOCK_FIXTURES = {
     "signet": ["signet-block-000000.bin", "signet-block-000001.bin"],
 }
 
+# blk.dat-framed contiguous real-chain segments, replayed end-to-end through
+# the library Chainstate (submitblock on the daemon side). Produced by
+# `tools/fetch_fixtures.py --segment <net> <first> <last>`.
+SEGMENT_FIXTURES = {
+    "mainnet": "mainnet-blocks-000000-000500.dat",
+}
+
 # Documented gaps where the two sides are known to differ today.
 EXPECTED_DIVERGENCE = {
+    "signet-block-000000.bin": (
+        "signet BIP325 block-solution validation is unimplemented; the daemon "
+        "accepts the genesis block as trivial-challenge (and known-in-index "
+        "duplicate), we return the explicit bad-signet-blksig-unchecked stub"
+    ),
     "signet-block-000001.bin": (
         "signet BIP325 block-solution validation is unimplemented; the daemon "
         "verifies the real signature, we return the explicit "
@@ -248,6 +269,81 @@ def avila_verdicts(network, paths, now):
     ]
 
 
+def read_blkdat(path):
+    """Split a blk.dat-framed file into a list of raw block byte strings."""
+    data = open(path, "rb").read()
+    blocks = []
+    cursor = 0
+    while cursor + 8 <= len(data):
+        length = struct.unpack_from("<I", data, cursor + 4)[0]
+        cursor += 8
+        if cursor + length > len(data):
+            raise RuntimeError(f"{path}: truncated frame at offset {cursor - 8}")
+        blocks.append(data[cursor:cursor + length])
+        cursor += length
+    if cursor != len(data):
+        raise RuntimeError(f"{path}: {len(data) - cursor} trailing bytes")
+    return blocks
+
+
+def avila_replay_verdicts(network, path, now):
+    """Verdict tokens per frame, from `check_blocks replay` — one Chainstate
+    over the whole segment, like check-many but for blk.dat framing."""
+    proc = subprocess.run(
+        [
+            "cargo", "run", "-q", "--locked", "-p", "avila-consensus",
+            "--example", "check_blocks", "--", "replay", network, path, str(now),
+        ],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=True,
+        env=cargo_env(),
+    )
+    lines = [l.split("\t") for l in proc.stdout.splitlines()]
+    return [
+        ("accepted" if v.startswith("accepted") else v.split(":", 1)[1])
+        for _name, v, _detail in lines
+    ]
+
+
+def suite_segment(network, workdir, now):
+    file_name = SEGMENT_FIXTURES[network]
+    path = os.path.join(REPO, "fixtures", file_name)
+    blocks = read_blkdat(path)
+
+    daemon = Daemon(network, workdir)
+    try:
+        core = [daemon.submit_block(b) for b in blocks]
+    finally:
+        daemon.stop()
+    ours = avila_replay_verdicts(network, path, now)
+
+    if len(ours) != len(blocks):
+        raise RuntimeError(
+            f"replay produced {len(ours)} verdicts for {len(blocks)} blocks"
+        )
+    rows = [
+        {"name": f"{file_name}#{i}", "core": c, "avila": o}
+        for i, (c, o) in enumerate(zip(core, ours))
+    ]
+    for row in rows:
+        if row["core"] != row["avila"]:
+            print(
+                f"  {row['name']:<40} core={row['core']:<36} avila={row['avila']}",
+                flush=True,
+            )
+    mismatches, notes, expected = compare_rows(rows)
+    return {
+        "blocks": len(rows),
+        "compared": len(rows),
+        "mismatches": mismatches,
+        "layer_notes": notes,
+        "expected_divergences": expected,
+        "rows": rows,
+    }
+
+
 def compare_rows(rows):
     """Split compared rows into (mismatches, layer_notes, expected)."""
     mismatches, notes, expected = [], [], []
@@ -339,7 +435,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--suites",
-        default="regtest-corpus,fixtures-mainnet,fixtures-testnet4,fixtures-signet",
+        default="regtest-corpus,fixtures-mainnet,fixtures-testnet4,fixtures-signet,segment-mainnet",
         help="comma-separated subset",
     )
     parser.add_argument(
@@ -394,6 +490,8 @@ def main():
                 result = suite_regtest_corpus(workdir, now)
             elif suite.startswith("fixtures-"):
                 result = suite_fixtures(suite[len("fixtures-"):], workdir, now)
+            elif suite.startswith("segment-"):
+                result = suite_segment(suite[len("segment-"):], workdir, now)
             else:
                 raise ValueError(f"unknown suite {suite}")
         except Exception as err:

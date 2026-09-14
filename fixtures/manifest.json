@@ -229,6 +229,26 @@
         "url": "https://mempool.space/signet/api/block/00000086d6b2636cb2a392d45edc4ec544a10024d30141c9adf4bfd9de533b53/raw"
       },
       "notes": "Signet height 1; coinbase carries the signet solution."
+    },
+    {
+      "file": "mainnet-blocks-000000-000500.dat",
+      "network": "mainnet",
+      "kind": "block-segment",
+      "first_height": 0,
+      "last_height": 500,
+      "count": 501,
+      "first_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+      "last_hash": "000000004ff664bfa7d217f6df64c1627089061429408e1da5ef903b8f3c77db",
+      "bytes": 114278,
+      "sha256": "ef9cb1e45eaaafa55d23016d7dfce3e8f64f56609573e18b9a8940b8b1ac3d73",
+      "source": {
+        "transport": "https",
+        "url": "https://mempool.space/api/block-height/<h> + /block/<hash>/raw",
+        "bases_used": [
+          "https://mempool.space/api"
+        ]
+      },
+      "notes": "blk.dat-framed contiguous segment for chainstate replay."
     }
   ],
   "observed": {
@@ -237,5 +257,5 @@
     "mainnet_nbits_at_32256": "0x1d00d86a"
   },
   "generator": "tools/fetch_fixtures.py",
-  "generated_at_utc": "2026-09-13T23:50:31Z"
+  "generated_at_utc": "2026-09-14T08:10:31Z"
 }
