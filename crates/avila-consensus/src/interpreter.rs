@@ -165,7 +165,7 @@ const OP_RIPEMD160: u8 = 0xa6;
 const OP_SHA1: u8 = 0xa7;
 const OP_SHA256: u8 = 0xa8;
 const OP_HASH256: u8 = 0xaa;
-const OP_CODESEPARATOR: u8 = 0xab;
+pub(crate) const OP_CODESEPARATOR: u8 = 0xab;
 const OP_NOP1: u8 = 0xb0;
 const OP_CHECKLOCKTIMEVERIFY: u8 = 0xb1; // NOP2
 const OP_CHECKSEQUENCEVERIFY: u8 = 0xb2; // NOP3
@@ -452,7 +452,7 @@ pub fn cast_to_bool(vch: &[u8]) -> bool {
 /// `GetScriptOp`'s early `return false`s leave it — past the opcode byte and
 /// any length bytes that were present (find-and-delete and the sigop scans
 /// depend on continuing from that position).
-fn get_op<'a>(script: &'a [u8], pc: &mut usize) -> Option<(u8, &'a [u8])> {
+pub(crate) fn get_op<'a>(script: &'a [u8], pc: &mut usize) -> Option<(u8, &'a [u8])> {
     let opcode = *script.get(*pc)?;
     *pc += 1;
     if opcode > OP_PUSHDATA4 {

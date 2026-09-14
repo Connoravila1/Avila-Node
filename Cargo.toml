@@ -29,6 +29,10 @@ thiserror = "2.0"
 sha2 = { version = "0.11", default-features = false }
 ripemd = { version = "0.2", default-features = false }
 sha1 = { version = "0.11", default-features = false }
+# Rust bindings to libsecp256k1 — the same C library Bitcoin Core links for
+# consensus signature verification, chosen so DER-parsing and verification
+# edge cases match the reference implementation.
+secp256k1 = { version = "0.29", default-features = false, features = ["alloc"] }
 # Development-only differential references for the consensus crate.
 bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 proptest = { version = "1.11", default-features = false, features = ["std"] }

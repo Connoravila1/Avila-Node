@@ -11,10 +11,13 @@ publish.workspace = true
 
 [dependencies]
 # The only trusted third-party code in the validation path: the RustCrypto
-# hashes (SHA-2 for txids/sighash, SHA-1 and RIPEMD-160 for legacy opcodes).
+# hashes (SHA-2 for txids/sighash, SHA-1 and RIPEMD-160 for legacy opcodes)
+# and libsecp256k1 for ECDSA/Schnorr verification — the same library Bitcoin
+# Core links for consensus signatures.
 sha2.workspace = true
 sha1.workspace = true
 ripemd.workspace = true
+secp256k1.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

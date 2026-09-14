@@ -1,8 +1,8 @@
 # Consensus rule and fixture inventory
 
-**Status: header-chain rules plus context-free and header-context block/transaction
-structure are implemented and tested; script execution and UTXO-state rules are
-not yet implemented.** This inventory is the
+**Status: header-chain rules, context-free and header-context block/transaction
+structure, UTXO-state transition rules, and script execution (including
+signature verification) are implemented and tested.** This inventory is the
 G1 "rule-to-test inventory" required by the [roadmap](../ROADMAP.md). It enumerates
 every consensus rule `avila-consensus` implements, the evidence backing it, and the
 rules it deliberately does not yet implement. Header validation alone is not full
@@ -64,7 +64,7 @@ consult (`GetOp`-equivalent instruction iteration, `GetSigOpCount`, `IsPushOnly`
 `IsPayToScriptHash`, `IsWitnessProgram`, `CScriptNum`/push encodings). Every error
 exposes Core's reject-reason string via `RuleError::reason`, and the block-level
 differential adapter (`tools/check_blocks_core.py` + `examples/check_blocks.rs`)
-verifies those reasons against a live daemon's `submitblock`: **246 corpus
+verifies those reasons against a live daemon's `submitblock`: **254 corpus
 submissions and 9 real block fixtures compared, zero verdict mismatches** —
 every named violation above returns Core's exact reason, including the
 order-dependent cases (`bad-blk-length` beats `bad-txns-oversize`;
@@ -104,13 +104,15 @@ solution while we return the explicit `bad-signet-blksig-unchecked` stub.
 
 ## UTXO-dependent rules (`connect.rs`)
 
-`connect.rs` ports `ConnectBlock` minus `CheckInputScripts` (the script gate is
-an explicit deferral, not an omission — see below): the `UtxoSet`
-(`CCoinsView` semantics — unspendable outputs never stored, spent coins
-removed), `Consensus::CheckTxInputs`, `CalculateSequenceLocks`/
+`connect.rs` ports `ConnectBlock` in full, including `CheckInputScripts`: the
+`UtxoSet` (`CCoinsView` semantics — unspendable outputs never stored, spent
+coins removed), `Consensus::CheckTxInputs`, `CalculateSequenceLocks`/
 `EvaluateSequenceLocks` (BIP68), `GetTransactionSigOpCost`, `GetBlockSubsidy`,
-and `GetBlockScriptFlags` (`ScriptFlags` + `block_script_flags` in
-`script.rs`). Two deliberate design departures with identical verdicts:
+`GetBlockScriptFlags` (`ScriptFlags` + `block_script_flags` in `script.rs`),
+and per-transaction script verification (`sigchecker.rs` —
+`PrecomputedTransactionData`, legacy/BIP143/BIP341-BIP342 sighashes, ECDSA and
+schnorr verification, taproot commitment checking). Two deliberate design
+departures with identical verdicts:
 atomicity comes from in-place rollback via recorded undo rather than a
 discarded `CCoinsViewCache` layer, and `BlockUndo` keeps one entry per
 transaction *including* the coinbase — which is why `disconnect_block`
@@ -135,7 +137,7 @@ boundary the daemon does.
 | Coinbase pays at most `subsidy + fees` (`bad-cb-amount`) | `ConnectBlock`, `GetBlockSubsidy` | `connect_block`, `block_subsidy` | subsidy+fees payment (unit test); plain subsidy (whole corpus) | subsidy + 1 with no fees (corpus 66, unit test) |
 | Subsidy halving: `50 BTC >> (h / halving_interval)`, zero at 64 halvings | `GetBlockSubsidy` | `block_subsidy` | halving-boundary unit tests incl. regtest interval 150 | — |
 | Script flags per block: base `P2SH\|WITNESS\|TAPROOT`, historical exception blocks, buried `DERSIG`/`CLTV`/`CSV`/`NULLDUMMY` ORed on | `GetBlockScriptFlags`, `script_flag_exceptions` | `block_script_flags` | gating exercised by every connected corpus block | — (exception-block coverage is a mainnet-sync case, noted below) |
-| Script execution | `CheckInputScripts`, `EvalScript`, `VerifyScript`, `VerifyWitnessProgram` | `interpreter.rs` ports the full stack machine: all opcodes incl. `CHECKSIG`/`CHECKMULTISIG`/`CHECKSIGADD`, `CLTV`/`CSV`, conditionals, altstack, `CODESEPARATOR`, `FindAndDelete`, signature/pubkey encoding checks (DERSIG/LOW_S/STRICTENC/WITNESS_PUBKEYTYPE/MINIMALIF/MINIMALDATA/NULLDUMMY/NULLFAIL/CONST_SCRIPTCODE), P2SH stack restore, witness v0 (P2WPKH/P2WSH), taproot key/script path incl. control block, annex and `OP_SUCCESSx`, `OP_CHECKSIGADD`, validation-weight accounting | **not wired** — `connect_block` performs no script evaluation until the sighash/crypto checker lands; a passing block is *provisionally* connected | — | 29 interpreter unit tests (opcode bodies, witness dispatch, P2SH, taproot control, encoding flags) |
+| Script execution | `CheckInputScripts`, `EvalScript`, `VerifyScript`, `VerifyWitnessProgram` | `interpreter.rs` ports the full stack machine: all opcodes incl. `CHECKSIG`/`CHECKMULTISIG`/`CHECKSIGADD`, `CLTV`/`CSV`, conditionals, altstack, `CODESEPARATOR`, `FindAndDelete`, signature/pubkey encoding checks (DERSIG/LOW_S/STRICTENC/WITNESS_PUBKEYTYPE/MINIMALIF/MINIMALDATA/NULLDUMMY/NULLFAIL/CONST_SCRIPTCODE), P2SH stack restore, witness v0 (P2WPKH/P2WSH), taproot key/script path incl. control block, annex and `OP_SUCCESSx`, `OP_CHECKSIGADD`, validation-weight accounting. `sigchecker.rs` ports `SignatureHash` (legacy + BIP143), `SignatureHashSchnorr` (BIP341/342), `PrecomputedTransactionData`, `GenericTransactionSignatureChecker`, `CheckInputScripts`, and taproot commitment verification; ECDSA/schnorr via `secp256k1` (libsecp256k1 — the library Core links). Wired into `connect_block` at Core's position (after sequence locks and sigop accounting, before UTXO update). | 500 vendored Core `sighash.json` legacy vectors; BIP143/BIP341 sighash differential vs `bitcoin::sighash::SighashCache`; signed-spend corpus cases the daemon actually connects: legacy P2PKH, P2WPKH, P2WSH, taproot key-path, taproot script-path, P2SH-P2WPKH (corpus 73–79) | corrupted-signature P2SH spend rejects with the daemon's exact `mandatory-script-verify-flag-failed (...)` string (corpus 81); always-false spend + rollback unit test; 29 interpreter unit tests |
 | Undo / disconnect: exact state restoration incl. spent inputs and overwritten coins | `DisconnectBlock`, `CBlockUndo`/`CTxUndo` | `disconnect_block`, `BlockUndo` (one `TxUndo` per tx incl. coinbase) | disconnect→pre-state and reconnect→same-state unit tests | — |
 
 ## Network parameters (`params.rs`)
@@ -199,11 +201,6 @@ Not defects — scope boundaries for later gates:
 
 - **Block-level acceptance**: signet block-signature validation (BIP325 — the
   `SignetSolutionUnsupported` stub in `check.rs`).
-- **Script**: the interpreter is ported (`interpreter.rs`) but the
-  cryptographic half is missing — sighash algorithms (legacy, BIP143,
-  BIP341/342), ECDSA and schnorr verification, taproot commitment checking —
-  behind `SignatureChecker`; the `CheckInputScripts` wiring into
-  `connect_block` follows it, G2.
 - **Reorg handling**: `disconnect_block` + the harness's disconnect-to-fork /
   connect-forward orchestration are exercised by the 80-fork corpus case; a
   production chainstate driver (disk-backed block store, invalid-branch
@@ -225,12 +222,17 @@ Not defects — scope boundaries for later gates:
   header tree plus `UtxoSet` — in `check-many` mode, so tip-extending blocks
   run through `connect_block` exactly as the daemon connects them), submits
   each block through `submitblock`, and replays the committed real block
-  fixtures on per-network daemons — **255 submissions, zero unexplained
+  fixtures on per-network daemons — **263 submissions, zero unexplained
   mismatches**, covering every `CheckBlock`/`ContextualCheckBlock` rule plus
   the `ConnectBlock` cases 61–72 (missingorspent, premature coinbase,
   in-belowout, cb-amount, BIP30, BIP68 height/time locks, P2SH/witness
-  sigops) and the 80-fork reorg (104-block branch disconnects and replaces
-  the connected 103-block chain identically on both sides). It caught the `push_int`/`OP_N` divergence described above on its
+  sigops), the signed-spend cases 73–79 and 81 (real ECDSA/schnorr spends of
+  every standard output type — P2PKH, P2WPKH, P2WSH, taproot key- and
+  script-path, P2SH-P2WPKH — accepted by the daemon's `CheckInputScripts`
+  and by ours, plus a corrupted-signature spend both reject with the same
+  reason string), and the 80-fork reorg (104-block branch disconnects and
+  replaces the connected 110-block chain identically on both sides). It
+  caught the `push_int`/`OP_N` divergence described above on its
   first run. Both artifacts record the reference binary's version and sha256.
   Coverage-guided fuzzing exists (`fuzz/`, libFuzzer via cargo-fuzz): six
   targets over header/transaction/block decoding, CompactSize canonicality,
@@ -260,14 +262,15 @@ exceptions (activation heights are mainnet):
 - BIP34 coinbase height (supermajority-gated at height 227931) —
   **implemented** in `contextual_check_block`; BIP66 strict DER (height
   363725) and BIP65 CLTV (height 388381) — activation heights carried and
-  flag-gated in `block_script_flags`, script enforcement pending the
-  interpreter.
+  flag-gated in `block_script_flags`, script enforcement **implemented** in
+  `interpreter.rs`/`sigchecker.rs` (DER checks, `OP_CHECKLOCKTIMEVERIFY`).
 - BIP9 versionbits deployments: CSV/BIP68-112-113 (height 419328 — the
-  BIP113 locktime cutoff **implemented**, and BIP68 sequence locks
-  **implemented** in `connect.rs`), segwit BIP141/143/147 (height 481824 —
-  commitment rules **implemented**, witness sigops **implemented**), taproot
-  BIP340-342 (height 709632 — flag carried in `block_script_flags`, script
-  rules pending).
+  BIP113 locktime cutoff **implemented**, BIP68 sequence locks
+  **implemented** in `connect.rs`, `OP_CHECKSEQUENCEVERIFY` **implemented**
+  in `interpreter.rs`), segwit BIP141/143/147 (height 481824 — commitment
+  rules, witness sigops, BIP143 sighashes, NULLDUMMY **implemented**),
+  taproot BIP340-342 (height 709632 — key/script-path spends, schnorr
+  verification, control-block commitment, tapscript **implemented**).
 - BIP141 enforcement quirks — **implemented**: no witness commitment in the
   coinbase ⇒ all non-coinbase witnesses must be empty; commitment counted
   in the coinbase's own witness.

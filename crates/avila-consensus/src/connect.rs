@@ -43,6 +43,7 @@ use crate::check::{MAX_BLOCK_SIGOPS_COST, MAX_MONEY};
 use crate::hash::{BlockHash, Txid};
 use crate::params::Params;
 use crate::script::{ScriptFlags, block_script_flags, count_witness_sig_ops};
+use crate::sigchecker::check_input_scripts;
 use crate::transaction::{OutPoint, Transaction, TxOut};
 
 /// `consensus/coinbase.h`'s `COINBASE_MATURITY`: a coinbase output is spendable
@@ -122,7 +123,7 @@ pub struct Coin {
 ///   bookkeeping exists for cache flushing, which this type doesn't do.
 ///
 /// [`Script::is_unspendable`]: crate::script::Script::is_unspendable
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct UtxoSet {
     map: HashMap<OutPoint, Coin>,
 }
@@ -305,6 +306,9 @@ pub enum ConnectError {
     NotFinal,
     /// The coinbase pays more than `subsidy + fees` (`bad-cb-amount`).
     CoinbaseAmount { actual: i64, limit: i64 },
+    /// An input's script evaluation failed (`mandatory-script-verify-flag-failed (...)`);
+    /// the payload is Core's `ScriptError` — its `Display` is `ScriptErrorString`.
+    ScriptVerify(crate::interpreter::ScriptError),
     /// An internal inconsistency Core reaches via `assert`/`logic_error` (e.g.
     /// a non-coinbase output overwrite that the BIP30 scan should have
     /// rejected). Not producible through a correctly-ordered pipeline.
@@ -317,19 +321,20 @@ impl ConnectError {
     /// variants report `"internal"`: they have no Core reject reason because
     /// Core never surfaces them as validation failures.
     #[must_use]
-    pub fn reason(&self) -> &'static str {
+    pub fn reason(&self) -> std::borrow::Cow<'static, str> {
         match self {
-            Self::UnknownBlock | Self::OrphanBlock | Self::Internal(_) => "internal",
-            Self::InputsMissingOrSpent => "bad-txns-inputs-missingorspent",
-            Self::PrematureCoinbaseSpend { .. } => "bad-txns-premature-spend-of-coinbase",
-            Self::InputValuesOutOfRange => "bad-txns-inputvalues-outofrange",
-            Self::InBelowOut => "bad-txns-in-belowout",
-            Self::FeeOutOfRange => "bad-txns-fee-outofrange",
-            Self::AccumulatedFeeOutOfRange => "bad-txns-accumulated-fee-outofrange",
-            Self::Bip30(_) => "bad-txns-BIP30",
-            Self::SigopsExceeded => "bad-blk-sigops",
-            Self::NotFinal => "bad-txns-nonfinal",
-            Self::CoinbaseAmount { .. } => "bad-cb-amount",
+            Self::UnknownBlock | Self::OrphanBlock | Self::Internal(_) => "internal".into(),
+            Self::InputsMissingOrSpent => "bad-txns-inputs-missingorspent".into(),
+            Self::PrematureCoinbaseSpend { .. } => "bad-txns-premature-spend-of-coinbase".into(),
+            Self::InputValuesOutOfRange => "bad-txns-inputvalues-outofrange".into(),
+            Self::InBelowOut => "bad-txns-in-belowout".into(),
+            Self::FeeOutOfRange => "bad-txns-fee-outofrange".into(),
+            Self::AccumulatedFeeOutOfRange => "bad-txns-accumulated-fee-outofrange".into(),
+            Self::Bip30(_) => "bad-txns-BIP30".into(),
+            Self::SigopsExceeded => "bad-blk-sigops".into(),
+            Self::NotFinal => "bad-txns-nonfinal".into(),
+            Self::CoinbaseAmount { .. } => "bad-cb-amount".into(),
+            Self::ScriptVerify(e) => format!("mandatory-script-verify-flag-failed ({e})").into(),
         }
     }
 }
@@ -356,6 +361,7 @@ impl std::fmt::Display for ConnectError {
                     "coinbase pays too much (actual={actual} vs limit={limit})"
                 )
             }
+            Self::ScriptVerify(e) => write!(f, "script verification failed: {e}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -672,6 +678,12 @@ pub fn connect_block(
             sigops_cost = sigops_cost.saturating_add(tx_sigop_cost(tx, &spent, flags));
             if sigops_cost > MAX_BLOCK_SIGOPS_COST {
                 return Err(ConnectError::SigopsExceeded);
+            }
+            // Core's CheckInputScripts — per-input script evaluation, after
+            // sequence locks and sigop accounting, before UpdateCoins.
+            if !tx.is_coinbase() {
+                let spent_outs: Vec<TxOut> = spent.iter().map(|c| c.out.clone()).collect();
+                check_input_scripts(tx, &spent_outs, flags).map_err(ConnectError::ScriptVerify)?;
             }
             // Apply (Core's UpdateCoins): spend inputs, then add outputs.
             for (input, coin) in tx.inputs.iter().zip(spent.iter()) {
@@ -1217,29 +1229,77 @@ mod tests {
     fn witness_sigops_counted_under_witness_flag() {
         let mut chain = Chain::new(easy_params());
         let cb_outs = chain.grow_to(101);
-        // A v0-P2WPKH-looking coin (witness program, 20 bytes).
-        let mut wpkh = vec![script::OP_0, 0x14];
-        wpkh.extend_from_slice(&[0x44; 20]);
+        // A P2WSH coin whose witness script is `OP_0 OP_IF <33B> OP_CHECKSIG
+        // OP_ENDIF OP_1` — 1 counted witness sigop (GetSigOpCount is static),
+        // trivially satisfiable without a signature.
+        let witness_script = {
+            let mut s = vec![script::OP_0, 0x63, 0x21];
+            s.extend_from_slice(&[0x44; 33]);
+            s.extend_from_slice(&[0xac, 0x68, script::OP_1]);
+            s
+        };
+        let program = crate::hash::sha256(&witness_script);
+        let mut wsh = vec![script::OP_0, 0x20];
+        wsh.extend_from_slice(&program);
         let setup = Transaction {
             version: 1,
             inputs: vec![txin(cb_outs[0], vec![], SEQUENCE_FINAL)],
-            outputs: vec![txout(1_000, wpkh)],
+            outputs: vec![txout(1_000, wsh)],
             lock_time: 0,
         };
         let block102 = chain.extend(vec![coinbase(102, SUBSIDY), setup]).unwrap();
-        let wpkh_out = OutPoint {
+        let wsh_out = OutPoint {
             txid: block102.transactions[1].txid(),
             vout: 0,
         };
         // Spending it counts 1 witness sigop; the block stays under the cap.
         let mut spend = Transaction {
             version: 1,
-            inputs: vec![txin(wpkh_out, vec![], SEQUENCE_FINAL)],
+            inputs: vec![txin(wsh_out, vec![], SEQUENCE_FINAL)],
             outputs: vec![txout(999, ANYONE.to_vec())],
             lock_time: 0,
         };
-        spend.inputs[0].witness = Witness::new(vec![vec![1u8; 72], vec![2u8; 33]]);
+        spend.inputs[0].witness = Witness::new(vec![witness_script]);
         chain.extend(vec![coinbase(103, SUBSIDY), spend]).unwrap();
+    }
+
+    #[test]
+    fn failing_script_rejects_block_and_rolls_back() {
+        let mut chain = Chain::new(easy_params());
+        let cb_outs = chain.grow_to(101);
+        // An always-false script (OP_0): lands in the UTXO set (it isn't
+        // provably-unspendable like OP_RETURN) but fails evaluation.
+        let setup = Transaction {
+            version: 1,
+            inputs: vec![txin(cb_outs[0], vec![], SEQUENCE_FINAL)],
+            outputs: vec![txout(1_000, vec![script::OP_0])],
+            lock_time: 0,
+        };
+        let block102 = chain.extend(vec![coinbase(102, SUBSIDY), setup]).unwrap();
+        let false_out = OutPoint {
+            txid: block102.transactions[1].txid(),
+            vout: 0,
+        };
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![txin(false_out, vec![], SEQUENCE_FINAL)],
+            outputs: vec![txout(999, ANYONE.to_vec())],
+            lock_time: 0,
+        };
+        let before = chain.utxo.clone();
+        let err = chain
+            .extend(vec![coinbase(103, SUBSIDY), spend])
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ConnectError::ScriptVerify(crate::interpreter::ScriptError::EvalFalse)
+        );
+        assert!(
+            err.reason()
+                .starts_with("mandatory-script-verify-flag-failed (")
+        );
+        // The failed block left the UTXO set untouched.
+        assert_eq!(chain.utxo, before);
     }
 
     // -- disconnect / rollback -------------------------------------------------

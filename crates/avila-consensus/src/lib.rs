@@ -18,4 +18,5 @@ pub mod params;
 pub mod pow;
 pub mod rules;
 pub mod script;
+pub mod sigchecker;
 pub mod transaction;

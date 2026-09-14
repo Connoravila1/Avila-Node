@@ -917,10 +917,10 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
     //
     // The daemon connects each of these blocks to its active chain, so
     // `ConnectBlock`'s verdict surfaces as the submitblock result. Our side
-    // runs `connect_block` when the block extends the connected tip —
-    // `state.connected` tracks it. Spends use anyone-can-spend (`OP_1`)
-    // prevouts with empty scriptSigs, so the daemon's script checks pass; our
-    // own script evaluation is intentionally not yet wired.
+    // runs `connect_block` — including `check_input_scripts` — when the block
+    // extends the connected tip; `state.connected` tracks it. The spends here
+    // use anyone-can-spend (`OP_1`) prevouts with empty scriptSigs; the
+    // signed-spend cases below cover the key-locked paths.
     //
     // Baseline: blocks h3..=h101 so the h1/h2 coinbases are mature (depth
     // >= 100) when the spend cases run at h102+.
@@ -1246,6 +1246,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
     // Positive controls at h103 (connects): a satisfied BIP68 height lock
     // (sequence 1 on a h102 coin — min height 102 < 103) and a sequence with
     // the disable flag set (not a lock at all).
+    let signed_parent;
     {
         let tx_ok = Transaction {
             version: 2,
@@ -1278,9 +1279,25 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             &mut state,
             now,
         )?;
+        // 72 connects — the signed-spend chain below extends its tip.
+        signed_parent = block.header;
     }
 
-    // Reorg: a 104-block branch on genesis outworks the connected tip (h103) —
+    // -- signed spends --------------------------------------------------------
+    // Real signature-verification coverage (see `emit_signed_spends`): a
+    // funding tx creates key-locked outputs of every standard type, then one
+    // block per spend connects on top so the daemon runs CheckInputScripts.
+    emit_signed_spends(
+        &mut manifest,
+        outdir,
+        signed_parent,
+        coinbase_outs[3],
+        &params,
+        &mut state,
+        now,
+    )?;
+
+    // Reorg: a 104-block branch on genesis outworks the connected tip (h110) —
     // both sides disconnect the 103-block main chain and connect 104 fork
     // blocks. Fork coinbases carry a tag byte so their txids (and headers)
     // differ from the main chain's. Fork blocks f1..f103 arrive as
@@ -1319,7 +1336,449 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         ));
     }
     json.push_str("]\n");
-    fs::write(outdir.join("manifest.json"), json).map_err(|e| e.to_string())?;
+    fs::write(outdir.join("manifest.json"), json).map_err(|e| format!("write manifest: {e}"))
+}
+
+/// Emits the signed-spend corpus cases (73–79 plus the 81 negative control)
+/// extending `parent`. `fund_input` must name a mature, unspent coinbase
+/// output.
+///
+/// Keys and signatures are produced with rust-bitcoin's `SighashCache` +
+/// `secp256k1` — implementations independent of this crate's sighash code —
+/// so a daemon-accepted spend proves end-to-end agreement, not
+/// self-consistency.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn emit_signed_spends(
+    manifest: &mut Vec<(String, String)>,
+    outdir: &Path,
+    parent: BlockHeader,
+    fund_input: OutPoint,
+    params: &Params,
+    state: &mut ChainState,
+    now: u32,
+) -> Result<(), String> {
+    use bitcoin::hashes::Hash as _;
+    let mut signed_parent = parent;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let sk = bitcoin::secp256k1::SecretKey::from_slice(&[0x77; 32]).unwrap();
+    let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+    let pk_bytes = pk.serialize();
+    let pk_hash160 = {
+        use bitcoin::hashes::Hash as _;
+        bitcoin::hashes::hash160::Hash::hash(&pk_bytes).to_byte_array()
+    };
+    let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &sk);
+    let (internal_key, _) = keypair.x_only_public_key();
+
+    // `OP_DUP OP_HASH160 <h160(pk)> OP_EQUALVERIFY OP_CHECKSIG`.
+    let p2pkh_spk =
+        Script::new([[0x76, 0xa9, 0x14].as_slice(), &pk_hash160, &[0x88, 0xac]].concat());
+    // P2WPKH program.
+    let p2wpkh_spk = Script::new([[0x00, 0x14].as_slice(), &pk_hash160].concat());
+    // P2WSH: witness script `<pk> OP_CHECKSIG`.
+    let p2wsh_script = Script::new([[0x21].as_slice(), &pk_bytes, &[0xac]].concat());
+    let p2wsh_spk = Script::new(
+        [
+            [0x00, 0x20].as_slice(),
+            &avila_consensus::hash::sha256(p2wsh_script.as_bytes()),
+        ]
+        .concat(),
+    );
+    // P2TR key path: tweaked internal key, no script tree.
+    let (p2tr_key_spk, tweaked_keypair) = {
+        let tweak = {
+            use sha2::Digest as _;
+            let tag = avila_consensus::hash::sha256(b"TapTweak");
+            let mut h = sha2::Sha256::new();
+            h.update(tag);
+            h.update(tag);
+            h.update(internal_key.serialize());
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        let scalar = bitcoin::secp256k1::Scalar::from_be_bytes(tweak).unwrap();
+        let tweaked = keypair.add_xonly_tweak(&secp, &scalar).unwrap();
+        let (out_key, _) = tweaked.x_only_public_key();
+        (
+            Script::new([[0x51, 0x20].as_slice(), &out_key.serialize()].concat()),
+            tweaked,
+        )
+    };
+    // P2TR script path: single leaf `<xonly leaf pk> OP_CHECKSIG` — the leaf
+    // key signs (untweaked); the output key is the internal key tweaked by
+    // TapTweak(internal || leaf_hash). The control block is leaf_ver|parity +
+    // internal key with no path nodes (single-leaf tree).
+    let leaf_sk = bitcoin::secp256k1::SecretKey::from_slice(&[0x88; 32]).unwrap();
+    let leaf_keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &leaf_sk);
+    let (leaf_key, _) = leaf_keypair.x_only_public_key();
+    let tap_script = Script::new([[0x20].as_slice(), &leaf_key.serialize(), &[0xac]].concat());
+    let leaf_hash = avila_consensus::interpreter::compute_tapleaf_hash(0xc0, tap_script.as_bytes());
+    let (p2tr_script_spk, control_block) = {
+        let tweak = {
+            use sha2::Digest as _;
+            let tag = avila_consensus::hash::sha256(b"TapTweak");
+            let mut h = sha2::Sha256::new();
+            h.update(tag);
+            h.update(tag);
+            h.update(internal_key.serialize());
+            h.update(leaf_hash);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        let scalar = bitcoin::secp256k1::Scalar::from_be_bytes(tweak).unwrap();
+        let (out_key, parity) = internal_key.add_tweak(&secp, &scalar).unwrap();
+        let mut control = vec![0xc0 | parity.to_u8()];
+        control.extend_from_slice(&internal_key.serialize());
+        (
+            Script::new([[0x51, 0x20].as_slice(), &out_key.serialize()].concat()),
+            control,
+        )
+    };
+    // P2SH-P2WPKH: redeem = the witness program; spk = HASH160 <h160(redeem)>.
+    let p2sh_p2wpkh_redeem = p2wpkh_spk.as_bytes().to_vec();
+    let p2sh_p2wpkh_spk = Script::new(
+        [
+            [0xa9, 0x14].as_slice(),
+            &bitcoin::hashes::hash160::Hash::hash(&p2sh_p2wpkh_redeem).to_byte_array(),
+            &[0x87],
+        ]
+        .concat(),
+    );
+    // Bare P2SH: redeem = `<pk> OP_CHECKSIG`.
+    let p2sh_redeem = Script::new([[0x21].as_slice(), &pk_bytes, &[0xac]].concat());
+    let p2sh_spk2 = Script::new(
+        [
+            [0xa9, 0x14].as_slice(),
+            &bitcoin::hashes::hash160::Hash::hash(p2sh_redeem.as_bytes()).to_byte_array(),
+            &[0x87],
+        ]
+        .concat(),
+    );
+
+    // 73-fund: spend the mature h4 coinbase into all the keyed outputs above.
+    let fund = Transaction {
+        version: 1,
+        inputs: vec![txin(fund_input, vec![])],
+        outputs: vec![
+            txout(100_000, p2pkh_spk.as_bytes().to_vec()),    // v0
+            txout(100_000, p2wpkh_spk.as_bytes().to_vec()),   // v1
+            txout(100_000, p2wsh_spk.as_bytes().to_vec()),    // v2
+            txout(100_000, p2tr_key_spk.as_bytes().to_vec()), // v3
+            txout(100_000, p2tr_script_spk.as_bytes().to_vec()), // v4
+            txout(100_000, p2sh_p2wpkh_spk.as_bytes().to_vec()), // v5
+            txout(100_000, p2sh_spk2.as_bytes().to_vec()),    // v6
+            txout(4_900_000_000, vec![script::OP_1]),         // change
+        ],
+        lock_time: 0,
+    };
+    let fund_txid = fund.txid();
+    {
+        let block = finish(
+            draft_on(&signed_parent, vec![regtest_coinbase(104), fund]),
+            params,
+        );
+        emit(manifest, outdir, "73-fund", &block, params, state, now)?;
+        signed_parent = block.header;
+    }
+    let spent_outs = |vout: u32| OutPoint {
+        txid: fund_txid,
+        vout,
+    };
+    let fund_outs = [
+        txout(100_000, p2pkh_spk.as_bytes().to_vec()),
+        txout(100_000, p2wpkh_spk.as_bytes().to_vec()),
+        txout(100_000, p2wsh_spk.as_bytes().to_vec()),
+        txout(100_000, p2tr_key_spk.as_bytes().to_vec()),
+        txout(100_000, p2tr_script_spk.as_bytes().to_vec()),
+        txout(100_000, p2sh_p2wpkh_spk.as_bytes().to_vec()),
+        txout(100_000, p2sh_spk2.as_bytes().to_vec()),
+    ];
+
+    // Signing helpers: sighashes come from rust-bitcoin's SighashCache —
+    // independent of this crate's sighash code, so a daemon-accepted spend is
+    // end-to-end agreement, not self-consistency.
+    fn btc_tx(tx: &Transaction) -> bitcoin::Transaction {
+        bitcoin::consensus::deserialize(&tx.encode()).expect("encoding parses")
+    }
+    fn btc_txout(o: &TxOut) -> bitcoin::TxOut {
+        bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(o.value as u64),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(o.script_pubkey.as_bytes().to_vec()),
+        }
+    }
+    fn sign_ecdsa(
+        secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+        sk: &bitcoin::secp256k1::SecretKey,
+        sighash: &[u8; 32],
+        hash_byte: u8,
+    ) -> Vec<u8> {
+        let msg = bitcoin::secp256k1::Message::from_digest_slice(sighash).unwrap();
+        let mut sig = secp.sign_ecdsa(&msg, sk).serialize_der().to_vec();
+        sig.push(hash_byte);
+        sig
+    }
+
+    // 74-spend-p2pkh (legacy sighash, scriptSig-signed).
+    {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![txin(spent_outs(0), vec![])],
+            outputs: vec![txout(99_000, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let sighash = bitcoin::sighash::SighashCache::new(&btc_tx(&tx))
+            .legacy_signature_hash(
+                0,
+                &bitcoin::ScriptBuf::from_bytes(p2pkh_spk.as_bytes().to_vec()),
+                1,
+            )
+            .unwrap()
+            .to_byte_array();
+        let sig = sign_ecdsa(&secp, &sk, &sighash, 1);
+        let mut script_sig = script::push_slice(&sig);
+        script_sig.extend_from_slice(&script::push_slice(&pk_bytes));
+        tx.inputs[0].script_sig = Script::new(script_sig);
+        let block = finish(
+            draft_on(&signed_parent, vec![regtest_coinbase(105), tx]),
+            params,
+        );
+        emit(
+            manifest,
+            outdir,
+            "74-spend-p2pkh",
+            &block,
+            params,
+            state,
+            now,
+        )?;
+        signed_parent = block.header;
+    }
+
+    // 75-spend-p2wpkh (BIP143 sighash, witness-carried).
+    {
+        let mut tx = Transaction {
+            version: 2,
+            inputs: vec![txin(spent_outs(1), vec![])],
+            outputs: vec![txout(99_000, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let sighash = bitcoin::sighash::SighashCache::new(&btc_tx(&tx))
+            .p2wpkh_signature_hash(
+                0,
+                &bitcoin::ScriptBuf::from_bytes(p2wpkh_spk.as_bytes().to_vec()),
+                bitcoin::Amount::from_sat(100_000),
+                bitcoin::sighash::EcdsaSighashType::All,
+            )
+            .unwrap()
+            .to_byte_array();
+        let sig = sign_ecdsa(&secp, &sk, &sighash, 1);
+        tx.inputs[0].witness = Witness::new(vec![sig, pk_bytes.to_vec()]);
+        let mut cb = regtest_coinbase(106);
+        cb.inputs[0].witness = Witness::new(vec![vec![0x42; 32]]);
+        let mut block = draft_on(&signed_parent, vec![cb, tx]);
+        add_witness_commitment(&mut block, params);
+        emit(
+            manifest,
+            outdir,
+            "75-spend-p2wpkh",
+            &block,
+            params,
+            state,
+            now,
+        )?;
+        signed_parent = block.header;
+    }
+
+    // 76-spend-p2wsh (witness script `<pk> CHECKSIG`).
+    {
+        let mut tx = Transaction {
+            version: 2,
+            inputs: vec![txin(spent_outs(2), vec![])],
+            outputs: vec![txout(99_000, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let sighash = bitcoin::sighash::SighashCache::new(&btc_tx(&tx))
+            .p2wsh_signature_hash(
+                0,
+                &bitcoin::ScriptBuf::from_bytes(p2wsh_script.as_bytes().to_vec()),
+                bitcoin::Amount::from_sat(100_000),
+                bitcoin::sighash::EcdsaSighashType::All,
+            )
+            .unwrap()
+            .to_byte_array();
+        let sig = sign_ecdsa(&secp, &sk, &sighash, 1);
+        tx.inputs[0].witness = Witness::new(vec![sig, p2wsh_script.as_bytes().to_vec()]);
+        let mut cb = regtest_coinbase(107);
+        cb.inputs[0].witness = Witness::new(vec![vec![0x42; 32]]);
+        let mut block = draft_on(&signed_parent, vec![cb, tx]);
+        add_witness_commitment(&mut block, params);
+        emit(
+            manifest,
+            outdir,
+            "76-spend-p2wsh",
+            &block,
+            params,
+            state,
+            now,
+        )?;
+        signed_parent = block.header;
+    }
+
+    // 77-spend-p2tr-key (BIP341 key path — tweaked key signs).
+    {
+        let mut tx = Transaction {
+            version: 2,
+            inputs: vec![txin(spent_outs(3), vec![])],
+            outputs: vec![txout(99_000, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let prevouts: Vec<bitcoin::TxOut> = vec![btc_txout(&fund_outs[3])];
+        let sighash = bitcoin::sighash::SighashCache::new(&btc_tx(&tx))
+            .taproot_key_spend_signature_hash(
+                0,
+                &bitcoin::sighash::Prevouts::All(&prevouts),
+                bitcoin::sighash::TapSighashType::Default,
+            )
+            .unwrap()
+            .to_byte_array();
+        let msg = bitcoin::secp256k1::Message::from_digest_slice(&sighash).unwrap();
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &tweaked_keypair);
+        tx.inputs[0].witness = Witness::new(vec![sig.serialize().to_vec()]);
+        let mut cb = regtest_coinbase(108);
+        cb.inputs[0].witness = Witness::new(vec![vec![0x42; 32]]);
+        let mut block = draft_on(&signed_parent, vec![cb, tx]);
+        add_witness_commitment(&mut block, params);
+        emit(
+            manifest,
+            outdir,
+            "77-spend-p2tr-key",
+            &block,
+            params,
+            state,
+            now,
+        )?;
+        signed_parent = block.header;
+    }
+
+    // 78-spend-p2tr-script (BIP342 script path — leaf key signs).
+    {
+        let mut tx = Transaction {
+            version: 2,
+            inputs: vec![txin(spent_outs(4), vec![])],
+            outputs: vec![txout(99_000, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let prevouts: Vec<bitcoin::TxOut> = vec![btc_txout(&fund_outs[4])];
+        let sighash = bitcoin::sighash::SighashCache::new(&btc_tx(&tx))
+            .taproot_signature_hash(
+                0,
+                &bitcoin::sighash::Prevouts::All(&prevouts),
+                None,
+                Some((
+                    bitcoin::taproot::TapLeafHash::from_byte_array(leaf_hash),
+                    0xffff_ffff,
+                )),
+                bitcoin::sighash::TapSighashType::Default,
+            )
+            .unwrap()
+            .to_byte_array();
+        let msg = bitcoin::secp256k1::Message::from_digest_slice(&sighash).unwrap();
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &leaf_keypair);
+        tx.inputs[0].witness = Witness::new(vec![
+            sig.serialize().to_vec(),
+            tap_script.as_bytes().to_vec(),
+            control_block.clone(),
+        ]);
+        let mut cb = regtest_coinbase(109);
+        cb.inputs[0].witness = Witness::new(vec![vec![0x42; 32]]);
+        let mut block = draft_on(&signed_parent, vec![cb, tx]);
+        add_witness_commitment(&mut block, params);
+        emit(
+            manifest,
+            outdir,
+            "78-spend-p2tr-script",
+            &block,
+            params,
+            state,
+            now,
+        )?;
+        signed_parent = block.header;
+    }
+
+    // 79-spend-p2sh-p2wpkh (nested segwit: scriptSig = redeem push only).
+    {
+        let mut tx = Transaction {
+            version: 2,
+            inputs: vec![txin(spent_outs(5), vec![])],
+            outputs: vec![txout(99_000, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let sighash = bitcoin::sighash::SighashCache::new(&btc_tx(&tx))
+            .p2wpkh_signature_hash(
+                0,
+                &bitcoin::ScriptBuf::from_bytes(p2wpkh_spk.as_bytes().to_vec()),
+                bitcoin::Amount::from_sat(100_000),
+                bitcoin::sighash::EcdsaSighashType::All,
+            )
+            .unwrap()
+            .to_byte_array();
+        let sig = sign_ecdsa(&secp, &sk, &sighash, 1);
+        tx.inputs[0].script_sig = Script::new(script::push_slice(&p2sh_p2wpkh_redeem));
+        tx.inputs[0].witness = Witness::new(vec![sig, pk_bytes.to_vec()]);
+        let mut cb = regtest_coinbase(110);
+        cb.inputs[0].witness = Witness::new(vec![vec![0x42; 32]]);
+        let mut block = draft_on(&signed_parent, vec![cb, tx]);
+        add_witness_commitment(&mut block, params);
+        emit(
+            manifest,
+            outdir,
+            "79-spend-p2sh-p2wpkh",
+            &block,
+            params,
+            state,
+            now,
+        )?;
+        signed_parent = block.header;
+    }
+
+    // 81-p2sh-badsig: the bare-P2SH spend with a corrupted signature — the
+    // daemon rejects with mandatory-script-verify-flag-failed; our side must
+    // produce the same reason. (Not connected; parent stays the tip.)
+    {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![txin(spent_outs(6), vec![])],
+            outputs: vec![txout(99_000, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let sighash = bitcoin::sighash::SighashCache::new(&btc_tx(&tx))
+            .legacy_signature_hash(
+                0,
+                &bitcoin::ScriptBuf::from_bytes(p2sh_redeem.as_bytes().to_vec()),
+                1,
+            )
+            .unwrap()
+            .to_byte_array();
+        let mut sig = sign_ecdsa(&secp, &sk, &sighash, 1);
+        // Corrupt a middle byte of the DER payload — still DER-valid, wrong sig.
+        sig[20] ^= 1;
+        let mut script_sig = script::push_slice(&sig);
+        script_sig.extend_from_slice(&script::push_slice(p2sh_redeem.as_bytes()));
+        tx.inputs[0].script_sig = Script::new(script_sig);
+        let block = finish(
+            draft_on(&signed_parent, vec![regtest_coinbase(111), tx]),
+            params,
+        );
+        emit(
+            manifest,
+            outdir,
+            "81-p2sh-badsig",
+            &block,
+            params,
+            state,
+            now,
+        )?;
+    }
     Ok(())
 }
 
