@@ -1,7 +1,7 @@
 //! Durable block storage: Core's `blkNNNNN.dat` flat-file format.
 //!
 //! Each file is a stream of `magic` + `u32` little-endian length + raw block
-//! frames, appended in arrival order and rotated at [`MAX_FILE_SIZE`] —
+//! frames, appended in arrival order and rotated at `MAX_FILE_SIZE` —
 //! Core's `MAX_BLOCKFILE_SIZE`. Files are append-only; the in-memory index is
 //! a *derived* structure rebuilt by scanning on [`BlockStore::open`], so no
 //! separate index can fall out of sync with the block files — an interrupted
@@ -54,7 +54,7 @@ pub struct BlockStore {
     /// Bytes in the tail file.
     tail_len: u64,
     tail: File,
-    /// Rotation threshold — [`MAX_FILE_SIZE`] in production; tests shrink it.
+    /// Rotation threshold — `MAX_FILE_SIZE` in production; tests shrink it.
     max_file_size: u64,
 }
 
@@ -188,7 +188,7 @@ impl BlockStore {
     }
 
     /// Appends `block` as a `magic | len | payload` frame, rotating to a new
-    /// file when the frame would push the tail past [`MAX_FILE_SIZE`].
+    /// file when the frame would push the tail past `MAX_FILE_SIZE`.
     /// Idempotent per block hash — a stored block is not written twice.
     ///
     /// # Errors

@@ -664,7 +664,10 @@ mod tests {
         for (hash, height) in locator.iter().zip(&expected_heights) {
             assert_eq!(*hash, headers[*height as usize].hash(), "height {height}");
         }
-        assert_eq!(*locator.last().unwrap_or(&BlockHash::ZERO), headers[0].hash());
+        assert_eq!(
+            *locator.last().unwrap_or(&BlockHash::ZERO),
+            headers[0].hash()
+        );
     }
 
     #[test]

@@ -272,7 +272,7 @@ impl Script {
     /// returns `0`), then the trailing pushed data is treated as the redeem
     /// script and *its* sigops counted accurately — a trailing `OP_N` or
     /// truncated push leaves that data empty (Core's `GetScriptOp` clears
-    /// `vchRet` on every call; see [`trailing_push_data`]).
+    /// `vchRet` on every call; see `trailing_push_data`).
     ///
     /// Callers must only use this when [`Script::is_p2sh`] holds — in Core the
     /// method is dispatched on the scriptPubKey and falls back to the scriptPubKey's

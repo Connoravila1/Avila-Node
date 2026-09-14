@@ -122,7 +122,7 @@ pub struct Coin {
 /// * a spent coin is removed entirely — Core's spent-tombstone/`FRESH`
 ///   bookkeeping exists for cache flushing, which this type doesn't do.
 ///
-/// [`Script::is_unspendable`]: crate::script::Script::is_unspendable
+/// [`Script::is_unspendable`]: crate::transaction::Script::is_unspendable
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct UtxoSet {
     map: HashMap<OutPoint, Coin>,
