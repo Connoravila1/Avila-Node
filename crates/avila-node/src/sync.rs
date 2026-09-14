@@ -35,6 +35,9 @@ pub struct SyncConfig {
     /// When set with `data_dir`, prune blk files after the final flush
     /// so the on-disk total stays under this many bytes.
     pub prune_bytes: Option<u64>,
+    /// When set, publish each tick's progress into this snapshot so a
+    /// query surface (RPC, GUI) can read it without blocking sync.
+    pub status: Option<crate::rpc::SharedStatus>,
 }
 
 impl Default for SyncConfig {
@@ -48,6 +51,7 @@ impl Default for SyncConfig {
             data_dir: None,
             cancel: None,
             prune_bytes: None,
+            status: None,
         }
     }
 }
@@ -210,7 +214,7 @@ pub fn run(
             .skip(chain.len().saturating_sub(12))
             .map(|(i, h)| (i as u32, *h))
             .collect();
-        progress(&SyncProgress {
+        let snapshot = SyncProgress {
             peers: mgr.len(),
             connected_height: connected,
             header_height: cs.tree().tip().height,
@@ -224,7 +228,13 @@ pub fn run(
                 mgr.mempool().orphan_count(),
                 mgr.mempool().estimate_fee(6),
             ),
-        });
+        };
+        if let Some(status) = &cfg.status
+            && let Ok(mut w) = status.write()
+        {
+            *w = snapshot.clone();
+        }
+        progress(&snapshot);
         if run_progress >= cfg.target_height {
             break;
         }

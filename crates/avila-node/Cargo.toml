@@ -14,6 +14,7 @@ avila-consensus.workspace = true
 avila-core.workspace = true
 avila-p2p.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 

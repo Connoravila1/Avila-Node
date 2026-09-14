@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use avila_node::Node;
 use avila_node::config::load_config;
-use avila_node::sync::{SyncConfig, run as run_sync};
+use avila_node::sync::{SyncConfig, SyncProgress, run as run_sync};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -41,6 +41,10 @@ enum Command {
         /// Route all outbound connections through this SOCKS5 proxy.
         #[arg(long)]
         proxy: Option<SocketAddr>,
+        /// Bind the read-only JSON-RPC query surface to this address
+        /// (e.g. 127.0.0.1:18443).
+        #[arg(long)]
+        rpc: Option<SocketAddr>,
     },
     /// Sync headers and blocks from live peers (headers-first, full
     /// consensus validation). Bounded by target height and timeout.
@@ -96,7 +100,11 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        Command::Run { connect, proxy } => {
+        Command::Run {
+            connect,
+            proxy,
+            rpc,
+        } => {
             // A real daemon: unbounded headers-first sync — sync to the
             // tip, then keep serving, relaying, and announcing until
             // killed. The store resumes from the last snapshot.
@@ -108,6 +116,24 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 avila_core::Network::Regtest => ConsensusNet::Regtest,
             };
             let params = consensus_net.params();
+            let status: avila_node::rpc::SharedStatus =
+                std::sync::Arc::new(std::sync::RwLock::new(SyncProgress {
+                    peers: 0,
+                    connected_height: 0,
+                    header_height: 0,
+                    in_flight: 0,
+                    established_total: 0,
+                    disconnects: 0,
+                    recent: Vec::new(),
+                    peer_details: Vec::new(),
+                    mempool: (0, 0, None),
+                }));
+            if let Some(addr) = rpc {
+                let _server = avila_node::rpc::serve(addr, status.clone())
+                    .map_err(|e| format!("rpc bind {addr}: {e}"))?;
+                println!("RPC listening on http://{addr} (read-only)");
+                std::mem::forget(_server);
+            }
             let cfg = SyncConfig {
                 connect,
                 target_height: u32::MAX,
@@ -117,6 +143,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 data_dir: Some(config.network_data_dir()),
                 cancel: None,
                 prune_bytes: None,
+                status: Some(status),
             };
             println!(
                 "Running {} — syncing to tip, then serving (Ctrl+C to stop)...",
@@ -160,6 +187,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 data_dir: store.then(|| config.network_data_dir()),
                 cancel: None,
                 prune_bytes: prune_mb.map(|m| m * 1024 * 1024),
+                status: None,
             };
             println!("Syncing {network} (target height {blocks}, {max_peers} peers max)...");
             let mut last = (u32::MAX, u32::MAX);

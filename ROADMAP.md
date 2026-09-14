@@ -159,7 +159,11 @@ operation. Compare complete initial download and catch-up, not only local replay
       unbounded headers-first sync with the block store resuming
       across restarts, then continuous peer service, relay and tip
       announcements until stopped (`--connect`, `--proxy` supported).
-      Control channel (RPC) remains open.
+      Control channel started: `--rpc` binds a read-only JSON-RPC
+      surface (getblockcount, getbestblockhash, getblockchaininfo,
+      getpeerinfo, getmempoolinfo, estimatesmartfee, help) answering
+      from the last sync snapshot — verified live over curl. Auth,
+      mutation methods, and the Core compatibility matrix remain open.
 - [x] Implement mempool admission, packages, replacement, eviction,
       relay and reorg reconciliation (first slice): `avila-mempool`
       applies consensus input/script checks identically to block
