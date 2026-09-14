@@ -46,9 +46,11 @@ measurements remain unknown. This gate establishes an application, not a Bitcoin
   and fuzz/ (libFuzzer targets).
 - [x] Implement the scorecard runner: exact manifests, raw measurements, correctness checks,
   cold/warm workloads and reproducible reference runs.
-  See tools/scorecard_headers.py; artifacts land in target/scorecard/.
+  See tools/scorecard_headers.py and tools/scorecard_blocks.py (segment replay);
+  artifacts land in target/scorecard/.
 - [x] Record baseline measurements before selecting hot-path layouts or storage defaults.
-  Header-acceptance baseline: experiments/2026-09-header-acceptance-baseline.md.
+  Header-acceptance baseline: experiments/2026-09-header-acceptance-baseline.md;
+  block-replay baselines: target/scorecard/blocks-*.json.
 
 Evidence: implemented checks are enumerated, invalid cases fail for the expected
 reason, reference discrepancies have reproducible cases, and another developer can
