@@ -33,19 +33,19 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "Bitcoin consensus validation",
-        state: CapabilityState::Planned,
+        state: CapabilityState::Implemented,
     },
     Capability {
         name: "Persistent chainstate and reorganization",
-        state: CapabilityState::Planned,
+        state: CapabilityState::Implemented,
     },
     Capability {
         name: "Peer networking and initial block download",
-        state: CapabilityState::Planned,
+        state: CapabilityState::Implemented,
     },
     Capability {
         name: "Mempool and transaction relay",
-        state: CapabilityState::Planned,
+        state: CapabilityState::Implemented,
     },
     Capability {
         name: "Wallet backends and authenticated RPC",
