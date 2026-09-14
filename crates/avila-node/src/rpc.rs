@@ -27,11 +27,12 @@ use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use avila_consensus::arith::difficulty_from_compact;
 use avila_consensus::chain::HeaderNode;
 use avila_consensus::chainstate::Chainstate;
 use avila_consensus::hash::{BlockHash, Txid};
 use avila_consensus::hex;
-use avila_consensus::transaction::{OutPoint, Transaction};
+use avila_consensus::transaction::{OutPoint, Script, Transaction};
 use avila_p2p::manager::PeerManager;
 use serde_json::{Value, json};
 
@@ -78,7 +79,9 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// call into the validator. `queries`, when present, reaches the live
 /// chainstate through the sync loop for chain data methods. `stop`,
 /// when present, is the flag the sync loop's cancellation check reads —
-/// the `stop` method sets it.
+/// the `stop` method sets it. `auth`, when present, is the expected
+/// `Authorization` header value (Core's cookie auth: HTTP Basic with
+/// user `__cookie__`).
 ///
 /// # Errors
 /// `io::Error` if the listener cannot bind.
@@ -87,6 +90,7 @@ pub fn serve(
     status: SharedStatus,
     queries: Option<QuerySender>,
     stop: Option<Arc<AtomicBool>>,
+    auth: Option<String>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     let listener = TcpListener::bind(addr)?;
     Ok(thread::spawn(move || {
@@ -96,12 +100,157 @@ pub fn serve(
                     let status = status.clone();
                     let queries = queries.clone();
                     let stop = stop.clone();
-                    thread::spawn(move || handle(stream, &status, queries.as_ref(), stop.as_ref()));
+                    let auth = auth.clone();
+                    thread::spawn(move || {
+                        handle(
+                            stream,
+                            &status,
+                            queries.as_ref(),
+                            stop.as_ref(),
+                            auth.as_deref(),
+                        );
+                    });
                 }
                 Err(_) => continue,
             }
         }
     }))
+}
+
+/// Minimal base64 encoding (RFC 4648, no padding omissions) — enough
+/// for HTTP Basic credentials without taking a dependency.
+pub fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+        let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// The `Authorization` header value Core-compatible clients send for a
+/// cookie token: `Basic base64("__cookie__:<token>")`.
+#[must_use]
+pub fn cookie_auth_header(token: &str) -> String {
+    format!(
+        "Basic {}",
+        base64_encode(format!("__cookie__:{token}").as_bytes())
+    )
+}
+
+/// Constant-time-ish comparison for credential values (byte fold, no
+/// early exit on the value bytes themselves).
+fn credentials_match(got: &str, expected: &str) -> bool {
+    let (a, b) = (got.as_bytes(), expected.as_bytes());
+    let mut diff = a.len() ^ b.len();
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= usize::from(x ^ y);
+    }
+    diff == 0
+}
+
+/// The cookie file's filename inside the network data directory —
+/// Core's `.cookie` convention, same `__cookie__:<token>` contents.
+pub const COOKIE_FILE: &str = ".cookie";
+
+/// Writes a fresh cookie token into `dir` (Core regenerates per run)
+/// with owner-only permissions, returning the token.
+///
+/// # Errors
+/// `io::Error` if the file cannot be created or written.
+pub fn write_cookie(dir: &std::path::Path) -> std::io::Result<String> {
+    let mut entropy = [0u8; 32];
+    getrandom::fill(&mut entropy)
+        .map_err(|e| std::io::Error::other(format!("entropy source: {e}")))?;
+    let token = hex::encode(&entropy);
+    let path = dir.join(COOKIE_FILE);
+    std::fs::write(&path, format!("__cookie__:{token}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(token)
+}
+
+/// Reads the cookie token from `dir`'s `.cookie` file.
+///
+/// # Errors
+/// `io::Error` if the file is missing or malformed.
+pub fn read_cookie(dir: &std::path::Path) -> std::io::Result<String> {
+    let text = std::fs::read_to_string(dir.join(COOKIE_FILE))?;
+    text.trim()
+        .strip_prefix("__cookie__:")
+        .map(str::to_string)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed .cookie file")
+        })
+}
+
+/// Response-body cap — a verbosity-0 `getblock` of a maximal block is
+/// ~8 MB of hex; anything past this is a misbehaving server.
+const MAX_RESPONSE: u64 = 32 * 1024 * 1024;
+
+/// A blocking JSON-RPC call — the transport behind the `rpc`
+/// subcommand and, later, the GUI's daemon-attach path. `auth` is the
+/// full `Authorization` header value ([`cookie_auth_header`]).
+///
+/// # Errors
+/// A `String` describing the transport, HTTP, or JSON failure.
+pub fn call(addr: SocketAddr, auth: Option<&str>, request: &Value) -> Result<Value, String> {
+    let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(|e| e.to_string())?;
+    let body = request.to_string();
+    let mut head = format!(
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    if let Some(value) = auth {
+        head.push_str("Authorization: ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    stream
+        .write_all(head.as_bytes())
+        .and_then(|()| stream.write_all(body.as_bytes()))
+        .map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    stream
+        .take(MAX_RESPONSE)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&buf);
+    let Some(boundary) = text.find("\r\n\r\n") else {
+        return Err("malformed HTTP response".into());
+    };
+    let status_line = text[..boundary].lines().next().unwrap_or_default();
+    if !status_line.contains(" 200") {
+        return Err(if status_line.contains("401") {
+            "unauthorized — bad or missing cookie credentials".into()
+        } else {
+            format!("HTTP {status_line}")
+        });
+    }
+    serde_json::from_str(text[boundary + 4..].trim())
+        .map_err(|e| format!("invalid JSON-RPC response: {e}"))
 }
 
 /// JSON-RPC error codes Core uses.
@@ -116,6 +265,7 @@ fn handle(
     status: &SharedStatus,
     queries: Option<&QuerySender>,
     stop: Option<&Arc<AtomicBool>>,
+    auth: Option<&str>,
 ) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let Ok(read_half) = stream.try_clone() else {
@@ -125,6 +275,7 @@ fn handle(
     // Read headers until the blank line, bounded.
     let mut content_length = 0usize;
     let mut read_bytes = 0usize;
+    let mut authorization = String::new();
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -134,15 +285,34 @@ fn handle(
                 if read_bytes > MAX_REQUEST {
                     return;
                 }
-                let lower = line.trim_end().to_lowercase();
+                let trimmed = line.trim_end();
+                let lower = trimmed.to_lowercase();
                 if let Some(rest) = lower.strip_prefix("content-length:") {
                     content_length = rest.trim().parse().unwrap_or(0);
                 }
-                if line.trim_end().is_empty() {
+                if let Some(rest) = lower.strip_prefix("authorization:") {
+                    // `rest` is a suffix of `trimmed` — same length, so
+                    // this slice keeps the credential's original case;
+                    // trim drops the space after the colon.
+                    authorization = trimmed[trimmed.len() - rest.len()..].trim().to_string();
+                }
+                if trimmed.is_empty() {
                     break;
                 }
             }
         }
+    }
+    // Cookie auth — Core's default. A missing/wrong credential gets the
+    // same 401 bitcoind returns, no method is reachable without it.
+    if let Some(expected) = auth
+        && !credentials_match(&authorization, expected)
+    {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"avila jsonrpc\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = stream.flush();
+        return;
     }
     if content_length == 0 || content_length > MAX_REQUEST {
         return;
@@ -231,20 +401,9 @@ fn missing_params(what: &str) -> (Value, Option<(i64, String)>) {
     )
 }
 
-/// Core's `GetDifficulty` (pow.cpp) — the same f64 math on the compact
-/// target, so the printed value matches bitcoind's exactly.
+/// Core's `GetDifficulty` (pow.cpp), matching bitcoind's printed value.
 fn difficulty(bits: u32) -> f64 {
-    let mut shift = ((bits >> 24) & 0xff) as i32;
-    let mut diff = f64::from(0x0000ffff) / f64::from(bits & 0x00ffffff);
-    while shift < 29 {
-        diff *= 256.0;
-        shift += 1;
-    }
-    while shift > 29 {
-        diff /= 256.0;
-        shift -= 1;
-    }
-    diff
+    difficulty_from_compact(avila_consensus::arith::CompactTarget(bits))
 }
 
 /// Whether `hash` sits on the active (connected, fully validated) chain.
@@ -831,6 +990,137 @@ fn dispatch(
                 Ok(json!(out))
             })
         }
+        "getblocktemplate" => chain_query(queries, |cs, mgr| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0);
+            // No wallet exists — the coinbase pays Core's default
+            // `OP_TRUE` anyone-can-spend script (what Core's
+            // BlockAssembler uses when no payout script is supplied).
+            let template = mgr
+                .mempool_ref()
+                .build_template(cs, Script::new(vec![avila_consensus::script::OP_1]), now)
+                .map_err(|e| (RPC_MISC_ERROR, format!("template: {e}")))?;
+            let block = &template.block;
+            let height = template.height;
+            let tip = cs.tip_hash();
+            let mtp = cs.tree().median_time_past(&tip).unwrap_or(0);
+            // In-block txid → index in the transactions array (1-based,
+            // coinbase excluded) for `depends`.
+            let position: std::collections::HashMap<Txid, usize> = block
+                .transactions
+                .iter()
+                .enumerate()
+                .skip(1)
+                .map(|(i, tx)| (tx.txid(), i))
+                .collect();
+            let flags =
+                avila_consensus::script::block_script_flags(cs.tree().params(), height, &tip);
+            let pool = mgr.mempool_ref();
+            let txs: Vec<Value> = block
+                .transactions
+                .iter()
+                .skip(1)
+                .map(|tx| {
+                    let txid = tx.txid();
+                    let mut depends: Vec<usize> = tx
+                        .inputs
+                        .iter()
+                        .filter_map(|i| position.get(&i.previous_output.txid))
+                        .copied()
+                        .collect();
+                    depends.sort_unstable();
+                    depends.dedup();
+                    // GetTransactionSigOpCost: legacy + p2sh + witness.
+                    let mut sigops = 0u64;
+                    for input in &tx.inputs {
+                        if let Some(coin) = pool.resolve(cs, &input.previous_output) {
+                            let spk = &coin.out.script_pubkey;
+                            sigops += spk.sig_ops(false);
+                            sigops += if spk.is_p2sh() {
+                                spk.p2sh_sig_ops(&input.script_sig)
+                            } else {
+                                input.script_sig.sig_ops(false)
+                            };
+                            sigops += avila_consensus::script::count_witness_sig_ops(
+                                &input.script_sig,
+                                spk,
+                                &input.witness,
+                                flags,
+                            );
+                        }
+                    }
+                    let fee = pool.entry(&txid).map(|e| e.fee).unwrap_or(0);
+                    json!({
+                        "data": hex::encode(&tx.encode()),
+                        "txid": txid.to_string(),
+                        "hash": tx.wtxid().to_string(),
+                        "depends": depends,
+                        "fee": fee,
+                        "sigops": sigops,
+                        "weight": tx.weight(),
+                    })
+                })
+                .collect();
+            let target = template.block.header.bits.expand().value;
+            let mut out = json!({
+                "capabilities": ["coinbasetxn", "workid", "coinbase/append"],
+                "version": block.header.version,
+                "rules": if flags.contains(avila_consensus::script::ScriptFlags::WITNESS) {
+                    vec!["csv", "segwit"]
+                } else {
+                    vec!["csv"]
+                },
+                "previousblockhash": tip.to_string(),
+                "transactions": txs,
+                "coinbaseaux": {"flags": ""},
+                "coinbasevalue": block.transactions[0].outputs[0].value,
+                "longpollid": format!("{}{}", tip, now),
+                "target": target.to_hex(),
+                "mintime": mtp + 1,
+                "mutable": ["time", "transactions", "prevblock"],
+                "noncerange": "00000000ffffffff",
+                "sigoplimit": 80_000,
+                "sizelimit": 4_000_000,
+                "weightlimit": 4_000_000,
+                "curtime": now,
+                "bits": format!("{:08x}", block.header.bits.0),
+                "height": height,
+            });
+            // BIP22: the witness commitment script a miner must carry
+            // when segwit transactions are included.
+            if block.transactions[0].outputs.len() > 1 {
+                out["default_witness_commitment"] = json!(hex::encode(
+                    block.transactions[0].outputs[1].script_pubkey.as_bytes()
+                ));
+            }
+            Ok(out)
+        }),
+        "getorphantxs" => chain_query(queries, |_, mgr| {
+            Ok(json!(
+                mgr.mempool_ref()
+                    .orphan_txids()
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+            ))
+        }),
+        "getmininginfo" => chain_query(queries, |cs, mgr| {
+            let tip = cs.tip_hash();
+            let node = cs.tree().tip();
+            Ok(json!({
+                "blocks": node.height,
+                "currentblockweight": null,
+                "currentblocktx": mgr.mempool_ref().len(),
+                "difficulty": difficulty(node.header.bits.0),
+                "bits": format!("{:08x}", node.header.bits.0),
+                "target": node.header.bits.expand().value.to_hex(),
+                "bestblockhash": tip.to_string(),
+                "pooledtx": mgr.mempool_ref().len(),
+                "network": format!("{:?}", cs.tree().params().network).to_lowercase(),
+            }))
+        }),
         "getnetworkinfo" => chain_query(queries, |cs, mgr| {
             Ok(json!({
                 "version": env!("CARGO_PKG_VERSION"),
@@ -880,7 +1170,8 @@ fn dispatch(
                  \x20   gettxout <txid> <n> [include_mempool]\n\
                  \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
                  \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
-                 \x20   testmempoolaccept <rawtx | [rawtx,...]>\n\
+                 \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>\n\
+                 \x20 mining: getblocktemplate, getmininginfo\n\
                  \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo\n\
                  \x20 misc:  estimatesmartfee <target>, uptime, help, stop"
             ),
@@ -952,6 +1243,42 @@ mod tests {
         let snap = snap();
         let (_, e) = dispatch("getblockhash", &json!([0]), &snap, None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+    }
+
+    #[test]
+    fn cookie_auth_and_base64_roundtrip() {
+        // RFC 4648 vectors.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+
+        // Cookie write/read roundtrip under a temp dir.
+        let dir = std::env::temp_dir().join(format!("avila-rpc-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = write_cookie(&dir).unwrap();
+        assert_eq!(token.len(), 64);
+        assert_eq!(read_cookie(&dir).unwrap(), token);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join(COOKIE_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "cookie must be owner-only");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // The expected header value encodes __cookie__:<token>.
+        let expected = cookie_auth_header(&token);
+        assert!(expected.starts_with("Basic "));
+        assert!(credentials_match(&expected, &expected));
+        assert!(!credentials_match("Basic d3Jvbmc=", &expected));
+        assert!(!credentials_match("", &expected));
     }
 
     #[test]

@@ -73,6 +73,19 @@ enum Command {
         #[arg(long)]
         prune_mb: Option<u64>,
     },
+    /// Call a JSON-RPC method on a running daemon — the bitcoin-cli
+    /// analog. Positional params are parsed as raw JSON values, falling
+    /// back to strings (e.g. `rpc getblockhash 100`,
+    /// `rpc getblockheader 0000…ab`).
+    Rpc {
+        /// The method name (see `rpc help`).
+        method: String,
+        /// Positional params, each parsed as JSON then as a string.
+        params: Vec<String>,
+        /// The daemon's RPC endpoint.
+        #[arg(long, default_value = "127.0.0.1:18443")]
+        rpc_addr: SocketAddr,
+    },
 }
 
 fn execute(args: Args) -> Result<(), Box<dyn Error>> {
@@ -131,15 +144,25 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 }));
             let (query_tx, query_rx) = std::sync::mpsc::channel();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let data_dir = config.network_data_dir();
             if let Some(addr) = rpc {
+                // Cookie auth, regenerated per run exactly like Core's
+                // .cookie — the file lives in the network data dir with
+                // owner-only permissions.
+                let token = avila_node::rpc::write_cookie(&data_dir)
+                    .map_err(|e| format!("cookie {}: {e}", data_dir.display()))?;
                 let _server = avila_node::rpc::serve(
                     addr,
                     status.clone(),
                     Some(query_tx),
                     Some(cancel.clone()),
+                    Some(avila_node::rpc::cookie_auth_header(&token)),
                 )
                 .map_err(|e| format!("rpc bind {addr}: {e}"))?;
-                println!("RPC listening on http://{addr} (read-only)");
+                println!(
+                    "RPC listening on http://{addr} (cookie auth: {}/.cookie)",
+                    data_dir.display()
+                );
                 std::mem::forget(_server);
             }
             let cfg = SyncConfig {
@@ -148,7 +171,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 max_peers: 8,
                 timeout: Duration::from_secs(u64::MAX),
                 proxy,
-                data_dir: Some(config.network_data_dir()),
+                data_dir: Some(data_dir.clone()),
                 cancel: Some(cancel),
                 prune_bytes: None,
                 status: Some(status),
@@ -159,7 +182,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 config.get().network
             );
             let mut last_print = Instant::now();
-            let _ = run_sync(&params, &cfg, |p| {
+            let result = run_sync(&params, &cfg, |p| {
                 if last_print.elapsed() >= Duration::from_secs(5) {
                     last_print = Instant::now();
                     println!(
@@ -167,7 +190,13 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                         p.connected_height, p.header_height, p.peers, p.mempool.0, p.mempool.1,
                     );
                 }
-            })?;
+            });
+            // The cookie is per-session — remove it on the way out,
+            // matching Core's shutdown.
+            if rpc.is_some() {
+                let _ = std::fs::remove_file(data_dir.join(avila_node::rpc::COOKIE_FILE));
+            }
+            result?;
         }
         Command::Sync {
             blocks,
@@ -231,6 +260,50 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     " — timeout before target"
                 },
             );
+        }
+        Command::Rpc {
+            method,
+            params,
+            rpc_addr,
+        } => {
+            // Params arrive as CLI strings; each parses as JSON first
+            // (`100` → number, `true` → bool, `"x"`/`[…]`/`{…}` →
+            // their JSON forms) and falls back to a bare string.
+            let params: Vec<serde_json::Value> = params
+                .iter()
+                .map(|p| serde_json::from_str(p).unwrap_or(serde_json::Value::String(p.clone())))
+                .collect();
+            let token = avila_node::rpc::read_cookie(&config.network_data_dir()).map_err(|e| {
+                format!(
+                    "reading {}: {e} — is a `run --rpc` daemon up?",
+                    config
+                        .network_data_dir()
+                        .join(avila_node::rpc::COOKIE_FILE)
+                        .display()
+                )
+            })?;
+            let request = serde_json::json!({
+                "jsonrpc": "1.0",
+                "id": "avila-cli",
+                "method": method,
+                "params": params,
+            });
+            let response = avila_node::rpc::call(
+                rpc_addr,
+                Some(&avila_node::rpc::cookie_auth_header(&token)),
+                &request,
+            )?;
+            if let Some(error) = response.get("error").filter(|e| !e.is_null()) {
+                println!("{}", serde_json::to_string_pretty(error)?);
+                return Err(format!("rpc {method} failed").into());
+            }
+            match response.get("result") {
+                Some(result) => match result {
+                    serde_json::Value::String(s) => println!("{s}"),
+                    other => println!("{}", serde_json::to_string_pretty(other)?),
+                },
+                None => println!("null"),
+            }
         }
     }
     Ok(())

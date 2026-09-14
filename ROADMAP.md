@@ -159,15 +159,25 @@ operation. Compare complete initial download and catch-up, not only local replay
       unbounded headers-first sync with the block store resuming
       across restarts, then continuous peer service, relay and tip
       announcements until stopped (`--connect`, `--proxy` supported).
-      Control channel started: `--rpc` binds a read-only JSON-RPC
-      surface answering from the last sync snapshot (getblockcount,
-      getbestblockhash, getblockchaininfo, getpeerinfo, getmempoolinfo,
-      estimatesmartfee, help) plus live-chainstate reads the sync loop
-      answers between ticks (getblockhash, getblockheader, getblock
-      verbosity 0-2, getrawtransaction from the pool or a named block,
-      gettxout with mempool-spend awareness) — verified live over curl.
-      Auth, mutation methods, txindex, and the Core compatibility
-      matrix remain open.
+      Control channel started: `--rpc` binds a JSON-RPC surface
+      gated by a per-session `.cookie` (Core's format and 0600
+      permissions, deleted on shutdown; unauthenticated requests
+      get HTTP 401) and an `avila-node rpc <method> [params]`
+      client reads it. Snapshot methods answer from the last
+      published status (getblockcount, getbestblockhash,
+      getblockchaininfo, getpeerinfo, getmempoolinfo,
+      estimatesmartfee, uptime, help); the sync loop answers
+      live-chainstate queries between ticks (getblockhash,
+      getblockheader, getblock verbosity 0-2, getrawtransaction
+      from the pool or a named block, gettxout with mempool-spend
+      awareness, getchaintips, getrawmempool, getmempoolentry,
+      getmempoolancestors/descendants, getorphantxs,
+      testmempoolaccept with a per-gate policy trace,
+      getblocktemplate built from live chainstate + pool,
+      getmininginfo, getnetworkinfo, getconnectioncount, stop) —
+      verified live over curl and the client. Mutation methods
+      beyond stop, txindex, and the Core compatibility matrix
+      remain open.
 - [x] Implement mempool admission, packages, replacement, eviction,
       relay and reorg reconciliation (first slice): `avila-mempool`
       applies consensus input/script checks identically to block
@@ -187,12 +197,15 @@ operation. Compare complete initial download and catch-up, not only local replay
       fee, package limits, consensus inputs, BIP68, scripts, relay fee,
       capacity) and returns a per-gate trace without mutating the pool.
       Isolated shadow-policy evaluation remains open.
-- [ ] Deliver authenticated/versioned control, a tested Core RPC compatibility matrix,
-  watch-only descriptors, wallet broadcast and scoped service access. Fee
-  information started: `FeeEstimator` records (rate, blocks-to-confirm)
-  samples from connected blocks and `estimate_fee` returns the median
-  confirming rate for a target (surfaced in the GUI ticker); the RPC
-  surface itself is still open.
+- [ ] Deliver versioned control, a tested Core RPC compatibility matrix,
+  watch-only descriptors, wallet broadcast and scoped service access.
+  Authentication landed: per-session `.cookie` (Core format, 0600,
+  HTTP Basic, 401 without it, removed on shutdown) plus the
+  `avila-node rpc` client. Fee information started: `FeeEstimator`
+  records (rate, blocks-to-confirm) samples from connected blocks and
+  `estimate_fee` returns the median confirming rate for a target
+  (surfaced in the GUI ticker); the compatibility matrix, watch-only
+  descriptors, and broadcast remain open.
 - [ ] Deliver Electrum/compact-filter services with tested clients and explicit index coverage.
 - [x] Pruned operation (first slice): `BlockStore::prune_to_bytes`
       deletes the oldest blk files past a byte budget (never the tail);
