@@ -85,6 +85,11 @@ def build_calls(height):
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),
         ("estimatesmartfee", [6]),
+        # sendrawtransaction: deterministic error paths only — a valid
+        # tx can't be in the static matrix since pool state differs per
+        # daemon (verified live separately).
+        ("sendrawtransaction", ["00ff"]),
+        ("sendrawtransaction", ["02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0151ffffffff010000000000000000015100000000"]),
         ("uptime", []),
         ("getpeerinfo", []),
         ("getorphantxs", []),

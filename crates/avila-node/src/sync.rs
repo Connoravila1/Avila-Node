@@ -251,7 +251,7 @@ pub fn run(
         {
             for _ in 0..64 {
                 match rx.try_recv() {
-                    Ok(q) => q.answer(&cs, &mgr),
+                    Ok(q) => q.answer(&cs, &mut mgr),
                     Err(_) => break,
                 }
             }

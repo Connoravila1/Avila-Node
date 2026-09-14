@@ -210,8 +210,13 @@ operation. Compare complete initial download and catch-up, not only local replay
   divergence is `fullrbf` (we enforce BIP125 signaling; Knots runs
   full-RBF); presence-only gaps are documented in
   `experiments/2026-09-14-rpc-compat-matrix.md` (per-peer byte/ping
-  telemetry, `localaddresses`, Knots-specific policy knobs). Fee
-  information started:
+  telemetry, `localaddresses`, Knots-specific policy knobs).
+  Broadcast landed: `sendrawtransaction` admits to the pool through
+  the full `AcceptToMemoryPool` gate set and relays an inv to peers —
+  verified end-to-end (Knots fetched and pooled our submission), with
+  Core's exact error paths (`-22` decode, `-26` reason strings,
+  `-25` maxfeerate/maxburnamount gates, silent success on resubmit).
+  Fee information started:
   `FeeEstimator` records (rate, blocks-to-confirm) samples and
   `estimatesmartfee` serves any target with data, erroring honestly
   when the sample set is empty.

@@ -52,8 +52,22 @@ Knots' `true`: a genuine policy divergence, not a serialization bug.
 Our pool enforces BIP125 opt-in signaling for replacements; Knots 29
 ships mempoolfullrbf semantics. One AVILA-ERROR (`estimatesmartfee` —
 honest "insufficient data" on a fresh chain with no confirmation
-samples; Knots returned its fallback). One BOTH-ERROR
-(`getrawtransaction` — neither side indexes arbitrary txids).
+samples; Knots returned its fallback). `sendrawtransaction` error
+paths match: `-22` decode failures, `-26`/`bad-cb-length` consensus
+rejects. One BOTH-ERROR (`getrawtransaction` — neither side indexes
+arbitrary txids).
+
+`sendrawtransaction` was also verified live end-to-end (outside the
+static matrix since pool state is per-daemon): a wallet-signed tx
+submitted only to Avila was admitted to our pool and relayed via inv
+to Knots, which fetched and pooled it; an already-pooled resubmit
+returns the txid silently (Core's idempotent-broadcast behavior);
+`maxfeerate=0` means unlimited (Knots accepted a 0.01-BTC-fee tx we
+initially rejected); a capped fee returns `-25` "Fee exceeds maximum
+configured by user (e.g. -maxtxfee, maxfeerate)"; a valued OP_RETURN
+output over `maxburnamount` returns `-25` "Unspendable output exceeds
+maximum configured by user (maxburnamount)" — both byte-identical to
+Knots.
 
 Exact matches now include the full display layer: `decodescript` on
 P2PKH, taproot, unknown-witness, and nonstandard scripts returns
@@ -89,4 +103,5 @@ v0: raw hex), `getchaintips`, `getrawmempool`, `getconnectioncount`,
   returning a floor — the estimator only reports rates it observed.
 - `getrawtransaction` requires a named block for non-pool txs; no
   txindex (same failure mode as Core without `txindex=1`).
-- `stop` exists beyond Core's read set; everything else is read-only.
+- `stop` and `sendrawtransaction` are the only mutating methods;
+  `sendrawtransaction` admits to our pool and relays to peers.

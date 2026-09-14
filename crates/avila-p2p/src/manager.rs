@@ -425,34 +425,58 @@ impl<S: Read + Write> PeerManager<S> {
         // Relay an accepted tx: wtxid inv for wtxidrelay peers, txid
         // otherwise (Core's BIP339 split); the source peer is excluded.
         if let Some((source, txid, wtxid)) = announce_tx {
-            for (&id, peer) in &mut self.peers {
-                if id == source || !peer.session.established() {
-                    continue;
-                }
-                let wants_tx = peer.session.peer().is_some_and(|i| i.relay);
-                if !wants_tx {
-                    continue;
-                }
-                let hash = if peer.session.peer().is_some_and(|i| i.wtxid_relay) {
-                    BlockHash::from_bytes(*wtxid.as_bytes())
-                } else {
-                    BlockHash::from_bytes(*txid.as_bytes())
-                };
-                let inv_type = if peer.session.peer().is_some_and(|i| i.wtxid_relay) {
-                    crate::message::InvType::Wtx
-                } else {
-                    crate::message::InvType::Tx
-                };
-                let _ = peer
-                    .session
-                    .send(&Message::Inv(vec![crate::message::InvVector {
-                        inv_type,
-                        hash,
-                    }]));
-            }
+            self.send_tx_inv(Some(source), &txid, &wtxid);
         }
         self.fill_queues(cs);
         events
+    }
+
+    /// Sends a tx inventory announcement to every established peer that
+    /// accepts tx relay (BIP339: `wtx` for wtxidrelay peers, `tx`
+    /// otherwise). `exclude` spares the peer that supplied the tx —
+    /// `None` for locally submitted transactions.
+    fn send_tx_inv(
+        &mut self,
+        exclude: Option<u64>,
+        txid: &avila_consensus::hash::Txid,
+        wtxid: &avila_consensus::hash::Wtxid,
+    ) {
+        for (&id, peer) in &mut self.peers {
+            if Some(id) == exclude || !peer.session.established() {
+                continue;
+            }
+            let wants_tx = peer.session.peer().is_some_and(|i| i.relay);
+            if !wants_tx {
+                continue;
+            }
+            let (inv_type, hash) = if peer.session.peer().is_some_and(|i| i.wtxid_relay) {
+                (
+                    crate::message::InvType::Wtx,
+                    BlockHash::from_bytes(*wtxid.as_bytes()),
+                )
+            } else {
+                (
+                    crate::message::InvType::Tx,
+                    BlockHash::from_bytes(*txid.as_bytes()),
+                )
+            };
+            let _ = peer
+                .session
+                .send(&Message::Inv(vec![crate::message::InvVector {
+                    inv_type,
+                    hash,
+                }]));
+        }
+    }
+
+    /// Announces a locally submitted transaction to every relay-accepting
+    /// peer — the broadcast half of `sendrawtransaction`.
+    pub fn announce_tx(
+        &mut self,
+        txid: avila_consensus::hash::Txid,
+        wtxid: avila_consensus::hash::Wtxid,
+    ) {
+        self.send_tx_inv(None, &txid, &wtxid);
     }
 
     /// The download scheduler: every tick, each established peer gets a

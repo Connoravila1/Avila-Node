@@ -10,10 +10,11 @@
 //!   validated state without locking the sync path (the role Core's
 //!   `cs_main` critical section plays for its RPC thread).
 //!
-//! There is no wallet, no `sendrawtransaction`, and no state mutation:
-//! every answer is "what this node has itself observed", never a remote
-//! claim. The single control method is `stop`, which flips the same
-//! cancellation flag a GUI Stop button or SIGINT handler would.
+//! There is no wallet; the only state mutation is `sendrawtransaction`
+//! (pool admission + peer relay). Every answer is "what this node has
+//! itself observed", never a remote claim. The single control method is
+//! `stop`, which flips the same cancellation flag a GUI Stop button or
+//! SIGINT handler would.
 //!
 //! Not implemented (by design, this slice): HTTP keep-alive, chunked
 //! encoding, TLS, authentication beyond localhost binding, batch
@@ -30,6 +31,7 @@ use std::time::Duration;
 use avila_consensus::arith::difficulty_from_compact;
 use avila_consensus::chain::HeaderNode;
 use avila_consensus::chainstate::Chainstate;
+use avila_consensus::check::RuleError;
 use avila_consensus::hash::{BlockHash, Txid};
 use avila_consensus::hex;
 use avila_consensus::transaction::{OutPoint, Script, Transaction};
@@ -41,12 +43,14 @@ use crate::sync::SyncProgress;
 /// The shared snapshot the sync loop publishes and the RPC server reads.
 pub type SharedStatus = Arc<RwLock<SyncProgress>>;
 
-/// The query body: read live state, produce a JSON result or a
-/// JSON-RPC `(code, message)` error.
-type QueryFn =
-    Box<dyn FnOnce(&Chainstate, &PeerManager<TcpStream>) -> Result<Value, (i64, String)> + Send>;
+/// The query body: act on live state, produce a JSON result or a
+/// JSON-RPC `(code, message)` error. `&mut PeerManager` lets mutation
+/// methods (e.g. `sendrawtransaction`) reach the mempool and relay.
+type QueryFn = Box<
+    dyn FnOnce(&Chainstate, &mut PeerManager<TcpStream>) -> Result<Value, (i64, String)> + Send,
+>;
 
-/// A read-only query the sync loop answers against the live chainstate
+/// A query the sync loop answers against the live chainstate
 /// and peer manager between ticks. The reply carries either the JSON
 /// result or a JSON-RPC `(code, message)` error.
 pub struct ChainQuery {
@@ -58,7 +62,7 @@ impl ChainQuery {
     /// Executes the query against the live node state and delivers the
     /// answer. Called by the sync loop; a dropped receiver just means the
     /// caller gave up waiting.
-    pub fn answer(self, cs: &Chainstate, mgr: &PeerManager<TcpStream>) {
+    pub fn answer(self, cs: &Chainstate, mgr: &mut PeerManager<TcpStream>) {
         let _ = self.reply.send((self.run)(cs, mgr));
     }
 }
@@ -257,8 +261,15 @@ pub fn call(addr: SocketAddr, auth: Option<&str>, request: &Value) -> Result<Val
 const RPC_MISC_ERROR: i64 = -1;
 const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
 const RPC_INVALID_PARAMETER: i64 = -8;
+const RPC_DESERIALIZATION_ERROR: i64 = -22;
+const RPC_VERIFY_ERROR: i64 = -25;
+const RPC_VERIFY_REJECTED: i64 = -26;
 const RPC_METHOD_NOT_FOUND: i64 = -32601;
 const RPC_INVALID_PARAMS: i64 = -32602;
+
+/// Core's `DEFAULT_MAX_RAW_TX_FEE_RATE` — `sendrawtransaction` refuses
+/// txs paying more than this unless the caller raises it (BTC/kvB).
+const DEFAULT_MAX_RAW_TX_FEE_RATE: f64 = 0.10;
 
 fn handle(
     mut stream: TcpStream,
@@ -354,7 +365,7 @@ fn handle(
 /// shapes the outcome as `dispatch`'s `(result, error)` pair.
 fn chain_query(
     queries: Option<&QuerySender>,
-    f: impl FnOnce(&Chainstate, &PeerManager<TcpStream>) -> Result<Value, (i64, String)>
+    f: impl FnOnce(&Chainstate, &mut PeerManager<TcpStream>) -> Result<Value, (i64, String)>
     + Send
     + 'static,
 ) -> (Value, Option<(i64, String)>) {
@@ -1227,6 +1238,113 @@ fn dispatch(
                 Ok(json!(out))
             })
         }
+        "sendrawtransaction" => {
+            let Some(raw) = param(params, 0, "hexstring").and_then(Value::as_str) else {
+                return missing_params("hexstring");
+            };
+            let maxfeerate = param(params, 1, "maxfeerate")
+                .and_then(Value::as_f64)
+                .unwrap_or(DEFAULT_MAX_RAW_TX_FEE_RATE);
+            if maxfeerate < 0.0 {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_INVALID_PARAMETER,
+                        "Invalid parameter, maxfeerate cannot be negative".into(),
+                    )),
+                );
+            }
+            let maxburnamount = param(params, 2, "maxburnamount")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let Ok(bytes) = hex::decode(raw) else {
+                return (
+                    Value::Null,
+                    Some((RPC_DESERIALIZATION_ERROR, "TX decode failed".into())),
+                );
+            };
+            chain_query(queries, move |cs, mgr| {
+                let tx = match Transaction::decode(&bytes) {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        return Err((RPC_DESERIALIZATION_ERROR, format!("TX decode failed: {e}")));
+                    }
+                };
+                let txid = tx.txid();
+                let wtxid = tx.wtxid();
+                let pool = mgr.mempool_ref();
+                // Core's BroadcastTransaction: an already-pooled txid is
+                // a silent success — resubmitting is idempotent.
+                if pool.entry(&txid).is_some() {
+                    return Ok(json!(txid.to_string()));
+                }
+                // Core's BroadcastTransaction policy bounds: the caller's
+                // maxfeerate (BTC/kvB; 0 = unlimited) and maxburnamount
+                // (BTC) gates run before admission.
+                let input_sum: Option<i64> = tx
+                    .inputs
+                    .iter()
+                    .map(|i| pool.resolve(cs, &i.previous_output).map(|c| c.out.value))
+                    .sum();
+                if maxfeerate > 0.0
+                    && let Some(input_sum) = input_sum
+                {
+                    let output_sum: i64 = tx.outputs.iter().map(|o| o.value).sum();
+                    let fee = input_sum - output_sum;
+                    let vsize = tx.weight().div_ceil(4).max(1);
+                    // Core: max_tx_fee = maxfeerate.GetFee(vsize) — an
+                    // absolute sats bound derived from the rate.
+                    let max_tx_fee = (maxfeerate * 100_000_000.0 * vsize as f64 / 1000.0) as i64;
+                    if fee > max_tx_fee {
+                        return Err((
+                            RPC_VERIFY_ERROR,
+                            "Fee exceeds maximum configured by user \
+                             (e.g. -maxtxfee, maxfeerate)"
+                                .into(),
+                        ));
+                    }
+                }
+                let burned: i64 = tx
+                    .outputs
+                    .iter()
+                    .filter(|o| o.script_pubkey.is_unspendable())
+                    .map(|o| o.value)
+                    .sum();
+                let max_burn_sat = (maxburnamount * 100_000_000.0) as i64;
+                if burned > max_burn_sat {
+                    return Err((
+                        RPC_VERIFY_ERROR,
+                        "Unspendable output exceeds maximum configured by user \
+                         (maxburnamount)"
+                            .into(),
+                    ));
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                match mgr.mempool().accept_tx(tx, cs, now) {
+                    Ok(_) => {
+                        // Admitted — relay an inv to every tx-accepting
+                        // peer (Core's RelayTransaction path).
+                        mgr.announce_tx(txid, wtxid);
+                        Ok(json!(txid.to_string()))
+                    }
+                    Err(avila_mempool::MempoolReject::AlreadyKnown) => Ok(json!(txid.to_string())),
+                    // Consensus and input failures carry Core's
+                    // state.Invalid reason strings via `reason()`;
+                    // policy rejects already Display as Core strings.
+                    Err(reject) => Err((
+                        RPC_VERIFY_REJECTED,
+                        match &reject {
+                            avila_mempool::MempoolReject::Consensus(e) => e.reason().to_string(),
+                            avila_mempool::MempoolReject::Inputs(e) => e.reason().into_owned(),
+                            _ => reject.to_string(),
+                        },
+                    )),
+                }
+            })
+        }
         "getblocktemplate" => chain_query(queries, |cs, mgr| {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1525,14 +1643,15 @@ fn dispatch(
         }
         "help" => (
             json!(
-                "avila-node JSON-RPC (read-only observations + stop):\n\
+                "avila-node JSON-RPC:\n\
                  \x20 chain: getblockcount, getbestblockhash, getblockchaininfo, getchaintips,\n\
                  \x20   getblockhash <height>, getblockheader <hash> [verbose],\n\
                  \x20   getblock <hash> [verbosity 0-2], getrawtransaction <txid> [verbosity] [blockhash],\n\
                  \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>\n\
                  \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
                  \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
-                 \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>\n\
+                 \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>,\n\
+                 \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount]\n\
                  \x20 mining: getblocktemplate, getmininginfo\n\
                  \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo\n\
                  \x20 misc:  estimatesmartfee <target>, uptime, help, stop"
@@ -1650,10 +1769,10 @@ mod tests {
     /// chainstate — the same plumbing the sync loop runs.
     fn query_server(cs: Chainstate) -> QuerySender {
         let (tx, rx) = mpsc::channel::<ChainQuery>();
-        let mgr: PeerManager<TcpStream> = PeerManager::new(8);
+        let mut mgr: PeerManager<TcpStream> = PeerManager::new(8);
         thread::spawn(move || {
             while let Ok(q) = rx.recv() {
-                q.answer(&cs, &mgr);
+                q.answer(&cs, &mut mgr);
             }
         });
         tx
@@ -1963,5 +2082,72 @@ mod tests {
         assert_eq!(malformed["asm"], "1 OP_INVALIDOPCODE");
         assert_eq!(malformed["type"], "nonstandard");
         assert_eq!(malformed["desc"], "raw(51ff)#297em9yk");
+    }
+
+    /// `sendrawtransaction`'s deterministic paths — param validation,
+    /// decode errors, and consensus rejects all carry Core's codes and
+    /// reason strings (verified live against Knots 29.3).
+    #[test]
+    fn sendrawtransaction_error_paths() {
+        let cs = Chainstate::new(&Network::Regtest.params());
+        let queries = query_server(cs);
+        let snap = snap();
+
+        // Missing arg and negative maxfeerate fail before decoding.
+        let (_, e) = dispatch(
+            "sendrawtransaction",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
+        let (_, e) = dispatch(
+            "sendrawtransaction",
+            &json!(["00", -1]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+
+        // Not-hex and non-tx hex are deserialization errors.
+        let (_, e) = dispatch(
+            "sendrawtransaction",
+            &json!(["zz"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
+        let (_, e) = dispatch(
+            "sendrawtransaction",
+            &json!(["00ff"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        let err = e.unwrap();
+        assert_eq!(err.0, RPC_DESERIALIZATION_ERROR);
+        assert!(err.1.starts_with("TX decode failed"));
+
+        // A coinbase is a consensus reject — Core's reason string, -26.
+        let coinbase = "02000000010000000000000000000000000000000000000000000000000000\
+        000000000000ffffffff0151ffffffff010000000000000000015100000000";
+        let coinbase: String = coinbase.chars().filter(|c| !c.is_whitespace()).collect();
+        let (_, e) = dispatch(
+            "sendrawtransaction",
+            &json!([coinbase]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        let err = e.unwrap();
+        assert_eq!(err.0, RPC_VERIFY_REJECTED);
+        assert_eq!(err.1, "bad-cb-length");
+
+        // Without the query channel the method reports honestly.
+        let (_, e) = dispatch("sendrawtransaction", &json!(["00"]), &snap, None, None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 }
