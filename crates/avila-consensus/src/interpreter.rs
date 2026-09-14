@@ -27,8 +27,8 @@ use crate::encode::{compact_size_len, write_compact_size};
 use crate::hash::sha256;
 use crate::script::{
     MAX_SCRIPT_SIZE, OP_0, OP_1, OP_1NEGATE, OP_16, OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY,
-    OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_EQUAL, OP_HASH160, OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4,
-    OP_RETURN, ScriptFlags, encode_script_num, push_slice,
+    OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_EQUAL, OP_HASH160, OP_NOP10, OP_PUSHDATA1, OP_PUSHDATA2,
+    OP_PUSHDATA4, OP_RETURN, ScriptFlags, encode_script_num, push_slice,
 };
 use crate::transaction::{Script, Witness};
 
@@ -170,7 +170,6 @@ const OP_NOP1: u8 = 0xb0;
 const OP_CHECKLOCKTIMEVERIFY: u8 = 0xb1; // NOP2
 const OP_CHECKSEQUENCEVERIFY: u8 = 0xb2; // NOP3
 const OP_NOP4: u8 = 0xb3;
-const OP_NOP10: u8 = 0xb9;
 const OP_CHECKSIGADD: u8 = 0xba;
 const OP_EQUALVERIFY: u8 = 0x88;
 

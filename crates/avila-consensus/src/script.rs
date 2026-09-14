@@ -54,6 +54,8 @@ pub const OP_CHECKSIGVERIFY: u8 = 0xad;
 pub const OP_CHECKMULTISIG: u8 = 0xae;
 /// `OP_CHECKMULTISIGVERIFY`.
 pub const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
+/// `OP_NOP10` — Core's `MAX_OPCODE`, the largest opcode `HasValidOps` accepts.
+pub const OP_NOP10: u8 = 0xb9;
 
 /// Core `script/script.h`'s `MAX_PUBKEYS_PER_MULTISIG`: the sigop cost charged for a
 /// bare multisig opcode when the preceding opcode is not a small integer (or accuracy
@@ -166,6 +168,201 @@ impl<'a> Iterator for Instructions<'a> {
     }
 }
 
+/// A well-known output template — Core's `TxoutType` from `Solver`
+/// (standard.cpp), with the extracted payload where the template
+/// carries one. Used for RPC `scriptPubKey` classification; this is
+/// display-layer naming, not a consensus rule.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ScriptType {
+    /// Matches no standard template (Core's `TX_NONSTANDARD`).
+    Nonstandard,
+    /// `<pubkey> OP_CHECKSIG` — bare pay-to-pubkey (Core's `TX_PUBKEY`).
+    PubKey(Vec<u8>),
+    /// `OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG` (`TX_PUBKEYHASH`).
+    PubKeyHash([u8; 20]),
+    /// `OP_HASH160 <20> OP_EQUAL` (`TX_SCRIPTHASH`).
+    ScriptHash([u8; 20]),
+    /// `m <pubkey>… n OP_CHECKMULTISIG` (`TX_MULTISIG`).
+    Multisig {
+        /// Signatures required (`m`).
+        required: u8,
+        /// The listed public keys, in script order.
+        keys: Vec<Vec<u8>>,
+    },
+    /// `OP_RETURN` followed by push-only data (`TX_NULL_DATA`).
+    NullData,
+    /// Any witness program — `OP_n <2..40-byte program>`; the variant
+    /// Core splits into `witness_v0_keyhash`/`witness_v0_scripthash`/
+    /// `witness_v1_taproot`/`witness_unknown` is derived from
+    /// `version`/`program` by [`ScriptType::name`].
+    Witness {
+        /// The witness version (0–16).
+        version: u8,
+        /// The witness program bytes.
+        program: Vec<u8>,
+    },
+}
+
+impl ScriptType {
+    /// Core's `GetTxnOutputType` string for this template.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Nonstandard => "nonstandard",
+            Self::PubKey(_) => "pubkey",
+            Self::PubKeyHash(_) => "pubkeyhash",
+            Self::ScriptHash(_) => "scripthash",
+            Self::Multisig { .. } => "multisig",
+            Self::NullData => "nulldata",
+            Self::Witness { version, program } => match (version, program.len()) {
+                (0, 20) => "witness_v0_keyhash",
+                (0, 32) => "witness_v0_scripthash",
+                (1, 32) => "witness_v1_taproot",
+                _ => "witness_unknown",
+            },
+        }
+    }
+}
+
+/// A pubkey in compressed (`02`/`03` + 32 bytes) or uncompressed
+/// (`04` + 64 bytes) form — Core's `CPubKey::ValidSize` +
+/// `IsCompressedOrUncompressedPubKey`.
+fn is_valid_pubkey(key: &[u8]) -> bool {
+    match key.len() {
+        33 => matches!(key[0], 0x02 | 0x03),
+        65 => key[0] == 0x04,
+        _ => false,
+    }
+}
+
+/// `CScriptNum` decode for `asm` rendering — little-endian
+/// sign-magnitude, no minimal-encoding or size enforcement (only
+/// pushes of at most four bytes reach it, so the value fits `i64`).
+fn script_num(data: &[u8]) -> i64 {
+    let mut value = 0i64;
+    for (i, &b) in data.iter().enumerate() {
+        value |= i64::from(b) << (8 * i);
+    }
+    if let Some(&last) = data.last()
+        && last & 0x80 != 0
+    {
+        value &= !(0x80i64 << (8 * (data.len() - 1)));
+        return -value;
+    }
+    value
+}
+
+/// Core's `GetOpName` — the canonical string for a non-push opcode.
+/// `OP_1..=OP_16` render as `1`–`16` and `OP_1NEGATE` as `-1`
+/// (numbers, matching bitcoind's `asm` output); unassigned opcode
+/// bytes render `OP_UNKNOWN`.
+#[must_use]
+pub fn opcode_name(opcode: u8) -> &'static str {
+    match opcode {
+        OP_1NEGATE => "-1",
+        OP_RESERVED => "OP_RESERVED",
+        OP_1..=OP_16 => {
+            const NUMBERS: [&str; 16] = [
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+                "16",
+            ];
+            NUMBERS[usize::from(opcode - OP_1)]
+        }
+        0x61 => "OP_NOP",
+        0x62 => "OP_VER",
+        0x63 => "OP_IF",
+        0x64 => "OP_NOTIF",
+        0x65 => "OP_VERIF",
+        0x66 => "OP_VERNOTIF",
+        0x67 => "OP_ELSE",
+        0x68 => "OP_ENDIF",
+        0x69 => "OP_VERIFY",
+        OP_RETURN => "OP_RETURN",
+        0x6b => "OP_TOALTSTACK",
+        0x6c => "OP_FROMALTSTACK",
+        0x6d => "OP_2DROP",
+        0x6e => "OP_2DUP",
+        0x6f => "OP_3DUP",
+        0x70 => "OP_2OVER",
+        0x71 => "OP_2ROT",
+        0x72 => "OP_2SWAP",
+        0x73 => "OP_IFDUP",
+        0x74 => "OP_DEPTH",
+        0x75 => "OP_DROP",
+        0x76 => "OP_DUP",
+        0x77 => "OP_NIP",
+        0x78 => "OP_OVER",
+        0x79 => "OP_PICK",
+        0x7a => "OP_ROLL",
+        0x7b => "OP_ROT",
+        0x7c => "OP_SWAP",
+        0x7d => "OP_TUCK",
+        0x7e => "OP_CAT",
+        0x7f => "OP_SUBSTR",
+        0x80 => "OP_LEFT",
+        0x81 => "OP_RIGHT",
+        0x82 => "OP_SIZE",
+        0x83 => "OP_INVERT",
+        0x84 => "OP_AND",
+        0x85 => "OP_OR",
+        0x86 => "OP_XOR",
+        0x87 => "OP_EQUAL",
+        0x88 => "OP_EQUALVERIFY",
+        0x89 => "OP_RESERVED1",
+        0x8a => "OP_RESERVED2",
+        0x8b => "OP_1ADD",
+        0x8c => "OP_1SUB",
+        0x8d => "OP_2MUL",
+        0x8e => "OP_2DIV",
+        0x8f => "OP_NEGATE",
+        0x90 => "OP_ABS",
+        0x91 => "OP_NOT",
+        0x92 => "OP_0NOTEQUAL",
+        0x93 => "OP_ADD",
+        0x94 => "OP_SUB",
+        0x95 => "OP_MUL",
+        0x96 => "OP_DIV",
+        0x97 => "OP_MOD",
+        0x98 => "OP_LSHIFT",
+        0x99 => "OP_RSHIFT",
+        0x9a => "OP_BOOLAND",
+        0x9b => "OP_BOOLOR",
+        0x9c => "OP_NUMEQUAL",
+        0x9d => "OP_NUMEQUALVERIFY",
+        0x9e => "OP_NUMNOTEQUAL",
+        0x9f => "OP_LESSTHAN",
+        0xa0 => "OP_GREATERTHAN",
+        0xa1 => "OP_LESSTHANOREQUAL",
+        0xa2 => "OP_GREATERTHANOREQUAL",
+        0xa3 => "OP_MIN",
+        0xa4 => "OP_MAX",
+        0xa5 => "OP_WITHIN",
+        0xa6 => "OP_RIPEMD160",
+        0xa7 => "OP_SHA1",
+        0xa8 => "OP_SHA256",
+        OP_HASH160 => "OP_HASH160",
+        0xaa => "OP_HASH256",
+        0xab => "OP_CODESEPARATOR",
+        OP_CHECKSIG => "OP_CHECKSIG",
+        OP_CHECKSIGVERIFY => "OP_CHECKSIGVERIFY",
+        OP_CHECKMULTISIG => "OP_CHECKMULTISIG",
+        OP_CHECKMULTISIGVERIFY => "OP_CHECKMULTISIGVERIFY",
+        0xb0 => "OP_NOP1",
+        0xb1 => "OP_CHECKLOCKTIMEVERIFY",
+        0xb2 => "OP_CHECKSEQUENCEVERIFY",
+        0xb3 => "OP_NOP4",
+        0xb4 => "OP_NOP5",
+        0xb5 => "OP_NOP6",
+        0xb6 => "OP_NOP7",
+        0xb7 => "OP_NOP8",
+        0xb8 => "OP_NOP9",
+        0xb9 => "OP_NOP10",
+        0xba => "OP_CHECKSIGADD",
+        0xff => "OP_INVALIDOPCODE",
+        _ => "OP_UNKNOWN",
+    }
+}
+
 impl Script {
     /// Iterates this script's instructions (Core's `GetOp` loop). `OP_0`, direct pushes
     /// (`0x01..=0x4b`) and `OP_PUSHDATA1/2/4` yield [`Instruction::Push`]; every other
@@ -266,6 +463,19 @@ impl Script {
         bytes.len() > MAX_SCRIPT_SIZE || bytes.first() == Some(&OP_RETURN)
     }
 
+    /// Core's `CScript::HasValidOps` — every opcode byte must decode
+    /// and be at most `MAX_OPCODE` (`OP_NOP10`, 0xb9). Display-layer
+    /// gate: Core refuses to show P2SH/segwit wrap addresses for
+    /// scripts containing invalid opcodes.
+    #[must_use]
+    pub fn has_valid_ops(&self) -> bool {
+        self.instructions().all(|i| match i {
+            Ok(Instruction::Op(op)) => op <= OP_NOP10,
+            Ok(Instruction::Push(_)) => true,
+            Err(_) => false,
+        })
+    }
+
     /// Counts signature operations the way `CScript::GetSigOpCount(const CScript&
     /// scriptSig)` does when `self` is a P2SH `scriptPubKey`: every `script_sig`
     /// instruction must decode and be `<= OP_16` (a malformed or non-push op
@@ -323,6 +533,137 @@ impl Script {
             return None;
         }
         Some((version, &bytes[2..]))
+    }
+
+    /// Renders this script the way Core's `ScriptToAsmStr` does for
+    /// `scriptPubKey.asm`/`scriptSig.asm`: pushes of at most four
+    /// bytes as their `CScriptNum` value (little-endian, sign bit in
+    /// the top byte — so `OP_0` prints as `0`), longer pushes as hex,
+    /// opcodes by [`opcode_name`], space-separated. A truncated push
+    /// appends `[error]` and stops (Core's loop does the same on
+    /// `GetOp` failure).
+    #[must_use]
+    pub fn asm(&self) -> String {
+        let mut out = String::new();
+        for instruction in self.instructions() {
+            match instruction {
+                Ok(Instruction::Push(data)) => {
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    if data.len() <= 4 {
+                        out.push_str(&script_num(data).to_string());
+                    } else {
+                        for byte in data {
+                            out.push_str(&format!("{byte:02x}"));
+                        }
+                    }
+                }
+                Ok(Instruction::Op(opcode)) => {
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str(opcode_name(opcode));
+                }
+                Err(_) => {
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str("[error]");
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Classifies this output script into a well-known template —
+    /// Core's `Solver` (standard.cpp): witness programs first, then
+    /// P2PKH/P2SH, bare pubkey, bare multisig, and `OP_RETURN`
+    /// nulldata. Display-layer classification only.
+    #[must_use]
+    pub fn classify(&self) -> ScriptType {
+        let bytes = self.as_bytes();
+        if bytes.is_empty() {
+            return ScriptType::Nonstandard;
+        }
+
+        // Witness programs — `IsWitnessProgram` checked first in
+        // Solver's modern shape (it precedes the legacy templates).
+        // A v0 program is only standard at exactly 20 or 32 bytes;
+        // other lengths fall through to nonstandard (BIP141).
+        if let Some((version, program)) = self.witness_program()
+            && (version != 0 || program.len() == 20 || program.len() == 32)
+        {
+            return ScriptType::Witness {
+                version,
+                program: program.to_vec(),
+            };
+        }
+
+        // P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG.
+        if bytes.len() == 25
+            && bytes[0] == 0x76
+            && bytes[1] == OP_HASH160
+            && bytes[2] == 0x14
+            && bytes[23] == 0x88
+            && bytes[24] == OP_CHECKSIG
+            && let Ok(hash) = <[u8; 20]>::try_from(&bytes[3..23])
+        {
+            return ScriptType::PubKeyHash(hash);
+        }
+
+        // P2SH: OP_HASH160 <20> OP_EQUAL.
+        if self.is_p2sh()
+            && let Ok(hash) = <[u8; 20]>::try_from(&bytes[2..22])
+        {
+            return ScriptType::ScriptHash(hash);
+        }
+
+        // Bare pay-to-pubkey: <push33|push65> <pubkey> OP_CHECKSIG.
+        if (bytes.len() == 35 && bytes[0] == 33) || (bytes.len() == 67 && bytes[0] == 65) {
+            let key = &bytes[1..bytes.len() - 1];
+            if bytes[bytes.len() - 1] == OP_CHECKSIG && is_valid_pubkey(key) {
+                return ScriptType::PubKey(key.to_vec());
+            }
+        }
+
+        // Bare multisig: OP_m <pubkey>… OP_n OP_CHECKMULTISIG, with the
+        // pubkey count matching `n` (Solver's TX_MULTISIG).
+        if bytes.len() >= 3
+            && bytes[bytes.len() - 1] == OP_CHECKMULTISIG
+            && let (Some(m), Some(n)) = (decode_op_n(bytes[0]), decode_op_n(bytes[bytes.len() - 2]))
+        {
+            let mut keys = Vec::new();
+            let mut ok = true;
+            for instruction in Script::new(bytes[1..bytes.len() - 2].to_vec()).instructions() {
+                match instruction {
+                    Ok(Instruction::Push(key)) if is_valid_pubkey(key) => {
+                        keys.push(key.to_vec());
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && keys.len() == usize::from(n) && m >= 1 && m <= n {
+                return ScriptType::Multisig { required: m, keys };
+            }
+        }
+
+        // Nulldata: OP_RETURN with a push-only tail (Solver does not
+        // apply the 83-byte datacarrier cap — that's IsStandard).
+        if bytes[0] == OP_RETURN {
+            let tail_push_only = Script::new(bytes[1..].to_vec())
+                .instructions()
+                .all(|i| matches!(i, Ok(Instruction::Push(_))));
+            if tail_push_only {
+                return ScriptType::NullData;
+            }
+        }
+
+        ScriptType::Nonstandard
     }
 }
 

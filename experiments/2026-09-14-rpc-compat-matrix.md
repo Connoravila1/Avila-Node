@@ -28,7 +28,7 @@ drift: any `DIFFERS` verdict on a shared field is a compatibility bug.
 
 ## Workload and method
 
-`tools/compare_rpc.py` calls 20 methods with identical parameters on
+`tools/compare_rpc.py` calls 24 methods with identical parameters on
 both endpoints (block hash and a coinbase txid resolved live at the
 shared height), flattens each response to field paths, and reports
 matched / expected-dynamic / differing / one-side-only fields.
@@ -46,40 +46,45 @@ python3 tools/compare_rpc.py \
 
 ## Results
 
-13 MATCH (every shared field byte-identical), 6 EXPECTED-DIFF
-(presence gaps only), **0 DIFFERS** — no shared field disagrees in
-value. One AVILA-ERROR (`estimatesmartfee` — honest "insufficient
-data" on a fresh chain with no confirmation samples; Knots returned
-its fallback). One BOTH-ERROR (`getrawtransaction` — neither side
-indexes arbitrary txids; consistent behavior).
+21 MATCH (every shared field byte-identical), 2 EXPECTED-DIFF
+(presence gaps only), **1 DIFFERS** — `fullrbf` reports `false` vs
+Knots' `true`: a genuine policy divergence, not a serialization bug.
+Our pool enforces BIP125 opt-in signaling for replacements; Knots 29
+ships mempoolfullrbf semantics. One AVILA-ERROR (`estimatesmartfee` —
+honest "insufficient data" on a fresh chain with no confirmation
+samples; Knots returned its fallback). One BOTH-ERROR
+(`getrawtransaction` — neither side indexes arbitrary txids).
 
-Exact matches include `getblocktemplate` — all 22 fields identical
-including `rules: ["csv","!segwit","taproot"]`, `vbrequired`,
-`vbavailable`, `longpollid` (tip+height) and the zero-witness-root
-`default_witness_commitment` every post-segwit block carries —
-plus `getblock` verbosity 1 (20 shared fields), `getblockheader`
-(15), `getchaintips`, `getrawmempool`, `getconnectioncount`,
+Exact matches now include the full display layer: `decodescript` on
+P2PKH, taproot, unknown-witness, and nonstandard scripts returns
+byte-identical `asm`, `desc` (with the descriptor polymod checksum),
+`type`, `address`, and the nested `p2sh`/`segwit`/`p2sh-segwit` wrap
+addresses — including `wsh(multi(...))` inner descriptors and the
+v0-program length rule (a v0 program outside 20/32 bytes is
+`nonstandard`, matching Solver). `gettxout` (9 fields), `getblock`
+verbosity 2 (29 fields incl. per-tx `hex` and decoded
+`scriptPubKey`/`scriptSig`), `getblocktemplate` (22), `getmininginfo`
+(11 — incl. `networkhashps` computed through 256-bit chainwork
+division, `currentblocksize/weight/tx` from a live template build),
+`getblockchaininfo` (13), `getblockheader` (15), `getblock` (v1: 20,
+v0: raw hex), `getchaintips`, `getrawmempool`, `getconnectioncount`,
 `getorphantxs`, `getblockcount`, `getbestblockhash`, `getblockhash`.
 
 ### Documented gaps (presence-only, never wrong values)
 
-- `gettxout`: `scriptPubKey.asm`/`type`/`address`/`desc` — needs a
-  script classifier + address encoder (not yet implemented).
-- `getmempoolinfo`: `maxmempool` (our pool is entry/weight-capped,
-  not byte-capped) and Knots-specific policy knobs (`rbf_policy`,
-  `truc_policy`, `fullrbf`, `dustdynamic`, `dustrelayfee*`,
-  `incrementalrelayfee`).
 - `getpeerinfo`: byte counters, ping times, `lastsend`/`lastrecv`,
-  per-height `inflight` list — per-peer telemetry we don't track.
+  per-height `inflight` list, `session_id` — per-peer telemetry we
+  don't track yet.
 - `getnetworkinfo`: `localaddresses` — we don't track our own
   advertised addresses.
-- `getmininginfo`: `currentblocksize`, `networkhashps` — the latter
-  needs a 256-bit work-diff divide not yet implemented.
-- `getblockchaininfo`: we add `localobservation`/`peers` (honest
-  extras; Core clients ignore unknown keys).
+- `getmempoolinfo`: `maxmempool` (our pool is entry-capped, not
+  byte-capped) and Knots-specific knobs (`rbf_policy`, `truc_policy`,
+  `dustdynamic`, `dustrelayfee*`).
 
 ### Known semantic differences
 
+- `fullrbf`: `false` — we implement BIP125 opt-in signaling; Knots
+  29 enables full RBF. Real policy divergence to decide on.
 - `estimatesmartfee` errors when the sample set is empty rather than
   returning a floor — the estimator only reports rates it observed.
 - `getrawtransaction` requires a named block for non-pool txs; no

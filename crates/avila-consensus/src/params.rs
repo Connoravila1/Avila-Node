@@ -53,6 +53,9 @@ impl Network {
                 .ok(),
                 message_start: [0xf9, 0xbe, 0xb4, 0xd9],
                 default_port: 8333,
+                base58_pubkey_prefix: 0x00,
+                base58_script_prefix: 0x05,
+                bech32_hrp: "bc",
                 dns_seeds: &[
                     "seed.bitcoin.sipa.be",
                     "dnsseed.bluematt.me",
@@ -93,6 +96,9 @@ impl Network {
                 .ok(),
                 message_start: [0x1c, 0x16, 0x3f, 0x28],
                 default_port: 48333,
+                base58_pubkey_prefix: 0x6f,
+                base58_script_prefix: 0xc4,
+                bech32_hrp: "tb",
                 dns_seeds: &[
                     "seed.testnet4.bitcoin.sprovoost.nl",
                     "seed.testnet4.wiz.biz",
@@ -127,6 +133,9 @@ impl Network {
                 .ok(),
                 message_start: [0x0a, 0x03, 0xcf, 0x40],
                 default_port: 38333,
+                base58_pubkey_prefix: 0x6f,
+                base58_script_prefix: 0xc4,
+                bech32_hrp: "tb",
                 dns_seeds: &[
                     "seed.signet.bitcoin.sprovoost.nl",
                     "seed.signet.achownodes.xyz",
@@ -162,6 +171,9 @@ impl Network {
                 assume_valid: None,
                 message_start: [0xfa, 0xbf, 0xb5, 0xda],
                 default_port: 18444,
+                base58_pubkey_prefix: 0x6f,
+                base58_script_prefix: 0xc4,
+                bech32_hrp: "bcrt",
                 dns_seeds: &[],
                 // Core's regtest defaults bury BIP34/65/66/CSV at height 1 and activate
                 bip34_height: 1,
@@ -249,6 +261,15 @@ pub struct Params {
     /// `vSeeds` — DNS seed hostnames for peer bootstrap. Empty on regtest
     /// (Core ships a dummy seed and disables seeding entirely).
     pub dns_seeds: &'static [&'static str],
+    /// `base58Prefixes[PUBKEY_ADDRESS]` — the version byte on base58check
+    /// pay-to-pubkey-hash addresses (0x00 mainnet, 0x6f elsewhere).
+    pub base58_pubkey_prefix: u8,
+    /// `base58Prefixes[SCRIPT_ADDRESS]` — the version byte on base58check
+    /// pay-to-script-hash addresses (0x05 mainnet, 0xc4 elsewhere).
+    pub base58_script_prefix: u8,
+    /// `bech32_hrp` — the human-readable part of segwit addresses
+    /// (`bc`, `tb`, `tb`, `bcrt`).
+    pub bech32_hrp: &'static str,
     /// `consensus.BIP34Height`: Core's `DEPLOYMENT_HEIGHTINCB` buried deployment (BIP34
     /// coinbase height enforcement). [`crate::chain::HeaderTree::insert`]'s `bad-version`
     /// check also uses this as the `nVersion < 2` floor's activation height, mirroring

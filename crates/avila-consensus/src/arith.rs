@@ -213,6 +213,21 @@ impl U256 {
         Some((quotient, remainder))
     }
 
+    /// `arith_uint256::getdouble` — the value as a double, used by
+    /// `networkhashps`-style reporting. Not part of consensus math.
+    #[must_use]
+    pub fn to_f64(self) -> f64 {
+        let mut ret = 0.0f64;
+        let mut factor = 1.0f64;
+        for word in self.0 {
+            // Match Core's 32-bit-word accumulation exactly.
+            ret += factor * (word & 0xffff_ffff) as f64;
+            ret += factor * 4_294_967_296.0 * (word >> 32) as f64;
+            factor *= 18_446_744_073_709_551_616.0; // 2^64
+        }
+        ret
+    }
+
     /// Shifts left by `shift` bits. Shifts of 256 or more return zero rather than panicking.
     ///
     /// This is an inherent method (per the crate specification) rather than an implementation

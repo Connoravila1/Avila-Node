@@ -202,12 +202,16 @@ operation. Compare complete initial download and catch-up, not only local replay
   per-session `.cookie` (Core format, 0600, HTTP Basic, 401 without
   it, removed on shutdown) plus the `avila-node rpc` client. The
   compatibility matrix has a tested start: `tools/compare_rpc.py`
-  diffs every shared field against a live Knots daemon — 13 methods
-  exact-match (getblocktemplate is a 22-field exact match), zero
-  value disagreements; presence-only gaps are documented in
-  `experiments/2026-09-14-rpc-compat-matrix.md` (scriptPubKey
-  classification, per-peer byte/ping telemetry, `networkhashps`,
-  Knots-specific policy knobs). Fee information started:
+  diffs every shared field against a live Knots daemon — 21 calls
+  exact-match including `decodescript` (asm, descriptor checksums,
+  P2SH/segwit wraps), `gettxout`, `getblock` verbosity 2,
+  `getblocktemplate` (22 fields) and `getmininginfo` (incl.
+  `networkhashps` via 256-bit chainwork division). The only value
+  divergence is `fullrbf` (we enforce BIP125 signaling; Knots runs
+  full-RBF); presence-only gaps are documented in
+  `experiments/2026-09-14-rpc-compat-matrix.md` (per-peer byte/ping
+  telemetry, `localaddresses`, Knots-specific policy knobs). Fee
+  information started:
   `FeeEstimator` records (rate, blocks-to-confirm) samples and
   `estimatesmartfee` serves any target with data, erroring honestly
   when the sample set is empty.

@@ -484,20 +484,122 @@ fn header_json(cs: &Chainstate, node: &HeaderNode) -> Value {
     out
 }
 
-/// Minimal `scriptPubKey`/`scriptSig` decode — hex only; type/address
-/// classification is not implemented yet.
+/// `scriptPubKey` in Core's `ScriptPubKeyToUniv` shape: asm rendering,
+/// type classification, the address where the template carries one,
+/// and the `addr(...)`/`raw(...)` descriptor form Core emits for bare
+/// scripts (InferDescriptor without key material).
+fn script_pubkey_json(
+    script: &avila_consensus::transaction::Script,
+    params: &avila_consensus::params::Params,
+) -> Value {
+    let mut out = json!({
+        "asm": script.asm(),
+        "desc": avila_consensus::descriptor::script_desc(script, params),
+        "hex": hex::encode(script.as_bytes()),
+        "type": script.classify().name(),
+    });
+    if let Some(addr) = avila_consensus::address::script_address(script, params) {
+        out["address"] = json!(addr);
+    }
+    out
+}
+
+/// `scriptSig` decode — asm + hex only; input scripts never carry an
+/// address.
 fn script_json(script: &avila_consensus::transaction::Script) -> Value {
-    json!({"hex": hex::encode(script.as_bytes())})
+    json!({
+        "asm": script.asm(),
+        "hex": hex::encode(script.as_bytes()),
+    })
+}
+
+/// Core's `decodescript`: the `script_pubkey_json` decode plus the
+/// P2SH and segwit wrap addresses for scripts that could occupy those
+/// wrappers. The wraps are omitted for unspendable scripts
+/// (`OP_RETURN`, oversize), scripts with invalid opcodes, P2SH
+/// itself, and — for `segwit` — any script that already is a witness
+/// program (v1+ programs suppress `p2sh` as well: there is no
+/// deployed P2SH-v1+ wrap form).
+fn decodescript_json(
+    script: &avila_consensus::transaction::Script,
+    params: &avila_consensus::params::Params,
+) -> Value {
+    use avila_consensus::script::ScriptType;
+
+    let mut out = script_pubkey_json(script, params);
+    // Core's decodescript drops the top-level hex echo (the input is
+    // already the hex); the wrapped segwit form keeps its own hex.
+    if let Some(obj) = out.as_object_mut() {
+        obj.remove("hex");
+    }
+    if !script.has_valid_ops() || script.is_unspendable() {
+        return out;
+    }
+    let class = script.classify();
+    let p2sh_of = |s: &avila_consensus::transaction::Script| {
+        avila_consensus::address::base58check(
+            params.base58_script_prefix,
+            &avila_consensus::hash::hash160(s.as_bytes()),
+        )
+    };
+    let is_p2sh = matches!(class, ScriptType::ScriptHash(_));
+    let witness_version = match &class {
+        ScriptType::Witness { version, .. } => Some(*version),
+        _ => None,
+    };
+    if !is_p2sh && witness_version.is_none_or(|v| v == 0) {
+        out["p2sh"] = json!(p2sh_of(script));
+    }
+    if !is_p2sh && witness_version.is_none() {
+        // The segwit wrap: P2PKH reuses its key hash, bare pubkey
+        // hashes to one, and everything else becomes a v0 scripthash
+        // of the script itself.
+        let subscript = match &class {
+            ScriptType::PubKeyHash(hash) => {
+                let mut b = vec![0x00, 0x14];
+                b.extend_from_slice(hash);
+                Script::new(b)
+            }
+            ScriptType::PubKey(key) => {
+                let mut b = vec![0x00, 0x14];
+                b.extend_from_slice(&avila_consensus::hash::hash160(key));
+                Script::new(b)
+            }
+            _ => {
+                let mut b = vec![0x00, 0x20];
+                b.extend_from_slice(&avila_consensus::hash::sha256(script.as_bytes()));
+                Script::new(b)
+            }
+        };
+        let mut segwit = script_pubkey_json(&subscript, params);
+        // A wrapped multisig keeps its inferred inner descriptor —
+        // wsh(multi(...)) — while hash-only wraps degrade to addr().
+        if let ScriptType::Multisig { required, keys } = &class {
+            let hexes = keys
+                .iter()
+                .map(|k| hex::encode(k))
+                .collect::<Vec<_>>()
+                .join(",");
+            let body = format!("wsh(multi({required},{hexes}))");
+            segwit["desc"] = json!(format!(
+                "{body}#{}",
+                avila_consensus::descriptor::descriptor_checksum(&body)
+            ));
+        }
+        segwit["p2sh-segwit"] = json!(p2sh_of(&subscript));
+        out["segwit"] = segwit;
+    }
+    out
 }
 
 /// A decoded transaction in Core's `getrawtransaction`/`getblock`
-/// verbosity-2 shape, minus fields we don't compute yet (`asm`,
-/// `type`, `addresses`, `vout` spends).
-fn tx_json(tx: &Transaction) -> Value {
+/// verbosity-2 shape (`vout` spends omitted).
+fn tx_json(tx: &Transaction, params: &avila_consensus::params::Params) -> Value {
     let weight = tx.weight();
     json!({
         "txid": tx.txid().to_string(),
         "hash": tx.wtxid().to_string(),
+        "hex": hex::encode(&tx.encode()),
         "version": tx.version,
         "size": tx.size_with_witness(),
         "vsize": weight.div_ceil(4),
@@ -533,7 +635,7 @@ fn tx_json(tx: &Transaction) -> Value {
             json!({
                 "value": out.value as f64 / 100_000_000.0,
                 "n": n,
-                "scriptPubKey": script_json(&out.script_pubkey),
+                "scriptPubKey": script_pubkey_json(&out.script_pubkey, params),
             })
         }).collect::<Vec<_>>(),
     })
@@ -617,7 +719,7 @@ fn dispatch(
                 .unwrap_or(Value::Null),
             None,
         ),
-        "getblockchaininfo" => chain_query(queries, |cs, mgr| {
+        "getblockchaininfo" => chain_query(queries, |cs, _mgr| {
             let tip = cs.tip_hash();
             let connected = cs.chain().len().saturating_sub(1) as u32;
             let best_header = cs.tree().tip();
@@ -662,11 +764,27 @@ fn dispatch(
                 "chainwork": node.chainwork.0.to_hex(),
                 "size_on_disk": size_on_disk,
                 "pruned": cs.store().and_then(|s| s.pruned_through()).is_some(),
-                "warnings": "",
-                "peers": mgr.len(),
-                "localobservation": true,
+                "warnings": [],
             }))
         }),
+        "decodescript" => {
+            let Some(hexstr) = param(params, 0, "hexstring").and_then(Value::as_str) else {
+                return missing_params("hexstring");
+            };
+            let Ok(bytes) = hex::decode(hexstr) else {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_INVALID_PARAMETER,
+                        format!("argument must be hexadecimal string (not '{hexstr}')"),
+                    )),
+                );
+            };
+            let script = Script::new(bytes);
+            chain_query(queries, move |cs, _| {
+                Ok(decodescript_json(&script, cs.tree().params()))
+            })
+        }
         "getblockhash" => {
             let Some(height) = param(params, 0, "height").and_then(Value::as_u64) else {
                 return missing_params("height");
@@ -738,7 +856,13 @@ fn dispatch(
                                     .collect::<Vec<_>>()
                             )
                         } else {
-                            json!(block.transactions.iter().map(tx_json).collect::<Vec<_>>())
+                            json!(
+                                block
+                                    .transactions
+                                    .iter()
+                                    .map(|tx| tx_json(tx, cs.tree().params()))
+                                    .collect::<Vec<_>>()
+                            )
                         };
                         Ok(out)
                     }
@@ -787,7 +911,10 @@ fn dispatch(
                             "bestblock": cs.tip_hash().to_string(),
                             "confirmations": tip - coin.height + 1,
                             "value": coin.out.value as f64 / 100_000_000.0,
-                            "scriptPubKey": script_json(&coin.out.script_pubkey),
+                            "scriptPubKey": script_pubkey_json(
+                                &coin.out.script_pubkey,
+                                cs.tree().params(),
+                            ),
                             "coinbase": coin.coinbase,
                         }))
                     }
@@ -836,7 +963,7 @@ fn dispatch(
                 match verbosity {
                     0 => Ok(json!(hex::encode(&tx.encode()))),
                     1 | 2 => {
-                        let mut out = tx_json(&tx);
+                        let mut out = tx_json(&tx, cs.tree().params());
                         if let Some(bh) = in_block
                             && let Some(node) = cs.tree().get(&bh)
                         {
@@ -909,7 +1036,8 @@ fn dispatch(
             let bytes = pool.total_tx_bytes();
             // BTC-denominated fields like Core's: our counters are
             // satoshis, so convert.
-            let relay_btc = pool.min_relay_fee() as f64 / 100_000_000.0;
+            let sat_to_btc = |sat_per_kvb: i64| sat_per_kvb as f64 / 100_000_000.0;
+            let relay_btc = sat_to_btc(pool.min_relay_fee());
             Ok(json!({
                 "loaded": true,
                 "size": pool.len(),
@@ -922,9 +1050,11 @@ fn dispatch(
                 // the configured relay floor until that lands.
                 "mempoolminfee": relay_btc,
                 "minrelaytxfee": relay_btc,
+                "incrementalrelayfee": sat_to_btc(avila_mempool::INCREMENTAL_RELAY_FEE),
+                // Our replacement rule is BIP125 opt-in signaling, not
+                // Core's mempoolfullrbf — the honest answer is false.
+                "fullrbf": false,
                 "unbroadcastcount": 0,
-                "orphans": pool.orphan_count(),
-                "fee_estimate_6blk_sat_per_kvb": pool.estimate_fee(6),
             }))
         }),
         "getchaintips" => chain_query(queries, |cs, _| {
@@ -1235,8 +1365,12 @@ fn dispatch(
             ))
         }),
         "getmininginfo" => chain_query(queries, |cs, mgr| {
+            // Core's getmininginfo reports on the connected tip
+            // (ActiveTip), not the best header.
             let tip = cs.tip_hash();
-            let node = cs.tree().tip();
+            let Some(node) = cs.tree().get(&tip) else {
+                return Err((RPC_MISC_ERROR, "tip not indexed".into()));
+            };
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as u32)
@@ -1251,17 +1385,59 @@ fn dispatch(
                 cs.tree(),
             )
             .ok();
+            // `currentblock*` describes the candidate Core refreshes in
+            // the background — we build it on demand and report its
+            // size/weight/tx count honestly.
+            let current = mgr
+                .mempool_ref()
+                .build_template(cs, Script::new(vec![avila_consensus::script::OP_1]), now)
+                .ok();
+            // networkhashps — Core's GetNetworkHashPS(120, tip): chainwork
+            // delta over the window divided by its time span; 0 when the
+            // chain is shorter than the window or the window is
+            // timestamp-degenerate.
+            const HASHPS_LOOKUP: u32 = 120;
+            let networkhashps = if node.height < HASHPS_LOOKUP {
+                0.0
+            } else {
+                let start_h = node.height - HASHPS_LOOKUP;
+                let base = cs.tree().get_ancestor(&tip, start_h);
+                let (mut min_t, mut max_t) = (node.header.time, node.header.time);
+                for h in start_h..node.height {
+                    if let Some(n) = cs
+                        .chain()
+                        .get(h as usize)
+                        .and_then(|hash| cs.tree().get(hash))
+                    {
+                        min_t = min_t.min(n.header.time);
+                        max_t = max_t.max(n.header.time);
+                    }
+                }
+                match base {
+                    Some(base) if min_t != max_t => {
+                        // Core: (workDiff as double) / timeDiff — a
+                        // floating quotient, not integer division.
+                        node.chainwork
+                            .0
+                            .checked_sub(base.chainwork.0)
+                            .map(|w| w.to_f64() / f64::from(max_t - min_t))
+                            .unwrap_or(0.0)
+                    }
+                    _ => 0.0,
+                }
+            };
             let mut out = json!({
                 "blocks": node.height,
-                "currentblockweight": null,
-                "currentblocktx": mgr.mempool_ref().len(),
+                "currentblocksize": current.as_ref().map(|t| t.block.encode().len()).unwrap_or(0),
+                "currentblockweight": current.as_ref().map(|t| t.weight).unwrap_or(0),
+                "currentblocktx": current.as_ref().map(|t| t.tx_count).unwrap_or(0),
                 "difficulty": difficulty(node.header.bits.0),
                 "bits": format!("{:08x}", node.header.bits.0),
                 "target": node.header.bits.expand().value.to_hex(),
-                "bestblockhash": tip.to_string(),
+                "networkhashps": networkhashps,
                 "pooledtx": mgr.mempool_ref().len(),
                 "chain": format!("{:?}", cs.tree().params().network).to_lowercase(),
-                "warnings": "",
+                "warnings": [],
             });
             if let Some(bits) = next {
                 out["next"] = json!({
@@ -1273,7 +1449,7 @@ fn dispatch(
             }
             Ok(out)
         }),
-        "getnetworkinfo" => chain_query(queries, |cs, mgr| {
+        "getnetworkinfo" => chain_query(queries, |_cs, mgr| {
             let snaps = mgr.peer_snapshots();
             let inbound = snaps.iter().filter(|p| p.inbound).count();
             // What we offer the network — NODE_NETWORK | NODE_WITNESS.
@@ -1309,10 +1485,9 @@ fn dispatch(
                 "connections": mgr.len(),
                 "connections_in": inbound,
                 "connections_out": mgr.len() - inbound,
-                "network": format!("{:?}", cs.tree().params().network).to_lowercase(),
                 "relayfee": mgr.mempool_ref().min_relay_fee() as f64 / 100_000_000.0,
-                "incrementalfee": mgr.mempool_ref().min_relay_fee() as f64 / 100_000_000.0,
-                "warnings": "",
+                "incrementalfee": avila_mempool::INCREMENTAL_RELAY_FEE as f64 / 100_000_000.0,
+                "warnings": [],
             }))
         }),
         "getconnectioncount" => (json!(snap.peers), None),
@@ -1354,7 +1529,7 @@ fn dispatch(
                  \x20 chain: getblockcount, getbestblockhash, getblockchaininfo, getchaintips,\n\
                  \x20   getblockhash <height>, getblockheader <hash> [verbose],\n\
                  \x20   getblock <hash> [verbosity 0-2], getrawtransaction <txid> [verbosity] [blockhash],\n\
-                 \x20   gettxout <txid> <n> [include_mempool]\n\
+                 \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>\n\
                  \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
                  \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
                  \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>\n\
@@ -1677,5 +1852,116 @@ mod tests {
         assert_eq!(r["connections_in"], 0);
         assert_eq!(r["connections_out"], 0);
         assert_eq!(r["localservicesnames"], json!(["NETWORK", "WITNESS"]));
+    }
+
+    /// Every expected string below is verbatim Knots 29.3
+    /// `decodescript` output on regtest — asm, desc (with checksum),
+    /// type, and address all compared against the real thing.
+    #[test]
+    fn script_pubkey_json_matches_core_shapes() {
+        use avila_consensus::transaction::Script;
+        let params = Network::Regtest.params();
+        let decode = |hexstr: &str| {
+            let script = Script::new(avila_consensus::hex::decode(hexstr).unwrap());
+            script_pubkey_json(&script, &params)
+        };
+
+        let p2pkh = decode("76a914ba602196720c6f0c47c823e106405d9b0dc71dc088ac");
+        assert_eq!(p2pkh["type"], "pubkeyhash");
+        assert_eq!(p2pkh["address"], "mxWR93hymS6qTPxA5oa9LrX6nUCEPnu9wm");
+        assert_eq!(
+            p2pkh["asm"],
+            "OP_DUP OP_HASH160 ba602196720c6f0c47c823e106405d9b0dc71dc0 OP_EQUALVERIFY OP_CHECKSIG"
+        );
+        assert_eq!(
+            p2pkh["desc"],
+            "addr(mxWR93hymS6qTPxA5oa9LrX6nUCEPnu9wm)#3935e2kq"
+        );
+
+        let p2sh = decode("a914eb2940a3d86327415123af1dc3ff8d3e349af46487");
+        assert_eq!(p2sh["type"], "scripthash");
+        assert_eq!(p2sh["address"], "2NEgeCdxfyXSUB8D2TDez9WTC5YV3LJxE9i");
+        assert_eq!(
+            p2sh["desc"],
+            "addr(2NEgeCdxfyXSUB8D2TDez9WTC5YV3LJxE9i)#957866pd"
+        );
+
+        let p2wpkh = decode("00142ef0abe149d195f81afe34f9c8a5b296947bb25d");
+        assert_eq!(p2wpkh["type"], "witness_v0_keyhash");
+        assert_eq!(
+            p2wpkh["address"],
+            "bcrt1q9mc2hc2f6x2lsxh7xnuu3fdjj628hvjatzgxcr"
+        );
+        assert_eq!(p2wpkh["asm"], "0 2ef0abe149d195f81afe34f9c8a5b296947bb25d");
+
+        let p2wsh = decode("0020651d283f80f9673099142e0c4d7f4367e3bf87f3b6e75f3d00e17540d1f4f96f");
+        assert_eq!(p2wsh["type"], "witness_v0_scripthash");
+        assert_eq!(
+            p2wsh["address"],
+            "bcrt1qv5wjs0uql9nnpxg59cxy6l6rvl3mlplnkmn470gqu965p505l9hsvmeu5k"
+        );
+
+        let p2tr = decode("51201d4ade4c044494c4d01633a5595d9b5e1660f8ea81e60564c5377b3f8cc5a2fb");
+        assert_eq!(p2tr["type"], "witness_v1_taproot");
+        assert_eq!(
+            p2tr["address"],
+            "bcrt1pr49dunqygj2vf5qkxwj4jhvmtctxp782s8nq2ex9xaanlrx95tasaxw9kg"
+        );
+        assert_eq!(
+            p2tr["asm"],
+            "1 1d4ade4c044494c4d01633a5595d9b5e1660f8ea81e60564c5377b3f8cc5a2fb"
+        );
+        assert_eq!(
+            p2tr["desc"],
+            "rawtr(1d4ade4c044494c4d01633a5595d9b5e1660f8ea81e60564c5377b3f8cc5a2fb)#wt50qs67"
+        );
+
+        // Bare pubkey: no address, pk() descriptor.
+        let p2pk = decode("2102aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac");
+        assert_eq!(p2pk["type"], "pubkey");
+        assert!(p2pk.get("address").is_none());
+        assert_eq!(
+            p2pk["desc"],
+            "pk(02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)#rkg34naf"
+        );
+
+        // Bare 1-of-2 multisig: no address, multi() descriptor.
+        let multi = decode(
+            "512102aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+             2103bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb52ae",
+        );
+        assert_eq!(multi["type"], "multisig");
+        assert!(multi.get("address").is_none());
+        assert_eq!(
+            multi["desc"],
+            "multi(1,02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,\
+03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)#wcrrdnej"
+        );
+
+        // An unknown witness program still gets an address (bech32m).
+        let wunknown = decode("600228e0");
+        assert_eq!(wunknown["type"], "witness_unknown");
+        assert_eq!(wunknown["address"], "bcrt1s9rsqjg3vuy");
+        assert_eq!(wunknown["asm"], "16 -24616");
+        assert_eq!(wunknown["desc"], "addr(bcrt1s9rsqjg3vuy)#k0y40j9r");
+
+        // OP_RETURN carries no address — desc is raw(hex).
+        let nulldata = decode("6a0b68656c6c6f20776f726c64");
+        assert_eq!(nulldata["type"], "nulldata");
+        assert!(nulldata.get("address").is_none());
+        assert_eq!(nulldata["asm"], "OP_RETURN 68656c6c6f20776f726c64");
+        assert_eq!(nulldata["desc"], "raw(6a0b68656c6c6f20776f726c64)#hcyqe6dc");
+
+        let empty = script_pubkey_json(&Script::new(Vec::new()), &params);
+        assert_eq!(empty["type"], "nonstandard");
+        assert_eq!(empty["asm"], "");
+        assert_eq!(empty["desc"], "raw()#58lrscpx");
+
+        // 0xff is OP_INVALIDOPCODE — a real opcode byte, not a
+        // truncated push.
+        let malformed = decode("51ff");
+        assert_eq!(malformed["asm"], "1 OP_INVALIDOPCODE");
+        assert_eq!(malformed["type"], "nonstandard");
+        assert_eq!(malformed["desc"], "raw(51ff)#297em9yk");
     }
 }

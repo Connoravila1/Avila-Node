@@ -3,12 +3,14 @@
 //! This crate performs no filesystem, socket, clock, or GUI operations. Time is
 //! always an explicit input. Every decoder is bounded by its input length.
 
+pub mod address;
 pub mod arith;
 pub mod block;
 pub mod chain;
 pub mod chainstate;
 pub mod check;
 pub mod connect;
+pub mod descriptor;
 pub mod encode;
 pub mod hash;
 pub mod header;
