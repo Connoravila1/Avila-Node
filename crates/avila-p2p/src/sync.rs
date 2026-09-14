@@ -319,6 +319,20 @@ impl PeerSync {
         }
     }
 
+    /// `notfound` clears matching in-flight slots — the peer answered, it
+    /// just doesn't have the data (e.g. pruned nodes serving recent
+    /// history only). Returns the hashes released this way.
+    pub fn on_notfound(&mut self, invs: &[InvVector]) -> Vec<BlockHash> {
+        let mut released = Vec::new();
+        for inv in invs {
+            if self.clear_in_flight(&inv.hash) {
+                released.push(inv.hash);
+            }
+            self.wanted.remove(&inv.hash);
+        }
+        released
+    }
+
     /// `true` if the oldest in-flight block request has gone unanswered
     /// past [`BLOCK_STALLING_TIMEOUT`] — the caller should evict the peer
     /// and requeue its blocks elsewhere.
@@ -546,6 +560,39 @@ mod tests {
         }
         assert_eq!(sync.in_flight(), 0);
         assert_eq!(cs.tip_hash(), blocks[2].block_hash());
+    }
+
+    #[test]
+    fn notfound_releases_in_flight_slots() {
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 3);
+        let mut sync = PeerSync::new();
+        let hashes: Vec<BlockHash> = blocks.iter().map(|b| b.block_hash()).collect();
+        let _ = sync.want_blocks(&cs, &hashes);
+        assert_eq!(sync.in_flight(), 3);
+
+        // Peer can't serve the first two (e.g. pruned) — slots release and
+        // the fill pass can hand them to someone else.
+        let released = sync.on_notfound(&[
+            InvVector {
+                inv_type: InvType::WitnessBlock,
+                hash: hashes[0],
+            },
+            InvVector {
+                inv_type: InvType::WitnessBlock,
+                hash: hashes[1],
+            },
+        ]);
+        assert_eq!(released.len(), 2);
+        assert_eq!(sync.in_flight(), 1);
+        assert!(!sync.stalled());
+
+        // The released hashes are requestable again.
+        let req = sync.want_blocks(&cs, &hashes);
+        match req {
+            Some(Message::GetData(want)) => assert_eq!(want.len(), 2),
+            other => panic!("expected getdata, got {other:?}"),
+        }
     }
 
     #[test]

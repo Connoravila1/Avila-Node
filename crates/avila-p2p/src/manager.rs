@@ -92,6 +92,10 @@ pub struct PeerManager<S> {
     peers: HashMap<u64, PeerEntry<S>>,
     next_id: u64,
     max_peers: usize,
+    /// The peer currently paging `getheaders` — only it continues pages;
+    /// others get one locator to learn their view. Core's sync-peer
+    /// discipline: N parallel header downloads fetch the same ranges.
+    headers_leader: Option<u64>,
     /// Gossiped peer addresses — discovery lives here.
     addrbook: AddrBook,
 }
@@ -104,6 +108,7 @@ impl<S: Read + Write> PeerManager<S> {
             peers: HashMap::new(),
             next_id: 0,
             max_peers,
+            headers_leader: None,
             addrbook: AddrBook::new(),
         }
     }
@@ -169,7 +174,10 @@ impl<S: Read + Write> PeerManager<S> {
         let mut events = Vec::new();
         let mut dead = Vec::new();
         let Self {
-            peers, addrbook, ..
+            peers,
+            addrbook,
+            headers_leader,
+            ..
         } = self;
         for (&id, peer) in peers.iter_mut() {
             if let Err(e) = peer.session.check_handshake_timeout() {
@@ -180,7 +188,17 @@ impl<S: Read + Write> PeerManager<S> {
                 Ok(peer_events) => {
                     for event in peer_events {
                         peer.last_rx = Instant::now();
-                        Self::dispatch(id, peer, event, cs, now, addrbook, &mut events, &mut dead);
+                        Self::dispatch(
+                            id,
+                            peer,
+                            event,
+                            cs,
+                            now,
+                            addrbook,
+                            headers_leader,
+                            &mut events,
+                            &mut dead,
+                        );
                     }
                 }
                 Err(e) => dead.push((id, DisconnectReason::Session(e.to_string()))),
@@ -199,6 +217,9 @@ impl<S: Read + Write> PeerManager<S> {
         }
         for (id, reason) in dead {
             self.peers.remove(&id);
+            if self.headers_leader == Some(id) {
+                self.headers_leader = None;
+            }
             events.push(NetEvent::Disconnected { peer: id, reason });
         }
         self.fill_queues(cs);
@@ -210,6 +231,15 @@ impl<S: Read + Write> PeerManager<S> {
     /// Peers that stall or leave simply stop holding reservations, so an
     /// interrupted download resumes through this pass automatically.
     fn fill_queues(&mut self, cs: &Chainstate) {
+        // Leaderless and connected: the first established peer resumes
+        // headers paging from our tip (locator-based, so cheap).
+        if self.headers_leader.is_none()
+            && let Some((&id, peer)) = self.peers.iter_mut().find(|(_, p)| p.session.established())
+        {
+            self.headers_leader = Some(id);
+            let req = peer.sync.request_headers(cs);
+            let _ = peer.session.send(&req);
+        }
         let mut reserved: std::collections::HashSet<BlockHash> = self
             .peers
             .values()
@@ -217,7 +247,6 @@ impl<S: Read + Write> PeerManager<S> {
             .collect();
         for peer in self.peers.values_mut() {
             if !peer.session.established()
-                || peer.sync.awaiting_headers()
                 || peer.sync.stalled()
                 || peer.sync.in_flight() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER
             {
@@ -251,6 +280,7 @@ impl<S: Read + Write> PeerManager<S> {
         cs: &mut Chainstate,
         now: u32,
         addrbook: &mut AddrBook,
+        headers_leader: &mut Option<u64>,
         events: &mut Vec<NetEvent>,
         dead: &mut Vec<(u64, DisconnectReason)>,
     ) {
@@ -279,7 +309,13 @@ impl<S: Read + Write> PeerManager<S> {
                 match peer.sync.on_headers(cs, &headers, now) {
                     Ok(outcome) => {
                         if let Some(next) = outcome.continuation {
-                            let _ = peer.session.send(&next);
+                            // Only the headers leader keeps paging — Core
+                            // pulls headers from one sync peer; other peers'
+                            // first pages still validated above.
+                            if headers_leader.is_none_or(|l| l == id) {
+                                *headers_leader = Some(id);
+                                let _ = peer.session.send(&next);
+                            }
                         }
                         if !outcome.fetchable.is_empty()
                             && let Some(req) = peer.sync.want_blocks(cs, &outcome.fetchable)
@@ -334,6 +370,11 @@ impl<S: Read + Write> PeerManager<S> {
                         break; // send budget exhausted — drop the rest
                     }
                 }
+            }
+            SessionEvent::Message(Message::NotFound(invs)) => {
+                // The peer can't serve these — release the slots so the
+                // fill pass reassigns them to another peer.
+                peer.sync.on_notfound(&invs);
             }
             SessionEvent::Message(Message::GetAddr) => {
                 let entries = addrbook
@@ -835,19 +876,14 @@ mod tests {
         let (mut peer_b, _id_b) = add_peer(&mut mgr);
         handshake(&mut mgr, &mut peer_a, &mut cs);
         handshake_peer(&mut mgr, &mut peer_b, &mut cs);
-        testpipe::drain(&mut peer_a, MAGIC);
-        testpipe::drain(&mut peer_b, MAGIC);
         // Both peers conclude their headers phase.
         testpipe::inject(&mut peer_a, MAGIC, &Message::Headers(vec![]));
         testpipe::inject(&mut peer_b, MAGIC, &Message::Headers(vec![]));
-        mgr.tick(&mut cs, NOW);
-        testpipe::drain(&mut peer_a, MAGIC);
-        testpipe::drain(&mut peer_b, MAGIC);
 
-        mgr.tick(&mut cs, NOW);
-        let sent_a = testpipe::drain(&mut peer_a, MAGIC);
-        let sent_b = testpipe::drain(&mut peer_b, MAGIC);
-        let reqs = |msgs: &[Message]| -> usize {
+        // Collect every getdata both pipes receive over a few ticks —
+        // the fill pass may have queued A's request while B was still
+        // handshaking, so tally across all drains, not one.
+        let count_getdata = |msgs: &[Message]| -> usize {
             msgs.iter()
                 .filter_map(|m| match m {
                     Message::GetData(vs) => Some(vs.len()),
@@ -855,9 +891,14 @@ mod tests {
                 })
                 .sum()
         };
-        let (ra, rb) = (reqs(&sent_a), reqs(&sent_b));
+        let mut requested = 0usize;
+        for _ in 0..4 {
+            mgr.tick(&mut cs, NOW);
+            requested += count_getdata(&testpipe::drain(&mut peer_a, MAGIC));
+            requested += count_getdata(&testpipe::drain(&mut peer_b, MAGIC));
+        }
         // All 4 blocks requested exactly once across the pair.
-        assert_eq!(ra + rb, 4, "a={sent_a:?} b={sent_b:?}");
+        assert_eq!(requested, 4);
     }
 
     #[test]

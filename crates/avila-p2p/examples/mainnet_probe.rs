@@ -20,6 +20,14 @@ fn main() -> Result<(), String> {
         .and_then(|i| std::env::args().nth(i + 1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
+    // --blocks N: after the headers pages, download and connect bodies
+    // h1..=N through the full pipeline (script checks correctly skip —
+    // the blocks are far below assumevalid, as in Core's IBD).
+    let blocks: u32 = std::env::args()
+        .position(|a| a == "--blocks")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let params = Network::Mainnet.params();
     let mut mgr = PeerManager::new(4);
@@ -62,7 +70,8 @@ fn main() -> Result<(), String> {
                 cs.tree().tip_hash()
             );
         }
-        if pages_seen >= pages {
+        let connected = cs.chain().len() as u32 - 1;
+        if pages_seen >= pages && connected >= blocks.max(0) {
             break;
         }
         if start.elapsed() > Duration::from_secs(120) {
@@ -71,8 +80,9 @@ fn main() -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(10));
     }
     println!(
-        "done: {} real mainnet headers validated via Chainstate in {:?}",
+        "done: {} mainnet headers validated, {} blocks connected via Chainstate in {:?}",
         headers_seen,
+        cs.chain().len() - 1,
         start.elapsed()
     );
     Ok(())

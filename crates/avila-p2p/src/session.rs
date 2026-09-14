@@ -239,7 +239,12 @@ impl<S: Read + Write> PeerSession<S> {
     /// Propagates real I/O failures.
     pub fn flush(&mut self) -> Result<(), SessionError> {
         while !self.send_buf.is_empty() {
-            let n = self.stream.write(self.send_buf.make_contiguous())?;
+            let n = match self.stream.write(self.send_buf.make_contiguous()) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break, // try again next poll
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(SessionError::Io(e)),
+            };
             if n == 0 {
                 return Err(SessionError::Io(io::Error::new(
                     io::ErrorKind::WriteZero,
