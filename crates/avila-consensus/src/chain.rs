@@ -244,6 +244,36 @@ impl HeaderTree {
         node
     }
 
+    /// A `getheaders`/`getblocks` locator for the current best tip — Core's
+    /// `LocatorEntries`: the tip, then exponentially larger steps back
+    /// (step 1 for the first 10 ancestors, doubling after), always ending at
+    /// genesis. The peer walks it to find our latest common block.
+    #[must_use]
+    pub fn locator(&self) -> Vec<BlockHash> {
+        let mut have = Vec::with_capacity(32);
+        let mut node = self.tip();
+        let mut step = 1u32;
+        loop {
+            have.push(node.hash());
+            if node.height == 0 {
+                break;
+            }
+            let height = node.height.saturating_sub(step);
+            // `height` < `node.height` and every node in the tree has a full
+            // parent chain back to genesis, so the walk always lands; a
+            // miss would mean index corruption, where ending the locator
+            // early is the safe behavior.
+            let Some(next) = self.get_ancestor(&node.hash(), height) else {
+                break;
+            };
+            node = next;
+            if have.len() > 10 {
+                step = step.saturating_mul(2);
+            }
+        }
+        have
+    }
+
     /// The median time past at `hash` — Core's `CBlockIndex::GetMedianTimePast` applied to
     /// the node: the median of up to [`rules::MEDIAN_TIME_SPAN`] most recent header times,
     /// newest first. `None` if `hash` is not in the tree.
@@ -583,6 +613,42 @@ mod tests {
             acc.checked_add(Work::from_compact(h.bits)).unwrap()
         });
         assert_eq!(tree.tip().chainwork, expected);
+    }
+
+    #[test]
+    fn locator_matches_cores_exponential_stepping() {
+        // Core's LocatorEntries: tip, then 10 step-1 ancestors, then
+        // doubling steps, always ending at genesis.
+        let headers = decode_headers(MAINNET_HEADERS);
+        let tree = tree_over(&headers, Network::Mainnet);
+        let locator = tree.locator();
+
+        // Same shape as LocatorEntries: push current, move back by the
+        // current step, then double the step once >10 entries exist.
+        let mut expected_heights = Vec::new();
+        let mut step = 1u32;
+        let mut cur = 4031u32;
+        loop {
+            expected_heights.push(cur);
+            if cur == 0 {
+                break;
+            }
+            cur = cur.saturating_sub(step);
+            if expected_heights.len() > 10 {
+                step = step.saturating_mul(2);
+            }
+        }
+        assert_eq!(locator.len(), expected_heights.len());
+        for (hash, height) in locator.iter().zip(&expected_heights) {
+            assert_eq!(*hash, headers[*height as usize].hash(), "height {height}");
+        }
+        assert_eq!(*locator.last().unwrap_or(&BlockHash::ZERO), headers[0].hash());
+    }
+
+    #[test]
+    fn locator_on_genesis_only_tree_is_just_genesis() {
+        let tree = HeaderTree::new(Network::Mainnet.params());
+        assert_eq!(tree.locator(), vec![tree.tip_hash()]);
     }
 
     #[test]

@@ -25,9 +25,11 @@
 pub mod codec;
 pub mod message;
 pub mod session;
+pub mod sync;
 
 pub use codec::{Command, FrameDecoder, FrameError, HEADER_LEN, MAX_MESSAGE_PAYLOAD};
 pub use message::{AddrEntry, GetHeaders, InvType, InvVector, Message, NetAddr, Reject, Version};
 pub use session::{
     HANDSHAKE_TIMEOUT, PeerInfo, PeerSession, SessionError, SessionEvent, build_version,
 };
+pub use sync::{BlockOutcome, HeadersOutcome, PeerSync, SyncError};

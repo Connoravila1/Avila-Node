@@ -73,8 +73,29 @@ Storage and synchronization research can use this implementation before P2P is r
 
 ### G3 — Independent network synchronization
 
-- [ ] Implement bounded P2P framing, discovery, lifecycle, acquisition and restart/resume.
-- [ ] Enforce per-peer and global budgets, timeouts, eviction and cancellation.
+- [x] Bounded wire framing and message codecs (`avila-p2p::codec`,
+      `avila-p2p::message`): 4 MiB `MAX_PROTOCOL_MESSAGE_LENGTH`, checksum
+      verification before delivery, network-magic and command-field
+      validation, and the sync-relevant command set (`version`/`verack`,
+      `ping`/`pong`, `sendheaders`/`wtxidrelay`/`sendaddrv2`/`feefilter`,
+      `getheaders`/`headers`, `inv`/`getdata`/`notfound`, `block`/`tx`,
+      `getaddr`/`addr`/`addrv2`, `mempool`, `reject`).
+- [x] Per-peer session state machine (`avila-p2p::session`): Core's
+      `version`/`verack` choreography, handshake timeout, session-layer
+      `ping`→`pong`, per-peer send budget, pre-version drop and
+      post-verack negotiation disconnect.
+- [x] Headers-first acquisition (`avila-p2p::sync` + `HeaderTree::locator`):
+      `getheaders` paging capped at `MAX_HEADERS_RESULTS`, `inv`→`getdata`
+      with `MAX_BLOCKS_IN_TRANSIT_PER_PEER` and `BLOCK_STALLING_TIMEOUT`,
+      witness-aware block requests, and consensus-validated intake.
+      Proven live: `examples/peer_probe` completed a real handshake and a
+      120-block headers-first sync against a Bitcoin Knots v29.3 regtest
+      peer, validating every block through `Chainstate`.
+- [ ] Peer discovery and lifecycle (addr gossip intake, outbound rotation,
+      connection manager).
+- [ ] Multi-peer download scheduling and restart/resume of interrupted
+      downloads.
+- [ ] Global budgets, eviction scoring, and cancellation.
 - [ ] Exercise regtest, signet, testnet4 and mainnet with their required rules.
 - [ ] Implement selected transport/privacy constraints together with traffic paths.
 - [ ] Add real sync, peer and resource observations to CLI and GUI.

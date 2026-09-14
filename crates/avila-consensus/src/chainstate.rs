@@ -307,7 +307,8 @@ impl Chainstate {
 
     /// `true` if `hash`'s body is available — in memory or in the store.
     /// Core's `HaveTxsDownloaded` equivalent under a durable body store.
-    fn have_body(&self, hash: &BlockHash) -> bool {
+    /// The sync layer needs it to decide which announced blocks to fetch.
+    pub fn have_body(&self, hash: &BlockHash) -> bool {
         self.blocks.contains_key(hash)
             || self
                 .store

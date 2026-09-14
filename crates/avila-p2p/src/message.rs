@@ -28,6 +28,14 @@ pub const NODE_P2P_V2: u64 = 1 << 11;
 /// The protocol version we speak — Core v29's `PROTOCOL_VERSION` is 70016.
 pub const PROTOCOL_VERSION: i32 = 70016;
 
+/// `MSG_WITNESS_FLAG` — OR'd into an inv type to request witness data.
+pub const MSG_WITNESS_FLAG: u32 = 0x4000_0000;
+/// `MSG_WITNESS_BLOCK` — a `getdata` type asking for the block with its
+/// witnesses. Requesting plain `MSG_BLOCK` on a segwit chain yields a
+/// witness-stripped serialization that fails the witness-commitment check —
+/// the same rejection Core produces.
+pub const MSG_WITNESS_BLOCK: u32 = MSG_WITNESS_FLAG | 2;
+
 /// A network address as serialized in `version`, `addr` and `addrv2`
 /// payloads. IPv4 peers appear IPv4-mapped, as on the wire.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -91,8 +99,12 @@ pub enum InvType {
     CompactBlock,
     /// `MSG_WTX`.
     Wtx,
-    /// `MSG_WITNESS_FLAG`-combined or otherwise unrecognized — kept for
-    /// round-trip fidelity; the requester, not the codec, assigns meaning.
+    /// `MSG_WITNESS_BLOCK` — a block with witness data.
+    WitnessBlock,
+    /// `MSG_WITNESS_TX` — a transaction by txid, witness serialization.
+    WitnessTx,
+    /// Otherwise unrecognized — kept for round-trip fidelity; the
+    /// requester, not the codec, assigns meaning.
     Other(u32),
 }
 
@@ -104,6 +116,8 @@ impl InvType {
             Self::FilteredBlock => 3,
             Self::CompactBlock => 4,
             Self::Wtx => 5,
+            Self::WitnessBlock => MSG_WITNESS_BLOCK,
+            Self::WitnessTx => MSG_WITNESS_FLAG | 1,
             Self::Other(v) => v,
         }
     }
@@ -257,6 +271,8 @@ fn get_inv_vector(d: &mut Decoder, command: &str) -> Result<InvVector, PayloadEr
         3 => InvType::FilteredBlock,
         4 => InvType::CompactBlock,
         5 => InvType::Wtx,
+        MSG_WITNESS_BLOCK => InvType::WitnessBlock,
+        x if x == MSG_WITNESS_FLAG | 1 => InvType::WitnessTx,
         other => InvType::Other(other),
     };
     let hash = BlockHash::from_bytes(d.read_array::<32>().map_err(|e| payload_err(command, e))?);
@@ -656,7 +672,9 @@ mod tests {
             InvType::Tx,
             InvType::Block,
             InvType::Wtx,
-            InvType::Other(0x4000_0002),
+            InvType::WitnessBlock,
+            InvType::WitnessTx,
+            InvType::Other(0x8000_0002),
         ] {
             let inv = InvVector {
                 inv_type: kind,
