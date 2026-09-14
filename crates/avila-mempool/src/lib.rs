@@ -51,6 +51,9 @@ pub struct MempoolEntry {
     pub vsize: usize,
     /// Arrival time (caller-supplied).
     pub time: u32,
+    /// The chain height when first pooled — the estimator's clock for
+    /// "blocks to confirm" (Core's `nHeight` at acceptance).
+    pub first_seen_height: u32,
 }
 
 /// Why a transaction was refused — the vocabulary Core's
@@ -140,6 +143,75 @@ struct OrphanEntry {
     time: u32,
 }
 
+/// Recent confirmation observations for fee estimation — Core's
+/// `CBlockPolicyEstimator` reduced to a bounded sample ring: each
+/// confirmed tx contributes `(fee rate in sat/kvB, blocks waited)`.
+/// `estimate` returns the median rate among samples that confirmed
+/// within the target — honest "recent blocks at this rate confirmed
+/// that fast" rather than a model.
+pub struct FeeEstimator {
+    /// `(rate sat/kvB, blocks from pool-entry to confirm)`.
+    samples: std::collections::VecDeque<(i64, u32)>,
+    /// Ring capacity — Core's `MAX_BLOCK_HISTORY` analog.
+    capacity: usize,
+}
+
+impl FeeEstimator {
+    /// An empty estimator with a 4096-sample ring.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            samples: std::collections::VecDeque::new(),
+            capacity: 4096,
+        }
+    }
+
+    /// Records one confirmation observation.
+    pub fn observe(&mut self, rate_sat_per_kvb: i64, blocks_to_confirm: u32) {
+        if self.samples.len() >= self.capacity {
+            self.samples.pop_front();
+        }
+        self.samples
+            .push_back((rate_sat_per_kvb, blocks_to_confirm));
+    }
+
+    /// The median fee rate of samples confirmed within `target` blocks,
+    /// or `None` with fewer than 5 qualifying samples — an honest
+    /// "insufficient data" rather than a fabricated rate.
+    #[must_use]
+    pub fn estimate(&self, target_blocks: u32) -> Option<i64> {
+        let mut rates: Vec<i64> = self
+            .samples
+            .iter()
+            .filter(|(_, waited)| *waited <= target_blocks)
+            .map(|(rate, _)| *rate)
+            .collect();
+        if rates.len() < 5 {
+            return None;
+        }
+        rates.sort_unstable();
+        Some(rates[rates.len() / 2])
+    }
+
+    /// Samples held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// No observations yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+}
+
+impl Default for FeeEstimator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A bounded policy pool over the live UTXO set.
 pub struct Mempool {
     /// txid → entry.
@@ -155,6 +227,8 @@ pub struct Mempool {
     max_entries: usize,
     /// Min relay fee rate in sat/kvB.
     min_relay_fee: i64,
+    /// Confirmation observations from connected blocks.
+    estimator: FeeEstimator,
 }
 
 impl Mempool {
@@ -168,6 +242,7 @@ impl Mempool {
             orphans: HashMap::new(),
             max_entries: DEFAULT_MAX_ENTRIES,
             min_relay_fee: DEFAULT_MIN_RELAY_FEE,
+            estimator: FeeEstimator::new(),
         }
     }
 
@@ -696,6 +771,7 @@ impl Mempool {
                 fee,
                 vsize,
                 time: now,
+                first_seen_height: cs.tree().tip().height,
             },
         );
         // Newly pooled outputs may un-orphan parked children — Core's
@@ -853,7 +929,7 @@ impl Mempool {
     /// whose txid the block now confirms — Core's
     /// `removeForBlock`-lite: confirmed txs leave the pool, and so do
     /// conflicts that can no longer confirm.
-    pub fn on_block_connected(&mut self, block: &avila_consensus::block::Block) {
+    pub fn on_block_connected(&mut self, block: &avila_consensus::block::Block, conf_height: u32) {
         let mut dead: Vec<Txid> = Vec::new();
         for tx in &block.transactions {
             let txid = tx.txid();
@@ -870,9 +946,24 @@ impl Mempool {
                 }
             }
         }
+        for id in &dead {
+            // Feed the estimator before removal: (entry rate, wait).
+            if let Some(entry) = self.map.get(id) {
+                let waited = conf_height.saturating_sub(entry.first_seen_height).max(1);
+                self.estimator
+                    .observe(entry.fee * 1000 / entry.vsize.max(1) as i64, waited);
+            }
+        }
         for id in dead {
             self.remove_recursive(&id);
         }
+    }
+
+    /// A fee rate (sat/kvB) that recently confirmed within
+    /// `target_blocks` — `None` means insufficient observations.
+    #[must_use]
+    pub fn estimate_fee(&self, target_blocks: u32) -> Option<i64> {
+        self.estimator.estimate(target_blocks)
     }
 
     /// Re-admits the non-coinbase transactions of a *disconnected* block
@@ -1206,7 +1297,7 @@ mod tests {
             block.header.nonce += 1;
         }
         cs.accept_block(&block, NOW + 200).unwrap();
-        pool.on_block_connected(&block);
+        pool.on_block_connected(&block, 102);
         assert!(pool.is_empty());
     }
 
@@ -1354,7 +1445,7 @@ mod tests {
             }
             other => panic!("template did not connect: {other:?}"),
         }
-        pool.on_block_connected(&block);
+        pool.on_block_connected(&block, 102);
         assert!(pool.is_empty());
     }
 
@@ -1380,5 +1471,22 @@ mod tests {
             .collect();
         assert_eq!(order.len(), 2);
         assert_eq!(order[0], pid, "parent must precede its child");
+    }
+
+    #[test]
+    fn fee_estimate_needs_enough_samples() {
+        let mut est = FeeEstimator::new();
+        assert_eq!(est.estimate(6), None, "no samples → no estimate");
+        for _ in 0..6 {
+            est.observe(5_000, 2);
+        }
+        assert_eq!(est.estimate(6), Some(5_000));
+        // A tighter target than any observation → still enough samples
+        // only if they waited ≤ target.
+        assert_eq!(est.estimate(1), None);
+        for _ in 0..6 {
+            est.observe(2_000, 1);
+        }
+        assert_eq!(est.estimate(1), Some(2_000));
     }
 }

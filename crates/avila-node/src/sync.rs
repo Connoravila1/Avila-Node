@@ -72,8 +72,9 @@ pub struct SyncProgress {
     pub recent: Vec<(u32, avila_consensus::hash::BlockHash)>,
     /// Per-peer views — what each peer claims vs. what it has served.
     pub peer_details: Vec<avila_p2p::manager::PeerSnapshot>,
-    /// Pooled transactions and parked orphans `(pool, orphans)`.
-    pub mempool: (usize, usize),
+    /// Pooled transactions, parked orphans, and the fee estimate for
+    /// ~6-block confirmation in sat/kvB (`None` = insufficient data).
+    pub mempool: (usize, usize, Option<i64>),
 }
 
 /// The outcome of a finished (or timed-out) sync run.
@@ -218,7 +219,11 @@ pub fn run(
             disconnects,
             recent,
             peer_details: mgr.peer_snapshots(),
-            mempool: (mgr.mempool().len(), mgr.mempool().orphan_count()),
+            mempool: (
+                mgr.mempool().len(),
+                mgr.mempool().orphan_count(),
+                mgr.mempool().estimate_fee(6),
+            ),
         });
         if run_progress >= cfg.target_height {
             break;

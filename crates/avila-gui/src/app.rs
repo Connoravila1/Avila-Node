@@ -421,6 +421,10 @@ impl AvilaApp {
                             ui.label(muted(format!("+{} orphans", p.mempool.1)));
                         }
                     }
+                    if let Some(rate) = p.mempool.2 {
+                        ui.label(muted("·"));
+                        ui.label(muted(format!("~{} sat/kvB (6 blk)", rate)));
+                    }
                 } else {
                     ui.label(muted("no chain data"));
                 }

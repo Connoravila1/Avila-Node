@@ -593,7 +593,19 @@ impl<S: Read + Write> PeerManager<S> {
                 match peer.sync.on_block(cs, &block, now) {
                     Ok(outcome) => {
                         peer.last_useful = Instant::now();
-                        mempool.on_block_connected(&block);
+                        let connected_height =
+                            if let avila_consensus::chainstate::Acceptance::Connected {
+                                height,
+                                ..
+                            } = outcome.acceptance
+                            {
+                                Some(height)
+                            } else {
+                                None
+                            };
+                        if let Some(h) = connected_height {
+                            mempool.on_block_connected(&block, h);
+                        }
                         if let avila_consensus::chainstate::Acceptance::Connected {
                             reorged, ..
                         } = outcome.acceptance

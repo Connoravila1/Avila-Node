@@ -172,7 +172,11 @@ operation. Compare complete initial download and catch-up, not only local replay
       capacity) and returns a per-gate trace without mutating the pool.
       Isolated shadow-policy evaluation remains open.
 - [ ] Deliver authenticated/versioned control, a tested Core RPC compatibility matrix,
-  watch-only descriptors, wallet broadcast, fee information and scoped service access.
+  watch-only descriptors, wallet broadcast and scoped service access. Fee
+  information started: `FeeEstimator` records (rate, blocks-to-confirm)
+  samples from connected blocks and `estimate_fee` returns the median
+  confirming rate for a target (surfaced in the GUI ticker); the RPC
+  surface itself is still open.
 - [ ] Deliver Electrum/compact-filter services with tested clients and explicit index coverage.
 - [x] Pruned operation (first slice): `BlockStore::prune_to_bytes`
       deletes the oldest blk files past a byte budget (never the tail);
