@@ -249,6 +249,10 @@ def core_verdict(item):
 
 
 def avila_verdicts(network, path, now):
+    # Some dev-dependency build scripts honor $TMPDIR; keep scratch space in the
+    # workspace where quota is available.
+    tmpdir = os.path.join(REPO, "target", "tmp")
+    os.makedirs(tmpdir, exist_ok=True)
     proc = subprocess.run(
         [
             "cargo",
@@ -268,7 +272,7 @@ def avila_verdicts(network, path, now):
         capture_output=True,
         text=True,
         check=True,
-        env={**os.environ, "TMPDIR": os.environ.get("TMPDIR", "/tmp")},
+        env={**os.environ, "TMPDIR": tmpdir},
     )
     verdicts = []
     for line in proc.stdout.splitlines():

@@ -34,7 +34,8 @@ measurements remain unknown. This gate establishes an application, not a Bitcoin
 
 ### G1 — Consensus fixtures, reference adapter and measurement harness
 
-- [ ] Record the validation-engine decision, trusted dependencies and extraction boundaries.
+- [x] Record the validation-engine decision, trusted dependencies and extraction boundaries.
+  See docs/ARCHITECTURE.md "Validation-engine decision".
 - [x] Implement bounded decoding, transaction/witness identities, headers, target arithmetic,
   proof of work, linkage, chainwork and explicit network parameters.
 - [x] Inventory historical and activated consensus rules with valid/invalid fixtures,
@@ -43,9 +44,11 @@ measurements remain unknown. This gate establishes an application, not a Bitcoin
 - [x] Add a pinned Core reference adapter, parser/arithmetic fuzzing and disagreement artifacts.
   See tools/check_headers_core.py (adapter + per-run reference pin and artifact)
   and fuzz/ (libFuzzer targets).
-- [ ] Implement the scorecard runner: exact manifests, raw measurements, correctness checks,
+- [x] Implement the scorecard runner: exact manifests, raw measurements, correctness checks,
   cold/warm workloads and reproducible reference runs.
-- [ ] Record baseline measurements before selecting hot-path layouts or storage defaults.
+  See tools/scorecard_headers.py; artifacts land in target/scorecard/.
+- [x] Record baseline measurements before selecting hot-path layouts or storage defaults.
+  Header-acceptance baseline: experiments/2026-09-header-acceptance-baseline.md.
 
 Evidence: implemented checks are enumerated, invalid cases fail for the expected
 reason, reference discrepancies have reproducible cases, and another developer can

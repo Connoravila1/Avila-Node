@@ -62,6 +62,36 @@ Evaluate the validation implementation and reference adapter against pinned
 [Bitcoin Core functional tests](https://github.com/bitcoin/bitcoin/tree/master/test/functional)
 and independently sourced valid/invalid fixtures.
 
+### Validation-engine decision (recorded for G1)
+
+**Decision: first-party validation.** `avila-consensus` is the validation
+engine — implemented from Bitcoin Core's consensus code as the specification,
+not by binding to an existing engine. The alternatives were rejected for
+distinct reasons:
+
+- `rust-bitcoin` in the validation path: its own documentation cautions
+  against consensus use; its `Target::from_compact` already diverges from
+  Core on sign-bit-set compact encodings with `size <= 3` (see
+  docs/RULE_INVENTORY.md). It remains a dev-dependency — a differential
+  *reference*, never validation code.
+- `bitcoinkernel` / a Core shared library: cedes the validation boundary to
+  C++ internals, contradicts the unsafe-free workspace policy, and makes
+  per-rule evidence collection harder. The installed `bitcoind` instead
+  serves as the *external* reference through `tools/check_headers_core.py`
+  — a process boundary, not a link boundary.
+
+**Trusted dependencies.** The consensus crate's production dependency surface
+is `sha2` (hashing) and `thiserror` (error derives). `bitcoin`, `proptest`
+and `libfuzzer-sys` are dev/fuzz-only; the `bitcoind` reference daemon and
+Python tooling are developer-time verification and never link into the node.
+
+**Extraction boundary.** `avila-consensus` performs no filesystem, network,
+clock or GUI operations — every contextual input (time, ancestry, params) is
+explicit. Tests, the `check_headers` example and the `fuzz/` workspace sit
+outside the library surface, so the engine can be lifted into other node
+projects intact; the verification harness would need its fixtures and tools,
+which are committed alongside it.
+
 Track the active chain, fully validated history, snapshot assumptions, index coverage
 and connection freshness independently. The distinction between active and background
 chainstates is illustrated by [Core's AssumeUTXO design](https://github.com/bitcoin/bitcoin/blob/master/doc/design/assumeutxo.md).

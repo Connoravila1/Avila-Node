@@ -64,7 +64,7 @@ node best, and missing a stretch target does not invalidate an otherwise useful 
 
 | ID | Dimension and measurement | Initial objective | Evidence / current result |
 | --- | --- | --- | --- |
-| C1 | Consensus acceptance, resulting state, historical/activation rule coverage | Zero unexplained discrepancies in the declared corpus; all required rules covered before readiness | Rule inventory, valid/invalid fixtures, replay, fuzzing and review; **not implemented** |
+| C1 | Consensus acceptance, resulting state, historical/activation rule coverage | Zero unexplained discrepancies in the declared corpus; all required rules covered before readiness | Header-rule layer done: [rule inventory](RULE_INVENTORY.md), fixture corpus with provenance, differential adapter (`tools/check_headers_core.py`) at zero mismatches, libFuzzer harness (`fuzz/`); tx/block/state coverage pending G2 |
 | C2 | Security and adversarial resource use: CPU, memory, disk and queues per hostile workload | Enforce every declared limit, isolate optional services and close discovered failures | Threat model, fault tests, review scope and unresolved findings; **unmeasured** |
 | P1 | Full initial validation: elapsed time, CPU time, work/s | Aim for at least **2× throughput / half elapsed time** with the same checks; network-constrained results reported separately | Fixed historical workload, final state and complete check manifest; **unmeasured** |
 | P2 | Current-tip block validation and reorg processing: p50/p95/p99 latency | Aim for **half p95 latency**, without worse p99 behavior or reduced checks | Ordinary and worst-case blocks/reorgs under background load; **unmeasured** |
