@@ -25,10 +25,12 @@ fn inspection_is_explicit_and_has_no_fake_tip() {
 }
 
 #[test]
-fn run_fails_instead_of_pretending_to_be_a_node() {
+fn run_with_no_peers_fails_honestly() {
+    // `run` is a real daemon now; on regtest with no seeds and no
+    // --connect it must still fail honestly rather than pretend.
     let output = cli().arg("run").output().unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("not implemented"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no peer candidates"));
 }
 
 #[test]
