@@ -227,16 +227,21 @@ impl PeerSync {
             if want.len() >= free {
                 break;
             }
-            // Blocks only — announced as MSG_BLOCK or MSG_WITNESS_BLOCK.
-            // Txs are not fetched: a sync node has no mempool yet.
-            if !matches!(inv.inv_type, InvType::Block | InvType::WitnessBlock) {
+            let is_block = matches!(inv.inv_type, InvType::Block | InvType::WitnessBlock);
+            let is_tx = matches!(
+                inv.inv_type,
+                InvType::Tx | InvType::Wtx | InvType::WitnessTx
+            );
+            if !is_block && !is_tx {
                 continue;
             }
             let hash = inv.hash;
-            // Known header + held body → nothing to fetch. Unknown header →
-            // fetch anyway (the block carries its header and Chainstate
-            // indexes it on acceptance — out-of-order announcements happen).
-            if cs.have_body(&hash) {
+            // Block: known header + held body → nothing to fetch. Unknown
+            // header → fetch anyway (the block carries its header and
+            // Chainstate indexes it on acceptance — out-of-order
+            // announcements happen). Tx: no cheap presence check here —
+            // the mempool dedups on admission by txid.
+            if is_block && cs.have_body(&hash) {
                 continue;
             }
             if self.wanted.insert(hash) {
@@ -245,7 +250,11 @@ impl PeerSync {
                     // MSG_BLOCK response is witness-stripped and fails the
                     // witness-commitment check on segwit chains, exactly as
                     // in Core.
-                    inv_type: InvType::WitnessBlock,
+                    inv_type: if is_block {
+                        InvType::WitnessBlock
+                    } else {
+                        InvType::WitnessTx
+                    },
                     hash,
                 });
             }
@@ -327,6 +336,14 @@ impl PeerSync {
         }
     }
 
+    /// A received `tx` releases its in-flight slot (the hash was
+    /// requested as the txid via `MSG_WITNESS_TX`).
+    pub fn on_tx(&mut self, txid: &avila_consensus::hash::Txid) {
+        let h = BlockHash::from_bytes(*txid.as_bytes());
+        self.clear_in_flight(&h);
+        self.wanted.remove(&h);
+    }
+
     /// `notfound` clears matching in-flight slots — the peer answered, it
     /// just doesn't have the data (e.g. pruned nodes serving recent
     /// history only). Returns the hashes released this way.
@@ -401,7 +418,11 @@ impl PeerSync {
     /// Bounded by the request size — `getdata` payloads are already capped
     /// at `MAX_INV_SZ` by the decoder.
     #[must_use]
-    pub fn serve_getdata(cs: &Chainstate, requests: &[InvVector]) -> Vec<Message> {
+    pub fn serve_getdata(
+        cs: &Chainstate,
+        mempool: Option<&avila_mempool::Mempool>,
+        requests: &[InvVector],
+    ) -> Vec<Message> {
         let mut out = Vec::new();
         let mut missing = Vec::new();
         for inv in requests {
@@ -425,7 +446,29 @@ impl PeerSync {
                         missing.push(*inv);
                     }
                 }
-                _ => missing.push(*inv), // tx serving isn't implemented
+                // A tx request is answered from the mempool — txid or
+                // wtxid both resolve to the pooled transaction; the wire
+                // form is always witness-capable (witness data present
+                // when the tx carries it, matching Core's MSG_WTX/TX
+                // response which never strips).
+                InvType::Tx | InvType::Wtx | InvType::WitnessTx => {
+                    let found = mempool.and_then(|m| {
+                        m.txids()
+                            .iter()
+                            .find(|id| {
+                                *id.as_bytes() == *inv.hash.as_bytes()
+                                    || m.get(id).is_some_and(|t| {
+                                        t.wtxid().as_bytes() == inv.hash.as_bytes()
+                                    })
+                            })
+                            .and_then(|id| m.get(id))
+                    });
+                    match found {
+                        Some(tx) => out.push(Message::Tx(tx.clone())),
+                        None => missing.push(*inv),
+                    }
+                }
+                _ => missing.push(*inv),
             }
         }
         if !missing.is_empty() {
@@ -517,7 +560,7 @@ mod tests {
                 hash: blocks[0].block_hash(),
             },
             InvVector {
-                inv_type: InvType::Tx, // ignored — no mempool
+                inv_type: InvType::Tx, // fetched as witness-tx for the mempool
                 hash: blocks[1].block_hash(),
             },
             InvVector {
@@ -527,12 +570,14 @@ mod tests {
         ];
         match sync.on_inv(&cs, &invs, usize::MAX) {
             Some(Message::GetData(want)) => {
-                assert_eq!(want.len(), 2);
-                assert!(want.iter().all(|v| v.inv_type == InvType::WitnessBlock));
+                assert_eq!(want.len(), 3);
+                assert_eq!(want[0].inv_type, InvType::WitnessBlock);
+                assert_eq!(want[1].inv_type, InvType::WitnessTx);
+                assert_eq!(want[2].inv_type, InvType::WitnessBlock);
             }
             other => panic!("expected getdata, got {other:?}"),
         }
-        assert_eq!(sync.in_flight(), 2);
+        assert_eq!(sync.in_flight(), 3);
         // Same invs again → nothing new to ask for.
         assert!(sync.on_inv(&cs, &invs, usize::MAX).is_none());
     }
@@ -690,7 +735,7 @@ mod tests {
                 hash: unknown,
             },
         ];
-        let out = PeerSync::serve_getdata(&cs, &reqs);
+        let out = PeerSync::serve_getdata(&cs, None, &reqs);
         assert_eq!(out.len(), 2);
         assert!(matches!(&out[0], Message::Block(b) if b.block_hash() == blocks[0].block_hash()));
         match &out[1] {

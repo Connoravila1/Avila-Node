@@ -469,6 +469,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "avila-mempool"
+version = "0.1.0-dev"
+dependencies = [
+ "avila-consensus",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "avila-node"
 version = "0.1.0-dev"
 dependencies = [
@@ -485,6 +493,7 @@ name = "avila-p2p"
 version = "0.1.0-dev"
 dependencies = [
  "avila-consensus",
+ "avila-mempool",
  "thiserror 2.0.20",
 ]
 

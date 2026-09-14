@@ -78,7 +78,7 @@ fn pump<S: std::io::Read + std::io::Write>(
                 session.send(&reply).map_err(|e| e.to_string())?;
             }
             SessionEvent::Message(Message::GetData(reqs)) => {
-                for reply in PeerSync::serve_getdata(cs, &reqs) {
+                for reply in PeerSync::serve_getdata(cs, None, &reqs) {
                     session.send(&reply).map_err(|e| e.to_string())?;
                 }
             }
@@ -193,7 +193,7 @@ fn main() {
                             session.send(&reply).expect("headers reply");
                         }
                         SessionEvent::Message(Message::GetData(reqs)) => {
-                            for reply in PeerSync::serve_getdata(&cs, &reqs) {
+                            for reply in PeerSync::serve_getdata(&cs, None, &reqs) {
                                 if matches!(reply, Message::Block(_)) {
                                     served_blocks += 1;
                                 }

@@ -446,7 +446,15 @@ fn enforce_bip30(height: u32, hash: &BlockHash, ctx: &ConnectContext<'_>) -> boo
 /// tx's fee.
 ///
 /// Read-only against `utxo`; the caller applies the spends after all checks.
-fn check_tx_inputs(
+/// Core's `Consensus::CheckTxInputs` — input resolution, maturity, value
+/// range, and the non-negative fee for `tx` spending `utxo` at
+/// `spend_height`. Returns the spent coins (input order) and the fee.
+///
+/// Public for the mempool's admission path — these are consensus rules,
+/// and mempool admission must apply them identically. Callers outside a
+/// block context supply their own resolved-coin view (e.g. a UTXO overlay
+/// including unconfirmed parents).
+pub fn check_tx_inputs(
     tx: &Transaction,
     utxo: &UtxoSet,
     spend_height: u32,
@@ -508,12 +516,20 @@ fn check_tx_inputs(
 /// (Core's `block.pprev->GetMedianTimePast()`). The caller gates this on CSV
 /// being active at the block's height — inside, version < 2 short-circuits as
 /// unlocked.
-fn bip68_locks_satisfied(
+/// Core's `EvaluateSequenceLocks` result — whether `tx`'s BIP68 relative
+/// locks are satisfied for inclusion at `height` under `parent_mtp`, with
+/// coin-age ancestor lookups resolved against `tree` from `tip` (the block
+/// being extended — for mempool admission, the current tip).
+///
+/// `spent` is `tx`'s consumed coins in input order.
+#[must_use]
+pub fn bip68_locks_satisfied(
     tx: &Transaction,
     spent: &[Coin],
     height: u32,
     parent_mtp: u32,
-    ctx: &ConnectContext<'_>,
+    tree: &HeaderTree,
+    tip: &BlockHash,
 ) -> bool {
     if tx.version < SEQUENCE_LOCKS_MIN_VERSION {
         return true;
@@ -531,10 +547,9 @@ fn bip68_locks_satisfied(
             // height-0 coin), then the masked value in 512-second units, minus
             // one to keep nLockTime's last-invalid semantics.
             let ancestor_height = coin.height.saturating_sub(1);
-            let coin_time = ctx
-                .tree
-                .get_ancestor(&ctx.block_hash, ancestor_height)
-                .and_then(|node| ctx.tree.median_time_past(&node.hash()))
+            let coin_time = tree
+                .get_ancestor(tip, ancestor_height)
+                .and_then(|node| tree.median_time_past(&node.hash()))
                 .map(i64::from);
             let Some(coin_time) = coin_time else {
                 return false;
@@ -682,7 +697,16 @@ pub fn connect_block(
                 if !money_range(fees) {
                     return Err(ConnectError::AccumulatedFeeOutOfRange);
                 }
-                if csv_active && !bip68_locks_satisfied(tx, &spent, height, parent_mtp, ctx) {
+                if csv_active
+                    && !bip68_locks_satisfied(
+                        tx,
+                        &spent,
+                        height,
+                        parent_mtp,
+                        ctx.tree,
+                        &ctx.block_hash,
+                    )
+                {
                     return Err(ConnectError::NotFinal);
                 }
             }

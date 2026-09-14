@@ -123,6 +123,10 @@ pub struct PeerManager<S> {
     max_in_flight_total: usize,
     /// Gossiped peer addresses — discovery lives here.
     addrbook: AddrBook,
+    /// The transaction pool — policy layer owned here so `tx` intake,
+    /// `inv` relay, and block-connect reconciliation stay atomic with
+    /// the tick loop.
+    mempool: avila_mempool::Mempool,
 }
 
 impl<S: Read + Write> PeerManager<S> {
@@ -136,6 +140,7 @@ impl<S: Read + Write> PeerManager<S> {
             headers_leader: None,
             max_in_flight_total: MAX_BLOCKS_IN_TRANSIT_TOTAL,
             addrbook: AddrBook::new(),
+            mempool: avila_mempool::Mempool::new(),
         }
     }
 
@@ -264,9 +269,16 @@ impl<S: Read + Write> PeerManager<S> {
             peers,
             addrbook,
             headers_leader,
+            mempool,
             ..
         } = self;
         let mut announce_tip: Option<u64> = None;
+        // txid/wtxid to relay at end of tick, and the peer it came from.
+        let mut announce_tx: Option<(
+            u64,
+            avila_consensus::hash::Txid,
+            avila_consensus::hash::Wtxid,
+        )> = None;
         for (&id, peer) in peers.iter_mut() {
             if let Err(e) = peer.session.check_handshake_timeout() {
                 dead.push((id, DisconnectReason::Session(e.to_string())));
@@ -285,6 +297,8 @@ impl<S: Read + Write> PeerManager<S> {
                             addrbook,
                             headers_leader,
                             &mut announce_tip,
+                            &mut announce_tx,
+                            mempool,
                             &mut global_free,
                             &mut events,
                             &mut dead,
@@ -338,6 +352,35 @@ impl<S: Read + Write> PeerManager<S> {
                     }
                 };
                 let _ = peer.session.send(&msg);
+            }
+        }
+        // Relay an accepted tx: wtxid inv for wtxidrelay peers, txid
+        // otherwise (Core's BIP339 split); the source peer is excluded.
+        if let Some((source, txid, wtxid)) = announce_tx {
+            for (&id, peer) in &mut self.peers {
+                if id == source || !peer.session.established() {
+                    continue;
+                }
+                let wants_tx = peer.session.peer().is_some_and(|i| i.relay);
+                if !wants_tx {
+                    continue;
+                }
+                let hash = if peer.session.peer().is_some_and(|i| i.wtxid_relay) {
+                    BlockHash::from_bytes(*wtxid.as_bytes())
+                } else {
+                    BlockHash::from_bytes(*txid.as_bytes())
+                };
+                let inv_type = if peer.session.peer().is_some_and(|i| i.wtxid_relay) {
+                    crate::message::InvType::Wtx
+                } else {
+                    crate::message::InvType::Tx
+                };
+                let _ = peer
+                    .session
+                    .send(&Message::Inv(vec![crate::message::InvVector {
+                        inv_type,
+                        hash,
+                    }]));
             }
         }
         self.fill_queues(cs);
@@ -406,6 +449,12 @@ impl<S: Read + Write> PeerManager<S> {
         addrbook: &mut AddrBook,
         headers_leader: &mut Option<u64>,
         announce_tip: &mut Option<u64>,
+        announce_tx: &mut Option<(
+            u64,
+            avila_consensus::hash::Txid,
+            avila_consensus::hash::Wtxid,
+        )>,
+        mempool: &mut avila_mempool::Mempool,
         global_free: &mut usize,
         events: &mut Vec<NetEvent>,
         dead: &mut Vec<(u64, DisconnectReason)>,
@@ -484,6 +533,7 @@ impl<S: Read + Write> PeerManager<S> {
                 match peer.sync.on_block(cs, &block, now) {
                     Ok(outcome) => {
                         peer.last_useful = Instant::now();
+                        mempool.on_block_connected(&block);
                         if let avila_consensus::chainstate::Acceptance::Connected { .. } =
                             outcome.acceptance
                         {
@@ -500,12 +550,22 @@ impl<S: Read + Write> PeerManager<S> {
             SessionEvent::Message(Message::SendHeaders) => {
                 peer.wants_headers_announce = true;
             }
+            SessionEvent::Message(Message::Tx(tx)) => {
+                let wtxid = tx.wtxid();
+                let txid_pre = tx.txid();
+                peer.sync.on_tx(&txid_pre);
+                if let Ok(txid) = mempool.accept_tx(tx, cs, now) {
+                    *announce_tx = Some((id, txid, wtxid));
+                }
+                // Policy/consensus rejects are not misbehavior — the peer
+                // stays (Core disconnects only for a score of them).
+            }
             SessionEvent::Message(Message::GetHeaders(req)) => {
                 let reply = PeerSync::serve_getheaders(cs, &req);
                 let _ = peer.session.send(&reply);
             }
             SessionEvent::Message(Message::GetData(reqs)) => {
-                for reply in PeerSync::serve_getdata(cs, &reqs) {
+                for reply in PeerSync::serve_getdata(cs, Some(mempool), &reqs) {
                     if peer.session.send(&reply).is_err() {
                         break; // send budget exhausted — drop the rest
                     }
@@ -549,6 +609,11 @@ impl<S: Read + Write> PeerManager<S> {
     /// the chainstate so restarts keep their peer candidates).
     pub fn addrbook(&mut self) -> &mut AddrBook {
         &mut self.addrbook
+    }
+
+    /// The transaction pool.
+    pub fn mempool(&mut self) -> &mut avila_mempool::Mempool {
+        &mut self.mempool
     }
 
     /// The peers' ids (for scheduling decisions above this layer).
@@ -1238,6 +1303,75 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(e, NetEvent::TipAdvanced(_))),
             "reorg should surface a tip-advance event: {events:?}"
+        );
+    }
+
+    #[test]
+    fn accepted_tx_relays_to_other_peers() {
+        use avila_consensus::transaction::{OutPoint, Script, TxIn, TxOut, Witness};
+        use avila_consensus::{script, transaction::Transaction};
+
+        let (mut mgr, mut peer_a, _id_a) = managed_peer();
+        let mut cs = regtest();
+        // 101 blocks so the h1 coinbase is mature for a mempool spend.
+        let blocks = chain_blocks(&cs, 101);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        let (mut peer_b, _id_b) = add_peer(&mut mgr);
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        handshake_peer(&mut mgr, &mut peer_b, &mut cs);
+        testpipe::drain(&mut peer_a, MAGIC);
+        testpipe::drain(&mut peer_b, MAGIC);
+        // The empty-headers reply ends both header phases.
+        for p in [&mut peer_a, &mut peer_b] {
+            testpipe::inject(p, MAGIC, &Message::Headers(vec![]));
+        }
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer_a, MAGIC);
+        testpipe::drain(&mut peer_b, MAGIC);
+
+        // A delivers a valid spend of the h1 coinbase (OP_1 outputs are
+        // anyone-can-spend).
+        let op = OutPoint {
+            txid: blocks[0].transactions[0].txid(),
+            vout: 0,
+        };
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: op,
+                script_sig: Script::new(vec![]),
+                sequence: 0xffff_ffff,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 4_999_000_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let txid = tx.txid();
+        testpipe::inject(&mut peer_a, MAGIC, &Message::Tx(tx));
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        assert!(mgr.mempool().get(&txid).is_some(), "tx entered the pool");
+        let sent_b = testpipe::drain(&mut peer_b, MAGIC);
+        assert!(
+            sent_b.iter().any(|m| matches!(
+                m,
+                Message::Inv(vs)
+                    if vs.iter().any(|v| v.inv_type == crate::message::InvType::Tx
+                        && v.hash.as_bytes() == txid.as_bytes())
+            )),
+            "B should get an inv for the tx: {sent_b:?}"
+        );
+        // The source peer is not re-announced its own tx.
+        let sent_a = testpipe::drain(&mut peer_a, MAGIC);
+        assert!(
+            !sent_a.iter().any(|m| matches!(m, Message::Inv(vs)
+                if vs.iter().any(|v| v.hash.as_bytes() == txid.as_bytes()))),
+            "source peer must not hear its own tx back: {sent_a:?}"
         );
     }
 

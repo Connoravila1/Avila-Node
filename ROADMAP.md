@@ -152,7 +152,19 @@ operation. Compare complete initial download and catch-up, not only local replay
 
 ### G4 — Complete everyday node and service workflows
 
-- [ ] Implement mempool admission, packages, replacement, eviction, relay and reorg reconciliation.
+- [x] Implement mempool admission, packages, replacement, eviction,
+      relay and reorg reconciliation (first slice): `avila-mempool`
+      applies consensus input/script checks identically to block
+      connect (shared `check_tx_inputs`, `bip68_locks_satisfied`,
+      `check_input_scripts`) plus Core's standardness set, weight cap,
+      min-relay fee, BIP125 replacement (RBF signaling + fee bump), and
+      bounded eviction by fee rate; unconfirmed parents resolve through
+      the pool. `PeerManager` owns the pool: `tx` messages admit,
+      `inv` announces to tx-relay peers (wtxid for BIP339 peers), `inv`
+      announcements fetch as `MSG_WITNESS_TX`, `getdata` serves pooled
+      txs, and connected blocks purge confirmed/conflicted entries.
+      Orphan pool, descendant-package limits, and disconnected-block
+      reinsertion remain open.
 - [ ] Provide replayable policy explanations and isolated shadow-policy evaluation.
 - [ ] Deliver authenticated/versioned control, a tested Core RPC compatibility matrix,
   watch-only descriptors, wallet broadcast, fee information and scoped service access.
