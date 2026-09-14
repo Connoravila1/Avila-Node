@@ -56,6 +56,12 @@ pub struct BlockStore {
     tail: File,
     /// Rotation threshold — `MAX_FILE_SIZE` in production; tests shrink it.
     max_file_size: u64,
+    /// `blkNNNNN.dat` files ≤ this number were deleted by
+    /// [`Self::prune_to_bytes`] this session — their index entries
+    /// survive so `read` can report "pruned" rather than "absent".
+    /// On reopen the index rebuilds from existing files only, so the
+    /// flag is session-scoped by design.
+    pruned_through: Option<u32>,
 }
 
 impl BlockStore {
@@ -138,6 +144,7 @@ impl BlockStore {
             tail_len,
             tail,
             max_file_size,
+            pruned_through: None,
         })
     }
 
@@ -179,6 +186,9 @@ impl BlockStore {
     /// `io::Error` on read failure; [`io::ErrorKind::InvalidData`] when the
     /// payload no longer decodes (store corruption).
     pub fn read(&self, pos: BlockPos) -> io::Result<Block> {
+        if self.is_pruned(pos) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "block body pruned"));
+        }
         let mut file = BufReader::new(File::open(file_path(&self.dir, pos.file))?);
         file.seek(SeekFrom::Start(pos.offset))?;
         let mut payload = vec![0u8; pos.len as usize];
@@ -219,6 +229,57 @@ impl BlockStore {
         self.tail_len += frame_len;
         self.index.insert(hash, pos);
         Ok(pos)
+    }
+
+    /// `true` if `pos` points into a file deleted by pruning.
+    #[must_use]
+    pub fn is_pruned(&self, pos: BlockPos) -> bool {
+        self.pruned_through.is_some_and(|t| pos.file <= t)
+    }
+
+    /// Highest `blkNNNNN.dat` file number deleted so far this session.
+    #[must_use]
+    pub fn pruned_through(&self) -> Option<u32> {
+        self.pruned_through
+    }
+
+    /// Deletes the oldest `blk*.dat` files while the on-disk total
+    /// exceeds `keep` bytes — never the append tail. Returns the count
+    /// deleted. Index entries survive in-session so `read` reports
+    /// "pruned" rather than "absent"; a reopen rebuilds the index from
+    /// what remains on disk.
+    ///
+    /// # Errors
+    ///
+    /// `io::Error` on listing or removal failure — a partial prune may
+    /// leave some files deleted.
+    pub fn prune_to_bytes(&mut self, keep: u64) -> io::Result<u32> {
+        self.tail.flush()?;
+        let mut files: Vec<(u32, u64)> = fs::read_dir(&self.dir)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name().into_string().ok()?;
+                let no = name
+                    .strip_prefix(FILE_PREFIX)?
+                    .strip_suffix(FILE_SUFFIX)?
+                    .parse::<u32>()
+                    .ok()?;
+                Some((no, entry.metadata().ok()?.len()))
+            })
+            .collect();
+        files.sort_unstable();
+        let mut total: u64 = files.iter().map(|(_, size)| size).sum();
+        let mut deleted = 0;
+        for (file, size) in files {
+            if file >= self.tail_no || total <= keep {
+                break;
+            }
+            fs::remove_file(file_path(&self.dir, file))?;
+            total -= size;
+            self.pruned_through = Some(file);
+            deleted += 1;
+        }
+        Ok(deleted)
     }
 
     /// Flushes buffered writes to the OS. Durability beyond this (fsync) is
@@ -738,6 +799,40 @@ mod tests {
             let pos = store.position(&block.block_hash()).unwrap();
             assert_eq!(store.read(pos).unwrap(), *block);
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pruning_deletes_oldest_files_and_reports_them() {
+        let dir = test_dir("prune");
+        let limit = 3 * (FRAME_HEADER + test_block(0).encode().len() as u64);
+        let mut store = BlockStore::open_with_limit(&dir, MAGIC, limit).unwrap();
+        let blocks: Vec<Block> = (0..9).map(test_block).collect();
+        for block in &blocks {
+            store.append(block).unwrap();
+        }
+        store.flush().unwrap();
+        // 9 blocks / 3 per file → files 0,1,2 (+tail 3).
+        let first_pos = store.position(&blocks[0].block_hash()).unwrap();
+        let last_pos = store.position(&blocks[8].block_hash()).unwrap();
+        let keep = fs::metadata(file_path(&dir, last_pos.file)).unwrap().len();
+        let deleted = store.prune_to_bytes(keep).unwrap();
+        assert!(deleted >= 1, "oldest files pruned");
+        // Pruned positions still resolve but reads report NotFound.
+        assert!(store.is_pruned(first_pos));
+        assert!(!store.is_pruned(last_pos));
+        assert_eq!(
+            store.read(first_pos).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(store.read(last_pos).unwrap(), blocks[8]);
+        drop(store);
+
+        // Reopen: the index holds only what survived; reads of retained
+        // bodies still work.
+        let store = BlockStore::open_with_limit(&dir, MAGIC, limit).unwrap();
+        assert!(store.position(&blocks[8].block_hash()).is_some());
+        assert_eq!(store.len(), 9 - deleted as usize * 3);
         fs::remove_dir_all(&dir).unwrap();
     }
 

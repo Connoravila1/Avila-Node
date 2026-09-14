@@ -174,7 +174,13 @@ operation. Compare complete initial download and catch-up, not only local replay
 - [ ] Deliver authenticated/versioned control, a tested Core RPC compatibility matrix,
   watch-only descriptors, wallet broadcast, fee information and scoped service access.
 - [ ] Deliver Electrum/compact-filter services with tested clients and explicit index coverage.
-- [ ] Support archival/pruned operation and verified historical reacquisition for rescans.
+- [x] Pruned operation (first slice): `BlockStore::prune_to_bytes`
+      deletes the oldest blk files past a byte budget (never the tail);
+      `have_body` reports pruned bodies absent so sync refetches them,
+      resubmitted pruned blocks re-store on `accept_block`, and a reorg
+      reaching a pruned body fails loudly at disconnect. Wired as
+      `avila-node sync --prune-mb` and the GUI's prune field. Verified
+      historical reacquisition for rescans remains open.
 - [ ] Integrate mining templates and selected Stratum V2 workflows behind optional services.
 - [ ] Provide backup/restore, migration/rollback, resource presets and actionable recovery.
 

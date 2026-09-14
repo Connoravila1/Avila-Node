@@ -313,10 +313,15 @@ impl Chainstate {
         // BLOCK_HAVE_DATA without ever downloading it.
         *hash == self.tree.params().genesis_header.hash()
             || self.blocks.contains_key(hash)
-            || self
-                .store
-                .as_ref()
-                .is_some_and(|store| store.position(hash).is_some())
+            || self.store.as_ref().is_some_and(|store| {
+                // A pruned body is genuinely unavailable — report false so
+                // sync refetches it and `accept_block` re-stores it on
+                // resubmission (Core's `fAlreadyHave` loses BLOCK_HAVE_DATA
+                // under pruning the same way).
+                store
+                    .position(hash)
+                    .is_some_and(|pos| !store.is_pruned(pos))
+            })
     }
 
     /// `hash`'s body, from memory or the store. Public for the P2P serving
@@ -365,6 +370,22 @@ impl Chainstate {
         store.flush()?;
         let (dir, magic) = (store.dir().to_path_buf(), store.magic());
         store::write_state(&dir, magic, &self.snapshot())
+    }
+
+    /// Deletes the oldest `blk*.dat` files while their total exceeds
+    /// `keep` bytes — Core's `-prune` analog. A reorg reaching a pruned
+    /// body fails loudly at disconnect rather than silently skipping
+    /// (Core halts with a fatal error past the prune depth); a
+    /// resubmitted pruned block re-validates and re-stores.
+    ///
+    /// # Errors
+    ///
+    /// `io::Error` on listing/removal failure. No-op without a store.
+    pub fn prune(&mut self, keep_bytes: u64) -> std::io::Result<u32> {
+        match &mut self.store {
+            Some(store) => store.prune_to_bytes(keep_bytes),
+            None => Ok(0),
+        }
     }
 
     /// The block index (Core's `mapBlockIndex` + best-tip bookkeeping).

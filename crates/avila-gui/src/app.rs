@@ -98,6 +98,7 @@ struct SyncUi {
     target_input: String,
     connect_input: String,
     proxy_input: String,
+    prune_input: String,
     store: bool,
 }
 
@@ -112,6 +113,7 @@ impl Default for SyncUi {
             target_input: "100".into(),
             connect_input: String::new(),
             proxy_input: String::new(),
+            prune_input: String::new(),
             store: true,
         }
     }
@@ -524,6 +526,13 @@ impl AvilaApp {
                     .desired_width(130.0)
                     .font(egui::FontId::monospace(12.0)),
             );
+            ui.label(muted("prune MiB"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sync.prune_input)
+                    .hint_text("archive")
+                    .desired_width(60.0)
+                    .font(egui::FontId::monospace(12.0)),
+            );
             ui.checkbox(&mut self.sync.store, "store");
             if self.sync.running {
                 if ui
@@ -778,6 +787,13 @@ impl AvilaApp {
                 .store
                 .then(|| self.node.config().network_data_dir()),
             cancel: Some(cancel.clone()),
+            prune_bytes: self
+                .sync
+                .prune_input
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .map(|m| m * 1024 * 1024),
         };
         let (tx, rx) = channel();
         thread::spawn(move || {

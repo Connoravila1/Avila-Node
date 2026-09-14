@@ -32,6 +32,9 @@ pub struct SyncConfig {
     /// Cancellation flag — checked each tick; `true` ends the run early
     /// and still returns a report (state already flushed).
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// When set with `data_dir`, prune blk files after the final flush
+    /// so the on-disk total stays under this many bytes.
+    pub prune_bytes: Option<u64>,
 }
 
 impl Default for SyncConfig {
@@ -44,6 +47,7 @@ impl Default for SyncConfig {
             proxy: None,
             data_dir: None,
             cancel: None,
+            prune_bytes: None,
         }
     }
 }
@@ -224,6 +228,9 @@ pub fn run(
 
     if let Some(dir) = &cfg.data_dir {
         cs.flush().map_err(SyncError::Store)?;
+        if let Some(keep) = cfg.prune_bytes {
+            cs.prune(keep).map_err(SyncError::Store)?;
+        }
         mgr.addrbook().save(&dir.join("peers.dat"))?;
     }
 

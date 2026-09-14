@@ -58,6 +58,9 @@ enum Command {
         /// pass --no-store for an in-memory run.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         store: bool,
+        /// Prune blk files to ~this many MiB after syncing (needs --store).
+        #[arg(long)]
+        prune_mb: Option<u64>,
     },
 }
 
@@ -94,6 +97,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             connect,
             proxy,
             store,
+            prune_mb,
         } => {
             use avila_consensus::params::Network as ConsensusNet;
             let network = config.get().network;
@@ -112,6 +116,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 proxy,
                 data_dir: store.then(|| config.network_data_dir()),
                 cancel: None,
+                prune_bytes: prune_mb.map(|m| m * 1024 * 1024),
             };
             println!("Syncing {network} (target height {blocks}, {max_peers} peers max)...");
             let mut last = (u32::MAX, u32::MAX);
