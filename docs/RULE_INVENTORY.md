@@ -62,8 +62,19 @@ failure seeds in `tests/property.proptest-regressions`).
 (`validation.cpp`); `script.rs` provides the structural script model those rules
 consult (`GetOp`-equivalent instruction iteration, `GetSigOpCount`, `IsPushOnly`,
 `IsPayToScriptHash`, `IsWitnessProgram`, `CScriptNum`/push encodings). Every error
-exposes Core's reject-reason string via `RuleError::reason` for later
-reason-level differential comparison (`submitblock`).
+exposes Core's reject-reason string via `RuleError::reason`, and the block-level
+differential adapter (`tools/check_blocks_core.py` + `examples/check_blocks.rs`)
+verifies those reasons against a live daemon's `submitblock`: **29 corpus blocks
+compared, zero verdict mismatches** — every named violation above returns Core's
+exact reason, including the order-dependent cases (`bad-blk-length` beats
+`bad-txns-oversize`; `bad-txns-duplicate` fires only for a natural-pair leaf
+duplication, matching Core's scan-before-padding merkle semantics). The first
+run caught a real divergence: `push_int` used raw data pushes for heights
+1..=16 where `CScript() << nHeight` emits `OP_1..OP_16` — fixed, with the
+daemon's `bad-cb-height` as the witness. One documented layer difference: our
+4,000,000-byte block-decode cap pre-rejects what Core reports as
+`bad-blk-weight` (any block that size is necessarily overweight, so the
+verdict is identical; only the layer differs).
 
 | Rule | Core anchor | Implementation | Valid coverage | Invalid coverage |
 | --- | --- | --- | --- | --- |
@@ -128,9 +139,11 @@ from. `fixtures/SHA256SUMS` is `sha256sum -c`-verifiable. Regenerate with
 | Input | Core / this crate | rust-bitcoin 0.32.102 | Notes |
 | --- | --- | --- | --- |
 | `nBits` `0x01800000` (compact size ≤ 3, sign bit set, zero mantissa) | expands to `0` (sign bit masked out by `0x7fffff` before shifting) | `128` (keeps sign bit in `0xFFFFFF` mantissa; it survives the shift as a value bit) | Sign-bit encodings are rejected by both (`negative` flag vs `Target::ZERO`→`is_met_by` fails), but for `size <= 3` rust-bitcoin computes a *different value* than Core. Recorded by `compact_expand_matches_rust_bitcoin`; regression seed in `tests/property.proptest-regressions`. |
+| BIP34 coinbase prefix at heights 1..=16 (`CScript() << nHeight` vs raw push) | `OP_1..OP_16` (this crate, after fix) | — | First-run catch of `tools/check_blocks_core.py`: `push_int` previously emitted `01 01` for height 1 where Core's `push_int64` emits `0x51`; the daemon returned `bad-cb-height` on our generated coinbase. Fixed in `script.rs` with `push_int(-1..=16)` mapping to `OP_1NEGATE`/`OP_0`/`OP_N`. |
 
-This is the class of finding the pinned-Core reference adapter (remaining G1
-work) exists to catch systematically.
+Both findings are the class the differential adapters exist to catch
+systematically — one against rust-bitcoin (documented divergence in the
+dev-only reference), one caught against the live daemon.
 
 ## Not yet implemented (explicit gaps)
 
@@ -151,15 +164,19 @@ Not defects — scope boundaries for later gates:
   checkpoints, `nMinimumChainWork`, BIP9 versionbits deployment state
   (Core treats unexpected versions as warnings, not rejections).
 - **Infrastructure**: the scorecard measurement harness. The reference
-  adapter exists (`tools/check_headers_core.py` + the
-  `avila-consensus/examples/check_headers.rs` helper): it launches an isolated
-  `bitcoind` per network, replays every header fixture and a generated
-  regtest invalid-case corpus through `submitheader`, and compares per-header
-  verdicts against `HeaderTree`. First full run: **10,404 compared headers,
-  zero verdict mismatches** (mainnet 4031, testnet4 4031 including real
-  BIP94-enforced headers, signet 2047, regtest 295 incl. bad-diffbits /
+  adapters exist: `tools/check_headers_core.py` (+ `examples/check_headers.rs`)
+  launches an isolated `bitcoind` per network, replays every header fixture and
+  a generated regtest invalid-case corpus through `submitheader`, and compares
+  per-header verdicts against `HeaderTree` — first full run: **10,404 compared
+  headers, zero verdict mismatches** (mainnet 4031, testnet4 4031 including
+  real BIP94-enforced headers, signet 2047, regtest 295 incl. bad-diffbits /
   high-hash / time-too-old / time-too-new / orphan / duplicate agreement).
-  The artifact records the reference binary's version and sha256.
+  `tools/check_blocks_core.py` (+ `examples/check_blocks.rs`) does the same at
+  block level: it generates a regtest corpus (one valid block plus one per
+  implemented rule violation), replays it through `submitblock`, and compares
+  verdicts reason-for-reason — **29 blocks, zero verdict mismatches**, and it
+  caught the `push_int`/`OP_N` divergence described above on its first run.
+  Both artifacts record the reference binary's version and sha256.
   Coverage-guided fuzzing exists (`fuzz/`, libFuzzer via cargo-fuzz): six
   targets over header/transaction/block decoding, CompactSize canonicality,
   compact-target arithmetic and merkle roots; ~14M executions across a

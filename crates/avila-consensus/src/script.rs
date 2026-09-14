@@ -345,12 +345,19 @@ pub fn push_slice(data: &[u8]) -> Vec<u8> {
     script
 }
 
-/// Encodes the canonical push of a small integer (`CScript << CScriptNum`): the value
-/// as a script number, then pushed. BIP34's expected coinbase prefix is
-/// `push_int(height)`.
+/// Encodes `CScript() << value` exactly — Core's `push_int64`: `OP_1NEGATE`,
+/// `OP_0`, or `OP_1..=OP_16` for -1..=16, otherwise the script number pushed as
+/// data. BIP34's expected coinbase prefix is `push_int(height)`, so the small
+/// heights that dominate early post-activation blocks are `OP_N` bytes, not
+/// raw data pushes.
 #[must_use]
 pub fn push_int(value: i64) -> Vec<u8> {
-    push_slice(&encode_script_num(value))
+    match value {
+        -1 => vec![OP_1NEGATE],
+        0 => vec![OP_0],
+        1..=16 => vec![OP_1 - 1 + value as u8],
+        _ => push_slice(&encode_script_num(value)),
+    }
 }
 
 #[cfg(test)]
@@ -513,7 +520,13 @@ mod tests {
         // BIP34: CScript() << height — height 227931 = 0x37A5B → scriptnum 5b 7a 03
         // → push 03 5b 7a 03.
         assert_eq!(push_int(227_931), vec![0x03, 0x5b, 0x7a, 0x03]);
+        // CScript::push_int64 uses the OP_N opcodes for -1..=16, not raw pushes —
+        // the differential adapter caught this against a live daemon.
+        assert_eq!(push_int(-1), vec![OP_1NEGATE]);
         assert_eq!(push_int(0), vec![OP_0]);
+        assert_eq!(push_int(1), vec![OP_1]);
+        assert_eq!(push_int(16), vec![OP_16]);
         assert_eq!(push_int(17), vec![0x01, 0x11]);
+        assert_eq!(push_int(-2), vec![0x01, 0x82]);
     }
 }

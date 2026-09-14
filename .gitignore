@@ -11,3 +11,5 @@
 # Cargo.lock belongs in version control for this application workspace.
 # Worktrees created by tooling for isolated agent runs.
 /.claude/worktrees/
+# Ad-hoc session scratch (daemon datadirs, generated corpora).
+/.scratch/
