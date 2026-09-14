@@ -42,6 +42,7 @@ impl Network {
                 enforce_bip94: false,
                 no_retargeting: false,
                 signet_blocks: false,
+                signet_challenge: &[],
                 // kernel/chainparams.cpp buried-deployment heights; cross-checked against
                 bip34_height: 227_931,
                 bip66_height: 363_725,
@@ -64,6 +65,7 @@ impl Network {
                 enforce_bip94: true,
                 no_retargeting: false,
                 signet_blocks: false,
+                signet_challenge: &[],
                 // Every buried deployment activates at height 1 on testnet4; segwit is
                 bip34_height: 1,
                 bip66_height: 1,
@@ -86,6 +88,7 @@ impl Network {
                 enforce_bip94: false,
                 no_retargeting: false,
                 signet_blocks: true,
+                signet_challenge: &SIGNET_CHALLENGE,
                 bip34_height: 1,
                 bip66_height: 1,
                 bip65_height: 1,
@@ -111,6 +114,7 @@ impl Network {
                 enforce_bip94: false,
                 no_retargeting: true,
                 signet_blocks: false,
+                signet_challenge: &[],
                 // Core's regtest defaults bury BIP34/65/66/CSV at height 1 and activate
                 bip34_height: 1,
                 bip66_height: 1,
@@ -172,9 +176,13 @@ pub struct Params {
     /// (regtest).
     pub no_retargeting: bool,
     /// `consensus.signet_blocks`: whether blocks carry a BIP325 signet solution that must
-    /// satisfy the network's block challenge. Recorded for completeness; the solution
-    /// check itself is not yet implemented (see `crate::check::check_block`).
+    /// satisfy the network's block challenge — enforced by
+    /// [`crate::signet::check_signet_block_solution`] inside `check_block`.
     pub signet_blocks: bool,
+    /// `consensus.signet_challenge`: the BIP325 block challenge script every
+    /// post-genesis signet block's solution must satisfy. Empty on networks
+    /// without signet blocks (`signet_challenge.clear()` in Core).
+    pub signet_challenge: &'static [u8],
     /// `consensus.BIP34Height`: Core's `DEPLOYMENT_HEIGHTINCB` buried deployment (BIP34
     /// coinbase height enforcement). [`crate::chain::HeaderTree::insert`]'s `bad-version`
     /// check also uses this as the `nVersion < 2` floor's activation height, mirroring
@@ -352,6 +360,17 @@ const TESTNET4_GENESIS: BlockHeader = BlockHeader {
     bits: CompactTarget(0x1d00_ffff),
     nonce: 393_743_547,
 };
+
+/// The default signet's BIP325 block challenge (Core `kernel/chainparams.cpp`
+/// `CChainParams::SigNet` — a 1-of-2 bare multisig:
+/// `OP_1 <pubkey1> <pubkey2> OP_2 OP_CHECKMULTISIG`).
+const SIGNET_CHALLENGE: [u8; 71] = [
+    0x51, 0x21, 0x03, 0xad, 0x5e, 0x0e, 0xda, 0xd1, 0x8c, 0xb1, 0xf0, 0xfc, 0x0d, 0x28, 0xa3, 0xd4,
+    0xf1, 0xf3, 0xe4, 0x45, 0x64, 0x03, 0x37, 0x48, 0x9a, 0xbb, 0x10, 0x40, 0x4f, 0x2d, 0x1e, 0x08,
+    0x6b, 0xe4, 0x30, 0x21, 0x03, 0x59, 0xef, 0x50, 0x21, 0x96, 0x4f, 0xe2, 0x2d, 0x6f, 0x8e, 0x05,
+    0xb2, 0x46, 0x3c, 0x95, 0x40, 0xce, 0x96, 0x88, 0x3f, 0xe3, 0xb2, 0x78, 0x76, 0x0f, 0x04, 0x8f,
+    0x51, 0x89, 0xf2, 0xe6, 0xc4, 0x52, 0xae,
+];
 
 /// The default signet's genesis block header (Core `SigNetParams`).
 const SIGNET_GENESIS: BlockHeader = BlockHeader {

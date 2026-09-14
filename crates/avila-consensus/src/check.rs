@@ -23,10 +23,10 @@
 //!   and the BIP141 "no uncommitted witness" rule's full weighting — these belong to
 //!   the connect-block layer;
 //! * script *execution* — DER/CLTV/CSV/signature rules are enforcement flags inside
-//!   the interpreter, which does not exist yet;
-//! * the BIP325 signet block-solution check: [`check_block`] returns
-//!   [`BlockRuleError::SignetSolutionUnsupported`] on `signet_blocks` networks rather
-//!   than silently skipping a consensus rule.
+//!   [`crate::interpreter`];
+//! * the BIP325 signet block-solution check lives in [`crate::signet`]
+//!   ([`check_block`] calls it in Core's position — after the header PoW check,
+//!   before the merkle check — and reports `bad-signet-blksig` on failure).
 //!
 //! Every error carries Core's reject-reason string via [`RuleError::reason`], so the
 //! reference adapter can compare verdicts reason-for-reason once block-level
@@ -40,6 +40,7 @@ use crate::block::{Block, MAX_BLOCK_WEIGHT, WITNESS_SCALE_FACTOR};
 use crate::params::Params;
 use crate::pow;
 use crate::script;
+use crate::signet;
 use crate::transaction::Transaction;
 
 /// `consensus/amount.h`'s `MAX_MONEY`: 21 million BTC in satoshis.
@@ -120,10 +121,11 @@ pub enum BlockRuleError {
     /// (Core's `CheckBlockHeader` inside `CheckBlock`).
     #[error("proof of work failed")]
     HighHash,
-    /// `params.signet_blocks` is set and the BIP325 block-solution check is not yet
-    /// implemented; the block is reported as unchecked rather than waved through.
-    #[error("signet block solution validation is not implemented")]
-    SignetSolutionUnsupported,
+    /// `params.signet_blocks` is set and the block's BIP325 signet solution failed
+    /// [`crate::signet::check_signet_block_solution`] — Core's
+    /// `bad-signet-blksig` (`BLOCK_CONSENSUS`, `CheckBlock`).
+    #[error("signet block signature validation failure")]
+    BadSignetBlkSig,
     /// `hashMerkleRoot` does not match the computed txid merkle root.
     #[error("merkle root mismatch")]
     BadTxnMerkleRoot,
@@ -154,8 +156,7 @@ impl RuleError for BlockRuleError {
     fn reason(&self) -> &'static str {
         match self {
             BlockRuleError::HighHash => "high-hash",
-            // Not a Core reason string: Core implements the check this stands in for.
-            BlockRuleError::SignetSolutionUnsupported => "bad-signet-blksig-unchecked",
+            BlockRuleError::BadSignetBlkSig => "bad-signet-blksig",
             BlockRuleError::BadTxnMerkleRoot => "bad-txnmrklroot",
             BlockRuleError::BadTxnsDuplicate => "bad-txns-duplicate",
             BlockRuleError::BadBlkLength => "bad-blk-length",
@@ -335,10 +336,12 @@ pub fn check_block(block: &Block, params: &Params) -> Result<(), BlockRuleError>
     pow::check_proof_of_work(&block.block_hash(), block.header.bits, params)
         .map_err(|_| BlockRuleError::HighHash)?;
 
-    // BIP325 signet blocks carry a solution that must satisfy the block challenge;
-    // report the gap instead of silently accepting what Core would reject.
-    if params.signet_blocks {
-        return Err(BlockRuleError::SignetSolutionUnsupported);
+    // Signet only: check the BIP325 block solution (Core's `CheckBlock` calls
+    // `CheckSignetBlockSolution` at exactly this position — after CheckBlockHeader,
+    // before the merkle root — gated on `signet_blocks && fCheckPOW`; our
+    // `check_block` always checks PoW).
+    if params.signet_blocks && !signet::check_signet_block_solution(block, params) {
+        return Err(BlockRuleError::BadSignetBlkSig);
     }
 
     let (root, mutated) = block.merkle_root();
@@ -872,13 +875,16 @@ mod tests {
     }
 
     #[test]
-    fn check_block_signet_reports_unsupported_solution_check() {
-        let block =
-            Block::decode(include_bytes!("../../../fixtures/signet-block-000000.bin")).unwrap();
-        assert_eq!(
-            check_block(&block, &Network::Signet.params()),
-            Err(BlockRuleError::SignetSolutionUnsupported)
-        );
+    fn check_block_signet_genesis_and_signed_block_pass() {
+        // The BIP325 solution check exempts the genesis block and verifies the
+        // real challenge spend on later blocks — both fixtures must pass.
+        for file in [
+            include_bytes!("../../../fixtures/signet-block-000000.bin").as_slice(),
+            include_bytes!("../../../fixtures/signet-block-000001.bin").as_slice(),
+        ] {
+            let block = Block::decode(file).unwrap();
+            assert_eq!(check_block(&block, &Network::Signet.params()), Ok(()));
+        }
     }
 
     #[test]

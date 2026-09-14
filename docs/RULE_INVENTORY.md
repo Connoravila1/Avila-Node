@@ -90,10 +90,10 @@ Core's `CPubKey::Verify` (parse DER-lax → `secp256k1_ecdsa_signature_normalize
 `82-high-s-p2pkh`. One
 documented layer difference: our 4,000,000-byte block-decode cap pre-rejects
 what Core reports as `bad-blk-weight` (any block that size is necessarily
-overweight, so the verdict is identical; only the layer differs). Signet blocks
-0 and 1 are the two *expected* divergences — the daemon verifies the trivial
-genesis challenge and block 1's real BIP325 signature, while we return the
-explicit `bad-signet-blksig-unchecked` stub for both.
+overweight, so the verdict is identical; only the layer differs). The signet
+fixtures match too: genesis is exempt per Core's `CheckSignetBlockSolution`
+short-circuit, and block 1's real BIP325 solution (a 1-of-2 bare-multisig
+challenge spend) verifies through our interpreter on both sides.
 
 | Rule | Core anchor | Implementation | Valid coverage | Invalid coverage |
 | --- | --- | --- | --- | --- |
@@ -112,7 +112,7 @@ explicit `bad-signet-blksig-unchecked` stub for both.
 | BIP34 height-in-coinbase prefix (`bad-cb-height`) | `ContextualCheckBlock` (`CScript() << nHeight`) | `contextual_check_block`, `script.rs` `push_int`/`encode_script_num` | Real post-activation fixture blocks; `encode_script_num` vs Core's `scriptnum_tests` vectors | wrong-height coinbase; pre-activation control (rule off below `bip34_height`) |
 | BIP141 witness commitment: when segwit is active a present commitment must verify (`bad-witness-nonce-size` / `bad-witness-merkle-match`); an absent commitment — or inactive segwit — forbids witness data entirely (`unexpected-witness`) | `ContextualCheckBlock`, `CheckWitnessMalleation`, `GetWitnessCommitmentIndex` | `contextual_check_block`, `block.rs` `witness_commitment_output`/`expected_witness_commitment`/`witness_merkle_root` | Segwit-era and taproot-era fixture blocks (both carry real commitments and witness data) | nonce-stack arity/size, corrupted commitment hash, witness-without-commitment (segwit active and inactive) |
 | Block weight ≤ `MAX_BLOCK_WEIGHT`, checked *after* witness-commitment verification (`bad-blk-weight`) | `ContextualCheckBlock` | `contextual_check_block` | All fixture blocks | ~4 MB-witness unit test |
-| Signet block solution (BIP325) | `CheckSignetBlockSolution` in `CheckBlock` | **not implemented** — `check_block` returns `BlockRuleError::SignetSolutionUnsupported` on `signet_blocks` networks rather than skipping the rule | signet fixture returns the explicit unsupported error | — |
+| Signet block solution (BIP325) | `CheckSignetBlockSolution` in `CheckBlock` (genesis exempt; synthetic to_spend/to_sign construction; `FetchAndClearCommitmentSection`; modified merkle root; `VerifyScript` with P2SH\|WITNESS\|DERSIG\|NULLDUMMY) | `signet.rs` | signet genesis (exempt) and block 1's real 1-of-2-multisig solution verify identically to the daemon | corrupted-solution unit test; malformed/missing-commitment and trailing-data paths return `bad-signet-blksig` |
 
 ## UTXO-dependent rules (`connect.rs`)
 
@@ -235,8 +235,6 @@ dev-only reference), one caught against the live daemon.
 
 Not defects — scope boundaries for later gates:
 
-- **Block-level acceptance**: signet block-signature validation (BIP325 — the
-  `SignetSolutionUnsupported` stub in `check.rs`).
 - **Reorg handling**: `chainstate.rs` drives disconnect-to-fork /
   connect-forward reorgs plus Core's failed-block bookkeeping
   (`BLOCK_FAILED_*`, `bad-prevblk`, `duplicate-invalid`, activation pruning);

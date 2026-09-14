@@ -118,19 +118,10 @@ SEGMENT_FIXTURES = {
     "mainnet": "mainnet-blocks-000000-000500.dat",
 }
 
-# Documented gaps where the two sides are known to differ today.
-EXPECTED_DIVERGENCE = {
-    "signet-block-000000.bin": (
-        "signet BIP325 block-solution validation is unimplemented; the daemon "
-        "accepts the genesis block as trivial-challenge (and known-in-index "
-        "duplicate), we return the explicit bad-signet-blksig-unchecked stub"
-    ),
-    "signet-block-000001.bin": (
-        "signet BIP325 block-solution validation is unimplemented; the daemon "
-        "verifies the real signature, we return the explicit "
-        "bad-signet-blksig-unchecked stub"
-    ),
-}
+# Documented gaps where the two sides are known to differ today. Currently
+# empty — the last divergence (BIP325 signet block-solution validation) is
+# implemented; keep the mechanism for future gaps.
+EXPECTED_DIVERGENCE = {}
 
 
 def free_port():
