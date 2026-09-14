@@ -71,7 +71,7 @@ fn main() -> Result<(), String> {
             );
         }
         let connected = cs.chain().len() as u32 - 1;
-        if pages_seen >= pages && connected >= blocks.max(0) {
+        if pages_seen >= pages && connected >= blocks {
             break;
         }
         if start.elapsed() > Duration::from_secs(120) {

@@ -564,7 +564,7 @@ mod tests {
 
     #[test]
     fn notfound_releases_in_flight_slots() {
-        let mut cs = regtest();
+        let cs = regtest();
         let blocks = chain_blocks(&cs, 3);
         let mut sync = PeerSync::new();
         let hashes: Vec<BlockHash> = blocks.iter().map(|b| b.block_hash()).collect();
