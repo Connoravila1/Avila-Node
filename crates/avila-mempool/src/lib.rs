@@ -97,12 +97,30 @@ pub enum MempoolReject {
     Full,
 }
 
+/// Core's `MAX_ORPHAN_TRANSACTIONS` — orphan entries bound separately
+/// from the pool so orphan flooding can't crowd out confirmed-parent
+/// txs or blow memory.
+pub const MAX_ORPHANS: usize = 100;
+
+/// Core's `ORPHAN_TX_EXPIRE_TIME` — orphans live at most 20 minutes.
+pub const ORPHAN_EXPIRE_SECS: u32 = 20 * 60;
+
+/// A parked orphan — a tx with unresolved inputs, kept for when its
+/// parents arrive.
+#[derive(Clone, Debug)]
+struct OrphanEntry {
+    tx: Transaction,
+    time: u32,
+}
+
 /// A bounded policy pool over the live UTXO set.
 pub struct Mempool {
     /// txid → entry.
     map: HashMap<Txid, MempoolEntry>,
     /// outpoint → txid of the pooled tx spending it (conflict index).
     spends: HashMap<OutPoint, Txid>,
+    /// txid → parked tx with missing parents (Core's orphan pool).
+    orphans: HashMap<Txid, OrphanEntry>,
     /// Entry cap.
     max_entries: usize,
     /// Min relay fee rate in sat/kvB.
@@ -116,6 +134,7 @@ impl Mempool {
         Self {
             map: HashMap::new(),
             spends: HashMap::new(),
+            orphans: HashMap::new(),
             max_entries: DEFAULT_MAX_ENTRIES,
             min_relay_fee: DEFAULT_MIN_RELAY_FEE,
         }
@@ -206,6 +225,7 @@ impl Mempool {
         let mut conflicts: Vec<Txid> = Vec::new();
         for input in &tx.inputs {
             let Some(coin) = self.resolve(cs, &input.previous_output) else {
+                self.park_orphan(tx, now);
                 return Err(MempoolReject::InputsMissingOrSpent);
             };
             spent.push(coin);
@@ -314,7 +334,61 @@ impl Mempool {
                 time: now,
             },
         );
+        // Newly pooled outputs may un-orphan parked children — Core's
+        // ProcessOrphanTx recursion. Repeat until no orphan resolves:
+        // each accepted orphan can itself be a parent.
+        loop {
+            let ready: Vec<Transaction> = self
+                .orphans
+                .values()
+                .filter(|e| {
+                    e.tx.inputs
+                        .iter()
+                        .all(|i| self.resolve(cs, &i.previous_output).is_some())
+                })
+                .map(|e| e.tx.clone())
+                .collect();
+            if ready.is_empty() {
+                break;
+            }
+            for orphan in ready {
+                let oid = orphan.txid();
+                self.orphans.remove(&oid);
+                // Re-admit through the full path; failures just stay out
+                // (they may fail policy even once resolvable).
+                let _ = self.accept_tx(orphan, cs, now);
+            }
+        }
         Ok(txid)
+    }
+
+    /// Parks a tx whose inputs don't resolve, bounded and expiring —
+    /// Core's `AddToOrphanage`. Evicts a random orphan at capacity
+    /// (deterministic here: the oldest).
+    fn park_orphan(&mut self, tx: Transaction, now: u32) {
+        self.expire_orphans(now);
+        let txid = tx.txid();
+        if self.orphans.contains_key(&txid) {
+            return;
+        }
+        if self.orphans.len() >= MAX_ORPHANS
+            && let Some((&oldest, _)) = self.orphans.iter().min_by_key(|(_, e)| e.time)
+        {
+            self.orphans.remove(&oldest);
+        }
+        self.orphans.insert(txid, OrphanEntry { tx, time: now });
+    }
+
+    /// Drops orphans older than [`ORPHAN_EXPIRE_SECS`].
+    fn expire_orphans(&mut self, now: u32) {
+        self.orphans
+            .retain(|_, e| now.saturating_sub(e.time) < ORPHAN_EXPIRE_SECS);
+    }
+
+    /// Orphan-pool size — observability for the sync layer.
+    #[must_use]
+    pub fn orphan_count(&self) -> usize {
+        self.orphans.len()
     }
 
     /// Drops `txid` and unindexes its input spends.
@@ -372,6 +446,28 @@ impl Mempool {
         for id in dead {
             self.remove_recursive(&id);
         }
+    }
+
+    /// Re-admits the non-coinbase transactions of a *disconnected* block
+    /// — Core's `DisconnectedBlockTransactions` queue: after a reorg the
+    /// old branch's txs are valid unconfirmed again. Each goes through
+    /// full admission (a tx may now conflict with the new chain).
+    pub fn reinsert_disconnected(
+        &mut self,
+        block: &avila_consensus::block::Block,
+        cs: &avila_consensus::chainstate::Chainstate,
+        now: u32,
+    ) -> usize {
+        let mut readmitted = 0usize;
+        for tx in &block.transactions {
+            if tx.is_coinbase() {
+                continue;
+            }
+            if self.accept_tx(tx.clone(), cs, now).is_ok() {
+                readmitted += 1;
+            }
+        }
+        readmitted
     }
 
     /// Every pooled txid — relay bookkeeping.
@@ -607,6 +703,52 @@ mod tests {
         );
         assert!(pool.accept_tx(child, &cs, NOW).is_ok());
         assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn orphan_parks_then_joins_when_parent_arrives() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        // Child arrives before its parent → parks as orphan.
+        let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let parent_id = parent.txid();
+        let child = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            4_998_000_000,
+            SEQ_FINAL,
+        );
+        assert_eq!(
+            pool.accept_tx(child, &cs, NOW),
+            Err(MempoolReject::InputsMissingOrSpent)
+        );
+        assert_eq!(pool.orphan_count(), 1);
+        assert_eq!(pool.len(), 0);
+        // Parent's arrival un-orphans the child automatically.
+        pool.accept_tx(parent, &cs, NOW).unwrap();
+        assert_eq!(pool.len(), 2, "parent + adopted orphan");
+        assert_eq!(pool.orphan_count(), 0);
+    }
+
+    #[test]
+    fn orphan_pool_is_bounded() {
+        let (cs, _b) = chainstate_at(5);
+        let mut pool = Mempool::new();
+        // MAX_ORPHANS + 5 distinct missing-input txs — the cap binds.
+        for i in 0..(MAX_ORPHANS + 5) {
+            let tx = spend_tx(
+                OutPoint {
+                    txid: Txid::from_bytes([i as u8; 32].map(|b| b.wrapping_add(1))),
+                    vout: i as u32,
+                },
+                1_000,
+                SEQ_FINAL,
+            );
+            let _ = pool.accept_tx(tx, &cs, NOW);
+        }
+        assert_eq!(pool.orphan_count(), MAX_ORPHANS);
     }
 
     #[test]

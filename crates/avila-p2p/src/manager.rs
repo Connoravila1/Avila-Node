@@ -530,13 +530,30 @@ impl<S: Read + Write> PeerManager<S> {
                 }
             }
             SessionEvent::Message(Message::Block(block)) => {
+                let old_tip = cs.tip_hash();
                 match peer.sync.on_block(cs, &block, now) {
                     Ok(outcome) => {
                         peer.last_useful = Instant::now();
                         mempool.on_block_connected(&block);
-                        if let avila_consensus::chainstate::Acceptance::Connected { .. } =
-                            outcome.acceptance
+                        if let avila_consensus::chainstate::Acceptance::Connected {
+                            reorged, ..
+                        } = outcome.acceptance
                         {
+                            if reorged {
+                                // The disconnected branch's txs are
+                                // unconfirmed again — re-admit them
+                                // (Core's DisconnectedBlockTransactions).
+                                let mut walk = old_tip;
+                                while let Some(node) = cs.tree().get(&walk) {
+                                    if cs.chain().contains(&walk) {
+                                        break; // reached the fork point
+                                    }
+                                    if let Some(b) = cs.body(&walk) {
+                                        mempool.reinsert_disconnected(&b, cs, now);
+                                    }
+                                    walk = node.header.prev_block_hash;
+                                }
+                            }
                             events.push(NetEvent::TipAdvanced(cs.chain().len() as u32 - 1));
                             // Relay the new tip to everyone except the peer
                             // that delivered it — they already know.
