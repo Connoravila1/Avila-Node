@@ -12,11 +12,9 @@
 
 use std::process::ExitCode;
 
-use avila_consensus::chain::{ChainError, HeaderTree, InsertStatus};
+use avila_consensus::chain::{HeaderTree, InsertStatus};
 use avila_consensus::header::BlockHeader;
 use avila_consensus::params::Network;
-use avila_consensus::pow::PowError;
-use avila_consensus::rules::TimeError;
 
 fn network(name: &str) -> Option<Network> {
     Some(match name {
@@ -26,36 +24,6 @@ fn network(name: &str) -> Option<Network> {
         "regtest" => Network::Regtest,
         _ => return None,
     })
-}
-
-/// The reject reason Core's `submitheader`/`AcceptBlockHeader` reports for the
-/// equivalent failure. Internal-only errors have no RPC-visible analog. Owned because
-/// `bad-version` is not a fixed token — Core formats the offending `nVersion` into it
-/// (`strprintf("bad-version(0x%08x)", block.nVersion)`), and [`ChainError::BadVersion`]'s
-/// `Display` already produces that exact string.
-fn core_reason(err: &ChainError) -> String {
-    match err {
-        ChainError::UnknownParent(_) => "prev-blk-not-found".to_string(),
-        ChainError::WrongBits { .. } => "bad-diffbits".to_string(),
-        // CheckProofOfWork failures all surface as "high-hash"
-        // (BLOCK_HEADER_LOW_WORK) through submitheader.
-        ChainError::Pow(
-            PowError::NegativeTarget(_)
-            | PowError::OverflowTarget(_)
-            | PowError::ZeroTarget(_)
-            | PowError::TargetAboveLimit(_)
-            | PowError::InsufficientWork { .. },
-        ) => "high-hash".to_string(),
-        ChainError::Pow(PowError::UnknownAncestor(_) | PowError::DegenerateDifficultyParams) => {
-            "internal".to_string()
-        }
-        ChainError::Time(TimeError::TooOld { .. }) => "time-too-old".to_string(),
-        ChainError::Time(TimeError::Timewarp { .. }) => "time-timewarp-attack".to_string(),
-        ChainError::Time(TimeError::TooNew { .. }) => "time-too-new".to_string(),
-        // `ChainError`'s `Display` for `BadVersion` is already Core's exact reject reason.
-        ChainError::BadVersion { .. } => err.to_string(),
-        ChainError::ChainWorkOverflow | ChainError::HeightOverflow => "internal".to_string(),
-    }
 }
 
 fn main() -> ExitCode {
@@ -109,7 +77,7 @@ fn main() -> ExitCode {
             Ok(InsertStatus::AlreadyKnown { height }) => {
                 println!("{index}\taccepted-known\theight={height}");
             }
-            Err(err) => println!("{index}\trejected:{}\t{err}", core_reason(&err)),
+            Err(err) => println!("{index}\trejected:{}\t{err}", err.reason()),
         }
     }
     ExitCode::SUCCESS

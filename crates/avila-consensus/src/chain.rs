@@ -22,7 +22,7 @@
 //! `nMinimumChainWork`/assume-valid DoS guards. These belong to later gates alongside
 //! block-level validation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use thiserror::Error;
 
@@ -109,6 +109,12 @@ pub enum ChainError {
         /// The header's `nVersion`, as received (interpreted as signed 32-bit).
         version: i32,
     },
+    /// The header descends from a block marked failed — its direct parent carries the
+    /// failed flag, or the walk from the parent reached a failed ancestor (Core's
+    /// `bad-prevblk` / `BLOCK_INVALID_PREV` in `AcceptBlockHeader`: the direct-parent
+    /// check runs before `ContextualCheckBlockHeader`, the failed-ancestor walk after).
+    #[error("prev block is invalid")]
+    InvalidParent,
     /// Accumulating this header's work overflowed 256 bits — unreachable on any real chain
     /// (total attainable work is bounded by the number of headers times per-block maximum,
     /// far below `2^256`), defended anyway.
@@ -118,6 +124,35 @@ pub enum ChainError {
     /// over four billion validated headers first), defended so a height can never wrap.
     #[error("header height overflowed u32")]
     HeightOverflow,
+}
+
+impl ChainError {
+    /// The reject reason Core's `submitblock`/`submitheader` reports for the equivalent
+    /// `AcceptBlockHeader` failure (the `reason` field of the RPC response).
+    #[must_use]
+    pub fn reason(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            ChainError::UnknownParent(_) => "prev-blk-not-found".into(),
+            ChainError::InvalidParent => "bad-prevblk".into(),
+            ChainError::WrongBits { .. } => "bad-diffbits".into(),
+            ChainError::Pow(
+                PowError::NegativeTarget(_)
+                | PowError::OverflowTarget(_)
+                | PowError::ZeroTarget(_)
+                | PowError::TargetAboveLimit(_)
+                | PowError::InsufficientWork { .. },
+            ) => "high-hash".into(),
+            ChainError::Pow(
+                PowError::UnknownAncestor(_) | PowError::DegenerateDifficultyParams,
+            ) => "internal".into(),
+            ChainError::Time(TimeError::TooOld { .. }) => "time-too-old".into(),
+            ChainError::Time(TimeError::Timewarp { .. }) => "time-timewarp-attack".into(),
+            ChainError::Time(TimeError::TooNew { .. }) => "time-too-new".into(),
+            // `BadVersion`'s `Display` is already Core's exact reject reason.
+            ChainError::BadVersion { .. } => self.to_string().into(),
+            ChainError::ChainWorkOverflow | ChainError::HeightOverflow => "internal".into(),
+        }
+    }
 }
 
 /// A tree of accepted block headers, seeded with the network's genesis.
@@ -131,6 +166,11 @@ pub struct HeaderTree {
     params: Params,
     nodes: HashMap<BlockHash, HeaderNode>,
     tip: BlockHash,
+    /// Hashes of nodes carrying Core's `BLOCK_FAILED_MASK` (`BLOCK_FAILED_VALID` for the
+    /// block whose own validation failed, `BLOCK_FAILED_CHILD` for descendants marked by
+    /// the insertion-time ancestor walk). Children of a failed block are rejected at
+    /// [`HeaderTree::insert`] — Core rejects them the same way, at `AcceptBlockHeader`.
+    invalid: HashSet<BlockHash>,
 }
 
 impl HeaderTree {
@@ -152,6 +192,7 @@ impl HeaderTree {
             params,
             nodes,
             tip: hash,
+            invalid: HashSet::new(),
         }
     }
 
@@ -227,6 +268,48 @@ impl HeaderTree {
         Some(node)
     }
 
+    /// Marks `hash` failed — Core's `pindex->nStatus |= BLOCK_FAILED_VALID`, set by
+    /// `AcceptBlock` on `CheckBlock`/`ContextualCheckBlock` failure and by
+    /// `InvalidChainFound` on `ConnectBlock` failure. Once marked, every descendant is
+    /// rejected at [`HeaderTree::insert`] (`bad-prevblk`) and a resubmission reports
+    /// [`InsertStatus::AlreadyKnown`] while [`HeaderTree::is_failed`] reports `true`
+    /// (Core's `duplicate-invalid`).
+    pub fn mark_invalid(&mut self, hash: BlockHash) {
+        self.invalid.insert(hash);
+    }
+
+    /// `true` if `hash` carries the failed flag — either the block whose own validation
+    /// failed, or a descendant marked by a previous insertion-time ancestor walk.
+    #[must_use]
+    pub fn is_failed(&self, hash: &BlockHash) -> bool {
+        self.invalid.contains(hash)
+    }
+
+    /// Walks the ancestor chain of `cursor` toward genesis. Returns `true` when the walk
+    /// reaches a failed block — in which case every node passed on the way is marked
+    /// failed, matching `AcceptBlockHeader`'s `invalid_walk` marking of the blocks
+    /// between `pindexPrev` and the failed ancestor. `false` when the walk reaches the
+    /// tree boundary (genesis) without hitting a failed node.
+    pub(crate) fn ancestor_is_invalid(&mut self, mut cursor: BlockHash) -> bool {
+        let mut path = Vec::new();
+        let hit = loop {
+            if self.invalid.contains(&cursor) {
+                break true;
+            }
+            let Some(node) = self.nodes.get(&cursor) else {
+                break false;
+            };
+            path.push(cursor);
+            cursor = node.header.prev_block_hash;
+        };
+        if hit {
+            for hash in path {
+                self.invalid.insert(hash);
+            }
+        }
+        hit
+    }
+
     /// Validates `header` against the tree and inserts it.
     ///
     /// `now` is the caller's adjusted local time for the future-drift check — an explicit
@@ -236,17 +319,24 @@ impl HeaderTree {
     /// Checks run in Core's `AcceptBlockHeader` / `ContextualCheckBlockHeader` order: the
     /// header is not already known (returns [`InsertStatus::AlreadyKnown`]); its hash
     /// satisfies [`pow::check_proof_of_work`] (`CheckBlockHeader`); its parent is in the
-    /// tree; its `nBits` equals [`pow::required_bits`] (`bad-diffbits`); its timestamp
+    /// tree; its parent does not carry the failed flag (`bad-prevblk`,
+    /// [`ChainError::InvalidParent`]); its `nBits` equals [`pow::required_bits`]
+    /// (`bad-diffbits`); its timestamp
     /// passes [`rules::check_block_time`] — median-time-past, then the BIP94 timewarp
     /// floor on `enforce_BIP94` networks at period-start heights, then the future-drift
     /// ceiling; and its `nVersion` meets every buried-deployment floor already active at
-    /// its height (`bad-version`, [`ChainError::BadVersion`]). On success the node is
+    /// its height (`bad-version`, [`ChainError::BadVersion`]); and no ancestor of its
+    /// parent carries the failed flag (`bad-prevblk`). On success the node is
     /// stored and the best tip moves to it iff its chainwork strictly exceeds the current
     /// tip's.
     ///
     /// # Errors
     ///
-    /// Returns the first failing [`ChainError`]; the tree is left unmodified on every error.
+    /// Returns the first failing [`ChainError`]. No header node is added on error; the
+    /// failed-ancestor walk behind [`ChainError::InvalidParent`] deliberately marks the
+    /// nodes it traverses failed before returning, exactly as `AcceptBlockHeader`'s
+    /// `invalid_walk` sets `BLOCK_FAILED_CHILD` on the blocks between the parent and the
+    /// failed ancestor.
     pub fn insert(&mut self, header: &BlockHeader, now: u32) -> Result<InsertStatus, ChainError> {
         let hash = header.hash();
         if let Some(existing) = self.nodes.get(&hash) {
@@ -255,10 +345,15 @@ impl HeaderTree {
             });
         }
         pow::check_proof_of_work(&hash, header.bits, &self.params)?;
-        let parent = self
+        let parent = *self
             .nodes
             .get(&header.prev_block_hash)
             .ok_or(ChainError::UnknownParent(header.prev_block_hash))?;
+        // `bad-prevblk` (direct parent): `AcceptBlockHeader` rejects before
+        // `ContextualCheckBlockHeader` when `pindexPrev` carries `BLOCK_FAILED_MASK`.
+        if self.invalid.contains(&header.prev_block_hash) {
+            return Err(ChainError::InvalidParent);
+        }
         let expected = pow::required_bits(
             parent.height,
             &parent.header,
@@ -272,7 +367,7 @@ impl HeaderTree {
                 actual: header.bits,
             });
         }
-        let (times, count) = self.ancestor_times(parent);
+        let (times, count) = self.ancestor_times(&parent);
         // BIP94's timewarp floor applies only on the first block of each difficulty
         // period. `required_bits` above already rejected a zero interval, so the modulo
         // cannot panic.
@@ -297,6 +392,13 @@ impl HeaderTree {
             return Err(ChainError::BadVersion {
                 version: header.version,
             });
+        }
+        // `bad-prevblk` (failed ancestor): `AcceptBlockHeader`'s last gate walks
+        // `m_failed_blocks` for an ancestor of `pindexPrev`, marking the blocks between
+        // `BLOCK_FAILED_CHILD` as it goes — the ancestor walk here is the same check
+        // and leaves the same marks.
+        if self.ancestor_is_invalid(header.prev_block_hash) {
+            return Err(ChainError::InvalidParent);
         }
         let chainwork = parent
             .chainwork

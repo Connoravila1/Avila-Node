@@ -64,7 +64,7 @@ consult (`GetOp`-equivalent instruction iteration, `GetSigOpCount`, `IsPushOnly`
 `IsPayToScriptHash`, `IsWitnessProgram`, `CScriptNum`/push encodings). Every error
 exposes Core's reject-reason string via `RuleError::reason`, and the block-level
 differential adapter (`tools/check_blocks_core.py` + `examples/check_blocks.rs`)
-verifies those reasons against a live daemon's `submitblock`: **254 corpus
+verifies those reasons against a live daemon's `submitblock`: **258 corpus
 submissions and 9 real block fixtures compared, zero verdict mismatches** —
 every named violation above returns Core's exact reason, including the
 order-dependent cases (`bad-blk-length` beats `bad-txns-oversize`;
@@ -121,8 +121,8 @@ restores even the BIP30-repeat overwrite cases that force Core's
 concern, not an in-memory one). Every error maps to Core's reject reason via
 `ConnectError::reason`; the corpus's connect-phase cases (61–72 in
 `gen-corpus`) exercise each rule on tip-extending blocks the daemon actually
-connects, and `check-many`'s `ChainState` runs `connect_block` on the same
-boundary the daemon does.
+connects, and the library `chainstate::Chainstate` runs `connect_block` on the
+same boundary the daemon does.
 
 | Rule | Core anchor | Implementation | Valid coverage | Invalid coverage |
 | --- | --- | --- | --- | --- |
@@ -139,6 +139,30 @@ boundary the daemon does.
 | Script flags per block: base `P2SH\|WITNESS\|TAPROOT`, historical exception blocks, buried `DERSIG`/`CLTV`/`CSV`/`NULLDUMMY` ORed on | `GetBlockScriptFlags`, `script_flag_exceptions` | `block_script_flags` | gating exercised by every connected corpus block | — (exception-block coverage is a mainnet-sync case, noted below) |
 | Script execution | `CheckInputScripts`, `EvalScript`, `VerifyScript`, `VerifyWitnessProgram` | `interpreter.rs` ports the full stack machine: all opcodes incl. `CHECKSIG`/`CHECKMULTISIG`/`CHECKSIGADD`, `CLTV`/`CSV`, conditionals, altstack, `CODESEPARATOR`, `FindAndDelete`, signature/pubkey encoding checks (DERSIG/LOW_S/STRICTENC/WITNESS_PUBKEYTYPE/MINIMALIF/MINIMALDATA/NULLDUMMY/NULLFAIL/CONST_SCRIPTCODE), P2SH stack restore, witness v0 (P2WPKH/P2WSH), taproot key/script path incl. control block, annex and `OP_SUCCESSx`, `OP_CHECKSIGADD`, validation-weight accounting. `sigchecker.rs` ports `SignatureHash` (legacy + BIP143), `SignatureHashSchnorr` (BIP341/342), `PrecomputedTransactionData`, `GenericTransactionSignatureChecker`, `CheckInputScripts`, and taproot commitment verification; ECDSA/schnorr via `secp256k1` (libsecp256k1 — the library Core links). Wired into `connect_block` at Core's position (after sequence locks and sigop accounting, before UTXO update). | 500 vendored Core `sighash.json` legacy vectors; BIP143/BIP341 sighash differential vs `bitcoin::sighash::SighashCache`; signed-spend corpus cases the daemon actually connects: legacy P2PKH, P2WPKH, P2WSH, taproot key-path, taproot script-path, P2SH-P2WPKH (corpus 73–79) | corrupted-signature P2SH spend rejects with the daemon's exact `mandatory-script-verify-flag-failed (...)` string (corpus 81); always-false spend + rollback unit test; 29 interpreter unit tests |
 | Undo / disconnect: exact state restoration incl. spent inputs and overwritten coins | `DisconnectBlock`, `CBlockUndo`/`CTxUndo` | `disconnect_block`, `BlockUndo` (one `TxUndo` per tx incl. coinbase) | disconnect→pre-state and reconnect→same-state unit tests | — |
+
+## Block acceptance (`chainstate.rs`)
+
+`chainstate.rs` is the stateful driver — Core's `ProcessNewBlock` →
+`AcceptBlock` → `ActivateBestChain` pipeline over `HeaderTree` (the block
+index) + `UtxoSet` (the coins view): `CheckBlock` *before* the header enters
+the index (Core's CVE-2012-2459 caution — a CheckBlock failure is never
+cached), `AcceptBlockHeader`/`ContextualCheckBlockHeader` insertion, then
+`ContextualCheckBlock`, body retention, and activation — tip-extension
+connects and heavier-branch reorgs that disconnect to the fork point and
+reconnect forward, committed atomically only when the whole branch connects.
+
+Failed-block bookkeeping matches `mapBlockIndex`: `ContextualCheckBlock` and
+`ConnectBlock` failures mark `BLOCK_FAILED_VALID` (except `BLOCK_MUTATED`-class
+rejections, which never mark); children of a failed block are `bad-prevblk`
+at header insertion — the direct-parent check before contextual header rules
+and the failed-ancestor walk after it, which also marks intermediates
+`BLOCK_FAILED_CHILD`; resubmitting a failed block is `duplicate-invalid`; and
+a heavier branch containing a failed block is pruned from activation without
+touching the active tip. Corpus cases 82–85 exercise all of these against the
+daemon (`duplicate-invalid` resubmission, `bad-prevblk` child, and the two
+orphan cases — child of a header-rejected block and child of a CheckBlock
+rejection are both `prev-blk-not-found`, since the parent never entered the
+index).
 
 ## Network parameters (`params.rs`)
 
@@ -201,10 +225,11 @@ Not defects — scope boundaries for later gates:
 
 - **Block-level acceptance**: signet block-signature validation (BIP325 — the
   `SignetSolutionUnsupported` stub in `check.rs`).
-- **Reorg handling**: `disconnect_block` + the harness's disconnect-to-fork /
-  connect-forward orchestration are exercised by the 80-fork corpus case; a
-  production chainstate driver (disk-backed block store, invalid-branch
-  marking, assumevalid) remains a G2 storage/sync task.
+- **Reorg handling**: `chainstate.rs` drives disconnect-to-fork /
+  connect-forward reorgs plus Core's failed-block bookkeeping
+  (`BLOCK_FAILED_*`, `bad-prevblk`, `duplicate-invalid`, activation pruning);
+  exercised by the 80-fork corpus case and cases 82–85. Remaining G2 storage
+  work: disk-backed block store, durable coins view, assumevalid.
 - **Header-chain rules not in Core's `ContextualCheckBlockHeader`**:
   checkpoints, `nMinimumChainWork`, BIP9 versionbits deployment state
   (Core treats unexpected versions as warnings, not rejections).
@@ -218,21 +243,22 @@ Not defects — scope boundaries for later gates:
   high-hash / time-too-old / time-too-new / orphan / duplicate agreement).
   `tools/check_blocks_core.py` (+ `examples/check_blocks.rs`) does the same at
   block level: it generates a stateful regtest corpus (valid controls plus one
-  violation per implemented rule, replayed through a shared `ChainState` —
-  header tree plus `UtxoSet` — in `check-many` mode, so tip-extending blocks
-  run through `connect_block` exactly as the daemon connects them), submits
-  each block through `submitblock`, and replays the committed real block
-  fixtures on per-network daemons — **263 submissions, zero unexplained
-  mismatches**, covering every `CheckBlock`/`ContextualCheckBlock` rule plus
-  the `ConnectBlock` cases 61–72 (missingorspent, premature coinbase,
-  in-belowout, cb-amount, BIP30, BIP68 height/time locks, P2SH/witness
-  sigops), the signed-spend cases 73–79 and 81 (real ECDSA/schnorr spends of
-  every standard output type — P2PKH, P2WPKH, P2WSH, taproot key- and
-  script-path, P2SH-P2WPKH — accepted by the daemon's `CheckInputScripts`
-  and by ours, plus a corrupted-signature spend both reject with the same
-  reason string), and the 80-fork reorg (104-block branch disconnects and
-  replaces the connected 110-block chain identically on both sides). It
-  caught the `push_int`/`OP_N` divergence described above on its
+  violation per implemented rule, replayed through the library `Chainstate` —
+  header index plus `UtxoSet` — so tip-extending blocks run through
+  `connect_block` exactly as the daemon connects them), submits each block
+  through `submitblock`, and replays the committed real block fixtures on
+  per-network daemons — **267 submissions, zero unexplained mismatches**,
+  covering every `CheckBlock`/`ContextualCheckBlock` rule plus the
+  `ConnectBlock` cases 61–72 (missingorspent, premature coinbase, in-belowout,
+  cb-amount, BIP30, BIP68 height/time locks, P2SH/witness sigops), the
+  signed-spend cases 73–79 and 81 (real ECDSA/schnorr spends of every standard
+  output type — P2PKH, P2WPKH, P2WSH, taproot key- and script-path,
+  P2SH-P2WPKH — accepted by the daemon's `CheckInputScripts` and by ours, plus
+  a corrupted-signature spend both reject with the same reason string), the
+  failed-block bookkeeping cases 82–85 (`duplicate-invalid`, `bad-prevblk`,
+  and `prev-blk-not-found` orphans), and the 80-fork reorg (104-block branch
+  disconnects and replaces the connected 110-block chain identically on both
+  sides). It caught the `push_int`/`OP_N` divergence described above on its
   first run. Both artifacts record the reference binary's version and sha256.
   Coverage-guided fuzzing exists (`fuzz/`, libFuzzer via cargo-fuzz): six
   targets over header/transaction/block decoding, CompactSize canonicality,

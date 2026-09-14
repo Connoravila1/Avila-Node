@@ -6,6 +6,7 @@
 pub mod arith;
 pub mod block;
 pub mod chain;
+pub mod chainstate;
 pub mod check;
 pub mod connect;
 pub mod encode;

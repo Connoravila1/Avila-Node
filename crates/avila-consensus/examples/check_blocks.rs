@@ -24,7 +24,6 @@
 //! shared tree in manifest order, so the manifest reflects the
 //! implementation's actual stateful behavior, not an assertion.
 
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -33,14 +32,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use avila_consensus::arith::CompactTarget;
 use avila_consensus::block::Block;
-use avila_consensus::chain::{ChainError, HeaderTree, InsertStatus};
-use avila_consensus::check::{self, BlockContext, RuleError};
-use avila_consensus::connect::{self, ConnectContext, UtxoSet};
+use avila_consensus::chainstate::{Acceptance, Chainstate};
+use avila_consensus::check;
+use avila_consensus::connect;
 use avila_consensus::hash::{BlockHash, MerkleRoot, Txid};
 use avila_consensus::header::BlockHeader;
 use avila_consensus::params::{Network, Params};
-use avila_consensus::pow::{self, PowError};
-use avila_consensus::rules::TimeError;
+use avila_consensus::pow;
 use avila_consensus::script;
 use avila_consensus::transaction::{OutPoint, Script, Transaction, TxIn, TxOut, Witness};
 
@@ -54,203 +52,27 @@ fn network(name: &str) -> Option<Network> {
     })
 }
 
-/// The reject reason Core's `AcceptBlockHeader` reports for the equivalent
-/// failure — the same mapping `check-headers` uses.
-fn core_reason_header(err: &ChainError) -> String {
-    match err {
-        ChainError::UnknownParent(_) => "prev-blk-not-found".to_string(),
-        ChainError::WrongBits { .. } => "bad-diffbits".to_string(),
-        ChainError::Pow(
-            PowError::NegativeTarget(_)
-            | PowError::OverflowTarget(_)
-            | PowError::ZeroTarget(_)
-            | PowError::TargetAboveLimit(_)
-            | PowError::InsufficientWork { .. },
-        ) => "high-hash".to_string(),
-        ChainError::Pow(PowError::UnknownAncestor(_) | PowError::DegenerateDifficultyParams) => {
-            "internal".to_string()
+/// Runs [`Chainstate::accept_block`] against `state` (shared across calls, like
+/// Core's block index + chainstate) and returns `(verdict, detail)` in the
+/// shape the differential driver compares. A block that extends the connected
+/// tip reports `accepted` after a real `connect_block`; a valid block on any
+/// other branch reports `accepted` after the context-free and contextual
+/// layers, like the daemon's `inconclusive` for side-chain blocks.
+fn validate(block: &Block, state: &mut Chainstate, now: u32) -> (String, String) {
+    match state.accept_block(block, now) {
+        Ok(Acceptance::Connected { height, reorged }) => (
+            "accepted".to_string(),
+            if reorged {
+                format!("height={height},connected,reorg")
+            } else {
+                format!("height={height},connected")
+            },
+        ),
+        Ok(Acceptance::Parked { height }) => ("accepted".to_string(), format!("height={height}")),
+        Ok(Acceptance::AlreadyKnown { height }) => {
+            ("accepted-known".to_string(), format!("height={height}"))
         }
-        ChainError::Time(TimeError::TooOld { .. }) => "time-too-old".to_string(),
-        ChainError::Time(TimeError::Timewarp { .. }) => "time-timewarp-attack".to_string(),
-        ChainError::Time(TimeError::TooNew { .. }) => "time-too-new".to_string(),
-        ChainError::BadVersion { .. } => err.to_string(),
-        ChainError::ChainWorkOverflow | ChainError::HeightOverflow => "internal".to_string(),
-    }
-}
-
-/// Stateful validation chain — mirrors the daemon's block index plus active
-/// chainstate. `tree` accumulates every inserted header; `utxo`/`connected`
-/// track the active chain tip so a block that extends it is actually
-/// connected, exactly as `submitblock` connecting a new tip on the daemon;
-/// `blocks`/`undos`/`chain` let a heavier side branch trigger a real reorg
-/// (disconnect back to the fork point, connect forward), as Core's
-/// `ActivateBestChain` does.
-struct ChainState {
-    tree: HeaderTree,
-    utxo: UtxoSet,
-    /// Block hash of the connected tip (`genesis` at start — the genesis
-    /// block's coinbase is not in the UTXO set on any network).
-    connected: BlockHash,
-    /// Accepted block bodies by hash — a real node fetches them from disk;
-    /// the corpus keeps them resident.
-    blocks: HashMap<BlockHash, Block>,
-    /// The connected chain's block hashes, genesis at index 0.
-    chain: Vec<BlockHash>,
-    /// Per-block undo for `chain[1..]` (genesis is never connected):
-    /// `undos[k]` reverses the block at height `k + 1`.
-    undos: Vec<connect::BlockUndo>,
-}
-
-impl ChainState {
-    fn new(params: &Params) -> Self {
-        let genesis = params.genesis_header.hash();
-        Self {
-            tree: HeaderTree::new(*params),
-            utxo: UtxoSet::new(),
-            connected: genesis,
-            blocks: HashMap::new(),
-            chain: vec![genesis],
-            undos: Vec::new(),
-        }
-    }
-
-    /// If `hash`'s branch has more chainwork than the connected tip, reorg:
-    /// disconnect `chain[fork+1..]` then connect the branch `fork+1..=hash`.
-    /// Simulated on a cloned UTXO set and committed only on success — the
-    /// daemon likewise keeps the old chain when a heavier branch fails to
-    /// connect (it marks the branch invalid and stays put).
-    ///
-    /// Returns `Ok(true)` when a reorg was performed, `Ok(false)` when the
-    /// branch does not outwork the tip, `Err` when the branch won the work
-    /// race but failed to connect.
-    fn maybe_reorg(
-        &mut self,
-        hash: BlockHash,
-        params: &Params,
-    ) -> Result<bool, connect::ConnectError> {
-        let Some(new_node) = self.tree.get(&hash) else {
-            return Err(connect::ConnectError::Internal("reorg on unknown header"));
-        };
-        let Some(conn_node) = self.tree.get(&self.connected) else {
-            return Err(connect::ConnectError::Internal("connected tip not in tree"));
-        };
-        if new_node.chainwork <= conn_node.chainwork {
-            return Ok(false);
-        }
-        // Collect the branch back to its fork point with the connected chain.
-        let chain_set: std::collections::HashSet<BlockHash> = self.chain.iter().copied().collect();
-        let mut branch_hashes = Vec::new();
-        let mut cursor = hash;
-        while !chain_set.contains(&cursor) {
-            branch_hashes.push(cursor);
-            let Some(node) = self.tree.get(&cursor) else {
-                return Err(connect::ConnectError::Internal("branch walk left the tree"));
-            };
-            cursor = node.header.prev_block_hash;
-        }
-        let fork = cursor;
-        let fork_height = self.tree.get(&fork).map(|n| n.height).unwrap_or(0);
-        branch_hashes.reverse();
-
-        // Simulate on a clone: disconnect the old branch, connect the new one.
-        let mut utxo = self.utxo.clone();
-        for height in (fork_height + 1..=self.undos.len() as u32).rev() {
-            let block_hash = self.chain[height as usize];
-            let Some(block) = self.blocks.get(&block_hash) else {
-                return Err(connect::ConnectError::Internal(
-                    "missing connected block body",
-                ));
-            };
-            let undo = &self.undos[(height - 1) as usize];
-            connect::disconnect_block(block, &mut utxo, undo)
-                .map_err(|_| connect::ConnectError::Internal("disconnect undo inconsistent"))?;
-        }
-        let mut new_undos = Vec::with_capacity(branch_hashes.len());
-        for branch_hash in &branch_hashes {
-            let Some(block) = self.blocks.get(branch_hash) else {
-                return Err(connect::ConnectError::Internal("missing branch block body"));
-            };
-            let ctx = ConnectContext {
-                params,
-                tree: &self.tree,
-                block_hash: *branch_hash,
-            };
-            new_undos.push(connect::connect_block(block, &mut utxo, &ctx)?);
-        }
-
-        // Commit.
-        self.utxo = utxo;
-        self.chain.truncate(fork_height as usize + 1);
-        self.undos.truncate(fork_height as usize);
-        self.chain.extend(branch_hashes);
-        self.undos.extend(new_undos);
-        self.connected = hash;
-        Ok(true)
-    }
-}
-
-/// Runs the implemented pipeline against `state` (shared across calls, like
-/// Core's block index + chainstate) and returns `(verdict, detail)`. A header
-/// that passes insertion stays in the tree even when a later block-level rule
-/// rejects the block — matching Core, where `AcceptBlockHeader` commits the
-/// header to the block index before `CheckBlock` runs. A block that extends
-/// the connected tip is run through [`connect::connect_block`]; a valid block
-/// on any other branch reports `accepted` after the context-free and
-/// contextual layers, like the daemon's `inconclusive` for side-chain blocks.
-fn validate(block: &Block, params: &Params, state: &mut ChainState, now: u32) -> (String, String) {
-    let height = match state.tree.insert(&block.header, now) {
-        Ok(InsertStatus::Added { height }) => height,
-        Ok(InsertStatus::AlreadyKnown { height }) => {
-            return ("accepted-known".to_string(), format!("height={height}"));
-        }
-        Err(err) => {
-            return (
-                format!("rejected:{}", core_reason_header(&err)),
-                err.to_string(),
-            );
-        }
-    };
-    if let Err(err) = check::check_block(block, params) {
-        return (format!("rejected:{}", err.reason()), err.to_string());
-    }
-    // Corpus blocks build on the seeded genesis, so the parent is in the tree.
-    let parent_mtp = state.tree.median_time_past(&block.header.prev_block_hash);
-    let ctx = BlockContext {
-        params,
-        height,
-        parent_median_time_past: parent_mtp,
-    };
-    if let Err(err) = check::contextual_check_block(block, &ctx) {
-        return (format!("rejected:{}", err.reason()), err.to_string());
-    }
-    // Structurally valid: the block body may be needed for a later reorg, so
-    // keep it (Core likewise stores every valid block on disk).
-    let hash = block.block_hash();
-    state.blocks.insert(hash, block.clone());
-    if block.header.prev_block_hash == state.connected {
-        let ctx = ConnectContext {
-            params,
-            tree: &state.tree,
-            block_hash: hash,
-        };
-        match connect::connect_block(block, &mut state.utxo, &ctx) {
-            Ok(undo) => {
-                state.chain.push(hash);
-                state.undos.push(undo);
-                state.connected = hash;
-                ("accepted".to_string(), format!("height={height},connected"))
-            }
-            Err(err) => (format!("rejected:{}", err.reason()), err.to_string()),
-        }
-    } else {
-        match state.maybe_reorg(hash, params) {
-            Ok(true) => (
-                "accepted".to_string(),
-                format!("height={height},connected,reorg"),
-            ),
-            Ok(false) => ("accepted".to_string(), format!("height={height}")),
-            Err(err) => (format!("rejected:{}", err.reason()), err.to_string()),
-        }
+        Err(err) => (format!("rejected:{}", err.reason()), err.to_string()),
     }
 }
 
@@ -384,11 +206,10 @@ fn emit(
     outdir: &Path,
     name: &str,
     block: &Block,
-    params: &Params,
-    state: &mut ChainState,
+    state: &mut Chainstate,
     now: u32,
 ) -> Result<(), String> {
-    let (verdict, _detail) = validate(block, params, state, now);
+    let (verdict, _detail) = validate(block, state, now);
     let path = outdir.join(format!("{name}.bin"));
     fs::write(&path, block.encode()).map_err(|e| format!("write {}: {e}", path.display()))?;
     manifest.push((name.to_string(), verdict));
@@ -402,14 +223,14 @@ fn emit_tx_case(
     outdir: &Path,
     name: &str,
     params: &Params,
-    state: &mut ChainState,
+    state: &mut Chainstate,
     now: u32,
     mutate: impl FnOnce(&mut Transaction),
 ) -> Result<(), String> {
     let mut tx = spend_tx();
     mutate(&mut tx);
     let block = finish(draft_block(params, vec![regtest_coinbase(1), tx]), params);
-    emit(manifest, outdir, name, &block, params, state, now)
+    emit(manifest, outdir, name, &block, state, now)
 }
 
 fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
@@ -418,19 +239,11 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
     // One chain state across the whole corpus: verdicts are stateful, matching
     // how the daemon accumulates headers in its block index and connects the
     // active chain tip between submissions.
-    let mut state = ChainState::new(&params);
+    let mut state = Chainstate::new(&params);
 
     // -- valid baseline ------------------------------------------------------
     let valid = finish(draft_block(&params, vec![regtest_coinbase(1)]), &params);
-    emit(
-        &mut manifest,
-        outdir,
-        "00-valid",
-        &valid,
-        &params,
-        &mut state,
-        now,
-    )?;
+    emit(&mut manifest, outdir, "00-valid", &valid, &mut state, now)?;
 
     // A valid child at height 2: exercises the pipeline past genesis+1 (the
     // daemon will connect both blocks). `child` is also the connect-phase
@@ -441,7 +254,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "05-valid-height2",
         &child,
-        &params,
         &mut state,
         now,
     )?;
@@ -450,18 +262,19 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
 
     // high-hash: a valid compact encoding under the limit, but the hash fails
     // the claimed (~2^248) target.
+    let high_hash_header;
     {
         let mut block = draft_block(&params, vec![regtest_coinbase(1)]);
         block.header.bits = CompactTarget(0x1f7f_ffff);
         while pow::check_proof_of_work(&block.block_hash(), block.header.bits, &params).is_ok() {
             block.header.nonce += 1;
         }
+        high_hash_header = block.header;
         emit(
             &mut manifest,
             outdir,
             "10-high-hash",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -480,7 +293,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "11-bad-diffbits",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -496,7 +308,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "12-time-too-old",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -512,7 +323,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "13-time-too-new",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -529,7 +339,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "14-bad-version",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -538,18 +347,19 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
     // -- CheckBlock ----------------------------------------------------------
 
     // bad-txnmrklroot: the committed root doesn't match the transaction list.
+    let mutated_header;
     {
         let mut block = draft_block(&params, vec![regtest_coinbase(1)]);
         let mut bytes = block.header.merkle_root.to_bytes();
         bytes[0] ^= 0xff;
         block.header.merkle_root = MerkleRoot::from_bytes(bytes);
         grind(&mut block, &params);
+        mutated_header = block.header;
         emit(
             &mut manifest,
             outdir,
             "20-bad-txnmrklroot",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -573,7 +383,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "21-bad-txns-duplicate",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -588,7 +397,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "22-bad-blk-length",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -602,7 +410,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "23-bad-cb-missing",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -621,7 +428,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "24-bad-cb-multiple",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -730,7 +536,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "39-cb-length",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -746,7 +551,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "40-bad-blk-sigops",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -781,7 +585,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "51-bad-cb-height",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -798,7 +601,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "52-unexpected-witness",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -821,7 +623,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "53-bad-witness-nonce-size",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -843,7 +644,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "54-bad-witness-merkle-match",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -863,7 +663,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "55-bad-blk-weight",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -882,7 +681,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "56-valid-witness",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -894,22 +692,14 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         let mut block = draft_block(&params, vec![regtest_coinbase(1)]);
         block.header.prev_block_hash = BlockHash::from_bytes([0x77; 32]);
         let block = finish(block, &params);
-        emit(
-            &mut manifest,
-            outdir,
-            "57-orphan",
-            &block,
-            &params,
-            &mut state,
-            now,
-        )?;
+        emit(&mut manifest, outdir, "57-orphan", &block, &mut state, now)?;
     }
 
     // duplicate: resubmitting 00-valid — our shared tree reports
     // `accepted-known`, the daemon's block index reports `duplicate`; both
     // normalize to `accepted`.
     {
-        let (verdict, _detail) = validate(&valid, &params, &mut state, now);
+        let (verdict, _detail) = validate(&valid, &mut state, now);
         manifest.push(("00-valid".to_string(), verdict));
     }
 
@@ -947,7 +737,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             &format!("60-chain-{h:03}"),
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -985,7 +774,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "61-valid-spend",
         &block102,
-        &params,
         &mut state,
         now,
     )?;
@@ -1015,7 +803,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "62-missing-input",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -1038,7 +825,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "63-spent-input",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -1061,7 +847,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "64-premature-coinbase",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -1085,23 +870,23 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "65-in-belowout",
             &block,
-            &params,
             &mut state,
             now,
         )?;
     }
 
     // bad-cb-amount: the coinbase pays subsidy + 1 with no fees in the block.
+    let bad_cb;
     {
         let mut cb = regtest_coinbase(103);
         cb.outputs[0].value = 5_000_000_001;
         let block = finish(draft_on(&case_parent, vec![cb]), &params);
+        bad_cb = block.clone();
         emit(
             &mut manifest,
             outdir,
             "66-cb-amount",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -1120,7 +905,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "67-bip30-duplicate",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -1144,7 +928,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "68-bip68-nonfinal",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -1169,7 +952,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "69-bip68-time-nonfinal",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -1196,7 +978,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "70-p2sh-sigops",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -1237,7 +1018,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "71-witness-sigops",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -1275,7 +1055,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             "72-bip68-ok",
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -1296,6 +1075,73 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         &mut state,
         now,
     )?;
+
+    // -- failed-block bookkeeping --------------------------------------------
+    // Core marks a block that fails CheckBlock/ContextualCheckBlock/ConnectBlock
+    // BLOCK_FAILED_VALID: resubmitting it is `duplicate-invalid`, and every
+    // descendant is `bad-prevblk` at AcceptBlockHeader — including descendants
+    // reached only through the failed-ancestor walk over unmarked parents.
+    emit(
+        &mut manifest,
+        outdir,
+        "82-invalid-resubmit",
+        &bad_cb,
+        &mut state,
+        now,
+    )?;
+
+    // A child of the connect-failed `66-cb-amount`: header insertion meets a
+    // failed direct parent.
+    {
+        let child = finish(
+            draft_on(&bad_cb.header, vec![regtest_coinbase(104)]),
+            &params,
+        );
+        emit(
+            &mut manifest,
+            outdir,
+            "83-child-of-invalid",
+            &child,
+            &mut state,
+            now,
+        )?;
+    }
+
+    // A child of `10-high-hash`: that header never entered the index, so this
+    // is an orphan — `prev-blk-not-found`, not `bad-prevblk`.
+    {
+        let child = finish(
+            draft_on(&high_hash_header, vec![regtest_coinbase(2)]),
+            &params,
+        );
+        emit(
+            &mut manifest,
+            outdir,
+            "84-child-of-unknown-header",
+            &child,
+            &mut state,
+            now,
+        )?;
+    }
+
+    // A child of `20-bad-txnmrklroot`: `ProcessNewBlock` runs `CheckBlock`
+    // before `AcceptBlock`, so a CheckBlock failure never enters the index at
+    // all — the child is an orphan (`prev-blk-not-found`), same as a child of
+    // a header-rejected block.
+    {
+        let child = finish(
+            draft_on(&mutated_header, vec![regtest_coinbase(2)]),
+            &params,
+        );
+        emit(
+            &mut manifest,
+            outdir,
+            "85-child-of-mutated",
+            &child,
+            &mut state,
+            now,
+        )?;
+    }
 
     // Reorg: a 104-block branch on genesis outworks the connected tip (h110) —
     // both sides disconnect the 103-block main chain and connect 104 fork
@@ -1320,7 +1166,6 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             outdir,
             &format!("80-fork-{h:03}"),
             &block,
-            &params,
             &mut state,
             now,
         )?;
@@ -1354,7 +1199,7 @@ fn emit_signed_spends(
     parent: BlockHeader,
     fund_input: OutPoint,
     params: &Params,
-    state: &mut ChainState,
+    state: &mut Chainstate,
     now: u32,
 ) -> Result<(), String> {
     use bitcoin::hashes::Hash as _;
@@ -1477,7 +1322,7 @@ fn emit_signed_spends(
             draft_on(&signed_parent, vec![regtest_coinbase(104), fund]),
             params,
         );
-        emit(manifest, outdir, "73-fund", &block, params, state, now)?;
+        emit(manifest, outdir, "73-fund", &block, state, now)?;
         signed_parent = block.header;
     }
     let spent_outs = |vout: u32| OutPoint {
@@ -1542,15 +1387,7 @@ fn emit_signed_spends(
             draft_on(&signed_parent, vec![regtest_coinbase(105), tx]),
             params,
         );
-        emit(
-            manifest,
-            outdir,
-            "74-spend-p2pkh",
-            &block,
-            params,
-            state,
-            now,
-        )?;
+        emit(manifest, outdir, "74-spend-p2pkh", &block, state, now)?;
         signed_parent = block.header;
     }
 
@@ -1577,15 +1414,7 @@ fn emit_signed_spends(
         cb.inputs[0].witness = Witness::new(vec![vec![0x42; 32]]);
         let mut block = draft_on(&signed_parent, vec![cb, tx]);
         add_witness_commitment(&mut block, params);
-        emit(
-            manifest,
-            outdir,
-            "75-spend-p2wpkh",
-            &block,
-            params,
-            state,
-            now,
-        )?;
+        emit(manifest, outdir, "75-spend-p2wpkh", &block, state, now)?;
         signed_parent = block.header;
     }
 
@@ -1612,15 +1441,7 @@ fn emit_signed_spends(
         cb.inputs[0].witness = Witness::new(vec![vec![0x42; 32]]);
         let mut block = draft_on(&signed_parent, vec![cb, tx]);
         add_witness_commitment(&mut block, params);
-        emit(
-            manifest,
-            outdir,
-            "76-spend-p2wsh",
-            &block,
-            params,
-            state,
-            now,
-        )?;
+        emit(manifest, outdir, "76-spend-p2wsh", &block, state, now)?;
         signed_parent = block.header;
     }
 
@@ -1648,15 +1469,7 @@ fn emit_signed_spends(
         cb.inputs[0].witness = Witness::new(vec![vec![0x42; 32]]);
         let mut block = draft_on(&signed_parent, vec![cb, tx]);
         add_witness_commitment(&mut block, params);
-        emit(
-            manifest,
-            outdir,
-            "77-spend-p2tr-key",
-            &block,
-            params,
-            state,
-            now,
-        )?;
+        emit(manifest, outdir, "77-spend-p2tr-key", &block, state, now)?;
         signed_parent = block.header;
     }
 
@@ -1693,15 +1506,7 @@ fn emit_signed_spends(
         cb.inputs[0].witness = Witness::new(vec![vec![0x42; 32]]);
         let mut block = draft_on(&signed_parent, vec![cb, tx]);
         add_witness_commitment(&mut block, params);
-        emit(
-            manifest,
-            outdir,
-            "78-spend-p2tr-script",
-            &block,
-            params,
-            state,
-            now,
-        )?;
+        emit(manifest, outdir, "78-spend-p2tr-script", &block, state, now)?;
         signed_parent = block.header;
     }
 
@@ -1729,15 +1534,7 @@ fn emit_signed_spends(
         cb.inputs[0].witness = Witness::new(vec![vec![0x42; 32]]);
         let mut block = draft_on(&signed_parent, vec![cb, tx]);
         add_witness_commitment(&mut block, params);
-        emit(
-            manifest,
-            outdir,
-            "79-spend-p2sh-p2wpkh",
-            &block,
-            params,
-            state,
-            now,
-        )?;
+        emit(manifest, outdir, "79-spend-p2sh-p2wpkh", &block, state, now)?;
         signed_parent = block.header;
     }
 
@@ -1769,15 +1566,7 @@ fn emit_signed_spends(
             draft_on(&signed_parent, vec![regtest_coinbase(111), tx]),
             params,
         );
-        emit(
-            manifest,
-            outdir,
-            "81-p2sh-badsig",
-            &block,
-            params,
-            state,
-            now,
-        )?;
+        emit(manifest, outdir, "81-p2sh-badsig", &block, state, now)?;
     }
     Ok(())
 }
@@ -1801,10 +1590,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let mut state = ChainState::new(&net.params());
+            let mut state = Chainstate::new(&net.params());
             match Block::decode(&bytes) {
                 Ok(block) => {
-                    let (verdict, detail) = validate(&block, &net.params(), &mut state, now);
+                    let (verdict, detail) = validate(&block, &mut state, now);
                     println!("{verdict}\t{detail}");
                     ExitCode::SUCCESS
                 }
@@ -1827,7 +1616,7 @@ fn main() -> ExitCode {
             // block index + chainstate — so duplicates are reported
             // `accepted-known` and later blocks may build on and connect
             // earlier accepted ones.
-            let mut state = ChainState::new(&net.params());
+            let mut state = Chainstate::new(&net.params());
             for path in &args[3..] {
                 let name = Path::new(path)
                     .file_name()
@@ -1838,7 +1627,7 @@ fn main() -> ExitCode {
                     .and_then(|bytes| Block::decode(&bytes).map_err(|e| format!("decode\t{e}")))
                 {
                     Ok(block) => {
-                        let (verdict, detail) = validate(&block, &net.params(), &mut state, now);
+                        let (verdict, detail) = validate(&block, &mut state, now);
                         format!("{verdict}\t{detail}")
                     }
                     Err(err) => format!("rejected:{err}"),
