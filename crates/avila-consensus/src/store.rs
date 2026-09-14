@@ -906,4 +906,35 @@ mod tests {
         assert!(!dir.join(STATE_TMP).exists());
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn rotation_failure_surfaces_and_store_stays_openable() {
+        let dir = test_dir("rotate-fail");
+        // ~3 small blocks per file; blk00001.dat exists as a *directory*, so
+        // the first rotation's open_tail fails mid-append.
+        let limit = 3 * (FRAME_HEADER + test_block(0).encode().len() as u64);
+        let mut store = BlockStore::open_with_limit(&dir, MAGIC, limit).unwrap();
+        fs::create_dir(dir.join("blk00001.dat")).unwrap();
+        let blocks: Vec<Block> = (0..8).map(test_block).collect();
+        let mut appended = 0;
+        for block in &blocks {
+            match store.append(block) {
+                Ok(_) => appended += 1,
+                Err(_) => break,
+            }
+        }
+        assert!(appended < 8, "rotation should have failed");
+        drop(store);
+        fs::remove_dir(dir.join("blk00001.dat")).unwrap();
+
+        // Reopen: the truncated tail is dropped, committed blocks are intact,
+        // and the store accepts appends again.
+        let mut store = BlockStore::open_with_limit(&dir, MAGIC, limit).unwrap();
+        assert_eq!(store.len(), appended);
+        for block in &blocks {
+            store.append(block).unwrap();
+        }
+        assert_eq!(store.len(), 8);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

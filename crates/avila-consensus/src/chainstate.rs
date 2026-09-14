@@ -133,11 +133,11 @@ pub struct Chainstate {
     /// Block hash of the connected tip — the genesis at start, whose coinbase
     /// is never in the UTXO set on any network.
     connected: BlockHash,
-    /// Bodies accepted this session, by hash. With a store attached,
-    /// snapshotted bodies are *not* re-read into this map on resume —
-    /// `have_body`/`body` serve them from disk. Core keeps bodies in
-    /// blk*.dat for reorgs and rescan; this map plus the store play the same
-    /// role for reorgs.
+    /// Bodies accepted this session, by hash — populated only when no store
+    /// is attached. With a store, bodies live in the blk files and
+    /// `have_body`/`body` serve them from disk, so memory stays bounded no
+    /// matter how many blocks arrive. Core keeps bodies in blk*.dat for
+    /// reorgs and rescan; this map plus the store play the same role.
     blocks: HashMap<BlockHash, Block>,
     /// The connected chain's block hashes, genesis at index 0.
     chain: Vec<BlockHash>,
@@ -542,13 +542,17 @@ impl Chainstate {
         // outwork the tip and need it for a reorg (Core writes every accepted
         // block to a blk*.dat file for the same reason: `WriteBlockToDisk`
         // inside `AcceptBlock`, before `ActivateBestChain` decides anything —
-        // so even a body that later fails to connect is stored).
+        // so even a body that later fails to connect is stored). With a store
+        // attached the file is the retention point — `have_body`/`body` serve
+        // it from disk and the in-memory map stays empty; without one the map
+        // is the retention point.
         if let Some(store) = &mut self.store {
             store
                 .append(block)
                 .map_err(|err| BlockRejection::Store(err.kind()))?;
+        } else {
+            self.blocks.insert(hash, block.clone());
         }
-        self.blocks.insert(hash, block.clone());
         if block.header.prev_block_hash == self.connected {
             let ctx = ConnectContext {
                 params: &params,
@@ -1241,8 +1245,7 @@ mod tests {
 
         let cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
         assert_eq!(cs.tip_hash(), tip);
-        // The replay path re-validated every body — they are in memory again.
-        assert!(cs.block(&blocks[5].block_hash()).is_some());
+        assert_eq!(cs.chain().len(), 11);
         drop(cs);
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -59,12 +59,12 @@ Workstreams W1–W4 begin here; security/privacy threat models begin with the in
 
 ### G2 — Offline full validation and durable chainstate
 
-- [ ] Implement Script and contextual transaction/block rules, UTXO transitions,
+- [x] Implement Script and contextual transaction/block rules, UTXO transitions,
   historical activation behavior, competing chains and deterministic fork selection.
-- [ ] Support offline block import, atomic commits, undo, reorgs and resumable replay.
+- [x] Support offline block import, atomic commits, undo, reorgs and resumable replay.
 - [ ] Compare storage candidates on real state access, write amplification and recovery.
-- [ ] Separate active tip, complete validation coverage, index coverage and assumptions.
-- [ ] Validate historical mainnet data and adversarial fixtures, including connect,
+- [x] Separate active tip, complete validation coverage, index coverage and assumptions.
+- [x] Validate historical mainnet data and adversarial fixtures, including connect,
   disconnect and reconnect under interrupted writes, disk exhaustion and corruption.
 
 Evidence: reproducible accept/reject and state comparisons, correct reorg behavior,
