@@ -1,4 +1,8 @@
 /target/
+# cargo-fuzz standalone workspace outputs
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
 /data/
 /config/local.toml
 *.log

@@ -27,6 +27,20 @@ meaningful invariants and failure cases. Future consensus changes need valid and
 invalid fixtures, activation/chain context, and differential evidence; successful
 decoding or matching one historical block is insufficient.
 
+`avila-consensus` has two optional test layers beyond `cargo test`: deterministic
+property tests in `crates/avila-consensus/tests/property.rs` (run with the rest of
+the suite), and a libFuzzer harness in `fuzz/` — a standalone nightly workspace
+that does not affect the root lockfile:
+
+```sh
+cd fuzz
+cargo +nightly fuzz build            # requires a nightly toolchain + cargo-fuzz
+cargo +nightly fuzz run decode-block # one of the six targets
+```
+
+Corpora, crash artifacts and `fuzz/target/` are gitignored. Minimize any crash to
+a regression test in the crate before fixing.
+
 Run `cargo run --locked -p avila-gui` in a graphical session after interface changes.
 Check keyboard navigation, small windows, increased zoom, long text, empty data,
 and errors. Rendering tests complement native interaction checks.

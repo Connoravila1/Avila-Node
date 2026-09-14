@@ -1,0 +1,53 @@
+[package]
+name = "avila-consensus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+avila-consensus = { path = "../crates/avila-consensus" }
+
+# Standalone workspace: fuzzing requires nightly and must not touch the
+# committed root lockfile.
+[workspace]
+
+[[bin]]
+name = "decode-header"
+path = "fuzz_targets/decode_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode-transaction"
+path = "fuzz_targets/decode_transaction.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode-block"
+path = "fuzz_targets/decode_block.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "compact-size"
+path = "fuzz_targets/compact_size.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "compact-target"
+path = "fuzz_targets/compact_target.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "merkle-root"
+path = "fuzz_targets/merkle_root.rs"
+test = false
+doc = false

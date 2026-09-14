@@ -2,8 +2,9 @@
 //!
 //! Arbitrary inputs must never panic, must stay bounded by the input's size, and must
 //! round-trip — or agree with the rust-bitcoin reference implementation where one exists.
-//! These are deterministic-seeded, cheap stand-ins for the full fuzz harness; the pinned
-//! Core reference adapter and coverage-guided fuzzing remain separate G1 work items.
+//! These are the deterministic, in-CI layer; coverage-guided fuzzing lives in the
+//! standalone `fuzz/` workspace, and the pinned-Core reference adapter remains a
+//! separate G1 work item.
 
 // Property assertions intentionally unwrap/expect: a failed invariant should panic.
 #![allow(clippy::unwrap_used, clippy::expect_used)]

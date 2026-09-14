@@ -105,9 +105,12 @@ Not defects — scope boundaries for later gates:
 - **Header-chain rules not in Core's `ContextualCheckBlockHeader`**:
   checkpoints, `nMinimumChainWork`, BIP9 versionbits deployment state
   (Core treats unexpected versions as warnings, not rejections).
-- **Infrastructure**: pinned-Core reference adapter with disagreement artifacts,
-  coverage-guided fuzzing (property tests are the interim stand-in), scorecard
-  measurement harness.
+- **Infrastructure**: pinned-Core reference adapter with disagreement artifacts
+  and the scorecard measurement harness. Coverage-guided fuzzing exists
+  (`fuzz/`, libFuzzer via cargo-fuzz): six targets over header/transaction/
+  block decoding, CompactSize canonicality, compact-target arithmetic and
+  merkle roots; ~14M executions across a 15 s/target smoke run with zero
+  crashes. Run with `cargo +nightly fuzz run <target>` from `fuzz/`.
 
 ### Historical and activation cases to carry into G2
 
