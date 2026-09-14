@@ -124,7 +124,7 @@ fn main() {
                     }
                 }
                 SessionEvent::Message(Message::Inv(invs)) => {
-                    if let Some(req) = sync.on_inv(&cs, &invs) {
+                    if let Some(req) = sync.on_inv(&cs, &invs, usize::MAX) {
                         session.send(&req).expect("getdata");
                     }
                 }

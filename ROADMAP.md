@@ -111,7 +111,17 @@ Storage and synchronization research can use this implementation before P2P is r
       to the rest of the peer set — `headers` for peers that sent
       `sendheaders`, `inv` otherwise — mirroring Core's
       `NewPoWValidBlock` announce (the delivering peer is excluded).
-- [ ] Global budgets, eviction scoring, and cancellation.
+- [x] Global budgets, eviction scoring, and cancellation: a shared
+      aggregate in-flight budget (`MAX_BLOCKS_IN_TRANSIT_TOTAL`,
+      overridable) bounds block reservations across the whole peer set —
+      fill-pass, headers-`fetchable`, and `inv`-driven fetches all draw
+      it down. Inbound admission on a full set evicts the least
+      recently useful inbound peer (usefulness = delivered headers or
+      blocks; the headers leader and recent suppliers are protected —
+      Core's `SelectNodeToEvict` shape); outbound peers are never
+      evicted for inbound slots. Cancellation is implicit: a stalled or
+      evicted peer's reservations release and the fill pass reassigns
+      them next tick.
 - [x] Exercised on all four networks: regtest (full sync + serve, both
       directions against Knots), and live mainnet / signet / testnet4
       runs via `examples/mainnet_probe` — DNS-seeded discovery, real

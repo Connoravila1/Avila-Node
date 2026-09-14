@@ -207,10 +207,18 @@ impl PeerSync {
     /// peer may announce ahead of our headers sync — Core fetches such
     /// announcements' *headers* first via `getheaders`, which the caller
     /// triggers separately). Returns at most the free in-flight slots'
-    /// worth of `getdata` entries.
+    /// worth of `getdata` entries, further bounded by `global_free` —
+    /// the caller's remaining aggregate in-flight budget.
     #[must_use]
-    pub fn on_inv(&mut self, cs: &Chainstate, invs: &[InvVector]) -> Option<Message> {
-        let free = MAX_BLOCKS_IN_TRANSIT_PER_PEER.saturating_sub(self.in_flight.len());
+    pub fn on_inv(
+        &mut self,
+        cs: &Chainstate,
+        invs: &[InvVector],
+        global_free: usize,
+    ) -> Option<Message> {
+        let free = MAX_BLOCKS_IN_TRANSIT_PER_PEER
+            .saturating_sub(self.in_flight.len())
+            .min(global_free);
         if free == 0 {
             return None;
         }
@@ -517,7 +525,7 @@ mod tests {
                 hash: blocks[2].block_hash(),
             },
         ];
-        match sync.on_inv(&cs, &invs) {
+        match sync.on_inv(&cs, &invs, usize::MAX) {
             Some(Message::GetData(want)) => {
                 assert_eq!(want.len(), 2);
                 assert!(want.iter().all(|v| v.inv_type == InvType::WitnessBlock));
@@ -526,7 +534,7 @@ mod tests {
         }
         assert_eq!(sync.in_flight(), 2);
         // Same invs again → nothing new to ask for.
-        assert!(sync.on_inv(&cs, &invs).is_none());
+        assert!(sync.on_inv(&cs, &invs, usize::MAX).is_none());
     }
 
     #[test]

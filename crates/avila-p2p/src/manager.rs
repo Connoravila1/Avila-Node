@@ -28,6 +28,16 @@ use crate::sync::{MAX_BLOCKS_IN_TRANSIT_PER_PEER, PeerSync};
 /// connection scheduling matures.
 pub const DEFAULT_MAX_PEERS: usize = 8;
 
+/// Global bound on outstanding block reservations across the whole peer
+/// set — independent of peer count, so aggregate download memory stays
+/// predictable (Core bounds this through `BLOCK_DOWNLOAD_WINDOW`).
+pub const MAX_BLOCKS_IN_TRANSIT_TOTAL: usize = 1024;
+
+/// Peers that delivered useful headers or blocks within this window are
+/// protected from inbound eviction (Core protects for ~30 min; our
+/// window is shorter since sessions are lighter).
+pub const USEFUL_PROTECTION_WINDOW: Duration = Duration::from_secs(20 * 60);
+
 /// Per-peer send-buffer cap — Core's ~4 MiB `MAX_SEND_BUFFER` analogue,
 /// sized generously for a headers burst.
 pub const SEND_BUDGET_PER_PEER: usize = 8 << 20;
@@ -84,6 +94,15 @@ struct PeerEntry<S> {
     /// The peer sent `sendheaders` — announce new tips via `headers`,
     /// not `inv` (Core's `fSendheaders` preference).
     wants_headers_announce: bool,
+    /// Inbound connection (they dialed us). Core only ever evicts
+    /// inbound peers — outbound slots are ours to manage.
+    inbound: bool,
+    /// When this peer was registered.
+    connected_at: Instant,
+    /// Last time the peer gave us something useful — headers we
+    /// accepted or a block body. Core's `m_most_recent_block_time` /
+    /// header/tx protection analog for eviction scoring.
+    last_useful: Instant,
     /// Time of the last received message of any kind.
     last_rx: Instant,
     /// Outstanding handshake deadline check cadence.
@@ -99,6 +118,9 @@ pub struct PeerManager<S> {
     /// others get one locator to learn their view. Core's sync-peer
     /// discipline: N parallel header downloads fetch the same ranges.
     headers_leader: Option<u64>,
+    /// Aggregate bound on block reservations across all peers —
+    /// defaults to [`MAX_BLOCKS_IN_TRANSIT_TOTAL`].
+    max_in_flight_total: usize,
     /// Gossiped peer addresses — discovery lives here.
     addrbook: AddrBook,
 }
@@ -112,6 +134,7 @@ impl<S: Read + Write> PeerManager<S> {
             next_id: 0,
             max_peers,
             headers_leader: None,
+            max_in_flight_total: MAX_BLOCKS_IN_TRANSIT_TOTAL,
             addrbook: AddrBook::new(),
         }
     }
@@ -120,6 +143,12 @@ impl<S: Read + Write> PeerManager<S> {
     #[must_use]
     pub fn len(&self) -> usize {
         self.peers.len()
+    }
+
+    /// Overrides the aggregate in-flight block budget (testing and
+    /// resource-preset knob). Defaults to [`MAX_BLOCKS_IN_TRANSIT_TOTAL`].
+    pub fn set_max_in_flight_total(&mut self, n: usize) {
+        self.max_in_flight_total = n;
     }
 
     /// Whether no peers are connected.
@@ -143,15 +172,63 @@ impl<S: Read + Write> PeerManager<S> {
     /// Registers an outbound session (already constructed, version queued).
     /// Returns the peer id, or `None` if the peer set is full.
     pub fn add_outbound(&mut self, session: PeerSession<S>) -> Option<u64> {
-        self.add(session, None)
+        self.add(session, None, false)
     }
 
-    /// Registers an inbound session. Subject to the same peer cap.
+    /// Registers an inbound session. When the set is full the
+    /// worst-scoring inbound peer is evicted to make room — Core's
+    /// `SelectNodeToEvict` behavior (outbound peers are never evicted
+    /// to admit inbound).
     pub fn add_inbound(&mut self, session: PeerSession<S>) -> Option<u64> {
-        self.add(session, None)
+        if !self.has_slot() {
+            self.evict_worst_inbound();
+        }
+        self.add(session, None, true)
     }
 
-    fn add(&mut self, session: PeerSession<S>, remote: Option<NetAddr>) -> Option<u64> {
+    /// Registers an outbound session with a known remote address.
+    pub fn add_outbound_to(&mut self, session: PeerSession<S>, remote: NetAddr) -> Option<u64> {
+        self.add(session, Some(remote), false)
+    }
+
+    /// Evicts the least valuable inbound peer, if any. Peers that
+    /// recently provided useful data, or currently lead the headers
+    /// download, are protected first; among the rest the least recently
+    /// useful peer leaves (ties: longest connected) — mirroring Core's
+    /// `SelectNodeToEvict` protection-then-score ordering.
+    fn evict_worst_inbound(&mut self) -> Option<u64> {
+        let now = Instant::now();
+        let mut scored: Vec<(bool, Instant, Instant, u64)> = self
+            .peers
+            .iter()
+            .filter(|(id, p)| p.inbound && self.headers_leader != Some(**id))
+            .map(|(id, p)| {
+                let protected = now.duration_since(p.last_useful) < USEFUL_PROTECTION_WINDOW;
+                // Reverse-ordered key: unprotected first, then oldest
+                // last_useful, then oldest connected_at.
+                (protected, p.last_useful, p.connected_at, *id)
+            })
+            .collect();
+        // Unprotected sort before protected; within a class, the least
+        // recently useful and longest-connected peer is the target.
+        scored.sort();
+        let worst = scored
+            .iter()
+            .find(|(protected, ..)| !protected)
+            .or_else(|| scored.first())
+            .map(|(.., id)| *id);
+        if let Some(id) = worst {
+            self.peers.remove(&id);
+        }
+        worst
+    }
+
+    fn add(
+        &mut self,
+        session: PeerSession<S>,
+        remote: Option<NetAddr>,
+        inbound: bool,
+    ) -> Option<u64> {
         if !self.has_slot() {
             return None;
         }
@@ -165,6 +242,9 @@ impl<S: Read + Write> PeerManager<S> {
                 sync: PeerSync::new(),
                 remote,
                 wants_headers_announce: false,
+                inbound,
+                connected_at: now,
+                last_useful: now,
                 last_rx: now,
                 last_ping: now,
             },
@@ -177,6 +257,9 @@ impl<S: Read + Write> PeerManager<S> {
     pub fn tick(&mut self, cs: &mut Chainstate, now: u32) -> Vec<NetEvent> {
         let mut events = Vec::new();
         let mut dead = Vec::new();
+        // Aggregate reservation budget shared by every event this tick —
+        // headers-driven and inv-driven fetches draw it down too.
+        let mut global_free = self.max_in_flight_total.saturating_sub(self.in_flight());
         let Self {
             peers,
             addrbook,
@@ -202,6 +285,7 @@ impl<S: Read + Write> PeerManager<S> {
                             addrbook,
                             headers_leader,
                             &mut announce_tip,
+                            &mut global_free,
                             &mut events,
                             &mut dead,
                         );
@@ -287,13 +371,19 @@ impl<S: Read + Write> PeerManager<S> {
                 reserved.extend(peer.sync.reserved_hashes().copied());
                 continue;
             }
+            if reserved.len() >= self.max_in_flight_total {
+                break;
+            }
             let unfetched: Vec<BlockHash> = cs
                 .tree()
                 .headers_by_height()
                 .iter()
                 .map(|h| h.hash())
                 .filter(|h| !cs.have_body(h) && !reserved.contains(h))
-                .take(MAX_BLOCKS_IN_TRANSIT_PER_PEER)
+                .take(
+                    crate::sync::MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                        .min(self.max_in_flight_total - reserved.len()),
+                )
                 .collect();
             if unfetched.is_empty() {
                 break;
@@ -316,6 +406,7 @@ impl<S: Read + Write> PeerManager<S> {
         addrbook: &mut AddrBook,
         headers_leader: &mut Option<u64>,
         announce_tip: &mut Option<u64>,
+        global_free: &mut usize,
         events: &mut Vec<NetEvent>,
         dead: &mut Vec<(u64, DisconnectReason)>,
     ) {
@@ -352,10 +443,15 @@ impl<S: Read + Write> PeerManager<S> {
                                 let _ = peer.session.send(&next);
                             }
                         }
-                        if !outcome.fetchable.is_empty()
-                            && let Some(req) = peer.sync.want_blocks(cs, &outcome.fetchable)
-                        {
-                            let _ = peer.session.send(&req);
+                        if !outcome.fetchable.is_empty() {
+                            let offer =
+                                &outcome.fetchable[..outcome.fetchable.len().min(*global_free)];
+                            let before = peer.sync.in_flight();
+                            if let Some(req) = peer.sync.want_blocks(cs, offer) {
+                                *global_free =
+                                    global_free.saturating_sub(peer.sync.in_flight() - before);
+                                let _ = peer.session.send(&req);
+                            }
                         }
                     }
                     Err(e) => dead.push((id, DisconnectReason::Misbehavior(e.to_string()))),
@@ -378,13 +474,16 @@ impl<S: Read + Write> PeerManager<S> {
                         missing: missing.clone(),
                     });
                 }
-                if let Some(req) = peer.sync.on_inv(cs, &invs) {
+                let before = peer.sync.in_flight();
+                if let Some(req) = peer.sync.on_inv(cs, &invs, *global_free) {
+                    *global_free = global_free.saturating_sub(peer.sync.in_flight() - before);
                     let _ = peer.session.send(&req);
                 }
             }
             SessionEvent::Message(Message::Block(block)) => {
                 match peer.sync.on_block(cs, &block, now) {
                     Ok(outcome) => {
+                        peer.last_useful = Instant::now();
                         if let avila_consensus::chainstate::Acceptance::Connected { .. } =
                             outcome.acceptance
                         {
@@ -477,7 +576,7 @@ impl PeerManager<TcpStream> {
             crate::addrman::net_addr_of(addr, 0),
         );
         let session = PeerSession::initiate(stream, magic, version, SEND_BUDGET_PER_PEER)?;
-        Ok(self.add(session, Some(crate::addrman::net_addr_of(addr, 0))))
+        Ok(self.add(session, Some(crate::addrman::net_addr_of(addr, 0)), false))
     }
 
     /// Resolves `params.dns_seeds` into the address book — the bootstrap
@@ -992,6 +1091,81 @@ mod tests {
             )),
             "C should get an inv announcement: {sent_c:?}"
         );
+    }
+
+    fn add_inbound_peer(mgr: &mut PeerManager<End>) -> Option<(End, u64)> {
+        let (us_end, peer_end) = testpipe::pair();
+        let session = PeerSession::initiate(
+            us_end,
+            MAGIC,
+            build_version(9, 0, NetAddr::unspecified()),
+            BUDGET,
+        )
+        .expect("session");
+        mgr.add_inbound(session).map(|id| (peer_end, id))
+    }
+
+    #[test]
+    fn full_set_evicts_least_useful_inbound() {
+        let mut mgr = PeerManager::new(2);
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 1);
+        for b in &blocks {
+            cs.accept_header(&b.header, NOW).unwrap();
+        }
+        let (mut p1, id1) = add_inbound_peer(&mut mgr).expect("slot");
+        let (_p2, id2) = add_inbound_peer(&mut mgr).expect("slot");
+        handshake(&mut mgr, &mut p1, &mut cs);
+        testpipe::drain(&mut p1, MAGIC);
+        // p1 delivers a block → becomes the more recently useful peer.
+        testpipe::inject(&mut p1, MAGIC, &Message::Block(blocks[0].clone()));
+        mgr.tick(&mut cs, NOW);
+        // The set is full: a third inbound evicts the least recently
+        // useful one — p2, not p1.
+        let (_p3, id3) = add_inbound_peer(&mut mgr).expect("eviction admits");
+        assert!(mgr.peers.contains_key(&id1), "useful peer survives");
+        assert!(!mgr.peers.contains_key(&id2), "stale peer evicted");
+        assert!(mgr.peers.contains_key(&id3));
+    }
+
+    #[test]
+    fn outbound_peers_are_never_evicted_for_inbound() {
+        let mut mgr = PeerManager::new(1);
+        let (_us_end, _peer_end) = testpipe::pair();
+        let session = PeerSession::initiate(
+            _us_end,
+            MAGIC,
+            build_version(9, 0, NetAddr::unspecified()),
+            BUDGET,
+        )
+        .expect("session");
+        let id = mgr.add_outbound(session).expect("slot");
+        // Full of outbound peers only — inbound admission cannot evict.
+        assert!(add_inbound_peer(&mut mgr).is_none());
+        assert!(mgr.peers.contains_key(&id));
+    }
+
+    #[test]
+    fn global_in_flight_budget_bounds_reservations() {
+        let (mut mgr, mut peer_a, _id_a) = managed_peer();
+        mgr.set_max_in_flight_total(3);
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 8);
+        for b in &blocks {
+            cs.accept_header(&b.header, NOW).unwrap();
+        }
+        let (mut peer_b, _id_b) = add_peer(&mut mgr);
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        handshake_peer(&mut mgr, &mut peer_b, &mut cs);
+        testpipe::drain(&mut peer_a, MAGIC);
+        testpipe::drain(&mut peer_b, MAGIC);
+        // End both headers phases so the fill pass feeds block queues.
+        for p in [&mut peer_a, &mut peer_b] {
+            testpipe::inject(p, MAGIC, &Message::Headers(vec![]));
+        }
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        assert_eq!(mgr.in_flight(), 3);
     }
 
     #[test]
