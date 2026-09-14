@@ -65,7 +65,7 @@ fn pump<S: std::io::Read + std::io::Write>(
                 }
             }
             SessionEvent::Message(Message::Inv(invs)) => {
-                if let Some(req) = sync.on_inv(cs, &invs, usize::MAX) {
+                if let Some(req) = sync.on_inv(cs, None, &invs, usize::MAX) {
                     session.send(&req).map_err(|e| e.to_string())?;
                 }
             }

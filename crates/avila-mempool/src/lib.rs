@@ -15,7 +15,7 @@ use avila_consensus::check::{TxRuleError, check_transaction};
 use avila_consensus::connect::{
     Coin, ConnectError, UtxoSet, bip68_locks_satisfied, check_tx_inputs,
 };
-use avila_consensus::hash::Txid;
+use avila_consensus::hash::{Txid, Wtxid};
 use avila_consensus::interpreter::ScriptError;
 use avila_consensus::script::{ScriptFlags, block_script_flags};
 use avila_consensus::sigchecker::check_input_scripts;
@@ -119,6 +119,9 @@ pub struct Mempool {
     map: HashMap<Txid, MempoolEntry>,
     /// outpoint → txid of the pooled tx spending it (conflict index).
     spends: HashMap<OutPoint, Txid>,
+    /// wtxid → txid — BIP339 announcements arrive by wtxid; dedup must
+    /// answer "do we have this" for either hash without a full scan.
+    wtxids: HashMap<Wtxid, Txid>,
     /// txid → parked tx with missing parents (Core's orphan pool).
     orphans: HashMap<Txid, OrphanEntry>,
     /// Entry cap.
@@ -134,6 +137,7 @@ impl Mempool {
         Self {
             map: HashMap::new(),
             spends: HashMap::new(),
+            wtxids: HashMap::new(),
             orphans: HashMap::new(),
             max_entries: DEFAULT_MAX_ENTRIES,
             min_relay_fee: DEFAULT_MIN_RELAY_FEE,
@@ -156,6 +160,24 @@ impl Mempool {
     #[must_use]
     pub fn get(&self, txid: &Txid) -> Option<&Transaction> {
         self.map.get(txid).map(|e| &e.tx)
+    }
+
+    /// Lookup by wtxid (BIP339 announcements and `MSG_WTX` requests).
+    #[must_use]
+    pub fn get_wtxid(&self, wtxid: &Wtxid) -> Option<&Transaction> {
+        self.wtxids.get(wtxid).and_then(|id| self.get(id))
+    }
+
+    /// Does the pool hold a tx under either hash form? Used to dedup
+    /// `inv` announcements before issuing `getdata`.
+    #[must_use]
+    pub fn contains_hash(&self, hash: &avila_consensus::hash::BlockHash) -> bool {
+        let txid = Txid::from_bytes(*hash.as_bytes());
+        if self.map.contains_key(&txid) {
+            return true;
+        }
+        self.wtxids
+            .contains_key(&Wtxid::from_bytes(*hash.as_bytes()))
     }
 
     /// Overrides the min-relay fee rate (sat/kvB) — an operator knob.
@@ -325,6 +347,7 @@ impl Mempool {
         for input in &tx.inputs {
             self.spends.insert(input.previous_output, txid);
         }
+        self.wtxids.insert(tx.wtxid(), txid);
         self.map.insert(
             txid,
             MempoolEntry {
@@ -394,6 +417,7 @@ impl Mempool {
     /// Drops `txid` and unindexes its input spends.
     pub fn remove(&mut self, txid: &Txid) -> Option<MempoolEntry> {
         let entry = self.map.remove(txid)?;
+        self.wtxids.remove(&entry.tx.wtxid());
         for input in &entry.tx.inputs {
             self.spends.remove(&input.previous_output);
         }

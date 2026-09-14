@@ -213,6 +213,7 @@ impl PeerSync {
     pub fn on_inv(
         &mut self,
         cs: &Chainstate,
+        mempool: Option<&avila_mempool::Mempool>,
         invs: &[InvVector],
         global_free: usize,
     ) -> Option<Message> {
@@ -239,9 +240,12 @@ impl PeerSync {
             // Block: known header + held body → nothing to fetch. Unknown
             // header → fetch anyway (the block carries its header and
             // Chainstate indexes it on acceptance — out-of-order
-            // announcements happen). Tx: no cheap presence check here —
-            // the mempool dedups on admission by txid.
+            // announcements happen). Tx: skip what the pool already holds
+            // (announced by txid or wtxid — `contains_hash` covers both).
             if is_block && cs.have_body(&hash) {
+                continue;
+            }
+            if is_tx && mempool.is_some_and(|m| m.contains_hash(&hash)) {
                 continue;
             }
             if self.wanted.insert(hash) {
@@ -453,15 +457,14 @@ impl PeerSync {
                 // response which never strips).
                 InvType::Tx | InvType::Wtx | InvType::WitnessTx => {
                     let found = mempool.and_then(|m| {
-                        m.txids()
-                            .iter()
-                            .find(|id| {
-                                *id.as_bytes() == *inv.hash.as_bytes()
-                                    || m.get(id).is_some_and(|t| {
-                                        t.wtxid().as_bytes() == inv.hash.as_bytes()
-                                    })
-                            })
-                            .and_then(|id| m.get(id))
+                        m.get(&avila_consensus::hash::Txid::from_bytes(
+                            *inv.hash.as_bytes(),
+                        ))
+                        .or_else(|| {
+                            m.get_wtxid(&avila_consensus::hash::Wtxid::from_bytes(
+                                *inv.hash.as_bytes(),
+                            ))
+                        })
                     });
                     match found {
                         Some(tx) => out.push(Message::Tx(tx.clone())),
@@ -568,7 +571,7 @@ mod tests {
                 hash: blocks[2].block_hash(),
             },
         ];
-        match sync.on_inv(&cs, &invs, usize::MAX) {
+        match sync.on_inv(&cs, None, &invs, usize::MAX) {
             Some(Message::GetData(want)) => {
                 assert_eq!(want.len(), 3);
                 assert_eq!(want[0].inv_type, InvType::WitnessBlock);
@@ -579,7 +582,7 @@ mod tests {
         }
         assert_eq!(sync.in_flight(), 3);
         // Same invs again → nothing new to ask for.
-        assert!(sync.on_inv(&cs, &invs, usize::MAX).is_none());
+        assert!(sync.on_inv(&cs, None, &invs, usize::MAX).is_none());
     }
 
     #[test]

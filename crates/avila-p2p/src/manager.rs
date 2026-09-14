@@ -524,7 +524,7 @@ impl<S: Read + Write> PeerManager<S> {
                     });
                 }
                 let before = peer.sync.in_flight();
-                if let Some(req) = peer.sync.on_inv(cs, &invs, *global_free) {
+                if let Some(req) = peer.sync.on_inv(cs, Some(mempool), &invs, *global_free) {
                     *global_free = global_free.saturating_sub(peer.sync.in_flight() - before);
                     let _ = peer.session.send(&req);
                 }
@@ -592,6 +592,32 @@ impl<S: Read + Write> PeerManager<S> {
                 // The peer can't serve these — release the slots so the
                 // fill pass reassigns them to another peer.
                 peer.sync.on_notfound(&invs);
+            }
+            SessionEvent::Message(Message::Mempool) => {
+                // BIP35: advertise the whole pool. wtxid entries for
+                // wtxidrelay peers, txid otherwise — one bounded inv.
+                let by_wtxid = peer.session.peer().is_some_and(|i| i.wtxid_relay);
+                let invs: Vec<crate::message::InvVector> = mempool
+                    .txids()
+                    .iter()
+                    .filter_map(|txid| {
+                        mempool.get(txid).map(|tx| crate::message::InvVector {
+                            inv_type: if by_wtxid {
+                                crate::message::InvType::Wtx
+                            } else {
+                                crate::message::InvType::Tx
+                            },
+                            hash: if by_wtxid {
+                                BlockHash::from_bytes(*tx.wtxid().as_bytes())
+                            } else {
+                                BlockHash::from_bytes(*txid.as_bytes())
+                            },
+                        })
+                    })
+                    .collect();
+                if !invs.is_empty() {
+                    let _ = peer.session.send(&Message::Inv(invs));
+                }
             }
             SessionEvent::Message(Message::GetAddr) => {
                 let entries = addrbook
@@ -1389,6 +1415,55 @@ mod tests {
             !sent_a.iter().any(|m| matches!(m, Message::Inv(vs)
                 if vs.iter().any(|v| v.hash.as_bytes() == txid.as_bytes()))),
             "source peer must not hear its own tx back: {sent_a:?}"
+        );
+    }
+
+    #[test]
+    fn mempool_request_is_served_from_the_pool() {
+        use avila_consensus::transaction::{OutPoint, Script, TxIn, TxOut, Witness};
+        use avila_consensus::{script, transaction::Transaction};
+
+        let (mut mgr, mut peer_a, _id_a) = managed_peer();
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 101);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        testpipe::drain(&mut peer_a, MAGIC);
+        // Pool a tx, then answer the peer's `mempool` request.
+        let op = OutPoint {
+            txid: blocks[0].transactions[0].txid(),
+            vout: 0,
+        };
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: op,
+                script_sig: Script::new(vec![]),
+                sequence: 0xffff_ffff,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 4_999_000_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let txid = tx.txid();
+        mgr.mempool().accept_tx(tx, &cs, NOW).unwrap();
+        testpipe::inject(&mut peer_a, MAGIC, &Message::Mempool);
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let sent = testpipe::drain(&mut peer_a, MAGIC);
+        assert!(
+            sent.iter().any(|m| matches!(
+                m,
+                Message::Inv(vs)
+                    if vs.iter().any(|v| v.inv_type == crate::message::InvType::Tx
+                        && v.hash.as_bytes() == txid.as_bytes())
+            )),
+            "mempool request should be answered with the pooled txid: {sent:?}"
         );
     }
 
