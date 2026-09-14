@@ -309,7 +309,10 @@ impl Chainstate {
     /// Core's `HaveTxsDownloaded` equivalent under a durable body store.
     /// The sync layer needs it to decide which announced blocks to fetch.
     pub fn have_body(&self, hash: &BlockHash) -> bool {
-        self.blocks.contains_key(hash)
+        // The genesis body is implicit in the chain anchor — Core marks it
+        // BLOCK_HAVE_DATA without ever downloading it.
+        *hash == self.tree.params().genesis_header.hash()
+            || self.blocks.contains_key(hash)
             || self
                 .store
                 .as_ref()

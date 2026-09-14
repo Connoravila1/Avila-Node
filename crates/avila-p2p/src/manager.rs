@@ -22,7 +22,7 @@ use avila_consensus::hash::BlockHash;
 use crate::addrman::{self, AddrBook};
 use crate::message::{AddrV2Entry, Message, NetAddr};
 use crate::session::{PeerInfo, PeerSession, SessionError, SessionEvent, build_version};
-use crate::sync::PeerSync;
+use crate::sync::{MAX_BLOCKS_IN_TRANSIT_PER_PEER, PeerSync};
 
 /// Maximum simultaneous peers — small by design; more arrive when
 /// connection scheduling matures.
@@ -85,8 +85,6 @@ struct PeerEntry<S> {
     last_rx: Instant,
     /// Outstanding handshake deadline check cadence.
     last_ping: Instant,
-    /// Blocks we've asked this peer for, awaiting bodies.
-    sent_requests: usize,
 }
 
 /// A bounded set of peers sharing one [`Chainstate`].
@@ -160,7 +158,6 @@ impl<S: Read + Write> PeerManager<S> {
                 remote,
                 last_rx: now,
                 last_ping: now,
-                sent_requests: 0,
             },
         );
         Some(id)
@@ -204,7 +201,45 @@ impl<S: Read + Write> PeerManager<S> {
             self.peers.remove(&id);
             events.push(NetEvent::Disconnected { peer: id, reason });
         }
+        self.fill_queues(cs);
         events
+    }
+
+    /// The download scheduler: every tick, each established peer gets a
+    /// `getdata` for indexed-but-unfetched blocks no peer has reserved.
+    /// Peers that stall or leave simply stop holding reservations, so an
+    /// interrupted download resumes through this pass automatically.
+    fn fill_queues(&mut self, cs: &Chainstate) {
+        let mut reserved: std::collections::HashSet<BlockHash> = self
+            .peers
+            .values()
+            .flat_map(|p| p.sync.reserved_hashes().copied())
+            .collect();
+        for peer in self.peers.values_mut() {
+            if !peer.session.established()
+                || peer.sync.awaiting_headers()
+                || peer.sync.stalled()
+                || peer.sync.in_flight() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER
+            {
+                reserved.extend(peer.sync.reserved_hashes().copied());
+                continue;
+            }
+            let unfetched: Vec<BlockHash> = cs
+                .tree()
+                .headers_by_height()
+                .iter()
+                .map(|h| h.hash())
+                .filter(|h| !cs.have_body(h) && !reserved.contains(h))
+                .take(MAX_BLOCKS_IN_TRANSIT_PER_PEER)
+                .collect();
+            if unfetched.is_empty() {
+                break;
+            }
+            if let Some(req) = peer.sync.want_blocks_excluding(cs, &unfetched, &reserved) {
+                let _ = peer.session.send(&req);
+            }
+            reserved.extend(peer.sync.reserved_hashes().copied());
+        }
     }
 
     /// One peer's event → replies and chainstate effects.
@@ -249,7 +284,6 @@ impl<S: Read + Write> PeerManager<S> {
                         if !outcome.fetchable.is_empty()
                             && let Some(req) = peer.sync.want_blocks(cs, &outcome.fetchable)
                         {
-                            peer.sent_requests += 1;
                             let _ = peer.session.send(&req);
                         }
                     }
@@ -280,27 +314,12 @@ impl<S: Read + Write> PeerManager<S> {
             SessionEvent::Message(Message::Block(block)) => {
                 match peer.sync.on_block(cs, &block, now) {
                     Ok(outcome) => {
-                        if outcome.was_in_flight {
-                            peer.sent_requests = peer.sent_requests.saturating_sub(1);
-                        }
                         if let avila_consensus::chainstate::Acceptance::Connected { .. } =
                             outcome.acceptance
                         {
                             events.push(NetEvent::TipAdvanced(cs.chain().len() as u32 - 1));
                         }
-                        // Freed a slot — ask for more if indexed blocks are
-                        // still unfetched.
-                        let want: Vec<BlockHash> = cs
-                            .tree()
-                            .headers_by_height()
-                            .iter()
-                            .map(|h| h.hash())
-                            .filter(|h| !cs.have_body(h))
-                            .take(64)
-                            .collect();
-                        if let Some(req) = peer.sync.want_blocks(cs, &want) {
-                            let _ = peer.session.send(&req);
-                        }
+                        // The tick fill pass re-feeds this peer's queue.
                     }
                     Err(e) => dead.push((id, DisconnectReason::Misbehavior(e.to_string()))),
                 }
@@ -688,6 +707,126 @@ mod tests {
             sent.iter().any(|m| matches!(m, Message::GetData(_))),
             "{sent:?}"
         );
+    }
+
+    /// A second managed peer; returns (its scripted end, its id).
+    fn add_peer(mgr: &mut PeerManager<End>) -> (End, u64) {
+        let (us_end, peer_end) = testpipe::pair();
+        let session = PeerSession::initiate(
+            us_end,
+            MAGIC,
+            build_version(9, 0, NetAddr::unspecified()),
+            BUDGET,
+        )
+        .expect("session");
+        let id = mgr.add_outbound(session).expect("slot");
+        (peer_end, id)
+    }
+
+    /// Same handshake as `handshake` but for an arbitrary peer end.
+    fn handshake_peer(
+        mgr: &mut PeerManager<End>,
+        peer: &mut End,
+        cs: &mut Chainstate,
+    ) -> Vec<NetEvent> {
+        handshake(mgr, peer, cs)
+    }
+
+    #[test]
+    fn second_peer_takes_over_interrupted_download() {
+        let (mut mgr, mut peer_a, id_a) = managed_peer();
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 4);
+        for b in &blocks {
+            cs.accept_header(&b.header, NOW).unwrap();
+        }
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        testpipe::drain(&mut peer_a, MAGIC);
+        // A ends its headers phase (empty page = "we're at your tip").
+        testpipe::inject(&mut peer_a, MAGIC, &Message::Headers(vec![]));
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let sent = testpipe::drain(&mut peer_a, MAGIC);
+        let a_wants = sent
+            .iter()
+            .filter(|m| matches!(m, Message::GetData(_)))
+            .count();
+        assert_eq!(a_wants, 1, "{sent:?}");
+
+        // A delivers only the first block, then dies mid-download.
+        testpipe::inject(&mut peer_a, MAGIC, &Message::Block(blocks[0].clone()));
+        mgr.tick(&mut cs, NOW);
+        assert_eq!(cs.chain().len(), 2);
+        drop(peer_a);
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, NetEvent::Disconnected { peer: p, .. } if *p == id_a))
+        );
+
+        // B connects, handshakes; the fill pass hands B the 3 stragglers.
+        let (mut peer_b, _id_b) = add_peer(&mut mgr);
+        handshake_peer(&mut mgr, &mut peer_b, &mut cs);
+        testpipe::drain(&mut peer_b, MAGIC);
+        testpipe::inject(&mut peer_b, MAGIC, &Message::Headers(vec![]));
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let sent = testpipe::drain(&mut peer_b, MAGIC);
+        let wanted: Vec<BlockHash> = sent
+            .iter()
+            .filter_map(|m| match m {
+                Message::GetData(vs) => Some(vs.iter().map(|v| v.hash).collect::<Vec<_>>()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            wanted.len(),
+            3,
+            "B should fetch only the undelivered blocks: {sent:?}"
+        );
+        for b in &blocks[1..] {
+            testpipe::inject(&mut peer_b, MAGIC, &Message::Block(b.clone()));
+        }
+        mgr.tick(&mut cs, NOW);
+        assert_eq!(cs.chain().len(), 5);
+    }
+
+    #[test]
+    fn two_peers_do_not_duplicate_requests() {
+        let (mut mgr, mut peer_a, _id_a) = managed_peer();
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 4);
+        for b in &blocks {
+            cs.accept_header(&b.header, NOW).unwrap();
+        }
+        let (mut peer_b, _id_b) = add_peer(&mut mgr);
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        handshake_peer(&mut mgr, &mut peer_b, &mut cs);
+        testpipe::drain(&mut peer_a, MAGIC);
+        testpipe::drain(&mut peer_b, MAGIC);
+        // Both peers conclude their headers phase.
+        testpipe::inject(&mut peer_a, MAGIC, &Message::Headers(vec![]));
+        testpipe::inject(&mut peer_b, MAGIC, &Message::Headers(vec![]));
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer_a, MAGIC);
+        testpipe::drain(&mut peer_b, MAGIC);
+
+        mgr.tick(&mut cs, NOW);
+        let sent_a = testpipe::drain(&mut peer_a, MAGIC);
+        let sent_b = testpipe::drain(&mut peer_b, MAGIC);
+        let reqs = |msgs: &[Message]| -> usize {
+            msgs.iter()
+                .filter_map(|m| match m {
+                    Message::GetData(vs) => Some(vs.len()),
+                    _ => None,
+                })
+                .sum()
+        };
+        let (ra, rb) = (reqs(&sent_a), reqs(&sent_b));
+        // All 4 blocks requested exactly once across the pair.
+        assert_eq!(ra + rb, 4, "a={sent_a:?} b={sent_b:?}");
     }
 
     #[test]

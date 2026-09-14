@@ -110,6 +110,16 @@ impl PeerSync {
         self.in_flight.len()
     }
 
+    /// Every hash this peer has been asked for or already marked — the
+    /// manager uses the union across peers as a reservation set so two
+    /// peers never download the same block.
+    pub fn reserved_hashes(&self) -> impl Iterator<Item = &BlockHash> {
+        self.in_flight
+            .iter()
+            .map(|(h, _)| h)
+            .chain(self.wanted.iter())
+    }
+
     /// Whether a `getheaders` is outstanding.
     #[must_use]
     pub fn awaiting_headers(&self) -> bool {
@@ -247,6 +257,19 @@ impl PeerSync {
     /// a headers page), capped by free in-flight slots.
     #[must_use]
     pub fn want_blocks(&mut self, cs: &Chainstate, hashes: &[BlockHash]) -> Option<Message> {
+        self.want_blocks_excluding(cs, hashes, &HashSet::new())
+    }
+
+    /// [`Self::want_blocks`] with a cross-peer reservation set: hashes in
+    /// `exclude` are skipped even if this peer hasn't seen them — another
+    /// peer is already fetching them.
+    #[must_use]
+    pub fn want_blocks_excluding(
+        &mut self,
+        cs: &Chainstate,
+        hashes: &[BlockHash],
+        exclude: &HashSet<BlockHash>,
+    ) -> Option<Message> {
         let free = MAX_BLOCKS_IN_TRANSIT_PER_PEER.saturating_sub(self.in_flight.len());
         if free == 0 {
             return None;
@@ -257,7 +280,7 @@ impl PeerSync {
             if want.len() >= free {
                 break;
             }
-            if cs.have_body(hash) || !self.wanted.insert(*hash) {
+            if cs.have_body(hash) || exclude.contains(hash) || !self.wanted.insert(*hash) {
                 continue;
             }
             self.in_flight.push_back((*hash, now));
