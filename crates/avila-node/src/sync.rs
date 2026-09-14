@@ -38,6 +38,12 @@ pub struct SyncConfig {
     /// When set, publish each tick's progress into this snapshot so a
     /// query surface (RPC, GUI) can read it without blocking sync.
     pub status: Option<crate::rpc::SharedStatus>,
+    /// When set, drain and answer chain queries each tick — the RPC
+    /// surface's read path into the live chainstate (Core's `cs_main`
+    /// read pattern, by message passing instead of locking). Shared so
+    /// the config stays `Clone`/`Debug`.
+    pub queries:
+        Option<std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<crate::rpc::ChainQuery>>>>,
 }
 
 impl Default for SyncConfig {
@@ -52,6 +58,7 @@ impl Default for SyncConfig {
             cancel: None,
             prune_bytes: None,
             status: None,
+            queries: None,
         }
     }
 }
@@ -233,6 +240,18 @@ pub fn run(
             && let Ok(mut w) = status.write()
         {
             *w = snapshot.clone();
+        }
+        // Answer queued chain queries against the just-ticked state —
+        // bounded backlog per tick so a flood can't starve sync.
+        if let Some(rx) = &cfg.queries
+            && let Ok(rx) = rx.lock()
+        {
+            for _ in 0..64 {
+                match rx.try_recv() {
+                    Ok(q) => q.answer(&cs, &mgr),
+                    Err(_) => break,
+                }
+            }
         }
         progress(&snapshot);
         if run_progress >= cfg.target_height {

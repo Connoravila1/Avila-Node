@@ -128,8 +128,9 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     peer_details: Vec::new(),
                     mempool: (0, 0, None),
                 }));
+            let (query_tx, query_rx) = std::sync::mpsc::channel();
             if let Some(addr) = rpc {
-                let _server = avila_node::rpc::serve(addr, status.clone())
+                let _server = avila_node::rpc::serve(addr, status.clone(), Some(query_tx))
                     .map_err(|e| format!("rpc bind {addr}: {e}"))?;
                 println!("RPC listening on http://{addr} (read-only)");
                 std::mem::forget(_server);
@@ -144,6 +145,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 cancel: None,
                 prune_bytes: None,
                 status: Some(status),
+                queries: Some(std::sync::Arc::new(std::sync::Mutex::new(query_rx))),
             };
             println!(
                 "Running {} — syncing to tip, then serving (Ctrl+C to stop)...",
@@ -188,6 +190,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 cancel: None,
                 prune_bytes: prune_mb.map(|m| m * 1024 * 1024),
                 status: None,
+                queries: None,
             };
             println!("Syncing {network} (target height {blocks}, {max_peers} peers max)...");
             let mut last = (u32::MAX, u32::MAX);

@@ -730,6 +730,13 @@ impl<S: Read + Write> PeerManager<S> {
         &mut self.mempool
     }
 
+    /// Read-only view of the transaction pool (for query surfaces that
+    /// only hold `&self`).
+    #[must_use]
+    pub fn mempool_ref(&self) -> &avila_mempool::Mempool {
+        &self.mempool
+    }
+
     /// The peers' ids (for scheduling decisions above this layer).
     #[must_use]
     pub fn peer_ids(&self) -> Vec<u64> {

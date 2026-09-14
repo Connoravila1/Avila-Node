@@ -792,6 +792,7 @@ impl AvilaApp {
                 .then(|| self.node.config().network_data_dir()),
             cancel: Some(cancel.clone()),
             status: None,
+            queries: None,
             prune_bytes: self
                 .sync
                 .prune_input

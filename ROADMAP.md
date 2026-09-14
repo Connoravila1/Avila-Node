@@ -160,10 +160,14 @@ operation. Compare complete initial download and catch-up, not only local replay
       across restarts, then continuous peer service, relay and tip
       announcements until stopped (`--connect`, `--proxy` supported).
       Control channel started: `--rpc` binds a read-only JSON-RPC
-      surface (getblockcount, getbestblockhash, getblockchaininfo,
-      getpeerinfo, getmempoolinfo, estimatesmartfee, help) answering
-      from the last sync snapshot — verified live over curl. Auth,
-      mutation methods, and the Core compatibility matrix remain open.
+      surface answering from the last sync snapshot (getblockcount,
+      getbestblockhash, getblockchaininfo, getpeerinfo, getmempoolinfo,
+      estimatesmartfee, help) plus live-chainstate reads the sync loop
+      answers between ticks (getblockhash, getblockheader, getblock
+      verbosity 0-2, getrawtransaction from the pool or a named block,
+      gettxout with mempool-spend awareness) — verified live over curl.
+      Auth, mutation methods, txindex, and the Core compatibility
+      matrix remain open.
 - [x] Implement mempool admission, packages, replacement, eviction,
       relay and reorg reconciliation (first slice): `avila-mempool`
       applies consensus input/script checks identically to block
