@@ -801,6 +801,16 @@ impl Mempool {
             .retain(|_, e| now.saturating_sub(e.time) < ORPHAN_EXPIRE_SECS);
     }
 
+    /// Every pooled entry — template.rs iterates these.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &MempoolEntry> {
+        self.map.values()
+    }
+
+    /// `txid` is pooled — template.rs's dependency test.
+    pub(crate) fn has_entry(&self, txid: &Txid) -> bool {
+        self.map.contains_key(txid)
+    }
+
     /// Orphan-pool size — observability for the sync layer.
     #[must_use]
     pub fn orphan_count(&self) -> usize {
@@ -926,6 +936,8 @@ fn standard_script_flags(
         .union(ScriptFlags::DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM)
         .union(ScriptFlags::DISCOURAGE_UPGRADABLE_TAPROOT_VERSION)
 }
+
+pub mod template;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::missing_panics_doc)]
@@ -1309,5 +1321,64 @@ mod tests {
         assert!(last.detail.contains("missingorspent"));
         // Orphan parking must not happen in explain mode.
         assert_eq!(pool.orphan_count(), 0);
+    }
+
+    #[test]
+    fn template_connects_as_a_real_block() {
+        let (mut cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let t1 = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let t2 = spend_tx(mature_outpoint(&blocks, 2), 4_999_500_000, SEQ_FINAL);
+        pool.accept_tx(t1, &cs, NOW).unwrap();
+        pool.accept_tx(t2, &cs, NOW).unwrap();
+
+        let miner_script = Script::new(vec![script::OP_1]);
+        let template = pool.build_template(&cs, miner_script, NOW + 120).unwrap();
+        assert_eq!(template.height, 102);
+        assert_eq!(template.tx_count, 2);
+        let params = Network::Regtest.params();
+        let mut block = template.block;
+        // The coinbase pays subsidy + both fees.
+        let subsidy = avila_consensus::connect::block_subsidy(102, &params);
+        assert_eq!(
+            block.transactions[0].outputs[0].value,
+            subsidy + template.fees
+        );
+        while pow::check_proof_of_work(&block.block_hash(), block.header.bits, &params).is_err() {
+            block.header.nonce += 1;
+        }
+        // The decisive check: full accept path connects our template.
+        match cs.accept_block(&block, NOW + 130).unwrap() {
+            avila_consensus::chainstate::Acceptance::Connected { height, .. } => {
+                assert_eq!(height, 102)
+            }
+            other => panic!("template did not connect: {other:?}"),
+        }
+        pool.on_block_connected(&block);
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn template_orders_parents_before_children() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let pid = parent.txid();
+        let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 4_998_000_000, SEQ_FINAL);
+        pool.accept_tx(parent, &cs, NOW).unwrap();
+        pool.accept_tx(child, &cs, NOW).unwrap();
+
+        let template = pool
+            .build_template(&cs, Script::new(vec![script::OP_1]), NOW + 120)
+            .unwrap();
+        let order: Vec<Txid> = template
+            .block
+            .transactions
+            .iter()
+            .skip(1)
+            .map(|t| t.txid())
+            .collect();
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[0], pid, "parent must precede its child");
     }
 }

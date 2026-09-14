@@ -181,7 +181,13 @@ operation. Compare complete initial download and catch-up, not only local replay
       reaching a pruned body fails loudly at disconnect. Wired as
       `avila-node sync --prune-mb` and the GUI's prune field. Verified
       historical reacquisition for rescans remains open.
-- [ ] Integrate mining templates and selected Stratum V2 workflows behind optional services.
+- [x] Mining templates (engine slice): `Mempool::build_template`
+      greedily fills a block by fee rate respecting in-pool parent
+      order and MAX_BLOCK_WEIGHT, pays subsidy+fees via a BIP34
+      coinbase, and sets the BIP141 witness commitment when needed.
+      Verified end-to-end: built templates pass `accept_block` and
+      connect. Ancestor-feerate package mining and Stratum V2 remain
+      open.
 - [ ] Provide backup/restore, migration/rollback, resource presets and actionable recovery.
 
 Evidence: documented end-to-end wallet, mining, pruning, reorg, service-isolation and
