@@ -199,11 +199,19 @@ checks skipped, connects on both sides) while block 130 spends the second
 — a partial tail frame from an interrupted write is truncated, foreign-magic
 stores are refused, and corruption in a non-tail file is reported. Accepted
 bodies are appended at `AcceptBlock`'s `WriteBlockToDisk` point (before the
-connect decision, so failed bodies persist), and `Chainstate::with_store`
-resumes by replaying stored bodies through the full pipeline — the coins
-view, undo records and index are still rebuilt in memory, so restart means
-re-validation, not re-download. `replay --store` exercises it; verdicts are
-identical with and without the store on the 501-block segment.
+connect decision, so failed bodies persist).
+
+`Chainstate::flush` then writes a versioned `state.dat` snapshot — full
+header index, best-header tip, connected chain, undo records, coins view and
+failed set, under a sha256d checksum — atomically via `state.dat.tmp` +
+rename, always *after* the blk files are flushed, so every body the snapshot
+claims is already durable. `Chainstate::with_store` restores a valid
+snapshot without re-validating (covered bodies stay on disk; `have_body`/
+`body` fall back to the store for resubmission and reorg disconnects), then
+replays only post-snapshot bodies through the normal pipeline. A missing,
+corrupt or unsupported snapshot falls back to full body replay — the blk
+files are always the record of what arrived. `replay --store` exercises it;
+verdicts are identical with and without the store on the 501-block segment.
 
 ## Network parameters (`params.rs`)
 
@@ -270,10 +278,11 @@ Not defects — scope boundaries for later gates:
 - **Reorg handling**: `chainstate.rs` drives disconnect-to-fork /
   connect-forward reorgs plus Core's failed-block bookkeeping
   (`BLOCK_FAILED_*`, `bad-prevblk`, `duplicate-invalid`, activation pruning);
-  exercised by the 80-fork corpus case and cases 82–85. Block bodies persist
-  via `store.rs` (`with_store` resumes by re-validation); remaining G2
-  storage work: durable coins view, persisted undo records, atomic
-  block+coins commit ordering.
+  exercised by the 80-fork corpus case and cases 82–85. Bodies persist in
+  `blkNNNNN.dat` files and the validated state in a `state.dat` snapshot
+  (`with_store` resumes from it, replaying only post-snapshot bodies);
+  remaining G2 storage work: incremental (not whole-state) snapshot writes,
+  and Core-style block+coins+undo commit batching.
 - **Header-chain rules not in Core's `ContextualCheckBlockHeader`**:
   checkpoints, `nMinimumChainWork` as a *header*-acceptance gate (it is wired
   for the `fScriptChecks` decision), BIP9 versionbits deployment state

@@ -40,7 +40,7 @@ use crate::connect::{self, BlockUndo, ConnectContext, ConnectError, UtxoSet};
 use crate::hash::BlockHash;
 use crate::header::BlockHeader;
 use crate::params::Params;
-use crate::store::BlockStore;
+use crate::store::{self, BlockStore, StateData};
 
 /// The outcome of a successful [`Chainstate::accept_block`] call.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -120,21 +120,24 @@ impl BlockRejection {
 /// chain, and the undo records needed to reorganize it.
 ///
 /// With [`Chainstate::new`] all state is resident in memory — this is the
-/// validation driver. [`Chainstate::with_store`] adds a durable body store:
-/// accepted blocks append to `blkNNNNN.dat` files at `AcceptBlock`'s
-/// `WriteBlockToDisk` point, and opening the store replays stored bodies to
-/// rebuild the index, coins view and tip — resumable import without
-/// re-downloading. A durable coins view and persisted undo remain a later
-/// milestone.
+/// validation driver. [`Chainstate::with_store`] adds durability: accepted
+/// blocks append to `blkNNNNN.dat` files at `AcceptBlock`'s
+/// `WriteBlockToDisk` point, [`Chainstate::flush`] writes a `state.dat`
+/// snapshot (header index, connected chain, undo records, coins view, failed
+/// set) atomically behind them, and reopening restores the snapshot then
+/// replays only the bodies it does not cover — resumable import without
+/// re-downloading *or* re-validating.
 pub struct Chainstate {
     tree: HeaderTree,
     utxo: UtxoSet,
     /// Block hash of the connected tip — the genesis at start, whose coinbase
     /// is never in the UTXO set on any network.
     connected: BlockHash,
-    /// Accepted block bodies by hash — Core keeps them in blk*.dat; a real
-    /// node needs them for reorgs and rescan, this driver needs them for
-    /// reorgs.
+    /// Bodies accepted this session, by hash. With a store attached,
+    /// snapshotted bodies are *not* re-read into this map on resume —
+    /// `have_body`/`body` serve them from disk. Core keeps bodies in
+    /// blk*.dat for reorgs and rescan; this map plus the store play the same
+    /// role for reorgs.
     blocks: HashMap<BlockHash, Block>,
     /// The connected chain's block hashes, genesis at index 0.
     chain: Vec<BlockHash>,
@@ -166,13 +169,21 @@ impl Chainstate {
     }
 
     /// A chainstate backed by a durable [`BlockStore`] in `dir`, resumed from
-    /// whatever the store already holds: `BlockStore::open` rebuilds the
+    /// whatever the store already holds. `BlockStore::open` rebuilds the
     /// hash→position index by scanning the blk files (truncating a partial
-    /// tail left by an interrupted write), then every stored body is replayed
-    /// through the normal acceptance pipeline in file order — restoring the
-    /// header index, the coins view, and the connected tip exactly as the
-    /// original run left them. Stored blocks that were rejected still replay
-    /// to the same rejection, so per-block verdicts are not errors here.
+    /// tail left by an interrupted write). Resume then takes one of two paths:
+    ///
+    /// * A valid `state.dat` snapshot restores the validated state directly —
+    ///   the header index, failed set, connected chain, undo records and coins
+    ///   view — and only bodies the snapshot does not cover (accepted after
+    ///   the last flush) are replayed through the normal pipeline.
+    /// * Otherwise — no snapshot, or a corrupt/unsupported one — every stored
+    ///   body replays in file order, exactly as the original run left them.
+    ///
+    /// Stored blocks that were rejected still replay to the same rejection, so
+    /// per-block verdicts are not errors here. A corrupt snapshot is likewise
+    /// non-fatal: the blk files remain the record of what arrived, and replay
+    /// rebuilds everything the snapshot claimed.
     ///
     /// `now` is the caller's adjusted local time for the header future-drift
     /// check during replay.
@@ -183,16 +194,27 @@ impl Chainstate {
     /// longer decodes, which is store corruption, not a rule verdict.
     pub fn with_store(dir: &Path, params: &Params, now: u32) -> std::io::Result<Self> {
         let store = BlockStore::open(dir, params.message_start)?;
-        // Replay stored bodies in file order through the normal pipeline while
-        // the store is still detached — `accept_block`'s append is skipped, so
-        // rebuild writes nothing back. A stored body that fails again (it was
-        // written before its connect attempt) is expected, not fatal.
         let mut cs = Self::new(params);
-        let mut pending: Vec<Block> = store
-            .positions()
-            .into_iter()
-            .map(|(_, pos)| store.read(pos))
-            .collect::<std::io::Result<_>>()?;
+        // Attach before replay: `append` is idempotent on indexed hashes, so
+        // replaying a stored body writes nothing back — and `have_body`/`body`
+        // see the store, so a post-snapshot side branch can reorg against
+        // snapshotted (memory-absent) connected blocks.
+        cs.store = Some(store);
+        // A snapshot that fails to load or restore falls back to full replay —
+        // the blk files are the record of what arrived; state.dat only ever
+        // re-derives it faster.
+        let mut pending = match store::read_state(dir, params.message_start) {
+            Ok(Some(state)) => match cs.restore(state, now) {
+                Ok(pending) => pending,
+                Err(_) => {
+                    let store = cs.store.take();
+                    cs = Self::new(params);
+                    cs.store = store;
+                    cs.stored_bodies(&HashSet::new())?
+                }
+            },
+            _ => cs.stored_bodies(&HashSet::new())?,
+        };
         // Bodies stored out of order are orphans until their parent lands —
         // loop until a pass makes no progress. A body that keeps failing a
         // non-orphan gate is a permanently-invalid stored block (it was
@@ -211,20 +233,133 @@ impl Chainstate {
                 break;
             }
         }
-        cs.store = Some(store);
         Ok(cs)
     }
 
-    /// Flushes the block store's buffered writes, when present.
+    /// Every stored body in file order except hashes in `skip` — the replay
+    /// set for both the no-snapshot path (`skip` empty) and the snapshot path
+    /// (`skip` = connected ∪ failed).
+    fn stored_bodies(&self, skip: &HashSet<BlockHash>) -> std::io::Result<Vec<Block>> {
+        let Some(store) = &self.store else {
+            return Ok(Vec::new());
+        };
+        store
+            .positions()
+            .into_iter()
+            .filter(|(hash, _)| !skip.contains(hash))
+            .map(|(_, pos)| store.read(pos))
+            .collect()
+    }
+
+    /// Restores validated state from a snapshot: reinserts every indexed
+    /// header (validation is deterministic, so the index comes back exactly),
+    /// re-applies the failed marks and the best-header tip, then installs the
+    /// connected chain, undo records and coins view. Returns the stored bodies
+    /// the snapshot does not cover, still to be replayed.
     ///
     /// # Errors
     ///
-    /// `io::Error` on flush failure.
-    pub fn flush(&mut self) -> std::io::Result<()> {
-        if let Some(store) = &mut self.store {
-            store.flush()?;
+    /// `io::Error` when the snapshot is internally inconsistent or disagrees
+    /// with the header rules or the store — the caller falls back to replay.
+    fn restore(&mut self, state: StateData, now: u32) -> std::io::Result<Vec<Block>> {
+        let corrupt = |msg: &str| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("state.dat: {msg}"))
+        };
+        // Headers first, while `invalid` is still empty: a FAILED_CHILD mark
+        // cannot turn a stored header's insert into `InvalidParent`. Insert
+        // order is by height, so parents always precede children.
+        for header in &state.headers {
+            self.tree
+                .insert(header, now)
+                .map_err(|e| corrupt(&format!("header reinsert: {e}")))?;
         }
-        Ok(())
+        for hash in &state.failed {
+            if !self.tree.contains(hash) {
+                return Err(corrupt("failed mark on unindexed header"));
+            }
+            self.tree.mark_invalid(*hash);
+        }
+        if !self.tree.restore_tip(state.best_header) {
+            return Err(corrupt("best header not a max-work tip"));
+        }
+        let store = self.store.as_ref().ok_or_else(|| corrupt("no store"))?;
+        for (index, hash) in state.chain.iter().enumerate() {
+            if !self.tree.contains(hash) {
+                return Err(corrupt("connected block unindexed"));
+            }
+            // The genesis (index 0) is never accepted through `accept_block`,
+            // so its body is legitimately absent from the store.
+            if index > 0 && store.position(hash).is_none() {
+                return Err(corrupt("connected block body not stored"));
+            }
+        }
+        self.connected = state.tip;
+        self.chain = state.chain;
+        self.undos = state.undos;
+        self.utxo = UtxoSet::new();
+        for (outpoint, coin) in state.utxo {
+            self.utxo.insert_synthetic(outpoint, coin);
+        }
+        let mut covered: HashSet<BlockHash> = state.failed.into_iter().collect();
+        covered.extend(self.chain.iter().copied());
+        self.stored_bodies(&covered)
+    }
+
+    /// `true` if `hash`'s body is available — in memory or in the store.
+    /// Core's `HaveTxsDownloaded` equivalent under a durable body store.
+    fn have_body(&self, hash: &BlockHash) -> bool {
+        self.blocks.contains_key(hash)
+            || self
+                .store
+                .as_ref()
+                .is_some_and(|store| store.position(hash).is_some())
+    }
+
+    /// `hash`'s body, from memory or the store.
+    fn body(&self, hash: &BlockHash) -> Option<Block> {
+        if let Some(block) = self.blocks.get(hash) {
+            return Some(block.clone());
+        }
+        let store = self.store.as_ref()?;
+        store.read(store.position(hash)?).ok()
+    }
+
+    /// The snapshot of the current validation state for `state.dat`.
+    fn snapshot(&self) -> StateData {
+        let mut failed = self.tree.failed_hashes();
+        failed.sort_unstable();
+        StateData {
+            tip: self.connected,
+            height: self.chain.len() as u32 - 1,
+            headers: self.tree.headers_by_height(),
+            best_header: self.tree.tip_hash(),
+            chain: self.chain.clone(),
+            undos: self.undos.clone(),
+            utxo: self
+                .utxo
+                .iter()
+                .map(|(outpoint, coin)| (*outpoint, coin.clone()))
+                .collect(),
+            failed,
+        }
+    }
+
+    /// Flushes the durable state, when present: the blk files first, then the
+    /// `state.dat` snapshot atomically over the old one. The ordering keeps the
+    /// invariant that every body the snapshot covers is already durable —
+    /// a crash between the two leaves the older snapshot plus the bodies the
+    /// replay path re-validates.
+    ///
+    /// # Errors
+    ///
+    /// `io::Error` on flush or snapshot-write failure.
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        let Some(store) = &mut self.store else {
+            return Ok(());
+        };
+        store.flush()?;
+        let (dir, magic) = (store.dir().to_path_buf(), store.magic());
+        store::write_state(&dir, magic, &self.snapshot())
     }
 
     /// The block index (Core's `mapBlockIndex` + best-tip bookkeeping).
@@ -258,7 +393,9 @@ impl Chainstate {
     }
 
     /// A stored block body by hash, if it passed `CheckBlock` +
-    /// `ContextualCheckBlock`.
+    /// `ContextualCheckBlock` — from memory only. Bodies a snapshot restore
+    /// left on disk (everything at or below the snapshot tip) are reachable
+    /// through the store, not here.
     #[must_use]
     pub fn block(&self, hash: &BlockHash) -> Option<&Block> {
         self.blocks.get(hash)
@@ -353,17 +490,17 @@ impl Chainstate {
                 if self.tree.is_failed(&hash) {
                     return Err(BlockRejection::CachedInvalid);
                 }
-                if self.blocks.contains_key(&hash) {
+                if self.have_body(&hash) {
                     // Body stored from the first submission: `AcceptBlock`
                     // short-circuits at `fAlreadyHave`, but `ActivateBestChain`
                     // still runs — a resubmitted side block whose branch now
                     // outworks the tip does reorg.
                     return match self.maybe_reorg(hash, &params) {
-                        Ok(true) => Ok(Acceptance::Connected {
+                        Ok(Some(disconnected)) => Ok(Acceptance::Connected {
                             height,
-                            reorged: true,
+                            reorged: disconnected,
                         }),
-                        Ok(false) => Ok(Acceptance::AlreadyKnown { height }),
+                        Ok(None) => Ok(Acceptance::AlreadyKnown { height }),
                         Err(err) => Err(BlockRejection::Connect(err)),
                     };
                 }
@@ -439,11 +576,11 @@ impl Chainstate {
             }
         } else {
             match self.maybe_reorg(hash, &params) {
-                Ok(true) => Ok(Acceptance::Connected {
+                Ok(Some(disconnected)) => Ok(Acceptance::Connected {
                     height,
-                    reorged: true,
+                    reorged: disconnected,
                 }),
-                Ok(false) => Ok(Acceptance::Parked { height }),
+                Ok(None) => Ok(Acceptance::Parked { height }),
                 Err(err) => Err(BlockRejection::Connect(err)),
             }
         }
@@ -458,10 +595,16 @@ impl Chainstate {
     /// `connect_block` is marked invalid (`BLOCK_FAILED_VALID`), so its
     /// descendants stop being reorg candidates.
     ///
-    /// Returns `Ok(true)` when a reorg was performed, `Ok(false)` when the
-    /// branch does not outwork the tip, `Err` when the branch won the work
-    /// race but failed to connect.
-    fn maybe_reorg(&mut self, hash: BlockHash, params: &Params) -> Result<bool, ConnectError> {
+    /// Returns `Ok(Some(disconnected))` when the branch activated —
+    /// `disconnected` is `true` when connected blocks were rolled back (a real
+    /// reorg) and `false` when the branch merely extended the tip —
+    /// `Ok(None)` when the branch does not outwork the tip, and `Err` when the
+    /// branch won the work race but failed to connect.
+    fn maybe_reorg(
+        &mut self,
+        hash: BlockHash,
+        params: &Params,
+    ) -> Result<Option<bool>, ConnectError> {
         let Some(new_node) = self.tree.get(&hash) else {
             return Err(ConnectError::Internal("reorg on unknown header"));
         };
@@ -469,14 +612,14 @@ impl Chainstate {
             return Err(ConnectError::Internal("connected tip not in tree"));
         };
         if new_node.chainwork <= conn_node.chainwork {
-            return Ok(false);
+            return Ok(None);
         }
         // Activation pruning: `FindMostWorkChain` skips a candidate whose
         // branch contains a failed block, marking the walked nodes
         // `BLOCK_FAILED_CHILD`. `ancestor_is_invalid` is the same walk with the
         // same marks — a failed-branch block parks rather than reconnecting.
         if self.tree.ancestor_is_invalid(hash) {
-            return Ok(false);
+            return Ok(None);
         }
         // Collect the branch back to its fork point with the connected chain.
         let chain_set: HashSet<BlockHash> = self.chain.iter().copied().collect();
@@ -498,24 +641,24 @@ impl Chainstate {
         // — the only way a header enters the index without a body is a
         // `BLOCK_MUTATED`-class `CheckBlock` rejection, which is not marked
         // failed, so its descendants park rather than report a verdict.
-        if branch_hashes.iter().any(|h| !self.blocks.contains_key(h)) {
-            return Ok(false);
+        if branch_hashes.iter().any(|h| !self.have_body(h)) {
+            return Ok(None);
         }
 
         // Simulate on a clone: disconnect the old branch, connect the new one.
         let mut utxo = self.utxo.clone();
         for height in (fork_height + 1..=self.undos.len() as u32).rev() {
             let block_hash = self.chain[height as usize];
-            let Some(block) = self.blocks.get(&block_hash) else {
+            let Some(block) = self.body(&block_hash) else {
                 return Err(ConnectError::Internal("missing connected block body"));
             };
             let undo = &self.undos[(height - 1) as usize];
-            connect::disconnect_block(block, &mut utxo, undo)
+            connect::disconnect_block(&block, &mut utxo, undo)
                 .map_err(|_| ConnectError::Internal("disconnect undo inconsistent"))?;
         }
         let mut new_undos = Vec::with_capacity(branch_hashes.len());
         for branch_hash in &branch_hashes {
-            let Some(block) = self.blocks.get(branch_hash) else {
+            let Some(block) = self.body(branch_hash) else {
                 return Err(ConnectError::Internal("missing branch block body"));
             };
             let ctx = ConnectContext {
@@ -524,7 +667,7 @@ impl Chainstate {
                 block_hash: *branch_hash,
                 script_checks: self.script_checks(branch_hash, params),
             };
-            match connect::connect_block(block, &mut utxo, &ctx) {
+            match connect::connect_block(&block, &mut utxo, &ctx) {
                 Ok(undo) => new_undos.push(undo),
                 Err(err) => {
                     // The branch wins on work but this block is invalid: mark
@@ -536,14 +679,18 @@ impl Chainstate {
             }
         }
 
-        // Commit.
+        // Commit. `disconnected` records whether any connected block was rolled
+        // back — false when the branch merely extended the tip (a stored-body
+        // resubmission landing here is `ActivateBestChain` connecting it, not
+        // a reorg).
+        let disconnected = (fork_height as usize) < self.chain.len() - 1;
         self.utxo = utxo;
         self.chain.truncate(fork_height as usize + 1);
         self.undos.truncate(fork_height as usize);
         self.chain.extend(branch_hashes);
         self.undos.extend(new_undos);
         self.connected = hash;
-        Ok(true)
+        Ok(Some(disconnected))
     }
 }
 
@@ -961,14 +1108,31 @@ mod tests {
         }
     }
 
+    /// A unique store dir — same pattern as the store tests.
+    fn store_dir(name: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let dir = base.join(format!(
+            "avila-chainstate-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The coins view as a sorted vec — `UtxoSet` iteration order is
+    /// unspecified, so equality checks go through this.
+    fn sorted_utxo(cs: &Chainstate) -> Vec<(OutPoint, crate::connect::Coin)> {
+        let mut v: Vec<_> = cs.utxo().iter().map(|(op, c)| (*op, c.clone())).collect();
+        v.sort_by_key(|(op, _)| (op.txid.to_bytes(), op.vout));
+        v
+    }
+
     #[test]
     fn with_store_persists_and_resumes() {
         let params = params();
-        let dir = std::env::temp_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::temp_dir())
-            .join(format!("avila-chainstate-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = store_dir("resume");
 
         let blocks = probe_chain(20, &[], &params);
         let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
@@ -979,7 +1143,7 @@ mod tests {
         let tip10 = cs.tip_hash();
         drop(cs);
 
-        // Resume: the stored bodies replay back to the same tip, and new
+        // Resume: the snapshot restores the same tip and coins view, and new
         // bodies connect on top.
         let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
         assert_eq!(cs.tip_hash(), tip10);
@@ -987,6 +1151,192 @@ mod tests {
             assert!(cs.accept_block(block, NOW).is_ok());
         }
         assert_eq!(cs.tip_hash(), blocks[19].block_hash());
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_resume_skips_covered_bodies() {
+        let params = params();
+        let dir = store_dir("snapshot-resume");
+        let blocks = probe_chain(20, &[], &params);
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        for block in &blocks[..10] {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        cs.flush().unwrap();
+        assert!(dir.join("state.dat").exists());
+        let tip = cs.tip_hash();
+        let utxo = sorted_utxo(&cs);
+        drop(cs);
+
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        assert_eq!(cs.tip_hash(), tip);
+        assert_eq!(cs.chain().len(), 11);
+        assert_eq!(sorted_utxo(&cs), utxo);
+        // Covered bodies came from the snapshot — never re-validated, so they
+        // never entered the in-memory body map (the store still serves them).
+        for block in &blocks[..10] {
+            assert!(cs.block(&block.block_hash()).is_none());
+        }
+        // A resubmitted snapshotted body reports already-known, not parked.
+        assert_eq!(
+            cs.accept_block(&blocks[5], NOW),
+            Ok(Acceptance::AlreadyKnown { height: 6 })
+        );
+        // Post-snapshot bodies connect normally.
+        for block in &blocks[10..] {
+            assert!(cs.accept_block(block, NOW).is_ok());
+        }
+        assert_eq!(cs.tip_hash(), blocks[19].block_hash());
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_gap_bodies_replay() {
+        let params = params();
+        let dir = store_dir("snapshot-gap");
+        let blocks = probe_chain(15, &[], &params);
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        for block in &blocks[..10] {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        cs.flush().unwrap();
+        // Bodies appended after the flush are not in the snapshot — the tail
+        // file is unbuffered, so they are already on disk.
+        for block in &blocks[10..] {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        let tip = cs.tip_hash();
+        drop(cs);
+
+        let cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        assert_eq!(cs.tip_hash(), tip);
+        assert_eq!(cs.chain().len(), 16);
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_corruption_falls_back_to_replay() {
+        let params = params();
+        let dir = store_dir("snapshot-corrupt");
+        let blocks = probe_chain(10, &[], &params);
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        for block in &blocks {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        cs.flush().unwrap();
+        let tip = cs.tip_hash();
+        drop(cs);
+
+        // Corrupt the snapshot payload — resume must still reach the same
+        // state by replaying every stored body.
+        let path = dir.join("state.dat");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        assert_eq!(cs.tip_hash(), tip);
+        // The replay path re-validated every body — they are in memory again.
+        assert!(cs.block(&blocks[5].block_hash()).is_some());
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_failed_marks_persist() {
+        let params = params();
+        let dir = store_dir("snapshot-failed");
+        let a1 = block_on(&genesis_header(), vec![coinbase_tx(1, subsidy(1))], &params);
+        let bad = block_on(
+            &a1.header,
+            vec![tagged_coinbase(2, subsidy(2) + 1, script::OP_EQUAL)],
+            &params,
+        );
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        cs.accept_block(&a1, NOW).unwrap();
+        assert!(matches!(
+            cs.accept_block(&bad, NOW),
+            Err(BlockRejection::Connect(_))
+        ));
+        cs.flush().unwrap();
+        drop(cs);
+
+        // The failed mark survives the restart: the resubmission is
+        // `duplicate-invalid`, and a child of it is `bad-prevblk`.
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        assert!(cs.tree().is_failed(&bad.block_hash()));
+        match cs.accept_block(&bad, NOW) {
+            Err(BlockRejection::CachedInvalid) => {}
+            other => panic!("expected cached-invalid, got {other:?}"),
+        }
+        let child = block_on(
+            &bad.header,
+            vec![tagged_coinbase(3, subsidy(3), script::OP_EQUAL)],
+            &params,
+        );
+        match cs.accept_block(&child, NOW) {
+            Err(BlockRejection::Header(ChainError::InvalidParent)) => {}
+            other => panic!("expected bad-prevblk, got {other:?}"),
+        }
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reorg_after_snapshot_restore() {
+        let params = params();
+        let dir = store_dir("snapshot-reorg");
+        let mut parent = genesis_header();
+        let mut a_chain = Vec::new();
+        for height in 1..=3u32 {
+            let block = block_on(&parent, vec![coinbase_tx(height, subsidy(height))], &params);
+            parent = block.header;
+            a_chain.push(block);
+        }
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        for block in &a_chain {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        cs.flush().unwrap();
+        drop(cs);
+
+        // A heavier side branch post-restore must disconnect the snapshotted
+        // connected blocks — their bodies exist only in the store.
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        assert!(cs.block(&a_chain[2].block_hash()).is_none());
+        let mut b_parent = genesis_header();
+        let mut b_chain = Vec::new();
+        for height in 1..=4u32 {
+            let block = block_on(
+                &b_parent,
+                vec![tagged_coinbase(height, subsidy(height), script::OP_HASH160)],
+                &params,
+            );
+            b_parent = block.header;
+            b_chain.push(block);
+        }
+        for block in &b_chain[..3] {
+            assert!(matches!(
+                cs.accept_block(block, NOW),
+                Ok(Acceptance::Parked { .. })
+            ));
+        }
+        // b4 outworks the a3 tip: the reorg disconnects a1..a3, whose bodies
+        // the store serves because they were never re-read into memory.
+        assert_eq!(
+            cs.accept_block(&b_chain[3], NOW),
+            Ok(Acceptance::Connected {
+                height: 4,
+                reorged: true
+            })
+        );
+        assert_eq!(cs.tip_hash(), b_chain[3].block_hash());
+        assert_eq!(cs.chain().len(), 5);
         drop(cs);
         std::fs::remove_dir_all(&dir).unwrap();
     }

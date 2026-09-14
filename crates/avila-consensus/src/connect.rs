@@ -162,6 +162,12 @@ impl UtxoSet {
         self.map.contains_key(outpoint)
     }
 
+    /// Iterates every `OutPoint → Coin` entry — the snapshot hook; order is
+    /// unspecified (HashMap order) and must not be relied on.
+    pub fn iter(&self) -> impl Iterator<Item = (&OutPoint, &Coin)> {
+        self.map.iter()
+    }
+
     /// Inserts a coin directly — the staging hook for tests and future
     /// chainstate seeding. Bypasses the unspendable check; the caller is
     /// responsible for the invariant.
@@ -221,7 +227,7 @@ impl UtxoSet {
 
 /// The undo data for one transaction — everything needed to reverse its UTXO
 /// effects (Core's `CTxUndo`).
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct TxUndo {
     /// The coins this transaction spent, in input order (Core's `vprevout`).
     /// Empty for the coinbase.
@@ -243,7 +249,7 @@ pub struct TxUndo {
 /// entry instead, so [`disconnect_block`] restores even those blocks exactly.
 /// Mapping to Core's n−1 layout is a serialization concern for the storage
 /// layer, not a state-correctness one.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct BlockUndo {
     /// Undo records for `block.transactions`, in block order.
     pub txs: Vec<TxUndo>,

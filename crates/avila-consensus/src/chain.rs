@@ -325,6 +325,37 @@ impl HeaderTree {
         self.invalid.contains(hash)
     }
 
+    /// Every indexed header sorted by height (ties unordered) — the snapshot's
+    /// header set. Height-sort guarantees parents precede their children when
+    /// the list is reinserted on restore.
+    #[must_use]
+    pub fn headers_by_height(&self) -> Vec<BlockHeader> {
+        let mut nodes: Vec<&HeaderNode> = self.nodes.values().collect();
+        nodes.sort_by_key(|node| node.height);
+        nodes.into_iter().map(|node| node.header).collect()
+    }
+
+    /// Every hash carrying the failed flag — the snapshot's failed set.
+    #[must_use]
+    pub fn failed_hashes(&self) -> Vec<BlockHash> {
+        self.invalid.iter().copied().collect()
+    }
+
+    /// Snapshot restore hook: moves the best tip to `hash` when it is indexed
+    /// and its chainwork is at least the current tip's — i.e. it is a maximal
+    /// tip. The explicit set preserves "earliest inserted wins" among
+    /// equal-work candidates, which a height-sorted reinsert cannot reproduce.
+    pub(crate) fn restore_tip(&mut self, hash: BlockHash) -> bool {
+        let Some(node) = self.nodes.get(&hash) else {
+            return false;
+        };
+        if node.chainwork < self.tip().chainwork {
+            return false;
+        }
+        self.tip = hash;
+        true
+    }
+
     /// Walks the ancestor chain of `cursor` toward genesis. Returns `true` when the walk
     /// reaches a failed block — in which case every node passed on the way is marked
     /// failed, matching `AcceptBlockHeader`'s `invalid_walk` marking of the blocks
