@@ -13,6 +13,7 @@ publish.workspace = true
 avila-core.workspace = true
 avila-node.workspace = true
 avila-consensus.workspace = true
+avila-p2p.workspace = true
 clap.workspace = true
 eframe.workspace = true
 egui_extras.workspace = true

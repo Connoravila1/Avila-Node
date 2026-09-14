@@ -463,6 +463,7 @@ dependencies = [
  "avila-consensus",
  "avila-core",
  "avila-node",
+ "avila-p2p",
  "clap",
  "eframe",
  "egui_extras",

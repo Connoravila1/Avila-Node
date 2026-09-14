@@ -84,6 +84,8 @@ pub struct PeerSync {
     /// Headers applied from this peer so far (a boundless-increment counter
     /// is fine — it's pure bookkeeping).
     headers_applied: usize,
+    /// Block bodies received from this peer.
+    blocks_received: usize,
 }
 
 impl Default for PeerSync {
@@ -101,6 +103,7 @@ impl PeerSync {
             wanted: HashSet::new(),
             headers_in_flight: false,
             headers_applied: 0,
+            blocks_received: 0,
         }
     }
 
@@ -130,6 +133,12 @@ impl PeerSync {
     #[must_use]
     pub fn headers_applied(&self) -> usize {
         self.headers_applied
+    }
+
+    /// Block bodies this peer has sent us.
+    #[must_use]
+    pub fn blocks_received(&self) -> usize {
+        self.blocks_received
     }
 
     /// The `getheaders` that (re)starts or continues the headers phase —
@@ -332,10 +341,13 @@ impl PeerSync {
         let was_in_flight = self.clear_in_flight(&hash);
         self.wanted.remove(&hash);
         match cs.accept_block(block, now) {
-            Ok(acceptance) => Ok(BlockOutcome {
-                acceptance,
-                was_in_flight,
-            }),
+            Ok(acceptance) => {
+                self.blocks_received += 1;
+                Ok(BlockOutcome {
+                    acceptance,
+                    was_in_flight,
+                })
+            }
             Err(rej) => Err(SyncError::InvalidBlock(rej.to_string())),
         }
     }

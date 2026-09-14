@@ -580,6 +580,10 @@ impl AvilaApp {
                 ui.label(muted(format!("{} established", p.established_total)));
                 ui.label(muted(format!("{} drops", p.disconnects)));
             });
+            if !p.peer_details.is_empty() {
+                ui.add_space(12.0);
+                self.peer_table(ui, &p.peer_details);
+            }
         } else if self.sync.running {
             ui.label(muted("connecting…"));
             ui.label(muted(
@@ -588,6 +592,81 @@ impl AvilaApp {
         } else {
             ui.label(muted("No sync run yet. Set a target height and start."));
         }
+    }
+
+    /// Every peer as an untrusted input: what it *claims* (its asserted
+    /// height) vs. what it has *served* (headers/blocks we verified).
+    fn peer_table(&self, ui: &mut egui::Ui, peers: &[avila_p2p::manager::PeerSnapshot]) {
+        ui.label(muted("PEERS — claims vs. served"));
+        ui.add_space(4.0);
+        TableBuilder::new(ui)
+            .id_salt("peers")
+            .striped(true)
+            .column(Column::remainder().at_least(150.0)) // address
+            .column(Column::initial(30.0)) // dir
+            .column(Column::initial(120.0).clip(true)) // agent
+            .column(Column::initial(55.0)) // claims
+            .column(Column::initial(50.0)) // hdrs
+            .column(Column::initial(45.0)) // blks
+            .column(Column::initial(45.0)) // in-flight
+            .column(Column::initial(45.0)) // idle
+            .header(20.0, |mut header| {
+                for label in [
+                    "peer", "dir", "agent", "claims", "hdrs", "blks", "in-flt", "idle",
+                ] {
+                    header.col(|ui| {
+                        ui.label(muted(label));
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(22.0, peers.len(), |mut row| {
+                    let p = &peers[row.index()];
+                    row.col(|ui| {
+                        let addr = p
+                            .remote
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| format!("#{}", p.id));
+                        ui.label(mono(addr));
+                    });
+                    row.col(|ui| {
+                        ui.label(muted(if p.inbound { "in" } else { "out" }));
+                    });
+                    row.col(|ui| {
+                        let agent = p.user_agent.as_deref().unwrap_or("—");
+                        let agent = agent.trim_start_matches('/').trim_end_matches('/');
+                        ui.label(muted(agent));
+                    });
+                    row.col(|ui| {
+                        // What the peer claims — never presented as verified.
+                        let claim = p
+                            .start_height
+                            .map(|h| h.to_string())
+                            .unwrap_or_else(|| "?".into());
+                        ui.label(muted(claim));
+                    });
+                    row.col(|ui| {
+                        ui.label(mono(p.headers_received.to_string()));
+                    });
+                    row.col(|ui| {
+                        ui.label(mono(p.blocks_received.to_string()));
+                    });
+                    row.col(|ui| {
+                        let n = p.in_flight;
+                        ui.label(mono(n.to_string()).color(if n > 0 { ACCENT } else { MUTED }));
+                    });
+                    row.col(|ui| {
+                        let idle = if p.idle_secs > 3600 {
+                            format!("{}h", p.idle_secs / 3600)
+                        } else if p.idle_secs > 60 {
+                            format!("{}m", p.idle_secs / 60)
+                        } else {
+                            format!("{}s", p.idle_secs)
+                        };
+                        ui.label(muted(idle).color(if p.idle_secs > 300 { WARN } else { MUTED }));
+                    });
+                });
+            });
     }
 
     /// A horizontal strip of the most recent connected blocks — the

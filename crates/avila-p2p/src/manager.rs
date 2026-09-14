@@ -109,6 +109,36 @@ struct PeerEntry<S> {
     last_ping: Instant,
 }
 
+/// A read-only view of one connected peer — the manager's state is
+/// private, so status displays pull this snapshot per tick.
+#[derive(Clone, Debug)]
+pub struct PeerSnapshot {
+    /// The manager-assigned peer id.
+    pub id: u64,
+    /// Remote address when known (always known for outbound dials).
+    pub remote: Option<std::net::SocketAddr>,
+    /// Inbound — they dialed us.
+    pub inbound: bool,
+    /// The version/verack handshake completed.
+    pub established: bool,
+    /// Their claimed best height from `version`, if the handshake ran.
+    pub start_height: Option<i32>,
+    /// Their user agent, if the handshake ran.
+    pub user_agent: Option<String>,
+    /// Prefers `headers` announcements over `inv`.
+    pub wants_headers_announce: bool,
+    /// Headers we've applied that this peer sent.
+    pub headers_received: usize,
+    /// Block bodies this peer has sent.
+    pub blocks_received: usize,
+    /// Outstanding `getdata` requests to this peer.
+    pub in_flight: usize,
+    /// Seconds since the connection registered.
+    pub connected_secs: u64,
+    /// Seconds since this peer last gave us something useful.
+    pub idle_secs: u64,
+}
+
 /// A bounded set of peers sharing one [`Chainstate`].
 pub struct PeerManager<S> {
     peers: HashMap<u64, PeerEntry<S>>,
@@ -148,6 +178,35 @@ impl<S: Read + Write> PeerManager<S> {
     #[must_use]
     pub fn len(&self) -> usize {
         self.peers.len()
+    }
+
+    /// A snapshot of every connected peer, for status displays —
+    /// ordered by peer id (registration order).
+    #[must_use]
+    pub fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
+        let mut out: Vec<PeerSnapshot> = self
+            .peers
+            .iter()
+            .map(|(id, peer)| {
+                let info = peer.session.peer();
+                PeerSnapshot {
+                    id: *id,
+                    remote: peer.remote.as_ref().map(addrman::socket_addr),
+                    inbound: peer.inbound,
+                    established: peer.session.established(),
+                    start_height: info.map(|i| i.start_height),
+                    user_agent: info.map(|i| i.user_agent.clone()),
+                    wants_headers_announce: peer.wants_headers_announce,
+                    headers_received: peer.sync.headers_applied(),
+                    blocks_received: peer.sync.blocks_received(),
+                    in_flight: peer.sync.in_flight(),
+                    connected_secs: peer.connected_at.elapsed().as_secs(),
+                    idle_secs: peer.last_useful.elapsed().as_secs(),
+                }
+            })
+            .collect();
+        out.sort_by_key(|p| p.id);
+        out
     }
 
     /// Overrides the aggregate in-flight block budget (testing and

@@ -66,6 +66,8 @@ pub struct SyncProgress {
     /// The last few connected blocks `(height, hash)` — newest last —
     /// for displays that render the chain itself.
     pub recent: Vec<(u32, avila_consensus::hash::BlockHash)>,
+    /// Per-peer views — what each peer claims vs. what it has served.
+    pub peer_details: Vec<avila_p2p::manager::PeerSnapshot>,
 }
 
 /// The outcome of a finished (or timed-out) sync run.
@@ -209,6 +211,7 @@ pub fn run(
             established_total,
             disconnects,
             recent,
+            peer_details: mgr.peer_snapshots(),
         });
         if run_progress >= cfg.target_height {
             break;
