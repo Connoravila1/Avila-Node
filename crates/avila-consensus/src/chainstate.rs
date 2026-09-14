@@ -316,8 +316,9 @@ impl Chainstate {
                 .is_some_and(|store| store.position(hash).is_some())
     }
 
-    /// `hash`'s body, from memory or the store.
-    fn body(&self, hash: &BlockHash) -> Option<Block> {
+    /// `hash`'s body, from memory or the store. Public for the P2P serving
+    /// path (`getdata` → block bytes).
+    pub fn body(&self, hash: &BlockHash) -> Option<Block> {
         if let Some(block) = self.blocks.get(hash) {
             return Some(block.clone());
         }

@@ -315,6 +315,79 @@ impl PeerSync {
             false
         }
     }
+
+    /// Answers a peer's `getheaders`: find the deepest locator hash on our
+    /// best header chain (Core's `FindFork` equivalent), then emit the
+    /// following headers — up to [`MAX_HEADERS_RESULTS`], stopping before
+    /// `stop` if it's on the chain. An empty reply means we have nothing
+    /// the peer doesn't (or the locator never intersected our chain —
+    /// Core serves from genesis in that case; an empty page is the honest
+    /// answer when the fork is our tip).
+    #[must_use]
+    pub fn serve_getheaders(cs: &Chainstate, request: &GetHeaders) -> Message {
+        let chain = cs.tree().best_chain();
+        // Deepest locator hash on our best chain; -1 means "no common
+        // point" — serve from genesis.
+        let fork = request
+            .locator
+            .iter()
+            .filter_map(|hash| chain.iter().position(|h| h == hash).map(|p| p as i64))
+            .max()
+            .unwrap_or(-1);
+        let mut headers = Vec::new();
+        for height in (fork + 1)..chain.len() as i64 {
+            let hash = &chain[height as usize];
+            if *hash == request.stop {
+                break;
+            }
+            let Some(node) = cs.tree().get(hash) else {
+                break;
+            };
+            headers.push(node.header);
+            if headers.len() as u64 == MAX_HEADERS_RESULTS {
+                break;
+            }
+        }
+        Message::Headers(headers)
+    }
+
+    /// Answers a peer's `getdata`: a `block` message for each requested
+    /// block whose body we hold (memory or store), `notfound` for the rest.
+    /// Bounded by the request size — `getdata` payloads are already capped
+    /// at `MAX_INV_SZ` by the decoder.
+    #[must_use]
+    pub fn serve_getdata(cs: &Chainstate, requests: &[InvVector]) -> Vec<Message> {
+        let mut out = Vec::new();
+        let mut missing = Vec::new();
+        for inv in requests {
+            match inv.inv_type {
+                InvType::Block | InvType::WitnessBlock => {
+                    if let Some(block) = cs.body(&inv.hash) {
+                        // MSG_BLOCK is answered witness-stripped — the wire
+                        // encoding mirrors Core's `NetMsgType::BLOCK` vs
+                        // `MSG_WITNESS_BLOCK` split.
+                        let mut block = block;
+                        if inv.inv_type == InvType::Block {
+                            for tx in &mut block.transactions {
+                                for input in &mut tx.inputs {
+                                    input.witness =
+                                        avila_consensus::transaction::Witness::default();
+                                }
+                            }
+                        }
+                        out.push(Message::Block(block));
+                    } else {
+                        missing.push(*inv);
+                    }
+                }
+                _ => missing.push(*inv), // tx serving isn't implemented
+            }
+        }
+        if !missing.is_empty() {
+            out.push(Message::NotFound(missing));
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -528,5 +601,89 @@ mod tests {
         let mut sync = PeerSync::new();
         let err = sync.on_block(&mut cs, &bad, NOW).unwrap_err();
         assert!(matches!(err, SyncError::InvalidBlock(_)), "{err}");
+    }
+
+    #[test]
+    fn serve_getheaders_answers_from_fork_point() {
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 5);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        // Peer at h2 asks with locator [h2, h1, genesis] → serve h3..h5.
+        let genesis = cs
+            .tree()
+            .get(&blocks[0].header.prev_block_hash)
+            .unwrap()
+            .hash();
+        let req = GetHeaders {
+            locator: vec![blocks[1].block_hash(), blocks[0].block_hash(), genesis],
+            stop: BlockHash::ZERO,
+        };
+        match PeerSync::serve_getheaders(&cs, &req) {
+            Message::Headers(headers) => {
+                assert_eq!(headers.len(), 3);
+                assert_eq!(headers[0].hash(), blocks[2].block_hash());
+                assert_eq!(headers[2].hash(), blocks[4].block_hash());
+            }
+            other => panic!("expected headers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_getheaders_stop_and_empty() {
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 4);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        // Stop at h3: serve h2 only (the stop hash is exclusive).
+        let req = GetHeaders {
+            locator: vec![blocks[0].block_hash()],
+            stop: blocks[2].block_hash(),
+        };
+        match PeerSync::serve_getheaders(&cs, &req) {
+            Message::Headers(h) => {
+                assert_eq!(h.len(), 1);
+                assert_eq!(h[0].hash(), blocks[1].block_hash());
+            }
+            other => panic!("expected headers, got {other:?}"),
+        }
+        // Locator at our tip → nothing to serve.
+        let req = GetHeaders {
+            locator: vec![blocks[3].block_hash()],
+            stop: BlockHash::ZERO,
+        };
+        match PeerSync::serve_getheaders(&cs, &req) {
+            Message::Headers(h) => assert!(h.is_empty()),
+            other => panic!("expected headers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_getdata_blocks_and_notfound() {
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 2);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        let unknown = BlockHash::from_bytes([0xee; 32]);
+        let reqs = vec![
+            InvVector {
+                inv_type: InvType::WitnessBlock,
+                hash: blocks[0].block_hash(),
+            },
+            InvVector {
+                inv_type: InvType::Block,
+                hash: unknown,
+            },
+        ];
+        let out = PeerSync::serve_getdata(&cs, &reqs);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[0], Message::Block(b) if b.block_hash() == blocks[0].block_hash()));
+        match &out[1] {
+            Message::NotFound(v) => assert_eq!(v[0].hash, unknown),
+            other => panic!("expected notfound, got {other:?}"),
+        }
     }
 }

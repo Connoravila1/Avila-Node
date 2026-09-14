@@ -29,8 +29,7 @@ use thiserror::Error;
 
 use crate::codec::{Command, FrameDecoder, FrameError, encode_frame};
 use crate::message::{
-    Message, NODE_NETWORK, NODE_P2P_V2, NODE_WITNESS, NetAddr, PROTOCOL_VERSION, PayloadError,
-    Version,
+    Message, NODE_NETWORK, NODE_WITNESS, NetAddr, PROTOCOL_VERSION, PayloadError, Version,
 };
 
 /// Core's `HANDSHAKE_TIMEOUT` — a peer that never finishes the version
@@ -40,8 +39,10 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bytes read per socket call inside `poll`.
 const READ_CHUNK: usize = 8 * 1024;
 
-/// The services we advertise on every connection.
-pub const OUR_SERVICES: u64 = NODE_NETWORK | NODE_WITNESS | NODE_P2P_V2;
+/// The services we advertise on every connection. `NODE_P2P_V2` is
+/// deliberately absent — BIP324 isn't implemented yet, and advertising it
+/// would make v29+ peers open an encrypted v2 stream we can't read.
+pub const OUR_SERVICES: u64 = NODE_NETWORK | NODE_WITNESS;
 
 /// Where the session is in the `version`/`verack` exchange.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

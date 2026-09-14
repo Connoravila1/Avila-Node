@@ -355,6 +355,28 @@ impl HeaderTree {
         self.invalid.contains(hash)
     }
 
+    /// The best (most-work) header chain, genesis at index 0 — the chain
+    /// `getheaders` serves from. Rebuilt by walking the tip's ancestry, so
+    /// `O(tip height)`; the serving path caps responses at 2000 headers but
+    /// the walk itself is linear.
+    #[must_use]
+    pub fn best_chain(&self) -> Vec<BlockHash> {
+        let mut chain = Vec::with_capacity(self.tip().height as usize + 1);
+        let mut node = self.tip();
+        loop {
+            chain.push(node.hash());
+            if node.height == 0 {
+                break;
+            }
+            let Some(parent) = self.nodes.get(&node.header.prev_block_hash) else {
+                break; // tree corruption — emit the partial chain
+            };
+            node = parent;
+        }
+        chain.reverse();
+        chain
+    }
+
     /// Every indexed header sorted by height (ties unordered) — the snapshot's
     /// header set. Height-sort guarantees parents precede their children when
     /// the list is reinserted on restore.
