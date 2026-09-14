@@ -335,8 +335,12 @@ mod tests {
 
     /// A unique store dir under the test target dir — no external tempdir dep.
     fn test_dir(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("avila-store-test-{}-{name}", std::process::id()));
+        // canonicalize: a relative TMPDIR would otherwise land inside the
+        // crate directory.
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let dir = base.join(format!("avila-store-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }

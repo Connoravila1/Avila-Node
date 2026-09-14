@@ -964,8 +964,10 @@ mod tests {
     #[test]
     fn with_store_persists_and_resumes() {
         let params = params();
-        let dir =
-            std::env::temp_dir().join(format!("avila-chainstate-test-{}", std::process::id()));
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!("avila-chainstate-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let blocks = probe_chain(20, &[], &params);
