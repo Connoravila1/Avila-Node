@@ -105,12 +105,21 @@ Not defects — scope boundaries for later gates:
 - **Header-chain rules not in Core's `ContextualCheckBlockHeader`**:
   checkpoints, `nMinimumChainWork`, BIP9 versionbits deployment state
   (Core treats unexpected versions as warnings, not rejections).
-- **Infrastructure**: pinned-Core reference adapter with disagreement artifacts
-  and the scorecard measurement harness. Coverage-guided fuzzing exists
-  (`fuzz/`, libFuzzer via cargo-fuzz): six targets over header/transaction/
-  block decoding, CompactSize canonicality, compact-target arithmetic and
-  merkle roots; ~14M executions across a 15 s/target smoke run with zero
-  crashes. Run with `cargo +nightly fuzz run <target>` from `fuzz/`.
+- **Infrastructure**: the scorecard measurement harness. The reference
+  adapter exists (`tools/check_headers_core.py` + the
+  `avila-consensus/examples/check_headers.rs` helper): it launches an isolated
+  `bitcoind` per network, replays every header fixture and a generated
+  regtest invalid-case corpus through `submitheader`, and compares per-header
+  verdicts against `HeaderTree`. First full run: **10,404 compared headers,
+  zero verdict mismatches** (mainnet 4031, testnet4 4031 including real
+  BIP94-enforced headers, signet 2047, regtest 295 incl. bad-diffbits /
+  high-hash / time-too-old / time-too-new / orphan / duplicate agreement).
+  The artifact records the reference binary's version and sha256.
+  Coverage-guided fuzzing exists (`fuzz/`, libFuzzer via cargo-fuzz): six
+  targets over header/transaction/block decoding, CompactSize canonicality,
+  compact-target arithmetic and merkle roots; ~14M executions across a
+  15 s/target smoke run with zero crashes. Run with
+  `cargo +nightly fuzz run <target>` from `fuzz/`.
 
 ### Historical and activation cases to carry into G2
 

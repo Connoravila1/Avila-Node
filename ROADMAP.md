@@ -40,7 +40,9 @@ measurements remain unknown. This gate establishes an application, not a Bitcoin
 - [x] Inventory historical and activated consensus rules with valid/invalid fixtures,
   activation context and provenance; start mainnet cases immediately.
   See docs/RULE_INVENTORY.md and fixtures/manifest.json.
-- [ ] Add a pinned Core reference adapter, parser/arithmetic fuzzing and disagreement artifacts.
+- [x] Add a pinned Core reference adapter, parser/arithmetic fuzzing and disagreement artifacts.
+  See tools/check_headers_core.py (adapter + per-run reference pin and artifact)
+  and fuzz/ (libFuzzer targets).
 - [ ] Implement the scorecard runner: exact manifests, raw measurements, correctness checks,
   cold/warm workloads and reproducible reference runs.
 - [ ] Record baseline measurements before selecting hot-path layouts or storage defaults.

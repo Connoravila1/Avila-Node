@@ -41,6 +41,20 @@ cargo +nightly fuzz run decode-block # one of the six targets
 Corpora, crash artifacts and `fuzz/target/` are gitignored. Minimize any crash to
 a regression test in the crate before fixing.
 
+A third layer differential-checks header acceptance against the installed
+`bitcoind` reference (any Core lineage; the run artifact records the exact
+binary version and sha256):
+
+```sh
+python3 tools/check_headers_core.py                # all four networks
+python3 tools/check_headers_core.py --suites regtest
+```
+
+It launches isolated daemons (no inbound/outbound peers), replays the header
+fixtures plus a generated invalid-case corpus through `submitheader`, and
+writes verdict disagreements to `target/reference-runs/`. A non-zero exit
+means a real consensus discrepancy — investigate before merging.
+
 Run `cargo run --locked -p avila-gui` in a graphical session after interface changes.
 Check keyboard navigation, small windows, increased zoom, long text, empty data,
 and errors. Rendering tests complement native interaction checks.
