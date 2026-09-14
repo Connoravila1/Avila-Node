@@ -109,7 +109,12 @@ Storage and synchronization research can use this implementation before P2P is r
       next tick. Proven live: two Knots regtest peers fed one chainstate
       to h120 with zero duplicate requests.
 - [ ] Global budgets, eviction scoring, and cancellation.
-- [ ] Exercise regtest, signet, testnet4 and mainnet with their required rules.
+- [x] Exercised on all four networks: regtest (full sync + serve, both
+      directions against Knots), and live mainnet / signet / testnet4
+      runs via `examples/mainnet_probe` — DNS-seeded discovery, real
+      handshakes, thousands of headers (retargets included) and real
+      block connection through `Chainstate`, signet blocks passing
+      BIP325 challenge verification.
 - [ ] Implement selected transport/privacy constraints together with traffic paths.
 - [ ] Add real sync, peer and resource observations to CLI and GUI.
 

@@ -1,12 +1,12 @@
-//! Live mainnet evidence: resolve a DNS seed, handshake a real Bitcoin
-//! peer, and validate a page of actual mainnet headers through
-//! `Chainstate::accept_header` — the same code path that matched Core
-//! verdict-for-verdict on the header fixtures.
+//! Live network evidence: resolve a DNS seed, handshake real Bitcoin
+//! peers, and validate actual headers — and optionally blocks — through
+//! `Chainstate`. Works on any network with DNS seeds.
 //!
-//! Bounded by design: one peer, at most `--pages` header pages, then a
-//! clean disconnect. This is exactly what light clients and crawlers do.
+//! Bounded by design: at most `--pages` header pages and `--blocks`
+//! connected blocks, then a clean disconnect.
 //!
-//! Usage: `mainnet_probe [--pages N]` (default 1, each ≤2000 headers).
+//! Usage: `mainnet_probe [--net mainnet|signet|testnet4|regtest]
+//!        [--pages N] [--blocks N]` (defaults: mainnet, 1 page).
 
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,18 @@ fn main() -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let params = Network::Mainnet.params();
+    let net = std::env::args()
+        .position(|a| a == "--net")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .unwrap_or_else(|| "mainnet".to_string());
+    let network = match net.as_str() {
+        "mainnet" => Network::Mainnet,
+        "signet" => Network::Signet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        other => return Err(format!("unknown net {other}")),
+    };
+    let params = network.params();
     let mut mgr = PeerManager::new(4);
     let now = || {
         std::time::SystemTime::now()
@@ -65,7 +76,7 @@ fn main() -> Result<(), String> {
             headers_seen = indexed;
             pages_seen += 1;
             println!(
-                "validated {} mainnet headers, tip {}",
+                "validated {} {net} headers, tip {}",
                 headers_seen,
                 cs.tree().tip_hash()
             );
@@ -80,7 +91,7 @@ fn main() -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(10));
     }
     println!(
-        "done: {} mainnet headers validated, {} blocks connected via Chainstate in {:?}",
+        "done: {} {net} headers validated, {} blocks connected via Chainstate in {:?}",
         headers_seen,
         cs.chain().len() - 1,
         start.elapsed()
