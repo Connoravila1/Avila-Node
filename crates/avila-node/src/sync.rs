@@ -26,6 +26,9 @@ pub struct SyncConfig {
     /// Optional SOCKS5 proxy for all outbound connections (Core's
     /// `-proxy`); DNS-seeded and explicit dials both route through it.
     pub proxy: Option<SocketAddr>,
+    /// When set, the chainstate persists under this directory —
+    /// re-running resumes from the stored snapshot instead of genesis.
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for SyncConfig {
@@ -36,6 +39,7 @@ impl Default for SyncConfig {
             max_peers: 8,
             timeout: Duration::from_secs(120),
             proxy: None,
+            data_dir: None,
         }
     }
 }
@@ -90,6 +94,9 @@ pub enum SyncError {
     /// A transport failure prevented any peer registration.
     #[error("peer transport error: {0}")]
     Io(#[from] io::Error),
+    /// The block store could not be opened or the snapshot flushed.
+    #[error("chainstate storage error: {0}")]
+    Store(io::Error),
 }
 
 fn unix_now() -> u32 {
@@ -107,7 +114,14 @@ pub fn run(
     cfg: &SyncConfig,
     mut progress: impl FnMut(&SyncProgress),
 ) -> Result<SyncReport, SyncError> {
-    let mut cs = Chainstate::new(params);
+    let mut cs = match &cfg.data_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).map_err(SyncError::Store)?;
+            Chainstate::with_store(dir, params, unix_now()).map_err(SyncError::Store)?
+        }
+        None => Chainstate::new(params),
+    };
+    let resumed_height = cs.chain().len() as u32 - 1;
     let mut mgr = PeerManager::new(cfg.max_peers);
     let started = Instant::now();
 
@@ -138,7 +152,9 @@ pub fn run(
     let mut established_total = 0u32;
     let mut disconnects = 0u32;
     let mut connected = 0u32;
-    while started.elapsed() < cfg.timeout && connected < cfg.target_height {
+    while started.elapsed() < cfg.timeout
+        && connected.saturating_sub(resumed_height) < cfg.target_height
+    {
         for event in mgr.tick_net(&mut cs, unix_now(), params.message_start, 0) {
             match event {
                 NetEvent::Connected { .. } => established_total += 1,
@@ -147,6 +163,10 @@ pub fn run(
             }
         }
         connected = cs.chain().len() as u32 - 1;
+        // The target counts blocks connected *this run* above whatever
+        // the store resumed at — a resumed chain doesn't re-trigger
+        // the stop condition at its own height.
+        let run_progress = connected.saturating_sub(resumed_height);
         progress(&SyncProgress {
             peers: mgr.len(),
             connected_height: connected,
@@ -155,10 +175,14 @@ pub fn run(
             established_total,
             disconnects,
         });
-        if connected >= cfg.target_height {
+        if run_progress >= cfg.target_height {
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+
+    if cfg.data_dir.is_some() {
+        cs.flush().map_err(SyncError::Store)?;
     }
 
     Ok(SyncReport {
@@ -167,7 +191,7 @@ pub fn run(
         header_height: cs.tree().tip().height,
         tip: cs.chain().last().map(|h| h.to_string()),
         established_total,
-        target_reached: connected >= cfg.target_height,
+        target_reached: connected.saturating_sub(resumed_height) >= cfg.target_height,
         elapsed: started.elapsed(),
     })
 }

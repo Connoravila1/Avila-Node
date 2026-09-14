@@ -53,6 +53,11 @@ enum Command {
         /// Route all outbound connections through this SOCKS5 proxy.
         #[arg(long)]
         proxy: Option<SocketAddr>,
+        /// Persist the chainstate under the configured data directory,
+        /// resuming where the last run stopped. Enabled by default;
+        /// pass --no-store for an in-memory run.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        store: bool,
     },
 }
 
@@ -88,6 +93,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             timeout_secs,
             connect,
             proxy,
+            store,
         } => {
             use avila_consensus::params::Network as ConsensusNet;
             let network = config.get().network;
@@ -104,6 +110,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 max_peers,
                 timeout: Duration::from_secs(timeout_secs),
                 proxy,
+                data_dir: store.then(|| config.network_data_dir()),
             };
             println!("Syncing {network} (target height {blocks}, {max_peers} peers max)...");
             let mut last = (u32::MAX, u32::MAX);
