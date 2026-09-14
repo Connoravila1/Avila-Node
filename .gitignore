@@ -13,3 +13,7 @@ target/
 /.claude/worktrees/
 # Ad-hoc session scratch (daemon datadirs, generated corpora).
 /.scratch/
+
+# Python bytecode caches
+__pycache__/
+*.pyc
