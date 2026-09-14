@@ -284,9 +284,14 @@ Not defects — scope boundaries for later gates:
   remaining G2 storage work: incremental (not whole-state) snapshot writes,
   and Core-style block+coins+undo commit batching.
 - **Header-chain rules not in Core's `ContextualCheckBlockHeader`**:
-  checkpoints, `nMinimumChainWork` as a *header*-acceptance gate (it is wired
-  for the `fScriptChecks` decision), BIP9 versionbits deployment state
-  (Core treats unexpected versions as warnings, not rejections).
+  checkpoints, BIP9 versionbits deployment state (Core treats unexpected
+  versions as warnings, not rejections), and the P2P-intake anti-DoS gates —
+  `AcceptBlockHeader`'s `min_pow_checked` (`too-little-chainwork`) and
+  `AcceptBlock`'s `!fRequested` low-work/too-far-ahead skips. Both are inert
+  on the RPC-intake path we mirror (`submitblock`/`submitheader` pass
+  `force_processing`/`min_pow_checked` = true); they become real once a P2P
+  surface exists at G3. `nMinimumChainWork` itself is wired for the
+  `fScriptChecks` decision.
 - **Infrastructure**: the scorecard measurement harness. The reference
   adapters exist: `tools/check_headers_core.py` (+ `examples/check_headers.rs`)
   launches an isolated `bitcoind` per network, replays every header fixture and

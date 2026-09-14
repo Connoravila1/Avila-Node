@@ -1340,4 +1340,37 @@ mod tests {
         drop(cs);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn snapshot_write_failure_keeps_previous_snapshot() {
+        let params = params();
+        let dir = store_dir("snapshot-writefail");
+        let blocks = probe_chain(10, &[], &params);
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        for block in &blocks[..5] {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        cs.flush().unwrap();
+        let committed = std::fs::read(dir.join("state.dat")).unwrap();
+        drop(cs);
+
+        // Connect five more bodies, then make `state.dat.tmp` a directory so
+        // the snapshot write fails after the blk flush succeeded.
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        for block in &blocks[5..] {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        std::fs::create_dir(dir.join("state.dat.tmp")).unwrap();
+        assert!(cs.flush().is_err());
+        drop(cs);
+        std::fs::remove_dir(dir.join("state.dat.tmp")).unwrap();
+
+        // The committed snapshot is byte-identical; resume restores it and
+        // replays the five post-snapshot bodies to the same tip.
+        assert_eq!(std::fs::read(dir.join("state.dat")).unwrap(), committed);
+        let cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        assert_eq!(cs.tip_hash(), blocks[9].block_hash());
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

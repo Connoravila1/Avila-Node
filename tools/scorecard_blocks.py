@@ -21,7 +21,10 @@ solutions). This runner measures that pipeline end-to-end:
                  row is only reported when both sides agree on every verdict.
   avila side     wall time + peak RSS of the release-mode `check_blocks
                  replay` process; rep 0 is "cold" (first run after build),
-                 later reps are "warm".
+                 later reps are "warm". A second batch times `--store` runs
+                 against a populated store dir: the first (untimed) run writes
+                 blk files + state.dat, later reps measure snapshot restore
+                 plus already-known rescan of the same stream.
   reference      wall time of the `submitblock` batch phase plus the daemon's
                  peak RSS afterwards; each rep runs against a fresh
                  daemon/datadir so every rep is a cold reference run (a warm
@@ -104,16 +107,17 @@ def rss_kb(pid):
     return 0
 
 
-def run_avila(network, path, now):
+def run_avila(network, path, now, store_dir=None):
     """One replay process; returns (wall seconds, peak RSS in KiB) via wait4."""
+    argv = [EXAMPLE_BIN, "replay", network, path, str(now)]
+    if store_dir is not None:
+        argv += ["--store", store_dir]
     pid = os.fork()
     if pid == 0:
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, 1)
-        os.execv(
-            EXAMPLE_BIN,
-            [EXAMPLE_BIN, "replay", network, path, str(now)],
-        )
+        os.dup2(devnull, 2)
+        os.execv(EXAMPLE_BIN, argv)
         os._exit(127)
     start = time.monotonic()
     _pid, status, rusage = os.wait4(pid, 0)
@@ -180,6 +184,21 @@ def measure_suite(suite, workdir, now, reps, ref_reps):
         "warm_seconds": times[1:],
         "peak_rss_kb": max(rss),
     }
+
+    # --- avila resume runs: populate the store once (untimed), then time
+    # restarts. A resumed run restores the state.dat snapshot (no
+    # re-validation) and resubmits every frame as already-known, so this is
+    # "restart + rescan the same stream", not pure restore latency. ---
+    store_dir = os.path.join(workdir, f"store-{network}")
+    os.makedirs(store_dir, exist_ok=True)
+    run_avila(network, path, now, store_dir)
+    resume_times, resume_rss = [], []
+    for _ in range(reps):
+        elapsed, peak = run_avila(network, path, now, store_dir)
+        resume_times.append(elapsed)
+        resume_rss.append(peak)
+    result["avila"]["resume_seconds"] = resume_times
+    result["avila"]["resume_peak_rss_kb"] = max(resume_rss)
     result["measured_blocks"] = len(blocks)
     return result
 
@@ -261,9 +280,11 @@ def main():
         artifact["suites"][suite] = result
         av = result["avila"]
         ref = result["reference"]
+        resume = av.get("resume_seconds", [])
         print(
             f"  correctness={result['correctness']} blocks={result['blocks']} "
             f"avila cold={av['cold_seconds']:.2f}s warm={min(av['warm_seconds'], default=0):.2f}s "
+            f"resume={min(resume, default=0):.2f}s "
             f"rss={av['peak_rss_kb']}KiB | "
             f"ref submit={min(ref['submit_seconds'], default=0):.2f}s "
             f"rss={ref.get('rss_kb', 0)}KiB",
