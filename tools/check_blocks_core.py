@@ -116,6 +116,7 @@ BLOCK_FIXTURES = {
 # `tools/fetch_fixtures.py --segment <net> <first> <last>`.
 SEGMENT_FIXTURES = {
     "mainnet": "mainnet-blocks-000000-000500.dat",
+    "signet": "signet-blocks-000000-000300.dat",
 }
 
 # Documented gaps where the two sides are known to differ today. Currently
@@ -426,7 +427,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--suites",
-        default="regtest-corpus,fixtures-mainnet,fixtures-testnet4,fixtures-signet,segment-mainnet",
+        default="regtest-corpus,fixtures-mainnet,fixtures-testnet4,fixtures-signet,segment-mainnet,segment-signet",
         help="comma-separated subset",
     )
     parser.add_argument(

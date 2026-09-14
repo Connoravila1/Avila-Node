@@ -249,6 +249,26 @@
         ]
       },
       "notes": "blk.dat-framed contiguous segment for chainstate replay."
+    },
+    {
+      "file": "signet-blocks-000000-000300.dat",
+      "network": "signet",
+      "kind": "block-segment",
+      "first_height": 0,
+      "last_height": 300,
+      "count": 301,
+      "first_hash": "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
+      "last_hash": "00000101eae97443c16c490d06c80fb0e652f34b7cc79042b34b5a614c6b6d38",
+      "bytes": 101565,
+      "sha256": "ce70b239c8f962f0dbd378f8f606d7c9796569905481c639438070736be0315a",
+      "source": {
+        "transport": "https",
+        "url": "https://mempool.space/signet/api/block-height/<h> + /block/<hash>/raw",
+        "bases_used": [
+          "https://mempool.space/signet/api"
+        ]
+      },
+      "notes": "blk.dat-framed contiguous segment for chainstate replay."
     }
   ],
   "observed": {
@@ -257,5 +277,5 @@
     "mainnet_nbits_at_32256": "0x1d00d86a"
   },
   "generator": "tools/fetch_fixtures.py",
-  "generated_at_utc": "2026-09-14T08:10:31Z"
+  "generated_at_utc": "2026-09-14T12:25:08Z"
 }

@@ -56,6 +56,7 @@ whole segment through `Chainstate::accept_block` in order.
 | File | Network | Heights | Blocks | Bytes |
 |---|---|---|---|---|
 | `mainnet-blocks-000000-000500.dat` | mainnet | 0..=500 | 501 | 114278 |
+| `signet-blocks-000000-000300.dat` | signet | 0..=300 | 301 | 101565 |
 
 Regenerate or fetch a different range with
 `python3 tools/fetch_fixtures.py --segment <network> <first> <last>`.

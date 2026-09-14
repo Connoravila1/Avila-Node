@@ -67,8 +67,9 @@ differential adapter (`tools/check_blocks_core.py` + `examples/check_blocks.rs`)
 verifies those reasons against a live daemon's `submitblock`: **259 corpus
 submissions and 9 real block fixtures compared, zero unexplained mismatches**, plus
 a contiguous **501-block real mainnet segment** (heights 0..=500,
-`fixtures/mainnet-blocks-000000-000500.dat`) replayed through `Chainstate` and
-the daemon with zero mismatches —
+`fixtures/mainnet-blocks-000000-000500.dat`) and a **301-block signet segment**
+(heights 0..=300 — 300 real BIP325 challenge-spend verifications) replayed
+through `Chainstate` and the daemon with zero mismatches —
 every named violation above returns Core's exact reason, including the
 order-dependent cases (`bad-blk-length` beats `bad-txns-oversize`;
 `bad-txns-duplicate` fires only for a natural-pair leaf duplication, matching
@@ -259,8 +260,9 @@ Not defects — scope boundaries for later gates:
   through `submitblock`, replays the committed real block fixtures on
   per-network daemons, and runs a `segment-*` suite that feeds a contiguous
   real `blk.dat`-framed chain through `Chainstate::accept_block` in order —
-  **769 submissions, zero unexplained mismatches** (259 regtest + 9 fixtures +
-  501-block mainnet segment, heights 0..=500),
+  **1070 submissions, zero unexplained mismatches** (259 regtest + 9 fixtures +
+  501-block mainnet segment, heights 0..=500 + 301-block signet segment,
+  heights 0..=300),
   covering every `CheckBlock`/`ContextualCheckBlock` rule plus the
   `ConnectBlock` cases 61–72 (missingorspent, premature coinbase, in-belowout,
   cb-amount, BIP30, BIP68 height/time locks, P2SH/witness sigops), the
