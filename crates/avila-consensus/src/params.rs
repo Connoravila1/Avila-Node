@@ -51,6 +51,7 @@ impl Network {
                     "00000000000000000001b658dd1120e82e66d2790811f89ede9742ada3ed6d77",
                 )
                 .ok(),
+                message_start: [0xf9, 0xbe, 0xb4, 0xd9],
                 // kernel/chainparams.cpp buried-deployment heights; cross-checked against
                 bip34_height: 227_931,
                 bip66_height: 363_725,
@@ -79,6 +80,7 @@ impl Network {
                     "0000000000003ed4f08dbdf6f7d6b271a6bcffce25675cb40aa9fa43179a89f3",
                 )
                 .ok(),
+                message_start: [0x1c, 0x16, 0x3f, 0x28],
                 // Every buried deployment activates at height 1 on testnet4; segwit is
                 bip34_height: 1,
                 bip66_height: 1,
@@ -107,6 +109,7 @@ impl Network {
                     "000000895a110f46e59eb82bbc5bfb67fa314656009c295509c21b4999f5180a",
                 )
                 .ok(),
+                message_start: [0x0a, 0x03, 0xcf, 0x40],
                 bip34_height: 1,
                 bip66_height: 1,
                 bip65_height: 1,
@@ -136,6 +139,7 @@ impl Network {
                 // CRegTestParams leaves both zero.
                 minimum_chain_work: Work::ZERO,
                 assume_valid: None,
+                message_start: [0xfa, 0xbf, 0xb5, 0xda],
                 // Core's regtest defaults bury BIP34/65/66/CSV at height 1 and activate
                 bip34_height: 1,
                 bip66_height: 1,
@@ -212,6 +216,10 @@ pub struct Params {
     /// below which script checks may be skipped — `None` where Core leaves it
     /// null (`uint256{}`), which disables the optimization entirely.
     pub assume_valid: Option<BlockHash>,
+    /// The network's `pchMessageStart` — the 4-byte magic prefixing every P2P
+    /// message and every `blk*.dat` frame. [`crate::store::BlockStore`] writes
+    /// and scans frames by it.
+    pub message_start: [u8; 4],
     /// `consensus.BIP34Height`: Core's `DEPLOYMENT_HEIGHTINCB` buried deployment (BIP34
     /// coinbase height enforcement). [`crate::chain::HeaderTree::insert`]'s `bad-version`
     /// check also uses this as the `nVersion < 2` floor's activation height, mirroring

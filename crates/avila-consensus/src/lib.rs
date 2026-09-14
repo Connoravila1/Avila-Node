@@ -21,4 +21,5 @@ pub mod rules;
 pub mod script;
 pub mod sigchecker;
 pub mod signet;
+pub mod store;
 pub mod transaction;

@@ -1850,6 +1850,7 @@ fn main() -> ExitCode {
             // order).
             let mut params = net.params();
             let mut header_bytes: Option<Vec<u8>> = None;
+            let mut store_dir: Option<std::path::PathBuf> = None;
             let mut i = 4;
             while i < args.len() {
                 match args[i].as_str() {
@@ -1873,6 +1874,10 @@ fn main() -> ExitCode {
                         }
                         i += 2;
                     }
+                    "--store" if i + 1 < args.len() => {
+                        store_dir = Some(std::path::PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
                     flag => {
                         eprintln!("unknown replay flag {flag:?}");
                         return ExitCode::FAILURE;
@@ -1884,13 +1889,24 @@ fn main() -> ExitCode {
             // the offline-import/replay path: every block runs the full
             // accept pipeline (CheckBlock -> header insert -> contextual ->
             // connect/reorg) in file order.
-            let expected_magic = match net {
-                Network::Mainnet => [0xf9, 0xbe, 0xb4, 0xd9],
-                Network::Testnet4 => [0x1c, 0x16, 0x3f, 0x28],
-                Network::Signet => [0x0a, 0x03, 0xcf, 0x40],
-                Network::Regtest => [0xfa, 0xbf, 0xb5, 0xda],
+            let expected_magic = params.message_start;
+            let mut state = match store_dir {
+                Some(dir) => match Chainstate::with_store(&dir, &params, now) {
+                    Ok(state) => {
+                        eprintln!(
+                            "store {}: resumed at height {}",
+                            dir.display(),
+                            state.tree().get(&state.tip_hash()).map_or(0, |n| n.height)
+                        );
+                        state
+                    }
+                    Err(err) => {
+                        eprintln!("cannot open store {}: {err}", dir.display());
+                        return ExitCode::FAILURE;
+                    }
+                },
+                None => Chainstate::new(&params),
             };
-            let mut state = Chainstate::new(&params);
             if let Some(bytes) = header_bytes {
                 // `ProcessNewBlockHeaders`: raw 80-byte headers, chain order.
                 // A rejected header aborts the preload — a body whose header
@@ -1953,6 +1969,10 @@ fn main() -> ExitCode {
                     data.len() - cursor
                 );
             }
+            if let Err(err) = state.flush() {
+                eprintln!("store flush failed: {err}");
+                return ExitCode::FAILURE;
+            }
             ExitCode::SUCCESS
         }
         Some("gen-corpus") if args.len() == 2 => {
@@ -2007,7 +2027,7 @@ fn main() -> ExitCode {
             eprintln!("  check-blocks check-many <network> <now> <block.bin>...");
             eprintln!(
                 "  check-blocks replay <network> <blocks.dat> <now> \
-                 [--headers <headers.bin>] [--assumevalid <hex>]"
+                 [--headers <headers.bin>] [--assumevalid <hex>] [--store <dir>]"
             );
             eprintln!("  check-blocks gen-corpus <outdir>");
             eprintln!("  check-blocks gen-assumevalid-corpus <outdir>");

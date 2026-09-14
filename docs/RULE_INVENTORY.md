@@ -193,6 +193,18 @@ block 110 spends an always-false `OP_0` output (below the assumed block:
 checks skipped, connects on both sides) while block 130 spends the second
 (above it: verified, both reject `mandatory-script-verify-flag-failed`).
 
+`store.rs` adds the durable body store: Core's `blkNNNNN.dat` framing
+(`message_start` magic + length + payload), rotation at
+`MAX_BLOCKFILE_SIZE`, and a hash→position index rebuilt by scanning on open
+— a partial tail frame from an interrupted write is truncated, foreign-magic
+stores are refused, and corruption in a non-tail file is reported. Accepted
+bodies are appended at `AcceptBlock`'s `WriteBlockToDisk` point (before the
+connect decision, so failed bodies persist), and `Chainstate::with_store`
+resumes by replaying stored bodies through the full pipeline — the coins
+view, undo records and index are still rebuilt in memory, so restart means
+re-validation, not re-download. `replay --store` exercises it; verdicts are
+identical with and without the store on the 501-block segment.
+
 ## Network parameters (`params.rs`)
 
 | Parameter | mainnet | testnet4 | signet | regtest |
@@ -258,8 +270,10 @@ Not defects — scope boundaries for later gates:
 - **Reorg handling**: `chainstate.rs` drives disconnect-to-fork /
   connect-forward reorgs plus Core's failed-block bookkeeping
   (`BLOCK_FAILED_*`, `bad-prevblk`, `duplicate-invalid`, activation pruning);
-  exercised by the 80-fork corpus case and cases 82–85. Remaining G2 storage
-  work: disk-backed block store, durable coins view.
+  exercised by the 80-fork corpus case and cases 82–85. Block bodies persist
+  via `store.rs` (`with_store` resumes by re-validation); remaining G2
+  storage work: durable coins view, persisted undo records, atomic
+  block+coins commit ordering.
 - **Header-chain rules not in Core's `ContextualCheckBlockHeader`**:
   checkpoints, `nMinimumChainWork` as a *header*-acceptance gate (it is wired
   for the `fScriptChecks` decision), BIP9 versionbits deployment state

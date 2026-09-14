@@ -29,6 +29,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use thiserror::Error;
 
@@ -39,6 +40,7 @@ use crate::connect::{self, BlockUndo, ConnectContext, ConnectError, UtxoSet};
 use crate::hash::BlockHash;
 use crate::header::BlockHeader;
 use crate::params::Params;
+use crate::store::BlockStore;
 
 /// The outcome of a successful [`Chainstate::accept_block`] call.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -91,6 +93,12 @@ pub enum BlockRejection {
     /// set are left as they were before the call.
     #[error("{0}")]
     Connect(ConnectError),
+    /// Writing the accepted body to the [`BlockStore`] failed (Core's
+    /// `WriteBlockToDisk` failure path — a `FatalError`, not a rule
+    /// rejection). Carries the `io::ErrorKind` so the error type stays
+    /// comparable.
+    #[error("block store write failed: {0:?}")]
+    Store(std::io::ErrorKind),
 }
 
 impl BlockRejection {
@@ -103,6 +111,7 @@ impl BlockRejection {
             BlockRejection::Check(err) => err.reason().into(),
             BlockRejection::Contextual(err) => err.reason().into(),
             BlockRejection::Connect(err) => err.reason(),
+            BlockRejection::Store(_) => "store-error".into(),
         }
     }
 }
@@ -110,9 +119,13 @@ impl BlockRejection {
 /// Stateful block acceptance: the block index, the coins view, the active
 /// chain, and the undo records needed to reorganize it.
 ///
-/// All state is resident in memory — this is the validation driver, not the
-/// storage layer. A durable backend (blk/rev files, a coins database,
-/// resumable replay) slots in behind the same pipeline in a later milestone.
+/// With [`Chainstate::new`] all state is resident in memory — this is the
+/// validation driver. [`Chainstate::with_store`] adds a durable body store:
+/// accepted blocks append to `blkNNNNN.dat` files at `AcceptBlock`'s
+/// `WriteBlockToDisk` point, and opening the store replays stored bodies to
+/// rebuild the index, coins view and tip — resumable import without
+/// re-downloading. A durable coins view and persisted undo remain a later
+/// milestone.
 pub struct Chainstate {
     tree: HeaderTree,
     utxo: UtxoSet,
@@ -128,6 +141,9 @@ pub struct Chainstate {
     /// Per-block undo for `chain[1..]` (the genesis is never connected):
     /// `undos[k]` reverses the block at height `k + 1`.
     undos: Vec<BlockUndo>,
+    /// The durable body store when this chainstate was opened with
+    /// [`Chainstate::with_store`]; `None` keeps everything in memory.
+    store: Option<BlockStore>,
 }
 
 impl Chainstate {
@@ -145,7 +161,70 @@ impl Chainstate {
             blocks: HashMap::new(),
             chain: vec![genesis],
             undos: Vec::new(),
+            store: None,
         }
+    }
+
+    /// A chainstate backed by a durable [`BlockStore`] in `dir`, resumed from
+    /// whatever the store already holds: `BlockStore::open` rebuilds the
+    /// hash→position index by scanning the blk files (truncating a partial
+    /// tail left by an interrupted write), then every stored body is replayed
+    /// through the normal acceptance pipeline in file order — restoring the
+    /// header index, the coins view, and the connected tip exactly as the
+    /// original run left them. Stored blocks that were rejected still replay
+    /// to the same rejection, so per-block verdicts are not errors here.
+    ///
+    /// `now` is the caller's adjusted local time for the header future-drift
+    /// check during replay.
+    ///
+    /// # Errors
+    ///
+    /// `io::Error` on store-open/read failures — including a payload that no
+    /// longer decodes, which is store corruption, not a rule verdict.
+    pub fn with_store(dir: &Path, params: &Params, now: u32) -> std::io::Result<Self> {
+        let store = BlockStore::open(dir, params.message_start)?;
+        // Replay stored bodies in file order through the normal pipeline while
+        // the store is still detached — `accept_block`'s append is skipped, so
+        // rebuild writes nothing back. A stored body that fails again (it was
+        // written before its connect attempt) is expected, not fatal.
+        let mut cs = Self::new(params);
+        let mut pending: Vec<Block> = store
+            .positions()
+            .into_iter()
+            .map(|(_, pos)| store.read(pos))
+            .collect::<std::io::Result<_>>()?;
+        // Bodies stored out of order are orphans until their parent lands —
+        // loop until a pass makes no progress. A body that keeps failing a
+        // non-orphan gate is a permanently-invalid stored block (it was
+        // written before its connect attempt), not a reason to keep retrying.
+        while !pending.is_empty() {
+            let mut progress = false;
+            pending.retain(|block| match cs.accept_block(block, now) {
+                Ok(_) => {
+                    progress = true;
+                    false
+                }
+                Err(BlockRejection::Header(ChainError::UnknownParent(_))) => true,
+                Err(_) => false,
+            });
+            if !progress {
+                break;
+            }
+        }
+        cs.store = Some(store);
+        Ok(cs)
+    }
+
+    /// Flushes the block store's buffered writes, when present.
+    ///
+    /// # Errors
+    ///
+    /// `io::Error` on flush failure.
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(store) = &mut self.store {
+            store.flush()?;
+        }
+        Ok(())
     }
 
     /// The block index (Core's `mapBlockIndex` + best-tip bookkeeping).
@@ -324,7 +403,14 @@ impl Chainstate {
         }
         // Structurally valid: retain the body — a later-arriving sibling may
         // outwork the tip and need it for a reorg (Core writes every accepted
-        // block to a blk*.dat file for the same reason).
+        // block to a blk*.dat file for the same reason: `WriteBlockToDisk`
+        // inside `AcceptBlock`, before `ActivateBestChain` decides anything —
+        // so even a body that later fails to connect is stored).
+        if let Some(store) = &mut self.store {
+            store
+                .append(block)
+                .map_err(|err| BlockRejection::Store(err.kind()))?;
+        }
         self.blocks.insert(hash, block.clone());
         if block.header.prev_block_hash == self.connected {
             let ctx = ConnectContext {
@@ -873,5 +959,33 @@ mod tests {
                 Err(BlockRejection::Connect(ConnectError::ScriptVerify(_)))
             ));
         }
+    }
+
+    #[test]
+    fn with_store_persists_and_resumes() {
+        let params = params();
+        let dir =
+            std::env::temp_dir().join(format!("avila-chainstate-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let blocks = probe_chain(20, &[], &params);
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        for block in &blocks[..10] {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        cs.flush().unwrap();
+        let tip10 = cs.tip_hash();
+        drop(cs);
+
+        // Resume: the stored bodies replay back to the same tip, and new
+        // bodies connect on top.
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        assert_eq!(cs.tip_hash(), tip10);
+        for block in &blocks[10..] {
+            assert!(cs.accept_block(block, NOW).is_ok());
+        }
+        assert_eq!(cs.tip_hash(), blocks[19].block_hash());
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
