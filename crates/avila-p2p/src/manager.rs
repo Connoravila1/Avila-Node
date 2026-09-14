@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use avila_consensus::chainstate::Chainstate;
 use avila_consensus::hash::BlockHash;
 
-use crate::message::{Message, NetAddr};
+use crate::addrman::{self, AddrBook};
+use crate::message::{AddrV2Entry, Message, NetAddr};
 use crate::session::{PeerInfo, PeerSession, SessionError, SessionEvent, build_version};
 use crate::sync::PeerSync;
 
@@ -78,6 +79,8 @@ pub enum NetEvent {
 struct PeerEntry<S> {
     session: PeerSession<S>,
     sync: PeerSync,
+    /// The peer's network address when we know it (outbound dials do).
+    remote: Option<NetAddr>,
     /// Time of the last received message of any kind.
     last_rx: Instant,
     /// Outstanding handshake deadline check cadence.
@@ -91,6 +94,8 @@ pub struct PeerManager<S> {
     peers: HashMap<u64, PeerEntry<S>>,
     next_id: u64,
     max_peers: usize,
+    /// Gossiped peer addresses — discovery lives here.
+    addrbook: AddrBook,
 }
 
 impl<S: Read + Write> PeerManager<S> {
@@ -101,6 +106,7 @@ impl<S: Read + Write> PeerManager<S> {
             peers: HashMap::new(),
             next_id: 0,
             max_peers,
+            addrbook: AddrBook::new(),
         }
     }
 
@@ -116,6 +122,12 @@ impl<S: Read + Write> PeerManager<S> {
         self.peers.is_empty()
     }
 
+    /// The gossiped-address table.
+    #[must_use]
+    pub fn addr_book(&self) -> &AddrBook {
+        &self.addrbook
+    }
+
     /// Whether another outbound peer may be added.
     #[must_use]
     pub fn has_slot(&self) -> bool {
@@ -125,6 +137,15 @@ impl<S: Read + Write> PeerManager<S> {
     /// Registers an outbound session (already constructed, version queued).
     /// Returns the peer id, or `None` if the peer set is full.
     pub fn add_outbound(&mut self, session: PeerSession<S>) -> Option<u64> {
+        self.add(session, None)
+    }
+
+    /// Registers an inbound session. Subject to the same peer cap.
+    pub fn add_inbound(&mut self, session: PeerSession<S>) -> Option<u64> {
+        self.add(session, None)
+    }
+
+    fn add(&mut self, session: PeerSession<S>, remote: Option<NetAddr>) -> Option<u64> {
         if !self.has_slot() {
             return None;
         }
@@ -136,6 +157,7 @@ impl<S: Read + Write> PeerManager<S> {
             PeerEntry {
                 session,
                 sync: PeerSync::new(),
+                remote,
                 last_rx: now,
                 last_ping: now,
                 sent_requests: 0,
@@ -144,17 +166,15 @@ impl<S: Read + Write> PeerManager<S> {
         Some(id)
     }
 
-    /// Registers an inbound session. Subject to the same peer cap.
-    pub fn add_inbound(&mut self, session: PeerSession<S>) -> Option<u64> {
-        self.add_outbound(session)
-    }
-
     /// Drives every session once: flush → read → dispatch → reply. Returns
     /// the events a caller should observe; `cs` absorbs headers/blocks.
     pub fn tick(&mut self, cs: &mut Chainstate, now: u32) -> Vec<NetEvent> {
         let mut events = Vec::new();
         let mut dead = Vec::new();
-        for (&id, peer) in &mut self.peers {
+        let Self {
+            peers, addrbook, ..
+        } = self;
+        for (&id, peer) in peers.iter_mut() {
             if let Err(e) = peer.session.check_handshake_timeout() {
                 dead.push((id, DisconnectReason::Session(e.to_string())));
                 continue;
@@ -163,7 +183,7 @@ impl<S: Read + Write> PeerManager<S> {
                 Ok(peer_events) => {
                     for event in peer_events {
                         peer.last_rx = Instant::now();
-                        Self::dispatch(id, peer, event, cs, now, &mut events, &mut dead);
+                        Self::dispatch(id, peer, event, cs, now, addrbook, &mut events, &mut dead);
                     }
                 }
                 Err(e) => dead.push((id, DisconnectReason::Session(e.to_string()))),
@@ -195,11 +215,15 @@ impl<S: Read + Write> PeerManager<S> {
         event: SessionEvent,
         cs: &mut Chainstate,
         now: u32,
+        addrbook: &mut AddrBook,
         events: &mut Vec<NetEvent>,
         dead: &mut Vec<(u64, DisconnectReason)>,
     ) {
         match event {
             SessionEvent::Established => {
+                if let Some(remote) = &peer.remote {
+                    addrbook.mark_tried(remote);
+                }
                 let info = peer.session.peer().cloned().unwrap_or(PeerInfo {
                     version: 0,
                     services: 0,
@@ -292,9 +316,24 @@ impl<S: Read + Write> PeerManager<S> {
                     }
                 }
             }
-            // getaddr: we have no address book yet — answer with nothing.
             SessionEvent::Message(Message::GetAddr) => {
-                let _ = peer.session.send(&Message::AddrV2(vec![]));
+                let entries = addrbook
+                    .sample()
+                    .iter()
+                    .map(|a| addr_v2_of(a, now))
+                    .collect();
+                let _ = peer.session.send(&Message::AddrV2(entries));
+            }
+            SessionEvent::Message(Message::Addr(entries)) => {
+                addrbook.add_many(entries.iter().map(|e| (e.addr, e.time)), now);
+            }
+            SessionEvent::Message(Message::AddrV2(entries)) => {
+                addrbook.add_many(
+                    entries
+                        .iter()
+                        .filter_map(|e| net_addr_of_v2(e).map(|a| (a, e.time))),
+                    now,
+                );
             }
             SessionEvent::Message(_) => {}
         }
@@ -331,21 +370,66 @@ impl PeerManager<TcpStream> {
         let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
-        let version = build_version(our_version, start_height, net_addr(addr));
+        let version = build_version(
+            our_version,
+            start_height,
+            crate::addrman::net_addr_of(addr, 0),
+        );
         let session = PeerSession::initiate(stream, magic, version, SEND_BUDGET_PER_PEER)?;
-        Ok(self.add_outbound(session))
+        Ok(self.add(session, Some(crate::addrman::net_addr_of(addr, 0))))
+    }
+
+    /// Dials address-book candidates until the peer set is full or the
+    /// book runs dry — the caller runs this between `tick`s to keep
+    /// outbound connectivity up. Returns the endpoints attempted.
+    pub fn maintain_outbounds(&mut self, magic: [u8; 4], start_height: i32) -> Vec<SocketAddr> {
+        let mut dialed = Vec::new();
+        while self.has_slot()
+            && let Some(candidate) = self.addrbook.select()
+        {
+            let sock = addrman::socket_addr(&candidate);
+            self.addrbook.mark_attempt(&candidate);
+            dialed.push(sock);
+            match self.connect(sock, magic, sock.port() as u64, start_height) {
+                Ok(Some(_)) => {}
+                Ok(None) => break,  // raced to full
+                Err(_) => continue, // unreachable — try the next candidate
+            }
+        }
+        dialed
     }
 }
 
-/// `NetAddr` for a socket endpoint (v4-mapped when needed).
-fn net_addr(sock: SocketAddr) -> NetAddr {
-    NetAddr {
-        services: 0,
-        ip: match sock.ip() {
-            std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
-            std::net::IpAddr::V6(v6) => v6.octets(),
-        },
-        port: sock.port(),
+/// `AddrV2Entry` → `NetAddr` for the networks we understand (IPv4 = 1,
+/// IPv6 = 2); other BIP155 networks are opaque and skipped.
+fn net_addr_of_v2(e: &AddrV2Entry) -> Option<NetAddr> {
+    let ip = match (e.network, e.addr.len()) {
+        (1, 4) => std::net::Ipv4Addr::new(e.addr[0], e.addr[1], e.addr[2], e.addr[3])
+            .to_ipv6_mapped()
+            .octets(),
+        (2, 16) => <[u8; 16]>::try_from(e.addr.as_slice()).ok()?,
+        _ => return None,
+    };
+    Some(NetAddr {
+        services: e.services,
+        ip,
+        port: e.port,
+    })
+}
+
+/// `NetAddr` → `AddrV2Entry` for `getaddr` replies.
+fn addr_v2_of(addr: &NetAddr, now: u32) -> AddrV2Entry {
+    let v6 = std::net::Ipv6Addr::from(addr.ip);
+    let (network, bytes) = match v6.to_ipv4_mapped() {
+        Some(v4) => (1, v4.octets().to_vec()),
+        None => (2, addr.ip.to_vec()),
+    };
+    AddrV2Entry {
+        time: now,
+        services: addr.services,
+        network,
+        addr: bytes,
+        port: addr.port,
     }
 }
 
@@ -353,7 +437,9 @@ fn net_addr(sock: SocketAddr) -> NetAddr {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::message::{GetHeaders, InvType, InvVector, NODE_NETWORK, PROTOCOL_VERSION, Version};
+    use crate::message::{
+        AddrEntry, GetHeaders, InvType, InvVector, NODE_NETWORK, PROTOCOL_VERSION, Version,
+    };
     use crate::testchain::{chain_blocks, regtest};
     use crate::testpipe::{self, End};
     use avila_consensus::hash::BlockHash;
@@ -416,32 +502,31 @@ mod tests {
 
     #[test]
     fn peer_cap_enforced() {
-        let (mgr, _peer, _id) = managed_peer();
-        let (us2, _peer2) = testpipe::pair();
-        let s2 = PeerSession::initiate(
-            us2,
-            MAGIC,
-            build_version(2, 0, NetAddr::unspecified()),
-            BUDGET,
-        )
-        .unwrap();
-        let mut mgr2 = PeerManager::<End>::new(1);
-        let _ = mgr2.add_outbound(s2);
+        let mut mgr = PeerManager::<End>::new(1);
+        let (us1, _p1) = testpipe::pair();
+        mgr.add_outbound(
+            PeerSession::initiate(
+                us1,
+                MAGIC,
+                build_version(1, 0, NetAddr::unspecified()),
+                BUDGET,
+            )
+            .unwrap(),
+        );
+        let (us2, _p2) = testpipe::pair();
         assert!(
-            mgr2.add_outbound({
-                let (us3, _p3) = testpipe::pair();
+            mgr.add_outbound(
                 PeerSession::initiate(
-                    us3,
+                    us2,
                     MAGIC,
-                    build_version(3, 0, NetAddr::unspecified()),
-                    BUDGET,
+                    build_version(2, 0, NetAddr::unspecified()),
+                    BUDGET
                 )
                 .unwrap()
-            })
+            )
             .is_none()
         );
-        assert_eq!(mgr2.len(), 1);
-        drop(mgr);
+        assert_eq!(mgr.len(), 1);
     }
 
     #[test]
@@ -524,7 +609,7 @@ mod tests {
         handshake(&mut mgr, &mut peer, &mut cs);
         testpipe::drain(&mut peer, MAGIC);
 
-        // A header that doesn't attach to anything we know.
+        // A header whose prev is nowhere in our tree.
         let params = *cs.tree().params();
         let junk = avila_consensus::header::BlockHeader {
             prev_block_hash: BlockHash::from_bytes([0xaa; 32]),
@@ -603,5 +688,53 @@ mod tests {
             sent.iter().any(|m| matches!(m, Message::GetData(_))),
             "{sent:?}"
         );
+    }
+
+    #[test]
+    fn addr_gossip_fills_the_book() {
+        let (mut mgr, mut peer, _id) = managed_peer();
+        let mut cs = regtest();
+        handshake(&mut mgr, &mut peer, &mut cs);
+        testpipe::drain(&mut peer, MAGIC);
+
+        let gossip = vec![
+            AddrEntry {
+                time: NOW - 10,
+                addr: addrman::loopback(18444, NODE_NETWORK),
+            },
+            AddrEntry {
+                time: NOW - 5,
+                addr: addrman::loopback(18445, NODE_NETWORK),
+            },
+        ];
+        testpipe::inject(&mut peer, MAGIC, &Message::Addr(gossip));
+        mgr.tick(&mut cs, NOW);
+        assert_eq!(mgr.addr_book().len(), 2);
+    }
+
+    #[test]
+    fn getaddr_serves_gossiped_peers() {
+        let (mut mgr, mut peer, _id) = managed_peer();
+        let mut cs = regtest();
+        handshake(&mut mgr, &mut peer, &mut cs);
+        testpipe::drain(&mut peer, MAGIC);
+
+        let gossip = vec![AddrEntry {
+            time: NOW - 10,
+            addr: addrman::loopback(18444, NODE_NETWORK),
+        }];
+        testpipe::inject(&mut peer, MAGIC, &Message::Addr(gossip));
+        testpipe::inject(&mut peer, MAGIC, &Message::GetAddr);
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let sent = testpipe::drain(&mut peer, MAGIC);
+        match sent.iter().find(|m| matches!(m, Message::AddrV2(_))) {
+            Some(Message::AddrV2(entries)) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].port, 18444);
+                assert_eq!(entries[0].network, 1); // ipv4
+            }
+            _ => panic!("no addrv2 reply in {sent:?}"),
+        }
     }
 }

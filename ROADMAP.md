@@ -91,8 +91,12 @@ Storage and synchronization research can use this implementation before P2P is r
       Proven live: `examples/peer_probe` completed a real handshake and a
       120-block headers-first sync against a Bitcoin Knots v29.3 regtest
       peer, validating every block through `Chainstate`.
-- [ ] Peer discovery and lifecycle (addr gossip intake, outbound rotation,
-      connection manager).
+- [~] Peer discovery and lifecycle: `avila-p2p::addrman` (bounded,
+      recency-ordered gossip table) and `avila-p2p::manager` (bounded
+      multi-peer `PeerManager` driving session+sync pairs over one
+      `Chainstate`, with `getaddr`/`addr`/`addrv2` service and
+      `maintain_outbounds` dialing) are in place; DNS-seed bootstrap and
+      disconnect→redial scheduling remain.
 - [ ] Multi-peer download scheduling and restart/resume of interrupted
       downloads.
 - [ ] Global budgets, eviction scoring, and cancellation.

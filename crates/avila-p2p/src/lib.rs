@@ -22,6 +22,7 @@
 //! [`avila_consensus::header::BlockHeader`], which `Chainstate::accept_header`
 //! validates — the wire format and the rule check stay separate.
 
+pub mod addrman;
 pub mod codec;
 pub mod manager;
 pub mod message;
@@ -33,6 +34,7 @@ pub(crate) mod testchain;
 #[cfg(test)]
 pub(crate) mod testpipe;
 
+pub use addrman::{AddrBook, AddrInfo};
 pub use codec::{Command, FrameDecoder, FrameError, HEADER_LEN, MAX_MESSAGE_PAYLOAD};
 pub use manager::{DisconnectReason, NetEvent, PeerManager};
 pub use message::{AddrEntry, GetHeaders, InvType, InvVector, Message, NetAddr, Reject, Version};

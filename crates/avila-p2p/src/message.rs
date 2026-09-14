@@ -38,7 +38,7 @@ pub const MSG_WITNESS_BLOCK: u32 = MSG_WITNESS_FLAG | 2;
 
 /// A network address as serialized in `version`, `addr` and `addrv2`
 /// payloads. IPv4 peers appear IPv4-mapped, as on the wire.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NetAddr {
     /// `nServices` flags.
     pub services: u64,
