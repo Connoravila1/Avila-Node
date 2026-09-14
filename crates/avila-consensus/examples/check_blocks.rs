@@ -24,6 +24,7 @@
 //! shared tree in manifest order, so the manifest reflects the
 //! implementation's actual stateful behavior, not an assertion.
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -80,22 +81,111 @@ fn core_reason_header(err: &ChainError) -> String {
 /// Stateful validation chain — mirrors the daemon's block index plus active
 /// chainstate. `tree` accumulates every inserted header; `utxo`/`connected`
 /// track the active chain tip so a block that extends it is actually
-/// connected, exactly as `submitblock` connecting a new tip on the daemon.
+/// connected, exactly as `submitblock` connecting a new tip on the daemon;
+/// `blocks`/`undos`/`chain` let a heavier side branch trigger a real reorg
+/// (disconnect back to the fork point, connect forward), as Core's
+/// `ActivateBestChain` does.
 struct ChainState {
     tree: HeaderTree,
     utxo: UtxoSet,
     /// Block hash of the connected tip (`genesis` at start — the genesis
     /// block's coinbase is not in the UTXO set on any network).
     connected: BlockHash,
+    /// Accepted block bodies by hash — a real node fetches them from disk;
+    /// the corpus keeps them resident.
+    blocks: HashMap<BlockHash, Block>,
+    /// The connected chain's block hashes, genesis at index 0.
+    chain: Vec<BlockHash>,
+    /// Per-block undo for `chain[1..]` (genesis is never connected):
+    /// `undos[k]` reverses the block at height `k + 1`.
+    undos: Vec<connect::BlockUndo>,
 }
 
 impl ChainState {
     fn new(params: &Params) -> Self {
+        let genesis = params.genesis_header.hash();
         Self {
             tree: HeaderTree::new(*params),
             utxo: UtxoSet::new(),
-            connected: params.genesis_header.hash(),
+            connected: genesis,
+            blocks: HashMap::new(),
+            chain: vec![genesis],
+            undos: Vec::new(),
         }
+    }
+
+    /// If `hash`'s branch has more chainwork than the connected tip, reorg:
+    /// disconnect `chain[fork+1..]` then connect the branch `fork+1..=hash`.
+    /// Simulated on a cloned UTXO set and committed only on success — the
+    /// daemon likewise keeps the old chain when a heavier branch fails to
+    /// connect (it marks the branch invalid and stays put).
+    ///
+    /// Returns `Ok(true)` when a reorg was performed, `Ok(false)` when the
+    /// branch does not outwork the tip, `Err` when the branch won the work
+    /// race but failed to connect.
+    fn maybe_reorg(
+        &mut self,
+        hash: BlockHash,
+        params: &Params,
+    ) -> Result<bool, connect::ConnectError> {
+        let Some(new_node) = self.tree.get(&hash) else {
+            return Err(connect::ConnectError::Internal("reorg on unknown header"));
+        };
+        let Some(conn_node) = self.tree.get(&self.connected) else {
+            return Err(connect::ConnectError::Internal("connected tip not in tree"));
+        };
+        if new_node.chainwork <= conn_node.chainwork {
+            return Ok(false);
+        }
+        // Collect the branch back to its fork point with the connected chain.
+        let chain_set: std::collections::HashSet<BlockHash> = self.chain.iter().copied().collect();
+        let mut branch_hashes = Vec::new();
+        let mut cursor = hash;
+        while !chain_set.contains(&cursor) {
+            branch_hashes.push(cursor);
+            let Some(node) = self.tree.get(&cursor) else {
+                return Err(connect::ConnectError::Internal("branch walk left the tree"));
+            };
+            cursor = node.header.prev_block_hash;
+        }
+        let fork = cursor;
+        let fork_height = self.tree.get(&fork).map(|n| n.height).unwrap_or(0);
+        branch_hashes.reverse();
+
+        // Simulate on a clone: disconnect the old branch, connect the new one.
+        let mut utxo = self.utxo.clone();
+        for height in (fork_height + 1..=self.undos.len() as u32).rev() {
+            let block_hash = self.chain[height as usize];
+            let Some(block) = self.blocks.get(&block_hash) else {
+                return Err(connect::ConnectError::Internal(
+                    "missing connected block body",
+                ));
+            };
+            let undo = &self.undos[(height - 1) as usize];
+            connect::disconnect_block(block, &mut utxo, undo)
+                .map_err(|_| connect::ConnectError::Internal("disconnect undo inconsistent"))?;
+        }
+        let mut new_undos = Vec::with_capacity(branch_hashes.len());
+        for branch_hash in &branch_hashes {
+            let Some(block) = self.blocks.get(branch_hash) else {
+                return Err(connect::ConnectError::Internal("missing branch block body"));
+            };
+            let ctx = ConnectContext {
+                params,
+                tree: &self.tree,
+                block_hash: *branch_hash,
+            };
+            new_undos.push(connect::connect_block(block, &mut utxo, &ctx)?);
+        }
+
+        // Commit.
+        self.utxo = utxo;
+        self.chain.truncate(fork_height as usize + 1);
+        self.undos.truncate(fork_height as usize);
+        self.chain.extend(branch_hashes);
+        self.undos.extend(new_undos);
+        self.connected = hash;
+        Ok(true)
     }
 }
 
@@ -133,19 +223,35 @@ fn validate(block: &Block, params: &Params, state: &mut ChainState, now: u32) ->
     if let Err(err) = check::contextual_check_block(block, &ctx) {
         return (format!("rejected:{}", err.reason()), err.to_string());
     }
+    // Structurally valid: the block body may be needed for a later reorg, so
+    // keep it (Core likewise stores every valid block on disk).
+    let hash = block.block_hash();
+    state.blocks.insert(hash, block.clone());
     if block.header.prev_block_hash == state.connected {
         let ctx = ConnectContext {
             params,
             tree: &state.tree,
-            block_hash: block.block_hash(),
+            block_hash: hash,
         };
-        if let Err(err) = connect::connect_block(block, &mut state.utxo, &ctx) {
-            return (format!("rejected:{}", err.reason()), err.to_string());
+        match connect::connect_block(block, &mut state.utxo, &ctx) {
+            Ok(undo) => {
+                state.chain.push(hash);
+                state.undos.push(undo);
+                state.connected = hash;
+                ("accepted".to_string(), format!("height={height},connected"))
+            }
+            Err(err) => (format!("rejected:{}", err.reason()), err.to_string()),
         }
-        state.connected = block.block_hash();
-        return ("accepted".to_string(), format!("height={height},connected"));
+    } else {
+        match state.maybe_reorg(hash, params) {
+            Ok(true) => (
+                "accepted".to_string(),
+                format!("height={height},connected,reorg"),
+            ),
+            Ok(false) => ("accepted".to_string(), format!("height={height}")),
+            Err(err) => (format!("rejected:{}", err.reason()), err.to_string()),
+        }
     }
-    ("accepted".to_string(), format!("height={height}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1167,6 +1273,35 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             &mut manifest,
             outdir,
             "72-bip68-ok",
+            &block,
+            &params,
+            &mut state,
+            now,
+        )?;
+    }
+
+    // Reorg: a 104-block branch on genesis outworks the connected tip (h103) —
+    // both sides disconnect the 103-block main chain and connect 104 fork
+    // blocks. Fork coinbases carry a tag byte so their txids (and headers)
+    // differ from the main chain's. Fork blocks f1..f103 arrive as
+    // heavier-branch precursors and are judged side blocks; f104 triggers the
+    // reorg.
+    let mut fork_parent = params.genesis_header;
+    for h in 1..=104u32 {
+        let mut cb = regtest_coinbase(h);
+        cb.inputs[0].script_sig = Script::new(
+            [
+                script::push_int(i64::from(h)).as_slice(),
+                &[script::OP_1, 0x01, 0xf0],
+            ]
+            .concat(),
+        );
+        let block = finish(draft_on(&fork_parent, vec![cb]), &params);
+        fork_parent = block.header;
+        emit(
+            &mut manifest,
+            outdir,
+            &format!("80-fork-{h:03}"),
             &block,
             &params,
             &mut state,

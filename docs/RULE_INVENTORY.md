@@ -64,7 +64,7 @@ consult (`GetOp`-equivalent instruction iteration, `GetSigOpCount`, `IsPushOnly`
 `IsPayToScriptHash`, `IsWitnessProgram`, `CScriptNum`/push encodings). Every error
 exposes Core's reject-reason string via `RuleError::reason`, and the block-level
 differential adapter (`tools/check_blocks_core.py` + `examples/check_blocks.rs`)
-verifies those reasons against a live daemon's `submitblock`: **142 corpus
+verifies those reasons against a live daemon's `submitblock`: **246 corpus
 submissions and 9 real block fixtures compared, zero verdict mismatches** —
 every named violation above returns Core's exact reason, including the
 order-dependent cases (`bad-blk-length` beats `bad-txns-oversize`;
@@ -72,8 +72,9 @@ order-dependent cases (`bad-blk-length` beats `bad-txns-oversize`;
 Core's scan-before-padding merkle semantics). Valid controls include a height-2
 child the daemon actually connects, a witness-committed block, a duplicate
 resubmission (`accepted-known` ↔ `duplicate`), a 101-block baseline chain the
-daemon connects end-to-end, and real mainnet block 1 — which connects through
-our UTXO path too. The first run caught a real divergence: `push_int` used raw
+daemon connects end-to-end, a 104-block side branch that triggers a real reorg
+(both sides disconnect 103 blocks and reconnect the fork identically), and
+real mainnet block 1 — which connects through our UTXO path too. The first run caught a real divergence: `push_int` used raw
 data pushes for heights 1..=16 where `CScript() << nHeight` emits
 `OP_1..OP_16` — fixed, with the daemon's `bad-cb-height` as the witness. One
 documented layer difference: our 4,000,000-byte block-decode cap pre-rejects
@@ -201,9 +202,10 @@ Not defects — scope boundaries for later gates:
 - **Script**: the entire script interpreter (legacy, P2SH, segwit v0, taproot) —
   including BIP66 DER, BIP65 CLTV and BIP112 CSV script rules — the
   `CheckInputScripts` step `connect_block` deliberately omits, G2.
-- **Reorg handling**: `disconnect_block` exists and restores exactly, but the
-  chainstate-level reorg driver (disconnect-to-fork-point + connect-to-new-tip
-  orchestration) is not wired — header-tip selection alone is in `chain.rs`.
+- **Reorg handling**: `disconnect_block` + the harness's disconnect-to-fork /
+  connect-forward orchestration are exercised by the 80-fork corpus case; a
+  production chainstate driver (disk-backed block store, invalid-branch
+  marking, assumevalid) remains a G2 storage/sync task.
 - **Header-chain rules not in Core's `ContextualCheckBlockHeader`**:
   checkpoints, `nMinimumChainWork`, BIP9 versionbits deployment state
   (Core treats unexpected versions as warnings, not rejections).
@@ -221,11 +223,12 @@ Not defects — scope boundaries for later gates:
   header tree plus `UtxoSet` — in `check-many` mode, so tip-extending blocks
   run through `connect_block` exactly as the daemon connects them), submits
   each block through `submitblock`, and replays the committed real block
-  fixtures on per-network daemons — **151 submissions, zero unexplained
+  fixtures on per-network daemons — **255 submissions, zero unexplained
   mismatches**, covering every `CheckBlock`/`ContextualCheckBlock` rule plus
   the `ConnectBlock` cases 61–72 (missingorspent, premature coinbase,
   in-belowout, cb-amount, BIP30, BIP68 height/time locks, P2SH/witness
-  sigops). It caught the `push_int`/`OP_N` divergence described above on its
+  sigops) and the 80-fork reorg (104-block branch disconnects and replaces
+  the connected 103-block chain identically on both sides). It caught the `push_int`/`OP_N` divergence described above on its
   first run. Both artifacts record the reference binary's version and sha256.
   Coverage-guided fuzzing exists (`fuzz/`, libFuzzer via cargo-fuzz): six
   targets over header/transaction/block decoding, CompactSize canonicality,
