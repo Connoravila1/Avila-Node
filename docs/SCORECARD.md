@@ -48,8 +48,11 @@ documentation describes Utreexo, a watch-only wallet, Electrum and a
 rust-bitcoinkernel validation boundary. Match actual enabled behavior and distinguish
 independent implementations from shared validation code.
 
-Add specialist indexers, wallet backends, mining services and storage implementations
-where they provide a stronger applicable comparison. A benchmark against Core and
+The surveyed field — including btcd, Gocoin, libbitcoin, Knots and specialist
+services — with per-row reference assignments and exclusion reasons lives in
+[docs/NODE_LANDSCAPE.md](NODE_LANDSCAPE.md). Add specialist indexers, wallet
+backends, mining services and storage implementations where they provide a
+stronger applicable comparison. A benchmark against Core and
 Floresta alone cannot establish leadership over every alternative. Record the search
 date, inclusion criteria and reasons for exclusions in each report.
 
