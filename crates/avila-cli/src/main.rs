@@ -111,6 +111,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 timeout: Duration::from_secs(timeout_secs),
                 proxy,
                 data_dir: store.then(|| config.network_data_dir()),
+                cancel: None,
             };
             println!("Syncing {network} (target height {blocks}, {max_peers} peers max)...");
             let mut last = (u32::MAX, u32::MAX);

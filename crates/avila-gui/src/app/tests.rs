@@ -97,31 +97,43 @@ fn keyboard_pages_render_at_minimum_size_and_double_scale() {
     for zoom in [1.0, 2.0] {
         desktop.ctx.set_zoom_factor(zoom);
         for (key, expected) in [
-            (egui::Key::Num1, "Verification has not started"),
-            (egui::Key::Num2, "Configuration validation"),
-            (egui::Key::Num3, "Loaded settings for this process."),
-            (egui::Key::Num4, "Configuration loaded"),
+            (egui::Key::Num1, "no validated chain yet"),
+            (egui::Key::Num2, "Start sync"),
+            (egui::Key::Num3, "Configuration loaded"),
+            (egui::Key::Num4, "Implementation status"),
+            (egui::Key::Num5, "Loaded settings for this process."),
         ] {
             let mut text = desktop.frame(shortcut(key));
             if !text.contains(expected) {
-                desktop.frame(vec![
-                    egui::Event::PointerMoved(egui::pos2(200.0, 180.0)),
-                    egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Point,
-                        delta: egui::vec2(0.0, -400.0),
-                        phase: egui::TouchPhase::Move,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ]);
-                for _ in 0..10 {
-                    text = desktop.frame(vec![]);
+                for direction in [-400.0, 400.0, 400.0] {
+                    desktop.frame(vec![
+                        egui::Event::PointerMoved(egui::pos2(200.0, 180.0)),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, direction),
+                            phase: egui::TouchPhase::Move,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]);
+                    for _ in 0..3 {
+                        text = desktop.frame(vec![]);
+                        if text.contains(expected) {
+                            break;
+                        }
+                    }
+                    if text.contains(expected) {
+                        break;
+                    }
                 }
+            }
+            if !text.contains(expected) {
+                eprintln!("==== DUMP {expected} zoom {zoom} ====\n{text}\n====");
             }
             assert!(
                 text.contains(expected),
                 "Missing {expected:?} at scale {zoom}"
             );
-            assert!(text.contains("No active Bitcoin connection"));
+            assert!(text.contains("no chain data"));
         }
     }
 }

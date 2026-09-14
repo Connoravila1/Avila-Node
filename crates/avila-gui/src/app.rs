@@ -1,44 +1,131 @@
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{Receiver, channel};
+use std::thread;
+use std::time::Duration;
+
 use crate::appearance::{AppearanceConfig, AppearanceMode};
 use avila_core::CapabilityState;
 use avila_node::Node;
 use avila_node::events::{EventRecord, NodeEvent};
-use eframe::egui::{self, RichText};
+use avila_node::sync::{SyncConfig, SyncProgress, SyncReport};
+use eframe::egui::{self, Align, Color32, Layout, RichText, Stroke, vec2};
 use egui_extras::{Column, TableBuilder};
 
 #[cfg(test)]
 mod tests;
 
+// ---------------------------------------------------------------------------
+// Design tokens — the node's data is the design. Graphite surfaces, hairline
+// rules, monospace for anything measured, and one accent reserved for live
+// data: the moving chain tip.
+// ---------------------------------------------------------------------------
+
+const ACCENT: Color32 = Color32::from_rgb(0xF7, 0x93, 0x1A); // live/active
+const OK: Color32 = Color32::from_rgb(0x43, 0xC0, 0x8E); // verified/connected
+const WARN: Color32 = Color32::from_rgb(0xD9, 0x6C, 0x4A); // stalls/errors
+const MUTED: Color32 = Color32::from_rgb(0x8C, 0x92, 0x9B);
+const HAIRLINE: Color32 = Color32::from_rgb(0x2A, 0x2E, 0x36);
+const CELL_BG: Color32 = Color32::from_rgb(0x1D, 0x20, 0x26);
+
+fn mono(text: impl Into<String>) -> RichText {
+    RichText::new(text).family(egui::FontFamily::Monospace)
+}
+
+fn muted(text: impl Into<String>) -> RichText {
+    mono(text).color(MUTED)
+}
+
+/// Short form of a 32-byte hash's display hex: `3504…2e1b`.
+fn short_hash(display: &str) -> String {
+    if display.len() > 12 {
+        format!("{}…{}", &display[..6], &display[display.len() - 5..])
+    } else {
+        display.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pages
+// ---------------------------------------------------------------------------
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Page {
     #[default]
-    Overview,
+    Chain,
+    Sync,
+    Events,
     Capabilities,
     Configuration,
-    Events,
 }
 
 impl Page {
-    const ALL: [Self; 4] = [
-        Self::Overview,
+    const ALL: [Self; 5] = [
+        Self::Chain,
+        Self::Sync,
+        Self::Events,
         Self::Capabilities,
         Self::Configuration,
-        Self::Events,
     ];
 
     fn title(self) -> &'static str {
         match self {
-            Self::Overview => "Overview",
+            Self::Chain => "Chain",
+            Self::Sync => "Sync",
+            Self::Events => "Events",
             Self::Capabilities => "Capabilities",
             Self::Configuration => "Configuration",
-            Self::Events => "Events",
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sync worker — avila_node::sync::run on a thread, progress over a channel.
+// ---------------------------------------------------------------------------
+
+enum SyncMsg {
+    Progress(Box<SyncProgress>),
+    Done(Result<SyncReport, String>),
+}
+
+struct SyncUi {
+    rx: Option<Receiver<SyncMsg>>,
+    cancel: Option<Arc<AtomicBool>>,
+    running: bool,
+    latest: Option<SyncProgress>,
+    report: Option<Result<SyncReport, String>>,
+    target_input: String,
+    connect_input: String,
+    proxy_input: String,
+    store: bool,
+}
+
+impl Default for SyncUi {
+    fn default() -> Self {
+        Self {
+            rx: None,
+            cancel: None,
+            running: false,
+            latest: None,
+            report: None,
+            target_input: "100".into(),
+            connect_input: String::new(),
+            proxy_input: String::new(),
+            store: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
 
 pub struct AvilaApp {
     node: Node,
     page: Page,
     logo: egui::TextureHandle,
+    sync: SyncUi,
     event_query: String,
     newest_first: bool,
     selected_event: Option<EventRecord>,
@@ -60,12 +147,17 @@ impl AvilaApp {
     ) -> Self {
         appearance.apply(ctx);
         ctx.all_styles_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+            style.spacing.item_spacing = vec2(10.0, 8.0);
+            style.spacing.button_padding = vec2(14.0, 6.0);
+            style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, HAIRLINE);
+            style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, HAIRLINE);
+            style.visuals.panel_fill = Color32::from_rgb(0x14, 0x16, 0x1B);
         });
         Self {
             node,
             page: Page::default(),
             logo: ctx.load_texture("avila-node-logo", logo, egui::TextureOptions::LINEAR),
+            sync: SyncUi::default(),
             event_query: String::new(),
             newest_first: true,
             selected_event: None,
@@ -86,6 +178,7 @@ impl AvilaApp {
                 egui::Key::Num2,
                 egui::Key::Num3,
                 egui::Key::Num4,
+                egui::Key::Num5,
             ]
             .into_iter()
             .zip(Page::ALL)
@@ -104,145 +197,515 @@ impl AvilaApp {
         });
     }
 
+    /// Drain the sync worker's channel into UI state.
+    fn poll_sync(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.sync.rx {
+            let mut done = None;
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    SyncMsg::Progress(p) => self.sync.latest = Some(*p),
+                    SyncMsg::Done(r) => done = Some(r),
+                }
+            }
+            if let Some(report) = done {
+                self.sync.report = Some(report);
+                self.sync.running = false;
+                self.sync.rx = None;
+                self.sync.cancel = None;
+            }
+        }
+        if self.sync.running {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
     pub fn render(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.appearance.scale = ctx.zoom_factor();
+        self.poll_sync(&ctx);
         self.shortcuts(&ctx);
-        egui::Panel::top("menu").show(ui, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("View", |ui| {
-                    for page in Page::ALL {
-                        if ui
-                            .selectable_value(&mut self.page, page, page.title())
-                            .clicked()
-                        {
-                            ui.close();
-                        }
-                    }
-                    ui.separator();
-                    if ui.button("Appearance…").clicked() {
-                        self.show_appearance = true;
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Help", |ui| {
-                    if ui.button("About and keyboard shortcuts").clicked() {
-                        self.show_help = true;
-                        ui.close();
-                    }
-                    #[cfg(debug_assertions)]
-                    if ui.button("egui development tools").clicked() {
-                        self.show_egui_tools = true;
-                        ui.close();
-                    }
-                });
-            });
-        });
+        self.header(ui);
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.strong("Local inspection");
+                ui.label(muted(format!(
+                    "{} · {}",
+                    self.node.config().get().network,
+                    self.node.config().network_data_dir().display()
+                )));
                 ui.separator();
-                ui.label(format!("{} selected", self.node.config().get().network));
-                ui.separator();
-                ui.label("No active Bitcoin connection");
+                ui.label(muted(format!(
+                    "{} events retained",
+                    self.node.events().entries().count()
+                )));
             });
         });
-        // High zoom moves navigation above the content to preserve reading space.
-        if ui.available_width() >= 650.0 {
-            egui::Panel::left("navigation")
-                .resizable(true)
-                .default_size(190.0)
-                .size_range(150.0..=260.0)
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| self.navigation(ui));
-                });
-        } else {
-            egui::Panel::top("compact_navigation").show(ui, |ui| {
-                egui::ComboBox::from_id_salt("page")
-                    .selected_text(self.page.title())
-                    .show_ui(ui, |ui| {
-                        for page in Page::ALL {
-                            ui.selectable_value(&mut self.page, page, page.title());
-                        }
-                    });
-            });
-        }
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading(self.page.title());
-            ui.add_space(8.0);
-            match self.page {
-                Page::Events => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("event_page")
-                        .show(ui, |ui| self.events(ui));
-                }
-                Page::Capabilities => self.capabilities(ui),
-                Page::Overview | Page::Configuration => {
-                    egui::ScrollArea::both()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if self.page == Page::Overview {
-                                self.overview(ui);
-                            } else {
-                                self.configuration(ui);
-                            }
-                        });
-                }
-            }
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .id_salt("page")
+                .show(ui, |ui| {
+                    ui.add_space(14.0);
+                    match self.page {
+                        Page::Chain => self.chain(ui),
+                        Page::Sync => self.sync_page(ui),
+                        Page::Events => self.events(ui),
+                        Page::Capabilities => self.capabilities(ui),
+                        Page::Configuration => self.configuration(ui),
+                    }
+                });
         });
         self.windows(&ctx);
     }
 
-    fn navigation(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(12.0);
-        ui.add(egui::Image::new(&self.logo).fit_to_exact_size(egui::vec2(80.0, 80.0)))
-            .on_hover_text("Avila Node · Connor Avila");
-        ui.heading("Avila Node");
-        ui.label(RichText::new("Independent by design").small());
-        ui.add_space(16.0);
-        for page in Page::ALL {
-            ui.selectable_value(&mut self.page, page, page.title());
-        }
-        ui.add_space(24.0);
-        ui.separator();
-        ui.label(RichText::new("Development foundation").color(self.appearance.theme.accent()));
-        ui.small("Open source · MIT");
-        ui.small(format!("Build {}", env!("CARGO_PKG_VERSION")));
-    }
-
-    fn overview(&self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.strong("Verification has not started");
-            ui.label("This build can inspect configuration and local events. Bitcoin validation, storage and networking are still being implemented.");
-        });
-        ui.add_space(16.0);
-        let snapshot = self.node.snapshot();
-        egui::Grid::new("verification")
-            .spacing([24.0, 12.0])
-            .show(ui, |ui| {
-                for (label, value) in [
-                    ("Selected network", snapshot.network.to_string()),
-                    ("Verified chain tip", "Unavailable".into()),
-                    ("Historical validation", "Not started".into()),
-                    ("Connected peers", "Unavailable".into()),
-                ] {
-                    ui.label(label);
-                    ui.label(value);
-                    ui.end_row();
+    /// The instrument band: wordmark, page tabs, live chain readout.
+    fn header(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("header").show(ui, |ui| {
+            ui.painter().hline(
+                ui.max_rect().x_range(),
+                ui.max_rect().bottom(),
+                Stroke::new(1.0, HAIRLINE),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add(egui::Image::new(&self.logo).fit_to_exact_size(vec2(22.0, 22.0)));
+                ui.label(RichText::new("AVILA").strong().size(15.0));
+                ui.label(muted("NODE"));
+                ui.add_space(20.0);
+                for page in Page::ALL {
+                    let active = self.page == page;
+                    let text = if active {
+                        RichText::new(page.title()).color(ACCENT).strong()
+                    } else {
+                        RichText::new(page.title()).color(MUTED)
+                    };
+                    let response = ui.add(egui::Button::new(text).frame_when_inactive(false));
+                    if active {
+                        ui.painter().hline(
+                            response.rect.x_range(),
+                            response.rect.bottom() + 2.0,
+                            Stroke::new(2.0, ACCENT),
+                        );
+                    }
+                    if response.clicked() {
+                        self.page = page;
+                    }
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(muted("⚙")).frame_when_inactive(false))
+                        .on_hover_text("Appearance")
+                        .clicked()
+                    {
+                        self.show_appearance = true;
+                    }
+                    if ui
+                        .add(egui::Button::new(muted("?")).frame_when_inactive(false))
+                        .on_hover_text("About and shortcuts")
+                        .clicked()
+                    {
+                        self.show_help = true;
+                    }
+                });
+            });
+            // The ticker row — the live chain readout, always visible.
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if let Some(p) = &self.sync.latest {
+                    ui.label(
+                        mono(format!("h {}", p.connected_height)).color(if self.sync.running {
+                            ACCENT
+                        } else {
+                            MUTED
+                        }),
+                    );
+                    ui.label(muted("·"));
+                    let tip = p
+                        .recent
+                        .last()
+                        .map(|(_, h)| format!("tip {}", short_hash(&h.to_string())))
+                        .unwrap_or_else(|| "no tip".into());
+                    ui.label(mono(tip));
+                    ui.label(muted("·"));
+                    ui.label(muted(format!("peers {}", p.peers)));
+                    if self.sync.running {
+                        ui.label(muted("·"));
+                        ui.label(mono("syncing").color(ACCENT));
+                    }
+                } else {
+                    ui.label(muted("no chain data"));
                 }
             });
-        ui.add_space(20.0);
-        ui.collapsing("What will a complete Avila Node do?", |ui| {
-            ui.label("Independently validate and synchronize Bitcoin, recover durable chainstate, relay transactions, serve wallets, enforce privacy choices, and explain its decisions.");
-            ui.label("The roadmap targets a complete node someone could choose as their primary node.");
-        });
-        ui.collapsing("How to interpret these measurements", |ui| {
-            ui.label("Unavailable means this process has no measurement. Selecting a network does not connect to it. An active chain tip, complete historical validation and a wallet's scan coverage will be tracked independently.");
+            ui.add_space(6.0);
         });
     }
 
+    // -- Chain page --------------------------------------------------------
+
+    fn chain(&mut self, ui: &mut egui::Ui) {
+        match (&self.sync.latest, &self.sync.report) {
+            (Some(p), _) => {
+                ui.label(muted("CONNECTED HEIGHT"));
+                ui.label(mono(p.connected_height.to_string()).size(52.0).strong());
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if let Some((h, hash)) = p.recent.last() {
+                        ui.label(muted("tip"));
+                        ui.label(mono(format!("{h} {}", short_hash(&hash.to_string()))));
+                    }
+                    ui.label(muted(format!("· best header {}", p.header_height)));
+                    ui.label(muted(format!("· {} peers", p.peers)));
+                    ui.label(muted(format!("· {} in flight", p.in_flight)));
+                });
+                if let Some(Ok(r)) = &self.sync.report {
+                    ui.add_space(10.0);
+                    ui.label(muted(format!(
+                        "last run: {} connected · {} peers · {:.1}s{}",
+                        r.connected_height,
+                        r.established_total,
+                        r.elapsed.as_secs_f64(),
+                        if r.target_reached {
+                            ""
+                        } else {
+                            " · stopped early"
+                        },
+                    )));
+                }
+            }
+            _ => {
+                ui.label(muted("NO CHAIN DATA"));
+                ui.add_space(6.0);
+                ui.label(RichText::new("This process has no validated chain yet.").size(20.0));
+                ui.label(muted(
+                    "Run a sync to download and verify blocks from live peers.",
+                ));
+                ui.add_space(10.0);
+                if ui
+                    .add(egui::Button::new(RichText::new("Open Sync").color(ACCENT)))
+                    .clicked()
+                {
+                    self.page = Page::Sync;
+                }
+            }
+        }
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(10.0);
+        // Recent events summary — the last few journal entries inline.
+        ui.label(muted("RECENT EVENTS"));
+        let recent: Vec<EventRecord> = self
+            .node
+            .events()
+            .entries()
+            .rev()
+            .take(4)
+            .copied()
+            .collect();
+        if recent.is_empty() {
+            ui.label(muted("none"));
+        }
+        for record in recent {
+            ui.horizontal(|ui| {
+                ui.label(muted(format!("#{}", record.sequence)));
+                ui.label(mono(event_title(record.event)));
+            });
+        }
+    }
+
+    // -- Sync page ---------------------------------------------------------
+
+    fn sync_page(&mut self, ui: &mut egui::Ui) {
+        // Controls.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(muted("target"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sync.target_input)
+                    .desired_width(60.0)
+                    .font(egui::FontId::monospace(12.0)),
+            );
+            ui.label(muted("connect"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sync.connect_input)
+                    .hint_text("addr:port")
+                    .desired_width(150.0)
+                    .font(egui::FontId::monospace(12.0)),
+            );
+            ui.label(muted("proxy"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sync.proxy_input)
+                    .hint_text("socks5 addr:port")
+                    .desired_width(130.0)
+                    .font(egui::FontId::monospace(12.0)),
+            );
+            ui.checkbox(&mut self.sync.store, "store");
+            if self.sync.running {
+                if ui
+                    .add(egui::Button::new(RichText::new("Stop").color(WARN)))
+                    .clicked()
+                    && let Some(c) = &self.sync.cancel
+                {
+                    c.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else if ui
+                .add(egui::Button::new(RichText::new("Start sync").color(ACCENT)))
+                .clicked()
+            {
+                self.start_sync();
+            }
+        });
+        if let Some(Err(e)) = &self.sync.report {
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("sync failed: {e}")).color(WARN));
+        }
+        ui.add_space(14.0);
+
+        // The block tape — the chain as the interface.
+        self.block_tape(ui);
+        ui.add_space(14.0);
+
+        if let Some(p) = &self.sync.latest {
+            // Hero metric: connected height.
+            ui.horizontal(|ui| {
+                ui.label(mono(p.connected_height.to_string()).size(52.0).strong());
+                ui.vertical(|ui| {
+                    ui.add_space(18.0);
+                    ui.label(muted("blocks connected"));
+                    if let Some((_, hash)) = p.recent.last() {
+                        ui.label(mono(short_hash(&hash.to_string())));
+                    }
+                });
+            });
+            ui.add_space(12.0);
+
+            // Two thin progress rails: headers vs connected, against target.
+            let target: f32 = self.sync.target_input.parse().unwrap_or(100.0_f32).max(1.0);
+            for (label, value, color) in [
+                ("headers", p.header_height as f32 / target, MUTED),
+                ("connected", p.connected_height as f32 / target, ACCENT),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(muted(format!("{label:>9}")));
+                    let bar = egui::ProgressBar::new(value.clamp(0.0, 1.0))
+                        .fill(color)
+                        .desired_height(6.0)
+                        .desired_width(ui.available_width() - 20.0)
+                        .text("");
+                    ui.add(bar);
+                });
+            }
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(muted(format!("{} peers", p.peers)));
+                ui.label(muted(format!("{} in flight", p.in_flight)));
+                ui.label(muted(format!("{} established", p.established_total)));
+                ui.label(muted(format!("{} drops", p.disconnects)));
+            });
+        } else if self.sync.running {
+            ui.label(muted("connecting…"));
+        } else {
+            ui.label(muted("No sync run yet. Set a target height and start."));
+        }
+    }
+
+    /// A horizontal strip of the most recent connected blocks — the
+    /// signature element. The tip cell carries the accent.
+    fn block_tape(&self, ui: &mut egui::Ui) {
+        const CELL: egui::Vec2 = vec2(92.0, 46.0);
+        const GAP: f32 = 6.0;
+        let cells: Vec<(u32, String)> = self
+            .sync
+            .latest
+            .as_ref()
+            .map(|p| {
+                p.recent
+                    .iter()
+                    .map(|(h, hash)| (*h, short_hash(&hash.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let count = cells.len().max(1);
+        let width = count as f32 * (CELL.x + GAP);
+        let (rect, _) = ui.allocate_exact_size(
+            vec2(ui.available_width().max(width), CELL.y + 22.0),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter_at(rect);
+        if cells.is_empty() {
+            // An empty tape: a single muted placeholder cell.
+            let cell = egui::Rect::from_min_size(rect.min + vec2(0.0, 18.0), CELL);
+            painter.rect(
+                cell,
+                2.0,
+                CELL_BG,
+                Stroke::new(1.0, HAIRLINE),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                cell.center(),
+                egui::Align2::CENTER_CENTER,
+                "no blocks",
+                egui::FontId::monospace(11.0),
+                MUTED,
+            );
+            return;
+        }
+        painter.text(
+            rect.min + vec2(0.0, 6.0),
+            egui::Align2::LEFT_CENTER,
+            "RECENT BLOCKS",
+            egui::FontId::monospace(10.0),
+            MUTED,
+        );
+        for (i, (height, hash)) in cells.iter().enumerate() {
+            let is_tip = i + 1 == cells.len();
+            let origin = rect.min + vec2(i as f32 * (CELL.x + GAP), 18.0);
+            let cell = egui::Rect::from_min_size(origin, CELL);
+            let (border, text_color) = if is_tip {
+                (Stroke::new(1.5, ACCENT), ACCENT)
+            } else {
+                (Stroke::new(1.0, HAIRLINE), MUTED)
+            };
+            painter.rect(cell, 2.0, CELL_BG, border, egui::StrokeKind::Inside);
+            painter.text(
+                cell.min + vec2(8.0, 12.0),
+                egui::Align2::LEFT_CENTER,
+                height.to_string(),
+                egui::FontId::monospace(12.0),
+                if is_tip { text_color } else { Color32::WHITE },
+            );
+            painter.text(
+                cell.min + vec2(8.0, 30.0),
+                egui::Align2::LEFT_CENTER,
+                hash,
+                egui::FontId::monospace(10.0),
+                text_color,
+            );
+        }
+    }
+
+    fn start_sync(&mut self) {
+        use avila_consensus::params::Network as ConsensusNet;
+        let consensus_net = match self.node.config().get().network {
+            avila_core::Network::Mainnet => ConsensusNet::Mainnet,
+            avila_core::Network::Testnet4 => ConsensusNet::Testnet4,
+            avila_core::Network::Signet => ConsensusNet::Signet,
+            avila_core::Network::Regtest => ConsensusNet::Regtest,
+        };
+        let params = consensus_net.params();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cfg = SyncConfig {
+            connect: self
+                .sync
+                .connect_input
+                .split(',')
+                .filter_map(|s| s.trim().parse::<SocketAddr>().ok())
+                .collect(),
+            target_height: self.sync.target_input.parse().unwrap_or(100),
+            max_peers: 8,
+            timeout: Duration::from_secs(3600),
+            proxy: self.sync.proxy_input.trim().parse().ok(),
+            data_dir: self
+                .sync
+                .store
+                .then(|| self.node.config().network_data_dir()),
+            cancel: Some(cancel.clone()),
+        };
+        let (tx, rx) = channel();
+        thread::spawn(move || {
+            let report = avila_node::sync::run(&params, &cfg, |p| {
+                let _ = tx.send(SyncMsg::Progress(Box::new(p.clone())));
+            });
+            let _ = tx.send(SyncMsg::Done(report.map_err(|e| e.to_string())));
+        });
+        self.sync.cancel = Some(cancel);
+        self.sync.rx = Some(rx);
+        self.sync.running = true;
+        self.sync.report = None;
+    }
+
+    // -- Events page -------------------------------------------------------
+
+    fn events(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(muted("search"));
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.event_query)
+                    .hint_text("sequence, event or explanation…")
+                    .desired_width(240.0),
+            );
+            if self.focus_search {
+                search.request_focus();
+                self.focus_search = false;
+            }
+            if ui.button("Clear").clicked() {
+                self.event_query.clear();
+            }
+            ui.checkbox(&mut self.newest_first, "Newest first");
+        });
+        let records: Vec<_> = self.node.events().entries().copied().collect();
+        let capacity = self.node.config().event_capacity().get();
+        ui.add(
+            egui::ProgressBar::new(records.len() as f32 / capacity as f32)
+                .fill(MUTED)
+                .desired_height(4.0)
+                .text(muted(format!("{} / {capacity} events", records.len()))),
+        )
+        .on_hover_text(
+            "Oldest events are evicted at capacity. Memory occupancy, not sync progress.",
+        );
+        let records = filtered_events(&records, &self.event_query, self.newest_first);
+        ui.add_space(8.0);
+        if records.is_empty() {
+            ui.label(muted("No events match this search."));
+            return;
+        }
+        let table_height = (ui.clip_rect().bottom() - ui.cursor().top()).max(96.0);
+        TableBuilder::new(ui)
+            .id_salt("events")
+            .striped(true)
+            .resizable(true)
+            .min_scrolled_height(96.0)
+            .max_scroll_height(table_height)
+            .column(Column::initial(90.0).at_least(65.0))
+            .column(Column::remainder().at_least(160.0))
+            .header(24.0, |mut header| {
+                header.col(|ui| {
+                    ui.label(muted("SEQ"));
+                });
+                header.col(|ui| {
+                    ui.label(muted("EVENT"));
+                });
+            })
+            .body(|body| {
+                body.rows(30.0, records.len(), |mut row| {
+                    let record = records[row.index()];
+                    row.col(|ui| {
+                        ui.label(muted(format!("#{}", record.sequence)));
+                    });
+                    row.col(|ui| {
+                        let response = ui
+                            .selectable_label(
+                                self.selected_event == Some(record),
+                                mono(event_title(record.event)),
+                            )
+                            .on_hover_text(event_description(record.event));
+                        if response.clicked() {
+                            self.selected_event = Some(record);
+                        }
+                        response.context_menu(|ui| {
+                            if ui.button("Copy event").clicked() {
+                                ui.ctx().copy_text(event_text(record));
+                                ui.close();
+                            }
+                        });
+                    });
+                });
+            });
+    }
+
+    // -- Capabilities page --------------------------------------------------
+
     fn capabilities(&mut self, ui: &mut egui::Ui) {
-        ui.label("Implementation status of this build.");
+        ui.label(muted("Implementation status of this build."));
         ui.checkbox(&mut self.implemented_only, "Show implemented only");
         ui.add_space(8.0);
         let capabilities: Vec<_> = self
@@ -260,21 +723,21 @@ impl AvilaApp {
             .resizable(true)
             .column(Column::initial(115.0).at_least(90.0))
             .column(Column::remainder().at_least(140.0))
-            .header(26.0, |mut header| {
+            .header(24.0, |mut header| {
                 header.col(|ui| {
-                    ui.strong("Status");
+                    ui.label(muted("STATUS"));
                 });
                 header.col(|ui| {
-                    ui.strong("Capability");
+                    ui.label(muted("CAPABILITY"));
                 });
             })
             .body(|body| {
-                body.rows(40.0, capabilities.len(), |mut row| {
+                body.rows(34.0, capabilities.len(), |mut row| {
                     let capability = capabilities[row.index()];
                     row.col(|ui| {
                         ui.label(match capability.state {
-                            CapabilityState::Implemented => "Implemented",
-                            CapabilityState::Planned => "Planned",
+                            CapabilityState::Implemented => RichText::new("Implemented").color(OK),
+                            CapabilityState::Planned => RichText::new("Planned").color(MUTED),
                         });
                     });
                     row.col(|ui| {
@@ -284,9 +747,11 @@ impl AvilaApp {
             });
     }
 
+    // -- Configuration page -------------------------------------------------
+
     fn configuration(&self, ui: &mut egui::Ui) {
         let config = self.node.config();
-        ui.label("Loaded settings for this process.");
+        ui.label(muted("Loaded settings for this process."));
         ui.add_space(8.0);
         egui::Grid::new("configuration")
             .spacing([20.0, 12.0])
@@ -300,8 +765,8 @@ impl AvilaApp {
                         config.network_data_dir().display().to_string(),
                     ),
                 ] {
-                    ui.label(label);
-                    ui.add(egui::Label::new(RichText::new(&value).monospace()).selectable(true));
+                    ui.label(muted(label));
+                    ui.add(egui::Label::new(mono(&value)).selectable(true));
                     if ui
                         .small_button("Copy")
                         .on_hover_text(format!("Copy {label}"))
@@ -315,86 +780,11 @@ impl AvilaApp {
         ui.add_space(16.0);
         ui.collapsing("Configuration file and data paths", |ui| {
             ui.label("Pass --config <path> when launching the CLI or desktop. Relative data paths are resolved against that file's directory. Without a file, data/ is relative to the working directory.");
-            ui.label("Each network has its own subdirectory. This build does not create data directories or listening sockets.");
+            ui.label("Each network has its own subdirectory; the chainstate (blk*.dat + state.dat) and peers.dat live under it.");
         });
     }
 
-    fn events(&mut self, ui: &mut egui::Ui) {
-        ui.label("Bounded diagnostic history for this process.");
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Search");
-            let search = ui.add(
-                egui::TextEdit::singleline(&mut self.event_query)
-                    .hint_text("Sequence, event or explanation…")
-                    .desired_width(240.0),
-            );
-            if self.focus_search {
-                search.request_focus();
-                self.focus_search = false;
-            }
-            if ui.button("Clear").clicked() {
-                self.event_query.clear();
-            }
-            ui.checkbox(&mut self.newest_first, "Newest first");
-        });
-        let records: Vec<_> = self.node.events().entries().copied().collect();
-        let capacity = self.node.config().event_capacity().get();
-        ui.add(
-            egui::ProgressBar::new(records.len() as f32 / capacity as f32)
-                .text(format!("{} / {capacity} events retained", records.len())),
-        )
-        .on_hover_text(
-            "Oldest events are evicted at capacity. This is memory occupancy, not sync progress.",
-        );
-        let records = filtered_events(&records, &self.event_query, self.newest_first);
-        ui.add_space(8.0);
-        if records.is_empty() {
-            ui.label("No events match this search.");
-            return;
-        }
-        let table_height = (ui.clip_rect().bottom() - ui.cursor().top()).max(96.0);
-        TableBuilder::new(ui)
-            .id_salt("events")
-            .striped(true)
-            .resizable(true)
-            .min_scrolled_height(96.0)
-            .max_scroll_height(table_height)
-            .column(Column::initial(90.0).at_least(65.0))
-            .column(Column::remainder().at_least(160.0))
-            .header(26.0, |mut header| {
-                header.col(|ui| {
-                    ui.strong("Sequence");
-                });
-                header.col(|ui| {
-                    ui.strong("Event · select for details");
-                });
-            })
-            .body(|body| {
-                body.rows(32.0, records.len(), |mut row| {
-                    let record = records[row.index()];
-                    row.col(|ui| {
-                        ui.monospace(format!("#{}", record.sequence));
-                    });
-                    row.col(|ui| {
-                        let response = ui
-                            .selectable_label(
-                                self.selected_event == Some(record),
-                                event_title(record.event),
-                            )
-                            .on_hover_text(event_description(record.event));
-                        if response.clicked() {
-                            self.selected_event = Some(record);
-                        }
-                        response.context_menu(|ui| {
-                            if ui.button("Copy event").clicked() {
-                                ui.ctx().copy_text(event_text(record));
-                                ui.close();
-                            }
-                        });
-                    });
-                });
-            });
-    }
+    // -- Windows ------------------------------------------------------------
 
     fn windows(&mut self, ctx: &egui::Context) {
         if let Some(record) = self.selected_event {
@@ -405,7 +795,7 @@ impl AvilaApp {
                 .default_width(400.0)
                 .vscroll(true)
                 .show(ctx, |ui| {
-                    ui.monospace(format!("Sequence #{}", record.sequence));
+                    ui.label(muted(format!("Sequence #{}", record.sequence)));
                     ui.heading(event_title(record.event));
                     ui.label(event_description(record.event));
                     ui.small("Source: this process's in-memory diagnostic history.");
@@ -450,13 +840,13 @@ impl AvilaApp {
                 ui.label("An open-source Bitcoin full node by Connor Avila.");
                 ui.label("Rust · egui · MIT license");
                 ui.separator();
-                ui.label("Ctrl/Cmd + 1–4: switch pages");
+                ui.label("Ctrl/Cmd + 1–5: switch pages");
                 ui.label("Ctrl/Cmd + F: search local events");
                 ui.label("F1: toggle this window");
                 ui.label("Tab / Shift + Tab: move keyboard focus");
                 ui.label("Enter / Space: activate a focused control");
                 ui.separator();
-                ui.label("The current build is the application foundation. No chain has been downloaded or validated.");
+                ui.label("Consensus validation, persistent chainstate, peer sync, and the mempool are implemented. Wallet, RPC, and services are not.");
             });
         #[cfg(debug_assertions)]
         egui::Window::new("egui development tools")
@@ -502,7 +892,7 @@ fn event_description(event: NodeEvent) -> &'static str {
             "The configuration passed validation. No Bitcoin services were started."
         }
         NodeEvent::StartupBlocked => {
-            "Startup was refused because consensus validation, persistent chainstate and peer networking are not implemented."
+            "Startup was refused because the persistent node services are not wired yet."
         }
     }
 }
@@ -521,7 +911,16 @@ fn filtered_events(records: &[EventRecord], query: &str, newest_first: bool) -> 
     let mut result: Vec<_> = records
         .iter()
         .copied()
-        .filter(|record| event_text(*record).to_lowercase().contains(&query))
+        .filter(|record| {
+            if query.is_empty() {
+                return true;
+            }
+            record.sequence.to_string().contains(&query)
+                || event_title(record.event).to_lowercase().contains(&query)
+                || event_description(record.event)
+                    .to_lowercase()
+                    .contains(&query)
+        })
         .collect();
     if newest_first {
         result.reverse();

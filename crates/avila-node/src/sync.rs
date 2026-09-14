@@ -29,6 +29,9 @@ pub struct SyncConfig {
     /// When set, the chainstate persists under this directory —
     /// re-running resumes from the stored snapshot instead of genesis.
     pub data_dir: Option<std::path::PathBuf>,
+    /// Cancellation flag — checked each tick; `true` ends the run early
+    /// and still returns a report (state already flushed).
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for SyncConfig {
@@ -40,6 +43,7 @@ impl Default for SyncConfig {
             timeout: Duration::from_secs(120),
             proxy: None,
             data_dir: None,
+            cancel: None,
         }
     }
 }
@@ -59,6 +63,9 @@ pub struct SyncProgress {
     pub established_total: u32,
     /// Cumulative disconnects this run.
     pub disconnects: u32,
+    /// The last few connected blocks `(height, hash)` — newest last —
+    /// for displays that render the chain itself.
+    pub recent: Vec<(u32, avila_consensus::hash::BlockHash)>,
 }
 
 /// The outcome of a finished (or timed-out) sync run.
@@ -157,8 +164,14 @@ pub fn run(
     let mut established_total = 0u32;
     let mut disconnects = 0u32;
     let mut connected = 0u32;
+    let cancelled = || {
+        cfg.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    };
     while started.elapsed() < cfg.timeout
         && connected.saturating_sub(resumed_height) < cfg.target_height
+        && !cancelled()
     {
         for event in mgr.tick_net(&mut cs, unix_now(), params.message_start, 0) {
             match event {
@@ -172,6 +185,14 @@ pub fn run(
         // the store resumed at — a resumed chain doesn't re-trigger
         // the stop condition at its own height.
         let run_progress = connected.saturating_sub(resumed_height);
+        // The last connected blocks, for the tape display.
+        let chain = cs.chain();
+        let recent: Vec<(u32, avila_consensus::hash::BlockHash)> = chain
+            .iter()
+            .enumerate()
+            .skip(chain.len().saturating_sub(12))
+            .map(|(i, h)| (i as u32, *h))
+            .collect();
         progress(&SyncProgress {
             peers: mgr.len(),
             connected_height: connected,
@@ -179,6 +200,7 @@ pub fn run(
             in_flight: mgr.in_flight(),
             established_total,
             disconnects,
+            recent,
         });
         if run_progress >= cfg.target_height {
             break;
