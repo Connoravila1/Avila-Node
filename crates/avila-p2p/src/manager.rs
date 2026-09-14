@@ -81,6 +81,9 @@ struct PeerEntry<S> {
     sync: PeerSync,
     /// The peer's network address when we know it (outbound dials do).
     remote: Option<NetAddr>,
+    /// The peer sent `sendheaders` — announce new tips via `headers`,
+    /// not `inv` (Core's `fSendheaders` preference).
+    wants_headers_announce: bool,
     /// Time of the last received message of any kind.
     last_rx: Instant,
     /// Outstanding handshake deadline check cadence.
@@ -161,6 +164,7 @@ impl<S: Read + Write> PeerManager<S> {
                 session,
                 sync: PeerSync::new(),
                 remote,
+                wants_headers_announce: false,
                 last_rx: now,
                 last_ping: now,
             },
@@ -179,6 +183,7 @@ impl<S: Read + Write> PeerManager<S> {
             headers_leader,
             ..
         } = self;
+        let mut announce_tip: Option<u64> = None;
         for (&id, peer) in peers.iter_mut() {
             if let Err(e) = peer.session.check_handshake_timeout() {
                 dead.push((id, DisconnectReason::Session(e.to_string())));
@@ -196,6 +201,7 @@ impl<S: Read + Write> PeerManager<S> {
                             now,
                             addrbook,
                             headers_leader,
+                            &mut announce_tip,
                             &mut events,
                             &mut dead,
                         );
@@ -221,6 +227,34 @@ impl<S: Read + Write> PeerManager<S> {
                 self.headers_leader = None;
             }
             events.push(NetEvent::Disconnected { peer: id, reason });
+        }
+        // Announce a newly connected tip to every established peer except
+        // the one that delivered it (Core's `NewPoWValidBlock` relay).
+        if let Some(source) = announce_tip {
+            // The connected tip — not `tree().tip()`, which is the best
+            // *header* and may sit above the connected chain.
+            let tip_hash = cs.chain().last().copied();
+            let tip_header = tip_hash.and_then(|h| cs.tree().get(&h)).map(|n| n.header);
+            for (&id, peer) in &mut self.peers {
+                if id == source || !peer.session.established() {
+                    continue;
+                }
+                let msg = if peer.wants_headers_announce {
+                    match tip_header {
+                        Some(header) => Message::Headers(vec![header]),
+                        None => continue,
+                    }
+                } else {
+                    match tip_hash {
+                        Some(hash) => Message::Inv(vec![crate::message::InvVector {
+                            inv_type: crate::message::InvType::Block,
+                            hash,
+                        }]),
+                        None => continue,
+                    }
+                };
+                let _ = peer.session.send(&msg);
+            }
         }
         self.fill_queues(cs);
         events
@@ -281,6 +315,7 @@ impl<S: Read + Write> PeerManager<S> {
         now: u32,
         addrbook: &mut AddrBook,
         headers_leader: &mut Option<u64>,
+        announce_tip: &mut Option<u64>,
         events: &mut Vec<NetEvent>,
         dead: &mut Vec<(u64, DisconnectReason)>,
     ) {
@@ -354,11 +389,17 @@ impl<S: Read + Write> PeerManager<S> {
                             outcome.acceptance
                         {
                             events.push(NetEvent::TipAdvanced(cs.chain().len() as u32 - 1));
+                            // Relay the new tip to everyone except the peer
+                            // that delivered it — they already know.
+                            *announce_tip = Some(id);
                         }
                         // The tick fill pass re-feeds this peer's queue.
                     }
                     Err(e) => dead.push((id, DisconnectReason::Misbehavior(e.to_string()))),
                 }
+            }
+            SessionEvent::Message(Message::SendHeaders) => {
+                peer.wants_headers_announce = true;
             }
             SessionEvent::Message(Message::GetHeaders(req)) => {
                 let reply = PeerSync::serve_getheaders(cs, &req);
@@ -899,6 +940,58 @@ mod tests {
         }
         // All 4 blocks requested exactly once across the pair.
         assert_eq!(requested, 4);
+    }
+
+    #[test]
+    fn connected_tip_is_announced_to_other_peers() {
+        let (mut mgr, mut peer_a, _id_a) = managed_peer();
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 2);
+        for b in &blocks {
+            cs.accept_header(&b.header, NOW).unwrap();
+        }
+        let (mut peer_b, _id_b) = add_peer(&mut mgr);
+        let (mut peer_c, _id_c) = add_peer(&mut mgr);
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        handshake_peer(&mut mgr, &mut peer_b, &mut cs);
+        handshake_peer(&mut mgr, &mut peer_c, &mut cs);
+        testpipe::drain(&mut peer_a, MAGIC);
+        testpipe::drain(&mut peer_b, MAGIC);
+        testpipe::drain(&mut peer_c, MAGIC);
+        // B opted into headers announcements; C did not.
+        testpipe::inject(&mut peer_b, MAGIC, &Message::SendHeaders);
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer_b, MAGIC);
+
+        // A delivers the block — the tip advances and B is told via
+        // headers; A (the source) hears nothing back.
+        testpipe::inject(&mut peer_a, MAGIC, &Message::Block(blocks[0].clone()));
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let sent_a = testpipe::drain(&mut peer_a, MAGIC);
+        let sent_b = testpipe::drain(&mut peer_b, MAGIC);
+        let sent_c = testpipe::drain(&mut peer_c, MAGIC);
+        assert!(
+            !sent_a
+                .iter()
+                .any(|m| matches!(m, Message::Headers(_) | Message::Inv(_))),
+            "source peer must not be re-announced: {sent_a:?}"
+        );
+        assert!(
+            sent_b.iter().any(|m| matches!(
+                m,
+                Message::Headers(hs) if hs.len() == 1 && hs[0].hash() == blocks[0].block_hash()
+            )),
+            "B should get a headers announcement: {sent_b:?}"
+        );
+        assert!(
+            sent_c.iter().any(|m| matches!(
+                m,
+                Message::Inv(vs) if vs.iter().any(|v| v.inv_type == crate::message::InvType::Block
+                    && v.hash == blocks[0].block_hash())
+            )),
+            "C should get an inv announcement: {sent_c:?}"
+        );
     }
 
     #[test]

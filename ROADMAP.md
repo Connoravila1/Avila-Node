@@ -107,7 +107,10 @@ Storage and synchronization research can use this implementation before P2P is r
       — no duplicate fetches, and a stalling/disconnecting peer's
       reservations release automatically so its blocks are reassigned
       next tick. Proven live: two Knots regtest peers fed one chainstate
-      to h120 with zero duplicate requests.
+      to h120 with zero duplicate requests. Connected tips are relayed
+      to the rest of the peer set — `headers` for peers that sent
+      `sendheaders`, `inv` otherwise — mirroring Core's
+      `NewPoWValidBlock` announce (the delivering peer is excluded).
 - [ ] Global budgets, eviction scoring, and cancellation.
 - [x] Exercised on all four networks: regtest (full sync + serve, both
       directions against Knots), and live mainnet / signet / testnet4
