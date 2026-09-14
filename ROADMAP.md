@@ -35,7 +35,7 @@ measurements remain unknown. This gate establishes an application, not a Bitcoin
 ### G1 — Consensus fixtures, reference adapter and measurement harness
 
 - [ ] Record the validation-engine decision, trusted dependencies and extraction boundaries.
-- [ ] Implement bounded decoding, transaction/witness identities, headers, target arithmetic,
+- [x] Implement bounded decoding, transaction/witness identities, headers, target arithmetic,
   proof of work, linkage, chainwork and explicit network parameters.
 - [ ] Inventory historical and activated consensus rules with valid/invalid fixtures,
   activation context and provenance; start mainnet cases immediately.
