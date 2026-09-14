@@ -173,6 +173,14 @@ pub fn run(
         && connected.saturating_sub(resumed_height) < cfg.target_height
         && !cancelled()
     {
+        // Nothing to talk to and nothing left to try — fail fast rather
+        // than idling until the timeout (e.g. regtest with no seeds).
+        if mgr.is_empty() && mgr.addrbook().is_empty() {
+            return Err(SyncError::NoPeers {
+                seeded,
+                explicit: cfg.connect.len(),
+            });
+        }
         for event in mgr.tick_net(&mut cs, unix_now(), params.message_start, 0) {
             match event {
                 NetEvent::Connected { .. } => established_total += 1,

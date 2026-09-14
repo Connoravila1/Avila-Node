@@ -117,6 +117,57 @@ impl Default for SyncUi {
     }
 }
 
+/// The one-glance verdict the interface exists to answer.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Verdict {
+    Idle,
+    Connecting,
+    Syncing,
+    AtTarget,
+    Stopped,
+    Failed,
+}
+
+impl Verdict {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Connecting => "connecting",
+            Self::Syncing => "syncing",
+            Self::AtTarget => "at target",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn color(self) -> Color32 {
+        match self {
+            Self::Idle | Self::Connecting => MUTED,
+            Self::Syncing => ACCENT,
+            Self::AtTarget => OK,
+            Self::Stopped | Self::Failed => WARN,
+        }
+    }
+}
+
+impl SyncUi {
+    fn verdict(&self) -> Verdict {
+        if self.running {
+            match &self.latest {
+                Some(p) if p.peers > 0 => Verdict::Syncing,
+                _ => Verdict::Connecting,
+            }
+        } else {
+            match &self.report {
+                Some(Ok(r)) if r.target_reached => Verdict::AtTarget,
+                Some(Ok(_)) => Verdict::Stopped,
+                Some(Err(_)) => Verdict::Failed,
+                None => Verdict::Idle,
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
@@ -126,6 +177,7 @@ pub struct AvilaApp {
     page: Page,
     logo: egui::TextureHandle,
     sync: SyncUi,
+    auto_started: bool,
     event_query: String,
     newest_first: bool,
     selected_event: Option<EventRecord>,
@@ -153,11 +205,17 @@ impl AvilaApp {
             style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, HAIRLINE);
             style.visuals.panel_fill = Color32::from_rgb(0x14, 0x16, 0x1B);
         });
+        let mut sync = SyncUi::default();
+        // Regtest has no DNS seeds — prefill Core's default port.
+        if node.config().get().network == avila_core::Network::Regtest {
+            sync.connect_input = "127.0.0.1:18444".into();
+        }
         Self {
             node,
             page: Page::default(),
             logo: ctx.load_texture("avila-node-logo", logo, egui::TextureOptions::LINEAR),
-            sync: SyncUi::default(),
+            sync,
+            auto_started: false,
             event_query: String::new(),
             newest_first: true,
             selected_event: None,
@@ -222,6 +280,23 @@ impl AvilaApp {
     pub fn render(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.appearance.scale = ctx.zoom_factor();
+        // A node starts itself — but never in headless tests, where a
+        // worker would touch the test's working directory.
+        #[cfg(not(test))]
+        if !self.auto_started {
+            self.auto_started = true;
+            let has_seeds = !matches!(
+                self.node.config().get().network,
+                avila_core::Network::Regtest
+            );
+            if has_seeds || !self.sync.connect_input.trim().is_empty() {
+                self.start_sync();
+            }
+        }
+        #[cfg(test)]
+        {
+            self.auto_started = true;
+        }
         self.poll_sync(&ctx);
         self.shortcuts(&ctx);
         self.header(ui);
@@ -310,6 +385,16 @@ impl AvilaApp {
             // The ticker row — the live chain readout, always visible.
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
+                let verdict = self.sync.verdict();
+                let (dot_rect, _) = ui.allocate_exact_size(
+                    vec2(10.0, ui.spacing().interact_size.y.min(14.0)),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .circle_filled(dot_rect.center(), 4.0, verdict.color());
+                ui.label(mono(verdict.label()).color(verdict.color()))
+                    .on_hover_text("Local verdict — what this node has itself observed");
+                ui.label(muted("·"));
                 if let Some(p) = &self.sync.latest {
                     ui.label(
                         mono(format!("h {}", p.connected_height)).color(if self.sync.running {
@@ -327,10 +412,6 @@ impl AvilaApp {
                     ui.label(mono(tip));
                     ui.label(muted("·"));
                     ui.label(muted(format!("peers {}", p.peers)));
-                    if self.sync.running {
-                        ui.label(muted("·"));
-                        ui.label(mono("syncing").color(ACCENT));
-                    }
                 } else {
                     ui.label(muted("no chain data"));
                 }
@@ -501,6 +582,9 @@ impl AvilaApp {
             });
         } else if self.sync.running {
             ui.label(muted("connecting…"));
+            ui.label(muted(
+                "No peers yet. On regtest there are no DNS seeds — enter a connect address above.",
+            ));
         } else {
             ui.label(muted("No sync run yet. Set a target height and start."));
         }
