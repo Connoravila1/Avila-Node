@@ -418,6 +418,14 @@ impl Chainstate {
         &self.chain
     }
 
+    /// The backing block store when this chainstate persists bodies —
+    /// `None` for the in-memory configuration. Read-only access for
+    /// reporting (getblockchaininfo's `pruned`/`size_on_disk`).
+    #[must_use]
+    pub fn store(&self) -> Option<&BlockStore> {
+        self.store.as_ref()
+    }
+
     /// A stored block body by hash, if it passed `CheckBlock` +
     /// `ContextualCheckBlock` — from memory only. Bodies a snapshot restore
     /// left on disk (everything at or below the snapshot tip) are reachable

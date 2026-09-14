@@ -125,6 +125,12 @@ pub struct PeerSnapshot {
     pub start_height: Option<i32>,
     /// Their user agent, if the handshake ran.
     pub user_agent: Option<String>,
+    /// Their protocol version, if the handshake ran.
+    pub version: Option<i32>,
+    /// Services they offer, if the handshake ran.
+    pub services: Option<u64>,
+    /// Whether they want transaction relay, if the handshake ran.
+    pub relay: Option<bool>,
     /// Prefers `headers` announcements over `inv`.
     pub wants_headers_announce: bool,
     /// Headers we've applied that this peer sent.
@@ -196,6 +202,9 @@ impl<S: Read + Write> PeerManager<S> {
                     established: peer.session.established(),
                     start_height: info.map(|i| i.start_height),
                     user_agent: info.map(|i| i.user_agent.clone()),
+                    version: info.map(|i| i.version),
+                    services: info.map(|i| i.services),
+                    relay: info.map(|i| i.relay),
                     wants_headers_announce: peer.wants_headers_announce,
                     headers_received: peer.sync.headers_applied(),
                     blocks_received: peer.sync.blocks_received(),

@@ -22,7 +22,7 @@ use avila_consensus::transaction::{OutPoint, Script, Transaction, TxIn, TxOut, W
 use crate::Mempool;
 
 /// BIP141's witness-commitment script magic: `OP_RETURN aa21a9ed …`.
-const WITNESS_COMMITMENT_MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
+pub const WITNESS_COMMITMENT_MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
 
 /// Space reserved for the coinbase and future commitment output.
 const COINBASE_RESERVE_WEIGHT: usize = 1_000;
@@ -129,9 +129,18 @@ impl Mempool {
 
         // Coinbase: BIP34 height prefix, subsidy + fees to the miner.
         let subsidy = block_subsidy(height, cs.tree().params());
-        let has_witness = chosen
-            .iter()
-            .any(|e| e.tx.inputs.iter().any(|i| !i.witness.is_empty()));
+        // Core's CreateNewBlock adds the witness commitment to every
+        // block once segwit is active — even with no witness txs the
+        // coinbase carries the reserved value and the zero-root
+        // commitment (`6a24aa21a9ed…`), which is what
+        // getblocktemplate's `default_witness_commitment` reports.
+        let segwit_active =
+            avila_consensus::script::block_script_flags(cs.tree().params(), height, &tip)
+                .contains(avila_consensus::script::ScriptFlags::WITNESS);
+        let has_witness = segwit_active
+            || chosen
+                .iter()
+                .any(|e| e.tx.inputs.iter().any(|i| !i.witness.is_empty()));
         let mut coinbase = Transaction {
             version: 2,
             inputs: vec![TxIn {

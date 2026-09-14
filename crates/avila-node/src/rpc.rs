@@ -406,6 +406,38 @@ fn difficulty(bits: u32) -> f64 {
     difficulty_from_compact(avila_consensus::arith::CompactTarget(bits))
 }
 
+/// Decode a service bitfield the way Core's `servicesnames` does —
+/// known bits named, unknown bits reported as `UNKNOWN[2^n]`.
+fn service_names(services: u64) -> Vec<String> {
+    const KNOWN: &[(u64, &str)] = &[
+        (1 << 0, "NETWORK"),
+        (1 << 1, "GETUTXO"),
+        (1 << 2, "BLOOM"),
+        (1 << 3, "WITNESS"),
+        (1 << 6, "COMPACT_FILTERS"),
+        (1 << 10, "NETWORK_LIMITED"),
+        (1 << 11, "P2P_V2"),
+    ];
+    let mut names = Vec::new();
+    let mut seen = 0u64;
+    for (bit, name) in KNOWN {
+        if services & bit != 0 {
+            names.push((*name).to_string());
+            seen |= bit;
+        }
+    }
+    let mut unknown = services & !seen;
+    let mut bit = 0;
+    while unknown != 0 {
+        if unknown & 1 != 0 {
+            names.push(format!("UNKNOWN[2^{bit}]"));
+        }
+        unknown >>= 1;
+        bit += 1;
+    }
+    names
+}
+
 /// Whether `hash` sits on the active (connected, fully validated) chain.
 fn on_active_chain(cs: &Chainstate, hash: &BlockHash, height: u32) -> bool {
     cs.chain().get(height as usize) == Some(hash)
@@ -435,6 +467,7 @@ fn header_json(cs: &Chainstate, node: &HeaderNode) -> Value {
             .unwrap_or(node.header.time),
         "nonce": node.header.nonce,
         "bits": format!("{:08x}", node.header.bits.0),
+        "target": node.header.bits.expand().value.to_hex(),
         "difficulty": difficulty(node.header.bits.0),
         "chainwork": node.chainwork.0.to_hex(),
     });
@@ -584,23 +617,56 @@ fn dispatch(
                 .unwrap_or(Value::Null),
             None,
         ),
-        "getblockchaininfo" => (
-            json!({
-                "chainheight": snap.connected_height,
-                "blocks": snap.connected_height,
-                "headers": snap.header_height,
-                "bestblockhash": snap.recent.last().map(|(_, h)| h.to_string()),
-                "peers": snap.peers,
-                "verificationprogress": if snap.header_height > 0 {
-                    snap.connected_height as f64 / snap.header_height.max(1) as f64
+        "getblockchaininfo" => chain_query(queries, |cs, mgr| {
+            let tip = cs.tip_hash();
+            let connected = cs.chain().len().saturating_sub(1) as u32;
+            let best_header = cs.tree().tip();
+            let Some(node) = cs.tree().get(&tip) else {
+                return Err((RPC_MISC_ERROR, "tip not indexed".into()));
+            };
+            // blk*.dat + state files under the store dir — Core sums
+            // its blocks/ and chainstate/ trees; our honest floor is
+            // the store we own.
+            let size_on_disk = cs
+                .store()
+                .map(|s| {
+                    std::fs::read_dir(s.dir())
+                        .map(|rd| {
+                            rd.filter_map(|e| e.ok())
+                                .filter_map(|e| e.metadata().ok())
+                                .map(|m| m.len())
+                                .sum::<u64>()
+                        })
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            Ok(json!({
+                "chain": format!("{:?}", cs.tree().params().network).to_lowercase(),
+                "blocks": connected,
+                "headers": best_header.height,
+                "bestblockhash": tip.to_string(),
+                "bits": format!("{:08x}", node.header.bits.0),
+                "target": node.header.bits.expand().value.to_hex(),
+                "difficulty": difficulty(node.header.bits.0),
+                "time": node.header.time,
+                "mediantime": cs
+                    .tree()
+                    .median_time_past(&tip)
+                    .unwrap_or(node.header.time),
+                "verificationprogress": if best_header.height > 0 {
+                    connected as f64 / best_header.height as f64
                 } else {
-                    0.0
+                    1.0
                 },
-                "initialblockdownload": snap.connected_height < snap.header_height,
+                "initialblockdownload": best_header.height > connected,
+                "chainwork": node.chainwork.0.to_hex(),
+                "size_on_disk": size_on_disk,
+                "pruned": cs.store().and_then(|s| s.pruned_through()).is_some(),
+                "warnings": "",
+                "peers": mgr.len(),
                 "localobservation": true,
-            }),
-            None,
-        ),
+            }))
+        }),
         "getblockhash" => {
             let Some(height) = param(params, 0, "height").and_then(Value::as_u64) else {
                 return missing_params("height");
@@ -789,37 +855,78 @@ fn dispatch(
                 }
             })
         }
-        "getpeerinfo" => (
-            Value::Array(
-                snap.peer_details
+        "getpeerinfo" => chain_query(queries, |_, mgr| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Ok(Value::Array(
+                mgr.peer_snapshots()
                     .iter()
                     .map(|p| {
+                        // Core-named fields where we hold the data;
+                        // ours are kept alongside so the claims-vs-
+                        // served framing stays visible.
                         json!({
                             "id": p.id,
                             "addr": p.remote.map(|a| a.to_string()),
                             "inbound": p.inbound,
-                            "handshake": p.established,
-                            "claimed_height": p.start_height,
+                            "connection_type": if p.inbound {
+                                "inbound"
+                            } else {
+                                "outbound-full-relay"
+                            },
+                            // v2 transport (BIP324) is not implemented.
+                            "transport_protocol_type": "v1",
+                            "version": p.version,
+                            // Core's field name is `subver` — there is
+                            // no `subversion` in getpeerinfo.
                             "subver": p.user_agent,
+                            "services": p.services.map(|s| format!("{s:016x}")),
+                            "servicesnames": p.services.map(service_names),
+                            "relaytxes": p.relay,
+                            "startingheight": p.start_height,
+                            "claimed_height": p.start_height,
+                            "synced_headers": p.headers_received,
+                            "synced_blocks": p.blocks_received,
+                            "handshake": p.established,
                             "headers_received": p.headers_received,
                             "blocks_received": p.blocks_received,
                             "in_flight": p.in_flight,
+                            "conntime": now.saturating_sub(p.connected_secs),
                             "connected_secs": p.connected_secs,
+                            "timeoffset": 0,
+                            "misbehavior_score": 0,
+                            "permissions": [],
                             "idle_secs": p.idle_secs,
                         })
                     })
                     .collect(),
-            ),
-            None,
-        ),
-        "getmempoolinfo" => (
-            json!({
-                "size": snap.mempool.0,
-                "orphans": snap.mempool.1,
-                "fee_estimate_6blk_sat_per_kvb": snap.mempool.2,
-            }),
-            None,
-        ),
+            ))
+        }),
+        "getmempoolinfo" => chain_query(queries, |_, mgr| {
+            let pool = mgr.mempool_ref();
+            let bytes = pool.total_tx_bytes();
+            // BTC-denominated fields like Core's: our counters are
+            // satoshis, so convert.
+            let relay_btc = pool.min_relay_fee() as f64 / 100_000_000.0;
+            Ok(json!({
+                "loaded": true,
+                "size": pool.len(),
+                "bytes": bytes,
+                // Encoded size is the honest floor for Core's
+                // allocator-dependent DynamicUsage figure.
+                "usage": bytes,
+                "total_fee": pool.total_fees() as f64 / 100_000_000.0,
+                // No size-based decay yet — the dynamic floor equals
+                // the configured relay floor until that lands.
+                "mempoolminfee": relay_btc,
+                "minrelaytxfee": relay_btc,
+                "unbroadcastcount": 0,
+                "orphans": pool.orphan_count(),
+                "fee_estimate_6blk_sat_per_kvb": pool.estimate_fee(6),
+            }))
+        }),
         "getchaintips" => chain_query(queries, |cs, _| {
             // A tip is an indexed node no other node points at as
             // parent — the same shape Core's setBlockIndexCandidates
@@ -1064,19 +1171,32 @@ fn dispatch(
                 })
                 .collect();
             let target = template.block.header.bits.expand().value;
+            // `!segwit` is Core's mandatory-rule marker: a miner that
+            // can't enforce segwit produces invalid blocks. `taproot`
+            // is informational (always-active on regtest, buried on
+            // mainnet/signet/testnet4).
+            let mut rules = vec!["csv"];
+            if flags.contains(avila_consensus::script::ScriptFlags::WITNESS) {
+                rules.push("!segwit");
+            }
+            if flags.contains(avila_consensus::script::ScriptFlags::TAPROOT) {
+                rules.push("taproot");
+            }
             let mut out = json!({
-                "capabilities": ["coinbasetxn", "workid", "coinbase/append"],
+                // Core's modern capability set — `proposal` is the only
+                // extension bitcoind 25+ advertises.
+                "capabilities": ["proposal"],
                 "version": block.header.version,
-                "rules": if flags.contains(avila_consensus::script::ScriptFlags::WITNESS) {
-                    vec!["csv", "segwit"]
-                } else {
-                    vec!["csv"]
-                },
+                "rules": rules,
+                "vbavailable": {},
+                "vbrequired": 0,
                 "previousblockhash": tip.to_string(),
                 "transactions": txs,
-                "coinbaseaux": {"flags": ""},
+                // Core omits `flags` when the coinbase aux is empty.
+                "coinbaseaux": {},
                 "coinbasevalue": block.transactions[0].outputs[0].value,
-                "longpollid": format!("{}{}", tip, now),
+                // Core's longpollid = tip hash + candidate height.
+                "longpollid": format!("{}{}", tip, height),
                 "target": target.to_hex(),
                 "mintime": mtp + 1,
                 "mutable": ["time", "transactions", "prevblock"],
@@ -1088,12 +1208,20 @@ fn dispatch(
                 "bits": format!("{:08x}", block.header.bits.0),
                 "height": height,
             });
-            // BIP22: the witness commitment script a miner must carry
-            // when segwit transactions are included.
-            if block.transactions[0].outputs.len() > 1 {
-                out["default_witness_commitment"] = json!(hex::encode(
-                    block.transactions[0].outputs[1].script_pubkey.as_bytes()
-                ));
+            // BIP22: the witness commitment script a miner must carry.
+            // build_template adds it to every block once segwit is
+            // active — find it by the OP_RETURN + magic prefix rather
+            // than assuming an output index.
+            let commitment = block.transactions[0].outputs.iter().find(|o| {
+                let b = o.script_pubkey.as_bytes();
+                b.len() >= 6
+                    && b[0] == avila_consensus::script::OP_RETURN
+                    && b[1] == 0x24
+                    && b[2..6] == avila_mempool::template::WITNESS_COMMITMENT_MAGIC
+            });
+            if let Some(out0) = commitment {
+                out["default_witness_commitment"] =
+                    json!(hex::encode(out0.script_pubkey.as_bytes()));
             }
             Ok(out)
         }),
@@ -1109,7 +1237,21 @@ fn dispatch(
         "getmininginfo" => chain_query(queries, |cs, mgr| {
             let tip = cs.tip_hash();
             let node = cs.tree().tip();
-            Ok(json!({
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0);
+            // `next` is what the next block's header would carry —
+            // the same `required_bits` the template builder used.
+            let next = avila_consensus::pow::required_bits(
+                node.height,
+                &node.header,
+                now,
+                cs.tree().params(),
+                cs.tree(),
+            )
+            .ok();
+            let mut out = json!({
                 "blocks": node.height,
                 "currentblockweight": null,
                 "currentblocktx": mgr.mempool_ref().len(),
@@ -1118,18 +1260,59 @@ fn dispatch(
                 "target": node.header.bits.expand().value.to_hex(),
                 "bestblockhash": tip.to_string(),
                 "pooledtx": mgr.mempool_ref().len(),
-                "network": format!("{:?}", cs.tree().params().network).to_lowercase(),
-            }))
+                "chain": format!("{:?}", cs.tree().params().network).to_lowercase(),
+                "warnings": "",
+            });
+            if let Some(bits) = next {
+                out["next"] = json!({
+                    "height": node.height + 1,
+                    "bits": format!("{:08x}", bits.0),
+                    "target": bits.expand().value.to_hex(),
+                    "difficulty": difficulty(bits.0),
+                });
+            }
+            Ok(out)
         }),
         "getnetworkinfo" => chain_query(queries, |cs, mgr| {
+            let snaps = mgr.peer_snapshots();
+            let inbound = snaps.iter().filter(|p| p.inbound).count();
+            // What we offer the network — NODE_NETWORK | NODE_WITNESS.
+            let services = avila_p2p::message::NODE_NETWORK | avila_p2p::message::NODE_WITNESS;
+            // Reachability is honest: clearnet only unless a proxy was
+            // configured (the proxy knob is CLI-side; report onion as
+            // unreachable until the config reaches this layer).
+            let net = |name: &str, reachable: bool| {
+                json!({
+                    "name": name,
+                    "limited": !reachable,
+                    "reachable": reachable,
+                    "proxy": "",
+                    "proxy_randomize_credentials": false,
+                })
+            };
             Ok(json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "subversion": "/Avila:0.1.0/",
                 "protocolversion": avila_p2p::message::PROTOCOL_VERSION,
-                "network": format!("{:?}", cs.tree().params().network).to_lowercase(),
+                "localservices": format!("{services:016x}"),
+                "localservicesnames": service_names(services),
+                "localrelay": true,
+                "timeoffset": 0,
+                "networkactive": true,
+                "networks": [
+                    net("ipv4", true),
+                    net("ipv6", true),
+                    net("onion", false),
+                    net("i2p", false),
+                    net("cjdns", false),
+                ],
                 "connections": mgr.len(),
+                "connections_in": inbound,
+                "connections_out": mgr.len() - inbound,
+                "network": format!("{:?}", cs.tree().params().network).to_lowercase(),
                 "relayfee": mgr.mempool_ref().min_relay_fee() as f64 / 100_000_000.0,
-                "localservices": format!("{:016x}", avila_p2p::message::NODE_NETWORK | avila_p2p::message::NODE_WITNESS),
+                "incrementalfee": mgr.mempool_ref().min_relay_fee() as f64 / 100_000_000.0,
+                "warnings": "",
             }))
         }),
         "getconnectioncount" => (json!(snap.peers), None),
@@ -1150,16 +1333,20 @@ fn dispatch(
                 .or_else(|| params.get("conf_target"))
                 .and_then(Value::as_u64)
                 .unwrap_or(6) as u32;
-            match snap.mempool.2 {
-                Some(rate) if target == 6 => (json!({"feerate": rate, "blocks": 6}), None),
-                _ => (
-                    Value::Null,
-                    Some((
+            chain_query(queries, move |_, mgr| {
+                match mgr.mempool_ref().estimate_fee(target) {
+                    // Core reports feerate in BTC/kvB; our estimator
+                    // stores sat/kvB.
+                    Some(rate) => Ok(json!({
+                        "feerate": rate as f64 / 100_000_000.0,
+                        "blocks": target,
+                    })),
+                    None => Err((
                         RPC_INVALID_PARAMS,
-                        "insufficient data — only the 6-block estimate is currently tracked".into(),
+                        "insufficient data — no confirming samples seen for this target".into(),
                     )),
-                ),
-            }
+                }
+            })
         }
         "help" => (
             json!(
@@ -1220,16 +1407,6 @@ mod tests {
         let (r, e) = snap_dispatch("getblockcount", &Value::Null, &snap);
         assert_eq!(r, json!(120));
         assert!(e.is_none());
-        let (r, _) = snap_dispatch("getblockchaininfo", &Value::Null, &snap);
-        assert_eq!(r["chainheight"], 120);
-        assert_eq!(r["headers"], 140);
-        let (r, _) = snap_dispatch("getmempoolinfo", &Value::Null, &snap);
-        assert_eq!(r["size"], 5);
-        let (r, _) = snap_dispatch("estimatesmartfee", &json!([6]), &snap);
-        assert_eq!(r["feerate"], 2_000);
-        // Non-6 targets honestly report insufficient data.
-        let (_, e) = snap_dispatch("estimatesmartfee", &json!([12]), &snap);
-        assert!(e.is_some());
         let (_, e) = snap_dispatch("sendtoaddress", &Value::Null, &snap);
         assert_eq!(e.unwrap().0, RPC_METHOD_NOT_FOUND);
         let (r, _) = snap_dispatch("uptime", &Value::Null, &snap);
@@ -1394,5 +1571,111 @@ mod tests {
             None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
+    }
+
+    #[test]
+    fn core_shaped_fields_are_present() {
+        let cs = Chainstate::new(&Network::Regtest.params());
+        let queries = query_server(cs);
+        let snap = snap();
+
+        // getblockchaininfo carries Core's field set.
+        let (r, e) = dispatch(
+            "getblockchaininfo",
+            &Value::Null,
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        for key in [
+            "chain",
+            "blocks",
+            "headers",
+            "bestblockhash",
+            "bits",
+            "target",
+            "difficulty",
+            "time",
+            "mediantime",
+            "verificationprogress",
+            "initialblockdownload",
+            "chainwork",
+            "size_on_disk",
+            "pruned",
+            "warnings",
+        ] {
+            assert!(r.get(key).is_some(), "getblockchaininfo missing {key}");
+        }
+        assert_eq!(r["chain"], "regtest");
+
+        // getmempoolinfo carries Core's counters.
+        let (r, e) = dispatch("getmempoolinfo", &Value::Null, &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        for key in [
+            "loaded",
+            "size",
+            "bytes",
+            "usage",
+            "total_fee",
+            "mempoolminfee",
+            "minrelaytxfee",
+            "unbroadcastcount",
+        ] {
+            assert!(r.get(key).is_some(), "getmempoolinfo missing {key}");
+        }
+
+        // getblocktemplate carries the Core/Knots shape: mandatory
+        // !segwit, taproot rule, proposal-only capabilities, empty
+        // coinbaseaux, vb fields, tip+height longpollid, and the
+        // zero-witness-root commitment every post-segwit block needs.
+        let (r, e) = dispatch(
+            "getblocktemplate",
+            &json!([{"rules": ["segwit"]}]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["capabilities"], json!(["proposal"]));
+        assert_eq!(r["rules"], json!(["csv", "!segwit", "taproot"]));
+        assert_eq!(r["vbrequired"], 0);
+        assert!(r.get("vbavailable").is_some());
+        assert_eq!(r["coinbaseaux"], json!({}));
+        assert_eq!(
+            r["longpollid"],
+            json!(format!(
+                "{}{}",
+                avila_consensus::params::Network::Regtest
+                    .params()
+                    .genesis_header
+                    .hash(),
+                1
+            ))
+        );
+        let commitment = r["default_witness_commitment"].as_str().unwrap();
+        assert!(
+            commitment.starts_with("6a24aa21a9ed"),
+            "missing the BIP141 commitment: {commitment}"
+        );
+
+        // getmininginfo reports the next-block retarget.
+        let (r, e) = dispatch("getmininginfo", &Value::Null, &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["chain"], "regtest");
+        assert_eq!(r["next"]["height"], 1);
+        assert!(r["next"]["target"].is_string());
+
+        // An empty pool has no confirmation samples — the estimate
+        // says so rather than inventing a rate.
+        let (_, e) = dispatch("estimatesmartfee", &json!([6]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
+
+        // getnetworkinfo splits in/out connections.
+        let (r, e) = dispatch("getnetworkinfo", &Value::Null, &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["connections_in"], 0);
+        assert_eq!(r["connections_out"], 0);
+        assert_eq!(r["localservicesnames"], json!(["NETWORK", "WITNESS"]));
     }
 }

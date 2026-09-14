@@ -282,6 +282,21 @@ impl Mempool {
             .contains_key(&Wtxid::from_bytes(*hash.as_bytes()))
     }
 
+    /// Total serialized size of pooled transactions in bytes —
+    /// getmempoolinfo's `bytes`/`usage` basis (Core's `DynamicUsage`
+    /// is allocator-dependent; encoded size is the honest floor).
+    #[must_use]
+    pub fn total_tx_bytes(&self) -> usize {
+        self.map.values().map(|e| e.tx.encode().len()).sum()
+    }
+
+    /// Sum of pooled entry fees in satoshis — getmempoolinfo's
+    /// `total_fee` (Core reports BTC; callers convert).
+    #[must_use]
+    pub fn total_fees(&self) -> i64 {
+        self.map.values().map(|e| e.fee).sum()
+    }
+
     /// The pool's current minimum relay fee rate in sat/kvB.
     #[must_use]
     pub fn min_relay_fee(&self) -> i64 {

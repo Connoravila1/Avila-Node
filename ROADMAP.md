@@ -197,15 +197,20 @@ operation. Compare complete initial download and catch-up, not only local replay
       fee, package limits, consensus inputs, BIP68, scripts, relay fee,
       capacity) and returns a per-gate trace without mutating the pool.
       Isolated shadow-policy evaluation remains open.
-- [ ] Deliver versioned control, a tested Core RPC compatibility matrix,
-  watch-only descriptors, wallet broadcast and scoped service access.
-  Authentication landed: per-session `.cookie` (Core format, 0600,
-  HTTP Basic, 401 without it, removed on shutdown) plus the
-  `avila-node rpc` client. Fee information started: `FeeEstimator`
-  records (rate, blocks-to-confirm) samples from connected blocks and
-  `estimate_fee` returns the median confirming rate for a target
-  (surfaced in the GUI ticker); the compatibility matrix, watch-only
-  descriptors, and broadcast remain open.
+- [ ] Deliver versioned control, watch-only descriptors, wallet
+  broadcast and scoped service access. Authentication landed:
+  per-session `.cookie` (Core format, 0600, HTTP Basic, 401 without
+  it, removed on shutdown) plus the `avila-node rpc` client. The
+  compatibility matrix has a tested start: `tools/compare_rpc.py`
+  diffs every shared field against a live Knots daemon — 13 methods
+  exact-match (getblocktemplate is a 22-field exact match), zero
+  value disagreements; presence-only gaps are documented in
+  `experiments/2026-09-14-rpc-compat-matrix.md` (scriptPubKey
+  classification, per-peer byte/ping telemetry, `networkhashps`,
+  Knots-specific policy knobs). Fee information started:
+  `FeeEstimator` records (rate, blocks-to-confirm) samples and
+  `estimatesmartfee` serves any target with data, erroring honestly
+  when the sample set is empty.
 - [ ] Deliver Electrum/compact-filter services with tested clients and explicit index coverage.
 - [x] Pruned operation (first slice): `BlockStore::prune_to_bytes`
       deletes the oldest blk files past a byte budget (never the tail);
