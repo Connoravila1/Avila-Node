@@ -23,11 +23,18 @@
 //! validates — the wire format and the rule check stay separate.
 
 pub mod codec;
+pub mod manager;
 pub mod message;
 pub mod session;
 pub mod sync;
 
+#[cfg(test)]
+pub(crate) mod testchain;
+#[cfg(test)]
+pub(crate) mod testpipe;
+
 pub use codec::{Command, FrameDecoder, FrameError, HEADER_LEN, MAX_MESSAGE_PAYLOAD};
+pub use manager::{DisconnectReason, NetEvent, PeerManager};
 pub use message::{AddrEntry, GetHeaders, InvType, InvVector, Message, NetAddr, Reject, Version};
 pub use session::{
     HANDSHAKE_TIMEOUT, PeerInfo, PeerSession, SessionError, SessionEvent, build_version,

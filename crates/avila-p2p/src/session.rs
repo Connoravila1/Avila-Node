@@ -390,86 +390,13 @@ impl PeerSession<TcpStream> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::codec::encode_frame;
     use crate::message::GetHeaders;
     use avila_consensus::hash::BlockHash;
-    use std::cell::{Cell, RefCell};
-    use std::rc::Rc;
 
     const MAGIC: [u8; 4] = [0xfa, 0xbf, 0xb5, 0xda]; // regtest
     const BUDGET: usize = 1 << 20;
 
-    /// An in-memory full-duplex pipe end: never blocks on write, `WouldBlock`
-    /// on empty read, EOF once the peer end drops.
-    struct End {
-        /// Bytes this end reads (written by the other end).
-        inbox: Rc<RefCell<VecDeque<u8>>>,
-        /// Bytes this end writes (read by the other end).
-        outbox: Rc<RefCell<VecDeque<u8>>>,
-        /// Whether the peer end is still alive.
-        peer_open: Rc<Cell<bool>>,
-        /// This end's liveness flag, observed by the peer.
-        alive: Rc<Cell<bool>>,
-    }
-
-    impl Drop for End {
-        fn drop(&mut self) {
-            self.alive.set(false);
-        }
-    }
-
-    struct Pipe;
-
-    impl Pipe {
-        fn pair() -> (End, End) {
-            let a_to_b = Rc::new(RefCell::new(VecDeque::new()));
-            let b_to_a = Rc::new(RefCell::new(VecDeque::new()));
-            let a_open = Rc::new(Cell::new(true));
-            let b_open = Rc::new(Cell::new(true));
-            (
-                End {
-                    inbox: b_to_a.clone(),
-                    outbox: a_to_b.clone(),
-                    peer_open: b_open.clone(),
-                    alive: a_open.clone(),
-                },
-                End {
-                    inbox: a_to_b,
-                    outbox: b_to_a,
-                    peer_open: a_open,
-                    alive: b_open,
-                },
-            )
-        }
-    }
-
-    impl Read for End {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let mut inbox = self.inbox.borrow_mut();
-            if inbox.is_empty() {
-                return if self.peer_open.get() {
-                    Err(io::Error::new(io::ErrorKind::WouldBlock, "empty pipe"))
-                } else {
-                    Ok(0) // peer hung up
-                };
-            }
-            let n = buf.len().min(inbox.len());
-            for slot in &mut buf[..n] {
-                *slot = inbox.pop_front().unwrap_or(0);
-            }
-            Ok(n)
-        }
-    }
-
-    impl Write for End {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.outbox.borrow_mut().extend(buf.iter().copied());
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
+    use crate::testpipe;
 
     fn version(start_height: i32) -> Version {
         Version {
@@ -485,29 +412,9 @@ mod tests {
         }
     }
 
-    /// What the other end of the pipe would receive, decoded to messages.
-    fn drain(end: &mut End) -> Vec<Message> {
-        let mut out = Vec::new();
-        let mut buf = [0u8; 8192];
-        let mut dec = FrameDecoder::new(MAGIC);
-        while let Ok(n) = end.read(&mut buf) {
-            dec.feed(&buf[..n]);
-        }
-        while let Ok(Some((cmd, payload))) = dec.next_frame() {
-            out.push(Message::decode(&cmd, &payload).unwrap());
-        }
-        out
-    }
-
-    /// Pushes a message into the session's receive path as wire bytes.
-    fn inject(end: &mut End, msg: &Message) {
-        let frame = encode_frame(MAGIC, msg.command().unwrap(), &msg.encode());
-        end.write_all(&frame).unwrap();
-    }
-
     #[test]
     fn outbound_sends_version_first() {
-        let (us_end, mut peer_end) = Pipe::pair();
+        let (us_end, mut peer_end) = testpipe::pair();
         let mut us = PeerSession::initiate(
             us_end,
             MAGIC,
@@ -516,7 +423,7 @@ mod tests {
         )
         .unwrap();
         us.poll().unwrap();
-        let sent = drain(&mut peer_end);
+        let sent = testpipe::drain(&mut peer_end, MAGIC);
         assert_eq!(sent.len(), 1);
         match &sent[0] {
             Message::Version(v) => {
@@ -529,7 +436,7 @@ mod tests {
 
     #[test]
     fn outbound_full_handshake() {
-        let (us_end, mut peer_end) = Pipe::pair();
+        let (us_end, mut peer_end) = testpipe::pair();
         let mut us = PeerSession::initiate(
             us_end,
             MAGIC,
@@ -539,19 +446,19 @@ mod tests {
         .unwrap();
         us.poll().unwrap();
         // Peer's view: exactly one version message.
-        let sent = drain(&mut peer_end);
+        let sent = testpipe::drain(&mut peer_end, MAGIC);
         assert_eq!(sent.len(), 1);
         assert!(matches!(sent[0], Message::Version(_)));
 
         // Peer replies: version → (our wtxidrelay, sendaddrv2, verack) → verack.
-        inject(&mut peer_end, &Message::Version(version(600)));
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Version(version(600)));
         let events = us.poll().unwrap();
-        let peer_sent = drain(&mut peer_end);
+        let peer_sent = testpipe::drain(&mut peer_end, MAGIC);
         let names: Vec<&str> = peer_sent.iter().map(|m| m.command_name()).collect();
         assert_eq!(names, ["wtxidrelay", "sendaddrv2", "verack"]);
         assert!(!us.established());
 
-        inject(&mut peer_end, &Message::Verack);
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Verack);
         let events2 = us.poll().unwrap();
         assert!(us.established());
         assert!(events2.contains(&SessionEvent::Established));
@@ -560,7 +467,7 @@ mod tests {
 
     #[test]
     fn inbound_handshake_bursts_on_version() {
-        let (us_end, mut peer_end) = Pipe::pair();
+        let (us_end, mut peer_end) = testpipe::pair();
         let mut us = PeerSession::accept(
             us_end,
             MAGIC,
@@ -568,11 +475,11 @@ mod tests {
             BUDGET,
         );
         us.poll().unwrap();
-        assert!(drain(&mut peer_end).is_empty()); // silent until their version
+        assert!(testpipe::drain(&mut peer_end, MAGIC).is_empty()); // silent until their version
 
-        inject(&mut peer_end, &Message::Version(version(600)));
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Version(version(600)));
         let events = us.poll().unwrap();
-        let sent = drain(&mut peer_end);
+        let sent = testpipe::drain(&mut peer_end, MAGIC);
         let names: Vec<&str> = sent.iter().map(|m| m.command_name()).collect();
         assert_eq!(names, ["version", "wtxidrelay", "sendaddrv2", "verack"]);
         assert!(matches!(
@@ -580,39 +487,39 @@ mod tests {
             SessionEvent::Message(Message::Version(_))
         ));
 
-        inject(&mut peer_end, &Message::Verack);
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Verack);
         assert!(us.poll().unwrap().contains(&SessionEvent::Established));
     }
 
     #[test]
     fn pre_version_traffic_is_dropped_not_fatal() {
-        let (us_end, mut peer_end) = Pipe::pair();
+        let (us_end, mut peer_end) = testpipe::pair();
         let mut us = PeerSession::accept(
             us_end,
             MAGIC,
             build_version(3, 0, NetAddr::unspecified()),
             BUDGET,
         );
-        inject(&mut peer_end, &Message::GetAddr);
-        inject(&mut peer_end, &Message::Ping(7));
+        testpipe::inject(&mut peer_end, MAGIC, &Message::GetAddr);
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Ping(7));
         // Ignored, no disconnect — the poll completes without error.
         us.poll().unwrap();
         assert!(!us.established());
-        assert!(drain(&mut peer_end).is_empty());
+        assert!(testpipe::drain(&mut peer_end, MAGIC).is_empty());
     }
 
     #[test]
     fn duplicate_version_disconnects() {
-        let (us_end, mut peer_end) = Pipe::pair();
+        let (us_end, mut peer_end) = testpipe::pair();
         let mut us = PeerSession::accept(
             us_end,
             MAGIC,
             build_version(4, 0, NetAddr::unspecified()),
             BUDGET,
         );
-        inject(&mut peer_end, &Message::Version(version(1)));
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Version(version(1)));
         us.poll().unwrap();
-        inject(&mut peer_end, &Message::Version(version(1)));
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Version(version(1)));
         assert_eq!(
             us.poll().unwrap_err().to_string(),
             "duplicate version message"
@@ -621,18 +528,18 @@ mod tests {
 
     #[test]
     fn wtxidrelay_after_verack_disconnects() {
-        let (us_end, mut peer_end) = Pipe::pair();
+        let (us_end, mut peer_end) = testpipe::pair();
         let mut us = PeerSession::accept(
             us_end,
             MAGIC,
             build_version(5, 0, NetAddr::unspecified()),
             BUDGET,
         );
-        inject(&mut peer_end, &Message::Version(version(1)));
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Version(version(1)));
         us.poll().unwrap();
-        inject(&mut peer_end, &Message::Verack);
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Verack);
         us.poll().unwrap();
-        inject(&mut peer_end, &Message::WtxidRelay);
+        testpipe::inject(&mut peer_end, MAGIC, &Message::WtxidRelay);
         assert_eq!(
             us.poll().unwrap_err().to_string(),
             "negotiation message after handshake completed"
@@ -641,25 +548,28 @@ mod tests {
 
     #[test]
     fn ping_is_answered_at_session_layer() {
-        let (us_end, mut peer_end) = Pipe::pair();
+        let (us_end, mut peer_end) = testpipe::pair();
         let mut us = PeerSession::accept(
             us_end,
             MAGIC,
             build_version(6, 0, NetAddr::unspecified()),
             BUDGET,
         );
-        inject(&mut peer_end, &Message::Version(version(1)));
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Version(version(1)));
         us.poll().unwrap();
-        drain(&mut peer_end);
-        inject(&mut peer_end, &Message::Ping(0xfeed_beef));
+        testpipe::drain(&mut peer_end, MAGIC);
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Ping(0xfeed_beef));
         let events = us.poll().unwrap();
         assert!(events.is_empty()); // ping produces no caller event
-        assert_eq!(drain(&mut peer_end), vec![Message::Pong(0xfeed_beef)]);
+        assert_eq!(
+            testpipe::drain(&mut peer_end, MAGIC),
+            vec![Message::Pong(0xfeed_beef)]
+        );
     }
 
     #[test]
     fn send_budget_is_enforced() {
-        let (us_end, _peer_end) = Pipe::pair();
+        let (us_end, _peer_end) = testpipe::pair();
         // A budget smaller than one version frame can't even start the
         // handshake — `initiate` fails rather than queueing past the cap.
         assert!(
@@ -675,7 +585,7 @@ mod tests {
 
     #[test]
     fn getheaders_reaches_the_caller() {
-        let (us_end, mut peer_end) = Pipe::pair();
+        let (us_end, mut peer_end) = testpipe::pair();
         let mut us = PeerSession::initiate(
             us_end,
             MAGIC,
@@ -683,21 +593,21 @@ mod tests {
             BUDGET,
         )
         .unwrap();
-        inject(&mut peer_end, &Message::Version(version(1)));
-        inject(&mut peer_end, &Message::Verack);
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Version(version(1)));
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Verack);
         us.poll().unwrap();
         let gh = Message::GetHeaders(GetHeaders {
             locator: vec![BlockHash::ZERO],
             stop: BlockHash::ZERO,
         });
-        inject(&mut peer_end, &gh);
+        testpipe::inject(&mut peer_end, MAGIC, &gh);
         let events = us.poll().unwrap();
         assert_eq!(events, vec![SessionEvent::Message(gh)]);
     }
 
     #[test]
     fn peer_hangup_is_eof() {
-        let (us_end, peer_end) = Pipe::pair();
+        let (us_end, peer_end) = testpipe::pair();
         let mut us = PeerSession::accept(
             us_end,
             MAGIC,
