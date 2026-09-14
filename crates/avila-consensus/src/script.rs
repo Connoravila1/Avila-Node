@@ -14,7 +14,9 @@
 //! data terminates an [`Instructions`] iterator instead of panicking, matching Core's
 //! `GetOp` returning `false`.
 
-use crate::transaction::Script;
+use crate::hash::BlockHash;
+use crate::params::Params;
+use crate::transaction::{Script, Witness};
 
 // ---------------------------------------------------------------------------
 // Opcodes (the subset the structural rules consult)
@@ -215,7 +217,8 @@ impl Script {
     }
 
     /// Returns `true` if every instruction is a push or a small-integer opcode
-    /// (`opcode <= OP_16`) — Core's `IsPushOnly`. Malformed scripts are not push-only.
+    /// (`opcode <= OP_16`) — Core's `IsPushOnly`. Malformed scripts are not
+    /// push-only (Core's loop returns `false` when `GetOp` fails).
     ///
     /// Note (matching Core's comment): `OP_RESERVED` *is* treated as push-type here;
     /// its execution would fail anyway, so the distinction is unobservable.
@@ -250,6 +253,37 @@ impl Script {
             }
         }
         Some(last)
+    }
+
+    /// Returns `true` if this output can never be spent — Core's `IsUnspendable`:
+    /// a script beginning with `OP_RETURN`, or longer than `MAX_SCRIPT_SIZE`
+    /// (10,000 bytes). Unspendable outputs are never added to the UTXO set
+    /// (Core's `CCoinsViewCache::AddCoin` returns early), so they cannot trigger
+    /// BIP30 duplicate-output or spend checks.
+    #[must_use]
+    pub fn is_unspendable(&self) -> bool {
+        let bytes = self.as_bytes();
+        bytes.len() > MAX_SCRIPT_SIZE || bytes.first() == Some(&OP_RETURN)
+    }
+
+    /// Counts signature operations the way `CScript::GetSigOpCount(const CScript&
+    /// scriptSig)` does when `self` is a P2SH `scriptPubKey`: every `script_sig`
+    /// instruction must decode and be `<= OP_16` (a malformed or non-push op
+    /// returns `0`), then the trailing pushed data is treated as the redeem
+    /// script and *its* sigops counted accurately — a trailing `OP_N` or
+    /// truncated push leaves that data empty (Core's `GetScriptOp` clears
+    /// `vchRet` on every call; see [`trailing_push_data`]).
+    ///
+    /// Callers must only use this when [`Script::is_p2sh`] holds — in Core the
+    /// method is dispatched on the scriptPubKey and falls back to the scriptPubKey's
+    /// own count otherwise; [`crate::connect`] calls it only on P2SH prevouts, so
+    /// the fallback is omitted here.
+    #[must_use]
+    pub fn p2sh_sig_ops(&self, script_sig: &Script) -> u64 {
+        if !script_sig.is_push_only() {
+            return 0;
+        }
+        Script::new(trailing_push_data(script_sig).to_vec()).sig_ops(true)
     }
 
     /// Returns `true` if this is a pay-to-script-hash output: exactly
@@ -358,6 +392,217 @@ pub fn push_int(value: i64) -> Vec<u8> {
         1..=16 => vec![OP_1 - 1 + value as u8],
         _ => push_slice(&encode_script_num(value)),
     }
+}
+
+/// Core `script/script.h`'s `MAX_SCRIPT_SIZE`: the longest script byte string the
+/// interpreter accepts — also an [`Script::is_unspendable`] trigger.
+pub const MAX_SCRIPT_SIZE: usize = 10_000;
+
+/// Witness program sizes from `script/interpreter.h`: a version-0 program of
+/// [`WITNESS_V0_KEYHASH_SIZE`] bytes is P2WPKH (1 sigop); one of
+/// [`WITNESS_V0_SCRIPTHASH_SIZE`] bytes is P2WSH (sigops counted from the last
+/// witness item).
+pub const WITNESS_V0_KEYHASH_SIZE: usize = 20;
+/// See [`WITNESS_V0_KEYHASH_SIZE`].
+pub const WITNESS_V0_SCRIPTHASH_SIZE: usize = 32;
+
+// ---------------------------------------------------------------------------
+// Script verification flags (script/interpreter.h) and per-block flag selection
+// ---------------------------------------------------------------------------
+
+/// The subset of Core's `script_verification_flags` consensus validation consults.
+/// Bit values are identical to `script/interpreter.h` so
+/// [`Params::script_flag_exceptions`] can carry raw Core flag words.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ScriptFlags(u32);
+
+impl ScriptFlags {
+    /// `SCRIPT_VERIFY_NONE`.
+    pub const NONE: Self = Self(0);
+    /// `SCRIPT_VERIFY_P2SH` (1 << 0).
+    pub const P2SH: Self = Self(1 << 0);
+    /// `SCRIPT_VERIFY_DERSIG` (1 << 2) — BIP66 strict DER signatures.
+    pub const DERSIG: Self = Self(1 << 2);
+    /// `SCRIPT_VERIFY_NULLDUMMY` (1 << 4) — BIP147, activated with segwit.
+    pub const NULLDUMMY: Self = Self(1 << 4);
+    /// `SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY` (1 << 9) — BIP65.
+    pub const CHECKLOCKTIMEVERIFY: Self = Self(1 << 9);
+    /// `SCRIPT_VERIFY_CHECKSEQUENCEVERIFY` (1 << 10) — BIP112, activated with
+    /// BIP68/113 as the CSV deployment.
+    pub const CHECKSEQUENCEVERIFY: Self = Self(1 << 10);
+    /// `SCRIPT_VERIFY_WITNESS` (1 << 11) — BIP141.
+    pub const WITNESS: Self = Self(1 << 11);
+    /// `SCRIPT_VERIFY_TAPROOT` (1 << 17) — BIP341/342.
+    pub const TAPROOT: Self = Self(1 << 17);
+
+    /// Returns `true` if every bit in `other` is set in `self` (Core's
+    /// `flags & SCRIPT_VERIFY_X` idiom for single-bit queries).
+    #[must_use]
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// The union of two flag sets (`flags |= X` in Core).
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// The raw `script/interpreter.h` flag word (for comparisons against Core
+    /// constants and [`Params::script_flag_exceptions`]).
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Wraps a raw flag word. Unknown bits are preserved, matching Core's
+    /// `uint32_t flags` (a future soft fork's flag is just another bit).
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+}
+
+/// The script-verification flags governing `block` — Core's `GetBlockScriptFlags`.
+///
+/// `P2SH | WITNESS | TAPROOT` are always on (they only *restrict* what executes
+/// validly, and the two historical violations are handled by
+/// [`Params::script_flag_exceptions`], which replaces the base set); the buried
+/// deployments then OR in `DERSIG` (BIP66), `CHECKLOCKTIMEVERIFY` (BIP65),
+/// `CHECKSEQUENCEVERIFY` (CSV), and `NULLDUMMY` (segwit) at their heights.
+#[must_use]
+pub fn block_script_flags(params: &Params, height: u32, block_hash: &BlockHash) -> ScriptFlags {
+    let mut flags = ScriptFlags::P2SH
+        .union(ScriptFlags::WITNESS)
+        .union(ScriptFlags::TAPROOT);
+    if let Some(&(_, exception)) = params
+        .script_flag_exceptions
+        .iter()
+        .find(|(hash, _)| hash == block_hash)
+    {
+        flags = ScriptFlags::from_bits(exception);
+    }
+    if height >= params.bip66_height {
+        flags = flags.union(ScriptFlags::DERSIG);
+    }
+    if height >= params.bip65_height {
+        flags = flags.union(ScriptFlags::CHECKLOCKTIMEVERIFY);
+    }
+    if height >= params.csv_height {
+        flags = flags.union(ScriptFlags::CHECKSEQUENCEVERIFY);
+    }
+    if height >= params.segwit_height {
+        flags = flags.union(ScriptFlags::NULLDUMMY);
+    }
+    flags
+}
+
+// ---------------------------------------------------------------------------
+// UTXO-dependent sigop counting (ConnectBlock's GetTransactionSigOpCost inputs)
+// ---------------------------------------------------------------------------
+
+/// Core's `WitnessSigOps`: the witness sigop count for a witness program.
+///
+/// Version 0: a 20-byte program (P2WPKH) costs 1; a 32-byte program (P2WSH)
+/// costs the accurate sigop count of the last witness item — `0` for an empty
+/// witness (the item never deserializes to a script). Every other version and
+/// size costs 0.
+#[must_use]
+fn witness_sig_ops(version: u8, program: &[u8], witness: &Witness) -> u64 {
+    if version != 0 {
+        return 0;
+    }
+    if program.len() == WITNESS_V0_KEYHASH_SIZE {
+        return 1;
+    }
+    if program.len() == WITNESS_V0_SCRIPTHASH_SIZE
+        && let Some(last) = witness.items().last()
+    {
+        return Script::new(last.clone()).sig_ops(true);
+    }
+    0
+}
+
+/// Core's `CountWitnessSigOps`: sigops attributable to witness data for one
+/// spent input. `0` when `flags` lacks [`ScriptFlags::WITNESS`]; otherwise the
+/// spent `script_pubkey`'s direct witness program counts, or — for a P2SH
+/// output spent by a push-only `script_sig` — the witness program inside the
+/// redeem script (nested segwit).
+///
+/// The caller must only reach this when `flags` also has [`ScriptFlags::P2SH`]
+/// set (Core `assert`s it inside `CountWitnessSigOps`).
+#[must_use]
+pub fn count_witness_sig_ops(
+    script_sig: &Script,
+    script_pubkey: &Script,
+    witness: &Witness,
+    flags: ScriptFlags,
+) -> u64 {
+    debug_assert!(flags.contains(ScriptFlags::P2SH));
+    if !flags.contains(ScriptFlags::WITNESS) {
+        return 0;
+    }
+    if let Some((version, program)) = script_pubkey.witness_program() {
+        return witness_sig_ops(version, program, witness);
+    }
+    if script_pubkey.is_p2sh() && script_sig.is_push_only() {
+        let data = trailing_push_data(script_sig);
+        if let Some((version, program)) = Script::new(data.to_vec()).witness_program() {
+            return witness_sig_ops(version, program, witness);
+        }
+    }
+    0
+}
+
+/// The value left in `vData` by Core's `while (pc < end) GetOp(pc, opcode, data)`
+/// extraction loop in `CountWitnessSigOps` and `CScript::GetSigOpCount(scriptSig)`.
+///
+/// `GetScriptOp` clears `vchRet` at the top of every call, so the result is the
+/// bytes pushed by the *final* instruction iff it decodes as a push — a trailing
+/// opcode (including `OP_N`) or a failed push leaves it empty. `GetOp` failures
+/// do not stop the walk: the cursor has already advanced past the opcode byte
+/// (and, for `PUSHDATA*`, any length bytes that were present), so parsing resumes
+/// mid-script — the tail bytes are reinterpreted as further instructions.
+fn trailing_push_data(script_sig: &Script) -> &[u8] {
+    let bytes = script_sig.as_bytes();
+    let mut pc = 0usize;
+    let mut data: &[u8] = &[];
+    while let Some(&opcode) = bytes.get(pc) {
+        pc += 1;
+        data = &[];
+        if opcode <= OP_PUSHDATA4 {
+            let len = match opcode {
+                op if op < OP_PUSHDATA1 => usize::from(op),
+                OP_PUSHDATA1 => match bytes.get(pc) {
+                    Some(&b) => {
+                        pc += 1;
+                        usize::from(b)
+                    }
+                    None => continue,
+                },
+                OP_PUSHDATA2 => match bytes.get(pc..pc + 2) {
+                    Some(b) => {
+                        pc += 2;
+                        usize::from(u16::from_le_bytes([b[0], b[1]]))
+                    }
+                    None => continue,
+                },
+                _ => match bytes.get(pc..pc + 4) {
+                    Some(b) => {
+                        pc += 4;
+                        u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize
+                    }
+                    None => continue,
+                },
+            };
+            if bytes.len() - pc < len {
+                continue;
+            }
+            data = &bytes[pc..pc + len];
+            pc += len;
+        }
+    }
+    data
 }
 
 #[cfg(test)]

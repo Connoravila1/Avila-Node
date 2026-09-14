@@ -64,23 +64,23 @@ consult (`GetOp`-equivalent instruction iteration, `GetSigOpCount`, `IsPushOnly`
 `IsPayToScriptHash`, `IsWitnessProgram`, `CScriptNum`/push encodings). Every error
 exposes Core's reject-reason string via `RuleError::reason`, and the block-level
 differential adapter (`tools/check_blocks_core.py` + `examples/check_blocks.rs`)
-verifies those reasons against a live daemon's `submitblock`: **31 corpus
+verifies those reasons against a live daemon's `submitblock`: **142 corpus
 submissions and 9 real block fixtures compared, zero verdict mismatches** —
 every named violation above returns Core's exact reason, including the
 order-dependent cases (`bad-blk-length` beats `bad-txns-oversize`;
 `bad-txns-duplicate` fires only for a natural-pair leaf duplication, matching
 Core's scan-before-padding merkle semantics). Valid controls include a height-2
 child the daemon actually connects, a witness-committed block, a duplicate
-resubmission (`accepted-known` ↔ `duplicate`), and real mainnet block 1 —
-which the daemon connects end-to-end (ConnectBlock included). The first run
-caught a real divergence: `push_int` used raw data pushes for heights
-1..=16 where `CScript() << nHeight` emits `OP_1..OP_16` — fixed, with the
-daemon's `bad-cb-height` as the witness. One documented layer difference: our
-4,000,000-byte block-decode cap pre-rejects what Core reports as
-`bad-blk-weight` (any block that size is necessarily overweight, so the
-verdict is identical; only the layer differs). Signet block 1 is the single
-*expected* divergence — the daemon verifies its real BIP325 solution while we
-return the explicit `bad-signet-blksig-unchecked` stub.
+resubmission (`accepted-known` ↔ `duplicate`), a 101-block baseline chain the
+daemon connects end-to-end, and real mainnet block 1 — which connects through
+our UTXO path too. The first run caught a real divergence: `push_int` used raw
+data pushes for heights 1..=16 where `CScript() << nHeight` emits
+`OP_1..OP_16` — fixed, with the daemon's `bad-cb-height` as the witness. One
+documented layer difference: our 4,000,000-byte block-decode cap pre-rejects
+what Core reports as `bad-blk-weight` (any block that size is necessarily
+overweight, so the verdict is identical; only the layer differs). Signet block
+1 is the single *expected* divergence — the daemon verifies its real BIP325
+solution while we return the explicit `bad-signet-blksig-unchecked` stub.
 
 | Rule | Core anchor | Implementation | Valid coverage | Invalid coverage |
 | --- | --- | --- | --- | --- |
@@ -101,6 +101,42 @@ return the explicit `bad-signet-blksig-unchecked` stub.
 | Block weight ≤ `MAX_BLOCK_WEIGHT`, checked *after* witness-commitment verification (`bad-blk-weight`) | `ContextualCheckBlock` | `contextual_check_block` | All fixture blocks | ~4 MB-witness unit test |
 | Signet block solution (BIP325) | `CheckSignetBlockSolution` in `CheckBlock` | **not implemented** — `check_block` returns `BlockRuleError::SignetSolutionUnsupported` on `signet_blocks` networks rather than skipping the rule | signet fixture returns the explicit unsupported error | — |
 
+## UTXO-dependent rules (`connect.rs`)
+
+`connect.rs` ports `ConnectBlock` minus `CheckInputScripts` (the script gate is
+an explicit deferral, not an omission — see below): the `UtxoSet`
+(`CCoinsView` semantics — unspendable outputs never stored, spent coins
+removed), `Consensus::CheckTxInputs`, `CalculateSequenceLocks`/
+`EvaluateSequenceLocks` (BIP68), `GetTransactionSigOpCost`, `GetBlockSubsidy`,
+and `GetBlockScriptFlags` (`ScriptFlags` + `block_script_flags` in
+`script.rs`). Two deliberate design departures with identical verdicts:
+atomicity comes from in-place rollback via recorded undo rather than a
+discarded `CCoinsViewCache` layer, and `BlockUndo` keeps one entry per
+transaction *including* the coinbase — which is why `disconnect_block`
+restores even the BIP30-repeat overwrite cases that force Core's
+`IsBIP30Unspendable` exceptions (Core's n−1 on-disk layout is a serialization
+concern, not an in-memory one). Every error maps to Core's reject reason via
+`ConnectError::reason`; the corpus's connect-phase cases (61–72 in
+`gen-corpus`) exercise each rule on tip-extending blocks the daemon actually
+connects, and `check-many`'s `ChainState` runs `connect_block` on the same
+boundary the daemon does.
+
+| Rule | Core anchor | Implementation | Valid coverage | Invalid coverage |
+| --- | --- | --- | --- | --- |
+| Input availability — every input's outpoint names an unspent coin, all inputs checked before maturity/value (`bad-txns-inputs-missingorspent`) | `HaveInputs` + `CheckTxInputs` | `connect::check_tx_inputs` (two-pass: collect-then-check) | all connected corpus blocks | missing outpoint and already-spent input (corpus 62/63, unit tests) |
+| Coinbase maturity: `spend_height - coin_height >= 100` (`bad-txns-premature-spend-of-coinbase`) | `CheckTxInputs` | `check_tx_inputs` | depth-100 spend at h102 (corpus 61, unit test) | depth-49/depth-99 spends (corpus 64, unit test) |
+| Input values and running total inside `MoneyRange` (`bad-txns-inputvalues-outofrange`) | `CheckTxInputs`, `MoneyRange` | `check_tx_inputs` | all connected corpus blocks | over-`MAX_MONEY` coin and overflowing pair (unit tests) |
+| `value_in >= value_out` (`bad-txns-in-belowout`) | `CheckTxInputs` | `check_tx_inputs` | all connected corpus blocks | output = input + 1 (corpus 65, unit test) |
+| Fee in `MoneyRange`, accumulated fees in range (`bad-txns-fee-outofrange`, `bad-txns-accumulated-fee-outofrange`) | `CheckTxInputs`, `ConnectBlock` | `check_tx_inputs`, `connect_block` | all connected corpus blocks | checked-arithmetic overflow paths (unit-level) |
+| BIP30 duplicate-output ban with the two repeat-block exceptions; skipped once the known chain passes `bip34_hash`, always on at height ≥ 1,983,702 (`bad-txns-BIP30`) | `ConnectBlock`, `IsBIP30Repeat`, `BIP34_IMPLIES_BIP30_LIMIT` | `enforce_bip30` + pre-application scan; `add_tx_outputs` permits coinbase overwrite with undo | repeat/overwrite permitted on a skipped-chain unit test | duplicate txid with unspent outputs (corpus 67, unit test) |
+| BIP68 sequence locks when CSV is active: disable flag, height locks (`coin_height + seq - 1 < block_height`), time locks (`coin-ancestor-MTP + (seq<<9) - 1 < parent_MTP`), version < 2 exemption (`bad-txns-nonfinal`) | `SequenceLocks`/`CalculateSequenceLocks`/`EvaluateSequenceLocks`, `DeploymentActiveAt` | `connect::bip68_locks_satisfied` | satisfied height lock and disabled flag (corpus 72, unit tests) | unsatisfied height and time locks (corpus 68/69, unit test) |
+| UTXO-dependent sigop cost: legacy × 4 always, P2SH × 4 under `SCRIPT_VERIFY_P2SH`, witness per `CountWitnessSigOps` under `SCRIPT_VERIFY_WITNESS`, block total ≤ `MAX_BLOCK_SIGOPS_COST` (`bad-blk-sigops`) | `GetTransactionSigOpCost`, `CountWitnessSigOps` | `tx_sigop_cost`, `Script::p2sh_sig_ops`, `count_witness_sig_ops` | all connected corpus blocks | 20_001-CHECKSIG P2SH redeem and 80_001-CHECKSIG P2WSH witness script (corpus 70/71, unit tests) |
+| Coinbase pays at most `subsidy + fees` (`bad-cb-amount`) | `ConnectBlock`, `GetBlockSubsidy` | `connect_block`, `block_subsidy` | subsidy+fees payment (unit test); plain subsidy (whole corpus) | subsidy + 1 with no fees (corpus 66, unit test) |
+| Subsidy halving: `50 BTC >> (h / halving_interval)`, zero at 64 halvings | `GetBlockSubsidy` | `block_subsidy` | halving-boundary unit tests incl. regtest interval 150 | — |
+| Script flags per block: base `P2SH\|WITNESS\|TAPROOT`, historical exception blocks, buried `DERSIG`/`CLTV`/`CSV`/`NULLDUMMY` ORed on | `GetBlockScriptFlags`, `script_flag_exceptions` | `block_script_flags` | gating exercised by every connected corpus block | — (exception-block coverage is a mainnet-sync case, noted below) |
+| Script execution | `CheckInputScripts` | **not implemented** — `connect_block` performs no script evaluation; a passing block is *provisionally* connected pending the interpreter gate | — | — |
+| Undo / disconnect: exact state restoration incl. spent inputs and overwritten coins | `DisconnectBlock`, `CBlockUndo`/`CTxUndo` | `disconnect_block`, `BlockUndo` (one `TxUndo` per tx incl. coinbase) | disconnect→pre-state and reconnect→same-state unit tests | — |
+
 ## Network parameters (`params.rs`)
 
 | Parameter | mainnet | testnet4 | signet | regtest |
@@ -112,6 +148,9 @@ return the explicit `bad-signet-blksig-unchecked` stub.
 | `no_retargeting` | false | false | false | true |
 | `bip34_height` / `bip66_height` / `bip65_height` | 227931 / 363725 / 388381 | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
 | `csv_height` / `segwit_height` / `taproot_height` | 419328 / 481824 / 709632 | 1 / 1 / 0 | 1 / 1 / 0 | 1 / 0 / 0 |
+| `subsidy_halving_interval` | 210000 | 210000 | 210000 | 150 |
+| `bip34_hash` | `…0808b8` | — | — | — |
+| `script_flag_exceptions` | BIP16 + taproot blocks | — | — | — |
 | Genesis header | ✓ fixture-pinned | ✓ fixture-pinned | ✓ fixture-pinned | ✓ canonical hash |
 
 Mainnet/testnet4 `pow_limit` is Core's raw `uint256S` value; its canonical compact
@@ -123,8 +162,10 @@ The six buried-deployment heights are transcribed from `kernel/chainparams.cpp`
 `min_activation_height`); `0` for `taproot_height` means Core's `ALWAYS_ACTIVE`, not
 "never active". `bip34_height`/`bip66_height`/`bip65_height` drive the `bad-version`
 floors in `chain.rs`; `bip34_height`, `csv_height` and `segwit_height` drive the
-contextual rules in `check.rs`; `taproot_height` is carried for the G2 script work
-listed under "Not yet implemented".
+contextual rules in `check.rs`; `csv_height` additionally gates BIP68 sequence
+locks in `connect.rs`, and `bip34_hash`/`subsidy_halving_interval`/
+`script_flag_exceptions` drive `enforce_bip30`, `block_subsidy` and
+`block_script_flags` there.
 
 ## Fixture corpus
 
@@ -156,16 +197,13 @@ dev-only reference), one caught against the live daemon.
 Not defects — scope boundaries for later gates:
 
 - **Block-level acceptance**: signet block-signature validation (BIP325 — the
-  `SignetSolutionUnsupported` stub in `check.rs`), BIP30 cross-block duplicate-txid.
-- **UTXO-dependent transaction rules** (`Consensus::CheckTxInputs` and friends):
-  missing/spent inputs, coinbase maturity, input-vs-output value and fee range.
-- **UTXO-dependent sigop cost**: P2SH and witness sigop counting
-  (`GetP2SHSigOpCount`, `CountWitnessSigOps`) — needs the spent outputs, so it
-  belongs to connect-block; the block-level legacy budget is implemented.
-- **Script**: entire script interpreter (legacy, P2SH, segwit v0, taproot) —
-  including BIP66 DER, BIP65 CLTV and BIP68/112/113 sequence/CSV script rules — G2.
-- **UTXO/connect**: `ConnectBlock` equivalents, undo data, reorg handling beyond
-  header-tip selection — G2.
+  `SignetSolutionUnsupported` stub in `check.rs`).
+- **Script**: the entire script interpreter (legacy, P2SH, segwit v0, taproot) —
+  including BIP66 DER, BIP65 CLTV and BIP112 CSV script rules — the
+  `CheckInputScripts` step `connect_block` deliberately omits, G2.
+- **Reorg handling**: `disconnect_block` exists and restores exactly, but the
+  chainstate-level reorg driver (disconnect-to-fork-point + connect-to-new-tip
+  orchestration) is not wired — header-tip selection alone is in `chain.rs`.
 - **Header-chain rules not in Core's `ContextualCheckBlockHeader`**:
   checkpoints, `nMinimumChainWork`, BIP9 versionbits deployment state
   (Core treats unexpected versions as warnings, not rejections).
@@ -179,12 +217,16 @@ Not defects — scope boundaries for later gates:
   high-hash / time-too-old / time-too-new / orphan / duplicate agreement).
   `tools/check_blocks_core.py` (+ `examples/check_blocks.rs`) does the same at
   block level: it generates a stateful regtest corpus (valid controls plus one
-  violation per implemented rule, replayed through a shared `HeaderTree` in
-  `check-many` mode), submits each block through `submitblock`, and replays the
-  committed real block fixtures on per-network daemons — **40 submissions, zero
-  unexplained mismatches**, and it caught the `push_int`/`OP_N` divergence
-  described above on its first run. Both artifacts record the reference
-  binary's version and sha256.
+  violation per implemented rule, replayed through a shared `ChainState` —
+  header tree plus `UtxoSet` — in `check-many` mode, so tip-extending blocks
+  run through `connect_block` exactly as the daemon connects them), submits
+  each block through `submitblock`, and replays the committed real block
+  fixtures on per-network daemons — **151 submissions, zero unexplained
+  mismatches**, covering every `CheckBlock`/`ContextualCheckBlock` rule plus
+  the `ConnectBlock` cases 61–72 (missingorspent, premature coinbase,
+  in-belowout, cb-amount, BIP30, BIP68 height/time locks, P2SH/witness
+  sigops). It caught the `push_int`/`OP_N` divergence described above on its
+  first run. Both artifacts record the reference binary's version and sha256.
   Coverage-guided fuzzing exists (`fuzz/`, libFuzzer via cargo-fuzz): six
   targets over header/transaction/block decoding, CompactSize canonicality,
   compact-target arithmetic and merkle roots; ~14M executions across a
@@ -196,26 +238,37 @@ Not defects — scope boundaries for later gates:
 Rules the connect-block engine must reproduce, including non-obvious historical
 exceptions (activation heights are mainnet):
 
-- Genesis block outputs are not in the UTXO set (Core never indexes them).
+- Genesis block outputs are not in the UTXO set (Core never indexes them) —
+  **implemented**: `UtxoSet::new` starts empty.
 - BIP30 duplicate-txid ban with its two grandfathered exceptions (heights
-  91842 and 91880).
+  91842 and 91880) — **implemented**: `enforce_bip30`/`is_bip30_repeat`,
+  including the post-`BIP34_IMPLIES_BIP30_LIMIT` unconditional scan and the
+  `bip34_hash` known-chain skip. Mainnet sync coverage of the actual repeat
+  blocks remains a G2 sync task.
 - Value-overflow checks: per-output and per-transaction caps at 21M
-  (CVE-2010-5139 era) — **implemented** in `check_transaction`.
+  (CVE-2010-5139 era) — **implemented** in `check_transaction`, plus the
+  input-side ranges in `check_tx_inputs`.
 - P2SH activation is **timestamp-based** (BIP16, April 2012), not height- or
-  versionbits-based.
+  versionbits-based — the timestamp form lives in Core's flag plumbing; ours
+  is subsumed by `block_script_flags`' always-on base + exception blocks,
+  matching v29 behavior exactly.
 - BIP34 coinbase height (supermajority-gated at height 227931) —
   **implemented** in `contextual_check_block`; BIP66 strict DER (height
-  363725) and BIP65 CLTV (height 388381) — activation heights carried,
-  script rules pending.
+  363725) and BIP65 CLTV (height 388381) — activation heights carried and
+  flag-gated in `block_script_flags`, script enforcement pending the
+  interpreter.
 - BIP9 versionbits deployments: CSV/BIP68-112-113 (height 419328 — the
-  BIP113 locktime cutoff **implemented**), segwit BIP141/143/147 (height
-  481824 — commitment rules **implemented**), taproot BIP340-342 (height
-  709632 — carried, script rules pending).
+  BIP113 locktime cutoff **implemented**, and BIP68 sequence locks
+  **implemented** in `connect.rs`), segwit BIP141/143/147 (height 481824 —
+  commitment rules **implemented**, witness sigops **implemented**), taproot
+  BIP340-342 (height 709632 — flag carried in `block_script_flags`, script
+  rules pending).
 - BIP141 enforcement quirks — **implemented**: no witness commitment in the
   coinbase ⇒ all non-coinbase witnesses must be empty; commitment counted
   in the coinbase's own witness.
-- Subsidy halving schedule (height % 210000) and coinbase maturity (100 blocks).
+- Subsidy halving schedule (height % 210000, regtest % 150) and coinbase
+  maturity (100 blocks) — **implemented** (`block_subsidy`, `check_tx_inputs`).
 - `nLockTime`/`nSequence` semantics across the pre-/post-BIP68 boundary —
-  `IsFinalTx` **implemented**; BIP68 sequence locks are UTXO-dependent and
-  pending.
+  `IsFinalTx` **implemented** in `check.rs`, `SequenceLocks` **implemented**
+  in `connect.rs`.
 

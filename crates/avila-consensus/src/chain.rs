@@ -213,6 +213,20 @@ impl HeaderTree {
         Some(rules::median_time_past(&times[..count]))
     }
 
+    /// The ancestor of `from` at exactly `height` — Core's `CBlockIndex::GetAncestor`,
+    /// implemented as a linear walk (no skip list; callers needing this — BIP30's
+    /// BIP34-height probe and BIP68 time-locks — walk distances bounded by coin
+    /// maturity, not the whole chain). `None` when `from` is not in the tree or
+    /// `height` exceeds `from`'s height.
+    #[must_use]
+    pub fn get_ancestor(&self, from: &BlockHash, height: u32) -> Option<&HeaderNode> {
+        let mut node = self.nodes.get(from)?;
+        while node.height > height {
+            node = self.nodes.get(&node.header.prev_block_hash)?;
+        }
+        Some(node)
+    }
+
     /// Validates `header` against the tree and inserts it.
     ///
     /// `now` is the caller's adjusted local time for the future-drift check — an explicit

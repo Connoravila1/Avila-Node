@@ -7,6 +7,7 @@ pub mod arith;
 pub mod block;
 pub mod chain;
 pub mod check;
+pub mod connect;
 pub mod encode;
 pub mod hash;
 pub mod header;

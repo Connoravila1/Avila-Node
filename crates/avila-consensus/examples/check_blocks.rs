@@ -34,6 +34,7 @@ use avila_consensus::arith::CompactTarget;
 use avila_consensus::block::Block;
 use avila_consensus::chain::{ChainError, HeaderTree, InsertStatus};
 use avila_consensus::check::{self, BlockContext, RuleError};
+use avila_consensus::connect::{self, ConnectContext, UtxoSet};
 use avila_consensus::hash::{BlockHash, MerkleRoot, Txid};
 use avila_consensus::header::BlockHeader;
 use avila_consensus::params::{Network, Params};
@@ -76,13 +77,38 @@ fn core_reason_header(err: &ChainError) -> String {
     }
 }
 
-/// Runs the implemented pipeline against `tree` (shared across calls, like
-/// Core's block index) and returns `(verdict, detail)`. A header that passes
-/// insertion stays in the tree even when a later block-level rule rejects the
-/// block — matching Core, where `AcceptBlockHeader` commits the header to the
-/// block index before `CheckBlock` runs.
-fn validate(block: &Block, params: &Params, tree: &mut HeaderTree, now: u32) -> (String, String) {
-    let height = match tree.insert(&block.header, now) {
+/// Stateful validation chain — mirrors the daemon's block index plus active
+/// chainstate. `tree` accumulates every inserted header; `utxo`/`connected`
+/// track the active chain tip so a block that extends it is actually
+/// connected, exactly as `submitblock` connecting a new tip on the daemon.
+struct ChainState {
+    tree: HeaderTree,
+    utxo: UtxoSet,
+    /// Block hash of the connected tip (`genesis` at start — the genesis
+    /// block's coinbase is not in the UTXO set on any network).
+    connected: BlockHash,
+}
+
+impl ChainState {
+    fn new(params: &Params) -> Self {
+        Self {
+            tree: HeaderTree::new(*params),
+            utxo: UtxoSet::new(),
+            connected: params.genesis_header.hash(),
+        }
+    }
+}
+
+/// Runs the implemented pipeline against `state` (shared across calls, like
+/// Core's block index + chainstate) and returns `(verdict, detail)`. A header
+/// that passes insertion stays in the tree even when a later block-level rule
+/// rejects the block — matching Core, where `AcceptBlockHeader` commits the
+/// header to the block index before `CheckBlock` runs. A block that extends
+/// the connected tip is run through [`connect::connect_block`]; a valid block
+/// on any other branch reports `accepted` after the context-free and
+/// contextual layers, like the daemon's `inconclusive` for side-chain blocks.
+fn validate(block: &Block, params: &Params, state: &mut ChainState, now: u32) -> (String, String) {
+    let height = match state.tree.insert(&block.header, now) {
         Ok(InsertStatus::Added { height }) => height,
         Ok(InsertStatus::AlreadyKnown { height }) => {
             return ("accepted-known".to_string(), format!("height={height}"));
@@ -98,16 +124,28 @@ fn validate(block: &Block, params: &Params, tree: &mut HeaderTree, now: u32) -> 
         return (format!("rejected:{}", err.reason()), err.to_string());
     }
     // Corpus blocks build on the seeded genesis, so the parent is in the tree.
-    let parent_mtp = tree.median_time_past(&block.header.prev_block_hash);
+    let parent_mtp = state.tree.median_time_past(&block.header.prev_block_hash);
     let ctx = BlockContext {
         params,
         height,
         parent_median_time_past: parent_mtp,
     };
-    match check::contextual_check_block(block, &ctx) {
-        Ok(()) => ("accepted".to_string(), format!("height={height}")),
-        Err(err) => (format!("rejected:{}", err.reason()), err.to_string()),
+    if let Err(err) = check::contextual_check_block(block, &ctx) {
+        return (format!("rejected:{}", err.reason()), err.to_string());
     }
+    if block.header.prev_block_hash == state.connected {
+        let ctx = ConnectContext {
+            params,
+            tree: &state.tree,
+            block_hash: block.block_hash(),
+        };
+        if let Err(err) = connect::connect_block(block, &mut state.utxo, &ctx) {
+            return (format!("rejected:{}", err.reason()), err.to_string());
+        }
+        state.connected = block.block_hash();
+        return ("accepted".to_string(), format!("height={height},connected"));
+    }
+    ("accepted".to_string(), format!("height={height}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +167,15 @@ fn txin(prev: OutPoint, script_sig: Vec<u8>) -> TxIn {
         previous_output: prev,
         script_sig: Script::new(script_sig),
         sequence: check::SEQUENCE_FINAL,
+        witness: Witness::default(),
+    }
+}
+
+fn txin_seq(prev: OutPoint, sequence: u32) -> TxIn {
+    TxIn {
+        previous_output: prev,
+        script_sig: Script::new(Vec::new()),
+        sequence,
         witness: Witness::default(),
     }
 }
@@ -232,10 +279,10 @@ fn emit(
     name: &str,
     block: &Block,
     params: &Params,
-    tree: &mut HeaderTree,
+    state: &mut ChainState,
     now: u32,
 ) -> Result<(), String> {
-    let (verdict, _detail) = validate(block, params, tree, now);
+    let (verdict, _detail) = validate(block, params, state, now);
     let path = outdir.join(format!("{name}.bin"));
     fs::write(&path, block.encode()).map_err(|e| format!("write {}: {e}", path.display()))?;
     manifest.push((name.to_string(), verdict));
@@ -249,22 +296,23 @@ fn emit_tx_case(
     outdir: &Path,
     name: &str,
     params: &Params,
-    tree: &mut HeaderTree,
+    state: &mut ChainState,
     now: u32,
     mutate: impl FnOnce(&mut Transaction),
 ) -> Result<(), String> {
     let mut tx = spend_tx();
     mutate(&mut tx);
     let block = finish(draft_block(params, vec![regtest_coinbase(1), tx]), params);
-    emit(manifest, outdir, name, &block, params, tree, now)
+    emit(manifest, outdir, name, &block, params, state, now)
 }
 
 fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
     let params = Network::Regtest.params();
     let mut manifest = Vec::new();
-    // One tree across the whole corpus: verdicts are stateful, matching how the
-    // daemon accumulates headers in its block index between submissions.
-    let mut tree = HeaderTree::new(params);
+    // One chain state across the whole corpus: verdicts are stateful, matching
+    // how the daemon accumulates headers in its block index and connects the
+    // active chain tip between submissions.
+    let mut state = ChainState::new(&params);
 
     // -- valid baseline ------------------------------------------------------
     let valid = finish(draft_block(&params, vec![regtest_coinbase(1)]), &params);
@@ -274,24 +322,23 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         "00-valid",
         &valid,
         &params,
-        &mut tree,
+        &mut state,
         now,
     )?;
 
     // A valid child at height 2: exercises the pipeline past genesis+1 (the
-    // daemon will connect both blocks).
-    {
-        let child = finish(draft_on(&valid.header, vec![regtest_coinbase(2)]), &params);
-        emit(
-            &mut manifest,
-            outdir,
-            "05-valid-height2",
-            &child,
-            &params,
-            &mut tree,
-            now,
-        )?;
-    }
+    // daemon will connect both blocks). `child` is also the connect-phase
+    // chain's h2 link below.
+    let child = finish(draft_on(&valid.header, vec![regtest_coinbase(2)]), &params);
+    emit(
+        &mut manifest,
+        outdir,
+        "05-valid-height2",
+        &child,
+        &params,
+        &mut state,
+        now,
+    )?;
 
     // -- header rules (AcceptBlockHeader/ContextualCheckBlockHeader) ---------
 
@@ -309,7 +356,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "10-high-hash",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -328,7 +375,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "11-bad-diffbits",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -344,7 +391,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "12-time-too-old",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -360,7 +407,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "13-time-too-new",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -377,7 +424,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "14-bad-version",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -397,7 +444,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "20-bad-txnmrklroot",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -421,7 +468,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "21-bad-txns-duplicate",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -436,7 +483,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "22-bad-blk-length",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -450,7 +497,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "23-bad-cb-missing",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -469,7 +516,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "24-bad-cb-multiple",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -481,7 +528,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "30-vin-empty",
         &params,
-        &mut tree,
+        &mut state,
         now,
         |tx| {
             tx.inputs.clear();
@@ -492,7 +539,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "31-vout-empty",
         &params,
-        &mut tree,
+        &mut state,
         now,
         |tx| {
             tx.outputs.clear();
@@ -503,7 +550,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "32-oversize",
         &params,
-        &mut tree,
+        &mut state,
         now,
         |tx| {
             tx.inputs[0].script_sig = Script::new(vec![0u8; 1_000_100]);
@@ -514,7 +561,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "33-vout-negative",
         &params,
-        &mut tree,
+        &mut state,
         now,
         |tx| {
             tx.outputs[0].value = -1;
@@ -525,7 +572,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "34-vout-toolarge",
         &params,
-        &mut tree,
+        &mut state,
         now,
         |tx| {
             tx.outputs[0].value = check::MAX_MONEY + 1;
@@ -536,7 +583,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "35-txouttotal-toolarge",
         &params,
-        &mut tree,
+        &mut state,
         now,
         |tx| {
             tx.outputs[0].value = check::MAX_MONEY;
@@ -548,7 +595,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "36-inputs-duplicate",
         &params,
-        &mut tree,
+        &mut state,
         now,
         |tx| {
             tx.inputs.push(tx.inputs[0].clone());
@@ -559,7 +606,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "37-prevout-null",
         &params,
-        &mut tree,
+        &mut state,
         now,
         |tx| {
             tx.inputs.push(txin(outpoint(9, 1), vec![]));
@@ -578,7 +625,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "39-cb-length",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -594,7 +641,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "40-bad-blk-sigops",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -608,7 +655,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "50-nonfinal",
         &params,
-        &mut tree,
+        &mut state,
         now,
         |tx| {
             tx.lock_time = 2;
@@ -629,7 +676,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "51-bad-cb-height",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -646,7 +693,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "52-unexpected-witness",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -669,7 +716,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "53-bad-witness-nonce-size",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -691,7 +738,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "54-bad-witness-merkle-match",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -711,7 +758,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "55-bad-blk-weight",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -730,7 +777,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "56-valid-witness",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -747,7 +794,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "57-orphan",
             &block,
             &params,
-            &mut tree,
+            &mut state,
             now,
         )?;
     }
@@ -756,8 +803,375 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
     // `accepted-known`, the daemon's block index reports `duplicate`; both
     // normalize to `accepted`.
     {
-        let (verdict, _detail) = validate(&valid, &params, &mut tree, now);
+        let (verdict, _detail) = validate(&valid, &params, &mut state, now);
         manifest.push(("00-valid".to_string(), verdict));
+    }
+
+    // -- ConnectBlock (UTXO-dependent rules) ----------------------------------
+    //
+    // The daemon connects each of these blocks to its active chain, so
+    // `ConnectBlock`'s verdict surfaces as the submitblock result. Our side
+    // runs `connect_block` when the block extends the connected tip —
+    // `state.connected` tracks it. Spends use anyone-can-spend (`OP_1`)
+    // prevouts with empty scriptSigs, so the daemon's script checks pass; our
+    // own script evaluation is intentionally not yet wired.
+    //
+    // Baseline: blocks h3..=h101 so the h1/h2 coinbases are mature (depth
+    // >= 100) when the spend cases run at h102+.
+    let mut coinbase_outs = vec![
+        OutPoint {
+            txid: valid.transactions[0].txid(),
+            vout: 0,
+        },
+        OutPoint {
+            txid: child.transactions[0].txid(),
+            vout: 0,
+        },
+    ];
+    let mut parent_header = child.header;
+    for h in 3..=101u32 {
+        let block = finish(draft_on(&parent_header, vec![regtest_coinbase(h)]), &params);
+        coinbase_outs.push(OutPoint {
+            txid: block.transactions[0].txid(),
+            vout: 0,
+        });
+        parent_header = block.header;
+        emit(
+            &mut manifest,
+            outdir,
+            &format!("60-chain-{h:03}"),
+            &block,
+            &params,
+            &mut state,
+            now,
+        )?;
+    }
+
+    // Positive control at h102 (connects): spend the mature h1 coinbase for a
+    // 1-sat fee, and a setup tx (h2 coinbase) creating one P2SH output plus
+    // three anyone-can-spend outputs for the locktime/sigop cases below.
+    let spend_h1 = Transaction {
+        version: 1,
+        inputs: vec![txin(coinbase_outs[0], vec![])],
+        outputs: vec![txout(5_000_000_000 - 1, vec![script::OP_1])],
+        lock_time: 0,
+    };
+    let mut p2sh_spk = vec![script::OP_HASH160, 0x14];
+    p2sh_spk.extend_from_slice(&[0x33; 20]);
+    p2sh_spk.push(script::OP_EQUAL);
+    let setup = Transaction {
+        version: 1,
+        inputs: vec![txin(coinbase_outs[1], vec![])],
+        outputs: vec![
+            txout(1_000, p2sh_spk),
+            txout(500, vec![script::OP_1]),
+            txout(500, vec![script::OP_1]),
+            txout(500, vec![script::OP_1]),
+        ],
+        lock_time: 0,
+    };
+    let block102 = finish(
+        draft_on(&parent_header, vec![regtest_coinbase(102), spend_h1, setup]),
+        &params,
+    );
+    emit(
+        &mut manifest,
+        outdir,
+        "61-valid-spend",
+        &block102,
+        &params,
+        &mut state,
+        now,
+    )?;
+    let setup_txid = block102.transactions[2].txid();
+    let out = |vout: u32| OutPoint {
+        txid: setup_txid,
+        vout,
+    };
+    // After 61 connects, the daemon's tip is h102 — connect-failure cases must
+    // extend it or they'd be side blocks judged "inconclusive".
+    let case_parent = block102.header;
+
+    // bad-txns-inputs-missingorspent: a never-created outpoint.
+    {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![txin(outpoint(0xde, 0), vec![])],
+            outputs: vec![txout(1, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let block = finish(
+            draft_on(&case_parent, vec![regtest_coinbase(103), tx]),
+            &params,
+        );
+        emit(
+            &mut manifest,
+            outdir,
+            "62-missing-input",
+            &block,
+            &params,
+            &mut state,
+            now,
+        )?;
+    }
+
+    // bad-txns-inputs-missingorspent again: h1's coinbase was spent by 61.
+    {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![txin(coinbase_outs[0], vec![])],
+            outputs: vec![txout(1, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let block = finish(
+            draft_on(&case_parent, vec![regtest_coinbase(103), tx]),
+            &params,
+        );
+        emit(
+            &mut manifest,
+            outdir,
+            "63-spent-input",
+            &block,
+            &params,
+            &mut state,
+            now,
+        )?;
+    }
+
+    // bad-txns-premature-spend-of-coinbase: h4's coinbase at h103 — depth 99.
+    {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![txin(coinbase_outs[3], vec![])],
+            outputs: vec![txout(1, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let block = finish(
+            draft_on(&case_parent, vec![regtest_coinbase(103), tx]),
+            &params,
+        );
+        emit(
+            &mut manifest,
+            outdir,
+            "64-premature-coinbase",
+            &block,
+            &params,
+            &mut state,
+            now,
+        )?;
+    }
+
+    // bad-txns-in-belowout: spend the mature h3 coinbase creating more than its
+    // input value.
+    {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![txin(coinbase_outs[2], vec![])],
+            outputs: vec![txout(5_000_000_000 + 1, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let block = finish(
+            draft_on(&case_parent, vec![regtest_coinbase(103), tx]),
+            &params,
+        );
+        emit(
+            &mut manifest,
+            outdir,
+            "65-in-belowout",
+            &block,
+            &params,
+            &mut state,
+            now,
+        )?;
+    }
+
+    // bad-cb-amount: the coinbase pays subsidy + 1 with no fees in the block.
+    {
+        let mut cb = regtest_coinbase(103);
+        cb.outputs[0].value = 5_000_000_001;
+        let block = finish(draft_on(&case_parent, vec![cb]), &params);
+        emit(
+            &mut manifest,
+            outdir,
+            "66-cb-amount",
+            &block,
+            &params,
+            &mut state,
+            now,
+        )?;
+    }
+
+    // bad-txns-BIP30: block102's spend tx appears again; its output is still
+    // unspent, so the pre-scan rejects before input checks.
+    {
+        let dup = block102.transactions[1].clone();
+        let block = finish(
+            draft_on(&case_parent, vec![regtest_coinbase(103), dup]),
+            &params,
+        );
+        emit(
+            &mut manifest,
+            outdir,
+            "67-bip30-duplicate",
+            &block,
+            &params,
+            &mut state,
+            now,
+        )?;
+    }
+
+    // bad-txns-nonfinal (BIP68 height lock): a h102 coin (created by 61),
+    // sequence = 200 height units — min height 102 + 200 - 1 = 301 >= 103.
+    {
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![txin_seq(out(1), 200)],
+            outputs: vec![txout(1, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let block = finish(
+            draft_on(&case_parent, vec![regtest_coinbase(103), tx]),
+            &params,
+        );
+        emit(
+            &mut manifest,
+            outdir,
+            "68-bip68-nonfinal",
+            &block,
+            &params,
+            &mut state,
+            now,
+        )?;
+    }
+
+    // bad-txns-nonfinal (BIP68 time lock): a h102 coin, sequence = TYPE|1 —
+    // min time = coin-MTP + 512 - 1, far beyond the parent MTP (corpus blocks
+    // tick at +1 s).
+    {
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![txin_seq(out(2), connect::SEQUENCE_LOCKTIME_TYPE_FLAG | 1)],
+            outputs: vec![txout(1, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let block = finish(
+            draft_on(&case_parent, vec![regtest_coinbase(103), tx]),
+            &params,
+        );
+        emit(
+            &mut manifest,
+            outdir,
+            "69-bip68-time-nonfinal",
+            &block,
+            &params,
+            &mut state,
+            now,
+        )?;
+    }
+
+    // bad-blk-sigops (P2SH): spending `out(0)` — the P2SH coin — with a
+    // 20_001-CHECKSIG redeem script costs 20_001 * 4 > 80_000. The daemon's
+    // sigop check fires before script evaluation, so the redeem body never
+    // runs there and our stubbed script layer is not divergent.
+    {
+        let redeem = vec![script::OP_CHECKSIG; 20_001];
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![txin(out(0), script::push_slice(&redeem))],
+            outputs: vec![txout(999, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let block = finish(
+            draft_on(&case_parent, vec![regtest_coinbase(103), tx]),
+            &params,
+        );
+        emit(
+            &mut manifest,
+            outdir,
+            "70-p2sh-sigops",
+            &block,
+            &params,
+            &mut state,
+            now,
+        )?;
+    }
+
+    // bad-blk-sigops (witness): an in-block setup creates a P2WSH-looking coin
+    // (h3 coinbase input — mature at h103), then a spend whose witness script
+    // holds 80_001 CHECKSIGs costs 80_001 > 80_000 under WITNESS accounting.
+    // The block carries a valid witness commitment so the sigop rule — not
+    // unexpected-witness — is what fires.
+    {
+        let witness_script = vec![script::OP_CHECKSIG; 80_001];
+        let mut wsh_spk = vec![script::OP_0, 0x20];
+        wsh_spk.extend_from_slice(&[0x55; 32]);
+        let setup_wsh = Transaction {
+            version: 1,
+            inputs: vec![txin(coinbase_outs[2], vec![])],
+            outputs: vec![txout(1_000, wsh_spk)],
+            lock_time: 0,
+        };
+        let wsh_out = OutPoint {
+            txid: setup_wsh.txid(),
+            vout: 0,
+        };
+        let mut spend = Transaction {
+            version: 1,
+            inputs: vec![txin(wsh_out, vec![])],
+            outputs: vec![txout(999, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        spend.inputs[0].witness = Witness::new(vec![Vec::new(), witness_script]);
+        let mut cb = regtest_coinbase(103);
+        cb.inputs[0].witness = Witness::new(vec![vec![0x42; 32]]);
+        let mut block = draft_on(&case_parent, vec![cb, setup_wsh, spend]);
+        add_witness_commitment(&mut block, &params);
+        emit(
+            &mut manifest,
+            outdir,
+            "71-witness-sigops",
+            &block,
+            &params,
+            &mut state,
+            now,
+        )?;
+    }
+
+    // Positive controls at h103 (connects): a satisfied BIP68 height lock
+    // (sequence 1 on a h102 coin — min height 102 < 103) and a sequence with
+    // the disable flag set (not a lock at all).
+    {
+        let tx_ok = Transaction {
+            version: 2,
+            inputs: vec![txin_seq(out(1), 1)],
+            outputs: vec![txout(1, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let tx_disabled = Transaction {
+            version: 2,
+            inputs: vec![txin_seq(
+                out(2),
+                connect::SEQUENCE_LOCKTIME_DISABLE_FLAG | 200,
+            )],
+            outputs: vec![txout(1, vec![script::OP_1])],
+            lock_time: 0,
+        };
+        let block = finish(
+            draft_on(
+                &case_parent,
+                vec![regtest_coinbase(103), tx_ok, tx_disabled],
+            ),
+            &params,
+        );
+        emit(
+            &mut manifest,
+            outdir,
+            "72-bip68-ok",
+            &block,
+            &params,
+            &mut state,
+            now,
+        )?;
     }
 
     // Hand-rolled manifest: `[{"file": ..., "expected_verdict": ...}]` — no JSON
@@ -793,10 +1207,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let mut tree = HeaderTree::new(net.params());
+            let mut state = ChainState::new(&net.params());
             match Block::decode(&bytes) {
                 Ok(block) => {
-                    let (verdict, detail) = validate(&block, &net.params(), &mut tree, now);
+                    let (verdict, detail) = validate(&block, &net.params(), &mut state, now);
                     println!("{verdict}\t{detail}");
                     ExitCode::SUCCESS
                 }
@@ -815,10 +1229,11 @@ fn main() -> ExitCode {
                 eprintln!("invalid <now> timestamp {:?}", args[2]);
                 return ExitCode::FAILURE;
             };
-            // One tree across all inputs — stateful, like the daemon's block
-            // index — so duplicates are reported `accepted-known` and later
-            // blocks may build on earlier accepted ones.
-            let mut tree = HeaderTree::new(net.params());
+            // One chain state across all inputs — stateful, like the daemon's
+            // block index + chainstate — so duplicates are reported
+            // `accepted-known` and later blocks may build on and connect
+            // earlier accepted ones.
+            let mut state = ChainState::new(&net.params());
             for path in &args[3..] {
                 let name = Path::new(path)
                     .file_name()
@@ -829,7 +1244,7 @@ fn main() -> ExitCode {
                     .and_then(|bytes| Block::decode(&bytes).map_err(|e| format!("decode\t{e}")))
                 {
                     Ok(block) => {
-                        let (verdict, detail) = validate(&block, &net.params(), &mut tree, now);
+                        let (verdict, detail) = validate(&block, &net.params(), &mut state, now);
                         format!("{verdict}\t{detail}")
                     }
                     Err(err) => format!("rejected:{err}"),

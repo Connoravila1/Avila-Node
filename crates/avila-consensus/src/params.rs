@@ -49,6 +49,10 @@ impl Network {
                 csv_height: 419_328,
                 segwit_height: 481_824,
                 taproot_height: 709_632,
+                subsidy_halving_interval: 210_000,
+                // uint256S("000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8")
+                bip34_hash: Some(BlockHash::from_bytes(MAINNET_BIP34_HASH)),
+                script_flag_exceptions: &MAINNET_SCRIPT_FLAG_EXCEPTIONS,
                 genesis_header: MAINNET_GENESIS,
             },
             Network::Testnet4 => Params {
@@ -67,6 +71,9 @@ impl Network {
                 csv_height: 1,
                 segwit_height: 1,
                 taproot_height: 0,
+                subsidy_halving_interval: 210_000,
+                bip34_hash: None,
+                script_flag_exceptions: &[],
                 genesis_header: TESTNET4_GENESIS,
             },
             Network::Signet => Params {
@@ -85,6 +92,9 @@ impl Network {
                 csv_height: 1,
                 segwit_height: 1,
                 taproot_height: 0,
+                subsidy_halving_interval: 210_000,
+                bip34_hash: None,
+                script_flag_exceptions: &[],
                 genesis_header: SIGNET_GENESIS,
             },
             Network::Regtest => Params {
@@ -108,6 +118,10 @@ impl Network {
                 csv_height: 1,
                 segwit_height: 0,
                 taproot_height: 0,
+                // Core's `CRegTestParams`: `nSubsidyHalvingInterval = 150`.
+                subsidy_halving_interval: 150,
+                bip34_hash: None,
+                script_flag_exceptions: &[],
                 genesis_header: REGTEST_GENESIS,
             },
         }
@@ -196,6 +210,24 @@ pub struct Params {
     /// this height alone; not consulted by any rule this crate implements — carried for
     /// documentation and G2.
     pub taproot_height: u32,
+    /// `consensus.nSubsidyHalvingInterval`: the number of blocks per subsidy halving
+    /// (210,000 on the public networks, 150 on regtest). Consulted by
+    /// [`crate::connect::block_subsidy`].
+    pub subsidy_halving_interval: u32,
+    /// `consensus.BIP34Hash`: the block hash expected at `bip34_height` on the real
+    /// chain. `ConnectBlock` uses it to skip the BIP30 duplicate-output scan once the
+    /// known chain has passed BIP34 activation; `None` reproduces Core's null
+    /// `uint256` on networks where the optimization can never trigger (testnet4,
+    /// signet, regtest — no real chain exists to match).
+    pub bip34_hash: Option<BlockHash>,
+    /// `consensus.script_flag_exceptions`: block hashes whose script-verification
+    /// flags *replace* the always-on base set (P2SH | WITNESS | TAPROOT) before the
+    /// deployment-gated bits are OR'd in — Core's `GetBlockScriptFlags`. Mainnet has
+    /// two: the historical BIP16 violation (`SCRIPT_VERIFY_NONE`) and the taproot
+    /// exception block (`P2SH | WITNESS`, dropping TAPROOT). Consulted by
+    /// [`crate::script::block_script_flags`]; the stored values are raw
+    /// `script/interpreter.h` flag bits.
+    pub script_flag_exceptions: &'static [(BlockHash, u32)],
     /// The network's genesis block header: the anchor every [`crate::chain::HeaderTree`]
     /// is seeded with.
     pub genesis_header: BlockHeader,
@@ -268,6 +300,38 @@ const TESTNET4_GENESIS_MERKLE_ROOT: MerkleRoot = MerkleRoot::from_bytes([
     0x4e, 0x7b, 0x2b, 0x91, 0x28, 0xfe, 0x02, 0x91, 0xdb, 0x06, 0x93, 0xaf, 0x2a, 0xe4, 0x18, 0xb7,
     0x67, 0xe6, 0x57, 0xcd, 0x40, 0x7e, 0x80, 0xcb, 0x14, 0x34, 0x22, 0x1e, 0xae, 0xa7, 0xa0, 0x7a,
 ]);
+
+/// `CMainParams`'s `consensus.BIP34Hash` in wire byte order: display form
+/// `000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8`.
+const MAINNET_BIP34_HASH: [u8; 32] = [
+    0xb8, 0x08, 0x08, 0x9c, 0x75, 0x6a, 0xdd, 0x15, 0x91, 0xb1, 0xd1, 0x7b, 0xab, 0x44, 0xbb, 0xa3,
+    0xfe, 0xd9, 0xe0, 0x2f, 0x94, 0x2a, 0xb4, 0x89, 0x4b, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// `CMainParams`'s `consensus.script_flag_exceptions`: (wire-order block hash,
+/// `script/interpreter.h` flag bits). The first is the historical BIP16 violation
+/// (`00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22` →
+/// `SCRIPT_VERIFY_NONE`); the second is the taproot exception block
+/// (`0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad` →
+/// `SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS` = 0x801).
+const MAINNET_SCRIPT_FLAG_EXCEPTIONS: [(BlockHash, u32); 2] = [
+    (
+        BlockHash::from_bytes([
+            0x22, 0x9c, 0x4f, 0xac, 0x88, 0xba, 0xb1, 0x94, 0xeb, 0x08, 0xf1, 0xa5, 0x28, 0xcc,
+            0x30, 0x8d, 0xed, 0x23, 0x97, 0xf4, 0xf4, 0xeb, 0x6e, 0x75, 0xdc, 0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ]),
+        0,
+    ),
+    (
+        BlockHash::from_bytes([
+            0xad, 0x95, 0xe3, 0xa1, 0x5e, 0xe5, 0xff, 0xd5, 0x85, 0xc5, 0xe8, 0x1d, 0x44, 0xb5,
+            0x6a, 0x98, 0x1e, 0x84, 0x2d, 0x5b, 0xc3, 0x14, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ]),
+        0x801,
+    ),
+];
 
 /// The mainnet genesis block header (Core `CMainParams`'s `CreateGenesisBlock` result).
 const MAINNET_GENESIS: BlockHeader = BlockHeader {
