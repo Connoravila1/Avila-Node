@@ -90,6 +90,9 @@ impl OutPoint {
 pub struct Witness(Vec<Vec<u8>>);
 
 impl Witness {
+    /// The empty witness — Core's `static const CScriptWitness emptyWitness`.
+    pub const EMPTY: Self = Self(Vec::new());
+
     /// Wraps a witness stack.
     #[must_use]
     pub fn new(items: Vec<Vec<u8>>) -> Self {

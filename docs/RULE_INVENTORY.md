@@ -135,7 +135,7 @@ boundary the daemon does.
 | Coinbase pays at most `subsidy + fees` (`bad-cb-amount`) | `ConnectBlock`, `GetBlockSubsidy` | `connect_block`, `block_subsidy` | subsidy+fees payment (unit test); plain subsidy (whole corpus) | subsidy + 1 with no fees (corpus 66, unit test) |
 | Subsidy halving: `50 BTC >> (h / halving_interval)`, zero at 64 halvings | `GetBlockSubsidy` | `block_subsidy` | halving-boundary unit tests incl. regtest interval 150 | — |
 | Script flags per block: base `P2SH\|WITNESS\|TAPROOT`, historical exception blocks, buried `DERSIG`/`CLTV`/`CSV`/`NULLDUMMY` ORed on | `GetBlockScriptFlags`, `script_flag_exceptions` | `block_script_flags` | gating exercised by every connected corpus block | — (exception-block coverage is a mainnet-sync case, noted below) |
-| Script execution | `CheckInputScripts` | **not implemented** — `connect_block` performs no script evaluation; a passing block is *provisionally* connected pending the interpreter gate | — | — |
+| Script execution | `CheckInputScripts`, `EvalScript`, `VerifyScript`, `VerifyWitnessProgram` | `interpreter.rs` ports the full stack machine: all opcodes incl. `CHECKSIG`/`CHECKMULTISIG`/`CHECKSIGADD`, `CLTV`/`CSV`, conditionals, altstack, `CODESEPARATOR`, `FindAndDelete`, signature/pubkey encoding checks (DERSIG/LOW_S/STRICTENC/WITNESS_PUBKEYTYPE/MINIMALIF/MINIMALDATA/NULLDUMMY/NULLFAIL/CONST_SCRIPTCODE), P2SH stack restore, witness v0 (P2WPKH/P2WSH), taproot key/script path incl. control block, annex and `OP_SUCCESSx`, `OP_CHECKSIGADD`, validation-weight accounting | **not wired** — `connect_block` performs no script evaluation until the sighash/crypto checker lands; a passing block is *provisionally* connected | — | 29 interpreter unit tests (opcode bodies, witness dispatch, P2SH, taproot control, encoding flags) |
 | Undo / disconnect: exact state restoration incl. spent inputs and overwritten coins | `DisconnectBlock`, `CBlockUndo`/`CTxUndo` | `disconnect_block`, `BlockUndo` (one `TxUndo` per tx incl. coinbase) | disconnect→pre-state and reconnect→same-state unit tests | — |
 
 ## Network parameters (`params.rs`)
@@ -199,9 +199,11 @@ Not defects — scope boundaries for later gates:
 
 - **Block-level acceptance**: signet block-signature validation (BIP325 — the
   `SignetSolutionUnsupported` stub in `check.rs`).
-- **Script**: the entire script interpreter (legacy, P2SH, segwit v0, taproot) —
-  including BIP66 DER, BIP65 CLTV and BIP112 CSV script rules — the
-  `CheckInputScripts` step `connect_block` deliberately omits, G2.
+- **Script**: the interpreter is ported (`interpreter.rs`) but the
+  cryptographic half is missing — sighash algorithms (legacy, BIP143,
+  BIP341/342), ECDSA and schnorr verification, taproot commitment checking —
+  behind `SignatureChecker`; the `CheckInputScripts` wiring into
+  `connect_block` follows it, G2.
 - **Reorg handling**: `disconnect_block` + the harness's disconnect-to-fork /
   connect-forward orchestration are exercised by the 80-fork corpus case; a
   production chainstate driver (disk-backed block store, invalid-branch

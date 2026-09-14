@@ -421,10 +421,23 @@ impl ScriptFlags {
     pub const NONE: Self = Self(0);
     /// `SCRIPT_VERIFY_P2SH` (1 << 0).
     pub const P2SH: Self = Self(1 << 0);
+    /// `SCRIPT_VERIFY_STRICTENC` (1 << 1).
+    pub const STRICTENC: Self = Self(1 << 1);
     /// `SCRIPT_VERIFY_DERSIG` (1 << 2) — BIP66 strict DER signatures.
     pub const DERSIG: Self = Self(1 << 2);
+    /// `SCRIPT_VERIFY_LOW_S` (1 << 3).
+    pub const LOW_S: Self = Self(1 << 3);
     /// `SCRIPT_VERIFY_NULLDUMMY` (1 << 4) — BIP147, activated with segwit.
     pub const NULLDUMMY: Self = Self(1 << 4);
+    /// `SCRIPT_VERIFY_SIGPUSHONLY` (1 << 5).
+    pub const SIGPUSHONLY: Self = Self(1 << 5);
+    /// `SCRIPT_VERIFY_MINIMALDATA` (1 << 6) — BIP62 minimal pushes.
+    pub const MINIMALDATA: Self = Self(1 << 6);
+    /// `SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS` (1 << 7).
+    pub const DISCOURAGE_UPGRADABLE_NOPS: Self = Self(1 << 7);
+    /// `SCRIPT_VERIFY_CLEANSTACK` (1 << 8) — BIP62; implies [`P2SH`](Self::P2SH)
+    /// and [`WITNESS`](Self::WITNESS) per Core's asserts.
+    pub const CLEANSTACK: Self = Self(1 << 8);
     /// `SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY` (1 << 9) — BIP65.
     pub const CHECKLOCKTIMEVERIFY: Self = Self(1 << 9);
     /// `SCRIPT_VERIFY_CHECKSEQUENCEVERIFY` (1 << 10) — BIP112, activated with
@@ -432,8 +445,24 @@ impl ScriptFlags {
     pub const CHECKSEQUENCEVERIFY: Self = Self(1 << 10);
     /// `SCRIPT_VERIFY_WITNESS` (1 << 11) — BIP141.
     pub const WITNESS: Self = Self(1 << 11);
+    /// `SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM` (1 << 12).
+    pub const DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM: Self = Self(1 << 12);
+    /// `SCRIPT_VERIFY_MINIMALIF` (1 << 13) — BIP62; consensus-enforced in tapscript.
+    pub const MINIMALIF: Self = Self(1 << 13);
+    /// `SCRIPT_VERIFY_NULLFAIL` (1 << 14) — BIP146.
+    pub const NULLFAIL: Self = Self(1 << 14);
+    /// `SCRIPT_VERIFY_WITNESS_PUBKEYTYPE` (1 << 15).
+    pub const WITNESS_PUBKEYTYPE: Self = Self(1 << 15);
+    /// `SCRIPT_VERIFY_CONST_SCRIPTCODE` (1 << 16).
+    pub const CONST_SCRIPTCODE: Self = Self(1 << 16);
     /// `SCRIPT_VERIFY_TAPROOT` (1 << 17) — BIP341/342.
     pub const TAPROOT: Self = Self(1 << 17);
+    /// `SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION` (1 << 18).
+    pub const DISCOURAGE_UPGRADABLE_TAPROOT_VERSION: Self = Self(1 << 18);
+    /// `SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS` (1 << 19) — BIP342 OP_SUCCESSx.
+    pub const DISCOURAGE_OP_SUCCESS: Self = Self(1 << 19);
+    /// `SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE` (1 << 20).
+    pub const DISCOURAGE_UPGRADABLE_PUBKEYTYPE: Self = Self(1 << 20);
 
     /// Returns `true` if every bit in `other` is set in `self` (Core's
     /// `flags & SCRIPT_VERIFY_X` idiom for single-bit queries).

@@ -12,6 +12,7 @@ pub mod encode;
 pub mod hash;
 pub mod header;
 pub mod hex;
+pub mod interpreter;
 pub mod merkle;
 pub mod params;
 pub mod pow;

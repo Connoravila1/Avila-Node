@@ -10,8 +10,11 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-# The only trusted third-party code in the validation path: RustCrypto SHA-2.
+# The only trusted third-party code in the validation path: the RustCrypto
+# hashes (SHA-2 for txids/sighash, SHA-1 and RIPEMD-160 for legacy opcodes).
 sha2.workspace = true
+sha1.workspace = true
+ripemd.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
