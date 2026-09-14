@@ -12,20 +12,22 @@
 //!
 //! There is no wallet, no `sendrawtransaction`, and no state mutation:
 //! every answer is "what this node has itself observed", never a remote
-//! claim.
+//! claim. The single control method is `stop`, which flips the same
+//! cancellation flag a GUI Stop button or SIGINT handler would.
 //!
 //! Not implemented (by design, this slice): HTTP keep-alive, chunked
 //! encoding, TLS, authentication beyond localhost binding, batch
 //! requests, txindex-backed `getrawtransaction`, and any method that
-//! would mutate state.
+//! would mutate chain, pool or peer state.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use avila_consensus::chain::{HeaderNode, HeaderTree};
+use avila_consensus::chain::HeaderNode;
 use avila_consensus::chainstate::Chainstate;
 use avila_consensus::hash::{BlockHash, Txid};
 use avila_consensus::hex;
@@ -74,7 +76,9 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Spawns the RPC listener on its own thread. `status` is read per
 /// request — answers reflect the most recent sync tick, not a live
 /// call into the validator. `queries`, when present, reaches the live
-/// chainstate through the sync loop for chain data methods.
+/// chainstate through the sync loop for chain data methods. `stop`,
+/// when present, is the flag the sync loop's cancellation check reads —
+/// the `stop` method sets it.
 ///
 /// # Errors
 /// `io::Error` if the listener cannot bind.
@@ -82,6 +86,7 @@ pub fn serve(
     addr: SocketAddr,
     status: SharedStatus,
     queries: Option<QuerySender>,
+    stop: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     let listener = TcpListener::bind(addr)?;
     Ok(thread::spawn(move || {
@@ -90,7 +95,8 @@ pub fn serve(
                 Ok(stream) => {
                     let status = status.clone();
                     let queries = queries.clone();
-                    thread::spawn(move || handle(stream, &status, queries.as_ref()));
+                    let stop = stop.clone();
+                    thread::spawn(move || handle(stream, &status, queries.as_ref(), stop.as_ref()));
                 }
                 Err(_) => continue,
             }
@@ -105,7 +111,12 @@ const RPC_INVALID_PARAMETER: i64 = -8;
 const RPC_METHOD_NOT_FOUND: i64 = -32601;
 const RPC_INVALID_PARAMS: i64 = -32602;
 
-fn handle(mut stream: TcpStream, status: &SharedStatus, queries: Option<&QuerySender>) {
+fn handle(
+    mut stream: TcpStream,
+    status: &SharedStatus,
+    queries: Option<&QuerySender>,
+    stop: Option<&Arc<AtomicBool>>,
+) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let Ok(read_half) = stream.try_clone() else {
         return;
@@ -152,7 +163,7 @@ fn handle(mut stream: TcpStream, status: &SharedStatus, queries: Option<&QuerySe
         Ok(s) => s.clone(),
         Err(_) => return,
     };
-    let (result, error) = dispatch(method, &params, &snap, queries);
+    let (result, error) = dispatch(method, &params, &snap, queries, stop);
     let response = match error {
         Some((code, message)) => {
             json!({"result": null, "error": {"code": code, "message": message}, "id": id})
@@ -237,8 +248,7 @@ fn difficulty(bits: u32) -> f64 {
 }
 
 /// Whether `hash` sits on the active (connected, fully validated) chain.
-fn on_active_chain(tree: &HeaderTree, cs: &Chainstate, hash: &BlockHash, height: u32) -> bool {
-    let _ = tree;
+fn on_active_chain(cs: &Chainstate, hash: &BlockHash, height: u32) -> bool {
     cs.chain().get(height as usize) == Some(hash)
 }
 
@@ -246,7 +256,7 @@ fn on_active_chain(tree: &HeaderTree, cs: &Chainstate, hash: &BlockHash, height:
 fn header_json(cs: &Chainstate, node: &HeaderNode) -> Value {
     let hash = node.hash();
     let tip_height = cs.tree().tip().height;
-    let active = on_active_chain(cs.tree(), cs, &hash, node.height);
+    let active = on_active_chain(cs, &hash, node.height);
     let mut out = json!({
         "hash": hash.to_string(),
         // Core: -1 for blocks not on the active chain.
@@ -337,11 +347,74 @@ fn tx_json(tx: &Transaction) -> Value {
     })
 }
 
+/// A pooled entry in Core's `getmempoolentry` shape — the admission
+/// facts plus computed ancestor/descendant package totals.
+fn entry_json(
+    pool: &avila_mempool::Mempool,
+    txid: &Txid,
+    entry: &avila_mempool::MempoolEntry,
+) -> Value {
+    let ancestors = pool.ancestor_txids(&entry.tx);
+    let descendants = pool.descendant_txids(txid);
+    let stat = |set: &std::collections::HashSet<Txid>| -> (usize, usize, i64) {
+        let mut size = 0usize;
+        let mut fees = 0i64;
+        for id in set {
+            if let Some(e) = pool.entry(id) {
+                size += e.vsize;
+                fees += e.fee;
+            }
+        }
+        (set.len(), size, fees)
+    };
+    let (acount, asize, afees) = stat(&ancestors);
+    let (dcount, dsize, dfees) = stat(&descendants);
+    json!({
+        "vsize": entry.vsize,
+        "weight": entry.vsize * 4,
+        "time": entry.time,
+        "height": entry.first_seen_height,
+        "wtxid": entry.tx.wtxid().to_string(),
+        "fees": {
+            "base": entry.fee as f64 / 100_000_000.0,
+        },
+        "ancestorcount": acount + 1,
+        "ancestorsize": asize + entry.vsize,
+        "ancestorfees": afees + entry.fee,
+        "descendantcount": dcount + 1,
+        "descendantsize": dsize + entry.vsize,
+        "descendantfees": dfees + entry.fee,
+    })
+}
+
+/// A txid set as a bare array (verbose=false) or Core's verbose map.
+fn family_json(
+    pool: &avila_mempool::Mempool,
+    set: std::collections::HashSet<Txid>,
+    verbose: bool,
+) -> Value {
+    let mut ids: Vec<Txid> = set.into_iter().collect();
+    ids.sort_by_key(|a| a.to_string());
+    if verbose {
+        let map: serde_json::Map<String, Value> = ids
+            .iter()
+            .filter_map(|txid| {
+                pool.entry(txid)
+                    .map(|e| (txid.to_string(), entry_json(pool, txid, e)))
+            })
+            .collect();
+        Value::Object(map)
+    } else {
+        json!(ids.iter().map(|t| t.to_string()).collect::<Vec<_>>())
+    }
+}
+
 fn dispatch(
     method: &str,
     params: &Value,
     snap: &SyncProgress,
     queries: Option<&QuerySender>,
+    stop: Option<&Arc<AtomicBool>>,
 ) -> (Value, Option<(i64, String)>) {
     match method {
         "getblockcount" => (json!(snap.connected_height), None),
@@ -588,6 +661,199 @@ fn dispatch(
             }),
             None,
         ),
+        "getchaintips" => chain_query(queries, |cs, _| {
+            // A tip is an indexed node no other node points at as
+            // parent — the same shape Core's setBlockIndexCandidates
+            // walk produces.
+            let parents: std::collections::HashSet<BlockHash> = cs
+                .tree()
+                .nodes()
+                .map(|(_, n)| n.header.prev_block_hash)
+                .collect();
+            let tip_height = cs.tree().tip().height;
+            let mut tips: Vec<Value> = cs
+                .tree()
+                .nodes()
+                .filter(|(hash, _)| !parents.contains(*hash))
+                .map(|(hash, node)| {
+                    // branchlen: blocks between this tip and its fork
+                    // point on the active chain (0 when it IS the tip).
+                    let mut branchlen = 0u32;
+                    if *hash != cs.tip_hash() {
+                        for h in (0..=node.height.min(tip_height)).rev() {
+                            let on_active = cs
+                                .tree()
+                                .get_ancestor(hash, h)
+                                .is_some_and(|a| cs.chain().get(h as usize) == Some(&a.hash()));
+                            if on_active {
+                                break;
+                            }
+                            branchlen = node.height - h;
+                        }
+                    }
+                    let status = if *hash == cs.tip_hash() {
+                        "active"
+                    } else if cs.tree().is_failed(hash) {
+                        "invalid"
+                    } else if cs.have_body(hash) {
+                        "valid-fork"
+                    } else {
+                        "headers-only"
+                    };
+                    json!({
+                        "height": node.height,
+                        "hash": hash.to_string(),
+                        "branchlen": branchlen,
+                        "status": status,
+                    })
+                })
+                .collect();
+            tips.sort_by_key(|t| std::cmp::Reverse(t["height"].as_u64().unwrap_or(0)));
+            Ok(json!(tips))
+        }),
+        "getrawmempool" => {
+            let verbose = param(params, 0, "verbose")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            chain_query(queries, move |_, mgr| {
+                let pool = mgr.mempool_ref();
+                if verbose {
+                    let map: serde_json::Map<String, Value> = pool
+                        .txids()
+                        .iter()
+                        .filter_map(|txid| {
+                            pool.entry(txid)
+                                .map(|e| (txid.to_string(), entry_json(pool, txid, e)))
+                        })
+                        .collect();
+                    Ok(Value::Object(map))
+                } else {
+                    Ok(json!(
+                        pool.txids()
+                            .iter()
+                            .map(|t| t.to_string())
+                            .collect::<Vec<_>>()
+                    ))
+                }
+            })
+        }
+        "getmempoolentry" | "getmempoolancestors" | "getmempooldescendants" => {
+            let Some(txid) = param(params, 0, "txid")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<Txid>().ok())
+            else {
+                return missing_params("txid");
+            };
+            let verbose = param(params, 1, "verbose")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            // `method` borrows the request — own it for the 'static closure.
+            let which = method.to_string();
+            chain_query(queries, move |_, mgr| {
+                let pool = mgr.mempool_ref();
+                let Some(entry) = pool.entry(&txid) else {
+                    return Err((
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        "Transaction not in mempool".into(),
+                    ));
+                };
+                match which.as_str() {
+                    "getmempoolentry" => Ok(entry_json(pool, &txid, entry)),
+                    "getmempoolancestors" => {
+                        Ok(family_json(pool, pool.ancestor_txids(&entry.tx), verbose))
+                    }
+                    _ => Ok(family_json(pool, pool.descendant_txids(&txid), verbose)),
+                }
+            })
+        }
+        "testmempoolaccept" => {
+            // Core's signature is `testmempoolaccept [rawtxs]` — the
+            // first positional param is the array (a bare string is a
+            // lenient single-tx shorthand).
+            let raws: Vec<String> = match param(params, 0, "rawtxs") {
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                Some(Value::String(s)) => vec![s.clone()],
+                _ => Vec::new(),
+            };
+            if raws.is_empty() {
+                return missing_params("rawtxs");
+            }
+            chain_query(queries, move |cs, mgr| {
+                let mut out = Vec::with_capacity(raws.len());
+                for raw in raws {
+                    let Ok(bytes) = hex::decode(&raw) else {
+                        return Err((RPC_INVALID_PARAMS, "rawtx is not valid hex".into()));
+                    };
+                    let tx = match Transaction::decode(&bytes) {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            return Err((RPC_INVALID_PARAMS, format!("TX decode failed: {e}")));
+                        }
+                    };
+                    let pool = mgr.mempool_ref();
+                    let steps = pool.explain_tx(&tx, cs, 0);
+                    let allowed = steps.iter().all(|s| s.passed);
+                    let mut verdict = json!({
+                        "txid": tx.txid().to_string(),
+                        "wtxid": tx.wtxid().to_string(),
+                        "allowed": allowed,
+                        "vsize": tx.weight().div_ceil(4),
+                    });
+                    if allowed {
+                        // Admission passed every gate — report the fee
+                        // the inputs resolve to (Core's fees.base).
+                        let input_sum: i64 = tx
+                            .inputs
+                            .iter()
+                            .filter_map(|i| pool.resolve(cs, &i.previous_output))
+                            .map(|c| c.out.value)
+                            .sum();
+                        let output_sum: i64 = tx.outputs.iter().map(|o| o.value).sum();
+                        let fee = input_sum - output_sum;
+                        verdict["fees"] = json!({"base": fee as f64 / 100_000_000.0});
+                        verdict["package-feerrate"] =
+                            json!(fee as f64 / tx.weight().div_ceil(4).max(1) as f64 / 1000.0);
+                    } else if let Some(failed) = steps.iter().find(|s| !s.passed) {
+                        verdict["reject-reason"] = json!(failed.detail);
+                    }
+                    // The full gate trace rides along — our extension,
+                    // clearly marked, for "why was this rejected".
+                    verdict["avila_policy_trace"] =
+                        json!(steps
+                        .iter()
+                        .map(|s| json!({"gate": s.gate, "passed": s.passed, "detail": s.detail}))
+                        .collect::<Vec<_>>());
+                    out.push(verdict);
+                }
+                Ok(json!(out))
+            })
+        }
+        "getnetworkinfo" => chain_query(queries, |cs, mgr| {
+            Ok(json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "subversion": "/Avila:0.1.0/",
+                "protocolversion": avila_p2p::message::PROTOCOL_VERSION,
+                "network": format!("{:?}", cs.tree().params().network).to_lowercase(),
+                "connections": mgr.len(),
+                "relayfee": mgr.mempool_ref().min_relay_fee() as f64 / 100_000_000.0,
+                "localservices": format!("{:016x}", avila_p2p::message::NODE_NETWORK | avila_p2p::message::NODE_WITNESS),
+            }))
+        }),
+        "getconnectioncount" => (json!(snap.peers), None),
+        "uptime" => (json!(snap.elapsed_secs), None),
+        "stop" => match stop {
+            Some(flag) => {
+                flag.store(true, Ordering::Relaxed);
+                (json!("Avila node stopping"), None)
+            }
+            None => (
+                Value::Null,
+                Some((RPC_MISC_ERROR, "no run loop to stop".into())),
+            ),
+        },
         "estimatesmartfee" => {
             let target = params
                 .get(0)
@@ -607,12 +873,16 @@ fn dispatch(
         }
         "help" => (
             json!(
-                "avila-node JSON-RPC (read-only observations):\n\
-                 \x20 getblockcount, getbestblockhash, getblockchaininfo,\n\
-                 \x20 getblockhash <height>, getblockheader <hash> [verbose],\n\
-                 \x20 getblock <hash> [verbosity 0-2], getrawtransaction <txid> [verbosity] [blockhash],\n\
-                 \x20 gettxout <txid> <n> [include_mempool], getpeerinfo, getmempoolinfo,\n\
-                 \x20 estimatesmartfee <target>, help"
+                "avila-node JSON-RPC (read-only observations + stop):\n\
+                 \x20 chain: getblockcount, getbestblockhash, getblockchaininfo, getchaintips,\n\
+                 \x20   getblockhash <height>, getblockheader <hash> [verbose],\n\
+                 \x20   getblock <hash> [verbosity 0-2], getrawtransaction <txid> [verbosity] [blockhash],\n\
+                 \x20   gettxout <txid> <n> [include_mempool]\n\
+                 \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
+                 \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
+                 \x20   testmempoolaccept <rawtx | [rawtx,...]>\n\
+                 \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo\n\
+                 \x20 misc:  estimatesmartfee <target>, uptime, help, stop"
             ),
             None,
         ),
@@ -640,33 +910,60 @@ mod tests {
             recent: vec![(120, avila_consensus::hash::BlockHash::from_bytes([7u8; 32]))],
             peer_details: Vec::new(),
             mempool: (5, 1, Some(2_000)),
+            elapsed_secs: 42,
         }
+    }
+
+    /// Snapshot methods take `None` for both optional channels.
+    fn snap_dispatch(
+        method: &str,
+        params: &Value,
+        snap: &SyncProgress,
+    ) -> (Value, Option<(i64, String)>) {
+        dispatch(method, params, snap, None, None)
     }
 
     #[test]
     fn read_only_methods_answer_from_the_snapshot() {
         let snap = snap();
-        let (r, e) = dispatch("getblockcount", &Value::Null, &snap, None);
+        let (r, e) = snap_dispatch("getblockcount", &Value::Null, &snap);
         assert_eq!(r, json!(120));
         assert!(e.is_none());
-        let (r, _) = dispatch("getblockchaininfo", &Value::Null, &snap, None);
+        let (r, _) = snap_dispatch("getblockchaininfo", &Value::Null, &snap);
         assert_eq!(r["chainheight"], 120);
         assert_eq!(r["headers"], 140);
-        let (r, _) = dispatch("getmempoolinfo", &Value::Null, &snap, None);
+        let (r, _) = snap_dispatch("getmempoolinfo", &Value::Null, &snap);
         assert_eq!(r["size"], 5);
-        let (r, _) = dispatch("estimatesmartfee", &json!([6]), &snap, None);
+        let (r, _) = snap_dispatch("estimatesmartfee", &json!([6]), &snap);
         assert_eq!(r["feerate"], 2_000);
         // Non-6 targets honestly report insufficient data.
-        let (_, e) = dispatch("estimatesmartfee", &json!([12]), &snap, None);
+        let (_, e) = snap_dispatch("estimatesmartfee", &json!([12]), &snap);
         assert!(e.is_some());
-        let (_, e) = dispatch("sendtoaddress", &Value::Null, &snap, None);
+        let (_, e) = snap_dispatch("sendtoaddress", &Value::Null, &snap);
         assert_eq!(e.unwrap().0, RPC_METHOD_NOT_FOUND);
+        let (r, _) = snap_dispatch("uptime", &Value::Null, &snap);
+        assert_eq!(r, json!(42));
+        let (r, _) = snap_dispatch("getconnectioncount", &Value::Null, &snap);
+        assert_eq!(r, json!(2));
     }
 
     #[test]
     fn chain_methods_need_the_query_channel() {
         let snap = snap();
-        let (_, e) = dispatch("getblockhash", &json!([0]), &snap, None);
+        let (_, e) = dispatch("getblockhash", &json!([0]), &snap, None, None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+    }
+
+    #[test]
+    fn stop_flips_the_cancel_flag() {
+        let snap = snap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let (r, e) = dispatch("stop", &Value::Null, &snap, None, Some(&flag));
+        assert!(e.is_none());
+        assert_eq!(r, json!("Avila node stopping"));
+        assert!(flag.load(Ordering::Relaxed));
+        // Without a run loop the call reports honestly instead of lying.
+        let (_, e) = dispatch("stop", &Value::Null, &snap, None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 
@@ -689,11 +986,17 @@ mod tests {
         let queries = query_server(cs);
         let snap = snap();
 
-        let (r, e) = dispatch("getblockhash", &json!([0]), &snap, Some(&queries));
+        let (r, e) = dispatch("getblockhash", &json!([0]), &snap, Some(&queries), None);
         assert!(e.is_none());
         let genesis = r.as_str().unwrap().to_string();
 
-        let (r, e) = dispatch("getblockheader", &json!([genesis]), &snap, Some(&queries));
+        let (r, e) = dispatch(
+            "getblockheader",
+            &json!([genesis]),
+            &snap,
+            Some(&queries),
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["height"], 0);
         assert_eq!(r["confirmations"], 1);
@@ -708,6 +1011,7 @@ mod tests {
             &json!([genesis, false]),
             &snap,
             Some(&queries),
+            None,
         );
         assert!(e.is_none());
         assert_eq!(r.as_str().unwrap().len(), 160);
@@ -715,17 +1019,24 @@ mod tests {
         // The genesis header is indexed but its body was never stored
         // (genesis is never connected) — getblock says so honestly,
         // the same error Core gives for missing block data.
-        let (_, e) = dispatch("getblock", &json!([genesis, 1]), &snap, Some(&queries));
+        let (_, e) = dispatch(
+            "getblock",
+            &json!([genesis, 1]),
+            &snap,
+            Some(&queries),
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
         // Unknown heights/hashes get Core's error codes, not nulls.
-        let (_, e) = dispatch("getblockhash", &json!([99]), &snap, Some(&queries));
+        let (_, e) = dispatch("getblockhash", &json!([99]), &snap, Some(&queries), None);
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
             "getblockheader",
             &json!([BlockHash::from_bytes([9u8; 32]).to_string()]),
             &snap,
             Some(&queries),
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
 
@@ -735,6 +1046,7 @@ mod tests {
             &json!([Txid::from_bytes([1u8; 32]).to_string(), 0]),
             &snap,
             Some(&queries),
+            None,
         );
         assert!(e.is_none());
         let (r, _) = dispatch(
@@ -742,6 +1054,7 @@ mod tests {
             &json!([Txid::from_bytes([1u8; 32]).to_string(), 0]),
             &snap,
             Some(&queries),
+            None,
         );
         assert!(r.is_null());
 
@@ -751,6 +1064,7 @@ mod tests {
             &json!([Txid::from_bytes([1u8; 32]).to_string()]),
             &snap,
             Some(&queries),
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
     }

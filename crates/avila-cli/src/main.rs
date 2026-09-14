@@ -127,11 +127,18 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     recent: Vec::new(),
                     peer_details: Vec::new(),
                     mempool: (0, 0, None),
+                    elapsed_secs: 0,
                 }));
             let (query_tx, query_rx) = std::sync::mpsc::channel();
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             if let Some(addr) = rpc {
-                let _server = avila_node::rpc::serve(addr, status.clone(), Some(query_tx))
-                    .map_err(|e| format!("rpc bind {addr}: {e}"))?;
+                let _server = avila_node::rpc::serve(
+                    addr,
+                    status.clone(),
+                    Some(query_tx),
+                    Some(cancel.clone()),
+                )
+                .map_err(|e| format!("rpc bind {addr}: {e}"))?;
                 println!("RPC listening on http://{addr} (read-only)");
                 std::mem::forget(_server);
             }
@@ -142,7 +149,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 timeout: Duration::from_secs(u64::MAX),
                 proxy,
                 data_dir: Some(config.network_data_dir()),
-                cancel: None,
+                cancel: Some(cancel),
                 prune_bytes: None,
                 status: Some(status),
                 queries: Some(std::sync::Arc::new(std::sync::Mutex::new(query_rx))),

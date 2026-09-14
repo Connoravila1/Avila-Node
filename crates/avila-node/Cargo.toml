@@ -12,6 +12,7 @@ publish.workspace = true
 [dependencies]
 avila-consensus.workspace = true
 avila-core.workspace = true
+avila-mempool = { version = "0.1.0-dev", path = "../avila-mempool" }
 avila-p2p.workspace = true
 serde.workspace = true
 serde_json.workspace = true

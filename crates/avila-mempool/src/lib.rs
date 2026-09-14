@@ -282,6 +282,12 @@ impl Mempool {
             .contains_key(&Wtxid::from_bytes(*hash.as_bytes()))
     }
 
+    /// The pool's current minimum relay fee rate in sat/kvB.
+    #[must_use]
+    pub fn min_relay_fee(&self) -> i64 {
+        self.min_relay_fee
+    }
+
     /// Overrides the min-relay fee rate (sat/kvB) — an operator knob.
     pub fn set_min_relay_fee(&mut self, sat_per_kvb: i64) {
         self.min_relay_fee = sat_per_kvb;
@@ -302,7 +308,14 @@ impl Mempool {
 
     /// Resolves an input's coin: the confirmed UTXO first, else a pooled
     /// parent's output — Core's `view` layered over `pool.cs`/`mapTx`.
-    fn resolve(&self, cs: &avila_consensus::chainstate::Chainstate, op: &OutPoint) -> Option<Coin> {
+    /// Public so query surfaces (`gettxout`, `testmempoolaccept`) can
+    /// answer "what would admission see" without duplicating the rules.
+    #[must_use]
+    pub fn resolve(
+        &self,
+        cs: &avila_consensus::chainstate::Chainstate,
+        op: &OutPoint,
+    ) -> Option<Coin> {
         if let Some(coin) = cs.utxo().get(op) {
             return Some(coin.clone());
         }
@@ -828,6 +841,49 @@ impl Mempool {
             }
         }
         ancestors
+    }
+
+    /// All in-pool ancestors of a candidate tx — Core's
+    /// `CalculateMemPoolAncestors` set, exposed for query surfaces.
+    #[must_use]
+    pub fn ancestor_txids(&self, tx: &Transaction) -> HashSet<Txid> {
+        self.ancestors_of(tx)
+    }
+
+    /// All in-pool descendants of a pooled txid — the set behind
+    /// `getmempooldescendants`.
+    #[must_use]
+    pub fn descendant_txids(&self, txid: &Txid) -> HashSet<Txid> {
+        let mut descendants = HashSet::new();
+        let mut stack = vec![*txid];
+        while let Some(id) = stack.pop() {
+            let Some(entry) = self.map.get(&id) else {
+                continue;
+            };
+            for vout in 0..entry.tx.outputs.len() as u32 {
+                if let Some(child) = self.spends.get(&OutPoint { txid: id, vout })
+                    && descendants.insert(*child)
+                {
+                    stack.push(*child);
+                }
+            }
+        }
+        descendants
+    }
+
+    /// The pooled entry for `txid`, with its admission-computed fee,
+    /// vsize, and arrival facts (Core's `mapTx` lookup behind
+    /// `getmempoolentry`).
+    #[must_use]
+    pub fn entry(&self, txid: &Txid) -> Option<&MempoolEntry> {
+        self.map.get(txid)
+    }
+
+    /// The parked orphans' txids — Core's orphan pool contents behind
+    /// `getorphantxs`-style queries.
+    #[must_use]
+    pub fn orphan_txids(&self) -> Vec<Txid> {
+        self.orphans.keys().copied().collect()
     }
 
     /// All in-pool descendants of a pooled tx, as `(count, total vsize)`.

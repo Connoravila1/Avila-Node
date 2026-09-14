@@ -86,6 +86,8 @@ pub struct SyncProgress {
     /// Pooled transactions, parked orphans, and the fee estimate for
     /// ~6-block confirmation in sat/kvB (`None` = insufficient data).
     pub mempool: (usize, usize, Option<i64>),
+    /// Seconds since this run started — the daemon's `uptime`.
+    pub elapsed_secs: u64,
 }
 
 /// The outcome of a finished (or timed-out) sync run.
@@ -235,6 +237,7 @@ pub fn run(
                 mgr.mempool().orphan_count(),
                 mgr.mempool().estimate_fee(6),
             ),
+            elapsed_secs: started.elapsed().as_secs(),
         };
         if let Some(status) = &cfg.status
             && let Ok(mut w) = status.write()

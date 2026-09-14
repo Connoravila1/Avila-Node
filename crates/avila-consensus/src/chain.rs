@@ -214,6 +214,12 @@ impl HeaderTree {
         self.nodes.is_empty()
     }
 
+    /// Iterates every indexed node — the read path behind
+    /// `getchaintips`-style enumeration. Order is unspecified.
+    pub fn nodes(&self) -> impl Iterator<Item = (&BlockHash, &HeaderNode)> {
+        self.nodes.iter()
+    }
+
     /// Returns the node stored under `hash`, if any.
     #[must_use]
     pub fn get(&self, hash: &BlockHash) -> Option<&HeaderNode> {
