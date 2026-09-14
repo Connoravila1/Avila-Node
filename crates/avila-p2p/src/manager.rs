@@ -1169,6 +1169,49 @@ mod tests {
     }
 
     #[test]
+    fn competing_branch_reorgs_the_connected_chain() {
+        use crate::testchain::fork_blocks;
+        let (mut mgr, mut peer_a, _id_a) = managed_peer();
+        let mut cs = regtest();
+        // Active chain: genesis + a1..a3, all connected.
+        let a_blocks = chain_blocks(&cs, 3);
+        for b in &a_blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        assert_eq!(cs.chain().last().copied(), Some(a_blocks[2].block_hash()));
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        testpipe::drain(&mut peer_a, MAGIC);
+
+        // The peer announces a fork off a1 with more work: f2,f3,f4.
+        let fork = fork_blocks(&cs, &a_blocks[0].header, 2, 3);
+        let headers: Vec<_> = fork.iter().map(|b| b.header).collect();
+        testpipe::inject(&mut peer_a, MAGIC, &Message::Headers(headers));
+        let mut events = mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        // The fork headers indexed → we asked for the fork bodies.
+        let sent = testpipe::drain(&mut peer_a, MAGIC);
+        assert!(
+            sent.iter()
+                .any(|m| matches!(m, Message::GetData(vs) if !vs.is_empty())),
+            "fork bodies should be requested: {sent:?}"
+        );
+        // Deliver the fork bodies — the branch outworks us at f4.
+        for b in &fork {
+            testpipe::inject(&mut peer_a, MAGIC, &Message::Block(b.clone()));
+            events.extend(mgr.tick(&mut cs, NOW));
+        }
+        assert_eq!(
+            cs.chain().last().copied(),
+            Some(fork[2].block_hash()),
+            "chain should reorg onto the stronger fork"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, NetEvent::TipAdvanced(_))),
+            "reorg should surface a tip-advance event: {events:?}"
+        );
+    }
+
+    #[test]
     fn addr_gossip_fills_the_book() {
         let (mut mgr, mut peer, _id) = managed_peer();
         let mut cs = regtest();

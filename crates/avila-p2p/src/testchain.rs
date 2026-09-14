@@ -70,3 +70,17 @@ pub fn chain_blocks(cs: &Chainstate, n: u32) -> Vec<Block> {
     }
     out
 }
+
+/// A branch of `n` blocks extending `prev` — a competing fork when `prev`
+/// is behind the tip. `first_height` is the branch's first block height.
+pub fn fork_blocks(cs: &Chainstate, prev: &BlockHeader, first_height: u32, n: u32) -> Vec<Block> {
+    let params = *cs.tree().params();
+    let mut out = Vec::new();
+    let mut p = *prev;
+    for i in 0..n {
+        let block = block_on(&p, first_height + i, &params);
+        p = block.header;
+        out.push(block);
+    }
+    out
+}
