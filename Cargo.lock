@@ -428,6 +428,8 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "avila-cli"
 version = "0.1.0-dev"
 dependencies = [
+ "avila-consensus",
+ "avila-core",
  "avila-node",
  "clap",
  "serde_json",
@@ -470,7 +472,9 @@ dependencies = [
 name = "avila-node"
 version = "0.1.0-dev"
 dependencies = [
+ "avila-consensus",
  "avila-core",
+ "avila-p2p",
  "serde",
  "thiserror 2.0.20",
  "toml",

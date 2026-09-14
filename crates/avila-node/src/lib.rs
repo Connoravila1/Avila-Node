@@ -1,10 +1,12 @@
 //! Coordinator shared by the headless executable and egui application.
 //!
-//! Startup currently fails explicitly: consensus, storage, and P2P are not
-//! implemented. There is no mock validator or success-returning placeholder.
+//! Full-node startup currently fails explicitly: persistent services are not
+//! wired yet. There is no mock validator or success-returning placeholder.
+//! Live peer sync is available through [`sync::run`].
 
 pub mod config;
 pub mod events;
+pub mod sync;
 
 use avila_core::{CAPABILITIES, Lifecycle, NodeSnapshot, ValidatedConfig};
 use thiserror::Error;

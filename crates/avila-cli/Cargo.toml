@@ -16,6 +16,8 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
+avila-consensus.workspace = true
+avila-core.workspace = true
 avila-node.workspace = true
 clap.workspace = true
 serde_json.workspace = true

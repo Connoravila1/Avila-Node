@@ -129,7 +129,12 @@ Storage and synchronization research can use this implementation before P2P is r
       block connection through `Chainstate`, signet blocks passing
       BIP325 challenge verification.
 - [ ] Implement selected transport/privacy constraints together with traffic paths.
-- [ ] Add real sync, peer and resource observations to CLI and GUI.
+- [x] Add real sync, peer and resource observations to CLI and GUI
+      (CLI side): `avila-node sync` drives `avila-node::sync::run` —
+      DNS-seeded or `--connect`-specified peers, headers-first download
+      through `PeerManager<TcpStream>` with live progress (headers,
+      connected height, peer count, in-flight, connects/drops) and a
+      final report. GUI observation surface remains open.
 
 Evidence: multi-node sync/reorg tests, malformed and stalling peers, unavailable
 privacy routes, interrupted downloads and sustained synchronization all have tested
