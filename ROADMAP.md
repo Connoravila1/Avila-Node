@@ -166,7 +166,11 @@ operation. Compare complete initial download and catch-up, not only local replay
       Orphan pool and disconnected-block reinsertion landed with it;
       ancestor/descendant package limits (Core's 25-entry / 101 kvB
       caps) are enforced at admission.
-- [ ] Provide replayable policy explanations and isolated shadow-policy evaluation.
+- [x] Replayable policy explanations: `Mempool::explain_tx` dry-runs
+      every admission gate (context-free, resolution, BIP125 signal and
+      fee, package limits, consensus inputs, BIP68, scripts, relay fee,
+      capacity) and returns a per-gate trace without mutating the pool.
+      Isolated shadow-policy evaluation remains open.
 - [ ] Deliver authenticated/versioned control, a tested Core RPC compatibility matrix,
   watch-only descriptors, wallet broadcast, fee information and scoped service access.
 - [ ] Deliver Electrum/compact-filter services with tested clients and explicit index coverage.

@@ -120,6 +120,18 @@ pub const MAX_ORPHANS: usize = 100;
 /// Core's `ORPHAN_TX_EXPIRE_TIME` — orphans live at most 20 minutes.
 pub const ORPHAN_EXPIRE_SECS: u32 = 20 * 60;
 
+/// One admission gate's outcome in a policy explanation.
+#[derive(Clone, Debug)]
+pub struct PolicyStep {
+    /// Which gate (`"input-resolution"`, `"bip125-fee"`, …).
+    pub gate: &'static str,
+    /// Whether the tx passed this gate.
+    pub passed: bool,
+    /// What the gate observed — source of each input, fee computed,
+    /// or the reject reason.
+    pub detail: String,
+}
+
 /// A parked orphan — a tx with unresolved inputs, kept for when its
 /// parents arrive.
 #[derive(Clone, Debug)]
@@ -230,6 +242,297 @@ impl Mempool {
             height: cs.tree().tip().height,
             coinbase: false,
         })
+    }
+
+    /// Dry-runs every admission gate and reports each outcome — the
+    /// replayable policy explanation. Never mutates the pool: a
+    /// missing-input tx is *reported* as unresolvable, not parked.
+    pub fn explain_tx(
+        &self,
+        tx: &Transaction,
+        cs: &avila_consensus::chainstate::Chainstate,
+        _now: u32,
+    ) -> Vec<PolicyStep> {
+        fn push(
+            steps: &mut Vec<PolicyStep>,
+            gate: &'static str,
+            r: Result<String, String>,
+        ) -> bool {
+            let (passed, detail) = match r {
+                Ok(d) => (true, d),
+                Err(d) => (false, d),
+            };
+            steps.push(PolicyStep {
+                gate,
+                passed,
+                detail,
+            });
+            passed
+        }
+        let mut steps = Vec::new();
+
+        if !push(
+            &mut steps,
+            "context-free",
+            check_transaction(tx)
+                .map(|()| format!("{} in, {} out", tx.inputs.len(), tx.outputs.len()))
+                .map_err(|e: TxRuleError| e.to_string()),
+        ) {
+            return steps;
+        }
+        if tx.is_coinbase() {
+            push(&mut steps, "coinbase", Err("coinbase".into()));
+            return steps;
+        }
+        if !push(
+            &mut steps,
+            "already-known",
+            if self.map.contains_key(&tx.txid()) {
+                Err("txn-already-in-mempool".into())
+            } else {
+                Ok("new".into())
+            },
+        ) {
+            return steps;
+        }
+        if !push(
+            &mut steps,
+            "weight-cap",
+            if tx.weight() > MAX_STANDARD_TX_WEIGHT {
+                Err(format!(
+                    "tx-size: {} > {MAX_STANDARD_TX_WEIGHT}",
+                    tx.weight()
+                ))
+            } else {
+                Ok(format!("weight {}", tx.weight()))
+            },
+        ) {
+            return steps;
+        }
+
+        let mut spent = Vec::with_capacity(tx.inputs.len());
+        let mut missing = 0usize;
+        let mut from_pool = 0usize;
+        let mut conflicts: Vec<Txid> = Vec::new();
+        for input in &tx.inputs {
+            if let Some(coin) = cs.utxo().get(&input.previous_output) {
+                spent.push(coin.clone());
+            } else if self
+                .map
+                .get(&input.previous_output.txid)
+                .and_then(|parent| parent.tx.outputs.get(input.previous_output.vout as usize))
+                .is_some_and(|out| {
+                    spent.push(Coin {
+                        out: out.clone(),
+                        height: cs.tree().tip().height,
+                        coinbase: false,
+                    });
+                    true
+                })
+            {
+                from_pool += 1;
+            } else {
+                missing += 1;
+            }
+            if let Some(&conflict) = self.spends.get(&input.previous_output)
+                && !conflicts.contains(&conflict)
+            {
+                conflicts.push(conflict);
+            }
+        }
+        if !push(
+            &mut steps,
+            "input-resolution",
+            if missing > 0 {
+                Err(format!(
+                    "bad-txns-inputs-missingorspent: {missing} of {} unresolved",
+                    tx.inputs.len()
+                ))
+            } else {
+                Ok(format!(
+                    "{} resolved ({} via pool parents)",
+                    spent.len(),
+                    from_pool
+                ))
+            },
+        ) {
+            return steps;
+        }
+
+        if !push(
+            &mut steps,
+            "bip125-signal",
+            if conflicts.is_empty() {
+                Ok("no conflicts".into())
+            } else if conflicts
+                .iter()
+                .all(|id| self.map.get(id).is_some_and(|e| Self::signals_rbf(&e.tx)))
+                && Self::signals_rbf(tx)
+            {
+                Ok(format!("replaces {} conflict(s)", conflicts.len()))
+            } else {
+                Err("txn-mempool-conflict: insufficient RBF signaling".into())
+            },
+        ) {
+            return steps;
+        }
+
+        let vsize = tx.weight().div_ceil(4);
+        let ancestors = self.ancestors_of(tx);
+        let ancestor_vsize: usize = ancestors
+            .iter()
+            .filter_map(|id| self.map.get(id))
+            .map(|e| e.vsize)
+            .sum();
+        let mut limit_violation = if ancestors.len() + 1 > ANCESTOR_LIMIT {
+            Some(format!(
+                "{} ancestors > {ANCESTOR_LIMIT}",
+                ancestors.len() + 1
+            ))
+        } else if ancestor_vsize + vsize > ANCESTOR_SIZE_LIMIT_KVB * 1000 {
+            Some(format!(
+                "ancestor size {} > {} vB",
+                ancestor_vsize + vsize,
+                ANCESTOR_SIZE_LIMIT_KVB * 1000
+            ))
+        } else {
+            None
+        };
+        if limit_violation.is_none() {
+            for ancestor in &ancestors {
+                let (count, size) = self.descendants_of(ancestor);
+                if count + 1 > DESCENDANT_LIMIT {
+                    limit_violation =
+                        Some(format!("descendants {} > {DESCENDANT_LIMIT}", count + 1));
+                    break;
+                }
+                if size + vsize > DESCENDANT_SIZE_LIMIT_KVB * 1000 {
+                    limit_violation = Some(format!(
+                        "descendant size {} > {} vB",
+                        size + vsize,
+                        DESCENDANT_SIZE_LIMIT_KVB * 1000
+                    ));
+                    break;
+                }
+            }
+        }
+        if !push(
+            &mut steps,
+            "package-limits",
+            match limit_violation {
+                None => Ok(format!(
+                    "{} ancestors, {} vB package",
+                    ancestors.len(),
+                    ancestor_vsize + vsize
+                )),
+                Some(w) => Err(format!("too-long-mempool-chain: {w}")),
+            },
+        ) {
+            return steps;
+        }
+
+        let tip = cs.tip_hash();
+        let next_height = cs.tree().tip().height + 1;
+        let mut overlay = UtxoSet::new();
+        for (input, coin) in tx.inputs.iter().zip(spent.iter()) {
+            overlay.insert_synthetic(input.previous_output, coin.clone());
+        }
+        let fee = match check_tx_inputs(tx, &overlay, next_height) {
+            Ok((_, fee)) => {
+                push(&mut steps, "consensus-inputs", Ok(format!("fee {fee} sat")));
+                fee
+            }
+            Err(e) => {
+                push(&mut steps, "consensus-inputs", Err(e.to_string()));
+                return steps;
+            }
+        };
+
+        if !conflicts.is_empty() {
+            let conflict_fees: i64 = conflicts
+                .iter()
+                .filter_map(|id| self.map.get(id))
+                .map(|e| e.fee)
+                .sum();
+            let required = conflict_fees + INCREMENTAL_RELAY_FEE * vsize as i64 / 1000;
+            if !push(
+                &mut steps,
+                "bip125-fee",
+                if fee < required {
+                    Err(format!("txn-mempool-conflict: {fee} < required {required}"))
+                } else {
+                    Ok(format!("{fee} >= required {required}"))
+                },
+            ) {
+                return steps;
+            }
+        }
+
+        if cs.tree().params().csv_height <= next_height {
+            let mtp = cs.tree().median_time_past(&tip);
+            let ok = mtp.is_some_and(|m| {
+                bip68_locks_satisfied(tx, &spent, next_height, m, cs.tree(), &tip)
+            });
+            if !push(
+                &mut steps,
+                "bip68",
+                if ok {
+                    Ok(format!("locks satisfied (mtp {})", mtp.unwrap_or(0)))
+                } else {
+                    Err("non-BIP68-final".into())
+                },
+            ) {
+                return steps;
+            }
+        }
+
+        let flags = standard_script_flags(cs, next_height, &tip);
+        let spent_outs: Vec<_> = spent.iter().map(|c| c.out.clone()).collect();
+        if !push(
+            &mut steps,
+            "scripts",
+            check_input_scripts(tx, &spent_outs, flags)
+                .map(|()| "all inputs verified".to_string())
+                .map_err(|e| format!("mandatory-script-verify-flag-failed ({e})")),
+        ) {
+            return steps;
+        }
+
+        if !push(
+            &mut steps,
+            "min-relay-fee",
+            if fee * 1000 < self.min_relay_fee * vsize as i64 {
+                Err(format!("min relay fee not met: {fee} sat for {vsize} vB"))
+            } else {
+                Ok(format!("{fee} sat for {vsize} vB"))
+            },
+        ) {
+            return steps;
+        }
+
+        push(
+            &mut steps,
+            "capacity",
+            if self.map.len() < self.max_entries {
+                Ok(format!("{}/{} entries", self.map.len(), self.max_entries))
+            } else {
+                let my_rate = fee * 1000 / vsize as i64;
+                match self
+                    .map
+                    .iter()
+                    .min_by_key(|(_, e)| e.fee * 1000 / e.vsize.max(1) as i64)
+                {
+                    Some((_, worst)) if my_rate > worst.fee * 1000 / worst.vsize.max(1) as i64 => {
+                        Ok(format!(
+                            "full; would evict rate {}",
+                            worst.fee * 1000 / worst.vsize.max(1) as i64
+                        ))
+                    }
+                    _ => Err("mempool full".into()),
+                }
+            },
+        );
+        steps
     }
 
     /// `AcceptToMemoryPool` for a single transaction (no package
@@ -965,5 +1268,46 @@ mod tests {
             pool.accept_tx(over, &cs, NOW),
             Err(MempoolReject::PackageLimits)
         );
+    }
+
+    #[test]
+    fn explain_traces_every_gate() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let steps = pool.explain_tx(&tx, &cs, NOW);
+        // Every gate passed, in order, and nothing was pooled.
+        assert!(steps.iter().all(|s| s.passed), "{steps:?}");
+        assert_eq!(steps.first().unwrap().gate, "context-free");
+        assert_eq!(steps.last().unwrap().gate, "capacity");
+        assert!(pool.is_empty());
+        pool.accept_tx(tx.clone(), &cs, NOW).unwrap();
+
+        // The same tx explained again reports the duplicate.
+        let steps = pool.explain_tx(&tx, &cs, NOW);
+        let dup = steps.iter().find(|s| s.gate == "already-known").unwrap();
+        assert!(!dup.passed);
+        assert!(dup.detail.contains("already-in-mempool"));
+    }
+
+    #[test]
+    fn explain_reports_the_failing_gate() {
+        let (cs, _b) = chainstate_at(5);
+        let pool = Mempool::new();
+        let tx = spend_tx(
+            OutPoint {
+                txid: Txid::ZERO,
+                vout: 0,
+            },
+            1_000,
+            SEQ_FINAL,
+        );
+        let steps = pool.explain_tx(&tx, &cs, NOW);
+        let last = steps.last().unwrap();
+        assert_eq!(last.gate, "input-resolution");
+        assert!(!last.passed);
+        assert!(last.detail.contains("missingorspent"));
+        // Orphan parking must not happen in explain mode.
+        assert_eq!(pool.orphan_count(), 0);
     }
 }

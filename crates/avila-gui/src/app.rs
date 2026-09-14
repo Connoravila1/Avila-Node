@@ -412,6 +412,13 @@ impl AvilaApp {
                     ui.label(mono(tip));
                     ui.label(muted("·"));
                     ui.label(muted(format!("peers {}", p.peers)));
+                    if p.mempool.0 > 0 || p.mempool.1 > 0 {
+                        ui.label(muted("·"));
+                        ui.label(muted(format!("pool {}", p.mempool.0)));
+                        if p.mempool.1 > 0 {
+                            ui.label(muted(format!("+{} orphans", p.mempool.1)));
+                        }
+                    }
                 } else {
                     ui.label(muted("no chain data"));
                 }
