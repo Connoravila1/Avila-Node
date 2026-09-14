@@ -50,6 +50,9 @@ enum Command {
         /// Explicit peer addr:port (repeatable); DNS seeds are also used.
         #[arg(long)]
         connect: Vec<SocketAddr>,
+        /// Route all outbound connections through this SOCKS5 proxy.
+        #[arg(long)]
+        proxy: Option<SocketAddr>,
     },
 }
 
@@ -84,6 +87,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             max_peers,
             timeout_secs,
             connect,
+            proxy,
         } => {
             use avila_consensus::params::Network as ConsensusNet;
             let network = config.get().network;
@@ -99,6 +103,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 target_height: blocks,
                 max_peers,
                 timeout: Duration::from_secs(timeout_secs),
+                proxy,
             };
             println!("Syncing {network} (target height {blocks}, {max_peers} peers max)...");
             let mut last = (u32::MAX, u32::MAX);

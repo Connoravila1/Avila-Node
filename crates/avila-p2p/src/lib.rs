@@ -26,6 +26,7 @@ pub mod addrman;
 pub mod codec;
 pub mod manager;
 pub mod message;
+pub mod proxy;
 pub mod session;
 pub mod sync;
 

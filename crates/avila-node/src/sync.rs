@@ -23,6 +23,9 @@ pub struct SyncConfig {
     pub max_peers: usize,
     /// Wall-clock bound on the whole run.
     pub timeout: Duration,
+    /// Optional SOCKS5 proxy for all outbound connections (Core's
+    /// `-proxy`); DNS-seeded and explicit dials both route through it.
+    pub proxy: Option<SocketAddr>,
 }
 
 impl Default for SyncConfig {
@@ -32,6 +35,7 @@ impl Default for SyncConfig {
             target_height: 100,
             max_peers: 8,
             timeout: Duration::from_secs(120),
+            proxy: None,
         }
     }
 }
@@ -110,7 +114,17 @@ pub fn run(
     let seeded = mgr.seed_from_dns(params, unix_now());
     let mut dialed = 0usize;
     for addr in &cfg.connect {
-        if let Ok(Some(_)) = mgr.connect(*addr, params.message_start, 0, cs.chain().len() as i32) {
+        let attempted = match cfg.proxy {
+            Some(proxy) => mgr.connect_via(
+                &proxy,
+                &avila_p2p::proxy::SocksTarget::Ip(*addr),
+                params.message_start,
+                0,
+                cs.chain().len() as i32,
+            ),
+            None => mgr.connect(*addr, params.message_start, 0, cs.chain().len() as i32),
+        };
+        if let Ok(Some(_)) = attempted {
             dialed += 1;
         }
     }

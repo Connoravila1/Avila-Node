@@ -128,7 +128,13 @@ Storage and synchronization research can use this implementation before P2P is r
       handshakes, thousands of headers (retargets included) and real
       block connection through `Chainstate`, signet blocks passing
       BIP325 challenge verification.
-- [ ] Implement selected transport/privacy constraints together with traffic paths.
+- [x] Implement selected transport/privacy constraints together with
+      traffic paths (partial): `avila-p2p::proxy` implements SOCKS5
+      no-auth CONNECT for IP and domain targets (the `.onion` path),
+      `PeerManager::connect_via` runs the P2P session over the proxied
+      stream, and `avila-node sync --proxy` routes all dials through it
+      — proven live by syncing 16 regtest blocks through a SOCKS5
+      forwarder. BIP324 v2 transport remains open.
 - [x] Add real sync, peer and resource observations to CLI and GUI
       (CLI side): `avila-node sync` drives `avila-node::sync::run` —
       DNS-seeded or `--connect`-specified peers, headers-first download

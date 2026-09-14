@@ -579,6 +579,30 @@ impl PeerManager<TcpStream> {
         Ok(self.add(session, Some(crate::addrman::net_addr_of(addr, 0)), false))
     }
 
+    /// Connects to `target` through a SOCKS5 `proxy` and registers the
+    /// outbound session — Core's `-proxy`/`onion` traffic path. The
+    /// handshake itself runs over the proxied stream unchanged.
+    pub fn connect_via(
+        &mut self,
+        proxy: &SocketAddr,
+        target: &crate::proxy::SocksTarget,
+        magic: [u8; 4],
+        our_version: u64,
+        start_height: i32,
+    ) -> Result<Option<u64>, SessionError> {
+        let stream = crate::proxy::socks5_connect(proxy, target, Duration::from_secs(10))?;
+        stream.set_nonblocking(true)?;
+        stream.set_nodelay(true)?;
+        let remote = match target {
+            crate::proxy::SocksTarget::Ip(addr) => crate::addrman::net_addr_of(*addr, 0),
+            // A domain target has no numeric address to gossip.
+            crate::proxy::SocksTarget::Domain(..) => NetAddr::unspecified(),
+        };
+        let version = build_version(our_version, start_height, remote);
+        let session = PeerSession::initiate(stream, magic, version, SEND_BUDGET_PER_PEER)?;
+        Ok(self.add(session, Some(remote), false))
+    }
+
     /// Resolves `params.dns_seeds` into the address book — the bootstrap
     /// path for real networks (regtest ships no seeds). Returns how many
     /// addresses were learned. Blocking DNS; run before the tick loop.
