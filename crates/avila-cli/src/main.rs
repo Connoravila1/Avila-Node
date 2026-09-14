@@ -33,8 +33,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Start the node (currently fails until required subsystems exist).
-    Run,
+    /// Run the node: sync to tip, then keep serving and relaying until killed.
+    Run {
+        /// Explicit peer addr:port (repeatable); DNS seeds are also used.
+        #[arg(long)]
+        connect: Vec<SocketAddr>,
+        /// Route all outbound connections through this SOCKS5 proxy.
+        #[arg(long)]
+        proxy: Option<SocketAddr>,
+    },
     /// Sync headers and blocks from live peers (headers-first, full
     /// consensus validation). Bounded by target height and timeout.
     Sync {
@@ -89,7 +96,43 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        Command::Run => Node::new(config)?.start()?,
+        Command::Run { connect, proxy } => {
+            // A real daemon: unbounded headers-first sync — sync to the
+            // tip, then keep serving, relaying, and announcing until
+            // killed. The store resumes from the last snapshot.
+            use avila_consensus::params::Network as ConsensusNet;
+            let consensus_net = match config.get().network {
+                avila_core::Network::Mainnet => ConsensusNet::Mainnet,
+                avila_core::Network::Testnet4 => ConsensusNet::Testnet4,
+                avila_core::Network::Signet => ConsensusNet::Signet,
+                avila_core::Network::Regtest => ConsensusNet::Regtest,
+            };
+            let params = consensus_net.params();
+            let cfg = SyncConfig {
+                connect,
+                target_height: u32::MAX,
+                max_peers: 8,
+                timeout: Duration::from_secs(u64::MAX),
+                proxy,
+                data_dir: Some(config.network_data_dir()),
+                cancel: None,
+                prune_bytes: None,
+            };
+            println!(
+                "Running {} — syncing to tip, then serving (Ctrl+C to stop)...",
+                config.get().network
+            );
+            let mut last_print = Instant::now();
+            let _ = run_sync(&params, &cfg, |p| {
+                if last_print.elapsed() >= Duration::from_secs(5) {
+                    last_print = Instant::now();
+                    println!(
+                        "  h {} | headers {} | peers {} | pool {}+{}orph",
+                        p.connected_height, p.header_height, p.peers, p.mempool.0, p.mempool.1,
+                    );
+                }
+            })?;
+        }
         Command::Sync {
             blocks,
             max_peers,

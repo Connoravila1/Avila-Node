@@ -143,7 +143,10 @@ Storage and synchronization research can use this implementation before P2P is r
       DNS-seeded or `--connect`-specified peers, headers-first download
       through `PeerManager<TcpStream>` with live progress (headers,
       connected height, peer count, in-flight, connects/drops) and a
-      final report. GUI observation surface remains open.
+      final report. GUI side: `avila-gui` auto-starts sync on launch,
+      shows a health verdict, live headers/connected rails, a
+      recent-blocks tape, a per-peer table (claims vs. served), and
+      pool/orphan/fee observations in the chain ticker.
 
 Evidence: multi-node sync/reorg tests, malformed and stalling peers, unavailable
 privacy routes, interrupted downloads and sustained synchronization all have tested
@@ -152,6 +155,11 @@ operation. Compare complete initial download and catch-up, not only local replay
 
 ### G4 — Complete everyday node and service workflows
 
+- [x] Persistent operation: `avila-node run` is a real daemon —
+      unbounded headers-first sync with the block store resuming
+      across restarts, then continuous peer service, relay and tip
+      announcements until stopped (`--connect`, `--proxy` supported).
+      Control channel (RPC) remains open.
 - [x] Implement mempool admission, packages, replacement, eviction,
       relay and reorg reconciliation (first slice): `avila-mempool`
       applies consensus input/script checks identically to block
