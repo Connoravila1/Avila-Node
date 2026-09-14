@@ -5,3 +5,5 @@
 .env
 .DS_Store
 # Cargo.lock belongs in version control for this application workspace.
+# Worktrees created by tooling for isolated agent runs.
+/.claude/worktrees/
