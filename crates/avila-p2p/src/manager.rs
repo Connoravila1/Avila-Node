@@ -545,6 +545,12 @@ impl<S: Read + Write> PeerManager<S> {
         self.peers.values().map(|p| p.sync.in_flight()).sum()
     }
 
+    /// The address book — peer discovery history (persist it alongside
+    /// the chainstate so restarts keep their peer candidates).
+    pub fn addrbook(&mut self) -> &mut AddrBook {
+        &mut self.addrbook
+    }
+
     /// The peers' ids (for scheduling decisions above this layer).
     #[must_use]
     pub fn peer_ids(&self) -> Vec<u64> {

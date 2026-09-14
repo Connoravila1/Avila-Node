@@ -24,6 +24,10 @@ pub const ADDR_TABLE_CAP: usize = 4096;
 /// i.e. 23% of its table).
 pub const GETADDR_REPLY_MAX: usize = 1000;
 
+/// `peers.dat` file magic + format version.
+const PEERS_MAGIC: [u8; 6] = *b"APEERS";
+const PEERS_VERSION: u32 = 1;
+
 /// One gossiped address with what we've learned about it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddrInfo {
@@ -155,6 +159,85 @@ impl AddrBook {
             .take(GETADDR_REPLY_MAX)
             .map(|e| e.addr)
             .collect()
+    }
+
+    /// Writes the table to `path` — Core's `peers.dat`: versioned,
+    /// checksummed, and atomic (tmp + rename) so a crash mid-write never
+    /// leaves a torn file. A corrupted file just loses gossip history —
+    /// never consensus state.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use avila_consensus::encode::write_compact_size;
+        let mut body = Vec::with_capacity(self.table.len() * 32);
+        body.extend_from_slice(&PEERS_VERSION.to_le_bytes());
+        write_compact_size(&mut body, self.table.len() as u64);
+        for e in self.table.values() {
+            body.extend_from_slice(&e.last_seen.to_le_bytes());
+            body.push(u8::from(e.tried));
+            body.push(e.attempts);
+            body.extend_from_slice(&e.addr.services.to_le_bytes());
+            body.extend_from_slice(&e.addr.ip);
+            body.extend_from_slice(&e.addr.port.to_le_bytes());
+        }
+        let mut out = PEERS_MAGIC.to_vec();
+        out.extend_from_slice(&avila_consensus::hash::sha256d(&body));
+        out.extend_from_slice(&body);
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &out)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Loads a saved table, replacing this book's contents. Returns the
+    /// number of entries restored; a missing file yields an empty book
+    /// (`Ok(0)`), a corrupt one is an error the caller may ignore.
+    pub fn load(&mut self, path: &std::path::Path, now: u32) -> std::io::Result<usize> {
+        use avila_consensus::encode::Decoder;
+        let raw = match std::fs::read(path) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed peers file");
+        if raw.len() < PEERS_MAGIC.len() + 32 + 4 || raw[..6] != PEERS_MAGIC[..] {
+            return Err(bad());
+        }
+        let body = &raw[PEERS_MAGIC.len() + 32..];
+        if avila_consensus::hash::sha256d(body) != raw[PEERS_MAGIC.len()..PEERS_MAGIC.len() + 32] {
+            return Err(bad());
+        }
+        let mut d = Decoder::new(body);
+        let version = d.read_u32_le().map_err(|_| bad())?;
+        if version != PEERS_VERSION {
+            return Err(bad());
+        }
+        let count = d.read_compact_size().map_err(|_| bad())?;
+        if count > ADDR_TABLE_CAP as u64 {
+            return Err(bad());
+        }
+        *self = Self::with_cap(self.cap);
+        for _ in 0..count {
+            let last_seen = d.read_u32_le().map_err(|_| bad())?;
+            let tried = d.read_u8().map_err(|_| bad())? != 0;
+            let attempts = d.read_u8().map_err(|_| bad())?;
+            let services = d.read_u64_le().map_err(|_| bad())?;
+            let ip = d.read_array::<16>().map_err(|_| bad())?;
+            let port = d.read_u16_le().map_err(|_| bad())?;
+            let addr = NetAddr { services, ip, port };
+            if !self.table.contains_key(&addr) {
+                self.seq.insert(addr, self.next_seq);
+                self.next_seq += 1;
+                self.table.insert(
+                    addr,
+                    AddrInfo {
+                        addr,
+                        last_seen: last_seen.min(now),
+                        tried,
+                        attempts,
+                    },
+                );
+            }
+        }
+        d.finish().map_err(|_| bad())?;
+        Ok(self.table.len())
     }
 
     /// Oldest-seen entries go first when the cap binds.
@@ -289,6 +372,47 @@ mod tests {
         let sample = book.sample();
         assert_eq!(sample.len(), 10);
         assert_eq!(sample[0], addr(9, 8333));
+    }
+
+    #[test]
+    fn peers_file_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("apeers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("peers.dat");
+        let mut book = AddrBook::new();
+        book.add(addr(1, 8333), 100, 200);
+        book.add(addr(2, 18333), 150, 200);
+        book.mark_tried(&addr(1, 8333));
+        book.mark_attempt(&addr(2, 18333));
+        book.save(&path).unwrap();
+
+        let mut fresh = AddrBook::new();
+        assert_eq!(fresh.load(&path, 200).unwrap(), 2);
+        assert!(fresh.table[&addr(1, 8333)].tried, "tried flag survives");
+        assert_eq!(fresh.table[&addr(2, 18333)].attempts, 1);
+        assert_eq!(fresh.table[&addr(2, 18333)].last_seen, 150);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peers_file_missing_and_corrupt() {
+        let dir = std::env::temp_dir().join(format!("apeers-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("peers.dat");
+        // Missing → empty book, no error.
+        let mut book = AddrBook::new();
+        assert_eq!(book.load(&path, 0).unwrap(), 0);
+        // Corrupt checksum → error, book untouched.
+        let mut good = AddrBook::new();
+        good.add(addr(9, 8333), 100, 200);
+        good.save(&path).unwrap();
+        let mut raw = std::fs::read(&path).unwrap();
+        let n = raw.len();
+        raw[n - 1] ^= 0xff;
+        std::fs::write(&path, &raw).unwrap();
+        assert!(book.load(&path, 0).is_err());
+        assert!(book.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

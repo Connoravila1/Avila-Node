@@ -97,7 +97,10 @@ Storage and synchronization research can use this implementation before P2P is r
       driving session+sync pairs over one `Chainstate`). `getaddr` is
       served from the book, `addr`/`addrv2` gossip is ingested, DNS-seed
       bootstrap resolves `vSeeds` per network, and `tick_net` redials
-      from the book on disconnect. Proven live: `examples/mainnet_probe`
+      from the book on disconnect. The book persists as `peers.dat`
+      (versioned, sha256d-checksummed, atomic) under the sync data dir —
+      restarts keep learned candidates; a corrupt file costs only
+      gossip history. Proven live: `examples/mainnet_probe`
       resolved 291 mainnet candidates, dialed four real Core/Knots
       peers, and validated 4000 mainnet headers — including the h2016
       retarget — through `Chainstate`.

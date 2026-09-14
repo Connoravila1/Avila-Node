@@ -125,6 +125,11 @@ pub fn run(
     let mut mgr = PeerManager::new(cfg.max_peers);
     let started = Instant::now();
 
+    // peers.dat — restart keeps learned candidates; a corrupt file just
+    // costs us gossip history, so load errors are ignored by design.
+    if let Some(dir) = &cfg.data_dir {
+        let _ = mgr.addrbook().load(&dir.join("peers.dat"), unix_now());
+    }
     let seeded = mgr.seed_from_dns(params, unix_now());
     let mut dialed = 0usize;
     for addr in &cfg.connect {
@@ -181,8 +186,9 @@ pub fn run(
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    if cfg.data_dir.is_some() {
+    if let Some(dir) = &cfg.data_dir {
         cs.flush().map_err(SyncError::Store)?;
+        mgr.addrbook().save(&dir.join("peers.dat"))?;
     }
 
     Ok(SyncReport {
