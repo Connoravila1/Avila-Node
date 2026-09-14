@@ -37,8 +37,9 @@ measurements remain unknown. This gate establishes an application, not a Bitcoin
 - [ ] Record the validation-engine decision, trusted dependencies and extraction boundaries.
 - [x] Implement bounded decoding, transaction/witness identities, headers, target arithmetic,
   proof of work, linkage, chainwork and explicit network parameters.
-- [ ] Inventory historical and activated consensus rules with valid/invalid fixtures,
+- [x] Inventory historical and activated consensus rules with valid/invalid fixtures,
   activation context and provenance; start mainnet cases immediately.
+  See docs/RULE_INVENTORY.md and fixtures/manifest.json.
 - [ ] Add a pinned Core reference adapter, parser/arithmetic fuzzing and disagreement artifacts.
 - [ ] Implement the scorecard runner: exact manifests, raw measurements, correctness checks,
   cold/warm workloads and reproducible reference runs.
