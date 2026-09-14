@@ -477,6 +477,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "avila-p2p"
+version = "0.1.0-dev"
+dependencies = [
+ "avila-consensus",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "base58ck"
 version = "0.1.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"

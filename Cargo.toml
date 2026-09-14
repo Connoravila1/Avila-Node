@@ -4,6 +4,7 @@ members = [
     "crates/avila-core",
     "crates/avila-consensus",
     "crates/avila-node",
+    "crates/avila-p2p",
     "crates/avila-cli",
     "crates/avila-gui",
 ]
@@ -22,6 +23,7 @@ publish = false
 avila-core = { path = "crates/avila-core" }
 avila-consensus = { path = "crates/avila-consensus" }
 avila-node = { path = "crates/avila-node" }
+avila-p2p = { path = "crates/avila-p2p" }
 clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
