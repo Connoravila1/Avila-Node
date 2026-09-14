@@ -64,17 +64,23 @@ consult (`GetOp`-equivalent instruction iteration, `GetSigOpCount`, `IsPushOnly`
 `IsPayToScriptHash`, `IsWitnessProgram`, `CScriptNum`/push encodings). Every error
 exposes Core's reject-reason string via `RuleError::reason`, and the block-level
 differential adapter (`tools/check_blocks_core.py` + `examples/check_blocks.rs`)
-verifies those reasons against a live daemon's `submitblock`: **29 corpus blocks
-compared, zero verdict mismatches** — every named violation above returns Core's
-exact reason, including the order-dependent cases (`bad-blk-length` beats
-`bad-txns-oversize`; `bad-txns-duplicate` fires only for a natural-pair leaf
-duplication, matching Core's scan-before-padding merkle semantics). The first
-run caught a real divergence: `push_int` used raw data pushes for heights
+verifies those reasons against a live daemon's `submitblock`: **31 corpus
+submissions and 9 real block fixtures compared, zero verdict mismatches** —
+every named violation above returns Core's exact reason, including the
+order-dependent cases (`bad-blk-length` beats `bad-txns-oversize`;
+`bad-txns-duplicate` fires only for a natural-pair leaf duplication, matching
+Core's scan-before-padding merkle semantics). Valid controls include a height-2
+child the daemon actually connects, a witness-committed block, a duplicate
+resubmission (`accepted-known` ↔ `duplicate`), and real mainnet block 1 —
+which the daemon connects end-to-end (ConnectBlock included). The first run
+caught a real divergence: `push_int` used raw data pushes for heights
 1..=16 where `CScript() << nHeight` emits `OP_1..OP_16` — fixed, with the
 daemon's `bad-cb-height` as the witness. One documented layer difference: our
 4,000,000-byte block-decode cap pre-rejects what Core reports as
 `bad-blk-weight` (any block that size is necessarily overweight, so the
-verdict is identical; only the layer differs).
+verdict is identical; only the layer differs). Signet block 1 is the single
+*expected* divergence — the daemon verifies its real BIP325 solution while we
+return the explicit `bad-signet-blksig-unchecked` stub.
 
 | Rule | Core anchor | Implementation | Valid coverage | Invalid coverage |
 | --- | --- | --- | --- | --- |
@@ -172,11 +178,13 @@ Not defects — scope boundaries for later gates:
   real BIP94-enforced headers, signet 2047, regtest 295 incl. bad-diffbits /
   high-hash / time-too-old / time-too-new / orphan / duplicate agreement).
   `tools/check_blocks_core.py` (+ `examples/check_blocks.rs`) does the same at
-  block level: it generates a regtest corpus (one valid block plus one per
-  implemented rule violation), replays it through `submitblock`, and compares
-  verdicts reason-for-reason — **29 blocks, zero verdict mismatches**, and it
-  caught the `push_int`/`OP_N` divergence described above on its first run.
-  Both artifacts record the reference binary's version and sha256.
+  block level: it generates a stateful regtest corpus (valid controls plus one
+  violation per implemented rule, replayed through a shared `HeaderTree` in
+  `check-many` mode), submits each block through `submitblock`, and replays the
+  committed real block fixtures on per-network daemons — **40 submissions, zero
+  unexplained mismatches**, and it caught the `push_int`/`OP_N` divergence
+  described above on its first run. Both artifacts record the reference
+  binary's version and sha256.
   Coverage-guided fuzzing exists (`fuzz/`, libFuzzer via cargo-fuzz): six
   targets over header/transaction/block decoding, CompactSize canonicality,
   compact-target arithmetic and merkle roots; ~14M executions across a

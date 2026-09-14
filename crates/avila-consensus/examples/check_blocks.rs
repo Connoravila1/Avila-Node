@@ -5,21 +5,24 @@
 //!
 //! Usage:
 //!   `check-blocks check <network> <block.bin> <now>`
+//!   `check-blocks check-many <network> <now> <block.bin>...`
 //!   `check-blocks gen-corpus <outdir>`
 //!
-//! In `check` mode the pipeline mirrors Core's `ProcessNewBlock` order:
-//! header insertion (`AcceptBlockHeader`/`ContextualCheckBlockHeader`) into a
-//! [`HeaderTree`] seeded with the network genesis, then [`check::check_block`]
-//! (`CheckBlock`), then [`check::contextual_check_block`]
-//! (`ContextualCheckBlock`). The corpus blocks all build directly on genesis,
-//! so the parent is always in the tree and its median-time-past is derivable.
-//! Output is `<verdict>\t<detail>` where `<verdict>` is `accepted`,
-//! `accepted-known`, or `rejected:<reason>` with the reason token matching the
-//! reject reason the reference daemon reports for the equivalent failure.
+//! The pipeline mirrors Core's `ProcessNewBlock` order: header insertion
+//! (`AcceptBlockHeader`/`ContextualCheckBlockHeader`) into a [`HeaderTree`]
+//! seeded with the network genesis, then [`check::check_block`] (`CheckBlock`),
+//! then [`check::contextual_check_block`] (`ContextualCheckBlock`). `check`
+//! uses a fresh tree per invocation; `check-many` shares one tree across all
+//! input blocks in order — like the daemon's block index — so later blocks may
+//! build on earlier accepted ones and resubmissions report `accepted-known`.
+//! Output lines are `<name>\t<verdict>\t<detail>` where `<verdict>` is
+//! `accepted`, `accepted-known`, or `rejected:<reason>` with the reason token
+//! matching the reject reason the reference daemon reports.
 //!
 //! `gen-corpus` writes `<name>.bin` files plus a `manifest.json` recording each
-//! block's expected verdict — every entry is produced by `validate`, so the
-//! manifest reflects the implementation's actual behavior, not an assertion.
+//! block's expected verdict — every entry is produced by `validate` against a
+//! shared tree in manifest order, so the manifest reflects the
+//! implementation's actual stateful behavior, not an assertion.
 
 use std::env;
 use std::fs;
@@ -73,9 +76,12 @@ fn core_reason_header(err: &ChainError) -> String {
     }
 }
 
-/// Runs the implemented pipeline and returns `(verdict, detail)`.
-fn validate(block: &Block, params: &Params, now: u32) -> (String, String) {
-    let mut tree = HeaderTree::new(*params);
+/// Runs the implemented pipeline against `tree` (shared across calls, like
+/// Core's block index) and returns `(verdict, detail)`. A header that passes
+/// insertion stays in the tree even when a later block-level rule rejects the
+/// block — matching Core, where `AcceptBlockHeader` commits the header to the
+/// block index before `CheckBlock` runs.
+fn validate(block: &Block, params: &Params, tree: &mut HeaderTree, now: u32) -> (String, String) {
     let height = match tree.insert(&block.header, now) {
         Ok(InsertStatus::Added { height }) => height,
         Ok(InsertStatus::AlreadyKnown { height }) => {
@@ -157,17 +163,16 @@ fn regtest_coinbase(height: u32) -> Transaction {
     }
 }
 
-/// Drafts a regtest height-1 block over `txs` with a correct merkle root, valid
-/// timestamps, and the regtest `nBits`. PoW is not ground — callers pass the
-/// result through `finish` after any intended mutations.
-fn draft_block(params: &Params, txs: Vec<Transaction>) -> Block {
-    let genesis = params.genesis_header;
+/// Drafts a regtest block over `txs` building on `parent` with a correct
+/// merkle root, `parent.time + 1`, and the regtest `nBits`. PoW is not ground —
+/// callers pass the result through `finish` after any intended mutations.
+fn draft_on(parent: &BlockHeader, txs: Vec<Transaction>) -> Block {
     let mut block = Block {
         header: BlockHeader {
             version: 4,
-            prev_block_hash: genesis.hash(),
-            merkle_root: genesis.merkle_root,
-            time: genesis.time + 1,
+            prev_block_hash: parent.hash(),
+            merkle_root: parent.merkle_root,
+            time: parent.time + 1,
             bits: CompactTarget(REGTEST_BITS),
             nonce: 0,
         },
@@ -176,6 +181,11 @@ fn draft_block(params: &Params, txs: Vec<Transaction>) -> Block {
     let (root, _) = block.merkle_root();
     block.header.merkle_root = root;
     block
+}
+
+/// Drafts a block on the network genesis — the usual corpus parent.
+fn draft_block(params: &Params, txs: Vec<Transaction>) -> Block {
+    draft_on(&params.genesis_header, txs)
 }
 
 /// Recomputes the merkle root after transaction-list mutations, then grinds the
@@ -214,16 +224,18 @@ fn add_witness_commitment(block: &mut Block, params: &Params) {
     fixup(block, params);
 }
 
-/// Runs `validate` on `block`, writes `<name>.bin`, and records the verdict.
+/// Runs `validate` on `block` against the shared corpus `tree`, writes
+/// `<name>.bin`, and records the verdict.
 fn emit(
     manifest: &mut Vec<(String, String)>,
     outdir: &Path,
     name: &str,
     block: &Block,
     params: &Params,
+    tree: &mut HeaderTree,
     now: u32,
 ) -> Result<(), String> {
-    let (verdict, _detail) = validate(block, params, now);
+    let (verdict, _detail) = validate(block, params, tree, now);
     let path = outdir.join(format!("{name}.bin"));
     fs::write(&path, block.encode()).map_err(|e| format!("write {}: {e}", path.display()))?;
     manifest.push((name.to_string(), verdict));
@@ -237,22 +249,49 @@ fn emit_tx_case(
     outdir: &Path,
     name: &str,
     params: &Params,
+    tree: &mut HeaderTree,
     now: u32,
     mutate: impl FnOnce(&mut Transaction),
 ) -> Result<(), String> {
     let mut tx = spend_tx();
     mutate(&mut tx);
     let block = finish(draft_block(params, vec![regtest_coinbase(1), tx]), params);
-    emit(manifest, outdir, name, &block, params, now)
+    emit(manifest, outdir, name, &block, params, tree, now)
 }
 
 fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
     let params = Network::Regtest.params();
     let mut manifest = Vec::new();
+    // One tree across the whole corpus: verdicts are stateful, matching how the
+    // daemon accumulates headers in its block index between submissions.
+    let mut tree = HeaderTree::new(params);
 
     // -- valid baseline ------------------------------------------------------
     let valid = finish(draft_block(&params, vec![regtest_coinbase(1)]), &params);
-    emit(&mut manifest, outdir, "00-valid", &valid, &params, now)?;
+    emit(
+        &mut manifest,
+        outdir,
+        "00-valid",
+        &valid,
+        &params,
+        &mut tree,
+        now,
+    )?;
+
+    // A valid child at height 2: exercises the pipeline past genesis+1 (the
+    // daemon will connect both blocks).
+    {
+        let child = finish(draft_on(&valid.header, vec![regtest_coinbase(2)]), &params);
+        emit(
+            &mut manifest,
+            outdir,
+            "05-valid-height2",
+            &child,
+            &params,
+            &mut tree,
+            now,
+        )?;
+    }
 
     // -- header rules (AcceptBlockHeader/ContextualCheckBlockHeader) ---------
 
@@ -264,7 +303,15 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         while pow::check_proof_of_work(&block.block_hash(), block.header.bits, &params).is_ok() {
             block.header.nonce += 1;
         }
-        emit(&mut manifest, outdir, "10-high-hash", &block, &params, now)?;
+        emit(
+            &mut manifest,
+            outdir,
+            "10-high-hash",
+            &block,
+            &params,
+            &mut tree,
+            now,
+        )?;
     }
 
     // bad-diffbits: PoW passes under the claimed bits, but required_bits at
@@ -281,6 +328,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "11-bad-diffbits",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -296,6 +344,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "12-time-too-old",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -311,6 +360,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "13-time-too-new",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -327,6 +377,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "14-bad-version",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -346,6 +397,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "20-bad-txnmrklroot",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -369,6 +421,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "21-bad-txns-duplicate",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -383,6 +436,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "22-bad-blk-length",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -396,6 +450,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "23-bad-cb-missing",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -414,26 +469,52 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "24-bad-cb-multiple",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
 
     // -- CheckTransaction (per-transaction, non-coinbase position) ------------
 
-    emit_tx_case(&mut manifest, outdir, "30-vin-empty", &params, now, |tx| {
-        tx.inputs.clear();
-    })?;
-    emit_tx_case(&mut manifest, outdir, "31-vout-empty", &params, now, |tx| {
-        tx.outputs.clear();
-    })?;
-    emit_tx_case(&mut manifest, outdir, "32-oversize", &params, now, |tx| {
-        tx.inputs[0].script_sig = Script::new(vec![0u8; 1_000_100]);
-    })?;
+    emit_tx_case(
+        &mut manifest,
+        outdir,
+        "30-vin-empty",
+        &params,
+        &mut tree,
+        now,
+        |tx| {
+            tx.inputs.clear();
+        },
+    )?;
+    emit_tx_case(
+        &mut manifest,
+        outdir,
+        "31-vout-empty",
+        &params,
+        &mut tree,
+        now,
+        |tx| {
+            tx.outputs.clear();
+        },
+    )?;
+    emit_tx_case(
+        &mut manifest,
+        outdir,
+        "32-oversize",
+        &params,
+        &mut tree,
+        now,
+        |tx| {
+            tx.inputs[0].script_sig = Script::new(vec![0u8; 1_000_100]);
+        },
+    )?;
     emit_tx_case(
         &mut manifest,
         outdir,
         "33-vout-negative",
         &params,
+        &mut tree,
         now,
         |tx| {
             tx.outputs[0].value = -1;
@@ -444,6 +525,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "34-vout-toolarge",
         &params,
+        &mut tree,
         now,
         |tx| {
             tx.outputs[0].value = check::MAX_MONEY + 1;
@@ -454,6 +536,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "35-txouttotal-toolarge",
         &params,
+        &mut tree,
         now,
         |tx| {
             tx.outputs[0].value = check::MAX_MONEY;
@@ -465,6 +548,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "36-inputs-duplicate",
         &params,
+        &mut tree,
         now,
         |tx| {
             tx.inputs.push(tx.inputs[0].clone());
@@ -475,6 +559,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         outdir,
         "37-prevout-null",
         &params,
+        &mut tree,
         now,
         |tx| {
             tx.inputs.push(txin(outpoint(9, 1), vec![]));
@@ -487,7 +572,15 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         let mut cb = regtest_coinbase(1);
         cb.inputs[0].script_sig = Script::new(vec![script::OP_1]);
         let block = finish(draft_block(&params, vec![cb]), &params);
-        emit(&mut manifest, outdir, "39-cb-length", &block, &params, now)?;
+        emit(
+            &mut manifest,
+            outdir,
+            "39-cb-length",
+            &block,
+            &params,
+            &mut tree,
+            now,
+        )?;
     }
 
     // bad-blk-sigops: legacy sigop cost above 80_000.
@@ -501,6 +594,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "40-bad-blk-sigops",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -509,10 +603,18 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
 
     // bad-txns-nonfinal: lock_time above the block height with a non-final
     // input sequence (height-based locktime needs no MTP).
-    emit_tx_case(&mut manifest, outdir, "50-nonfinal", &params, now, |tx| {
-        tx.lock_time = 2;
-        tx.inputs[0].sequence = 0;
-    })?;
+    emit_tx_case(
+        &mut manifest,
+        outdir,
+        "50-nonfinal",
+        &params,
+        &mut tree,
+        now,
+        |tx| {
+            tx.lock_time = 2;
+            tx.inputs[0].sequence = 0;
+        },
+    )?;
 
     // bad-cb-height: the coinbase pushes height 2 at block height 1.
     {
@@ -527,6 +629,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "51-bad-cb-height",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -543,6 +646,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "52-unexpected-witness",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -565,6 +669,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "53-bad-witness-nonce-size",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -586,6 +691,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "54-bad-witness-merkle-match",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -605,6 +711,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "55-bad-blk-weight",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -623,6 +730,7 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
             "56-valid-witness",
             &block,
             &params,
+            &mut tree,
             now,
         )?;
     }
@@ -633,7 +741,23 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
         let mut block = draft_block(&params, vec![regtest_coinbase(1)]);
         block.header.prev_block_hash = BlockHash::from_bytes([0x77; 32]);
         let block = finish(block, &params);
-        emit(&mut manifest, outdir, "57-orphan", &block, &params, now)?;
+        emit(
+            &mut manifest,
+            outdir,
+            "57-orphan",
+            &block,
+            &params,
+            &mut tree,
+            now,
+        )?;
+    }
+
+    // duplicate: resubmitting 00-valid — our shared tree reports
+    // `accepted-known`, the daemon's block index reports `duplicate`; both
+    // normalize to `accepted`.
+    {
+        let (verdict, _detail) = validate(&valid, &params, &mut tree, now);
+        manifest.push(("00-valid".to_string(), verdict));
     }
 
     // Hand-rolled manifest: `[{"file": ..., "expected_verdict": ...}]` — no JSON
@@ -669,9 +793,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            let mut tree = HeaderTree::new(net.params());
             match Block::decode(&bytes) {
                 Ok(block) => {
-                    let (verdict, detail) = validate(&block, &net.params(), now);
+                    let (verdict, detail) = validate(&block, &net.params(), &mut tree, now);
                     println!("{verdict}\t{detail}");
                     ExitCode::SUCCESS
                 }
@@ -680,6 +805,38 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
             }
+        }
+        Some("check-many") if args.len() >= 4 => {
+            let Some(net) = network(&args[1]) else {
+                eprintln!("unknown network {:?}", args[1]);
+                return ExitCode::FAILURE;
+            };
+            let Ok(now) = args[2].parse::<u32>() else {
+                eprintln!("invalid <now> timestamp {:?}", args[2]);
+                return ExitCode::FAILURE;
+            };
+            // One tree across all inputs — stateful, like the daemon's block
+            // index — so duplicates are reported `accepted-known` and later
+            // blocks may build on earlier accepted ones.
+            let mut tree = HeaderTree::new(net.params());
+            for path in &args[3..] {
+                let name = Path::new(path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                let verdict_line = match fs::read(path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|bytes| Block::decode(&bytes).map_err(|e| format!("decode\t{e}")))
+                {
+                    Ok(block) => {
+                        let (verdict, detail) = validate(&block, &net.params(), &mut tree, now);
+                        format!("{verdict}\t{detail}")
+                    }
+                    Err(err) => format!("rejected:{err}"),
+                };
+                println!("{name}\t{verdict_line}");
+            }
+            ExitCode::SUCCESS
         }
         Some("gen-corpus") if args.len() == 2 => {
             let outdir = Path::new(&args[1]);
@@ -707,6 +864,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!("usage:");
             eprintln!("  check-blocks check <network> <block.bin> <now>");
+            eprintln!("  check-blocks check-many <network> <now> <block.bin>...");
             eprintln!("  check-blocks gen-corpus <outdir>");
             ExitCode::FAILURE
         }
