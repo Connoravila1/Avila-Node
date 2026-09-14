@@ -33,9 +33,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use avila_consensus::arith::CompactTarget;
 use avila_consensus::block::{Block, MAX_BLOCK_SERIALIZED_SIZE};
-use avila_consensus::chainstate::{Acceptance, Chainstate};
+use avila_consensus::chainstate::{Acceptance, BlockRejection, Chainstate};
 use avila_consensus::check;
 use avila_consensus::connect;
+use avila_consensus::connect::ConnectError;
 use avila_consensus::hash::{BlockHash, MerkleRoot, Txid};
 use avila_consensus::header::BlockHeader;
 use avila_consensus::params::{Network, Params};
@@ -1185,6 +1186,138 @@ fn gen_corpus(outdir: &Path, now: u32) -> Result<(), String> {
     fs::write(outdir.join("manifest.json"), json).map_err(|e| format!("write manifest: {e}"))
 }
 
+/// `gen-assumevalid-corpus` — a headers-first scenario exercising
+/// `Chainstate::script_checks` (Core's assumevalid `fScriptChecks` path in
+/// `ConnectBlock`).
+///
+/// * `headers.bin` — the raw 80-byte headers of the full chain, heights
+///   1..=2160 (genesis is already indexed on both sides).
+/// * `blocks.dat` — blk.dat-framed bodies for heights 1..=130 only (the
+///   genesis body is never connected on either side; the segment suites
+///   already cover its resubmission verdict).
+/// * `manifest.json` — the assumevalid hash (block 120) and case notes.
+///
+/// Block 1's coinbase pays two zero-value `OP_0` (always-false) outputs in
+/// addition to its subsidy output. Block 110 — strictly below the assumevalid
+/// height — spends `OP_0` output v1: script checks are skipped on both sides,
+/// so the block connects despite the unsatisfiable spend. Block 130 — above
+/// the assumevalid height — spends v2 and is rejected
+/// `mandatory-script-verify-flag-failed` on both sides, pinning the gate's
+/// threshold.
+fn gen_assumevalid_corpus(outdir: &Path, now: u32) -> Result<(), String> {
+    const LAST_BODY: u32 = 130;
+    const ASSUMEVALID_HEIGHT: u32 = 120;
+    const LAST_HEADER: u32 = 2160; // 2030 blocks above the last body — >2017 blocks of proof-equivalent time
+    const REGTEST_MAGIC: [u8; 4] = [0xfa, 0xbf, 0xb5, 0xda];
+
+    let mut params = Network::Regtest.params();
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut parent = params.genesis_header;
+    let mut assumevalid_hash = String::new();
+    let mut funding_txid = Txid::from_bytes([0; 32]);
+    let mut headers_bin = Vec::new();
+    let mut blocks_dat = Vec::new();
+
+    for height in 1..=LAST_HEADER {
+        let block = {
+            let mut coinbase = regtest_coinbase(height);
+            if height == 1 {
+                // v1/v2: zero-value always-false outputs spent by the two
+                // probe blocks — spendable only while script checks skip.
+                coinbase.outputs.push(txout(0, vec![script::OP_0]));
+                coinbase.outputs.push(txout(0, vec![script::OP_0]));
+            }
+            let mut txs = vec![coinbase];
+            if height == 110 || height == 130 {
+                let vout = if height == 110 { 1 } else { 2 };
+                txs.push(Transaction {
+                    version: 1,
+                    inputs: vec![txin(
+                        OutPoint {
+                            txid: funding_txid,
+                            vout,
+                        },
+                        vec![],
+                    )],
+                    outputs: vec![txout(0, vec![script::OP_1])],
+                    lock_time: 0,
+                });
+            }
+            finish(draft_on(&parent, txs), &params)
+        };
+        if height == 1 {
+            funding_txid = block.transactions[0].txid();
+        }
+        if height == ASSUMEVALID_HEIGHT {
+            assumevalid_hash = block.block_hash().to_string();
+        }
+        headers_bin.extend_from_slice(&block.header.encode());
+        if height <= LAST_BODY {
+            let payload = block.encode();
+            blocks_dat.extend_from_slice(&REGTEST_MAGIC);
+            blocks_dat.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            blocks_dat.extend_from_slice(&payload);
+            blocks.push(block.clone());
+        }
+        parent = block.header;
+    }
+    params.assume_valid = Some(
+        assumevalid_hash
+            .parse()
+            .map_err(|_| "unparseable assumevalid hash".to_string())?,
+    );
+
+    // Self-check, mirroring the driver: headers first, then bodies.
+    let mut state = Chainstate::new(&params);
+    {
+        let mut header_bytes = headers_bin.as_slice();
+        let mut index = 1u32;
+        while !header_bytes.is_empty() {
+            let header = BlockHeader::decode(&header_bytes[..80])
+                .map_err(|e| format!("corpus header {index} decode: {e}"))?;
+            state
+                .accept_header(&header, now)
+                .map_err(|err| format!("corpus header {index} rejected: {}", err.reason()))?;
+            header_bytes = &header_bytes[80..];
+            index += 1;
+        }
+    }
+    for block in &blocks {
+        let height = state
+            .tree()
+            .get(&block.block_hash())
+            .map(|n| n.height)
+            .unwrap_or(0);
+        match state.accept_block(block, now) {
+            Ok(_) if height == 130 => {
+                return Err("verify-case block unexpectedly connected".to_string());
+            }
+            Ok(_) => {}
+            Err(err) if height == 130 => {
+                if !matches!(err, BlockRejection::Connect(ConnectError::ScriptVerify(_))) {
+                    return Err(format!(
+                        "verify-case block failed with the wrong gate: {}",
+                        err.reason()
+                    ));
+                }
+            }
+            Err(err) => {
+                return Err(format!("corpus block {height} rejected: {}", err.reason()));
+            }
+        }
+    }
+
+    fs::write(outdir.join("headers.bin"), headers_bin)
+        .map_err(|e| format!("write headers.bin: {e}"))?;
+    fs::write(outdir.join("blocks.dat"), blocks_dat)
+        .map_err(|e| format!("write blocks.dat: {e}"))?;
+    let manifest = format!(
+        "{{\n  \"network\": \"regtest\",\n  \"assumevalid\": \"{assumevalid_hash}\",\n  \"assumevalid_height\": {ASSUMEVALID_HEIGHT},\n  \"header_count\": {LAST_HEADER},\n  \"body_count\": {},\n  \"skip_case_height\": 110,\n  \"verify_case_height\": {LAST_BODY}\n}}\n",
+        LAST_BODY
+    );
+    fs::write(outdir.join("manifest.json"), manifest).map_err(|e| format!("write manifest: {e}"))
+}
+
 /// Emits the signed-spend corpus cases (73–79 plus the 81 negative control)
 /// extending `parent`. `fund_input` must name a mature, unspent coinbase
 /// output.
@@ -1694,7 +1827,7 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Some("replay") if args.len() == 4 => {
+        Some("replay") if args.len() >= 4 => {
             let Some(net) = network(&args[1]) else {
                 eprintln!("unknown network {:?}", args[1]);
                 return ExitCode::FAILURE;
@@ -1710,6 +1843,42 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // Optional headers-first intake and an assumevalid override —
+            // `Chainstate::script_checks` only skips when the best header sits
+            // far enough above the connected block, so exercising that path
+            // needs headers indexed before bodies arrive (Core's real sync
+            // order).
+            let mut params = net.params();
+            let mut header_bytes: Option<Vec<u8>> = None;
+            let mut i = 4;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--headers" if i + 1 < args.len() => {
+                        match fs::read(&args[i + 1]) {
+                            Ok(b) => header_bytes = Some(b),
+                            Err(err) => {
+                                eprintln!("cannot read {}: {err}", args[i + 1]);
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                        i += 2;
+                    }
+                    "--assumevalid" if i + 1 < args.len() => {
+                        match args[i + 1].parse::<BlockHash>() {
+                            Ok(hash) => params.assume_valid = Some(hash),
+                            Err(err) => {
+                                eprintln!("invalid --assumevalid hash: {err}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                        i += 2;
+                    }
+                    flag => {
+                        eprintln!("unknown replay flag {flag:?}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             // blk.dat framing: 4-byte network magic + 4-byte LE length +
             // raw block, repeated. One Chainstate across the stream — this is
             // the offline-import/replay path: every block runs the full
@@ -1721,7 +1890,27 @@ fn main() -> ExitCode {
                 Network::Signet => [0x0a, 0x03, 0xcf, 0x40],
                 Network::Regtest => [0xfa, 0xbf, 0xb5, 0xda],
             };
-            let mut state = Chainstate::new(&net.params());
+            let mut state = Chainstate::new(&params);
+            if let Some(bytes) = header_bytes {
+                // `ProcessNewBlockHeaders`: raw 80-byte headers, chain order.
+                // A rejected header aborts the preload — a body whose header
+                // was never indexed is an orphan to `accept_block`.
+                for (index, chunk) in (1u64..).zip(bytes.chunks(80)) {
+                    match BlockHeader::decode(chunk)
+                        .map_err(|e| format!("decode\t{e}"))
+                        .and_then(|h| {
+                            state
+                                .accept_header(&h, now)
+                                .map_err(|e| e.reason().into_owned())
+                        }) {
+                        Ok(_) => {}
+                        Err(err) => {
+                            println!("#header\trejected:{err}\tindex={index}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+            }
             let mut cursor = 0usize;
             let mut index = 0u64;
             while cursor + 8 <= data.len() {
@@ -1789,12 +1978,39 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("gen-assumevalid-corpus") if args.len() == 2 => {
+            let outdir = Path::new(&args[1]);
+            if let Err(err) = fs::create_dir_all(outdir) {
+                eprintln!("cannot create {}: {err}", outdir.display());
+                return ExitCode::FAILURE;
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0);
+            match gen_assumevalid_corpus(outdir, now) {
+                Ok(()) => {
+                    for entry in fs::read_dir(outdir).into_iter().flatten().flatten() {
+                        println!("{}", entry.file_name().to_string_lossy());
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("gen-assumevalid-corpus: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => {
             eprintln!("usage:");
             eprintln!("  check-blocks check <network> <block.bin> <now>");
             eprintln!("  check-blocks check-many <network> <now> <block.bin>...");
-            eprintln!("  check-blocks replay <network> <blocks.dat> <now>");
+            eprintln!(
+                "  check-blocks replay <network> <blocks.dat> <now> \
+                 [--headers <headers.bin>] [--assumevalid <hex>]"
+            );
             eprintln!("  check-blocks gen-corpus <outdir>");
+            eprintln!("  check-blocks gen-assumevalid-corpus <outdir>");
             ExitCode::FAILURE
         }
     }

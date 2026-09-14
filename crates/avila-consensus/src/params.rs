@@ -7,7 +7,9 @@
 //! each is cross-checked against its network's canonical hash in this module's tests (and,
 //! for the three public networks, against the committed real-chain fixtures).
 
-use crate::arith::{CompactTarget, Target, U256};
+use std::str::FromStr;
+
+use crate::arith::{CompactTarget, Target, U256, Work};
 use crate::hash::{BlockHash, MerkleRoot};
 use crate::header::BlockHeader;
 
@@ -43,6 +45,12 @@ impl Network {
                 no_retargeting: false,
                 signet_blocks: false,
                 signet_challenge: &[],
+                // kernel/chainparams.cpp: uint256{...} values, in display hex.
+                minimum_chain_work: Work(U256::from_be_bytes(MINIMUM_CHAIN_WORK_MAINNET)),
+                assume_valid: BlockHash::from_str(
+                    "00000000000000000001b658dd1120e82e66d2790811f89ede9742ada3ed6d77",
+                )
+                .ok(),
                 // kernel/chainparams.cpp buried-deployment heights; cross-checked against
                 bip34_height: 227_931,
                 bip66_height: 363_725,
@@ -66,6 +74,11 @@ impl Network {
                 no_retargeting: false,
                 signet_blocks: false,
                 signet_challenge: &[],
+                minimum_chain_work: Work(U256::from_be_bytes(MINIMUM_CHAIN_WORK_TESTNET4)),
+                assume_valid: BlockHash::from_str(
+                    "0000000000003ed4f08dbdf6f7d6b271a6bcffce25675cb40aa9fa43179a89f3",
+                )
+                .ok(),
                 // Every buried deployment activates at height 1 on testnet4; segwit is
                 bip34_height: 1,
                 bip66_height: 1,
@@ -89,6 +102,11 @@ impl Network {
                 no_retargeting: false,
                 signet_blocks: true,
                 signet_challenge: &SIGNET_CHALLENGE,
+                minimum_chain_work: Work(U256::from_be_bytes(MINIMUM_CHAIN_WORK_SIGNET)),
+                assume_valid: BlockHash::from_str(
+                    "000000895a110f46e59eb82bbc5bfb67fa314656009c295509c21b4999f5180a",
+                )
+                .ok(),
                 bip34_height: 1,
                 bip66_height: 1,
                 bip65_height: 1,
@@ -115,6 +133,9 @@ impl Network {
                 no_retargeting: true,
                 signet_blocks: false,
                 signet_challenge: &[],
+                // CRegTestParams leaves both zero.
+                minimum_chain_work: Work::ZERO,
+                assume_valid: None,
                 // Core's regtest defaults bury BIP34/65/66/CSV at height 1 and activate
                 bip34_height: 1,
                 bip66_height: 1,
@@ -183,6 +204,14 @@ pub struct Params {
     /// post-genesis signet block's solution must satisfy. Empty on networks
     /// without signet blocks (`signet_challenge.clear()` in Core).
     pub signet_challenge: &'static [u8],
+    /// `consensus.nMinimumChainWork`: the floor the best header chain's total
+    /// work must reach before [`crate::chainstate`] may skip script checks
+    /// under `assume_valid` (Core's `MinimumChainWork` guard in `ConnectBlock`).
+    pub minimum_chain_work: Work,
+    /// `consensus.defaultAssumeValid`: the externally-verified ancestor block
+    /// below which script checks may be skipped — `None` where Core leaves it
+    /// null (`uint256{}`), which disables the optimization entirely.
+    pub assume_valid: Option<BlockHash>,
     /// `consensus.BIP34Height`: Core's `DEPLOYMENT_HEIGHTINCB` buried deployment (BIP34
     /// coinbase height enforcement). [`crate::chain::HeaderTree::insert`]'s `bad-version`
     /// check also uses this as the `nVersion < 2` floor's activation height, mirroring
@@ -360,6 +389,27 @@ const TESTNET4_GENESIS: BlockHeader = BlockHeader {
     bits: CompactTarget(0x1d00_ffff),
     nonce: 393_743_547,
 };
+
+/// `consensus.nMinimumChainWork` for mainnet (Core `kernel/chainparams.cpp`):
+/// `uint256{"0000000000000000000000000000000000000000b1f3b93b65b16d035a82be84"}`.
+const MINIMUM_CHAIN_WORK_MAINNET: [u8; 32] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xb1, 0xf3, 0xb9, 0x3b, 0x65, 0xb1,
+    0x6d, 0x03, 0x5a, 0x82, 0xbe, 0x84,
+];
+
+/// `consensus.nMinimumChainWork` for testnet4:
+/// `uint256{"0000000000000000000000000000000000000000000001d6dce8651b6094e4c1"}`.
+const MINIMUM_CHAIN_WORK_TESTNET4: [u8; 32] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xd6, 0xdc, 0xe8, 0x65,
+    0x1b, 0x60, 0x94, 0xe4, 0xc1,
+];
+
+/// `consensus.nMinimumChainWork` for the default signet:
+/// `uint256{"000000000000000000000000000000000000000000000000000002b517f3d1a1"}`.
+const MINIMUM_CHAIN_WORK_SIGNET: [u8; 32] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x00, 0x02, 0xb5,
+    0x17, 0xf3, 0xd1, 0xa1,
+];
 
 /// The default signet's BIP325 block challenge (Core `kernel/chainparams.cpp`
 /// `CChainParams::SigNet` — a 1-of-2 bare multisig:

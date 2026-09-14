@@ -177,6 +177,22 @@ orphan cases — child of a header-rejected block and child of a CheckBlock
 rejection are both `prev-blk-not-found`, since the parent never entered the
 index).
 
+Headers-first intake and the assumevalid optimization are also in place:
+`accept_header` indexes a header without its body (Core's
+`ProcessNewBlockHeaders`), and `ConnectBlock`'s `fScriptChecks` decision is
+ported — `CheckInputScripts` is skipped only when the connected block is an
+ancestor-or-self of the configured `assume_valid` block, an ancestor of the
+best header, the best header's chainwork meets `minimum_chain_work`
+(`nMinimumChainWork`), and the block sits more than two weeks of
+proof-equivalent time (`GetBlockProofEquivalentTime`, ported to `chain.rs`)
+below the best header. All non-script consensus checks always run. The
+`assumevalid-regtest` differential suite drives this end-to-end: a
+2160-header chain goes through `submitheader`, the daemon launches with
+`-assumevalid=<block@120>`, and bodies 1..=130 arrive via `submitblock` —
+block 110 spends an always-false `OP_0` output (below the assumed block:
+checks skipped, connects on both sides) while block 130 spends the second
+(above it: verified, both reject `mandatory-script-verify-flag-failed`).
+
 ## Network parameters (`params.rs`)
 
 | Parameter | mainnet | testnet4 | signet | regtest |
@@ -191,6 +207,9 @@ index).
 | `subsidy_halving_interval` | 210000 | 210000 | 210000 | 150 |
 | `bip34_hash` | `…0808b8` | — | — | — |
 | `script_flag_exceptions` | BIP16 + taproot blocks | — | — | — |
+| `signet_challenge` | — | — | default 1-of-2 bare multisig | — |
+| `minimum_chain_work` | `…b1f3b93b65b16d035a82be84` | `…0001d6dce8651b6094e4c1` | `…000002b517f3d1a1` | 0 |
+| `assume_valid` | `…dd1120e82e66d2790811f89ede9742ada3ed6d77` | `…8dbdf6f7d6b271a6bcffce25675cb40aa9fa43179a89f3` | `…5a110f46e59eb82bbc5bfb67fa314656009c295509c21b4999f5180a` | none |
 | Genesis header | ✓ fixture-pinned | ✓ fixture-pinned | ✓ fixture-pinned | ✓ canonical hash |
 
 Mainnet/testnet4 `pow_limit` is Core's raw `uint256S` value; its canonical compact
@@ -240,9 +259,10 @@ Not defects — scope boundaries for later gates:
   connect-forward reorgs plus Core's failed-block bookkeeping
   (`BLOCK_FAILED_*`, `bad-prevblk`, `duplicate-invalid`, activation pruning);
   exercised by the 80-fork corpus case and cases 82–85. Remaining G2 storage
-  work: disk-backed block store, durable coins view, assumevalid.
+  work: disk-backed block store, durable coins view.
 - **Header-chain rules not in Core's `ContextualCheckBlockHeader`**:
-  checkpoints, `nMinimumChainWork`, BIP9 versionbits deployment state
+  checkpoints, `nMinimumChainWork` as a *header*-acceptance gate (it is wired
+  for the `fScriptChecks` decision), BIP9 versionbits deployment state
   (Core treats unexpected versions as warnings, not rejections).
 - **Infrastructure**: the scorecard measurement harness. The reference
   adapters exist: `tools/check_headers_core.py` (+ `examples/check_headers.rs`)
@@ -260,9 +280,9 @@ Not defects — scope boundaries for later gates:
   through `submitblock`, replays the committed real block fixtures on
   per-network daemons, and runs a `segment-*` suite that feeds a contiguous
   real `blk.dat`-framed chain through `Chainstate::accept_block` in order —
-  **1070 submissions, zero unexplained mismatches** (259 regtest + 9 fixtures +
+  **1200 submissions, zero unexplained mismatches** (259 regtest + 9 fixtures +
   501-block mainnet segment, heights 0..=500 + 301-block signet segment,
-  heights 0..=300),
+  heights 0..=300 + the 130-body assumevalid suite),
   covering every `CheckBlock`/`ContextualCheckBlock` rule plus the
   `ConnectBlock` cases 61–72 (missingorspent, premature coinbase, in-belowout,
   cb-amount, BIP30, BIP68 height/time locks, P2SH/witness sigops), the

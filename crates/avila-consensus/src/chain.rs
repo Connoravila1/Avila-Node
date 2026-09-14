@@ -268,6 +268,46 @@ impl HeaderTree {
         Some(node)
     }
 
+    /// `true` if `ancestor` is `descendant`'s ancestor-or-self — Core's
+    /// `pindexOther->GetAncestor(pindex->nHeight) == pindex` test (when
+    /// `ancestor.height > descendant.height`, `GetAncestor` returns null,
+    /// which this reports as `false`).
+    #[must_use]
+    pub fn is_ancestor(&self, ancestor: &HeaderNode, descendant: &HeaderNode) -> bool {
+        self.get_ancestor(&descendant.hash(), ancestor.height)
+            .is_some_and(|n| n == ancestor)
+    }
+
+    /// `GetBlockProofEquivalentTime` (`chain.cpp`): the wall-clock seconds the
+    /// chainwork between `from` and `to` would take at `tip`'s difficulty —
+    /// `|to.work - from.work| * nPowTargetSpacing / GetBlockProof(tip)`, signed
+    /// negative when `to` precedes `from`, saturating at `i64::MAX`. Used by
+    /// `ConnectBlock`'s assumevalid "block too recent" guard.
+    #[must_use]
+    pub fn block_proof_equivalent_time(
+        to: &HeaderNode,
+        from: &HeaderNode,
+        tip: &HeaderNode,
+        params: &Params,
+    ) -> i64 {
+        let (r, sign) = if to.chainwork > from.chainwork {
+            (to.chainwork.0.wrapping_sub(from.chainwork.0), 1i64)
+        } else {
+            (from.chainwork.0.wrapping_sub(to.chainwork.0), -1i64)
+        };
+        let proof = Work::from_compact(tip.header.bits).0;
+        let Some((r, _rem)) = r.wrapping_mul_u64(params.pow_target_spacing).div_rem(proof) else {
+            // Zero per-block proof for the tip — unreachable for a real header
+            // (zero proof means an invalid nBits, which `insert` rejected);
+            // defensive saturation matching the `bits() > 63` arm.
+            return sign.saturating_mul(i64::MAX);
+        };
+        if r.bits() > 63 {
+            return sign.saturating_mul(i64::MAX);
+        }
+        sign.saturating_mul(i64::try_from(r.low_u64()).unwrap_or(i64::MAX))
+    }
+
     /// Marks `hash` failed — Core's `pindex->nStatus |= BLOCK_FAILED_VALID`, set by
     /// `AcceptBlock` on `CheckBlock`/`ContextualCheckBlock` failure and by
     /// `InvalidChainFound` on `ConnectBlock` failure. Once marked, every descendant is
@@ -1045,6 +1085,33 @@ mod tests {
                 expected: genesis.header.bits,
                 actual: forged.bits,
             })
+        );
+    }
+
+    #[test]
+    fn block_proof_equivalent_time_counts_blocks_at_tip_difficulty() {
+        // Every fixture header carries the same nBits (0x1d00ffff), so the
+        // work delta between two heights is exactly the height gap times the
+        // per-block proof, and `r * nPowTargetSpacing / tip_proof` reduces to
+        // `gap * 600`.
+        let headers = decode_headers(MAINNET_HEADERS);
+        let tree = tree_over(&headers, Network::Mainnet);
+        let params = Network::Mainnet.params();
+        let genesis = tree.get(&params.genesis_header.hash()).unwrap();
+        let tip = tree.tip();
+        assert_eq!(
+            HeaderTree::block_proof_equivalent_time(tip, genesis, tip, &params),
+            i64::from(tip.height) * i64::try_from(params.pow_target_spacing).unwrap()
+        );
+        // Reversed arguments negate the result.
+        assert_eq!(
+            HeaderTree::block_proof_equivalent_time(genesis, tip, tip, &params),
+            -i64::from(tip.height) * i64::try_from(params.pow_target_spacing).unwrap()
+        );
+        // Same node: zero delta.
+        assert_eq!(
+            HeaderTree::block_proof_equivalent_time(tip, tip, tip, &params),
+            0
         );
     }
 }

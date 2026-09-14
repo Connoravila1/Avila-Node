@@ -263,6 +263,11 @@ pub struct ConnectContext<'a> {
     /// The candidate block's hash — locates its `HeaderNode`, from which the
     /// block's height and ancestor chain derive.
     pub block_hash: BlockHash,
+    /// Core's `fScriptChecks` (`ConnectBlock`): when `false`, `CheckInputScripts`
+    /// is skipped — the assumevalid optimization for blocks already known to be
+    /// valid through external verification. Every other check (inputs, maturity,
+    /// values, sigops, locks, coinbase amount) still runs.
+    pub script_checks: bool,
 }
 
 /// A consensus or internal failure while connecting a block. Every
@@ -680,8 +685,9 @@ pub fn connect_block(
                 return Err(ConnectError::SigopsExceeded);
             }
             // Core's CheckInputScripts — per-input script evaluation, after
-            // sequence locks and sigop accounting, before UpdateCoins.
-            if !tx.is_coinbase() {
+            // sequence locks and sigop accounting, before UpdateCoins. Gated by
+            // `fScriptChecks` (validation.cpp: `!tx.IsCoinBase() && fScriptChecks`).
+            if !tx.is_coinbase() && ctx.script_checks {
                 let spent_outs: Vec<TxOut> = spent.iter().map(|c| c.out.clone()).collect();
                 check_input_scripts(tx, &spent_outs, flags).map_err(ConnectError::ScriptVerify)?;
             }
@@ -943,6 +949,7 @@ mod tests {
                 params: &self.params,
                 tree: &self.tree,
                 block_hash: block.block_hash(),
+                script_checks: true,
             };
             connect_block(&block, &mut self.utxo, &ctx)?;
             self.tip = block.block_hash();
@@ -1322,6 +1329,7 @@ mod tests {
             params: &chain.params,
             tree: &chain.tree,
             block_hash: block.block_hash(),
+            script_checks: true,
         };
         // Re-run connect on a clone to capture the undo (extend already applied
         // it); disconnect must restore `before` exactly.
@@ -1362,6 +1370,7 @@ mod tests {
             params: &chain.params,
             tree: &chain.tree,
             block_hash: block.block_hash(),
+            script_checks: true,
         };
         assert_eq!(
             connect_block(&block, &mut chain.utxo, &ctx).unwrap_err(),
@@ -1469,6 +1478,7 @@ mod tests {
             params: &chain.params,
             tree: &chain.tree,
             block_hash: block.block_hash(),
+            script_checks: true,
         };
         let base = chain.utxo.clone();
         let undo = connect_block(&block, &mut chain.utxo, &ctx).unwrap();

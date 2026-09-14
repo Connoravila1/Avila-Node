@@ -37,6 +37,7 @@ use crate::chain::{ChainError, HeaderTree, InsertStatus};
 use crate::check::{self, BlockContext, BlockRuleError, ContextualBlockError, RuleError};
 use crate::connect::{self, BlockUndo, ConnectContext, ConnectError, UtxoSet};
 use crate::hash::BlockHash;
+use crate::header::BlockHeader;
 use crate::params::Params;
 
 /// The outcome of a successful [`Chainstate::accept_block`] call.
@@ -184,6 +185,58 @@ impl Chainstate {
         self.blocks.get(hash)
     }
 
+    /// Indexes a header without a body — Core's `ProcessNewBlockHeaders` →
+    /// `AcceptBlockHeader`. Headers-first intake matters for `assume_valid`:
+    /// `ConnectBlock` only skips script checks when the best *header* sits far
+    /// enough above the block being connected, so exercising that path requires
+    /// headers in the tree before their blocks arrive.
+    ///
+    /// # Errors
+    ///
+    /// [`BlockRejection::Header`] on any header-validation failure (orphan,
+    /// PoW, contextual, failed ancestry).
+    pub fn accept_header(&mut self, header: &BlockHeader, now: u32) -> Result<u32, BlockRejection> {
+        match self.tree.insert(header, now) {
+            Ok(InsertStatus::Added { height } | InsertStatus::AlreadyKnown { height }) => {
+                Ok(height)
+            }
+            Err(err) => Err(BlockRejection::Header(err)),
+        }
+    }
+
+    /// `ConnectBlock`'s `fScriptChecks` decision for the block at `hash`
+    /// (validation.cpp): `true` = run `CheckInputScripts`. Script checks may be
+    /// skipped only when every condition holds:
+    ///
+    /// * `assume_valid` is configured (`AssumedValidBlock` non-null);
+    /// * the assumevalid hash is in the block index;
+    /// * this block is the assumevalid block's ancestor-or-self;
+    /// * this block is the best *header*'s ancestor-or-self;
+    /// * the best header's chainwork meets `minimum_chain_work`;
+    /// * the block is more than two weeks of proof-equivalent time below the
+    ///   best header (the "block too recent" extortion guard).
+    fn script_checks(&self, hash: &BlockHash, params: &Params) -> bool {
+        const TWO_WEEKS: i64 = 60 * 60 * 24 * 7 * 2;
+        let Some(assume) = params.assume_valid else {
+            return true; // assumevalid=0 (always verify)
+        };
+        let Some(av) = self.tree.get(&assume) else {
+            return true; // assumevalid hash not in headers
+        };
+        let Some(pindex) = self.tree.get(hash) else {
+            return true;
+        };
+        let best = self.tree.tip();
+        if !self.tree.is_ancestor(pindex, av)
+            || !self.tree.is_ancestor(pindex, best)
+            || best.chainwork < params.minimum_chain_work
+            || HeaderTree::block_proof_equivalent_time(best, pindex, best, params) <= TWO_WEEKS
+        {
+            return true;
+        }
+        false
+    }
+
     /// Runs `block` through the full acceptance pipeline — Core's
     /// `ProcessNewBlock` for a block with its body present, i.e.
     /// `AcceptBlock` (header insert, `CheckBlock`, `ContextualCheckBlock`,
@@ -278,6 +331,7 @@ impl Chainstate {
                 params: &params,
                 tree: &self.tree,
                 block_hash: hash,
+                script_checks: self.script_checks(&hash, &params),
             };
             match connect::connect_block(block, &mut self.utxo, &ctx) {
                 Ok(undo) => {
@@ -382,6 +436,7 @@ impl Chainstate {
                 params,
                 tree: &self.tree,
                 block_hash: *branch_hash,
+                script_checks: self.script_checks(branch_hash, params),
             };
             match connect::connect_block(block, &mut utxo, &ctx) {
                 Ok(undo) => new_undos.push(undo),
@@ -725,5 +780,98 @@ mod tests {
             cs.accept_block(&b, NOW),
             Ok(Acceptance::AlreadyKnown { height: 1 })
         );
+    }
+
+    /// Builds a same-difficulty header chain 1..=`tip_height` over the regtest
+    /// genesis. Height 1's coinbase pays two zero-value `OP_0` (always-false)
+    /// outputs at v1/v2; `probe_heights` blocks additionally spend one of
+    /// them — a spend that can only connect while script checks are skipped.
+    fn probe_chain(tip_height: u32, probe_heights: &[(u32, u32)], params: &Params) -> Vec<Block> {
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut parent = params.genesis_header;
+        for height in 1..=tip_height {
+            let mut coinbase = coinbase_tx(height, subsidy(height));
+            if height == 1 {
+                coinbase.outputs.push(TxOut {
+                    value: 0,
+                    script_pubkey: Script::new(vec![script::OP_0]),
+                });
+                coinbase.outputs.push(TxOut {
+                    value: 0,
+                    script_pubkey: Script::new(vec![script::OP_0]),
+                });
+            }
+            let mut txs = vec![coinbase];
+            if let Some((_, vout)) = probe_heights.iter().find(|(h, _)| *h == height) {
+                txs.push(Transaction {
+                    version: 1,
+                    inputs: vec![TxIn {
+                        previous_output: OutPoint {
+                            txid: blocks[0].transactions[0].txid(),
+                            vout: *vout,
+                        },
+                        script_sig: Script::new(vec![]),
+                        sequence: SEQUENCE_FINAL,
+                        witness: Witness::default(),
+                    }],
+                    outputs: vec![TxOut {
+                        value: 0,
+                        script_pubkey: Script::new(vec![script::OP_1]),
+                    }],
+                    lock_time: 0,
+                });
+            }
+            let block = block_on(&parent, txs, params);
+            parent = block.header;
+            blocks.push(block);
+        }
+        blocks
+    }
+
+    #[test]
+    fn assumevalid_skips_script_checks_below_the_assumed_block() {
+        let mut params = params();
+        // Bodies to height 135; headers to 2130 so the best header sits
+        // >2017 blocks (two weeks of proof-equivalent time at 10-minute
+        // spacing) above every connected block. assumevalid = block@120.
+        // Block 105 spends an always-false output (below av -> checks
+        // skipped -> connects); block 135 spends the second (above av ->
+        // verified -> rejected).
+        let blocks = probe_chain(2130, &[(105, 1), (135, 2)], &params);
+        params.assume_valid = Some(blocks[119].block_hash());
+        let mut cs = Chainstate::new(&params);
+        for block in &blocks {
+            cs.accept_header(&block.header, NOW).unwrap();
+        }
+        for block in &blocks[..134] {
+            assert!(
+                cs.accept_block(block, NOW).is_ok(),
+                "body {} should connect",
+                cs.tree().get(&block.block_hash()).map_or(0, |n| n.height)
+            );
+        }
+        assert!(matches!(
+            cs.accept_block(&blocks[134], NOW),
+            Err(BlockRejection::Connect(ConnectError::ScriptVerify(_)))
+        ));
+    }
+
+    #[test]
+    fn assumevalid_unindexed_or_unset_still_verifies() {
+        // `assumevalid hash not in headers` — a configured hash that never
+        // entered the index keeps script checks on (Core's first gate).
+        let mut unindexed = params();
+        unindexed.assume_valid = Some(BlockHash::from_bytes([7; 32]));
+        let blocks = probe_chain(105, &[(105, 1)], &unindexed);
+        for params in [unindexed, params()] {
+            let mut cs = Chainstate::new(&params);
+            for block in &blocks[..104] {
+                cs.accept_block(block, NOW).unwrap();
+            }
+            assert!(matches!(
+                cs.accept_block(&blocks[104], NOW),
+                Err(BlockRejection::Connect(ConnectError::ScriptVerify(_)))
+            ));
+        }
     }
 }

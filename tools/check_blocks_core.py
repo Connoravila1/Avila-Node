@@ -134,15 +134,18 @@ def free_port():
 class Daemon:
     """An isolated reference daemon on one network."""
 
-    def __init__(self, network, workdir):
+    def __init__(self, network, workdir, extra_args=None):
         cfg = NETWORKS[network]
         self.rpc_port = free_port()
         self.p2p_port = free_port()
-        self.datadir = os.path.join(workdir, f"datadir-{network}")
+        self.datadir = os.path.join(
+            workdir, f"datadir-{network}-{id(self) & 0xffff:x}"
+        )
         os.makedirs(self.datadir, exist_ok=True)
         self.proc = subprocess.Popen(
             ["bitcoind"]
             + cfg["flag"]
+            + list(extra_args or [])
             + [
                 f"-datadir={self.datadir}",
                 "-connect=0",
@@ -173,7 +176,13 @@ class Daemon:
             raise RuntimeError(f"bitcoind for {network} did not become ready")
 
     def rpc(self, method, *params):
-        payload = [{"jsonrpc": "1.0", "id": 0, "method": method, "params": list(params)}]
+        return self.rpc_batch([(method, list(params))])[0]
+
+    def rpc_batch(self, calls):
+        payload = [
+            {"jsonrpc": "1.0", "id": i, "method": m, "params": p}
+            for i, (m, p) in enumerate(calls)
+        ]
         req = urllib.request.Request(
             f"http://127.0.0.1:{self.rpc_port}",
             data=json.dumps(payload).encode(),
@@ -187,7 +196,7 @@ class Daemon:
                 body = resp.read()
         except urllib.error.HTTPError as err:
             body = err.read()
-        return json.loads(body)[0]
+        return sorted(json.loads(body), key=lambda item: item["id"])
 
     def submit_block(self, block_bytes):
         """Verdict token: 'accepted' for tip/side-chain acceptance, 'decode'
@@ -202,6 +211,21 @@ class Daemon:
         if result is None or result in ("inconclusive", "duplicate"):
             return "accepted"
         return result
+
+    def submit_headers(self, headers, chunk=400):
+        """submitheader one header per call, JSON-RPC batched in chunks."""
+        verdicts = []
+        for start in range(0, len(headers), chunk):
+            batch = [("submitheader", [h.hex()]) for h in headers[start : start + chunk]]
+            for item in self.rpc_batch(batch):
+                if item["error"] is not None:
+                    message = item["error"].get("message", "rpc-error")
+                    verdicts.append(
+                        "decode" if "decode" in message.lower() else message
+                    )
+                else:
+                    verdicts.append("accepted")
+        return verdicts
 
     def stop(self):
         try:
@@ -278,14 +302,15 @@ def read_blkdat(path):
     return blocks
 
 
-def avila_replay_verdicts(network, path, now):
+def avila_replay_verdicts(network, path, now, extra_args=None):
     """Verdict tokens per frame, from `check_blocks replay` — one Chainstate
     over the whole segment, like check-many but for blk.dat framing."""
     proc = subprocess.run(
         [
             "cargo", "run", "-q", "--locked", "-p", "avila-consensus",
             "--example", "check_blocks", "--", "replay", network, path, str(now),
-        ],
+        ]
+        + list(extra_args or []),
         cwd=REPO,
         capture_output=True,
         text=True,
@@ -392,6 +417,85 @@ def suite_regtest_corpus(workdir, now):
     }
 
 
+def suite_assumevalid(workdir, now):
+    """Headers-first assumevalid differential: `gen-assumevalid-corpus`
+    produces a regtest chain whose headers extend far past the submitted
+    bodies, with an unsatisfiable (`OP_0`) spend below the assumevalid height
+    (script checks skipped on both sides -> connects) and a second one above
+    it (verified -> `mandatory-script-verify-flag-failed`)."""
+    corpus_dir = os.path.join(workdir, "assumevalid-corpus")
+    os.makedirs(corpus_dir, exist_ok=True)
+    proc = subprocess.run(
+        [
+            "cargo", "run", "-q", "--locked", "-p", "avila-consensus",
+            "--example", "check_blocks", "--", "gen-assumevalid-corpus", corpus_dir,
+        ],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=True,
+        env=cargo_env(),
+    )
+    del proc
+    manifest = json.loads(
+        open(os.path.join(corpus_dir, "manifest.json")).read()
+    )
+    headers_path = os.path.join(corpus_dir, "headers.bin")
+    blocks_path = os.path.join(corpus_dir, "blocks.dat")
+
+    raw = open(headers_path, "rb").read()
+    if len(raw) % 80:
+        raise RuntimeError(f"{headers_path}: {len(raw)} is not a multiple of 80")
+    headers = [raw[i : i + 80] for i in range(0, len(raw), 80)]
+    blocks = read_blkdat(blocks_path)
+
+    daemon = Daemon(
+        "regtest", workdir, extra_args=[f"-assumevalid={manifest['assumevalid']}"]
+    )
+    try:
+        header_verdicts = daemon.submit_headers(headers)
+        for i, v in enumerate(header_verdicts):
+            if v != "accepted":
+                raise RuntimeError(f"submitheader #{i}: {v}")
+        core = [daemon.submit_block(b) for b in blocks]
+    finally:
+        daemon.stop()
+    ours = avila_replay_verdicts(
+        "regtest",
+        blocks_path,
+        now,
+        ["--headers", headers_path, "--assumevalid", manifest["assumevalid"]],
+    )
+
+    if len(ours) != len(blocks):
+        raise RuntimeError(
+            f"replay produced {len(ours)} verdicts for {len(blocks)} blocks"
+        )
+    rows = [
+        {"name": f"assumevalid#{i}", "core": c, "avila": o}
+        for i, (c, o) in enumerate(zip(core, ours))
+    ]
+    for row in rows:
+        if row["core"] != row["avila"] or row["name"] in (
+            f"assumevalid#{manifest['skip_case_height'] - 1}",
+            f"assumevalid#{manifest['verify_case_height'] - 1}",
+        ):
+            print(
+                f"  {row['name']:<40} core={row['core']:<36} avila={row['avila']}",
+                flush=True,
+            )
+    mismatches, notes, expected = compare_rows(rows)
+    return {
+        "blocks": len(rows),
+        "compared": len(rows),
+        "mismatches": mismatches,
+        "layer_notes": notes,
+        "expected_divergences": expected,
+        "assumevalid": manifest["assumevalid"],
+        "rows": rows,
+    }
+
+
 def suite_fixtures(network, workdir, now):
     files = BLOCK_FIXTURES[network]
     paths = [os.path.join(REPO, "fixtures", f) for f in files]
@@ -427,7 +531,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--suites",
-        default="regtest-corpus,fixtures-mainnet,fixtures-testnet4,fixtures-signet,segment-mainnet,segment-signet",
+        default="regtest-corpus,fixtures-mainnet,fixtures-testnet4,fixtures-signet,segment-mainnet,segment-signet,assumevalid-regtest",
         help="comma-separated subset",
     )
     parser.add_argument(
@@ -484,6 +588,8 @@ def main():
                 result = suite_fixtures(suite[len("fixtures-"):], workdir, now)
             elif suite.startswith("segment-"):
                 result = suite_segment(suite[len("segment-"):], workdir, now)
+            elif suite == "assumevalid-regtest":
+                result = suite_assumevalid(workdir, now)
             else:
                 raise ValueError(f"unknown suite {suite}")
         except Exception as err:
