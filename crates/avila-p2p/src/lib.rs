@@ -13,6 +13,10 @@
 //!   `reject`. Unknown commands decode to [`Message::Unknown`] — Core ignores
 //!   them the same way.
 //!
+//! * [`session`] — one peer's handshake choreography and message pump over
+//!   any `Read + Write` transport, mirroring `net_processing`'s
+//!   `version`/`verack` ordering.
+//!
 //! Everything here is transport plumbing; no consensus verdict is produced
 //! or consumed at this layer. The `headers` payload decodes to
 //! [`avila_consensus::header::BlockHeader`], which `Chainstate::accept_header`
@@ -20,6 +24,10 @@
 
 pub mod codec;
 pub mod message;
+pub mod session;
 
 pub use codec::{Command, FrameDecoder, FrameError, HEADER_LEN, MAX_MESSAGE_PAYLOAD};
 pub use message::{AddrEntry, GetHeaders, InvType, InvVector, Message, NetAddr, Reject, Version};
+pub use session::{
+    HANDSHAKE_TIMEOUT, PeerInfo, PeerSession, SessionError, SessionEvent, build_version,
+};

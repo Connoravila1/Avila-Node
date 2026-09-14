@@ -325,6 +325,14 @@ impl Message {
         }
     }
 
+    /// The [`Command`] this message sends under. `None` only if a stored
+    /// `Unknown` name cannot re-encode — decode guarantees it can, so
+    /// `None` effectively means "constructed by hand with an invalid name".
+    #[must_use]
+    pub fn command(&self) -> Option<Command> {
+        Command::new(self.command_name())
+    }
+
     /// Encodes the payload (frame layer adds the header).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
