@@ -1,7 +1,8 @@
 # Consensus rule and fixture inventory
 
-**Status: header-chain rules implemented and tested; transaction/block contextual
-rules, script, and UTXO validation are not yet implemented.** This inventory is the
+**Status: header-chain rules plus context-free and header-context block/transaction
+structure are implemented and tested; script execution and UTXO-state rules are
+not yet implemented.** This inventory is the
 G1 "rule-to-test inventory" required by the [roadmap](../ROADMAP.md). It enumerates
 every consensus rule `avila-consensus` implements, the evidence backing it, and the
 rules it deliberately does not yet implement. Header validation alone is not full
@@ -35,7 +36,7 @@ failure seeds in `tests/property.proptest-regressions`).
 
 `chain.rs` `HeaderTree::insert` applies these in Core's `AcceptBlockHeader` /
 `ContextualCheckBlockHeader` order: known-header short-circuit → PoW → parent →
-`bad-diffbits` → `time-too-old` → BIP94 timewarp → `time-too-new`.
+`bad-diffbits` → `time-too-old` → BIP94 timewarp → `time-too-new` → `bad-version`.
 
 | Rule | Core anchor | Implementation | Valid coverage | Invalid coverage |
 | --- | --- | --- | --- | --- |
@@ -50,8 +51,38 @@ failure seeds in `tests/property.proptest-regressions`).
 | BIP94 timewarp floor: boundary `nTime ≥ parent.nTime − 600` | `ContextualCheckBlockHeader` (`MAX_TIMEWARP`) | `rules.rs` `check_block_time` | BIP94-off control on identical chain shape | `TimeError::Timewarp` at floor − 1; inclusive floor accepted |
 | Median-time-past (`time-too-old`: `nTime > MTP(parent)`) | `ContextualCheckBlockHeader` | `rules.rs` `median_time_past` | All fixture headers | `TimeError::TooOld` boundary unit tests |
 | Future drift (`time-too-new`: `nTime ≤ now + 2h`, caller-supplied clock) | `MAX_FUTURE_BLOCK_TIME` | `rules.rs` | All fixture headers | `TimeError::TooNew` unit tests |
+| Header version floors: `nVersion < 2`/`< 3`/`< 4` once BIP34/BIP66/BIP65 govern the height (`bad-version`) | `ContextualCheckBlockHeader` (`validation.cpp`), heights from `DeploymentActiveAfter`/`DeploymentHeight` (`deploymentstatus.h`, `consensus/params.h`) | `chain.rs` `HeaderTree::insert` (`ChainError::BadVersion`), heights in `params.rs` `Params::bip34_height`/`bip66_height`/`bip65_height` | All fixture headers (real mainnet/testnet4/signet versions all clear every floor active at their heights); regtest version 4 accepted; mainnet-shaped params isolate a version-1 header below `bip34_height` | Regtest (all three floors buried at height 1) rejects versions 1, 2 and 3 each for the specific floor that first fires, and negative versions; genesis is exempt (never run through `insert`); `bad-diffbits` takes precedence when a header fails both |
 | Cumulative chainwork; best tip = strictly greatest work | `CBlockIndex::nChainWork`, `ActivateBestChain` tip comparison | `arith.rs` `Work`, `chain.rs` | Fixture chains reproduce real cumulative work; differential per-block work vs rust-bitcoin | `ChainWorkOverflow` guard; equal-work fork does not displace tip |
 | Height accumulation | `CBlockIndex::nHeight` | `chain.rs` | Fixture heights | `HeightOverflow` guard (`u32::MAX` parent) |
+
+## Transaction and block structure (`check.rs`, `script.rs`)
+
+`check.rs` ports the non-UTXO, non-execution parts of Core's `CheckTransaction`
+(`consensus/tx_check.cpp`), `CheckBlock` and `ContextualCheckBlock`
+(`validation.cpp`); `script.rs` provides the structural script model those rules
+consult (`GetOp`-equivalent instruction iteration, `GetSigOpCount`, `IsPushOnly`,
+`IsPayToScriptHash`, `IsWitnessProgram`, `CScriptNum`/push encodings). Every error
+exposes Core's reject-reason string via `RuleError::reason` for later
+reason-level differential comparison (`submitblock`).
+
+| Rule | Core anchor | Implementation | Valid coverage | Invalid coverage |
+| --- | --- | --- | --- | --- |
+| `vin`/`vout` non-empty (`bad-txns-vin-empty`/`bad-txns-vout-empty`) | `CheckTransaction` | `check::check_transaction` | All fixture block transactions | unit tests |
+| Base-size limit: `size(no-witness) × WITNESS_SCALE_FACTOR ≤ MAX_BLOCK_WEIGHT` (`bad-txns-oversize`) | `CheckTransaction` | `check_transaction` | All fixture transactions | 1 MB `scriptSig` unit test |
+| Output value range: `0 ≤ v ≤ MAX_MONEY` per output and for the running total (`bad-txns-vout-negative`/`-toolarge`/`bad-txns-txouttotal-toolarge`, CVE-2010-5139) | `CheckTransaction`, `MoneyRange` | `check_transaction` (checked `i64` accumulation) | All fixture transactions | negative / over-limit / overflowing-total unit tests |
+| Duplicate inputs (`bad-txns-inputs-duplicate`, CVE-2018-17144) | `CheckTransaction` | `check_transaction` (`HashSet<OutPoint>`) | All fixture transactions | duplicated-input unit test |
+| Coinbase `scriptSig` length 2..=100 (`bad-cb-length`); non-coinbase inputs may not spend the null outpoint (`bad-txns-prevout-null`) | `CheckTransaction` | `check_transaction` | All fixture coinbases | boundary lengths 0/1/101; null prevout in a multi-input tx (single-input-null is a coinbase by definition) |
+| Block header PoW inside `CheckBlock` (`high-hash`) | `CheckBlockHeader` | `check::check_block` → `pow::check_proof_of_work` | All fixture blocks | claimed `nBits` above a custom `pow_limit` |
+| `hashMerkleRoot` match (`bad-txnmrklroot`) and CVE-2012-2459 mutation flag (`bad-txns-duplicate`) | `CheckMerkleRoot` | `check_block` via `block.rs` `merkle_root` | All fixture blocks | corrupted-root unit test; identical-coinbase duplication exercises the mutation path |
+| Block size limits: non-empty, `tx_count × 4 ≤ MAX_BLOCK_WEIGHT`, `size(no-witness) × 4 ≤ MAX_BLOCK_WEIGHT` (`bad-blk-length`) | `CheckBlock` | `check_block` | All fixture blocks | — (empty-block case unreachable through the checked API: it fails `bad-blk-length` first) |
+| First tx is coinbase (`bad-cb-missing`); no other tx is a coinbase (`bad-cb-multiple`) | `CheckBlock` | `check_block` | All fixture blocks | non-coinbase-first and two-coinbase unit tests |
+| Per-transaction `CheckTransaction` inside `CheckBlock` | `CheckBlock` | `check_block` → `check_transaction` | All fixture blocks | propagated `TxRuleError` unit tests |
+| Legacy sigop budget: `Σ legacy sigops × 4 ≤ MAX_BLOCK_SIGOPS_COST` (`bad-blk-sigops`) | `CheckBlock`, `GetLegacySigOpCount`, `CScript::GetSigOpCount` | `check_block`, `script.rs` `Script::sig_ops` (incl. accurate-multisig `OP_N` decode and malformed-script early stop) | All fixture blocks; opcode-counting unit tests | 20_001-op `scriptPubKey` unit test |
+| Transaction finality vs `nLockTime` cutoff (`bad-txns-nonfinal`); BIP113 moves the cutoff to parent MTP once CSV is active | `ContextualCheckBlock`, `IsFinalTx` | `check::contextual_check_block`, `check::is_final_tx` | All fixture blocks; lock_time/sequence boundary unit tests | non-final height- and time-locked txs; missing-MTP context error |
+| BIP34 height-in-coinbase prefix (`bad-cb-height`) | `ContextualCheckBlock` (`CScript() << nHeight`) | `contextual_check_block`, `script.rs` `push_int`/`encode_script_num` | Real post-activation fixture blocks; `encode_script_num` vs Core's `scriptnum_tests` vectors | wrong-height coinbase; pre-activation control (rule off below `bip34_height`) |
+| BIP141 witness commitment: when segwit is active a present commitment must verify (`bad-witness-nonce-size` / `bad-witness-merkle-match`); an absent commitment — or inactive segwit — forbids witness data entirely (`unexpected-witness`) | `ContextualCheckBlock`, `CheckWitnessMalleation`, `GetWitnessCommitmentIndex` | `contextual_check_block`, `block.rs` `witness_commitment_output`/`expected_witness_commitment`/`witness_merkle_root` | Segwit-era and taproot-era fixture blocks (both carry real commitments and witness data) | nonce-stack arity/size, corrupted commitment hash, witness-without-commitment (segwit active and inactive) |
+| Block weight ≤ `MAX_BLOCK_WEIGHT`, checked *after* witness-commitment verification (`bad-blk-weight`) | `ContextualCheckBlock` | `contextual_check_block` | All fixture blocks | ~4 MB-witness unit test |
+| Signet block solution (BIP325) | `CheckSignetBlockSolution` in `CheckBlock` | **not implemented** — `check_block` returns `BlockRuleError::SignetSolutionUnsupported` on `signet_blocks` networks rather than skipping the rule | signet fixture returns the explicit unsupported error | — |
 
 ## Network parameters (`params.rs`)
 
@@ -62,11 +93,21 @@ failure seeds in `tests/property.proptest-regressions`).
 | `allow_min_difficulty_blocks` | false | true | false | true |
 | `enforce_bip94` | false | true | false | false (Core default; Core exposes it as a regtest option) |
 | `no_retargeting` | false | false | false | true |
+| `bip34_height` / `bip66_height` / `bip65_height` | 227931 / 363725 / 388381 | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `csv_height` / `segwit_height` / `taproot_height` | 419328 / 481824 / 709632 | 1 / 1 / 0 | 1 / 1 / 0 | 1 / 0 / 0 |
 | Genesis header | ✓ fixture-pinned | ✓ fixture-pinned | ✓ fixture-pinned | ✓ canonical hash |
 
 Mainnet/testnet4 `pow_limit` is Core's raw `uint256S` value; its canonical compact
 `0x1d00ffff` is slightly smaller. The gap is unobservable on built-in networks
 (every `nBits` expansion has ≤ 23 significant bits) and documented in `params.rs`.
+
+The six buried-deployment heights are transcribed from `kernel/chainparams.cpp`
+(`BIP34Height`/`BIP66Height`/`BIP65Height`/`CSVHeight`/`SegwitHeight`, and Taproot's
+`min_activation_height`); `0` for `taproot_height` means Core's `ALWAYS_ACTIVE`, not
+"never active". `bip34_height`/`bip66_height`/`bip65_height` drive the `bad-version`
+floors in `chain.rs`; `bip34_height`, `csv_height` and `segwit_height` drive the
+contextual rules in `check.rs`; `taproot_height` is carried for the G2 script work
+listed under "Not yet implemented".
 
 ## Fixture corpus
 
@@ -95,11 +136,15 @@ work) exists to catch systematically.
 
 Not defects — scope boundaries for later gates:
 
-- **Block-level acceptance**: signet block-signature validation, BIP34 coinbase
-  height, BIP30 duplicate-txid, weight limit (`MAX_BLOCK_WEIGHT`), sigop counting.
-- **Transaction-level rules**: standardless-input checks, coinbase maturity,
-  subsidy schedule, fee accounting, BIP68/112 sequence locks, BIP65 CLTV.
-- **Script**: entire script interpreter (legacy, P2SH, segwit v0, taproot) — G2.
+- **Block-level acceptance**: signet block-signature validation (BIP325 — the
+  `SignetSolutionUnsupported` stub in `check.rs`), BIP30 cross-block duplicate-txid.
+- **UTXO-dependent transaction rules** (`Consensus::CheckTxInputs` and friends):
+  missing/spent inputs, coinbase maturity, input-vs-output value and fee range.
+- **UTXO-dependent sigop cost**: P2SH and witness sigop counting
+  (`GetP2SHSigOpCount`, `CountWitnessSigOps`) — needs the spent outputs, so it
+  belongs to connect-block; the block-level legacy budget is implemented.
+- **Script**: entire script interpreter (legacy, P2SH, segwit v0, taproot) —
+  including BIP66 DER, BIP65 CLTV and BIP68/112/113 sequence/CSV script rules — G2.
 - **UTXO/connect**: `ConnectBlock` equivalents, undo data, reorg handling beyond
   header-tip selection — G2.
 - **Header-chain rules not in Core's `ContextualCheckBlockHeader`**:
@@ -130,17 +175,22 @@ exceptions (activation heights are mainnet):
 - BIP30 duplicate-txid ban with its two grandfathered exceptions (heights
   91842 and 91880).
 - Value-overflow checks: per-output and per-transaction caps at 21M
-  (CVE-2010-5139 era); the pre-fix chain contains none, but the check is
-  consensus-critical.
+  (CVE-2010-5139 era) — **implemented** in `check_transaction`.
 - P2SH activation is **timestamp-based** (BIP16, April 2012), not height- or
   versionbits-based.
-- BIP34 coinbase height (supermajority-gated at height 227931), BIP66 strict
-  DER (height 363725), BIP65 CLTV (height 388381).
-- BIP9 versionbits deployments: CSV/BIP68-112-113 (height 419328), segwit
-  BIP141/143/147 (height 481824), taproot BIP340-342 (height 709632).
-- BIP141 enforcement quirks: no witness commitment in the coinbase ⇒ all
-  non-coinbase witnesses must be empty; commitment counted in the coinbase's
-  own witness.
+- BIP34 coinbase height (supermajority-gated at height 227931) —
+  **implemented** in `contextual_check_block`; BIP66 strict DER (height
+  363725) and BIP65 CLTV (height 388381) — activation heights carried,
+  script rules pending.
+- BIP9 versionbits deployments: CSV/BIP68-112-113 (height 419328 — the
+  BIP113 locktime cutoff **implemented**), segwit BIP141/143/147 (height
+  481824 — commitment rules **implemented**), taproot BIP340-342 (height
+  709632 — carried, script rules pending).
+- BIP141 enforcement quirks — **implemented**: no witness commitment in the
+  coinbase ⇒ all non-coinbase witnesses must be empty; commitment counted
+  in the coinbase's own witness.
 - Subsidy halving schedule (height % 210000) and coinbase maturity (100 blocks).
-- `nLockTime`/`nSequence` semantics across the pre-/post-BIP68 boundary.
+- `nLockTime`/`nSequence` semantics across the pre-/post-BIP68 boundary —
+  `IsFinalTx` **implemented**; BIP68 sequence locks are UTXO-dependent and
+  pending.
 

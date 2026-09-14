@@ -29,11 +29,14 @@ fn network(name: &str) -> Option<Network> {
 }
 
 /// The reject reason Core's `submitheader`/`AcceptBlockHeader` reports for the
-/// equivalent failure. Internal-only errors have no RPC-visible analog.
-fn core_reason(err: &ChainError) -> &'static str {
+/// equivalent failure. Internal-only errors have no RPC-visible analog. Owned because
+/// `bad-version` is not a fixed token — Core formats the offending `nVersion` into it
+/// (`strprintf("bad-version(0x%08x)", block.nVersion)`), and [`ChainError::BadVersion`]'s
+/// `Display` already produces that exact string.
+fn core_reason(err: &ChainError) -> String {
     match err {
-        ChainError::UnknownParent(_) => "prev-blk-not-found",
-        ChainError::WrongBits { .. } => "bad-diffbits",
+        ChainError::UnknownParent(_) => "prev-blk-not-found".to_string(),
+        ChainError::WrongBits { .. } => "bad-diffbits".to_string(),
         // CheckProofOfWork failures all surface as "high-hash"
         // (BLOCK_HEADER_LOW_WORK) through submitheader.
         ChainError::Pow(
@@ -42,14 +45,16 @@ fn core_reason(err: &ChainError) -> &'static str {
             | PowError::ZeroTarget(_)
             | PowError::TargetAboveLimit(_)
             | PowError::InsufficientWork { .. },
-        ) => "high-hash",
+        ) => "high-hash".to_string(),
         ChainError::Pow(PowError::UnknownAncestor(_) | PowError::DegenerateDifficultyParams) => {
-            "internal"
+            "internal".to_string()
         }
-        ChainError::Time(TimeError::TooOld { .. }) => "time-too-old",
-        ChainError::Time(TimeError::Timewarp { .. }) => "time-timewarp-attack",
-        ChainError::Time(TimeError::TooNew { .. }) => "time-too-new",
-        ChainError::ChainWorkOverflow | ChainError::HeightOverflow => "internal",
+        ChainError::Time(TimeError::TooOld { .. }) => "time-too-old".to_string(),
+        ChainError::Time(TimeError::Timewarp { .. }) => "time-timewarp-attack".to_string(),
+        ChainError::Time(TimeError::TooNew { .. }) => "time-too-new".to_string(),
+        // `ChainError`'s `Display` for `BadVersion` is already Core's exact reject reason.
+        ChainError::BadVersion { .. } => err.to_string(),
+        ChainError::ChainWorkOverflow | ChainError::HeightOverflow => "internal".to_string(),
     }
 }
 

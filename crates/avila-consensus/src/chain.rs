@@ -5,8 +5,10 @@
 //! (`HeaderTree::insert`) applies the header-level rules of Core's `AcceptBlockHeader` /
 //! `CheckBlockHeader` / `ContextualCheckBlockHeader` (`validation.cpp`): the parent must
 //! already be in the tree, `nBits` must equal [`crate::pow::required_bits`], the hash must
-//! satisfy [`crate::pow::check_proof_of_work`], and the timestamp must pass
-//! [`crate::rules::check_block_time`] against the parent chain's median time past.
+//! satisfy [`crate::pow::check_proof_of_work`], the timestamp must pass
+//! [`crate::rules::check_block_time`] against the parent chain's median time past, and the
+//! header's `nVersion` must meet the buried-deployment floors active at its height (the
+//! `bad-version` check, this module's [`ChainError::BadVersion`]).
 //!
 //! The best tip is the node with strictly the greatest chainwork — a new tip must exceed,
 //! not merely match, the current one, so among equal-work candidates the earliest inserted
@@ -15,10 +17,10 @@
 //! high-rate P2P header relay; this tree is single-threaded and deterministic instead.
 //!
 //! Not implemented (documented gaps, not bugs): checkpoint pinning and the DoS-preservation
-//! checks around it, minimum-chainwork floors, the deprecated-version rejection
-//! (`bad-version`), signet's block-level signature rule (BIP325 signs the *block*, not the
-//! header — header rules still apply), and the `nMinimumChainWork`/assume-valid DoS
-//! guards. These belong to later gates alongside block-level validation.
+//! checks around it, minimum-chainwork floors, signet's block-level signature rule (BIP325
+//! signs the *block*, not the header — header rules still apply), and the
+//! `nMinimumChainWork`/assume-valid DoS guards. These belong to later gates alongside
+//! block-level validation.
 
 use std::collections::HashMap;
 
@@ -92,6 +94,21 @@ pub enum ChainError {
     /// The header's timestamp violates a contextual time rule.
     #[error(transparent)]
     Time(#[from] TimeError),
+    /// The header's `nVersion` is below a buried-deployment floor already active at its
+    /// height (Core's `bad-version` in `ContextualCheckBlockHeader`): `nVersion < 2` once
+    /// [`crate::params::Params::bip34_height`] is active, `nVersion < 3` once
+    /// [`crate::params::Params::bip66_height`] is active, or `nVersion < 4` once
+    /// [`crate::params::Params::bip65_height`] is active.
+    ///
+    /// The `Display` reproduces Core's exact reject reason — `strprintf("bad-version(0x%08x)",
+    /// block.nVersion)` — formatting the signed `nVersion` as its 32-bit two's-complement
+    /// hex (Rust's `{:x}` on a signed integer already formats the bit pattern, matching
+    /// `%08x` on Core's `int32_t`).
+    #[error("bad-version(0x{version:08x})")]
+    BadVersion {
+        /// The header's `nVersion`, as received (interpreted as signed 32-bit).
+        version: i32,
+    },
     /// Accumulating this header's work overflowed 256 bits — unreachable on any real chain
     /// (total attainable work is bounded by the number of headers times per-block maximum,
     /// far below `2^256`), defended anyway.
@@ -205,11 +222,13 @@ impl HeaderTree {
     /// Checks run in Core's `AcceptBlockHeader` / `ContextualCheckBlockHeader` order: the
     /// header is not already known (returns [`InsertStatus::AlreadyKnown`]); its hash
     /// satisfies [`pow::check_proof_of_work`] (`CheckBlockHeader`); its parent is in the
-    /// tree; its `nBits` equals [`pow::required_bits`] (`bad-diffbits`); and its timestamp
+    /// tree; its `nBits` equals [`pow::required_bits`] (`bad-diffbits`); its timestamp
     /// passes [`rules::check_block_time`] — median-time-past, then the BIP94 timewarp
     /// floor on `enforce_BIP94` networks at period-start heights, then the future-drift
-    /// ceiling. On success the node is stored and the best tip moves to it iff its
-    /// chainwork strictly exceeds the current tip's.
+    /// ceiling; and its `nVersion` meets every buried-deployment floor already active at
+    /// its height (`bad-version`, [`ChainError::BadVersion`]). On success the node is
+    /// stored and the best tip moves to it iff its chainwork strictly exceeds the current
+    /// tip's.
     ///
     /// # Errors
     ///
@@ -253,6 +272,18 @@ impl HeaderTree {
             now,
             timewarp_min,
         )?;
+        // `bad-version`: Core's ContextualCheckBlockHeader checks this last, after every
+        // timestamp rule. `new_height` was already computed above (`parent.height + 1`)
+        // for the BIP94 boundary test; reusing it here matches Core's
+        // `pindexPrev->nHeight + 1` exactly and cannot overflow (it is a `u64`).
+        if (header.version < 2 && new_height >= u64::from(self.params.bip34_height))
+            || (header.version < 3 && new_height >= u64::from(self.params.bip66_height))
+            || (header.version < 4 && new_height >= u64::from(self.params.bip65_height))
+        {
+            return Err(ChainError::BadVersion {
+                version: header.version,
+            });
+        }
         let chainwork = parent
             .chainwork
             .checked_add(Work::from_compact(header.bits))
@@ -419,21 +450,22 @@ mod tests {
         params
     }
 
-    /// Builds a child of `parent` with the given time/bits and grinds the nonce (starting
-    /// at `nonce_hint`) until the header satisfies its own claimed target under `params`.
-    /// With `easy_params`'s powLimit and the regtest genesis `nBits` (`0x207fffff`, target
-    /// ≈ `2^255`), roughly every other nonce passes. The hint lets sibling headers differ
-    /// even at equal times.
-    fn mint(
+    /// Builds a child of `parent` with the given version/time/bits and grinds the nonce
+    /// (starting at `nonce_hint`) until the header satisfies its own claimed target under
+    /// `params`. With `easy_params`'s powLimit and the regtest genesis `nBits`
+    /// (`0x207fffff`, target ≈ `2^255`), roughly every other nonce passes. The hint lets
+    /// sibling headers differ even at equal times.
+    fn mint_versioned(
         parent: &HeaderNode,
         params: &Params,
+        version: i32,
         time: u32,
         bits: CompactTarget,
         nonce_hint: u32,
     ) -> BlockHeader {
         for nonce in nonce_hint..u32::MAX {
             let header = BlockHeader {
-                version: 1,
+                version,
                 prev_block_hash: parent.hash(),
                 merkle_root: parent.header.merkle_root,
                 time,
@@ -445,6 +477,18 @@ mod tests {
             }
         }
         panic!("no nonce satisfied the target — target implausibly tight for this helper");
+    }
+
+    /// [`mint_versioned`] with version 4 — the modern, always-valid version every test that
+    /// is not specifically exercising the version floor should mint with.
+    fn mint(
+        parent: &HeaderNode,
+        params: &Params,
+        time: u32,
+        bits: CompactTarget,
+        nonce_hint: u32,
+    ) -> BlockHeader {
+        mint_versioned(parent, params, 4, time, bits, nonce_hint)
     }
 
     /// A valid child of `parent` under `easy_params`: correct bits (regtest never retargets
@@ -707,5 +751,184 @@ mod tests {
         let b1 = extend(&genesis_node, &params, genesis_time + 2, 200);
         tree.insert(&b1, u32::MAX).unwrap();
         assert_eq!(tree.tip_hash(), first_tip);
+    }
+
+    // ---- Version floor (`bad-version`) ----
+
+    /// Regtest's `easy_params` buries BIP34/66/65 at height 1 (the network default), so
+    /// every non-genesis height already sits above every floor: versions 1–3 must each be
+    /// rejected by the specific floor Core checks for them, version 4 clears every floor,
+    /// and a negative version — still `< 2` — is rejected the same way version 1 is.
+    #[test]
+    fn version_floor_rejects_versions_below_the_buried_heights_on_regtest() {
+        let params = easy_params();
+        assert_eq!(params.bip34_height, 1);
+        assert_eq!(params.bip66_height, 1);
+        assert_eq!(params.bip65_height, 1);
+        let genesis = *HeaderTree::new(params).tip();
+
+        // Version 1: below the BIP34 floor (`nVersion < 2`), active from height 1.
+        let mut tree = HeaderTree::new(params);
+        let v1 = mint_versioned(
+            &genesis,
+            &params,
+            1,
+            genesis.header.time + 1,
+            genesis.header.bits,
+            0,
+        );
+        assert_eq!(
+            tree.insert(&v1, u32::MAX),
+            Err(ChainError::BadVersion { version: 1 })
+        );
+        assert_eq!(tree.len(), 1, "rejected header must not be inserted");
+
+        // Version 2: clears BIP34 but is below the BIP66 floor (`nVersion < 3`).
+        let v2 = mint_versioned(
+            &genesis,
+            &params,
+            2,
+            genesis.header.time + 1,
+            genesis.header.bits,
+            10,
+        );
+        assert_eq!(
+            tree.insert(&v2, u32::MAX),
+            Err(ChainError::BadVersion { version: 2 })
+        );
+
+        // Version 3: clears BIP34/66 but is below the BIP65 floor (`nVersion < 4`).
+        let v3 = mint_versioned(
+            &genesis,
+            &params,
+            3,
+            genesis.header.time + 1,
+            genesis.header.bits,
+            20,
+        );
+        assert_eq!(
+            tree.insert(&v3, u32::MAX),
+            Err(ChainError::BadVersion { version: 3 })
+        );
+
+        // Version 4 clears every floor.
+        let v4 = mint_versioned(
+            &genesis,
+            &params,
+            4,
+            genesis.header.time + 1,
+            genesis.header.bits,
+            30,
+        );
+        assert_eq!(
+            tree.insert(&v4, u32::MAX),
+            Ok(InsertStatus::Added { height: 1 })
+        );
+
+        // A negative version is still `< 2`: rejected exactly like version 1, with its
+        // `Display` showing the 32-bit two's-complement hex Core would report.
+        let neg = mint_versioned(
+            &genesis,
+            &params,
+            -1,
+            genesis.header.time + 2,
+            genesis.header.bits,
+            40,
+        );
+        assert_eq!(
+            tree.insert(&neg, u32::MAX),
+            Err(ChainError::BadVersion { version: -1 })
+        );
+        assert_eq!(
+            ChainError::BadVersion { version: -1 }.to_string(),
+            "bad-version(0xffffffff)"
+        );
+        assert_eq!(
+            ChainError::BadVersion { version: 1 }.to_string(),
+            "bad-version(0x00000001)"
+        );
+    }
+
+    /// The genesis header is never run through `insert`'s checks — it is seeded directly
+    /// by [`HeaderTree::new`] — so it is exempt from the version floor even when a floor is
+    /// configured to cover height 0 itself (which no built-in network's parameters do; Core
+    /// buries every floor at height ≥ 1).
+    #[test]
+    fn genesis_is_exempt_from_the_version_floor() {
+        let mut params = easy_params();
+        params.bip34_height = 0;
+        // The regtest genesis carries version 1, which would fail an active BIP34 floor
+        // (`nVersion < 2`) at height 0 if `new` validated it the way `insert` validates
+        // every other header.
+        assert_eq!(params.genesis_header.version, 1);
+        let tree = HeaderTree::new(params);
+        assert_eq!(tree.tip().height, 0);
+        assert_eq!(tree.tip().header.version, 1);
+    }
+
+    /// Mainnet-shaped params (real buried heights) but an easy, regtest-style genesis
+    /// target so a child header can be nonce-ground in a test without real mining. A
+    /// version-1 header at height 1 — far below mainnet's `bip34_height` (227931) — must
+    /// clear the version floor (though a real chain's version-1 blocks predate BIP34
+    /// regardless, this pins the height comparison itself in isolation from real fixture
+    /// data).
+    fn easy_mainnet_params() -> Params {
+        let mut params = Network::Mainnet.params();
+        params.pow_limit = crate::arith::Target(crate::arith::U256::MAX);
+        params.no_retargeting = true;
+        params.allow_min_difficulty_blocks = false;
+        // Keep every other mainnet field (including the real bip34/66/65 heights) but
+        // swap in a trivially-easy genesis target, mirroring `easy_params`'s regtest
+        // technique — `HeaderTree::new` never PoW-checks the genesis it is seeded with, so
+        // an arbitrary nonce is fine here.
+        params.genesis_header.bits = CompactTarget(0x207f_ffff);
+        params
+    }
+
+    #[test]
+    fn version_one_below_bip34_height_passes_the_version_floor_on_mainnet_params() {
+        let params = easy_mainnet_params();
+        assert_eq!(params.bip34_height, 227_931);
+        let mut tree = HeaderTree::new(params);
+        let genesis = *tree.tip();
+        let header = mint_versioned(
+            &genesis,
+            &params,
+            1,
+            genesis.header.time + 1,
+            genesis.header.bits,
+            0,
+        );
+        assert_eq!(
+            tree.insert(&header, u32::MAX),
+            Ok(InsertStatus::Added { height: 1 })
+        );
+    }
+
+    /// Core checks `bad-diffbits` before `bad-version`: a header that fails both reports
+    /// the diffbits failure.
+    #[test]
+    fn bad_diffbits_is_reported_before_bad_version() {
+        let params = easy_params();
+        let genesis = *HeaderTree::new(params).tip();
+        let mut tree = HeaderTree::new(params);
+        // Forge a version-1 child (fails the BIP34 floor, active at height 1) whose bits
+        // also differ from the required (parent's) bits — its own claimed PoW still
+        // passes, so only the ordering of the two checks decides which error surfaces.
+        let forged = mint_versioned(
+            &genesis,
+            &params,
+            1,
+            genesis.header.time + 1,
+            CompactTarget(0x207f_fffe),
+            0,
+        );
+        assert_eq!(
+            tree.insert(&forged, u32::MAX),
+            Err(ChainError::WrongBits {
+                expected: genesis.header.bits,
+                actual: forged.bits,
+            })
+        );
     }
 }

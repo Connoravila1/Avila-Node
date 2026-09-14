@@ -41,6 +41,14 @@ impl Network {
                 allow_min_difficulty_blocks: false,
                 enforce_bip94: false,
                 no_retargeting: false,
+                signet_blocks: false,
+                // kernel/chainparams.cpp buried-deployment heights; cross-checked against
+                bip34_height: 227_931,
+                bip66_height: 363_725,
+                bip65_height: 388_381,
+                csv_height: 419_328,
+                segwit_height: 481_824,
+                taproot_height: 709_632,
                 genesis_header: MAINNET_GENESIS,
             },
             Network::Testnet4 => Params {
@@ -51,6 +59,14 @@ impl Network {
                 allow_min_difficulty_blocks: true,
                 enforce_bip94: true,
                 no_retargeting: false,
+                signet_blocks: false,
+                // Every buried deployment activates at height 1 on testnet4; segwit is
+                bip34_height: 1,
+                bip66_height: 1,
+                bip65_height: 1,
+                csv_height: 1,
+                segwit_height: 1,
+                taproot_height: 0,
                 genesis_header: TESTNET4_GENESIS,
             },
             Network::Signet => Params {
@@ -62,6 +78,13 @@ impl Network {
                 allow_min_difficulty_blocks: false,
                 enforce_bip94: false,
                 no_retargeting: false,
+                signet_blocks: true,
+                bip34_height: 1,
+                bip66_height: 1,
+                bip65_height: 1,
+                csv_height: 1,
+                segwit_height: 1,
+                taproot_height: 0,
                 genesis_header: SIGNET_GENESIS,
             },
             Network::Regtest => Params {
@@ -77,6 +100,14 @@ impl Network {
                 // (`RegTestOptions{}`) is false.
                 enforce_bip94: false,
                 no_retargeting: true,
+                signet_blocks: false,
+                // Core's regtest defaults bury BIP34/65/66/CSV at height 1 and activate
+                bip34_height: 1,
+                bip66_height: 1,
+                bip65_height: 1,
+                csv_height: 1,
+                segwit_height: 0,
+                taproot_height: 0,
                 genesis_header: REGTEST_GENESIS,
             },
         }
@@ -126,6 +157,45 @@ pub struct Params {
     /// `consensus.fPowNoRetargeting`: difficulty adjustments are disabled entirely
     /// (regtest).
     pub no_retargeting: bool,
+    /// `consensus.signet_blocks`: whether blocks carry a BIP325 signet solution that must
+    /// satisfy the network's block challenge. Recorded for completeness; the solution
+    /// check itself is not yet implemented (see `crate::check::check_block`).
+    pub signet_blocks: bool,
+    /// `consensus.BIP34Height`: Core's `DEPLOYMENT_HEIGHTINCB` buried deployment (BIP34
+    /// coinbase height enforcement). [`crate::chain::HeaderTree::insert`]'s `bad-version`
+    /// check also uses this as the `nVersion < 2` floor's activation height, mirroring
+    /// `DeploymentActiveAfter(pindexPrev, ..., DEPLOYMENT_HEIGHTINCB)` in Core's
+    /// `ContextualCheckBlockHeader` (`validation.cpp`): a candidate block at height `h`
+    /// (`pindexPrev->nHeight + 1`) is governed once `h >= bip34_height`.
+    pub bip34_height: u32,
+    /// `consensus.BIP66Height`: Core's `DEPLOYMENT_DERSIG` buried deployment (BIP66 strict
+    /// DER signatures). Also the `bad-version` check's `nVersion < 3` floor's activation
+    /// height.
+    pub bip66_height: u32,
+    /// `consensus.BIP65Height`: Core's `DEPLOYMENT_CLTV` buried deployment (BIP65
+    /// `OP_CHECKLOCKTIMEVERIFY`). Also the `bad-version` check's `nVersion < 4` floor's
+    /// activation height.
+    pub bip65_height: u32,
+    /// `consensus.CSVHeight`: Core's `DEPLOYMENT_CSV` buried deployment (BIP68/112/113:
+    /// relative lock time, `OP_CHECKSEQUENCEVERIFY`, and the median-time-past `nLockTime`
+    /// cutoff). [`crate::check::contextual_check_block`] consults it for the BIP113
+    /// locktime cutoff; the relative-lock-time rules themselves are UTXO-dependent and
+    /// not yet implemented.
+    pub csv_height: u32,
+    /// `consensus.SegwitHeight`: Core's `DEPLOYMENT_SEGWIT` buried deployment
+    /// (BIP141/143/147, segregated witness). [`crate::check::contextual_check_block`]
+    /// consults it for the witness-commitment rules; the witness program/script rules
+    /// themselves are UTXO-dependent and not yet implemented.
+    pub segwit_height: u32,
+    /// Taproot's (BIP340-342) buried activation height: Core's `DEPLOYMENT_TAPROOT`
+    /// versionbits deployment's `min_activation_height` (`709632` on mainnet). On
+    /// testnet4, signet and regtest the deployment starts `ALWAYS_ACTIVE`, which Core
+    /// records as `min_activation_height = 0` — so `0` here means "active from genesis",
+    /// not "never active". Unlike the buried heights above, Core still tracks Taproot's
+    /// *true* activation through versionbits signaling state (`VersionBitsCache`), not
+    /// this height alone; not consulted by any rule this crate implements — carried for
+    /// documentation and G2.
+    pub taproot_height: u32,
     /// The network's genesis block header: the anchor every [`crate::chain::HeaderTree`]
     /// is seeded with.
     pub genesis_header: BlockHeader,
@@ -323,6 +393,35 @@ mod tests {
         assert!(Network::Testnet4.params().enforce_bip94);
         assert!(!Network::Signet.params().enforce_bip94);
         assert!(!Network::Regtest.params().enforce_bip94);
+    }
+
+    /// `kernel/chainparams.cpp`'s buried-deployment heights (`BIP34Height`, `BIP66Height`,
+    /// `BIP65Height`, `CSVHeight`, `SegwitHeight`, and Taproot's `min_activation_height`),
+    /// transcribed per network.
+    #[test]
+    fn buried_deployment_heights_match_core_chainparams_values() {
+        for (network, bip34, bip66, bip65, csv, segwit, taproot) in [
+            (
+                Network::Mainnet,
+                227_931,
+                363_725,
+                388_381,
+                419_328,
+                481_824,
+                709_632,
+            ),
+            (Network::Testnet4, 1, 1, 1, 1, 1, 0),
+            (Network::Signet, 1, 1, 1, 1, 1, 0),
+            (Network::Regtest, 1, 1, 1, 1, 0, 0),
+        ] {
+            let params = network.params();
+            assert_eq!(params.bip34_height, bip34, "{network:?} bip34_height");
+            assert_eq!(params.bip66_height, bip66, "{network:?} bip66_height");
+            assert_eq!(params.bip65_height, bip65, "{network:?} bip65_height");
+            assert_eq!(params.csv_height, csv, "{network:?} csv_height");
+            assert_eq!(params.segwit_height, segwit, "{network:?} segwit_height");
+            assert_eq!(params.taproot_height, taproot, "{network:?} taproot_height");
+        }
     }
 
     /// The genesis constants must produce each network's canonical hash. For the public

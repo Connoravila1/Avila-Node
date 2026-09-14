@@ -6,6 +6,7 @@
 pub mod arith;
 pub mod block;
 pub mod chain;
+pub mod check;
 pub mod encode;
 pub mod hash;
 pub mod header;
@@ -14,4 +15,5 @@ pub mod merkle;
 pub mod params;
 pub mod pow;
 pub mod rules;
+pub mod script;
 pub mod transaction;
