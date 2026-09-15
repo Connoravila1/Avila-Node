@@ -807,7 +807,6 @@ fn deploymentinfo_json(cs: &Chainstate, node: &HeaderNode) -> Value {
                 "statistics".into(),
                 json!({
                     "period": stats.period,
-                    "period_start": stats.period_start,
                     "elapsed": stats.elapsed,
                     "count": stats.count,
                     "threshold": stats.threshold,
@@ -1536,19 +1535,11 @@ fn dispatch(
                         }
                         Ok(out)
                     }
-                    Err((error, locations)) => {
-                        let mut out = json!({
-                            "isvalid": false,
-                            "error_locations": locations,
-                            "error": error,
-                        });
-                        // Core emits error_index = the first located
-                        // position when any were found.
-                        if let Some(first) = locations.first() {
-                            out["error_index"] = json!(first);
-                        }
-                        Ok(out)
-                    }
+                    Err((error, locations)) => Ok(json!({
+                        "isvalid": false,
+                        "error_locations": locations,
+                        "error": error,
+                    })),
                 }
             })
         }
@@ -2727,14 +2718,15 @@ fn dispatch(
                 // allocator-dependent DynamicUsage figure.
                 "usage": bytes,
                 "total_fee": pool.total_fees() as f64 / 100_000_000.0,
+                "maxmempool": pool.max_bytes(),
                 // No size-based decay yet — the dynamic floor equals
                 // the configured relay floor until that lands.
                 "mempoolminfee": relay_btc,
                 "minrelaytxfee": relay_btc,
                 "incrementalrelayfee": sat_to_btc(avila_mempool::INCREMENTAL_RELAY_FEE),
-                // Our replacement rule is BIP125 opt-in signaling, not
-                // Core's mempoolfullrbf — the honest answer is false.
-                "fullrbf": false,
+                // Full-RBF matches deployed Core's -mempoolfullrbf=1:
+                // replacements no longer need BIP125 signaling.
+                "fullrbf": pool.full_rbf(),
                 "unbroadcastcount": 0,
             }))
         }),
@@ -3381,7 +3373,8 @@ fn dispatch(
             .ok();
             // `currentblock*` describes the candidate Core refreshes in
             // the background — we build it on demand and report its
-            // size/weight/tx count honestly.
+            // weight/tx count honestly. Core dropped `currentblocksize`
+            // (Knots still emits it); match Core.
             let current = mgr
                 .mempool_ref()
                 .build_template(cs, Script::new(vec![avila_consensus::script::OP_1]), now)
@@ -3391,7 +3384,6 @@ fn dispatch(
             let networkhashps = network_hashps(cs, 120, -1);
             let mut out = json!({
                 "blocks": node.height,
-                "currentblocksize": current.as_ref().map(|t| t.block.encode().len()).unwrap_or(0),
                 "currentblockweight": current.as_ref().map(|t| t.weight).unwrap_or(0),
                 "currentblocktx": current.as_ref().map(|t| t.tx_count).unwrap_or(0),
                 "difficulty": core_num(difficulty(node.header.bits.0)),
@@ -4077,6 +4069,9 @@ fn dispatch(
                 "connections": mgr.len(),
                 "connections_in": inbound,
                 "connections_out": mgr.len() - inbound,
+                // No discovered/advertised local addrs yet — Core's
+                // regtest answer is the empty list too.
+                "localaddresses": [],
                 "relayfee": mgr.mempool_ref().min_relay_fee() as f64 / 100_000_000.0,
                 "incrementalfee": avila_mempool::INCREMENTAL_RELAY_FEE as f64 / 100_000_000.0,
                 "warnings": [],
@@ -4473,12 +4468,20 @@ mod tests {
             "bytes",
             "usage",
             "total_fee",
+            "maxmempool",
             "mempoolminfee",
             "minrelaytxfee",
+            "incrementalrelayfee",
+            "fullrbf",
             "unbroadcastcount",
         ] {
             assert!(r.get(key).is_some(), "getmempoolinfo missing {key}");
         }
+        // Core 29.x deployed defaults: 0.1 sat/vB floors + full-RBF.
+        assert_eq!(r["incrementalrelayfee"].as_f64(), Some(1e-6));
+        assert_eq!(r["minrelaytxfee"].as_f64(), Some(1e-6));
+        assert_eq!(r["fullrbf"], Value::Bool(true));
+        assert_eq!(r["maxmempool"].as_u64(), Some(300_000_000));
 
         // getblocktemplate carries the Core/Knots shape: mandatory
         // !segwit, taproot rule, proposal-only capabilities, empty

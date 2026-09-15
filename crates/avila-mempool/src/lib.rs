@@ -21,20 +21,24 @@ use avila_consensus::script::{ScriptFlags, block_script_flags};
 use avila_consensus::sigchecker::check_input_scripts;
 use avila_consensus::transaction::{OutPoint, Transaction};
 
-/// Core's `DEFAULT_MIN_RELAY_TX_FEE`: 1000 sat/kvB (1 sat/vB).
-pub const DEFAULT_MIN_RELAY_FEE: i64 = 1000;
+/// Deployed Core's `DEFAULT_MIN_RELAY_TX_FEE`: 100 sat/kvB
+/// (0.1 sat/vB — lowered in the 29.x policy relaxation).
+pub const DEFAULT_MIN_RELAY_FEE: i64 = 100;
 
 /// Core's `MAX_STANDARD_TX_WEIGHT` — 400,000 weight units (~100 kvB).
 /// Policy only; consensus has no per-tx weight cap beyond the block's.
 pub const MAX_STANDARD_TX_WEIGHT: usize = 400_000;
 
-/// Core's `DEFAULT_INCREMENTAL_RELAY_FEE` — a replacement must cover its
-/// own relay at this rate on top of the conflicting tx's fee.
-pub const INCREMENTAL_RELAY_FEE: i64 = 1000; // sat/kvB
+/// Deployed Core's `DEFAULT_INCREMENTAL_RELAY_FEE` — a replacement must
+/// cover its own relay at this rate on top of the conflicting tx's fee.
+pub const INCREMENTAL_RELAY_FEE: i64 = 100; // sat/kvB
 
-/// Bound on pool entries — Core bounds by bytes (300 MB default); ours
-/// is an entry count, which is simpler and strictly bounded either way.
+/// Bound on pool entries — a belt alongside the `DEFAULT_MAX_BYTES`
+/// suspenders; either cap trips the evict-lowest-feerate path.
 pub const DEFAULT_MAX_ENTRIES: usize = 25_000;
+
+/// Core's `DEFAULT_MAX_MEMPOOL_SIZE` — 300 MB in bytes.
+pub const DEFAULT_MAX_BYTES: usize = 300_000_000;
 
 /// Core's `nSequence` threshold for BIP125 replaceability signaling:
 /// any input below `0xfffffffe` opts the tx into replacement.
@@ -225,8 +229,18 @@ pub struct Mempool {
     orphans: HashMap<Txid, OrphanEntry>,
     /// Entry cap.
     max_entries: usize,
+    /// Serialized-bytes cap — Core's `-maxmempool` (300 MB default).
+    /// Enforced alongside the entry cap: either limit trips the
+    /// evict-lowest-feerate path.
+    max_bytes: usize,
+    /// Live serialized bytes in the pool — the `max_bytes` accounting.
+    pool_bytes: usize,
     /// Min relay fee rate in sat/kvB.
     min_relay_fee: i64,
+    /// Full-RBF: deployed Core accepts replacements regardless of
+    /// BIP125 signaling (`-mempoolfullrbf` default-on). When false,
+    /// the signaling requirement is enforced.
+    full_rbf: bool,
     /// Confirmation observations from connected blocks.
     estimator: FeeEstimator,
 }
@@ -241,7 +255,10 @@ impl Mempool {
             wtxids: HashMap::new(),
             orphans: HashMap::new(),
             max_entries: DEFAULT_MAX_ENTRIES,
+            max_bytes: DEFAULT_MAX_BYTES,
+            pool_bytes: 0,
             min_relay_fee: DEFAULT_MIN_RELAY_FEE,
+            full_rbf: true,
             estimator: FeeEstimator::new(),
         }
     }
@@ -294,7 +311,7 @@ impl Mempool {
     /// is allocator-dependent; encoded size is the honest floor).
     #[must_use]
     pub fn total_tx_bytes(&self) -> usize {
-        self.map.values().map(|e| e.tx.encode().len()).sum()
+        self.pool_bytes
     }
 
     /// Sum of pooled entry fees in satoshis — getmempoolinfo's
@@ -318,6 +335,30 @@ impl Mempool {
     /// Overrides the entry cap — an operator knob.
     pub fn set_max_entries(&mut self, n: usize) {
         self.max_entries = n;
+    }
+
+    /// The serialized-bytes cap — `getmempoolinfo`'s `maxmempool`.
+    #[must_use]
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Overrides the serialized-bytes cap — `-maxmempool`'s analog.
+    pub fn set_max_bytes(&mut self, n: usize) {
+        self.max_bytes = n;
+    }
+
+    /// Whether full-RBF is on (deployed Core's `-mempoolfullrbf`
+    /// default). With it on, replacements skip the BIP125 signaling
+    /// requirement; the fee-bump rules always apply.
+    #[must_use]
+    pub fn full_rbf(&self) -> bool {
+        self.full_rbf
+    }
+
+    /// Overrides the full-RBF policy — `-mempoolfullrbf`'s analog.
+    pub fn set_full_rbf(&mut self, on: bool) {
+        self.full_rbf = on;
     }
 
     /// Does `tx` signal BIP125 replaceability (any input sequence below
@@ -474,10 +515,11 @@ impl Mempool {
             "bip125-signal",
             if conflicts.is_empty() {
                 Ok("no conflicts".into())
-            } else if conflicts
-                .iter()
-                .all(|id| self.map.get(id).is_some_and(|e| Self::signals_rbf(&e.tx)))
-                && Self::signals_rbf(tx)
+            } else if self.full_rbf
+                || (conflicts
+                    .iter()
+                    .all(|id| self.map.get(id).is_some_and(|e| Self::signals_rbf(&e.tx)))
+                    && Self::signals_rbf(tx))
             {
                 Ok(format!("replaces {} conflict(s)", conflicts.len()))
             } else {
@@ -623,8 +665,16 @@ impl Mempool {
         push(
             &mut steps,
             "capacity",
-            if self.map.len() < self.max_entries {
-                Ok(format!("{}/{} entries", self.map.len(), self.max_entries))
+            if self.map.len() < self.max_entries
+                && self.pool_bytes + tx.encode().len() <= self.max_bytes
+            {
+                Ok(format!(
+                    "{}/{} entries, {}/{} bytes",
+                    self.map.len(),
+                    self.max_entries,
+                    self.pool_bytes,
+                    self.max_bytes
+                ))
             } else {
                 let my_rate = fee * 1000 / vsize as i64;
                 match self
@@ -686,10 +736,11 @@ impl Mempool {
             }
         }
 
-        // 3. BIP125: a conflicted spend may only proceed if every
-        //    conflict signals replaceability and the bump is large
-        //    enough — checked after the fee is known (step 5).
-        if !conflicts.is_empty() {
+        // 3. BIP125: with full-RBF off, a conflicted spend may only
+        //    proceed if every conflict signals replaceability and the
+        //    bump is large enough — checked after the fee is known
+        //    (step 5).
+        if !conflicts.is_empty() && !self.full_rbf {
             let all_signal = conflicts
                 .iter()
                 .all(|id| self.map.get(id).is_some_and(|e| Self::signals_rbf(&e.tx)));
@@ -772,9 +823,11 @@ impl Mempool {
             return Err(MempoolReject::MinRelayFee);
         }
 
-        // 9. Capacity: evict the lowest fee-rate entry if this one
-        //    outbids it; refuse otherwise.
-        if self.map.len() >= self.max_entries {
+        // 9. Capacity: either cap (entries or serialized bytes — Core's
+        //    `-maxmempool` analog) trips the evict-the-worst path; the
+        //    candidate must outbid the victim to displace it.
+        let tx_size = tx.encode().len();
+        if self.map.len() >= self.max_entries || self.pool_bytes + tx_size > self.max_bytes {
             let my_rate = fee * 1000 / vsize as i64;
             let Some((&worst_id, worst)) = self
                 .map
@@ -799,6 +852,7 @@ impl Mempool {
             self.spends.insert(input.previous_output, txid);
         }
         self.wtxids.insert(tx.wtxid(), txid);
+        self.pool_bytes += tx.encode().len();
         self.map.insert(
             txid,
             MempoolEntry {
@@ -1104,6 +1158,7 @@ impl Mempool {
     pub fn remove(&mut self, txid: &Txid) -> Option<MempoolEntry> {
         let entry = self.map.remove(txid)?;
         self.wtxids.remove(&entry.tx.wtxid());
+        self.pool_bytes = self.pool_bytes.saturating_sub(entry.tx.encode().len());
         for input in &entry.tx.inputs {
             self.spends.remove(&input.previous_output);
         }
@@ -1391,11 +1446,72 @@ mod tests {
     fn double_spend_without_rbf_is_rejected() {
         let (cs, blocks) = chainstate_at(101);
         let mut pool = Mempool::new();
+        // BIP125 signaling is still enforced when full-RBF is off —
+        // deployed Core's -mempoolfullrbf=0 path.
+        pool.set_full_rbf(false);
         let op = mature_outpoint(&blocks, 1);
         let tx1 = spend_tx(op, 4_999_000_000, SEQ_FINAL);
         let tx2 = spend_tx(op, 4_998_000_000, SEQ_FINAL);
         pool.accept_tx(tx1, &cs, NOW).unwrap();
         assert_eq!(pool.accept_tx(tx2, &cs, NOW), Err(MempoolReject::Conflict));
+    }
+
+    #[test]
+    fn full_rbf_accepts_unsignaled_replacement() {
+        // Deployed Core default (-mempoolfullrbf=1): neither side needs
+        // BIP125 signaling — only the fee-bump rules bind.
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        assert!(pool.full_rbf());
+        let op = mature_outpoint(&blocks, 1);
+        let tx1 = spend_tx(op, 4_999_000_000, SEQ_FINAL); // 1M sat fee
+        let tx2 = spend_tx(op, 4_998_000_000, SEQ_FINAL); // 2M sat — covers bump
+        let id1 = tx1.txid();
+        let id2 = tx2.txid();
+        pool.accept_tx(tx1, &cs, NOW).unwrap();
+        assert_eq!(pool.accept_tx(tx2, &cs, NOW), Ok(id2));
+        assert!(pool.get(&id1).is_none(), "conflict evicted");
+        assert!(pool.get(&id2).is_some());
+    }
+
+    #[test]
+    fn full_rbf_still_requires_adequate_bump() {
+        // Full-RBF waives signaling, not economics: an underpaying
+        // replacement still fails.
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let op = mature_outpoint(&blocks, 1);
+        let tx1 = spend_tx(op, 4_999_000_000, SEQ_FINAL); // 1M sat fee
+        // Same inputs, barely more output — fee shrinks below bump.
+        let tx2 = spend_tx(op, 4_999_999_000, SEQ_FINAL);
+        pool.accept_tx(tx1, &cs, NOW).unwrap();
+        assert_eq!(pool.accept_tx(tx2, &cs, NOW), Err(MempoolReject::Conflict));
+    }
+
+    #[test]
+    fn byte_cap_evicts_lowest_feerate() {
+        // `-maxmempool`'s analog: a candidate that outbids the pool's
+        // worst feerate displaces it when the byte cap binds.
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let small = spend_tx(mature_outpoint(&blocks, 1), 4_999_999_000, SEQ_FINAL);
+        let cap = small.encode().len() + 8;
+        pool.set_max_bytes(cap);
+        // Low feerate occupies the only byte-slot.
+        let weak = spend_tx(mature_outpoint(&blocks, 1), 4_999_999_000, SEQ_FINAL);
+        let weak_id = weak.txid();
+        pool.accept_tx(weak, &cs, NOW).unwrap();
+        // A richer spend of a different outpoint outbids → evicts.
+        let rich = spend_tx(mature_outpoint(&blocks, 2), 4_000_000_000, SEQ_FINAL);
+        let rich_id = rich.txid();
+        assert_eq!(pool.accept_tx(rich, &cs, NOW), Ok(rich_id));
+        assert!(pool.get(&weak_id).is_none());
+        assert!(pool.get(&rich_id).is_some());
+        // …but an equal-or-lower feerate bounces off the full pool.
+        // (h1's outpoint freed when `weak` was evicted.)
+        let poor = spend_tx(mature_outpoint(&blocks, 1), 4_999_999_500, SEQ_FINAL);
+        assert_eq!(pool.accept_tx(poor, &cs, NOW), Err(MempoolReject::Full));
+        assert!(pool.pool_bytes + 8 <= cap);
     }
 
     #[test]

@@ -13,6 +13,10 @@ target/
 /.claude/worktrees/
 # Ad-hoc session scratch (daemon datadirs, generated corpora).
 /.scratch/
+# Live regtest datadirs for the reference-comparison setup.
+/data-core/
+/data-core-ref/
+/data-core31-ref/
 
 # Python bytecode caches
 __pycache__/

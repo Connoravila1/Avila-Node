@@ -1,4 +1,4 @@
-# Experiment: field-level RPC compatibility against Knots 29.3
+# Experiment: field-level RPC compatibility against Bitcoin Core and Knots
 
 Status: complete (first matrix; ongoing coverage grows with the surface)
 
@@ -8,7 +8,24 @@ Scorecard rows: C1 (correctness evidence — the RPC surface is a
 verdicts surface: identical inputs must produce identical answers).
 
 Operating profile: `avila-node run --connect` + `--rpc` on regtest,
-cookie auth, against a live Knots 29.3.0 regtest daemon.
+cookie auth, against live regtest reference daemons.
+
+## Reference daemons
+
+- **Primary: Bitcoin Core 29.4** (`bitcoin-29.4.tar.gz`, SHA256SUMS-
+  verified) — the authoritative target. Regtest-only, `-txindex`,
+  datadir `data-core-ref/`, P2P `127.0.0.1:58341`, RPC `127.0.0.1:58321`.
+- **Secondary: Bitcoin Knots 29.3.0** (`/Satoshi:29.3.0/Knots:20260508/`)
+  — kept for cross-checking, but Knots-specific behavior is *not*
+  Bitcoin evidence. Knots fields/extensions absent from Core are
+  treated as Knots-isms, not compat targets.
+- Spot-check: **Core 31.1** (`data-core31-ref/`, RPC `127.0.0.1:58323`)
+  to distinguish "upstream field added after 29.4" from "Knots-only".
+
+Newer Knots carries divergent deployment rules (BIP110 was rejected by
+Bitcoin and its supporters split onto a separate network), so Core —
+not Knots — decides what "Bitcoin-compatible" means. All regtest-only:
+no mainnet IBD, negligible disk/CPU.
 
 ## Question and hypothesis
 
@@ -19,12 +36,12 @@ drift: any `DIFFERS` verdict on a shared field is a compatibility bug.
 
 ## Baseline and candidate
 
-- Baseline: `bitcoind` Knots 29.3.0 (`/Satoshi:29.3.0/Knots:20260508/`)
-  regtest, datadir `target/p2p-interop/datadir`, RPC `:58321`.
-- Candidate: `avila-node` @ commit under test, regtest, RPC `:18443`,
-  synced to the same chain tip (h121 at measurement — see the
-  `submitblock` paragraph; the matrix itself grew the chain).
-- Both endpoints authenticated via Core-format `.cookie` over HTTP
+- Baseline: `bitcoind` Core 29.4 regtest (primary) and Knots 29.3.0
+  regtest (secondary).
+- Candidate: `avila-node` @ commit under test, regtest, synced to the
+  same chain tip (h160 vs Core 29.4; h121 at first measurement — the
+  matrix itself grows the chain).
+- All endpoints authenticated via Core-format `.cookie` over HTTP
   Basic — the same code path on both sides.
 
 ## Workload and method
@@ -37,30 +54,43 @@ matched / expected-dynamic / differing / one-side-only fields.
 `DYNAMIC_KEYS`/`DYNAMIC_METHODS` mark legitimately node- or
 time-specific values (time, curtime, peers, uptime, help text).
 
-Reproduce:
+Reproduce (Core 29.4 as reference; keep datadirs on the home
+filesystem — /tmp tmpfs quota has already bitten once):
 
 ```
-avila-node run --connect <core-p2p> --rpc 127.0.0.1:18443 --txindex
+bitcoind -regtest -datadir=<repo>/data-core-ref -server \
+    -rpcport=58321 -port=58341 -bind=127.0.0.1:58341 \
+    -daemon -txindex -listenonion=0
+# inside Core: createwallet, then generatetoaddress 160
+avila-node run --config <cfg: data_dir=<repo>/data-core> \
+    --connect 127.0.0.1:58341 --rpc 127.0.0.1:18444 --txindex
 python3 tools/compare_rpc.py \
-    --avila-cookie data/regtest/.cookie \
-    --core-cookie <core-datadir>/regtest/.cookie --height 100
+    --core 127.0.0.1:58321 --avila 127.0.0.1:18444 \
+    --avila-cookie data-core/regtest/.cookie \
+    --core-cookie data-core-ref/regtest/.cookie
 ```
 
 ## Results
 
-46 MATCH (every shared field byte-identical), 2 EXPECTED-DIFF
-(presence gaps only), 3 DIFFERS — one is a genuine policy divergence
-(`fullrbf`: our pool enforces BIP125 opt-in signaling; Knots 29 ships
-mempoolfullrbf semantics) and two are environmental (`getpeerinfo`,
-`getconnectioncount` — the daemons hold different peer sets).
+Latest run vs **Core 29.4** at h160: 63 MATCH, 2 EXPECTED-DIFF
+(`getpeerinfo` per-peer field shape — our extra observability fields
+vs Core's direction-specific `addrbind`/`addrlocal`/`last_block`;
+`getrawtransaction`'s `in_active_chain` — an upstream field added
+after 29.4, verified present in Core 31.1), 0 DIFFERS, 1 CORE-ERROR
+(`gettxoutproof prove_witness` — the witness-proof wire format is a
+Knots extension Core doesn't implement), 53 BOTH-ERROR (identical
+error paths). First matrix vs Knots: 46 MATCH, 2 EXPECTED-DIFF,
+3 DIFFERS — `fullrbf` was a genuine policy divergence then; the
+mempool has since been aligned to Core 29.x (below).
+
 `estimatesmartfee` now returns Core's no-data result object
 (`{"errors": ["Insufficient data or no feerate found"], "blocks": 0}`)
 and its full argument-validation table (`-3` type, `-8` range,
-case-insensitive `estimate_mode`). One CORE-ERROR
-(`getrawtransaction` on a buried coinbase — a flag asymmetry: Knots
-runs without `-txindex`, we run with it, so the bare-txid lookup
-resolves only on our side; `getindexinfo` likewise reports `txindex`
-only on the node that has it). `sendrawtransaction` error
+case-insensitive `estimate_mode`). The historical CORE-ERROR on
+`getrawtransaction` was a flag asymmetry (reference ran without
+`-txindex`); the Core 29.4 reference runs with it, so that row is now
+matched — only `in_active_chain` (added upstream after 29.4) remains
+expected-different. `sendrawtransaction` error
 paths match: `-22` decode failures, `-26`/`bad-cb-length` consensus
 rejects. `savemempool` matches (`{"filename": <abs path>}`) and the
 pool survives restart: `mempool.dat` is written on shutdown, entries
@@ -122,8 +152,9 @@ v0-program length rule (a v0 program outside 20/32 bytes is
 `nonstandard`, matching Solver). `gettxout` (9 fields), `getblock`
 verbosity 2 (29 fields incl. per-tx `hex` and decoded
 `scriptPubKey`/`scriptSig`), `getblocktemplate` (22), `getmininginfo`
-(11 — incl. `networkhashps` computed through 256-bit chainwork
-division, `currentblocksize/weight/tx` from a live template build),
+(incl. `networkhashps` computed through 256-bit chainwork division,
+`currentblockweight`/`currentblocktx` from a live template build;
+Core dropped `currentblocksize`, we match Core),
 `getblockchaininfo` (13), `getblockheader` (15), `getblock` (v1: 20,
 v0: raw hex), `getchaintips`, `getrawmempool`, `getconnectioncount`,
 `getorphantxs`, `getblockcount`, `getbestblockhash`, `getblockhash`.
@@ -175,11 +206,14 @@ Serving genesis surfaced two deeper compat fixes:
   `addrlocal` — each daemon sees the other as the opposite direction)
   or Knots extensions (`cpu_load`, `forced_inbound`,
   `last_block_announcement`).
-- `getnetworkinfo`: `localaddresses` — we don't track our own
-  advertised addresses.
-- `getmempoolinfo`: `maxmempool` (our pool is entry-capped, not
-  byte-capped) and Knots-specific knobs (`rbf_policy`, `truc_policy`,
-  `dustdynamic`, `dustrelayfee*`).
+- `getmempoolinfo`: Knots-specific policy knobs only (`rbf_policy`,
+  `truc_policy`, `dustdynamic`, `dustrelayfee*`) — correctly absent.
+  The pool now carries a serialized-bytes cap (`DEFAULT_MAX_BYTES` =
+  Core's 300 MB `-maxmempool` default, enforced alongside the entry
+  cap via evict-lowest-feerate) and reports `maxmempool`; both relay
+  floors are the 29.x relaxed 100 sat/kvB (0.1 sat/vB) defaults and
+  `fullrbf` matches deployed Core — replacements no longer require
+  BIP125 signaling, only the fee-bump economics.
 
 `decoderawtransaction`, `gettxspendingprevout`, and `getindexinfo`
 landed, along with three display/validation fixes the comparison
@@ -254,11 +288,12 @@ surfaced:
   (bit 28, start 0, NO_TIMEOUT, threshold 108/144), and the
   ALWAYS_ACTIVE/NEVER_ACTIVE sentinels. Live-verified past the first
   regtest window: `status:"started"`, `since:144`, `statistics`
-  `{period:144, period_start:144, elapsed:6, count:6, threshold:108,
-  possible:true}`, `signalling:"######"` — byte-identical to Knots.
-  The same machine drives `getblocktemplate`'s `vbavailable` and
-  `ComputeBlockVersion` (template version `0x30000000` once testdummy
-  is started, matching Knots).
+  `{period:144, elapsed:6, count:6, threshold:108, possible:true}`,
+  `signalling:"######"` — byte-identical to Core. (Knots emits an
+  extra `period_start` in `statistics`; Core 29.4 and 31.1 don't —
+  Knots-ism, not emitted.) The same machine drives `getblocktemplate`'s
+  `vbavailable` and `ComputeBlockVersion` (template version
+  `0x30000000` once testdummy is started, matching both).
 - `gettxoutproof`/`verifytxoutproof` implement BIP37 partial merkle
   proofs (`PartialMerkleTree` in `merkle.rs`, a faithful port of
   `CPartialMerkleTree`) plus Knots' witness-aware extension: the
@@ -279,11 +314,10 @@ surfaced:
 
 ### Known semantic differences
 
-- `fullrbf`: `false` — we implement BIP125 opt-in signaling; Knots
-  29 enables full RBF. Real policy divergence to decide on.
-- `getindexinfo`/`getrawtransaction` differences against Knots are
-  flag-driven: our test node runs `--txindex`, the Knots instance
-  does not. Both sides answer correctly for their configuration.
+- `getindexinfo`/`getrawtransaction` differences are flag-driven:
+  `in_active_chain` is an upstream addition after 29.4 (present in
+  Core 31.1, absent in 29.4) — version drift, not a Knots-ism; and
+  bare-txid lookup needs `-txindex` on the reference side too.
 - `getrawtransaction` without a named block now goes through the
   `-txindex` index when enabled (`run --txindex`); without it the
   error is Core's exact `-5` ("No such mempool transaction. Use
