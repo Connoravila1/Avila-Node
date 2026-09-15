@@ -309,7 +309,13 @@ operation. Compare complete initial download and catch-up, not only local replay
       non-POST, `jsonrpc` cookie realm, 400/404/500 status mapping,
       `id` echoed only when present, `\n`-terminated bodies, batch
       arrays with the stale-`id` quirk, and V2 envelopes plus 204
-      notifications. RPC
+      notifications. Positional validation is a single
+      RPCHelpMan-style gate (`METHOD_ARGS`): bad counts return -1
+      with full help text, bad types collect into Core's -3 "Wrong
+      type passed" list, required args reject `null` while optional
+      ones read it as omitted, and amount/hash args (`ParseHashV`,
+      `ValueFromAmount`) carry Core's per-method wording and
+      8-decimal BTC text. RPC
       doubles emit Core's `UniValue::setFloat` text (`%.16g` via `g16`)
       rather than ryu's shortest repr — the two parse to different
       f64s on values like 101/17, and `txrate` now matches

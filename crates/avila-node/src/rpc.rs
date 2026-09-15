@@ -1083,6 +1083,19 @@ fn float_g16(v: f64) -> Value {
     serde_json::from_str(&g16(v)).unwrap_or(Value::Null)
 }
 
+/// Core's `ValueFromAmount` — fixed 8-decimal BTC text (`25.00000000`,
+/// never `25.0`), kept verbatim through `arbitrary_precision`.
+fn value_from_amount(sats: i64) -> Value {
+    let n = sats.unsigned_abs();
+    let text = format!(
+        "{}{}.{:08}",
+        if sats < 0 { "-" } else { "" },
+        n / 100_000_000,
+        n % 100_000_000
+    );
+    serde_json::from_str(&text).unwrap_or(Value::Null)
+}
+
 /// Core's `ParseHashV`: 64-char hex, else -8 with its exact wording.
 fn parse_hash_v<T>(s: &str, name: &str) -> Result<T, (i64, String)>
 where
@@ -1100,6 +1113,15 @@ where
             format!("{name} must be hexadecimal string (not '{s}')"),
         )
     })
+}
+
+/// The `Value`-level `ParseHashV` — non-strings throw the bare `-3`
+/// from its `RPCTypeCheck` before the length/hex wording.
+fn parse_hash_arg<T: std::str::FromStr>(v: &Value, name: &str) -> Result<T, (i64, String)> {
+    match v.as_str() {
+        Some(s) => parse_hash_v(s, name),
+        None => Err((RPC_TYPE_ERROR, field_type_message(v, "string"))),
+    }
 }
 
 /// Core's `UniValue::getValStr` — the scalar string form: strings and
@@ -1296,7 +1318,7 @@ const DECODERAWTRANSACTION_HELP: &str = "decoderawtransaction \"hexstring\" ( is
 const CREATERAWTRANSACTION_HELP: &str = "createrawtransaction [{\"txid\":\"hex\",\"vout\":n,\"sequence\":n},...] [{\"address\":amount,...},{\"data\":\"hex\"},...] ( locktime replaceable )\n\nCreate a transaction spending the given inputs and creating new outputs.\nOutputs can be addresses or data.\nReturns hex-encoded raw transaction.\nNote that the transaction's inputs are not signed, and\nit is not stored in the wallet or transmitted to the network.\n\nArguments:\n1. inputs                      (json array, required) The inputs\n     [\n       {                       (json object)\n         \"txid\": \"hex\",        (string, required) The transaction id\n         \"vout\": n,            (numeric, required) The output number\n         \"sequence\": n,        (numeric, optional, default=depends on the value of the 'replaceable' and 'locktime' arguments) The sequence number\n       },\n       ...\n     ]\n2. outputs                     (json array, required) The outputs specified as key-value pairs.\n                               Each key may only appear once, i.e. there can only be one 'data' output, and no address may be duplicated.\n                               At least one output of either type must be specified.\n                               For compatibility reasons, a dictionary, which holds the key-value pairs directly, is also\n                               accepted as second parameter.\n     [\n       {                       (json object)\n         \"address\": amount,    (numeric or string, required) A key-value pair. The key (string) is the bitcoin address, the value (float or string) is the amount in BTC\n         ...\n       },\n       {                       (json object)\n         \"data\": \"hex\",        (string, required) A key-value pair. The key must be \"data\", the value is hex-encoded data\n       },\n       ...\n     ]\n3. locktime                    (numeric, optional, default=0) Raw locktime. Non-0 value also locktime-activates inputs\n4. replaceable                 (boolean, optional, default=true) Marks this transaction as BIP125-replaceable.\n                               Allows this transaction to be replaced by a transaction with higher fees. If provided, it is an error if explicit sequence numbers are incompatible.\n\nResult:\n\"hex\"    (string) hex string of the transaction\n\nExamples:\n> bitcoin-cli createrawtransaction \"[{\\\"txid\\\":\\\"myid\\\",\\\"vout\\\":0}]\" \"[{\\\"address\\\":0.01}]\"\n> bitcoin-cli createrawtransaction \"[{\\\"txid\\\":\\\"myid\\\",\\\"vout\\\":0}]\" \"[{\\\"data\\\":\\\"00010203\\\"}]\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"createrawtransaction\", \"params\": [\"[{\\\"txid\\\":\\\"myid\\\",\\\"vout\\\":0}]\", \"[{\\\"address\\\":0.01}]\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"createrawtransaction\", \"params\": [\"[{\\\"txid\\\":\\\"myid\\\",\\\"vout\\\":0}]\", \"[{\\\"data\\\":\\\"00010203\\\"}]\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help gettxspendingprevout` text (Bitcoin Core 29).
-const GETTXSPENDINGPREVOUT_HELP: &str = "gettxspendingprevout [{\"txid\":\"hex\",\"vout\":n},...]\n\nScans the mempool to find transactions spending any of the given outputs\n\nArguments:\n1. outputs                 (json array, required) The transaction outputs that we want to check, and within each, the txid (string) vout (numeric).\n     [\n       {                   (json object)\n         \"txid\": \"hex\",    (string, required) The transaction id\n         \"vout\": n,        (numeric, required) The output number\n       },\n       ...\n     ]\n\nResult:\n[                              (json array)\n  {                            (json object)\n    \"txid\" : \"hex\",            (string) the transaction id of the checked output\n    \"vout\" : n,                (numeric) the vout value of the checked output\n    \"spendingtxid\" : \"hex\"     (string, optional) the transaction id of the mempool transaction spending this output (omitted if unspent)\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli gettxspendingprevout \"[{\\\"txid\\\":\\\"a08e6907dbbd3d809776dbfc5d82e371b764ed838b5655e72f463568df1aadf0\\\",\\\"vout\\\":3}]\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxspendingprevout\", \"params\": [[{\"txid\":\"a08e6907dbbd3d809776dbfc5d82e371b764ed838b5655e72f463568df1aadf0\",\"vout\":3}]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETTXSPENDINGPREVOUT_HELP: &str = "gettxspendingprevout [{\"txid\":\"hex\",\"vout\":n},...]\n\nScans the mempool to find transactions spending any of the given outputs\n\nArguments:\n1. outputs                 (json array, required) The transaction outputs that we want to check, and within each, the txid (string) vout (numeric).\n     [\n       {                   (json object)\n         \"txid\": \"hex\",    (string, required) The transaction id\n         \"vout\": n,        (numeric, required) The output number\n       },\n       ...\n     ]\n\nResult:\n[                              (json array)\n  {                            (json object)\n    \"txid\" : \"hex\",            (string) the transaction id of the checked output\n    \"vout\" : n,                (numeric) the vout value of the checked output\n    \"spendingtxid\" : \"hex\"     (string, optional) the transaction id of the mempool transaction spending this output (omitted if unspent)\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli gettxspendingprevout \"[{\\\"txid\\\":\\\"a08e6907dbbd3d809776dbfc5d82e371b764ed838b5655e72f463568df1aadf0\\\",\\\"vout\\\":3}]\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxspendingprevout\", \"params\": [\"[{\\\"txid\\\":\\\"a08e6907dbbd3d809776dbfc5d82e371b764ed838b5655e72f463568df1aadf0\\\",\\\"vout\\\":3}]\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help estimatesmartfee` text (Bitcoin Core 29).
 const ESTIMATESMARTFEE_HELP: &str = "estimatesmartfee conf_target ( \"estimate_mode\" )\n\nEstimates the approximate fee per kilobyte needed for a transaction to begin\nconfirmation within conf_target blocks if possible and return the number of blocks\nfor which the estimate is valid. Uses virtual transaction size as defined\nin BIP 141 (witness data is discounted).\n\nArguments:\n1. conf_target      (numeric, required) Confirmation target in blocks (1 - 1008)\n2. estimate_mode    (string, optional, default=\"economical\") The fee estimate mode.\n                    unset, economical, conservative \n                    unset means no mode set (default mode will be used). \n                    economical estimates use a shorter time horizon, making them more\n                    responsive to short-term drops in the prevailing fee market. This mode\n                    potentially returns a lower fee rate estimate.\n                    conservative estimates use a longer time horizon, making them\n                    less responsive to short-term drops in the prevailing fee market. This mode\n                    potentially returns a higher fee rate estimate.\n                    \n\nResult:\n{                   (json object)\n  \"feerate\" : n,    (numeric, optional) estimate fee rate in BTC/kvB (only present if no errors were encountered)\n  \"errors\" : [      (json array, optional) Errors encountered during processing (if there are any)\n    \"str\",          (string) error\n    ...\n  ],\n  \"blocks\" : n      (numeric) block number where estimate was found\n                    The request target will be clamped between 2 and the highest target\n                    fee estimation is able to return based on how long it has been running.\n                    An error is returned if not enough transactions and blocks\n                    have been observed to make an estimate for any number of blocks.\n}\n\nExamples:\n> bitcoin-cli estimatesmartfee 6\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"estimatesmartfee\", \"params\": [6]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
@@ -1312,13 +1334,13 @@ const GETNETTOTALS_HELP: &str = "getnettotals\n\nReturns information about netwo
 const PING_HELP: &str = "ping\n\nRequests that a ping be sent to all other nodes, to measure ping time.\nResults are provided in getpeerinfo.\nPing command is handled in queue with all other commands, so it measures processing backlog, not just network ping.\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli ping \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"ping\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help disconnectnode` text (Bitcoin Core 29).
-const DISCONNECTNODE_HELP: &str = "disconnectnode ( \"address\" nodeid )\n\nImmediately disconnects from the specified peer node.\n\nStrictly one out of 'address' and 'nodeid' can be provided to identify the node.\n\nTo disconnect by nodeid, either set 'address' to the empty string, or call using the named 'nodeid' argument only.\n\nArguments:\n1. address    (string, optional, default=fallback to nodeid) The IP address/port of the node or subnet\n2. nodeid     (numeric, optional, default=fallback to address) The node ID (see getpeerinfo for node IDs)\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli disconnectnode \"192.168.0.6:8333\"\n> bitcoin-cli disconnectnode \"\" 1\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"disconnectnode\", \"params\": [\"192.168.0.6:8333\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"disconnectnode\", \"params\": [\"\", 1]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const DISCONNECTNODE_HELP: &str = "disconnectnode ( \"address\" nodeid )\n\nImmediately disconnects from the specified peer node.\n\nStrictly one out of 'address' and 'nodeid' can be provided to identify the node.\n\nTo disconnect by nodeid, either set 'address' to the empty string, or call using the named 'nodeid' argument only.\n\nArguments:\n1. address    (string, optional, default=fallback to nodeid) The IP address/port of the node\n2. nodeid     (numeric, optional, default=fallback to address) The node ID (see getpeerinfo for node IDs)\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli disconnectnode \"192.168.0.6:8333\"\n> bitcoin-cli disconnectnode \"\" 1\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"disconnectnode\", \"params\": [\"192.168.0.6:8333\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"disconnectnode\", \"params\": [\"\", 1]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help addnode` text (Knots 29.3).
-const ADDNODE_HELP: &str = "addnode \"node\" \"command\" ( v2transport \"connection_type\" )\n\nAttempts to add or remove a node from the addnode list.\nOr try a connection to a node once.\nAddnode connections are limited to 8 at a time and are counted separately from the -maxconnections limit.\n\nArguments:\n1. node               (string, required) The address of the peer to connect to\n2. command            (string, required) 'add' to add a node to the list, 'remove' to remove a node from the list, 'onetry' to try a connection to the node once\n3. v2transport        (boolean, optional, default=set by -v2transport) Attempt to connect using BIP324 v2 transport protocol (ignored for 'remove' command)\n4. connection_type    (string, optional, default=\"manual\") Type of connection: \n                      outbound-full-relay (default automatic connections),\n                      block-relay-only (does not relay transactions or addresses),\n                      inbound (initiated by the peer),\n                      manual (added via addnode RPC or -addnode/-connect configuration options; protected from DoS disconnection and not required to be full nodes as other outbound peers are),\n                      addr-fetch (short-lived automatic connection for soliciting addresses),\n                      feeler (short-lived automatic connection for testing addresses)\n                      Only supported for command \"onetry\" for now.\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli addnode \"192.168.0.6:8333\" \"onetry\" true\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"addnode\", \"params\": [\"192.168.0.6:8333\", \"onetry\" true]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const ADDNODE_HELP: &str = "addnode \"node\" \"command\" ( v2transport )\n\nAttempts to add or remove a node from the addnode list.\nOr try a connection to a node once.\nNodes added using addnode (or -connect) are protected from DoS disconnection and are not required to be\nfull nodes/support SegWit as other outbound peers are (though such peers will not be synced from).\nAddnode connections are limited to 8 at a time and are counted separately from the -maxconnections limit.\n\nArguments:\n1. node           (string, required) The address of the peer to connect to\n2. command        (string, required) 'add' to add a node to the list, 'remove' to remove a node from the list, 'onetry' to try a connection to the node once\n3. v2transport    (boolean, optional, default=set by -v2transport) Attempt to connect using BIP324 v2 transport protocol (ignored for 'remove' command)\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli addnode \"192.168.0.6:8333\" \"onetry\" true\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"addnode\", \"params\": [\"192.168.0.6:8333\", \"onetry\" true]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help setnetworkactive` text (Bitcoin Core 29).
-const SETNETWORKACTIVE_HELP: &str = "setnetworkactive state\n\nDisable/enable all p2p network activity.\n\nArguments:\n1. state    (boolean, required) true to enable networking, false to disable\n\nResult:\ntrue|false    (boolean) The value that was passed in\n\nExamples:\n> bitcoin-cli setnetworkactive true\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"setnetworkactive\", \"params\": [true]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const SETNETWORKACTIVE_HELP: &str = "setnetworkactive state\n\nDisable/enable all p2p network activity.\n\nArguments:\n1. state    (boolean, required) true to enable networking, false to disable\n\nResult:\ntrue|false    (boolean) The value that was passed in\n";
 
 /// Verbatim `help getaddrmaninfo` text (Bitcoin Core 29.4).
 const GETADDRMANINFO_HELP: &str = "getaddrmaninfo\n\nProvides information about the node's address manager by returning the number of addresses in the `new` and `tried` tables and their sum for all networks.\n\nResult:\n{                   (json object) json object with network type as keys\n  \"network\" : {     (json object) the network (ipv4, ipv6, onion, i2p, cjdns, all_networks)\n    \"new\" : n,      (numeric) number of addresses in the new table, which represent potential peers the node has discovered but hasn't yet successfully connected to.\n    \"tried\" : n,    (numeric) number of addresses in the tried table, which represent peers the node has successfully connected to in the past.\n    \"total\" : n     (numeric) total number of addresses in both new/tried tables\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getaddrmaninfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getaddrmaninfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
@@ -1329,7 +1351,7 @@ const GETNODEADDRESSES_HELP: &str = "getnodeaddresses ( count \"network\" )\n\nR
 const ADDPEERADDRESS_HELP: &str = "addpeeraddress \"address\" port ( tried )\n\nAdd the address of a potential peer to an address manager table. This RPC is for testing only.\n\nArguments:\n1. address    (string, required) The IP address of the peer\n2. port       (numeric, required) The port of the peer\n3. tried      (boolean, optional, default=false) If true, attempt to add the peer to the tried addresses table\n\nResult:\n{                            (json object)\n  \"success\" : true|false,    (boolean) whether the peer address was successfully added to the address manager table\n  \"error\" : \"str\"            (string, optional) error description, if the address could not be added\n}\n\nExamples:\n> bitcoin-cli addpeeraddress \"1.2.3.4\" 8333 true\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"addpeeraddress\", \"params\": [\"1.2.3.4\", 8333, true]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help getdeploymentinfo` text (Knots 29.3).
-const GETDEPLOYMENTINFO_HELP: &str = "getdeploymentinfo ( \"blockhash\" )\n\nReturns an object containing various state info regarding deployments of consensus changes.\n\nArguments:\n1. blockhash    (string, optional, default=\"hash of current chain tip\") The block hash at which to query deployment state\n\nResult:\n{                                       (json object)\n  \"hash\" : \"str\",                       (string) requested block hash (or tip)\n  \"height\" : n,                         (numeric) requested block height (or tip)\n  \"deployments\" : {                     (json object)\n    \"xxxx\" : {                          (json object) name of the deployment\n      \"type\" : \"str\",                   (string) one of \"buried\", \"bip9\"\n      \"height\" : n,                     (numeric, optional) height of the first block which enforces the rules (only for \"buried\" type, or \"bip9\" type with \"active\" status)\n      \"height_end\" : n,                 (numeric, optional) height of the last block which enforces the rules (only for \"bip9\" type with \"active\" status and temporary deployments)\n      \"active\" : true|false,            (boolean) true if the rules are enforced for the mempool and the next block\n      \"bip9\" : {                        (json object, optional) status of bip9 softforks (only for \"bip9\" type)\n        \"bit\" : n,                      (numeric, optional) the bit (0-28) in the block version field used to signal this softfork (only for \"started\" and \"locked_in\" status)\n        \"start_time\" : xxx,             (numeric) the minimum median time past of a block at which the bit gains its meaning\n        \"timeout\" : xxx,                (numeric) the median time past of a block at which the deployment is considered failed if not yet locked in\n        \"min_activation_height\" : n,    (numeric) minimum height of blocks for which the rules may be enforced\n        \"max_activation_height\" : n,    (numeric, optional) height at which the deployment will unconditionally activate (absent for miner-vetoable deployments)\n        \"status\" : \"str\",               (string) status of deployment at specified block (one of \"defined\", \"started\", \"locked_in\", \"active\", \"failed\", \"expired\")\n        \"since\" : n,                    (numeric) height of the first block to which the status applies\n        \"status_next\" : \"str\",          (string) status of deployment at the next block\n        \"statistics\" : {                (json object, optional) numeric statistics about signalling for a softfork (only for \"started\" and \"locked_in\" status)\n          \"period\" : n,                 (numeric) the length in blocks of the signalling period\n          \"period_start\" : n,           (numeric) height of the first block of this signalling period\n          \"threshold\" : n,              (numeric, optional) the number of blocks with the version bit set required to activate the feature (only for \"started\" status)\n          \"elapsed\" : n,                (numeric) the number of blocks elapsed since the beginning of the current period\n          \"count\" : n,                  (numeric) the number of blocks with the version bit set in the current period\n          \"possible\" : true|false       (boolean, optional) returns false if there are not enough blocks left in this period to pass activation threshold (only for \"started\" status)\n        },\n        \"signalling\" : \"str\"            (string, optional) indicates blocks that signalled with a # and blocks that did not with a -\n      }\n    },\n    ...\n  }\n}\n\nExamples:\n> bitcoin-cli getdeploymentinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getdeploymentinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETDEPLOYMENTINFO_HELP: &str = "getdeploymentinfo ( \"blockhash\" )\n\nReturns an object containing various state info regarding deployments of consensus changes.\n\nArguments:\n1. blockhash    (string, optional, default=\"hash of current chain tip\") The block hash at which to query deployment state\n\nResult:\n{                                       (json object)\n  \"hash\" : \"str\",                       (string) requested block hash (or tip)\n  \"height\" : n,                         (numeric) requested block height (or tip)\n  \"deployments\" : {                     (json object)\n    \"xxxx\" : {                          (json object) name of the deployment\n      \"type\" : \"str\",                   (string) one of \"buried\", \"bip9\"\n      \"height\" : n,                     (numeric, optional) height of the first block which the rules are or will be enforced (only for \"buried\" type, or \"bip9\" type with \"active\" status)\n      \"active\" : true|false,            (boolean) true if the rules are enforced for the mempool and the next block\n      \"bip9\" : {                        (json object, optional) status of bip9 softforks (only for \"bip9\" type)\n        \"bit\" : n,                      (numeric, optional) the bit (0-28) in the block version field used to signal this softfork (only for \"started\" and \"locked_in\" status)\n        \"start_time\" : xxx,             (numeric) the minimum median time past of a block at which the bit gains its meaning\n        \"timeout\" : xxx,                (numeric) the median time past of a block at which the deployment is considered failed if not yet locked in\n        \"min_activation_height\" : n,    (numeric) minimum height of blocks for which the rules may be enforced\n        \"status\" : \"str\",               (string) status of deployment at specified block (one of \"defined\", \"started\", \"locked_in\", \"active\", \"failed\")\n        \"since\" : n,                    (numeric) height of the first block to which the status applies\n        \"status_next\" : \"str\",          (string) status of deployment at the next block\n        \"statistics\" : {                (json object, optional) numeric statistics about signalling for a softfork (only for \"started\" and \"locked_in\" status)\n          \"period\" : n,                 (numeric) the length in blocks of the signalling period\n          \"threshold\" : n,              (numeric, optional) the number of blocks with the version bit set required to activate the feature (only for \"started\" status)\n          \"elapsed\" : n,                (numeric) the number of blocks elapsed since the beginning of the current period\n          \"count\" : n,                  (numeric) the number of blocks with the version bit set in the current period\n          \"possible\" : true|false       (boolean, optional) returns false if there are not enough blocks left in this period to pass activation threshold (only for \"started\" status)\n        },\n        \"signalling\" : \"str\"            (string, optional) indicates blocks that signalled with a # and blocks that did not with a -\n      }\n    },\n    ...\n  }\n}\n\nExamples:\n> bitcoin-cli getdeploymentinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getdeploymentinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help gettxoutproof` text (Knots 29.3 — witness-proof form).
 const GETTXOUTPROOF_HELP: &str = "gettxoutproof [\"txid\",...] ( \"blockhash\" {\"prove_witness\":bool,...} )\n\nReturns a hex-encoded proof that \"txid\" was included in a block.\n\nNOTE: By default this function only works sometimes. This is when there is an\nunspent output in the utxo for this transaction. To make it always work,\nyou need to maintain a transaction index, using the -txindex command line option or\nspecify the block in which the transaction is included manually (by blockhash).\n\nArguments:\n1. txids          (json array, required) The txids to filter\n     [\n       \"txid\",    (string) A transaction id\n       ...\n     ]\n2. blockhash      (string, optional) If specified, looks for txid in the block with this hash\n3. options        (json object, optional) Options object that can be used to pass named arguments, listed below.\n\nNamed Arguments:\nprove_witness    (boolean, optional, default=false) If true, proves the associated wtxid/hash of the specified transactions instead of txid\n\nResult (If prove_witness is false or unspecified):\n\"str\"    (string) A string that is a serialized, hex-encoded data for the proof.\n\nResult (If prove_witness is true):\n{                            (json object)\n  \"proof\" : \"str\",           (string) The produced txout proof, hex-encoded.\n  \"proven\" : {               (json object) Information about the proof.\n    \"blockhash\" : \"hex\",     (string) The block hash the proof links to\n    \"blockheight\" : n,       (numeric) The height of the block the proof links to\n    \"tx\" : [                 (json array) Information about transactions\n      {                      (json object) Information about a transaction\n        \"txid\" : \"hex\",      (string) Transaction id this is for (parameter; NOT proven by proof)\n        \"wtxid\" : \"hex\",     (string) Wtxid/hash of a transaction\n        \"blockindex\" : n     (numeric) Index of transaction in block\n      },\n      ...\n    ]\n  }\n}\n";
@@ -1394,9 +1416,44 @@ const CLEARBANNED_HELP: &str = "clearbanned\n\nClear all banned IPs.\n\nResult:\
 
 const GETRPCINFO_HELP: &str = "getrpcinfo\n\nReturns details of the RPC server.\n\nResult:\n{                          (json object)\n  \"active_commands\" : [    (json array) All active commands\n    {                      (json object) Information about an active command\n      \"method\" : \"str\",    (string) The name of the RPC command\n      \"duration\" : n       (numeric) The running time in microseconds\n    },\n    ...\n  ],\n  \"logpath\" : \"str\"        (string) The complete file path to the debug log\n}\n\nExamples:\n> bitcoin-cli getrpcinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getrpcinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+const GETBLOCKCOUNT_HELP: &str = "getblockcount\n\nReturns the height of the most-work fully-validated chain.\nThe genesis block has height 0.\n\nResult:\nn    (numeric) The current block count\n\nExamples:\n> bitcoin-cli getblockcount \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockcount\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETBESTBLOCKHASH_HELP: &str = "getbestblockhash\n\nReturns the hash of the best (tip) block in the most-work fully-validated chain.\n\nResult:\n\"hex\"    (string) the block hash, hex-encoded\n\nExamples:\n> bitcoin-cli getbestblockhash \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getbestblockhash\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETDIFFICULTY_HELP: &str = "getdifficulty\n\nReturns the proof-of-work difficulty as a multiple of the minimum difficulty.\n\nResult:\nn    (numeric) the proof-of-work difficulty as a multiple of the minimum difficulty.\n\nExamples:\n> bitcoin-cli getdifficulty \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getdifficulty\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETBLOCKCHAININFO_HELP: &str = "getblockchaininfo\n\nReturns an object containing various state info regarding blockchain processing.\n\nResult:\n{                                         (json object)\n  \"chain\" : \"str\",                        (string) current network name (main, test, testnet4, signet, regtest)\n  \"blocks\" : n,                           (numeric) the height of the most-work fully-validated chain. The genesis block has height 0\n  \"headers\" : n,                          (numeric) the current number of headers we have validated\n  \"bestblockhash\" : \"str\",                (string) the hash of the currently best block\n  \"bits\" : \"hex\",                         (string) nBits: compact representation of the block difficulty target\n  \"target\" : \"hex\",                       (string) The difficulty target\n  \"difficulty\" : n,                       (numeric) the current difficulty\n  \"time\" : xxx,                           (numeric) The block time expressed in UNIX epoch time\n  \"mediantime\" : xxx,                     (numeric) The median block time expressed in UNIX epoch time\n  \"verificationprogress\" : n,             (numeric) estimate of verification progress [0..1]\n  \"initialblockdownload\" : true|false,    (boolean) (debug information) estimate of whether this node is in Initial Block Download mode\n  \"chainwork\" : \"hex\",                    (string) total amount of work in active chain, in hexadecimal\n  \"size_on_disk\" : n,                     (numeric) the estimated size of the block and undo files on disk\n  \"pruned\" : true|false,                  (boolean) if the blocks are subject to pruning\n  \"pruneheight\" : n,                      (numeric, optional) height of the last block pruned, plus one (only present if pruning is enabled)\n  \"automatic_pruning\" : true|false,       (boolean, optional) whether automatic pruning is enabled (only present if pruning is enabled)\n  \"prune_target_size\" : n,                (numeric, optional) the target size used by pruning (only present if automatic pruning is enabled)\n  \"signet_challenge\" : \"hex\",             (string, optional) the block challenge (aka. block script), in hexadecimal (only present if the current network is a signet)\n  \"warnings\" : [                          (json array) any network and blockchain warnings (run with `-deprecatedrpc=warnings` to return the latest warning as a single string)\n    \"str\",                                (string) warning\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli getblockchaininfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockchaininfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const VALIDATEADDRESS_HELP: &str = "validateaddress \"address\"\n\nReturn information about the given bitcoin address.\n\nArguments:\n1. address    (string, required) The bitcoin address to validate\n\nResult:\n{                               (json object)\n  \"isvalid\" : true|false,       (boolean) If the address is valid or not\n  \"address\" : \"str\",            (string, optional) The bitcoin address validated\n  \"scriptPubKey\" : \"hex\",       (string, optional) The hex-encoded output script generated by the address\n  \"isscript\" : true|false,      (boolean, optional) If the key is a script\n  \"iswitness\" : true|false,     (boolean, optional) If the address is a witness address\n  \"witness_version\" : n,        (numeric, optional) The version number of the witness program\n  \"witness_program\" : \"hex\",    (string, optional) The hex value of the witness program\n  \"error\" : \"str\",              (string, optional) Error message, if any\n  \"error_locations\" : [         (json array, optional) Indices of likely error locations in address, if known (e.g. Bech32 errors)\n    n,                          (numeric) index of a potential error\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli validateaddress \"bc1q09vm5lfy0j5reeulh4x5752q25uqqvz34hufdl\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"validateaddress\", \"params\": [\"bc1q09vm5lfy0j5reeulh4x5752q25uqqvz34hufdl\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const DECODESCRIPT_HELP: &str = "decodescript \"hexstring\"\n\nDecode a hex-encoded script.\n\nArguments:\n1. hexstring    (string, required) the hex-encoded script\n\nResult:\n{                             (json object)\n  \"asm\" : \"str\",              (string) Disassembly of the script\n  \"desc\" : \"str\",             (string) Inferred descriptor for the script\n  \"type\" : \"str\",             (string) The output type (e.g. nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n  \"address\" : \"str\",          (string, optional) The Bitcoin address (only if a well-defined address exists)\n  \"p2sh\" : \"str\",             (string, optional) address of P2SH script wrapping this redeem script (not returned for types that should not be wrapped)\n  \"segwit\" : {                (json object, optional) Result of a witness output script wrapping this redeem script (not returned for types that should not be wrapped)\n    \"asm\" : \"str\",            (string) Disassembly of the output script\n    \"hex\" : \"hex\",            (string) The raw output script bytes, hex-encoded\n    \"type\" : \"str\",           (string) The type of the output script (e.g. witness_v0_keyhash or witness_v0_scripthash)\n    \"address\" : \"str\",        (string, optional) The Bitcoin address (only if a well-defined address exists)\n    \"desc\" : \"str\",           (string) Inferred descriptor for the script\n    \"p2sh-segwit\" : \"str\"     (string) address of the P2SH script wrapping this witness redeem script\n  }\n}\n\nExamples:\n> bitcoin-cli decodescript \"hexstring\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"decodescript\", \"params\": [\"hexstring\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETBLOCKHASH_HELP: &str = "getblockhash height\n\nReturns hash of block in best-block-chain at height provided.\n\nArguments:\n1. height    (numeric, required) The height index\n\nResult:\n\"hex\"    (string) The block hash\n\nExamples:\n> bitcoin-cli getblockhash 1000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockhash\", \"params\": [1000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETBLOCKHEADER_HELP: &str = "getblockheader \"blockhash\" ( verbose )\n\nIf verbose is false, returns a string that is serialized, hex-encoded data for blockheader 'hash'.\nIf verbose is true, returns an Object with information about blockheader <hash>.\n\nArguments:\n1. blockhash    (string, required) The block hash\n2. verbose      (boolean, optional, default=true) true for a json object, false for the hex-encoded data\n\nResult (for verbose = true):\n{                                 (json object)\n  \"hash\" : \"hex\",                 (string) the block hash (same as provided)\n  \"confirmations\" : n,            (numeric) The number of confirmations, or -1 if the block is not on the main chain\n  \"height\" : n,                   (numeric) The block height or index\n  \"version\" : n,                  (numeric) The block version\n  \"versionHex\" : \"hex\",           (string) The block version formatted in hexadecimal\n  \"merkleroot\" : \"hex\",           (string) The merkle root\n  \"time\" : xxx,                   (numeric) The block time expressed in UNIX epoch time\n  \"mediantime\" : xxx,             (numeric) The median block time expressed in UNIX epoch time\n  \"nonce\" : n,                    (numeric) The nonce\n  \"bits\" : \"hex\",                 (string) nBits: compact representation of the block difficulty target\n  \"target\" : \"hex\",               (string) The difficulty target\n  \"difficulty\" : n,               (numeric) The difficulty\n  \"chainwork\" : \"hex\",            (string) Expected number of hashes required to produce the current chain\n  \"nTx\" : n,                      (numeric) The number of transactions in the block\n  \"previousblockhash\" : \"hex\",    (string, optional) The hash of the previous block (if available)\n  \"nextblockhash\" : \"hex\"         (string, optional) The hash of the next block (if available)\n}\n\nResult (for verbose=false):\n\"hex\"    (string) A string that is serialized, hex-encoded data for block 'hash'\n\nExamples:\n> bitcoin-cli getblockheader \"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockheader\", \"params\": [\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETBLOCK_HELP: &str = "getblock \"blockhash\" ( verbosity )\n\nIf verbosity is 0, returns a string that is serialized, hex-encoded data for block 'hash'.\nIf verbosity is 1, returns an Object with information about block <hash>.\nIf verbosity is 2, returns an Object with information about block <hash> and information about each transaction.\nIf verbosity is 3, returns an Object with information about block <hash> and information about each transaction, including prevout information for inputs (only for unpruned blocks in the current best chain).\n\nArguments:\n1. blockhash    (string, required) The block hash\n2. verbosity    (numeric, optional, default=1) 0 for hex-encoded data, 1 for a JSON object, 2 for JSON object with transaction data, and 3 for JSON object with transaction data including prevout information for inputs\n\nResult (for verbosity = 0):\n\"hex\"    (string) A string that is serialized, hex-encoded data for block 'hash'\n\nResult (for verbosity = 1):\n{                                 (json object)\n  \"hash\" : \"hex\",                 (string) the block hash (same as provided)\n  \"confirmations\" : n,            (numeric) The number of confirmations, or -1 if the block is not on the main chain\n  \"size\" : n,                     (numeric) The block size\n  \"strippedsize\" : n,             (numeric) The block size excluding witness data\n  \"weight\" : n,                   (numeric) The block weight as defined in BIP 141\n  \"height\" : n,                   (numeric) The block height or index\n  \"version\" : n,                  (numeric) The block version\n  \"versionHex\" : \"hex\",           (string) The block version formatted in hexadecimal\n  \"merkleroot\" : \"hex\",           (string) The merkle root\n  \"tx\" : [                        (json array) The transaction ids\n    \"hex\",                        (string) The transaction id\n    ...\n  ],\n  \"time\" : xxx,                   (numeric) The block time expressed in UNIX epoch time\n  \"mediantime\" : xxx,             (numeric) The median block time expressed in UNIX epoch time\n  \"nonce\" : n,                    (numeric) The nonce\n  \"bits\" : \"hex\",                 (string) nBits: compact representation of the block difficulty target\n  \"target\" : \"hex\",               (string) The difficulty target\n  \"difficulty\" : n,               (numeric) The difficulty\n  \"chainwork\" : \"hex\",            (string) Expected number of hashes required to produce the chain up to this block (in hex)\n  \"nTx\" : n,                      (numeric) The number of transactions in the block\n  \"previousblockhash\" : \"hex\",    (string, optional) The hash of the previous block (if available)\n  \"nextblockhash\" : \"hex\"         (string, optional) The hash of the next block (if available)\n}\n\nResult (for verbosity = 2):\n{                   (json object)\n  ...,              Same output as verbosity = 1\n  \"tx\" : [          (json array)\n    {               (json object)\n      ...,          The transactions in the format of the getrawtransaction RPC. Different from verbosity = 1 \"tx\" result\n      \"fee\" : n     (numeric) The transaction fee in BTC, omitted if block undo data is not available\n    },\n    ...\n  ]\n}\n\nResult (for verbosity = 3):\n{                                        (json object)\n  ...,                                   Same output as verbosity = 2\n  \"tx\" : [                               (json array)\n    {                                    (json object)\n      \"vin\" : [                          (json array)\n        {                                (json object)\n          ...,                           The same output as verbosity = 2\n          \"prevout\" : {                  (json object) (Only if undo information is available)\n            \"generated\" : true|false,    (boolean) Coinbase or not\n            \"height\" : n,                (numeric) The height of the prevout\n            \"value\" : n,                 (numeric) The value in BTC\n            \"scriptPubKey\" : {           (json object)\n              \"asm\" : \"str\",             (string) Disassembly of the output script\n              \"desc\" : \"str\",            (string) Inferred descriptor for the output\n              \"hex\" : \"hex\",             (string) The raw output script bytes, hex-encoded\n              \"address\" : \"str\",         (string, optional) The Bitcoin address (only if a well-defined address exists)\n              \"type\" : \"str\"             (string) The type (one of: nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n            }\n          }\n        },\n        ...\n      ]\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli getblock \"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblock\", \"params\": [\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETBLOCKSTATS_HELP: &str = "getblockstats hash_or_height ( stats )\n\nCompute per block statistics for a given window. All amounts are in satoshis.\nIt won't work for some heights with pruning.\n\nArguments:\n1. hash_or_height    (string or numeric, required) The block hash or height of the target block\n2. stats             (json array, optional, default=all values) Values to plot (see result below)\n     [\n       \"height\",     (string) Selected statistic\n       \"time\",       (string) Selected statistic\n       ...\n     ]\n\nResult:\n{                                (json object)\n  \"avgfee\" : n,                  (numeric, optional) Average fee in the block\n  \"avgfeerate\" : n,              (numeric, optional) Average feerate (in satoshis per virtual byte)\n  \"avgtxsize\" : n,               (numeric, optional) Average transaction size\n  \"blockhash\" : \"hex\",           (string, optional) The block hash (to check for potential reorgs)\n  \"feerate_percentiles\" : [      (json array, optional) Feerates at the 10th, 25th, 50th, 75th, and 90th percentile weight unit (in satoshis per virtual byte)\n    n,                           (numeric) The 10th percentile feerate\n    n,                           (numeric) The 25th percentile feerate\n    n,                           (numeric) The 50th percentile feerate\n    n,                           (numeric) The 75th percentile feerate\n    n                            (numeric) The 90th percentile feerate\n  ],\n  \"height\" : n,                  (numeric, optional) The height of the block\n  \"ins\" : n,                     (numeric, optional) The number of inputs (excluding coinbase)\n  \"maxfee\" : n,                  (numeric, optional) Maximum fee in the block\n  \"maxfeerate\" : n,              (numeric, optional) Maximum feerate (in satoshis per virtual byte)\n  \"maxtxsize\" : n,               (numeric, optional) Maximum transaction size\n  \"medianfee\" : n,               (numeric, optional) Truncated median fee in the block\n  \"mediantime\" : n,              (numeric, optional) The block median time past\n  \"mediantxsize\" : n,            (numeric, optional) Truncated median transaction size\n  \"minfee\" : n,                  (numeric, optional) Minimum fee in the block\n  \"minfeerate\" : n,              (numeric, optional) Minimum feerate (in satoshis per virtual byte)\n  \"mintxsize\" : n,               (numeric, optional) Minimum transaction size\n  \"outs\" : n,                    (numeric, optional) The number of outputs\n  \"subsidy\" : n,                 (numeric, optional) The block subsidy\n  \"swtotal_size\" : n,            (numeric, optional) Total size of all segwit transactions\n  \"swtotal_weight\" : n,          (numeric, optional) Total weight of all segwit transactions\n  \"swtxs\" : n,                   (numeric, optional) The number of segwit transactions\n  \"time\" : n,                    (numeric, optional) The block time\n  \"total_out\" : n,               (numeric, optional) Total amount in all outputs (excluding coinbase and thus reward [ie subsidy + totalfee])\n  \"total_size\" : n,              (numeric, optional) Total size of all non-coinbase transactions\n  \"total_weight\" : n,            (numeric, optional) Total weight of all non-coinbase transactions\n  \"totalfee\" : n,                (numeric, optional) The fee total\n  \"txs\" : n,                     (numeric, optional) The number of transactions (including coinbase)\n  \"utxo_increase\" : n,           (numeric, optional) The increase/decrease in the number of unspent outputs (not discounting op_return and similar)\n  \"utxo_size_inc\" : n,           (numeric, optional) The increase/decrease in size for the utxo index (not discounting op_return and similar)\n  \"utxo_increase_actual\" : n,    (numeric, optional) The increase/decrease in the number of unspent outputs, not counting unspendables\n  \"utxo_size_inc_actual\" : n     (numeric, optional) The increase/decrease in size for the utxo index, not counting unspendables\n}\n\nExamples:\n> bitcoin-cli getblockstats '\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"' '[\"minfeerate\",\"avgfeerate\"]'\n> bitcoin-cli getblockstats 1000 '[\"minfeerate\",\"avgfeerate\"]'\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockstats\", \"params\": [\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\", [\"minfeerate\",\"avgfeerate\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockstats\", \"params\": [1000, [\"minfeerate\",\"avgfeerate\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETTXOUT_HELP: &str = "gettxout \"txid\" n ( include_mempool )\n\nReturns details about an unspent transaction output.\n\nArguments:\n1. txid               (string, required) The transaction id\n2. n                  (numeric, required) vout number\n3. include_mempool    (boolean, optional, default=true) Whether to include the mempool. Note that an unspent output that is spent in the mempool won't appear.\n\nResult (If the UTXO was not found):\nnull    (json null)\n\nResult (Otherwise):\n{                             (json object)\n  \"bestblock\" : \"hex\",        (string) The hash of the block at the tip of the chain\n  \"confirmations\" : n,        (numeric) The number of confirmations\n  \"value\" : n,                (numeric) The transaction value in BTC\n  \"scriptPubKey\" : {          (json object)\n    \"asm\" : \"str\",            (string) Disassembly of the output script\n    \"desc\" : \"str\",           (string) Inferred descriptor for the output\n    \"hex\" : \"hex\",            (string) The raw output script bytes, hex-encoded\n    \"type\" : \"str\",           (string) The type, eg pubkeyhash\n    \"address\" : \"str\"         (string, optional) The Bitcoin address (only if a well-defined address exists)\n  },\n  \"coinbase\" : true|false     (boolean) Coinbase or not\n}\n\nExamples:\n\nGet unspent transactions\n> bitcoin-cli listunspent \n\nView the details\n> bitcoin-cli gettxout \"txid\" 1\n\nAs a JSON-RPC call\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxout\", \"params\": [\"txid\", 1]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETRAWTRANSACTION_HELP: &str = "getrawtransaction \"txid\" ( verbosity \"blockhash\" )\n\nBy default, this call only returns a transaction if it is in the mempool. If -txindex is enabled\nand no blockhash argument is passed, it will return the transaction if it is in the mempool or any block.\nIf a blockhash argument is passed, it will return the transaction if\nthe specified block is available and the transaction is in that block.\n\nHint: Use gettransaction for wallet transactions.\n\nIf verbosity is 0 or omitted, returns the serialized transaction as a hex-encoded string.\nIf verbosity is 1, returns a JSON Object with information about the transaction.\nIf verbosity is 2, returns a JSON Object with information about the transaction, including fee and prevout information.\n\nArguments:\n1. txid         (string, required) The transaction id\n2. verbosity    (numeric, optional, default=0) 0 for hex-encoded data, 1 for a JSON object, and 2 for JSON object with fee and prevout\n3. blockhash    (string, optional) The block in which to look for the transaction\n\nResult (if verbosity is not set or set to 0):\n\"str\"    (string) The serialized transaction as a hex-encoded string for 'txid'\n\nResult (if verbosity is set to 1):\n{                                    (json object)\n  \"in_active_chain\" : true|false,    (boolean, optional) Whether specified block is in the active chain or not (only present with explicit \"blockhash\" argument)\n  \"blockhash\" : \"hex\",               (string, optional) the block hash\n  \"confirmations\" : n,               (numeric, optional) The confirmations\n  \"blocktime\" : xxx,                 (numeric, optional) The block time expressed in UNIX epoch time\n  \"time\" : n,                        (numeric, optional) Same as \"blocktime\"\n  \"hex\" : \"hex\",                     (string) The serialized, hex-encoded data for 'txid'\n  \"txid\" : \"hex\",                    (string) The transaction id (same as provided)\n  \"hash\" : \"hex\",                    (string) The transaction hash (differs from txid for witness transactions)\n  \"size\" : n,                        (numeric) The serialized transaction size\n  \"vsize\" : n,                       (numeric) The virtual transaction size (differs from size for witness transactions)\n  \"weight\" : n,                      (numeric) The transaction's weight (between vsize*4-3 and vsize*4)\n  \"version\" : n,                     (numeric) The version\n  \"locktime\" : xxx,                  (numeric) The lock time\n  \"vin\" : [                          (json array)\n    {                                (json object)\n      \"coinbase\" : \"hex\",            (string, optional) The coinbase value (only if coinbase transaction)\n      \"txid\" : \"hex\",                (string, optional) The transaction id (if not coinbase transaction)\n      \"vout\" : n,                    (numeric, optional) The output number (if not coinbase transaction)\n      \"scriptSig\" : {                (json object, optional) The script (if not coinbase transaction)\n        \"asm\" : \"str\",               (string) Disassembly of the signature script\n        \"hex\" : \"hex\"                (string) The raw signature script bytes, hex-encoded\n      },\n      \"txinwitness\" : [              (json array, optional)\n        \"hex\",                       (string) hex-encoded witness data (if any)\n        ...\n      ],\n      \"sequence\" : n                 (numeric) The script sequence number\n    },\n    ...\n  ],\n  \"vout\" : [                         (json array)\n    {                                (json object)\n      \"value\" : n,                   (numeric) The value in BTC\n      \"n\" : n,                       (numeric) index\n      \"scriptPubKey\" : {             (json object)\n        \"asm\" : \"str\",               (string) Disassembly of the output script\n        \"desc\" : \"str\",              (string) Inferred descriptor for the output\n        \"hex\" : \"hex\",               (string) The raw output script bytes, hex-encoded\n        \"address\" : \"str\",           (string, optional) The Bitcoin address (only if a well-defined address exists)\n        \"type\" : \"str\"               (string) The type (one of: nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n      }\n    },\n    ...\n  ]\n}\n\nResult (for verbosity = 2):\n{                                    (json object)\n  ...,                               Same output as verbosity = 1\n  \"fee\" : n,                         (numeric, optional) transaction fee in BTC, omitted if block undo data is not available\n  \"vin\" : [                          (json array)\n    {                                (json object) utxo being spent\n      ...,                           Same output as verbosity = 1\n      \"prevout\" : {                  (json object, optional) The previous output, omitted if block undo data is not available\n        \"generated\" : true|false,    (boolean) Coinbase or not\n        \"height\" : n,                (numeric) The height of the prevout\n        \"value\" : n,                 (numeric) The value in BTC\n        \"scriptPubKey\" : {           (json object)\n          \"asm\" : \"str\",             (string) Disassembly of the output script\n          \"desc\" : \"str\",            (string) Inferred descriptor for the output\n          \"hex\" : \"hex\",             (string) The raw output script bytes, hex-encoded\n          \"address\" : \"str\",         (string, optional) The Bitcoin address (only if a well-defined address exists)\n          \"type\" : \"str\"             (string) The type (one of: nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n        }\n      }\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli getrawtransaction \"mytxid\"\n> bitcoin-cli getrawtransaction \"mytxid\" 1\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getrawtransaction\", \"params\": [\"mytxid\", 1]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> bitcoin-cli getrawtransaction \"mytxid\" 0 \"myblockhash\"\n> bitcoin-cli getrawtransaction \"mytxid\" 1 \"myblockhash\"\n> bitcoin-cli getrawtransaction \"mytxid\" 2 \"myblockhash\"\n";
+const SAVEMEMPOOL_HELP: &str = "savemempool\n\nDumps the mempool to disk. It will fail until the previous dump is fully loaded.\n\nResult:\n{                        (json object)\n  \"filename\" : \"str\"     (string) the directory and file where the mempool was saved\n}\n\nExamples:\n> bitcoin-cli savemempool \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"savemempool\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETPEERINFO_HELP: &str = "getpeerinfo\n\nReturns data about each connected network peer as a json array of objects.\n\nResult:\n[                                         (json array)\n  {                                       (json object)\n    \"id\" : n,                             (numeric) Peer index\n    \"addr\" : \"str\",                       (string) (host:port) The IP address and port of the peer\n    \"addrbind\" : \"str\",                   (string, optional) (ip:port) Bind address of the connection to the peer\n    \"addrlocal\" : \"str\",                  (string, optional) (ip:port) Local address as reported by the peer\n    \"network\" : \"str\",                    (string) Network (ipv4, ipv6, onion, i2p, cjdns, not_publicly_routable)\n    \"mapped_as\" : n,                      (numeric, optional) Mapped AS (Autonomous System) number at the end of the BGP route to the peer, used for diversifying\n                                          peer selection (only displayed if the -asmap config option is set)\n    \"services\" : \"hex\",                   (string) The services offered\n    \"servicesnames\" : [                   (json array) the services offered, in human-readable form\n      \"str\",                              (string) the service name if it is recognised\n      ...\n    ],\n    \"relaytxes\" : true|false,             (boolean) Whether we relay transactions to this peer\n    \"lastsend\" : xxx,                     (numeric) The UNIX epoch time of the last send\n    \"lastrecv\" : xxx,                     (numeric) The UNIX epoch time of the last receive\n    \"last_transaction\" : xxx,             (numeric) The UNIX epoch time of the last valid transaction received from this peer\n    \"last_block\" : xxx,                   (numeric) The UNIX epoch time of the last block received from this peer\n    \"bytessent\" : n,                      (numeric) The total bytes sent\n    \"bytesrecv\" : n,                      (numeric) The total bytes received\n    \"conntime\" : xxx,                     (numeric) The UNIX epoch time of the connection\n    \"timeoffset\" : n,                     (numeric) The time offset in seconds\n    \"pingtime\" : n,                       (numeric, optional) The last ping time in seconds, if any\n    \"minping\" : n,                        (numeric, optional) The minimum observed ping time in seconds, if any\n    \"pingwait\" : n,                       (numeric, optional) The duration in seconds of an outstanding ping (if non-zero)\n    \"version\" : n,                        (numeric) The peer version, such as 70001\n    \"subver\" : \"str\",                     (string) The string version\n    \"inbound\" : true|false,               (boolean) Inbound (true) or Outbound (false)\n    \"bip152_hb_to\" : true|false,          (boolean) Whether we selected peer as (compact blocks) high-bandwidth peer\n    \"bip152_hb_from\" : true|false,        (boolean) Whether peer selected us as (compact blocks) high-bandwidth peer\n    \"startingheight\" : n,                 (numeric) The starting height (block) of the peer\n    \"presynced_headers\" : n,              (numeric) The current height of header pre-synchronization with this peer, or -1 if no low-work sync is in progress\n    \"synced_headers\" : n,                 (numeric) The last header we have in common with this peer\n    \"synced_blocks\" : n,                  (numeric) The last block we have in common with this peer\n    \"inflight\" : [                        (json array)\n      n,                                  (numeric) The heights of blocks we're currently asking from this peer\n      ...\n    ],\n    \"addr_relay_enabled\" : true|false,    (boolean) Whether we participate in address relay with this peer\n    \"addr_processed\" : n,                 (numeric) The total number of addresses processed, excluding those dropped due to rate limiting\n    \"addr_rate_limited\" : n,              (numeric) The total number of addresses dropped due to rate limiting\n    \"permissions\" : [                     (json array) Any special permissions that have been granted to this peer\n      \"str\",                              (string) bloomfilter (allow requesting BIP37 filtered blocks and transactions),\n                                          noban (do not ban for misbehavior; implies download),\n                                          forcerelay (relay transactions that are already in the mempool; implies relay),\n                                          relay (relay even in -blocksonly mode, and unlimited transaction announcements),\n                                          mempool (allow requesting BIP35 mempool contents),\n                                          download (allow getheaders during IBD, no disconnect after maxuploadtarget limit),\n                                          addr (responses to GETADDR avoid hitting the cache and contain random records with the most up-to-date info).\n                                          \n      ...\n    ],\n    \"minfeefilter\" : n,                   (numeric) The minimum fee rate for transactions this peer accepts\n    \"bytessent_per_msg\" : {               (json object)\n      \"msg\" : n,                          (numeric) The total bytes sent aggregated by message type\n                                          When a message type is not listed in this json object, the bytes sent are 0.\n                                          Only known message types can appear as keys in the object.\n      ...\n    },\n    \"bytesrecv_per_msg\" : {               (json object)\n      \"msg\" : n,                          (numeric) The total bytes received aggregated by message type\n                                          When a message type is not listed in this json object, the bytes received are 0.\n                                          Only known message types can appear as keys in the object and all bytes received\n                                          of unknown message types are listed under '*other*'.\n      ...\n    },\n    \"connection_type\" : \"str\",            (string) Type of connection: \n                                          outbound-full-relay (default automatic connections),\n                                          block-relay-only (does not relay transactions or addresses),\n                                          inbound (initiated by the peer),\n                                          manual (added via addnode RPC or -addnode/-connect configuration options),\n                                          addr-fetch (short-lived automatic connection for soliciting addresses),\n                                          feeler (short-lived automatic connection for testing addresses).\n                                          Please note this output is unlikely to be stable in upcoming releases as we iterate to\n                                          best capture connection behaviors.\n    \"transport_protocol_type\" : \"str\",    (string) Type of transport protocol: \n                                          detecting (peer could be v1 or v2),\n                                          v1 (plaintext transport protocol),\n                                          v2 (BIP324 encrypted transport protocol).\n                                          \n    \"session_id\" : \"str\"                  (string) The session ID for this connection, or \"\" if there is none (\"v2\" transport protocol only).\n                                          \n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli getpeerinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getpeerinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETMEMPOOLINFO_HELP: &str = "getmempoolinfo\n\nReturns details on the active state of the TX memory pool.\n\nResult:\n{                               (json object)\n  \"loaded\" : true|false,        (boolean) True if the initial load attempt of the persisted mempool finished\n  \"size\" : n,                   (numeric) Current tx count\n  \"bytes\" : n,                  (numeric) Sum of all virtual transaction sizes as defined in BIP 141. Differs from actual serialized size because witness data is discounted\n  \"usage\" : n,                  (numeric) Total memory usage for the mempool\n  \"total_fee\" : n,              (numeric) Total fees for the mempool in BTC, ignoring modified fees through prioritisetransaction\n  \"maxmempool\" : n,             (numeric) Maximum memory usage for the mempool\n  \"mempoolminfee\" : n,          (numeric) Minimum fee rate in BTC/kvB for tx to be accepted. Is the maximum of minrelaytxfee and minimum mempool fee\n  \"minrelaytxfee\" : n,          (numeric) Current minimum relay fee for transactions\n  \"incrementalrelayfee\" : n,    (numeric) minimum fee rate increment for mempool limiting or replacement in BTC/kvB\n  \"unbroadcastcount\" : n,       (numeric) Current number of transactions that haven't passed initial broadcast yet\n  \"fullrbf\" : true|false        (boolean) True if the mempool accepts RBF without replaceability signaling inspection (DEPRECATED)\n}\n\nExamples:\n> bitcoin-cli getmempoolinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getmempoolinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETCHAINTIPS_HELP: &str = "getchaintips\n\nReturn information about all known tips in the block tree, including the main chain as well as orphaned branches.\n\nResult:\n[                        (json array)\n  {                      (json object)\n    \"height\" : n,        (numeric) height of the chain tip\n    \"hash\" : \"hex\",      (string) block hash of the tip\n    \"branchlen\" : n,     (numeric) zero for main chain, otherwise length of branch connecting the tip to the main chain\n    \"status\" : \"str\"     (string) status of the chain, \"active\" for the main chain\n                         Possible values for status:\n                         1.  \"invalid\"               This branch contains at least one invalid block\n                         2.  \"headers-only\"          Not all blocks for this branch are available, but the headers are valid\n                         3.  \"valid-headers\"         All blocks are available for this branch, but they were never fully validated\n                         4.  \"valid-fork\"            This branch is not part of the active chain, but is fully validated\n                         5.  \"active\"                This is the tip of the active main chain, which is certainly valid\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli getchaintips \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getchaintips\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETRAWMEMPOOL_HELP: &str = "getrawmempool ( verbose mempool_sequence )\n\nReturns all transaction ids in memory pool as a json array of string transaction ids.\n\nHint: use getmempoolentry to fetch a specific transaction from the mempool.\n\nArguments:\n1. verbose             (boolean, optional, default=false) True for a json object, false for array of transaction ids\n2. mempool_sequence    (boolean, optional, default=false) If verbose=false, returns a json object with transaction list and mempool sequence number attached.\n\nResult (for verbose = false):\n[           (json array)\n  \"hex\",    (string) The transaction id\n  ...\n]\n\nResult (for verbose = true):\n{                                         (json object)\n  \"transactionid\" : {                     (json object)\n    \"vsize\" : n,                          (numeric) virtual transaction size as defined in BIP 141. This is different from actual serialized size for witness transactions as witness data is discounted.\n    \"weight\" : n,                         (numeric) transaction weight as defined in BIP 141.\n    \"time\" : xxx,                         (numeric) local time transaction entered pool in seconds since 1 Jan 1970 GMT\n    \"height\" : n,                         (numeric) block height when transaction entered pool\n    \"descendantcount\" : n,                (numeric) number of in-mempool descendant transactions (including this one)\n    \"descendantsize\" : n,                 (numeric) virtual transaction size of in-mempool descendants (including this one)\n    \"ancestorcount\" : n,                  (numeric) number of in-mempool ancestor transactions (including this one)\n    \"ancestorsize\" : n,                   (numeric) virtual transaction size of in-mempool ancestors (including this one)\n    \"wtxid\" : \"hex\",                      (string) hash of serialized transaction, including witness data\n    \"fees\" : {                            (json object)\n      \"base\" : n,                         (numeric) transaction fee, denominated in BTC\n      \"modified\" : n,                     (numeric) transaction fee with fee deltas used for mining priority, denominated in BTC\n      \"ancestor\" : n,                     (numeric) transaction fees of in-mempool ancestors (including this one) with fee deltas used for mining priority, denominated in BTC\n      \"descendant\" : n                    (numeric) transaction fees of in-mempool descendants (including this one) with fee deltas used for mining priority, denominated in BTC\n    },\n    \"depends\" : [                         (json array) unconfirmed transactions used as inputs for this transaction\n      \"hex\",                              (string) parent transaction id\n      ...\n    ],\n    \"spentby\" : [                         (json array) unconfirmed transactions spending outputs from this transaction\n      \"hex\",                              (string) child transaction id\n      ...\n    ],\n    \"bip125-replaceable\" : true|false,    (boolean) Whether this transaction signals BIP125 replaceability or has an unconfirmed ancestor signaling BIP125 replaceability. (DEPRECATED)\n                                          \n    \"unbroadcast\" : true|false            (boolean) Whether this transaction is currently unbroadcast (initial broadcast not yet acknowledged by any peers)\n  },\n  ...\n}\n\nResult (for verbose = false and mempool_sequence = true):\n{                            (json object)\n  \"txids\" : [                (json array)\n    \"hex\",                   (string) The transaction id\n    ...\n  ],\n  \"mempool_sequence\" : n     (numeric) The mempool sequence value.\n}\n\nExamples:\n> bitcoin-cli getrawmempool true\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getrawmempool\", \"params\": [true]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETMEMPOOLENTRY_HELP: &str = "getmempoolentry \"txid\"\n\nReturns mempool data for given transaction\n\nArguments:\n1. txid    (string, required) The transaction id (must be in mempool)\n\nResult:\n{                                       (json object)\n  \"vsize\" : n,                          (numeric) virtual transaction size as defined in BIP 141. This is different from actual serialized size for witness transactions as witness data is discounted.\n  \"weight\" : n,                         (numeric) transaction weight as defined in BIP 141.\n  \"time\" : xxx,                         (numeric) local time transaction entered pool in seconds since 1 Jan 1970 GMT\n  \"height\" : n,                         (numeric) block height when transaction entered pool\n  \"descendantcount\" : n,                (numeric) number of in-mempool descendant transactions (including this one)\n  \"descendantsize\" : n,                 (numeric) virtual transaction size of in-mempool descendants (including this one)\n  \"ancestorcount\" : n,                  (numeric) number of in-mempool ancestor transactions (including this one)\n  \"ancestorsize\" : n,                   (numeric) virtual transaction size of in-mempool ancestors (including this one)\n  \"wtxid\" : \"hex\",                      (string) hash of serialized transaction, including witness data\n  \"fees\" : {                            (json object)\n    \"base\" : n,                         (numeric) transaction fee, denominated in BTC\n    \"modified\" : n,                     (numeric) transaction fee with fee deltas used for mining priority, denominated in BTC\n    \"ancestor\" : n,                     (numeric) transaction fees of in-mempool ancestors (including this one) with fee deltas used for mining priority, denominated in BTC\n    \"descendant\" : n                    (numeric) transaction fees of in-mempool descendants (including this one) with fee deltas used for mining priority, denominated in BTC\n  },\n  \"depends\" : [                         (json array) unconfirmed transactions used as inputs for this transaction\n    \"hex\",                              (string) parent transaction id\n    ...\n  ],\n  \"spentby\" : [                         (json array) unconfirmed transactions spending outputs from this transaction\n    \"hex\",                              (string) child transaction id\n    ...\n  ],\n  \"bip125-replaceable\" : true|false,    (boolean) Whether this transaction signals BIP125 replaceability or has an unconfirmed ancestor signaling BIP125 replaceability. (DEPRECATED)\n                                        \n  \"unbroadcast\" : true|false            (boolean) Whether this transaction is currently unbroadcast (initial broadcast not yet acknowledged by any peers)\n}\n\nExamples:\n> bitcoin-cli getmempoolentry \"mytxid\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getmempoolentry\", \"params\": [\"mytxid\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETMEMPOOLANCESTORS_HELP: &str = "getmempoolancestors \"txid\" ( verbose )\n\nIf txid is in the mempool, returns all in-mempool ancestors.\n\nArguments:\n1. txid       (string, required) The transaction id (must be in mempool)\n2. verbose    (boolean, optional, default=false) True for a json object, false for array of transaction ids\n\nResult (for verbose = false):\n[           (json array)\n  \"hex\",    (string) The transaction id of an in-mempool ancestor transaction\n  ...\n]\n\nResult (for verbose = true):\n{                                         (json object)\n  \"transactionid\" : {                     (json object)\n    \"vsize\" : n,                          (numeric) virtual transaction size as defined in BIP 141. This is different from actual serialized size for witness transactions as witness data is discounted.\n    \"weight\" : n,                         (numeric) transaction weight as defined in BIP 141.\n    \"time\" : xxx,                         (numeric) local time transaction entered pool in seconds since 1 Jan 1970 GMT\n    \"height\" : n,                         (numeric) block height when transaction entered pool\n    \"descendantcount\" : n,                (numeric) number of in-mempool descendant transactions (including this one)\n    \"descendantsize\" : n,                 (numeric) virtual transaction size of in-mempool descendants (including this one)\n    \"ancestorcount\" : n,                  (numeric) number of in-mempool ancestor transactions (including this one)\n    \"ancestorsize\" : n,                   (numeric) virtual transaction size of in-mempool ancestors (including this one)\n    \"wtxid\" : \"hex\",                      (string) hash of serialized transaction, including witness data\n    \"fees\" : {                            (json object)\n      \"base\" : n,                         (numeric) transaction fee, denominated in BTC\n      \"modified\" : n,                     (numeric) transaction fee with fee deltas used for mining priority, denominated in BTC\n      \"ancestor\" : n,                     (numeric) transaction fees of in-mempool ancestors (including this one) with fee deltas used for mining priority, denominated in BTC\n      \"descendant\" : n                    (numeric) transaction fees of in-mempool descendants (including this one) with fee deltas used for mining priority, denominated in BTC\n    },\n    \"depends\" : [                         (json array) unconfirmed transactions used as inputs for this transaction\n      \"hex\",                              (string) parent transaction id\n      ...\n    ],\n    \"spentby\" : [                         (json array) unconfirmed transactions spending outputs from this transaction\n      \"hex\",                              (string) child transaction id\n      ...\n    ],\n    \"bip125-replaceable\" : true|false,    (boolean) Whether this transaction signals BIP125 replaceability or has an unconfirmed ancestor signaling BIP125 replaceability. (DEPRECATED)\n                                          \n    \"unbroadcast\" : true|false            (boolean) Whether this transaction is currently unbroadcast (initial broadcast not yet acknowledged by any peers)\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getmempoolancestors \"mytxid\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getmempoolancestors\", \"params\": [\"mytxid\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETMEMPOOLDESCENDANTS_HELP: &str = "getmempooldescendants \"txid\" ( verbose )\n\nIf txid is in the mempool, returns all in-mempool descendants.\n\nArguments:\n1. txid       (string, required) The transaction id (must be in mempool)\n2. verbose    (boolean, optional, default=false) True for a json object, false for array of transaction ids\n\nResult (for verbose = false):\n[           (json array)\n  \"hex\",    (string) The transaction id of an in-mempool descendant transaction\n  ...\n]\n\nResult (for verbose = true):\n{                                         (json object)\n  \"transactionid\" : {                     (json object)\n    \"vsize\" : n,                          (numeric) virtual transaction size as defined in BIP 141. This is different from actual serialized size for witness transactions as witness data is discounted.\n    \"weight\" : n,                         (numeric) transaction weight as defined in BIP 141.\n    \"time\" : xxx,                         (numeric) local time transaction entered pool in seconds since 1 Jan 1970 GMT\n    \"height\" : n,                         (numeric) block height when transaction entered pool\n    \"descendantcount\" : n,                (numeric) number of in-mempool descendant transactions (including this one)\n    \"descendantsize\" : n,                 (numeric) virtual transaction size of in-mempool descendants (including this one)\n    \"ancestorcount\" : n,                  (numeric) number of in-mempool ancestor transactions (including this one)\n    \"ancestorsize\" : n,                   (numeric) virtual transaction size of in-mempool ancestors (including this one)\n    \"wtxid\" : \"hex\",                      (string) hash of serialized transaction, including witness data\n    \"fees\" : {                            (json object)\n      \"base\" : n,                         (numeric) transaction fee, denominated in BTC\n      \"modified\" : n,                     (numeric) transaction fee with fee deltas used for mining priority, denominated in BTC\n      \"ancestor\" : n,                     (numeric) transaction fees of in-mempool ancestors (including this one) with fee deltas used for mining priority, denominated in BTC\n      \"descendant\" : n                    (numeric) transaction fees of in-mempool descendants (including this one) with fee deltas used for mining priority, denominated in BTC\n    },\n    \"depends\" : [                         (json array) unconfirmed transactions used as inputs for this transaction\n      \"hex\",                              (string) parent transaction id\n      ...\n    ],\n    \"spentby\" : [                         (json array) unconfirmed transactions spending outputs from this transaction\n      \"hex\",                              (string) child transaction id\n      ...\n    ],\n    \"bip125-replaceable\" : true|false,    (boolean) Whether this transaction signals BIP125 replaceability or has an unconfirmed ancestor signaling BIP125 replaceability. (DEPRECATED)\n                                          \n    \"unbroadcast\" : true|false            (boolean) Whether this transaction is currently unbroadcast (initial broadcast not yet acknowledged by any peers)\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getmempooldescendants \"mytxid\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getmempooldescendants\", \"params\": [\"mytxid\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const TESTMEMPOOLACCEPT_HELP: &str = "testmempoolaccept [\"rawtx\",...] ( maxfeerate )\n\nReturns result of mempool acceptance tests indicating if raw transaction(s) (serialized, hex-encoded) would be accepted by mempool.\n\nIf multiple transactions are passed in, parents must come before children and package policies apply: the transactions cannot conflict with any mempool transactions or each other.\n\nIf one transaction fails, other transactions may not be fully validated (the 'allowed' key will be blank).\n\nThe maximum number of transactions allowed is 25.\n\nThis checks if transactions violate the consensus or policy rules.\n\nSee sendrawtransaction call.\n\nArguments:\n1. rawtxs          (json array, required) An array of hex strings of raw transactions.\n     [\n       \"rawtx\",    (string)\n       ...\n     ]\n2. maxfeerate      (numeric or string, optional, default=\"0.10\") Reject transactions whose fee rate is higher than the specified value, expressed in BTC/kvB.\n                   Fee rates larger than 1BTC/kvB are rejected.\n                   Set to 0 to accept any fee rate.\n\nResult:\n[                                 (json array) The result of the mempool acceptance test for each raw transaction in the input array.\n                                  Returns results for each transaction in the same order they were passed in.\n                                  Transactions that cannot be fully validated due to failures in other transactions will not contain an 'allowed' result.\n                                  \n  {                               (json object)\n    \"txid\" : \"hex\",               (string) The transaction hash in hex\n    \"wtxid\" : \"hex\",              (string) The transaction witness hash in hex\n    \"package-error\" : \"str\",      (string, optional) Package validation error, if any (only possible if rawtxs had more than 1 transaction).\n    \"allowed\" : true|false,       (boolean, optional) Whether this tx would be accepted to the mempool and pass client-specified maxfeerate. If not present, the tx was not fully validated due to a failure in another tx in the list.\n    \"vsize\" : n,                  (numeric, optional) Virtual transaction size as defined in BIP 141. This is different from actual serialized size for witness transactions as witness data is discounted (only present when 'allowed' is true)\n    \"fees\" : {                    (json object, optional) Transaction fees (only present if 'allowed' is true)\n      \"base\" : n,                 (numeric) transaction fee in BTC\n      \"effective-feerate\" : n,    (numeric) the effective feerate in BTC per KvB. May differ from the base feerate if, for example, there are modified fees from prioritisetransaction or a package feerate was used.\n      \"effective-includes\" : [    (json array) transactions whose fees and vsizes are included in effective-feerate.\n        \"hex\",                    (string) transaction wtxid in hex\n        ...\n      ]\n    },\n    \"reject-reason\" : \"str\",      (string, optional) Rejection reason (only present when 'allowed' is false)\n    \"reject-details\" : \"str\"      (string, optional) Rejection details (only present when 'allowed' is false and rejection details exist)\n  },\n  ...\n]\n\nExamples:\n\nCreate a transaction\n> bitcoin-cli createrawtransaction \"[{\\\"txid\\\" : \\\"mytxid\\\",\\\"vout\\\":0}]\" \"{\\\"myaddress\\\":0.01}\"\nSign the transaction, and get back the hex\n> bitcoin-cli signrawtransactionwithwallet \"myhex\"\n\nTest acceptance of the transaction (signed hex)\n> bitcoin-cli testmempoolaccept '[\"signedhex\"]'\n\nAs a JSON-RPC call\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"testmempoolaccept\", \"params\": [[\"signedhex\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const SENDRAWTRANSACTION_HELP: &str = "sendrawtransaction \"hexstring\" ( maxfeerate maxburnamount )\n\nSubmit a raw transaction (serialized, hex-encoded) to local node and network.\n\nThe transaction will be sent unconditionally to all peers, so using sendrawtransaction\nfor manual rebroadcast may degrade privacy by leaking the transaction's origin, as\nnodes will normally not rebroadcast non-wallet transactions already in their mempool.\n\nA specific exception, RPC_TRANSACTION_ALREADY_IN_UTXO_SET, may throw if the transaction cannot be added to the mempool.\n\nRelated RPCs: createrawtransaction, signrawtransactionwithkey\n\nArguments:\n1. hexstring        (string, required) The hex string of the raw transaction\n2. maxfeerate       (numeric or string, optional, default=\"0.10\") Reject transactions whose fee rate is higher than the specified value, expressed in BTC/kvB.\n                    Fee rates larger than 1BTC/kvB are rejected.\n                    Set to 0 to accept any fee rate.\n3. maxburnamount    (numeric or string, optional, default=\"0.00\") Reject transactions with provably unspendable outputs (e.g. 'datacarrier' outputs that use the OP_RETURN opcode) greater than the specified value, expressed in BTC.\n                    If burning funds through unspendable outputs is desired, increase this value.\n                    This check is based on heuristics and does not guarantee spendability of outputs.\n                    \n\nResult:\n\"hex\"    (string) The transaction hash in hex\n\nExamples:\n\nCreate a transaction\n> bitcoin-cli createrawtransaction \"[{\\\"txid\\\" : \\\"mytxid\\\",\\\"vout\\\":0}]\" \"{\\\"myaddress\\\":0.01}\"\nSign the transaction, and get back the hex\n> bitcoin-cli signrawtransactionwithwallet \"myhex\"\n\nSend the transaction (signed hex)\n> bitcoin-cli sendrawtransaction \"signedhex\"\n\nAs a JSON-RPC call\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"sendrawtransaction\", \"params\": [\"signedhex\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const SUBMITBLOCK_HELP: &str = "submitblock \"hexdata\" ( \"dummy\" )\n\nAttempts to submit new block to network.\nSee https://en.bitcoin.it/wiki/BIP_0022 for full specification.\n\nArguments:\n1. hexdata    (string, required) the hex-encoded block data to submit\n2. dummy      (string, optional, default=ignored) dummy value, for compatibility with BIP22. This value is ignored.\n\nResult (If the block was accepted):\nnull    (json null)\n\nResult (Otherwise):\n\"str\"    (string) According to BIP22\n\nExamples:\n> bitcoin-cli submitblock \"mydata\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"submitblock\", \"params\": [\"mydata\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const SUBMITHEADER_HELP: &str = "submitheader \"hexdata\"\n\nDecode the given hexdata as a header and submit it as a candidate chain tip if valid.\nThrows when the header is invalid.\n\nArguments:\n1. hexdata    (string, required) the hex-encoded block header data\n\nResult:\nnull    (json null) None\n\nExamples:\n> bitcoin-cli submitheader \"aabbcc\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"submitheader\", \"params\": [\"aabbcc\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GENERATETOADDRESS_HELP: &str = "generatetoaddress nblocks \"address\" ( maxtries )\n\nMine to a specified address and return the block hashes.\n\nArguments:\n1. nblocks     (numeric, required) How many blocks are generated.\n2. address     (string, required) The address to send the newly generated bitcoin to.\n3. maxtries    (numeric, optional, default=1000000) How many iterations to try.\n\nResult:\n[           (json array) hashes of blocks generated\n  \"hex\",    (string) blockhash\n  ...\n]\n\nExamples:\n\nGenerate 11 blocks to myaddress\n> bitcoin-cli generatetoaddress 11 \"myaddress\"\nIf you are using the Bitcoin Core wallet, you can get a new address to send the newly generated bitcoin to with:\n> bitcoin-cli getnewaddress \n";
+const GENERATEBLOCK_HELP: &str = "generateblock \"output\" [\"rawtx/txid\",...] ( submit )\n\nMine a set of ordered transactions to a specified address or descriptor and return the block hash.\n\nArguments:\n1. output               (string, required) The address or descriptor to send the newly generated bitcoin to.\n2. transactions         (json array, required) An array of hex strings which are either txids or raw transactions.\n                        Txids must reference transactions currently in the mempool.\n                        All transactions must be valid and in valid order, otherwise the block will be rejected.\n     [\n       \"rawtx/txid\",    (string)\n       ...\n     ]\n3. submit               (boolean, optional, default=true) Whether to submit the block before the RPC call returns or to return it as hex.\n\nResult:\n{                    (json object)\n  \"hash\" : \"hex\",    (string) hash of generated block\n  \"hex\" : \"hex\"      (string, optional) hex of generated block, only present when submit=false\n}\n\nExamples:\n\nGenerate a block to myaddress, with txs rawtx and mempool_txid\n> bitcoin-cli generateblock \"myaddress\" '[\"rawtx\", \"mempool_txid\"]'\n";
+const GETBLOCKTEMPLATE_HELP: &str = "getblocktemplate {\"mode\":\"str\",\"capabilities\":[\"str\",...],\"rules\":[\"segwit\",\"str\",...],\"longpollid\":\"str\",\"data\":\"hex\"}\n\nIf the request parameters include a 'mode' key, that is used to explicitly select between the default 'template' request or a 'proposal'.\nIt returns data needed to construct a block to work on.\nFor full specification, see BIPs 22, 23, 9, and 145:\n    https://github.com/bitcoin/bips/blob/master/bip-0022.mediawiki\n    https://github.com/bitcoin/bips/blob/master/bip-0023.mediawiki\n    https://github.com/bitcoin/bips/blob/master/bip-0009.mediawiki#getblocktemplate_changes\n    https://github.com/bitcoin/bips/blob/master/bip-0145.mediawiki\n\nArguments:\n1. template_request            (json object, required) Format of the template\n     {\n       \"mode\": \"str\",          (string, optional) This must be set to \"template\", \"proposal\" (see BIP 23), or omitted\n       \"capabilities\": [       (json array, optional) A list of strings\n         \"str\",                (string) client side supported feature, 'longpoll', 'coinbasevalue', 'proposal', 'serverlist', 'workid'\n         ...\n       ],\n       \"rules\": [              (json array, required) A list of strings\n         \"segwit\",             (string, required) (literal) indicates client side segwit support\n         \"str\",                (string) other client side supported softfork deployment\n         ...\n       ],\n       \"longpollid\": \"str\",    (string, optional) delay processing request until the result would vary significantly from the \"longpollid\" of a prior template\n       \"data\": \"hex\",          (string, optional) proposed block data to check, encoded in hexadecimal; valid only for mode=\"proposal\"\n     }\n\nResult (If the proposal was accepted with mode=='proposal'):\nnull    (json null)\n\nResult (If the proposal was not accepted with mode=='proposal'):\n\"str\"    (string) According to BIP22\n\nResult (Otherwise):\n{                                          (json object)\n  \"version\" : n,                           (numeric) The preferred block version\n  \"rules\" : [                              (json array) specific block rules that are to be enforced\n    \"str\",                                 (string) name of a rule the client must understand to some extent; see BIP 9 for format\n    ...\n  ],\n  \"vbavailable\" : {                        (json object) set of pending, supported versionbit (BIP 9) softfork deployments\n    \"rulename\" : n,                        (numeric) identifies the bit number as indicating acceptance and readiness for the named softfork rule\n    ...\n  },\n  \"capabilities\" : [                       (json array)\n    \"str\",                                 (string) A supported feature, for example 'proposal'\n    ...\n  ],\n  \"vbrequired\" : n,                        (numeric) bit mask of versionbits the server requires set in submissions\n  \"previousblockhash\" : \"str\",             (string) The hash of current highest block\n  \"transactions\" : [                       (json array) contents of non-coinbase transactions that should be included in the next block\n    {                                      (json object)\n      \"data\" : \"hex\",                      (string) transaction data encoded in hexadecimal (byte-for-byte)\n      \"txid\" : \"hex\",                      (string) transaction hash excluding witness data, shown in byte-reversed hex\n      \"hash\" : \"hex\",                      (string) transaction hash including witness data, shown in byte-reversed hex\n      \"depends\" : [                        (json array) array of numbers\n        n,                                 (numeric) transactions before this one (by 1-based index in 'transactions' list) that must be present in the final block if this one is\n        ...\n      ],\n      \"fee\" : n,                           (numeric) difference in value between transaction inputs and outputs (in satoshis); for coinbase transactions, this is a negative Number of the total collected block fees (ie, not including the block subsidy); if key is not present, fee is unknown and clients MUST NOT assume there isn't one\n      \"sigops\" : n,                        (numeric) total SigOps cost, as counted for purposes of block limits; if key is not present, sigop cost is unknown and clients MUST NOT assume it is zero\n      \"weight\" : n                         (numeric) total transaction weight, as counted for purposes of block limits\n    },\n    ...\n  ],\n  \"coinbaseaux\" : {                        (json object) data that should be included in the coinbase's scriptSig content\n    \"key\" : \"hex\",                         (string) values must be in the coinbase (keys may be ignored)\n    ...\n  },\n  \"coinbasevalue\" : n,                     (numeric) maximum allowable input to coinbase transaction, including the generation award and transaction fees (in satoshis)\n  \"longpollid\" : \"str\",                    (string) an id to include with a request to longpoll on an update to this template\n  \"target\" : \"str\",                        (string) The hash target\n  \"mintime\" : xxx,                         (numeric) The minimum timestamp appropriate for the next block time, expressed in UNIX epoch time. Adjusted for the proposed BIP94 timewarp rule.\n  \"mutable\" : [                            (json array) list of ways the block template may be changed\n    \"str\",                                 (string) A way the block template may be changed, e.g. 'time', 'transactions', 'prevblock'\n    ...\n  ],\n  \"noncerange\" : \"hex\",                    (string) A range of valid nonces\n  \"sigoplimit\" : n,                        (numeric) limit of sigops in blocks\n  \"sizelimit\" : n,                         (numeric) limit of block size\n  \"weightlimit\" : n,                       (numeric, optional) limit of block weight\n  \"curtime\" : xxx,                         (numeric) current timestamp in UNIX epoch time. Adjusted for the proposed BIP94 timewarp rule.\n  \"bits\" : \"str\",                          (string) compressed target of next block\n  \"height\" : n,                            (numeric) The height of the next block\n  \"signet_challenge\" : \"hex\",              (string, optional) Only on signet\n  \"default_witness_commitment\" : \"hex\"     (string, optional) a valid witness commitment for the unmodified block template\n}\n\nExamples:\n> bitcoin-cli getblocktemplate '{\"rules\": [\"segwit\"]}'\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblocktemplate\", \"params\": [{\"rules\": [\"segwit\"]}]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETORPHANTXS_HELP: &str = "getorphantxs ( verbosity )\n\nShows transactions in the tx orphanage.\n\nEXPERIMENTAL warning: this call may be changed in future releases.\n\nArguments:\n1. verbosity    (numeric, optional, default=0) 0 for an array of txids (may contain duplicates), 1 for an array of objects with tx details, and 2 for details from (1) and tx hex\n\nResult (for verbose = 0):\n[           (json array)\n  \"hex\",    (string) The transaction hash in hex\n  ...\n]\n\nResult (for verbose = 1):\n[                          (json array)\n  {                        (json object)\n    \"txid\" : \"hex\",        (string) The transaction hash in hex\n    \"wtxid\" : \"hex\",       (string) The transaction witness hash in hex\n    \"bytes\" : n,           (numeric) The serialized transaction size in bytes\n    \"vsize\" : n,           (numeric) The virtual transaction size as defined in BIP 141. This is different from actual serialized size for witness transactions as witness data is discounted.\n    \"weight\" : n,          (numeric) The transaction weight as defined in BIP 141.\n    \"entry\" : xxx,         (numeric) The entry time into the orphanage expressed in UNIX epoch time\n    \"expiration\" : xxx,    (numeric) The orphan expiration time expressed in UNIX epoch time\n    \"from\" : [             (json array)\n      n,                   (numeric) Peer ID\n      ...\n    ]\n  },\n  ...\n]\n\nResult (for verbose = 2):\n[                          (json array)\n  {                        (json object)\n    \"txid\" : \"hex\",        (string) The transaction hash in hex\n    \"wtxid\" : \"hex\",       (string) The transaction witness hash in hex\n    \"bytes\" : n,           (numeric) The serialized transaction size in bytes\n    \"vsize\" : n,           (numeric) The virtual transaction size as defined in BIP 141. This is different from actual serialized size for witness transactions as witness data is discounted.\n    \"weight\" : n,          (numeric) The transaction weight as defined in BIP 141.\n    \"entry\" : xxx,         (numeric) The entry time into the orphanage expressed in UNIX epoch time\n    \"expiration\" : xxx,    (numeric) The orphan expiration time expressed in UNIX epoch time\n    \"from\" : [             (json array)\n      n,                   (numeric) Peer ID\n      ...\n    ],\n    \"hex\" : \"hex\"          (string) The serialized, hex-encoded transaction data\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli getorphantxs 2\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getorphantxs\", \"params\": [2]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETMININGINFO_HELP: &str = "getmininginfo\n\nReturns a json object containing mining-related information.\n\nResult:\n{                                (json object)\n  \"blocks\" : n,                  (numeric) The current block\n  \"currentblockweight\" : n,      (numeric, optional) The block weight (including reserved weight for block header, txs count and coinbase tx) of the last assembled block (only present if a block was ever assembled)\n  \"currentblocktx\" : n,          (numeric, optional) The number of block transactions (excluding coinbase) of the last assembled block (only present if a block was ever assembled)\n  \"bits\" : \"hex\",                (string) The current nBits, compact representation of the block difficulty target\n  \"difficulty\" : n,              (numeric) The current difficulty\n  \"target\" : \"hex\",              (string) The current target\n  \"networkhashps\" : n,           (numeric) The network hashes per second\n  \"pooledtx\" : n,                (numeric) The size of the mempool\n  \"chain\" : \"str\",               (string) current network name (main, test, testnet4, signet, regtest)\n  \"signet_challenge\" : \"hex\",    (string, optional) The block challenge (aka. block script), in hexadecimal (only present if the current network is a signet)\n  \"next\" : {                     (json object) The next block\n    \"height\" : n,                (numeric) The next height\n    \"bits\" : \"hex\",              (string) The next target nBits\n    \"difficulty\" : n,            (numeric) The next difficulty\n    \"target\" : \"hex\"             (string) The next target\n  },\n  \"warnings\" : [                 (json array) any network and blockchain warnings (run with `-deprecatedrpc=warnings` to return the latest warning as a single string)\n    \"str\",                       (string) warning\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli getmininginfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getmininginfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETNETWORKINFO_HELP: &str = "getnetworkinfo\n\nReturns an object containing various state info regarding P2P networking.\n\nResult:\n{                                                    (json object)\n  \"version\" : n,                                     (numeric) the server version\n  \"subversion\" : \"str\",                              (string) the server subversion string\n  \"protocolversion\" : n,                             (numeric) the protocol version\n  \"localservices\" : \"hex\",                           (string) the services we offer to the network\n  \"localservicesnames\" : [                           (json array) the services we offer to the network, in human-readable form\n    \"str\",                                           (string) the service name\n    ...\n  ],\n  \"localrelay\" : true|false,                         (boolean) true if transaction relay is requested from peers\n  \"timeoffset\" : n,                                  (numeric) the time offset\n  \"connections\" : n,                                 (numeric) the total number of connections\n  \"connections_in\" : n,                              (numeric) the number of inbound connections\n  \"connections_out\" : n,                             (numeric) the number of outbound connections\n  \"networkactive\" : true|false,                      (boolean) whether p2p networking is enabled\n  \"networks\" : [                                     (json array) information per network\n    {                                                (json object)\n      \"name\" : \"str\",                                (string) network (ipv4, ipv6, onion, i2p, cjdns)\n      \"limited\" : true|false,                        (boolean) is the network limited using -onlynet?\n      \"reachable\" : true|false,                      (boolean) is the network reachable?\n      \"proxy\" : \"str\",                               (string) (\"host:port\") the proxy that is used for this network, or empty if none\n      \"proxy_randomize_credentials\" : true|false     (boolean) Whether randomized credentials are used\n    },\n    ...\n  ],\n  \"relayfee\" : n,                                    (numeric) minimum relay fee rate for transactions in BTC/kvB\n  \"incrementalfee\" : n,                              (numeric) minimum fee rate increment for mempool limiting or replacement in BTC/kvB\n  \"localaddresses\" : [                               (json array) list of local addresses\n    {                                                (json object)\n      \"address\" : \"str\",                             (string) network address\n      \"port\" : n,                                    (numeric) network port\n      \"score\" : n                                    (numeric) relative score\n    },\n    ...\n  ],\n  \"warnings\" : [                                     (json array) any network and blockchain warnings (run with `-deprecatedrpc=warnings` to return the latest warning as a single string)\n    \"str\",                                           (string) warning\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli getnetworkinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getnetworkinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETCONNECTIONCOUNT_HELP: &str = "getconnectioncount\n\nReturns the number of connections to other nodes.\n\nResult:\nn    (numeric) The connection count\n\nExamples:\n> bitcoin-cli getconnectioncount \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getconnectioncount\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const UPTIME_HELP: &str = "uptime\n\nReturns the total uptime of the server.\n\nResult:\nn    (numeric) The number of seconds that the server has been running\n\nExamples:\n> bitcoin-cli uptime \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"uptime\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const STOP_HELP: &str = "stop\n\nRequest a graceful shutdown of Bitcoin Core.\n\nResult:\n\"str\"    (string) A string with the content 'Bitcoin Core stopping'\n";
+const HELP_HELP: &str = "help ( \"command\" )\n\nList all commands, or get help for a specified command.\n\nArguments:\n1. command    (string, optional, default=all commands) The command to get help on\n\nResult:\n\"str\"    (string) The help text\n";
+
 const GETMEMORYINFO_HELP: &str = "getmemoryinfo ( \"mode\" )\n\nReturns an object containing information about memory usage.\n\nArguments:\n1. mode    (string, optional, default=\"stats\") determines what kind of information is returned.\n           - \"stats\" returns general statistics about memory usage in the daemon.\n           - \"mallocinfo\" returns an XML string describing low-level heap state (only available if compiled with glibc).\n\nResult (mode \"stats\"):\n{                         (json object)\n  \"locked\" : {            (json object) Information about locked memory manager\n    \"used\" : n,           (numeric) Number of bytes used\n    \"free\" : n,           (numeric) Number of bytes available in current arenas\n    \"total\" : n,          (numeric) Total number of bytes managed\n    \"locked\" : n,         (numeric) Amount of bytes that succeeded locking. If this number is smaller than total, locking pages failed at some point and key data could be swapped to disk.\n    \"chunks_used\" : n,    (numeric) Number allocated chunks\n    \"chunks_free\" : n     (numeric) Number unused chunks\n  }\n}\n\nResult (mode \"mallocinfo\"):\n\"str\"    (string) \"<malloc version=\"1\">...\"\n\nExamples:\n> bitcoin-cli getmemoryinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getmemoryinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
-const LOGGING_HELP: &str = "logging ( [\"include_category\",...] [\"exclude_category\",...] )\n\nGets and sets the logging configuration.\nWhen called without an argument, returns the list of categories with status that are currently being debug logged or not.\nWhen called with arguments, adds or removes categories from debug logging and return the lists above.\nThe arguments are evaluated in order \"include\", \"exclude\".\nIf an item is both included and excluded, it will thus end up being excluded.\nThe valid logging categories are: addrman, bench, blockstorage, cmpctblock, coindb, estimatefee, http, i2p, ipc, leveldb, libevent, mempool, mempoolrej, net, proxy, prune, qt, rand, reindex, rpc, scan, selectcoins, tor, txpackages, txreconciliation, validation, walletdb, zmq\nIn addition, the following are available as category names with special meanings:\n  - \"all\",  \"1\" : represent all logging categories.\n\nArguments:\n1. include                    (json array, optional) The categories to add to debug logging\n     [\n       \"include_category\",    (string) the valid logging category\n       ...\n     ]\n2. exclude                    (json array, optional) The categories to remove from debug logging\n     [\n       \"exclude_category\",    (string) the valid logging category\n       ...\n     ]\n\nResult:\n{                             (json object) keys are the logging categories, and values indicates its status\n  \"category\" : true|false,    (boolean) if being debug logged or not. false:inactive, true:active\n  ...\n}\n\n";
+const LOGGING_HELP: &str = "logging ( [\"include_category\",...] [\"exclude_category\",...] )\n\nGets and sets the logging configuration.\nWhen called without an argument, returns the list of categories with status that are currently being debug logged or not.\nWhen called with arguments, adds or removes categories from debug logging and return the lists above.\nThe arguments are evaluated in order \"include\", \"exclude\".\nIf an item is both included and excluded, it will thus end up being excluded.\nThe valid logging categories are: addrman, bench, blockstorage, cmpctblock, coindb, estimatefee, http, i2p, ipc, leveldb, libevent, mempool, mempoolrej, net, proxy, prune, qt, rand, reindex, rpc, scan, selectcoins, tor, txpackages, txreconciliation, validation, walletdb, zmq\nIn addition, the following are available as category names with special meanings:\n  - \"all\",  \"1\" : represent all logging categories.\n\nArguments:\n1. include                    (json array, optional) The categories to add to debug logging\n     [\n       \"include_category\",    (string) the valid logging category\n       ...\n     ]\n2. exclude                    (json array, optional) The categories to remove from debug logging\n     [\n       \"exclude_category\",    (string) the valid logging category\n       ...\n     ]\n\nResult:\n{                             (json object) keys are the logging categories, and values indicates its status\n  \"category\" : true|false,    (boolean) if being debug logged or not. false:inactive, true:active\n  ...\n}\n\nExamples:\n> bitcoin-cli logging \"[\\\"all\\\"]\" \"[\\\"http\\\"]\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"logging\", \"params\": [[\"all\"], [\"libevent\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 fn missing_params(what: &str) -> (Value, Option<(i64, String)>) {
     (
@@ -2057,7 +2114,7 @@ fn tx_json(tx: &Transaction, params: &avila_consensus::params::Params, include_h
         }).collect::<Vec<_>>(),
         "vout": tx.outputs.iter().enumerate().map(|(n, out)| {
             json!({
-                "value": out.value as f64 / 100_000_000.0,
+                "value": value_from_amount(out.value),
                 "n": n,
                 "scriptPubKey": script_pubkey_json(&out.script_pubkey, params),
             })
@@ -2126,10 +2183,10 @@ fn entry_json(
         "height": entry.first_seen_height,
         "wtxid": entry.tx.wtxid().to_string(),
         "fees": {
-            "base": entry.fee as f64 / 100_000_000.0,
-            "modified": modified as f64 / 100_000_000.0,
-            "ancestor": (afees + modified) as f64 / 100_000_000.0,
-            "descendant": (dfees + modified) as f64 / 100_000_000.0,
+            "base": value_from_amount(entry.fee),
+            "modified": value_from_amount(modified),
+            "ancestor": value_from_amount(afees + modified),
+            "descendant": value_from_amount(dfees + modified),
         },
         "ancestorcount": ancestors.len() + 1,
         "ancestorsize": asize + entry.vsize,
@@ -2209,6 +2266,488 @@ fn mine_and_connect(
     }
 }
 
+/// One declared RPC argument: `(name, expected_type, required)`.
+/// `expected_type` is the `uvTypeName` in Core's `MatchesType` error;
+/// `None` skips the check (`AMOUNT`/`RANGE`/`skip_type_check` args —
+/// "numeric or string" and friends — accept anything through the
+/// collected check).
+type ArgSpec = (&'static str, Option<&'static str>, bool);
+
+/// `(method, [args], help)` — Core's `RPCHelpMan` arg declarations
+/// for v29.4. `IsValidNumArgs` bounds derive from the specs: `min` =
+/// count of required args (required args needn't be contiguous —
+/// `prioritisetransaction`'s `fee_delta` trails the optional `dummy`),
+/// `max` = `args.len()`. `MatchesType` then runs over every declared
+/// position — required args reject `null`, optional args treat it as
+/// omitted. Object (named) `params` bypass the gate entirely.
+static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
+    (
+        "addnode",
+        &[
+            ("node", Some("string"), true),
+            ("command", Some("string"), true),
+            ("v2transport", Some("bool"), false),
+        ],
+        ADDNODE_HELP,
+    ),
+    (
+        "addpeeraddress",
+        &[
+            ("address", Some("string"), true),
+            ("port", Some("number"), true),
+            ("tried", Some("bool"), false),
+        ],
+        ADDPEERADDRESS_HELP,
+    ),
+    ("clearbanned", &[], CLEARBANNED_HELP),
+    (
+        "createmultisig",
+        &[
+            ("nrequired", Some("number"), true),
+            ("keys", Some("array"), true),
+            ("address_type", Some("string"), false),
+        ],
+        CREATEMULTISIG_HELP,
+    ),
+    (
+        "createrawtransaction",
+        &[
+            ("inputs", Some("array"), true),
+            ("outputs", None, true),
+            ("locktime", Some("number"), false),
+            ("replaceable", Some("bool"), false),
+        ],
+        CREATERAWTRANSACTION_HELP,
+    ),
+    (
+        "decoderawtransaction",
+        &[
+            ("hexstring", Some("string"), true),
+            ("iswitness", Some("bool"), false),
+        ],
+        DECODERAWTRANSACTION_HELP,
+    ),
+    (
+        "decodescript",
+        &[("hexstring", Some("string"), true)],
+        DECODESCRIPT_HELP,
+    ),
+    (
+        "deriveaddresses",
+        &[("descriptor", Some("string"), true), ("range", None, false)],
+        DERIVEADDRESSES_HELP,
+    ),
+    (
+        "disconnectnode",
+        &[
+            ("address", Some("string"), false),
+            ("nodeid", Some("number"), false),
+        ],
+        DISCONNECTNODE_HELP,
+    ),
+    (
+        "estimatesmartfee",
+        &[
+            ("conf_target", Some("number"), true),
+            ("estimate_mode", Some("string"), false),
+        ],
+        ESTIMATESMARTFEE_HELP,
+    ),
+    (
+        "generateblock",
+        &[
+            ("output", Some("string"), true),
+            ("transactions", Some("array"), true),
+            ("submit", Some("bool"), false),
+        ],
+        GENERATEBLOCK_HELP,
+    ),
+    (
+        "generatetoaddress",
+        &[
+            ("nblocks", Some("number"), true),
+            ("address", Some("string"), true),
+            ("maxtries", Some("number"), false),
+        ],
+        GENERATETOADDRESS_HELP,
+    ),
+    (
+        "generatetodescriptor",
+        &[
+            ("num_blocks", Some("number"), true),
+            ("descriptor", Some("string"), true),
+            ("maxtries", Some("number"), false),
+        ],
+        GENERATETODESCRIPTOR_HELP,
+    ),
+    ("getaddrmaninfo", &[], GETADDRMANINFO_HELP),
+    ("getbestblockhash", &[], GETBESTBLOCKHASH_HELP),
+    (
+        "getblock",
+        &[
+            ("blockhash", Some("string"), true),
+            ("verbosity", Some("number"), false),
+        ],
+        GETBLOCK_HELP,
+    ),
+    ("getblockchaininfo", &[], GETBLOCKCHAININFO_HELP),
+    ("getblockcount", &[], GETBLOCKCOUNT_HELP),
+    (
+        "getblockfrompeer",
+        &[
+            ("blockhash", Some("string"), true),
+            ("peer_id", Some("number"), true),
+        ],
+        GETBLOCKFROMPEER_HELP,
+    ),
+    (
+        "getblockhash",
+        &[("height", Some("number"), true)],
+        GETBLOCKHASH_HELP,
+    ),
+    (
+        "getblockheader",
+        &[
+            ("blockhash", Some("string"), true),
+            ("verbose", Some("bool"), false),
+        ],
+        GETBLOCKHEADER_HELP,
+    ),
+    (
+        "getblockstats",
+        &[
+            ("hash_or_height", None, true),
+            ("stats", Some("array"), false),
+        ],
+        GETBLOCKSTATS_HELP,
+    ),
+    (
+        "getblocktemplate",
+        &[("template_request", Some("object"), true)],
+        GETBLOCKTEMPLATE_HELP,
+    ),
+    ("getchaintips", &[], GETCHAINTIPS_HELP),
+    (
+        "getchaintxstats",
+        &[
+            ("nblocks", Some("number"), false),
+            ("blockhash", Some("string"), false),
+        ],
+        GETCHAINTXSTATS_HELP,
+    ),
+    ("getconnectioncount", &[], GETCONNECTIONCOUNT_HELP),
+    (
+        "getdeploymentinfo",
+        &[("blockhash", Some("string"), false)],
+        GETDEPLOYMENTINFO_HELP,
+    ),
+    (
+        "getdescriptorinfo",
+        &[("descriptor", Some("string"), true)],
+        GETDESCRIPTORINFO_HELP,
+    ),
+    ("getdifficulty", &[], GETDIFFICULTY_HELP),
+    (
+        "getindexinfo",
+        &[("index_name", Some("string"), false)],
+        GETINDEXINFO_HELP,
+    ),
+    (
+        "getmemoryinfo",
+        &[("mode", Some("string"), false)],
+        GETMEMORYINFO_HELP,
+    ),
+    (
+        "getmempoolancestors",
+        &[
+            ("txid", Some("string"), true),
+            ("verbose", Some("bool"), false),
+        ],
+        GETMEMPOOLANCESTORS_HELP,
+    ),
+    (
+        "getmempooldescendants",
+        &[
+            ("txid", Some("string"), true),
+            ("verbose", Some("bool"), false),
+        ],
+        GETMEMPOOLDESCENDANTS_HELP,
+    ),
+    (
+        "getmempoolentry",
+        &[("txid", Some("string"), true)],
+        GETMEMPOOLENTRY_HELP,
+    ),
+    ("getmempoolinfo", &[], GETMEMPOOLINFO_HELP),
+    ("getmininginfo", &[], GETMININGINFO_HELP),
+    ("getnettotals", &[], GETNETTOTALS_HELP),
+    (
+        "getnetworkhashps",
+        &[
+            ("nblocks", Some("number"), false),
+            ("height", Some("number"), false),
+        ],
+        GETNETWORKHASHPS_HELP,
+    ),
+    ("getnetworkinfo", &[], GETNETWORKINFO_HELP),
+    (
+        "getnodeaddresses",
+        &[
+            ("count", Some("number"), false),
+            ("network", Some("string"), false),
+        ],
+        GETNODEADDRESSES_HELP,
+    ),
+    // `verbosity` skips the decl check — the body's own getInt path
+    // produces the bare messages ("Verbosity was boolean…").
+    (
+        "getorphantxs",
+        &[("verbosity", None, false)],
+        GETORPHANTXS_HELP,
+    ),
+    ("getpeerinfo", &[], GETPEERINFO_HELP),
+    (
+        "getprioritisedtransactions",
+        &[],
+        GETPRIORITISEDTRANSACTIONS_HELP,
+    ),
+    (
+        "getrawmempool",
+        &[
+            ("verbose", Some("bool"), false),
+            ("mempool_sequence", Some("bool"), false),
+        ],
+        GETRAWMEMPOOL_HELP,
+    ),
+    (
+        "getrawtransaction",
+        &[
+            ("txid", Some("string"), true),
+            ("verbosity", Some("number"), false),
+            ("blockhash", Some("string"), false),
+        ],
+        GETRAWTRANSACTION_HELP,
+    ),
+    ("getrpcinfo", &[], GETRPCINFO_HELP),
+    (
+        "gettxout",
+        &[
+            ("txid", Some("string"), true),
+            ("n", Some("number"), true),
+            ("include_mempool", Some("bool"), false),
+        ],
+        GETTXOUT_HELP,
+    ),
+    // `options.prove_witness` is a post-29.4 upstream addition — kept
+    // in the declared surface like `in_active_chain`.
+    (
+        "gettxoutproof",
+        &[
+            ("txids", Some("array"), true),
+            ("blockhash", Some("string"), false),
+            ("options", Some("object"), false),
+        ],
+        GETTXOUTPROOF_HELP,
+    ),
+    (
+        "gettxoutsetinfo",
+        &[
+            ("hash_type", Some("string"), false),
+            ("hash_or_height", None, false),
+            ("use_index", Some("bool"), false),
+        ],
+        GETTXOUTSETINFO_HELP,
+    ),
+    (
+        "gettxspendingprevout",
+        &[("outputs", Some("array"), true)],
+        GETTXSPENDINGPREVOUT_HELP,
+    ),
+    ("help", &[("command", Some("string"), false)], HELP_HELP),
+    ("listbanned", &[], LISTBANNED_HELP),
+    (
+        "logging",
+        &[
+            ("include", Some("array"), false),
+            ("exclude", Some("array"), false),
+        ],
+        LOGGING_HELP,
+    ),
+    ("ping", &[], PING_HELP),
+    (
+        "preciousblock",
+        &[("blockhash", Some("string"), true)],
+        PRECIOUSBLOCK_HELP,
+    ),
+    (
+        "prioritisetransaction",
+        &[
+            ("txid", Some("string"), true),
+            ("dummy", Some("number"), false),
+            ("fee_delta", Some("number"), true),
+        ],
+        PRIORITISETRANSACTION_HELP,
+    ),
+    ("savemempool", &[], SAVEMEMPOOL_HELP),
+    (
+        "scantxoutset",
+        &[
+            ("action", Some("string"), true),
+            ("scanobjects", Some("array"), false),
+        ],
+        SCANTXOUTSET_HELP,
+    ),
+    (
+        "sendrawtransaction",
+        &[
+            ("hexstring", Some("string"), true),
+            ("maxfeerate", None, false),
+            ("maxburnamount", None, false),
+        ],
+        SENDRAWTRANSACTION_HELP,
+    ),
+    (
+        "setban",
+        &[
+            ("subnet", Some("string"), true),
+            ("command", Some("string"), true),
+            ("bantime", Some("number"), false),
+            ("absolute", Some("bool"), false),
+        ],
+        SETBAN_HELP,
+    ),
+    (
+        "setnetworkactive",
+        &[("state", Some("bool"), true)],
+        SETNETWORKACTIVE_HELP,
+    ),
+    (
+        "signmessagewithprivkey",
+        &[
+            ("privkey", Some("string"), true),
+            ("message", Some("string"), true),
+        ],
+        SIGNMESSAGEWITHPRIVKEY_HELP,
+    ),
+    ("stop", &[], STOP_HELP),
+    (
+        "submitblock",
+        &[
+            ("hexdata", Some("string"), true),
+            ("dummy", Some("string"), false),
+        ],
+        SUBMITBLOCK_HELP,
+    ),
+    (
+        "submitheader",
+        &[("hexdata", Some("string"), true)],
+        SUBMITHEADER_HELP,
+    ),
+    (
+        "testmempoolaccept",
+        &[("rawtxs", Some("array"), true), ("maxfeerate", None, false)],
+        TESTMEMPOOLACCEPT_HELP,
+    ),
+    ("uptime", &[], UPTIME_HELP),
+    (
+        "validateaddress",
+        &[("address", Some("string"), true)],
+        VALIDATEADDRESS_HELP,
+    ),
+    (
+        "verifychain",
+        &[
+            ("checklevel", Some("number"), false),
+            ("nblocks", Some("number"), false),
+        ],
+        VERIFYCHAIN_HELP,
+    ),
+    (
+        "verifymessage",
+        &[
+            ("address", Some("string"), true),
+            ("signature", Some("string"), true),
+            ("message", Some("string"), true),
+        ],
+        VERIFYMESSAGE_HELP,
+    ),
+    // `options.verify_witness` is the same post-29.4 addition.
+    (
+        "verifytxoutproof",
+        &[
+            ("proof", Some("string"), true),
+            ("options", Some("object"), false),
+        ],
+        VERIFYTXOUTPROOF_HELP,
+    ),
+    (
+        "waitforblock",
+        &[
+            ("blockhash", Some("string"), true),
+            ("timeout", Some("number"), false),
+        ],
+        WAITFORBLOCK_HELP,
+    ),
+    (
+        "waitforblockheight",
+        &[
+            ("height", Some("number"), true),
+            ("timeout", Some("number"), false),
+        ],
+        WAITFORBLOCKHEIGHT_HELP,
+    ),
+    (
+        "waitfornewblock",
+        &[("timeout", Some("number"), false)],
+        WAITFORNEWBLOCK_HELP,
+    ),
+];
+
+/// `RPCHelpMan::HandleRequest`'s pre-body checks: `IsValidNumArgs`
+/// (`-1` + full help) then the collected per-position `MatchesType`
+/// (`-3` "Wrong type passed"). Required args reject `null`; optional
+/// args read it as omitted. Returns `None` when the call passes or
+/// `method`/`params` isn't covered (named object params bypass).
+fn arg_errors(method: &str, params: &Value) -> Option<(i64, String)> {
+    let Value::Array(args) = params else {
+        return None;
+    };
+    let &(_, specs, help) = METHOD_ARGS.iter().find(|r| r.0 == method)?;
+    // `IsValidNumArgs` strips only *trailing* optionals — a required
+    // arg after an optional one still counts at its position, so
+    // `prioritisetransaction`'s `fee_delta` forces a 3-arg minimum.
+    let required = specs.iter().rposition(|s| s.2).map_or(0, |i| i + 1);
+    if !(required..=specs.len()).contains(&args.len()) {
+        return Some((RPC_MISC_ERROR, help.to_string()));
+    }
+    let mismatches: Vec<(usize, &str, &Value, &str)> = specs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (name, ty, required))| {
+            let v = args.get(i).unwrap_or(&Value::Null);
+            let ty = (*ty)?;
+            let ok = match v {
+                Value::Null => !required,
+                Value::String(_) => ty == "string",
+                Value::Number(_) => ty == "number",
+                Value::Bool(_) => ty == "bool",
+                Value::Array(_) => ty == "array",
+                Value::Object(_) => ty == "object",
+            };
+            (!ok).then_some((i + 1, *name, v, ty))
+        })
+        .collect();
+    if mismatches.is_empty() {
+        return None;
+    }
+    Some((RPC_TYPE_ERROR, wrong_type_list(&mismatches)))
+}
+
+/// The per-method help text used by `help <name>` — same const the
+/// arity gate throws on bad counts.
+fn method_help(name: &str) -> Option<&'static str> {
+    METHOD_ARGS.iter().find(|r| r.0 == name).map(|r| r.2)
+}
 fn dispatch(
     method: &str,
     params: &Value,
@@ -2221,6 +2760,9 @@ fn dispatch(
     // `getrpcinfo` reports the in-flight command's runtime — Core's
     // `g_rpc_interfaces` stamps the start at dispatch.
     let call_start = std::time::Instant::now();
+    if let Some(e) = arg_errors(method, params) {
+        return (Value::Null, Some(e));
+    }
     match method {
         "getblockcount" => (json!(snap.connected_height), None),
         "getbestblockhash" => (
@@ -2605,11 +3147,11 @@ fn dispatch(
             })
         }
         "getblockheader" => {
-            let Some(hash) = param(params, 0, "blockhash")
-                .and_then(Value::as_str)
-                .and_then(|s| s.parse::<BlockHash>().ok())
-            else {
-                return missing_params("blockhash");
+            // The gate guarantees a string here; ParseHashV calls the
+            // arg "hash" in its errors.
+            let hash = match parse_hash_arg(&params[0], "hash") {
+                Ok(h) => h,
+                Err(e) => return (Value::Null, Some(e)),
             };
             let verbose = param(params, 1, "verbose")
                 .and_then(Value::as_bool)
@@ -2631,11 +3173,9 @@ fn dispatch(
             })
         }
         "getblock" => {
-            let Some(hash) = param(params, 0, "blockhash")
-                .and_then(Value::as_str)
-                .and_then(|s| s.parse::<BlockHash>().ok())
-            else {
-                return missing_params("blockhash");
+            let hash = match parse_hash_arg(&params[0], "blockhash") {
+                Ok(h) => h,
+                Err(e) => return (Value::Null, Some(e)),
             };
             let verbosity = param(params, 1, "verbosity")
                 .and_then(Value::as_u64)
@@ -2756,11 +3296,10 @@ fn dispatch(
                             }
                         }
                     }
-                    _ => {
-                        return Err((
-                            RPC_INVALID_PARAMS,
-                            "missing parameter: hash_or_height".to_string(),
-                        ));
+                    // ParseHashV's RPCTypeCheck — non-num, non-str
+                    // (null, bool, array, object) → bare -3.
+                    v => {
+                        return Err((RPC_TYPE_ERROR, field_type_message(v, "string")));
                     }
                 };
                 let height = node.height;
@@ -2814,7 +3353,7 @@ fn dispatch(
                         Ok(json!({
                             "bestblock": cs.tip_hash().to_string(),
                             "confirmations": tip - coin.height + 1,
-                            "value": coin.out.value as f64 / 100_000_000.0,
+                            "value": value_from_amount(coin.out.value),
                             "scriptPubKey": script_pubkey_json(
                                 &coin.out.script_pubkey,
                                 cs.tree().params(),
@@ -3454,11 +3993,10 @@ fn dispatch(
             })
         }
         "getrawtransaction" => {
-            let Some(txid) = param(params, 0, "txid")
-                .and_then(Value::as_str)
-                .and_then(|s| s.parse::<Txid>().ok())
-            else {
-                return missing_params("txid");
+            // ParseHashV with the literal "parameter 1" arg name.
+            let txid = match parse_hash_arg(&params[0], "parameter 1") {
+                Ok(t) => t,
+                Err(e) => return (Value::Null, Some(e)),
             };
             // Core accepts verbosity as a bool or 0/1/2 int.
             let verbosity = param(params, 1, "verbose")
@@ -3676,9 +4214,8 @@ fn dispatch(
             let pool = mgr.mempool_ref();
             let bytes = pool.total_tx_bytes();
             // BTC-denominated fields like Core's: our counters are
-            // satoshis, so convert.
-            let sat_to_btc = |sat_per_kvb: i64| sat_per_kvb as f64 / 100_000_000.0;
-            let relay_btc = sat_to_btc(pool.min_relay_fee());
+            // satoshis, so convert through `ValueFromAmount`.
+            let relay = pool.min_relay_fee();
             Ok(json!({
                 "loaded": true,
                 "size": pool.len(),
@@ -3686,17 +4223,17 @@ fn dispatch(
                 // Encoded size is the honest floor for Core's
                 // allocator-dependent DynamicUsage figure.
                 "usage": bytes,
-                "total_fee": pool.total_fees() as f64 / 100_000_000.0,
+                "total_fee": value_from_amount(pool.total_fees()),
                 "maxmempool": pool.max_bytes(),
                 // No size-based decay yet — the dynamic floor equals
                 // the configured relay floor until that lands.
-                "mempoolminfee": relay_btc,
-                "minrelaytxfee": relay_btc,
-                "incrementalrelayfee": sat_to_btc(avila_mempool::INCREMENTAL_RELAY_FEE),
+                "mempoolminfee": value_from_amount(relay),
+                "minrelaytxfee": value_from_amount(relay),
+                "incrementalrelayfee": value_from_amount(avila_mempool::INCREMENTAL_RELAY_FEE),
+                "unbroadcastcount": pool.unbroadcast_count(),
                 // Full-RBF matches deployed Core's -mempoolfullrbf=1:
                 // replacements no longer need BIP125 signaling.
                 "fullrbf": pool.full_rbf(),
-                "unbroadcastcount": pool.unbroadcast_count(),
             }))
         }),
         "getchaintips" => chain_query(queries, |cs, _| {
@@ -3776,11 +4313,10 @@ fn dispatch(
             })
         }
         "getmempoolentry" | "getmempoolancestors" | "getmempooldescendants" => {
-            let Some(txid) = param(params, 0, "txid")
-                .and_then(Value::as_str)
-                .and_then(|s| s.parse::<Txid>().ok())
-            else {
-                return missing_params("txid");
+            // ParseHashV with the literal "parameter 1" arg name.
+            let txid = match parse_hash_arg(&params[0], "parameter 1") {
+                Ok(t) => t,
+                Err(e) => return (Value::Null, Some(e)),
             };
             let verbose = param(params, 1, "verbose")
                 .and_then(Value::as_bool)
@@ -3851,7 +4387,7 @@ fn dispatch(
                             .sum();
                         let output_sum: i64 = tx.outputs.iter().map(|o| o.value).sum();
                         let fee = input_sum - output_sum;
-                        verdict["fees"] = json!({"base": fee as f64 / 100_000_000.0});
+                        verdict["fees"] = json!({"base": value_from_amount(fee)});
                         verdict["package-feerrate"] =
                             json!(fee as f64 / tx.weight().div_ceil(4).max(1) as f64 / 1000.0);
                     } else if let Some(failed) = steps.iter().find(|s| !s.passed) {
@@ -3888,17 +4424,19 @@ fn dispatch(
             let maxburnamount = param(params, 2, "maxburnamount")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
-            let Ok(bytes) = hex::decode(raw) else {
-                return (
-                    Value::Null,
-                    Some((RPC_DESERIALIZATION_ERROR, "TX decode failed".into())),
-                );
-            };
+            // Core's sendrawtransaction decode failures all read
+            // "TX decode failed. Make sure the tx has at least one
+            // input." (decoderawtransaction keeps the bare wording).
+            let bytes = hex::decode(raw).unwrap_or_default();
             chain_query(queries, move |cs, mgr| {
                 let tx = match Transaction::decode(&bytes) {
                     Ok(tx) => tx,
-                    Err(e) => {
-                        return Err((RPC_DESERIALIZATION_ERROR, format!("TX decode failed: {e}")));
+                    Err(_) => {
+                        return Err((
+                            RPC_DESERIALIZATION_ERROR,
+                            "TX decode failed. Make sure the tx has at least one input."
+                                .to_string(),
+                        ));
                     }
                 };
                 let txid = tx.txid();
@@ -5088,7 +5626,7 @@ fn dispatch(
                         "total_amount overflowed MoneyRange".into(),
                     ));
                 };
-                o.insert("total_amount".into(), (total as f64 / 100_000_000.0).into());
+                o.insert("total_amount".into(), value_from_amount(total));
                 o.insert("transactions".into(), s.transactions.into());
                 o.insert("disk_size".into(), s.disk_size.into());
                 Ok(Value::Object(o))
@@ -5330,7 +5868,7 @@ fn dispatch(
                                     .get(coin.out.script_pubkey.as_bytes())
                                     .cloned()
                                     .unwrap_or_default(),
-                                "amount": coin.out.value as f64 / 100_000_000.0,
+                                "amount": value_from_amount(coin.out.value),
                                 "coinbase": coin.coinbase,
                                 "height": coin.height,
                                 "blockhash": blockhash,
@@ -5344,7 +5882,7 @@ fn dispatch(
                             "height": tip_height,
                             "bestblock": tip_hash,
                             "unspents": unspents,
-                            "total_amount": total_in as f64 / 100_000_000.0,
+                            "total_amount": value_from_amount(total_in),
                         }))
                     })
                 }
@@ -5711,15 +6249,60 @@ fn dispatch(
             }
             Ok(out)
         }),
-        "getorphantxs" => chain_query(queries, |_, mgr| {
-            Ok(json!(
-                mgr.mempool_ref()
-                    .orphan_txids()
-                    .iter()
-                    .map(|t| t.to_string())
-                    .collect::<Vec<_>>()
-            ))
-        }),
+        "getorphantxs" => {
+            // getInt<int> semantics: bool → the special -3, non-int
+            // → -1 out-of-range, other non-num → bare -3, then the
+            // 0..=2 domain check is -8.
+            let verbosity = match params.get(0) {
+                None | Some(Value::Null) => 0u64,
+                Some(Value::Bool(_)) => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            "Verbosity was boolean but only integer allowed".into(),
+                        )),
+                    );
+                }
+                Some(v @ (Value::String(_) | Value::Array(_) | Value::Object(_))) => {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, field_type_message(v, "number"))),
+                    );
+                }
+                Some(v) => match v.as_u64().filter(|_| !v.is_f64()) {
+                    Some(n) if n <= 2 => n,
+                    Some(n) => {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_INVALID_PARAMETER,
+                                format!("Invalid verbosity value {n}"),
+                            )),
+                        );
+                    }
+                    None => {
+                        return (
+                            Value::Null,
+                            Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                        );
+                    }
+                },
+            };
+            // Verbosity 1/2 will need a per-tx detail record once the
+            // orphan pool tracks more than txids — v0 emits the same
+            // list for every accepted verbosity.
+            let _ = verbosity;
+            chain_query(queries, |_, mgr| {
+                Ok(json!(
+                    mgr.mempool_ref()
+                        .orphan_txids()
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>()
+                ))
+            })
+        }
         "getmininginfo" => chain_query(queries, |cs, mgr| {
             // Core's getmininginfo reports on the connected tip
             // (ActiveTip), not the best header.
@@ -5756,22 +6339,22 @@ fn dispatch(
                 "blocks": node.height,
                 "currentblockweight": current.as_ref().map(|t| t.weight).unwrap_or(0),
                 "currentblocktx": current.as_ref().map(|t| t.tx_count).unwrap_or(0),
-                "difficulty": core_num(difficulty(node.header.bits.0)),
                 "bits": format!("{:08x}", node.header.bits.0),
+                "difficulty": core_num(difficulty(node.header.bits.0)),
                 "target": node.header.bits.expand().value.to_hex(),
                 "networkhashps": core_num(networkhashps),
                 "pooledtx": mgr.mempool_ref().len(),
                 "chain": format!("{:?}", cs.tree().params().network).to_lowercase(),
-                "warnings": [],
             });
             if let Some(bits) = next {
                 out["next"] = json!({
                     "height": node.height + 1,
                     "bits": format!("{:08x}", bits.0),
+                    "difficulty": core_num(difficulty(bits.0)),
                     "target": bits.expand().value.to_hex(),
-                    "difficulty": difficulty(bits.0),
                 });
             }
+            out["warnings"] = json!([]);
             Ok(out)
         }),
         "getnetworkhashps" => {
@@ -5782,7 +6365,8 @@ fn dispatch(
             // `nblocks`: getInt<int> — a float/out-of-i32 value is -1,
             // non-number is -3, 0 and below -1 are -8.
             let nblocks = match param(params, 0, "nblocks") {
-                None => 120i64,
+                // Optional arg — explicit null is omitted.
+                None | Some(Value::Null) => 120i64,
                 Some(v) if !v.is_number() => {
                     return (
                         Value::Null,
@@ -5887,10 +6471,9 @@ fn dispatch(
         }
         "disconnectnode" => {
             let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
-            if arr.is_empty() || arr.len() > 2 {
-                return help_error(DISCONNECTNODE_HELP);
-            }
-            let address = &arr[0];
+            // >2 args is unreachable past the gate. `[]`, `[null]`,
+            // and `[null,null]` all land on the either/or check.
+            let address = arr.first().unwrap_or(&Value::Null);
             let nodeid = arr.get(1).unwrap_or(&Value::Null);
             // Type checks precede the either/or check, like Core.
             if !address.is_null() && !address.is_string() {
@@ -5912,8 +6495,7 @@ fn dispatch(
                 );
             }
             let by_addr = !address.is_null() && nodeid.is_null();
-            let by_id = !nodeid.is_null()
-                && (address.is_null() || address.as_str().is_some_and(str::is_empty));
+            let by_id = !nodeid.is_null() && address.is_null();
             if !by_addr && !by_id {
                 return (
                     Value::Null,
@@ -6625,8 +7207,8 @@ fn dispatch(
                 // No discovered/advertised local addrs yet — Core's
                 // regtest answer is the empty list too.
                 "localaddresses": [],
-                "relayfee": mgr.mempool_ref().min_relay_fee() as f64 / 100_000_000.0,
-                "incrementalfee": avila_mempool::INCREMENTAL_RELAY_FEE as f64 / 100_000_000.0,
+                "relayfee": value_from_amount(mgr.mempool_ref().min_relay_fee()),
+                "incrementalfee": value_from_amount(avila_mempool::INCREMENTAL_RELAY_FEE),
                 "warnings": [],
             }))
         }),
@@ -6717,70 +7299,97 @@ fn dispatch(
                     // Core reports feerate in BTC/kvB; our estimator
                     // stores sat/kvB.
                     Some(rate) => Ok(json!({
-                        "feerate": rate as f64 / 100_000_000.0,
+                        "feerate": value_from_amount(rate),
                         "blocks": target,
                     })),
                     // Core's estimator returns a result object with an
                     // `errors` list when it has no data — not an RPC
-                    // error.
+                    // error — and still echoes the conf_target.
                     None => Ok(json!({
                         "errors": ["Insufficient data or no feerate found"],
-                        "blocks": 0,
+                        "blocks": target,
                     })),
                 }
             })
         }
-        "help" => (
-            json!(
-                "avila-node JSON-RPC:\n\
-                 \x20 chain: getblockcount, getbestblockhash, getblockchaininfo, getchaintips,\n\
-                 \x20   getdifficulty,\n\
-                 \x20   getblockhash <height>, getblockheader <hash> [verbose],\n\
-                 \x20   getblock <hash> [verbosity 0-2], getblockstats <hash|height> [stats],\n\
-                 \x20   getdeploymentinfo [blockhash],\n\
-                 \x20   getrawtransaction <txid> [verbosity] [blockhash],\n\
-                 \x20   decoderawtransaction <hex> [iswitness], getindexinfo [index_name],\n\
-                 \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>,\n\
-                 \x20   gettxoutproof <txids> [blockhash] [options],\n\
-                 \x20   verifytxoutproof <proof> [options], validateaddress <address>,\n\
-                 \x20   verifymessage <address> <sig> <msg>,\n\
-                 \x20   signmessagewithprivkey <wif> <msg>,\n\
-                 \x20   verifychain [checklevel] [nblocks],\n\
-                 \x20   getchaintxstats [nblocks] [blockhash],\n\
-                 \x20   gettxoutsetinfo [hash_type] [hash_or_height] [use_index]\n\
-                 \x20   scantxoutset <action> [scanobjects,...]\n\
-                 \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
-                 \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
-                 \x20   gettxspendingprevout <outputs>,\n\
-                 \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>,\n\
-                 \x20   createrawtransaction <inputs> <outputs> [locktime] [replaceable],\n\
-                 \x20   createmultisig <nrequired> [keys] [address_type],\n\
-                 \x20   getdescriptorinfo <desc>, deriveaddresses <desc> [range],\n\
-                 \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount], savemempool\n\
-                 \x20 mining: getblocktemplate, getmininginfo, getnetworkhashps,\n\
-                 \x20   submitblock <hex>,\n\
-                 \x20   submitheader <hex>, generatetoaddress <n> <address> [maxtries],\n\
-                 \x20   generateblock <output> [rawtx/txid,...],\n\
-                 \x20   generatetodescriptor <n> <desc> [maxtries],\n\
-                 \x20   preciousblock <hash>, prioritisetransaction <txid> 0 <delta>,\n\
-                 \x20   getprioritisedtransactions,\n\
-                 \x20   getblockfrompeer <hash> <peer_id>,\n\
-                 \x20   waitforblock <hash> [timeout], waitforblockheight <h> [timeout],\n\
-                 \x20   waitfornewblock [timeout]\n\
-                 \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo,\n\
-                 \x20   getnettotals, getnodeaddresses [count] [network],\n\
-                 \x20   getaddrmaninfo,\n\
-                 \x20   addpeeraddress <address> <port> [tried], ping,\n\
-                 \x20   disconnectnode [address] [nodeid], addnode <node> <cmd>,\n\
-                 \x20   setnetworkactive <state>,\n\
-                 \x20   setban <subnet> <add|remove> [bantime] [absolute],\n\
-                 \x20   listbanned, clearbanned\n\
-                 \x20 misc:  estimatesmartfee <target>, getrpcinfo,\n\
-                 \x20   getmemoryinfo [mode], logging [include] [exclude],\n\
-                 \x20   uptime, help, stop"
+        "help" => match params.get(0) {
+            // `help` with no arg lists the implemented surface.
+            None => (
+                json!(
+                    "avila-node JSON-RPC:\n\
+                     \x20 chain: getblockcount, getbestblockhash, getblockchaininfo, getchaintips,\n\
+                     \x20   getdifficulty,\n\
+                     \x20   getblockhash <height>, getblockheader <hash> [verbose],\n\
+                     \x20   getblock <hash> [verbosity 0-2], getblockstats <hash|height> [stats],\n\
+                     \x20   getdeploymentinfo [blockhash],\n\
+                     \x20   getrawtransaction <txid> [verbosity] [blockhash],\n\
+                     \x20   decoderawtransaction <hex> [iswitness], getindexinfo [index_name],\n\
+                     \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>,\n\
+                     \x20   gettxoutproof <txids> [blockhash] [options],\n\
+                     \x20   verifytxoutproof <proof> [options], validateaddress <address>,\n\
+                     \x20   verifymessage <address> <sig> <msg>,\n\
+                     \x20   signmessagewithprivkey <wif> <msg>,\n\
+                     \x20   verifychain [checklevel] [nblocks],\n\
+                     \x20   getchaintxstats [nblocks] [blockhash],\n\
+                     \x20   gettxoutsetinfo [hash_type] [hash_or_height] [use_index]\n\
+                     \x20   scantxoutset <action> [scanobjects,...]\n\
+                     \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
+                     \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
+                     \x20   gettxspendingprevout <outputs>,\n\
+                     \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>,\n\
+                     \x20   createrawtransaction <inputs> <outputs> [locktime] [replaceable],\n\
+                     \x20   createmultisig <nrequired> [keys] [address_type],\n\
+                     \x20   getdescriptorinfo <desc>, deriveaddresses <desc> [range],\n\
+                     \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount], savemempool\n\
+                     \x20 mining: getblocktemplate, getmininginfo, getnetworkhashps,\n\
+                     \x20   submitblock <hex>,\n\
+                     \x20   submitheader <hex>, generatetoaddress <n> <address> [maxtries],\n\
+                     \x20   generateblock <output> [rawtx/txid,...],\n\
+                     \x20   generatetodescriptor <n> <desc> [maxtries],\n\
+                     \x20   preciousblock <hash>, prioritisetransaction <txid> 0 <delta>,\n\
+                     \x20   getprioritisedtransactions,\n\
+                     \x20   getblockfrompeer <hash> <peer_id>,\n\
+                     \x20   waitforblock <hash> [timeout], waitforblockheight <h> [timeout],\n\
+                     \x20   waitfornewblock [timeout]\n\
+                     \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo,\n\
+                     \x20   getnettotals, getnodeaddresses [count] [network],\n\
+                     \x20   getaddrmaninfo,\n\
+                     \x20   addpeeraddress <address> <port> [tried], ping,\n\
+                     \x20   disconnectnode [address] [nodeid], addnode <node> <cmd>,\n\
+                     \x20   setnetworkactive <state>,\n\
+                     \x20   setban <subnet> <add|remove> [bantime] [absolute],\n\
+                     \x20   listbanned, clearbanned\n\
+                     \x20 misc:  estimatesmartfee <target>, getrpcinfo,\n\
+                     \x20   getmemoryinfo [mode], logging [include] [exclude],\n\
+                     \x20   uptime, help, stop"
+                ),
+                None,
             ),
-            None,
-        ),
+            // An explicit `null` counts as provided-but-null — Core's
+            // `get_str` throws the bare type error (not the collected
+            // RPCHelpMan form, which only covers real type mismatches).
+            Some(Value::Null) => (
+                Value::Null,
+                Some((
+                    RPC_TYPE_ERROR,
+                    "JSON value of type null is not of expected type string".to_string(),
+                )),
+            ),
+            Some(v @ (Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_))) => (
+                Value::Null,
+                Some((
+                    RPC_TYPE_ERROR,
+                    wrong_type_list(&[(1, "command", v, "string")]),
+                )),
+            ),
+            Some(Value::String(name)) => (
+                match method_help(name) {
+                    Some(text) => json!(text),
+                    None => json!(format!("help: unknown command: {name}")),
+                },
+                None,
+            ),
+        },
         _ => (
             Value::Null,
             Some((RPC_METHOD_NOT_FOUND, "Method not found".to_string())),
@@ -7159,7 +7768,7 @@ mod tests {
         assert!(e.is_none());
         assert_eq!(
             r,
-            json!({"errors": ["Insufficient data or no feerate found"], "blocks": 0})
+            json!({"errors": ["Insufficient data or no feerate found"], "blocks": 6})
         );
 
         // getnetworkinfo splits in/out connections.
@@ -7308,7 +7917,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
+        assert_eq!(e.unwrap(), (RPC_MISC_ERROR, SENDRAWTRANSACTION_HELP.into()));
         let (_, e) = dispatch(
             "sendrawtransaction",
             &json!(["00", -1]),
@@ -7825,7 +8434,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
+        assert_eq!(e.unwrap(), (RPC_MISC_ERROR, SUBMITBLOCK_HELP.into()));
     }
 
     /// `submitheader` — a known header returns null, an orphan carries
@@ -8320,7 +8929,8 @@ mod tests {
         let (_, e) = dispatch("ping", &json!([1]), &snap, Some(&queries), None, None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
-        // disconnectnode: no match → -29; both ids → -32602; bad
+        // disconnectnode: no match → -29; both ids → -32602 (an
+        // empty-string address still counts as provided); bad
         // subnet → -8; bad types → -3.
         let (_, e) = dispatch(
             "disconnectnode",
@@ -8331,7 +8941,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_NOT_CONNECTED);
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
         let (_, e) = dispatch(
             "disconnectnode",
             &json!(["1.2.3.4:5", 6]),
@@ -8395,7 +9005,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (r, e) = dispatch(
             "addnode",
             &json!(["1.2.3.4:8333", "remove"]),
@@ -8426,7 +9036,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch(
             "addnode",
             &json!(["x", "add", true]),
@@ -8897,7 +9507,9 @@ mod tests {
         let snap = snap();
         let txid = "00".repeat(32);
 
-        // Arity — fewer than 3 args or extra args → -1 + help.
+        // Arity — `fee_delta` is required at position 3, so anything
+        // below 3 args (or above) → -1 + help; the middle `dummy`
+        // stays optional only for `null` values.
         for p in [
             json!([]),
             json!([txid]),
@@ -9219,8 +9831,8 @@ mod tests {
             assert!(msg.starts_with("createrawtransaction"), "{msg}");
         }
 
-        // Collected -3 list: inputs not an array, locktime and
-        // replaceable wrong — `outputs` is union-typed and skipped.
+        // Collected -3 list: inputs, locktime and replaceable
+        // mismatch — `outputs` is skip-type-checked like Core.
         let (code, msg) = d(json!([7, "x", "x", "x"])).1.unwrap();
         assert_eq!(code, RPC_TYPE_ERROR);
         assert!(msg.contains("Position 1 (inputs)"), "{msg}");
@@ -10045,7 +10657,7 @@ mod tests {
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["txouts"], json!(1));
         assert_eq!(r["unspents"].as_array().unwrap().len(), 0);
-        assert_eq!(r["total_amount"], json!(0.0));
+        assert_eq!(r["total_amount"], value_from_amount(0));
         // Slot released after the scan — `status` is null again.
         assert_eq!(g(json!(["status"])), (Value::Null, None));
     }
@@ -10499,7 +11111,7 @@ mod tests {
             assert_eq!(r["height"], json!(0), "{p}");
             assert_eq!(r["txouts"], json!(0), "{p}");
             assert_eq!(r["transactions"], json!(0), "{p}");
-            assert_eq!(r["total_amount"], json!(0.0), "{p}");
+            assert_eq!(r["total_amount"], value_from_amount(0), "{p}");
             assert!(r.get(key).is_some(), "{p}");
         }
         let (r, e) = dispatch(

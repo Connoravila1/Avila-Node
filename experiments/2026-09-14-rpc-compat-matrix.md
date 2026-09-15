@@ -612,9 +612,36 @@ surfaced:
 - Mutating methods are `stop`, `sendrawtransaction`, `submitblock`,
   `submitheader`, `generatetoaddress`, `generateblock` — the pool
   admission, block connect, and tip-announce paths are all live.
-- Arity: Core throws `-1` with the method's help text when required
-  args are missing or extras are passed (its `RPCHelpMan` required/
-  total checks). Some older method arms still emit `-32602`
-  "missing parameter" or silently ignore trailing args — a sweep to
-  `-1`+help everywhere is queued. Named-object `params` (Core
-  resolves arguments by name) is not yet supported.
+- Positional arity and declared-arg types are now enforced by one
+  `RPCHelpMan`-style pass before dispatch (`METHOD_ARGS` in
+  `rpc.rs`): arg-count failures return `-1` with the method's full
+  help text, and mismatched positions collect into Core's `-3`
+  "Wrong type passed" object (`"Position N (name)": "JSON value of
+  type X is not of expected type Y"`). Required args reject `null`;
+  optional args read `null` as omitted — and `IsValidNumArgs` only
+  strips *trailing* optionals, so `prioritisetransaction`'s
+  required `fee_delta` at position 3 forces a 3-arg minimum.
+  `AMOUNT`/`RANGE`/`skip_type_check` args ("numeric or string",
+  `hash_or_height`, `createrawtransaction`'s union `outputs`,
+  `getorphantxs`'s `verbosity`) pass through to body-level checks.
+  Body-level wording also tightened: `ParseHashV` calls carry Core's
+  per-method arg names ("parameter 1" for the txid methods,
+  "blockhash" for `getblock`, "hash" for `getblockheader`,
+  "hash_or_height" for `getblockstats`), `sendrawtransaction` decode
+  failures say "TX decode failed. Make sure the tx has at least one
+  input." (`decoderawtransaction` keeps the bare text),
+  `disconnectnode` enforces its exactly-one-of address/nodeid rule
+  with `-32602`, `getorphantxs` reproduces the `getInt` path
+  ("Verbosity was boolean but only integer allowed", "Invalid
+  verbosity value N"), `estimatesmartfee` echoes `conf_target` in
+  `blocks` on insufficient data, and all BTC-denominated outputs go
+  through `ValueFromAmount` (`0.00000000`, never `0.0`).
+  Verified live: a 592-row positional matrix over every implemented
+  method — `[null]×0..4`, `5`, `"x"`, `true` per method — is
+  byte-identical except documented extensions (`gettxoutproof`/
+  `verifytxoutproof` options args, our `help` listing) and
+  per-node state fields (`size_on_disk`, `disk_size`, mempool
+  `usage` accounting, addrman/peer contents, `uptime`, `logpath`,
+  `subversion`).
+- Named-object `params` (Core resolves arguments by name) is still
+  not supported — it bypasses the gate like Core's named-arg path.
