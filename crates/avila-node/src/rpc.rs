@@ -426,6 +426,52 @@ fn param<'a>(params: &'a Value, index: usize, name: &str) -> Option<&'a Value> {
     params.get(index).or_else(|| params.get(name))
 }
 
+/// `logging`'s mutable category state — Core's `g_logger` category
+/// set. The toggles are advisory: our log sites don't yet gate on
+/// categories, but the RPC contract (include/exclude ordering, the
+/// `all`/`1` specials, reported state) is exact.
+static LOG_CATEGORIES: std::sync::Mutex<[bool; 28]> = std::sync::Mutex::new([false; 28]);
+
+/// Core's `BCLog::LogFlags` names, in `logging`'s reported order.
+const LOG_CATEGORY_NAMES: [&str; 28] = [
+    "addrman",
+    "bench",
+    "blockstorage",
+    "cmpctblock",
+    "coindb",
+    "estimatefee",
+    "http",
+    "i2p",
+    "ipc",
+    "leveldb",
+    "libevent",
+    "mempool",
+    "mempoolrej",
+    "net",
+    "proxy",
+    "prune",
+    "qt",
+    "rand",
+    "reindex",
+    "rpc",
+    "scan",
+    "selectcoins",
+    "tor",
+    "txpackages",
+    "txreconciliation",
+    "validation",
+    "walletdb",
+    "zmq",
+];
+
+/// `getmemoryinfo "mallocinfo"` — glibc's `malloc_info` needs raw FFI,
+/// which the workspace's `unsafe-code` forbid rules out. `None`
+/// mirrors Core's `!HAVE_MALLOC_INFO` build variant ("mallocinfo mode
+/// not supported").
+fn malloc_info_xml() -> Option<String> {
+    None
+}
+
 /// `RPCTypeCheckArgument`'s message — the `Wrong type passed:` list
 /// keyed by position and argument name.
 fn wrong_type_message(position: usize, name: &str, v: &Value, expected: &str) -> String {
@@ -549,6 +595,12 @@ const VERIFYTXOUTPROOF_HELP: &str = "verifytxoutproof \"proof\" ( {\"verify_witn
 
 /// Verbatim `help getindexinfo` text (Bitcoin Core 29).
 const GETINDEXINFO_HELP: &str = "getindexinfo ( \"index_name\" )\n\nReturns the status of one or all available indices currently running in the node.\n\nArguments:\n1. index_name    (string, optional) Filter results for an index with a specific name.\n\nResult:\n{                               (json object)\n  \"name\" : {                    (json object) The name of the index\n    \"synced\" : true|false,      (boolean) Whether the index is synced or not\n    \"best_block_height\" : n     (numeric) The block height to which the index is synced\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getindexinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> bitcoin-cli getindexinfo txindex\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": [txindex]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+const GETRPCINFO_HELP: &str = "getrpcinfo\n\nReturns details of the RPC server.\n\nResult:\n{                          (json object)\n  \"active_commands\" : [    (json array) All active commands\n    {                      (json object) Information about an active command\n      \"method\" : \"str\",    (string) The name of the RPC command\n      \"duration\" : n       (numeric) The running time in microseconds\n    },\n    ...\n  ],\n  \"logpath\" : \"str\"        (string) The complete file path to the debug log\n}\n\nExamples:\n> bitcoin-cli getrpcinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getrpcinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+const GETMEMORYINFO_HELP: &str = "getmemoryinfo ( \"mode\" )\n\nReturns an object containing information about memory usage.\n\nArguments:\n1. mode    (string, optional, default=\"stats\") determines what kind of information is returned.\n           - \"stats\" returns general statistics about memory usage in the daemon.\n           - \"mallocinfo\" returns an XML string describing low-level heap state (only available if compiled with glibc).\n\nResult (mode \"stats\"):\n{                         (json object)\n  \"locked\" : {            (json object) Information about locked memory manager\n    \"used\" : n,           (numeric) Number of bytes used\n    \"free\" : n,           (numeric) Number of bytes available in current arenas\n    \"total\" : n,          (numeric) Total number of bytes managed\n    \"locked\" : n,         (numeric) Amount of bytes that succeeded locking. If this number is smaller than total, locking pages failed at some point and key data could be swapped to disk.\n    \"chunks_used\" : n,    (numeric) Number allocated chunks\n    \"chunks_free\" : n     (numeric) Number unused chunks\n  }\n}\n\nResult (mode \"mallocinfo\"):\n\"str\"    (string) \"<malloc version=\"1\">...\"\n\nExamples:\n> bitcoin-cli getmemoryinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getmemoryinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+const LOGGING_HELP: &str = "logging ( [\"include_category\",...] [\"exclude_category\",...] )\n\nGets and sets the logging configuration.\nWhen called without an argument, returns the list of categories with status that are currently being debug logged or not.\nWhen called with arguments, adds or removes categories from debug logging and return the lists above.\nThe arguments are evaluated in order \"include\", \"exclude\".\nIf an item is both included and excluded, it will thus end up being excluded.\nThe valid logging categories are: addrman, bench, blockstorage, cmpctblock, coindb, estimatefee, http, i2p, ipc, leveldb, libevent, mempool, mempoolrej, net, proxy, prune, qt, rand, reindex, rpc, scan, selectcoins, tor, txpackages, txreconciliation, validation, walletdb, zmq\nIn addition, the following are available as category names with special meanings:\n  - \"all\",  \"1\" : represent all logging categories.\n\nArguments:\n1. include                    (json array, optional) The categories to add to debug logging\n     [\n       \"include_category\",    (string) the valid logging category\n       ...\n     ]\n2. exclude                    (json array, optional) The categories to remove from debug logging\n     [\n       \"exclude_category\",    (string) the valid logging category\n       ...\n     ]\n\nResult:\n{                             (json object) keys are the logging categories, and values indicates its status\n  \"category\" : true|false,    (boolean) if being debug logged or not. false:inactive, true:active\n  ...\n}\n\n";
 
 fn missing_params(what: &str) -> (Value, Option<(i64, String)>) {
     (
@@ -1336,6 +1388,9 @@ fn dispatch(
     queries: Option<&QuerySender>,
     stop: Option<&Arc<AtomicBool>>,
 ) -> (Value, Option<(i64, String)>) {
+    // `getrpcinfo` reports the in-flight command's runtime — Core's
+    // `g_rpc_interfaces` stamps the start at dispatch.
+    let call_start = std::time::Instant::now();
     match method {
         "getblockcount" => (json!(snap.connected_height), None),
         "getbestblockhash" => (
@@ -3685,6 +3740,132 @@ fn dispatch(
                 Ok(json!(state))
             })
         }
+        "getrpcinfo" => {
+            if params.as_array().is_some_and(|a| !a.is_empty()) {
+                return help_error(GETRPCINFO_HELP);
+            }
+            // Owned copies — the query closure must be 'static.
+            let method_name = method.to_string();
+            chain_query(queries, move |cs, _mgr| {
+                // Core reports the configured debug log path — the
+                // chainstate store dir is our per-network datadir.
+                // `absolute` (not `canonicalize`): the file need not
+                // exist, matching Core which reports the configured
+                // path regardless.
+                let logpath = cs
+                    .store()
+                    .and_then(|s| std::path::absolute(s.dir().join("debug.log")).ok())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Ok(json!({
+                    "active_commands": [{
+                        "method": method_name,
+                        "duration": call_start.elapsed().as_micros() as u64,
+                    }],
+                    "logpath": logpath,
+                }))
+            })
+        }
+        "getmemoryinfo" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() > 1 {
+                return help_error(GETMEMORYINFO_HELP);
+            }
+            let mode = match arr.first() {
+                None | Some(Value::Null) => "stats",
+                Some(Value::String(s)) => s.as_str(),
+                Some(v) => {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, wrong_type_message(1, "mode", v, "string"))),
+                    );
+                }
+            };
+            match mode {
+                "stats" => (
+                    // No locked-page pool: Core's LockedPool block is
+                    // reported as the honest all-zero state.
+                    json!({"locked": {
+                        "used": 0, "free": 0, "total": 0, "locked": 0,
+                        "chunks_used": 0, "chunks_free": 0,
+                    }}),
+                    None,
+                ),
+                "mallocinfo" => match malloc_info_xml() {
+                    Some(xml) => (json!(xml), None),
+                    None => (
+                        Value::Null,
+                        Some((
+                            RPC_INVALID_PARAMETER,
+                            "mallocinfo mode not supported".into(),
+                        )),
+                    ),
+                },
+                other => (
+                    Value::Null,
+                    Some((RPC_INVALID_PARAMETER, format!("unknown mode {other}"))),
+                ),
+            }
+        }
+        "logging" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() > 2 {
+                return help_error(LOGGING_HELP);
+            }
+            // Core type-checks include/exclude as arrays first.
+            for (i, name) in ["include", "exclude"].iter().enumerate() {
+                if let Some(v) = arr.get(i)
+                    && !v.is_null()
+                    && !v.is_array()
+                {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, wrong_type_message(i + 1, name, v, "array"))),
+                    );
+                }
+            }
+            // Include is applied first, then exclude — an item in both
+            // ends excluded (Core evaluates the lists in order).
+            let mut state = LOG_CATEGORIES.lock().unwrap_or_else(|p| p.into_inner());
+            for (arg_idx, value) in [(0, true), (1, false)] {
+                if let Some(list) = arr.get(arg_idx).and_then(|v| v.as_array()) {
+                    for item in list {
+                        let Some(cat) = item.as_str() else {
+                            return (
+                                Value::Null,
+                                Some((
+                                    RPC_TYPE_ERROR,
+                                    format!(
+                                        "JSON value of type {} is not of expected \
+                                         type string",
+                                        json_type_name(item),
+                                    ),
+                                )),
+                            );
+                        };
+                        if cat == "all" || cat == "1" {
+                            state.fill(value);
+                            continue;
+                        }
+                        let Some(pos) = LOG_CATEGORY_NAMES.iter().position(|c| *c == cat) else {
+                            return (
+                                Value::Null,
+                                Some((
+                                    RPC_INVALID_PARAMETER,
+                                    format!("unknown logging category {cat}"),
+                                )),
+                            );
+                        };
+                        state[pos] = value;
+                    }
+                }
+            }
+            let mut map = serde_json::Map::with_capacity(LOG_CATEGORY_NAMES.len());
+            for (i, c) in LOG_CATEGORY_NAMES.iter().enumerate() {
+                map.insert((*c).to_string(), json!(state[i]));
+            }
+            (Value::Object(map), None)
+        }
         "getnodeaddresses" => {
             // RPCHelpMan: 0–2 args.
             if params.as_array().is_some_and(|a| a.len() > 2) {
@@ -4028,7 +4209,9 @@ fn dispatch(
                  \x20   addpeeraddress <address> <port> [tried], ping,\n\
                  \x20   disconnectnode [address] [nodeid], addnode <node> <cmd>,\n\
                  \x20   setnetworkactive <state>\n\
-                 \x20 misc:  estimatesmartfee <target>, uptime, help, stop"
+                 \x20 misc:  estimatesmartfee <target>, getrpcinfo,\n\
+                 \x20   getmemoryinfo [mode], logging [include] [exclude],\n\
+                 \x20   uptime, help, stop"
             ),
             None,
         ),
@@ -5385,6 +5568,90 @@ mod tests {
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch("setnetworkactive", &json!([]), &snap, Some(&queries), None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+    }
+
+    /// `getrpcinfo`/`getmemoryinfo`/`logging` — the introspection
+    /// surface: shapes, mode/category errors, and type contract.
+    #[test]
+    fn introspection_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+
+        // getrpcinfo: the in-flight command names itself; logpath is
+        // empty without a store. Any arg → -1 + help.
+        let (r, e) = dispatch("getrpcinfo", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["active_commands"][0]["method"], json!("getrpcinfo"));
+        assert!(r["active_commands"][0]["duration"].is_u64());
+        assert_eq!(r["logpath"], json!(""));
+        let (_, e) = dispatch("getrpcinfo", &json!([1]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+
+        // getmemoryinfo: stats shape; unknown mode → -8; bad type → -3.
+        let (r, e) = dispatch("getmemoryinfo", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["locked"]["total"], json!(0));
+        let (_, e) = dispatch(
+            "getmemoryinfo",
+            &json!(["bogus"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        let (_, e) = dispatch("getmemoryinfo", &json!([5]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
+
+        // logging: 28 categories all-false at rest; include/exclude in
+        // order; "all"/"1" specials; unknown → -8; bad types → -3.
+        let (r, e) = dispatch("logging", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r.as_object().unwrap().len(), 28);
+        assert!(r.as_object().unwrap().values().all(|v| *v == json!(false)));
+        let (r, _) = dispatch(
+            "logging",
+            &json!([["net", "mempool"]]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(r["net"], json!(true));
+        assert_eq!(r["mempool"], json!(true));
+        let (r, _) = dispatch(
+            "logging",
+            &json!([[], ["net"]]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(r["net"], json!(false));
+        assert_eq!(r["mempool"], json!(true));
+        let (r, _) = dispatch(
+            "logging",
+            &json!([["mempool"], ["mempool"]]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(r["mempool"], json!(false));
+        let (_, e) = dispatch(
+            "logging",
+            &json!([["boguscat"]]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        let (_, e) = dispatch("logging", &json!([5]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
+        // Reset so other tests see a clean map.
+        let _ = dispatch(
+            "logging",
+            &json!([[], ["all"]]),
+            &snap,
+            Some(&queries),
+            None,
+        );
     }
 
     /// `getnodeaddresses` — Core's count/network argument contract and

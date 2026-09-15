@@ -210,8 +210,14 @@ operation. Compare complete initial download and catch-up, not only local replay
       drops all sessions and halts outbound maintenance until
       re-enabled, and `-connect` entries persist as added-nodes so
       re-enable redials them — the no-peers fail-fast is suppressed
-      while networking is intentionally off)) — verified
-      live over curl and the client.
+      while networking is intentionally off)),
+      getrpcinfo/getmemoryinfo/logging (introspection — in-flight
+      command + µs duration, the datadir debug-log path, LockedPool
+      stats honestly zeroed (no locked allocator; `mallocinfo` needs
+      unsafe FFI so it takes Core's !HAVE_MALLOC_INFO build-variant
+      error), and the 28-category include/exclude map with the
+      `all`/`1` specials and ordered include-then-exclude evaluation)
+      — verified live over curl and the client.
       Genesis is served even though its body is never stored:
       `Params::genesis_block` reconstructs Core's per-network
       `CreateGenesisBlock` coinbase and `Chainstate::body` falls back

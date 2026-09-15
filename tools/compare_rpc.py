@@ -34,6 +34,10 @@ import urllib.error
 # checked, the path value itself is per-installation.
 DYNAMIC_METHODS = {"uptime", "help", "getrawmempool", "savemempool",
                    "getnodeaddresses", "addpeeraddress",
+                   # Introspection values are per-node: the log path,
+                   # in-flight duration, locked-pool counters (we run no
+                   # LockedPool), and the mutable logging category map.
+                   "getrpcinfo", "getmemoryinfo", "logging",
                    # Bare tip-hash echo — forks legitimately diverge it.
                    "getbestblockhash"}
 
@@ -195,6 +199,18 @@ def build_calls(height):
         ("addnode", ["x", "add", "feeler"]),
         ("setnetworkactive", [5]),
         ("setnetworkactive", []),
+        # Introspection — logpath/duration/locked-pool counters are
+        # per-node; category map and error paths are deterministic.
+        ("getrpcinfo", []),
+        ("getrpcinfo", [1]),
+        ("getmemoryinfo", []),
+        ("getmemoryinfo", ["stats"]),
+        ("getmemoryinfo", ["bogus"]),
+        ("getmemoryinfo", [5]),
+        ("logging", [["boguscat"]]),
+        ("logging", [["none"]]),
+        ("logging", [5]),
+        ("logging", [[], [], 3]),
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),
         ("estimatesmartfee", [6]),
