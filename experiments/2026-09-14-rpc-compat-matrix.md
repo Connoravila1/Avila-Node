@@ -72,11 +72,11 @@ python3 tools/compare_rpc.py \
 
 ## Results
 
-Latest run vs **Core 29.4** at h161: 91 MATCH, 1 EXPECTED-DIFF
+Latest run vs **Core 29.4** at h163: 98 MATCH, 1 EXPECTED-DIFF
 (`getrawtransaction`'s `in_active_chain` — an upstream field added
 after 29.4, verified present in Core 31.1), 0 DIFFERS, 1 CORE-ERROR
 (`gettxoutproof prove_witness` — the witness-proof wire format is a
-Knots extension Core doesn't implement), 113 BOTH-ERROR (identical
+Knots extension Core doesn't implement), 129 BOTH-ERROR (identical
 error paths). `getpeerinfo` now matches fully once the peer pair
 settles — the earlier per-peer shape diff was connection-phase
 state. First matrix vs Knots: 46 MATCH, 2 EXPECTED-DIFF,
@@ -445,6 +445,29 @@ surfaced:
   queries. Verified live: with four unroutable book entries mid-dial,
   chain RPCs answer in ~10ms where synchronous dialing serialized
   them behind ~5s per candidate.
+- `waitforblock`/`waitforblockheight`/`waitfornewblock` landed with
+  Core's blocking-wait contract: arity → collected `-3` list →
+  hash/`getInt` parse → timeout `getInt` (`-1` out-of-range,
+  `-1` "Negative timeout"), 0/null meaning wait-forever. The RPC
+  server is one-thread-per-connection, so a parked wait blocks only
+  its own socket — the predicate rides the chain-query channel into
+  the sync loop, where it registers atomically with its first
+  evaluation (a block landing between check and register can't be
+  missed). The loop re-evaluates a bounded registry (256 waiters)
+  each tick — Core's validation-interface notifications, polled —
+  and a drop guard wakes every waiter on any exit path so shutdown
+  answers the last tip rather than hanging. Verified live:
+  `waitfornewblock` and `waitforblockheight 163` parked, then both
+  fired within ~200ms of a Core-mined block connecting, returning the
+  new tip; timeouts return the live tip byte-identically.
+- RPC doubles now emit Core's `UniValue::setFloat` text —
+  `std::setprecision(16)` (`%.16g`) — via `g16`, instead of serde's
+  ryu shortest-round-trip. The two differ at the last digit on values
+  like 101/17 (`5.9411764705882355` vs Core's `5.941176470588236`),
+  which parse to different f64s. serde_json gained the
+  `arbitrary_precision` feature so `float_g16`'s literal survives
+  re-serialization; `txrate` emits through it and now matches
+  byte-for-byte.
 
 ### Known semantic differences
 

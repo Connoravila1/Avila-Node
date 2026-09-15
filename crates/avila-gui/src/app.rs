@@ -793,6 +793,7 @@ impl AvilaApp {
             cancel: Some(cancel.clone()),
             status: None,
             queries: None,
+            waiters: None,
             txindex: false,
             prune_bytes: self
                 .sync

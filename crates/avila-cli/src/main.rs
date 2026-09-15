@@ -162,6 +162,9 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 }
             }
             let data_dir = config.network_data_dir();
+            // The waitforblock* registry — RPC handlers park predicates,
+            // the sync loop fires them on tick and on shutdown.
+            let waiters = std::sync::Arc::new(avila_node::rpc::BlockWaiters::new());
             if let Some(addr) = rpc {
                 // Cookie auth, regenerated per run exactly like Core's
                 // .cookie — the file lives in the network data dir with
@@ -172,6 +175,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     addr,
                     status.clone(),
                     Some(query_tx),
+                    Some(waiters.clone()),
                     Some(cancel.clone()),
                     Some(avila_node::rpc::cookie_auth_header(&token)),
                 )
@@ -194,6 +198,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 txindex,
                 status: Some(status),
                 queries: Some(std::sync::Arc::new(std::sync::Mutex::new(query_rx))),
+                waiters: Some(waiters),
             };
             println!(
                 "Running {} — syncing to tip, then serving (Ctrl+C to stop)...",
@@ -247,6 +252,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 txindex,
                 status: None,
                 queries: None,
+                waiters: None,
             };
             println!("Syncing {network} (target height {blocks}, {max_peers} peers max)...");
             let mut last = (u32::MAX, u32::MAX);

@@ -48,6 +48,11 @@ pub struct SyncConfig {
     /// the config stays `Clone`/`Debug`.
     pub queries:
         Option<std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<crate::rpc::ChainQuery>>>>,
+    /// The `waitforblock*` registry — parked predicates are re-checked
+    /// against the live chainstate each tick, and `shutdown` wakes
+    /// every waiter on loop exit (Core's validation-interface
+    /// notifications, polled instead of callbacked).
+    pub waiters: Option<std::sync::Arc<crate::rpc::BlockWaiters>>,
 }
 
 impl Default for SyncConfig {
@@ -64,6 +69,7 @@ impl Default for SyncConfig {
             txindex: false,
             status: None,
             queries: None,
+            waiters: None,
         }
     }
 }
@@ -220,6 +226,19 @@ pub fn run(
             .as_ref()
             .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     };
+    // Wakes every parked wait-RPC on *any* exit — clean, cancelled, or
+    // the early error returns — so handlers answer the last tip rather
+    // than blocking on a dead loop.
+    struct WaiterShutdown<'a>(Option<&'a std::sync::Arc<crate::rpc::BlockWaiters>>);
+    impl Drop for WaiterShutdown<'_> {
+        fn drop(&mut self) {
+            if let Some(w) = self.0 {
+                w.shutdown();
+            }
+        }
+    }
+    let _waiter_shutdown = WaiterShutdown(cfg.waiters.as_ref());
+
     while started.elapsed() < cfg.timeout
         && connected.saturating_sub(resumed_height) < cfg.target_height
         && !cancelled()
@@ -291,11 +310,23 @@ pub fn run(
                 }
             }
         }
+        // Fire every `waitforblock*` predicate that this tick's state
+        // satisfies — the loop's half of Core's BlockConnected
+        // notifications.
+        if let Some(waiters) = &cfg.waiters {
+            waiters.notify(&cs);
+        }
         progress(&snapshot);
         if run_progress >= cfg.target_height {
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // The loop is leaving — wake every parked wait-RPC so its handler
+    // answers the last tip instead of blocking on a dead loop.
+    if let Some(waiters) = &cfg.waiters {
+        waiters.shutdown();
     }
 
     if let Some(dir) = &cfg.data_dir {

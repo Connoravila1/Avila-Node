@@ -28,7 +28,10 @@ avila-node = { path = "crates/avila-node" }
 avila-p2p = { path = "crates/avila-p2p" }
 clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# `arbitrary_precision` keeps a number's literal text inside Value —
+# the wait/stats RPCs emit Core's `%.16g` float text verbatim, which
+# doesn't always round-trip through serde's ryu formatting.
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 signal-hook = "0.3.17"
 thiserror = "2.0"
 sha2 = { version = "0.11", default-features = false }

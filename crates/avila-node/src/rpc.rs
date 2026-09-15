@@ -25,9 +25,9 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, mpsc};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use avila_consensus::address::{script_address, validate_address};
 use avila_consensus::arith::difficulty_from_compact;
@@ -97,6 +97,7 @@ pub fn serve(
     addr: SocketAddr,
     status: SharedStatus,
     queries: Option<QuerySender>,
+    waiters: Option<Arc<BlockWaiters>>,
     stop: Option<Arc<AtomicBool>>,
     auth: Option<String>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
@@ -107,6 +108,7 @@ pub fn serve(
                 Ok(stream) => {
                     let status = status.clone();
                     let queries = queries.clone();
+                    let waiters = waiters.clone();
                     let stop = stop.clone();
                     let auth = auth.clone();
                     thread::spawn(move || {
@@ -114,6 +116,7 @@ pub fn serve(
                             stream,
                             &status,
                             queries.as_ref(),
+                            waiters.as_ref(),
                             stop.as_ref(),
                             auth.as_deref(),
                         );
@@ -285,6 +288,7 @@ fn handle(
     mut stream: TcpStream,
     status: &SharedStatus,
     queries: Option<&QuerySender>,
+    waiters: Option<&Arc<BlockWaiters>>,
     stop: Option<&Arc<AtomicBool>>,
     auth: Option<&str>,
 ) {
@@ -354,7 +358,7 @@ fn handle(
         Ok(s) => s.clone(),
         Err(_) => return,
     };
-    let (result, error) = dispatch(method, &params, &snap, queries, stop);
+    let (result, error) = dispatch(method, &params, &snap, queries, waiters, stop);
     let response = match error {
         Some((code, message)) => {
             json!({"result": null, "error": {"code": code, "message": message}, "id": id})
@@ -408,6 +412,192 @@ fn chain_query(
             Value::Null,
             Some((RPC_MISC_ERROR, "chain query timed out".into())),
         ),
+    }
+}
+
+/// The cap on parked `waitforblock*` predicates — a flood of wait calls
+/// must not grow waiter state without bound.
+const MAX_BLOCK_WAITERS: usize = 256;
+
+/// A `waitforblock*` predicate parked by an RPC handler. The sync loop
+/// re-evaluates `check` against the live chainstate each tick and
+/// wakes the handler on the first hit — Core's validation-interface
+/// block notifications, by polling instead of callbacks.
+struct BlockWaiter {
+    check: Box<dyn Fn(&Chainstate) -> bool + Send>,
+    wake: mpsc::SyncSender<()>,
+}
+
+/// The waiter registry shared between the sync loop and RPC handlers.
+/// The loop calls [`BlockWaiters::notify`] once per tick and
+/// [`BlockWaiters::shutdown`] on the way out; handlers only register
+/// and block on their own receiver, so a blocked `waitforblock` call
+/// never stalls the query channel or the sync loop.
+pub struct BlockWaiters {
+    pending: Mutex<Vec<BlockWaiter>>,
+    shutdown: AtomicBool,
+}
+
+impl BlockWaiters {
+    pub fn new() -> Self {
+        Self {
+            pending: Mutex::new(Vec::new()),
+            shutdown: AtomicBool::new(false),
+        }
+    }
+
+    /// Parks `check` for per-tick evaluation; `wake` fires once it
+    /// holds. Returns false when the registry is at capacity or the
+    /// loop already shut down — the caller then answers the
+    /// timeout-shaped result immediately rather than queueing more
+    /// waiter state.
+    fn register(
+        &self,
+        check: Box<dyn Fn(&Chainstate) -> bool + Send>,
+        wake: mpsc::SyncSender<()>,
+    ) -> bool {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
+        match self.pending.lock() {
+            Ok(mut pending) if pending.len() < MAX_BLOCK_WAITERS => {
+                pending.push(BlockWaiter { check, wake });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Sync-loop hook, once per tick: fires and drops every waiter
+    /// whose predicate now holds against the live chainstate.
+    pub fn notify(&self, cs: &Chainstate) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        pending.retain(|w| {
+            if (w.check)(cs) {
+                let _ = w.wake.try_send(());
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Sync-loop exit: wakes every parked waiter so handlers answer
+    /// with the last tip instead of hanging on a dead channel — the
+    /// role Core's shutdown interrupt plays for its wait calls.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Ok(mut pending) = self.pending.lock() {
+            for w in pending.drain(..) {
+                let _ = w.wake.try_send(());
+            }
+        }
+    }
+
+    /// Whether [`BlockWaiters::shutdown`] already ran — woken handlers
+    /// then answer the registration snapshot instead of querying a
+    /// stopped loop.
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for BlockWaiters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for BlockWaiters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockWaiters")
+            .field(
+                "pending",
+                &self.pending.lock().map(|p| p.len()).unwrap_or(usize::MAX),
+            )
+            .field("shutdown", &self.is_shutdown())
+            .finish()
+    }
+}
+
+/// The `{hash, height}` answer all three wait calls produce — the
+/// connected tip at the moment the wait ends, not the target.
+fn wait_tip_result(cs: &Chainstate) -> Value {
+    json!({
+        "hash": cs.chain().last().map(ToString::to_string).unwrap_or_default(),
+        "height": cs.chain().len().saturating_sub(1) as u64,
+    })
+}
+
+/// The shared `timeout` argument of the `waitforblock*` family: null
+/// or missing → 0 (wait forever), non-integral → Core's integer-range
+/// error, negative → its `Negative timeout` error.
+fn wait_timeout_ms(v: Option<&Value>) -> Result<i64, (i64, String)> {
+    let Some(v) = v.filter(|v| !v.is_null()) else {
+        return Ok(0);
+    };
+    let Some(ms) = v.as_i64() else {
+        return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
+    };
+    if ms < 0 {
+        return Err((RPC_MISC_ERROR, "Negative timeout".into()));
+    }
+    Ok(ms)
+}
+
+/// The `waitforblock*` engine: registers `check` with the sync loop's
+/// waiter registry — predicate-check and registration ride the same
+/// chain query so a block landing between them can't be missed — then
+/// blocks this connection's thread until it fires, the deadline
+/// passes, or the loop shuts down. The answer is always the live tip
+/// (Core returns the current block on timeout or exit).
+fn block_wait(
+    queries: Option<&QuerySender>,
+    waiters: Option<&Arc<BlockWaiters>>,
+    timeout_ms: i64,
+    check: impl Fn(&Chainstate) -> bool + Send + 'static,
+) -> (Value, Option<(i64, String)>) {
+    let Some(waiters) = waiters else {
+        // No sync loop is feeding waiters — answer the current tip,
+        // the same shape a zero-length timeout returns.
+        return chain_query(queries, |cs, _| Ok(wait_tip_result(cs)));
+    };
+    let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+    let registry = Arc::clone(waiters);
+    let (reg, reg_err) = chain_query(queries, move |cs, _| {
+        let satisfied = check(cs) || !registry.register(Box::new(check), wake_tx);
+        Ok(json!({"tip": wait_tip_result(cs), "waiting": !satisfied}))
+    });
+    if let Some(err) = reg_err {
+        return (Value::Null, Some(err));
+    }
+    let start_tip = reg.get("tip").cloned().unwrap_or(Value::Null);
+    if !reg.get("waiting").and_then(Value::as_bool).unwrap_or(false) {
+        return (start_tip, None);
+    }
+    match (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64)) {
+        Some(deadline) => {
+            if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                // Fired, timed out, or the registry went away — every
+                // outcome ends the wait.
+                let _ = wake_rx.recv_timeout(remaining);
+            }
+        }
+        None => {
+            let _ = wake_rx.recv();
+        }
+    }
+    // The loop is gone — answer the snapshot taken at registration.
+    if waiters.is_shutdown() {
+        return (start_tip, None);
+    }
+    let (tip, err) = chain_query(queries, |cs, _| Ok(wait_tip_result(cs)));
+    if tip.is_null() {
+        (start_tip, None)
+    } else {
+        (tip, err)
     }
 }
 
@@ -503,6 +693,57 @@ fn field_type_message(v: &Value, expected: &str) -> String {
         "JSON value of type {} is not of expected type {expected}",
         json_type_name(v)
     )
+}
+
+/// Core's `UniValue::setFloat` — `std::setprecision(16)` in the
+/// default float format, i.e. C's `%.16g`: up to 16 significant
+/// digits, trailing zeros stripped, scientific notation when the
+/// decimal exponent is outside `[-4, 16)`. serde's ryu
+/// shortest-round-trip text differs at the last digit for some
+/// values (e.g. 101/17 → `5.9411764705882355` vs Core's
+/// `5.941176470588236`), so doubles the reference formats through
+/// `setFloat` go through this.
+fn g16(v: f64) -> String {
+    if !v.is_finite() {
+        // A non-finite double can't be a JSON number; callers never
+        // reach this for consensus-derived values.
+        return "null".to_string();
+    }
+    if v == 0.0 {
+        return if v.is_sign_negative() { "-0" } else { "0" }.to_string();
+    }
+    // 16 significant digits in scientific form — Rust's float
+    // formatting rounds correctly to the last digit, like printf.
+    let s = format!("{:.15e}", v);
+    let Some((mant, exp_s)) = s.split_once('e') else {
+        return "0".to_string();
+    };
+    let exp: i32 = exp_s.parse().unwrap_or(0);
+    if !(-4..16).contains(&exp) {
+        // Scientific: strip mantissa trailing zeros, exponent signed
+        // and padded to two digits (C's `%g`).
+        let mant = mant.trim_end_matches('0').trim_end_matches('.');
+        format!("{mant}e{exp:+03}")
+    } else {
+        // Fixed: `15 - exp` fraction digits keeps 16 significant, then
+        // strip the fractional padding %g removes — only past the
+        // point, never integer digits.
+        let fixed = format!("{:.*}", (15 - exp) as usize, v);
+        if fixed.contains('.') {
+            fixed
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string()
+        } else {
+            fixed
+        }
+    }
+}
+
+/// A `Value` carrying `g16`'s literal text — requires serde_json's
+/// `arbitrary_precision` so the digits survive re-serialization.
+fn float_g16(v: f64) -> Value {
+    serde_json::from_str(&g16(v)).unwrap_or(Value::Null)
 }
 
 /// Core's `ParseHashV`: 64-char hex, else -8 with its exact wording.
@@ -635,6 +876,15 @@ const GETBLOCKFROMPEER_HELP: &str = "getblockfrompeer \"blockhash\" peer_id\n\nA
 
 /// Verbatim `help prioritisetransaction` text (Bitcoin Core 29.4).
 const PRIORITISETRANSACTION_HELP: &str = "prioritisetransaction \"txid\" ( dummy ) fee_delta\n\nAccepts the transaction into mined blocks at a higher (or lower) priority\n\nArguments:\n1. txid         (string, required) The transaction id.\n2. dummy        (numeric, optional) API-Compatibility for previous API. Must be zero or null.\n                DEPRECATED. For forward compatibility use named arguments and omit this parameter.\n3. fee_delta    (numeric, required) The fee value (in satoshis) to add (or subtract, if negative).\n                Note, that this value is not a fee rate. It is a value to modify absolute fee of the TX.\n                The fee is not actually paid, only the algorithm for selecting transactions into a block\n                considers the transaction as it would have paid a higher (or lower) fee.\n\nResult:\ntrue|false    (boolean) Returns true\n\nExamples:\n> bitcoin-cli prioritisetransaction \"txid\" 0.0 10000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"prioritisetransaction\", \"params\": [\"txid\", 0.0, 10000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help waitforblock` text (Bitcoin Core 29.4).
+const WAITFORBLOCK_HELP: &str = "waitforblock \"blockhash\" ( timeout )\n\nWaits for a specific new block and returns useful info about it.\n\nReturns the current block on timeout or exit.\n\nMake sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\n\nArguments:\n1. blockhash    (string, required) Block hash to wait for.\n2. timeout      (numeric, optional, default=0) Time in milliseconds to wait for a response. 0 indicates no timeout.\n\nResult:\n{                    (json object)\n  \"hash\" : \"hex\",    (string) The blockhash\n  \"height\" : n       (numeric) Block height\n}\n\nExamples:\n> bitcoin-cli waitforblock \"0000000000079f8ef3d2c688c244eb7a4570b24c9ed7b4a8c619eb02596f8862\" 1000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"waitforblock\", \"params\": [\"0000000000079f8ef3d2c688c244eb7a4570b24c9ed7b4a8c619eb02596f8862\", 1000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help waitforblockheight` text (Bitcoin Core 29.4).
+const WAITFORBLOCKHEIGHT_HELP: &str = "waitforblockheight height ( timeout )\n\nWaits for (at least) block height and returns the height and hash\nof the current tip.\n\nReturns the current block on timeout or exit.\n\nMake sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\n\nArguments:\n1. height     (numeric, required) Block height to wait for.\n2. timeout    (numeric, optional, default=0) Time in milliseconds to wait for a response. 0 indicates no timeout.\n\nResult:\n{                    (json object)\n  \"hash\" : \"hex\",    (string) The blockhash\n  \"height\" : n       (numeric) Block height\n}\n\nExamples:\n> bitcoin-cli waitforblockheight 100 1000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"waitforblockheight\", \"params\": [100, 1000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help waitfornewblock` text (Bitcoin Core 29.4).
+const WAITFORNEWBLOCK_HELP: &str = "waitfornewblock ( timeout )\n\nWaits for any new block and returns useful info about it.\n\nReturns the current block on timeout or exit.\n\nMake sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\n\nArguments:\n1. timeout    (numeric, optional, default=0) Time in milliseconds to wait for a response. 0 indicates no timeout.\n\nResult:\n{                    (json object)\n  \"hash\" : \"hex\",    (string) The blockhash\n  \"height\" : n       (numeric) Block height\n}\n\nExamples:\n> bitcoin-cli waitfornewblock 1000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"waitfornewblock\", \"params\": [1000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help verifychain` text (Bitcoin Core 29.4).
 const VERIFYCHAIN_HELP: &str = "verifychain ( checklevel nblocks )\n\nVerifies blockchain database.\n\nArguments:\n1. checklevel    (numeric, optional, default=3, range=0-4) How thorough the block verification is:\n                 - level 0 reads the blocks from disk\n                 - level 1 verifies block validity\n                 - level 2 verifies undo data\n                 - level 3 checks disconnection of tip blocks\n                 - level 4 tries to reconnect the blocks\n                 - each level includes the checks of the previous levels\n2. nblocks       (numeric, optional, default=6, 0=all) The number of blocks to check.\n\nResult:\ntrue|false    (boolean) Verification finished successfully. If false, check debug.log for reason.\n\nExamples:\n> bitcoin-cli verifychain \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"verifychain\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
@@ -1470,6 +1720,7 @@ fn dispatch(
     params: &Value,
     snap: &SyncProgress,
     queries: Option<&QuerySender>,
+    waiters: Option<&Arc<BlockWaiters>>,
     stop: Option<&Arc<AtomicBool>>,
 ) -> (Value, Option<(i64, String)>) {
     // `getrpcinfo` reports the in-flight command's runtime — Core's
@@ -3202,6 +3453,109 @@ fn dispatch(
                 Ok(json!({}))
             })
         }
+        "waitforblock" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.is_empty() || arr.len() > 2 {
+                return help_error(WAITFORBLOCK_HELP);
+            }
+            // RPCHelpMan type pass — every bad argument collected.
+            let mut type_errors: Vec<(usize, &str, &Value, &str)> = Vec::new();
+            if !arr[0].is_string() {
+                type_errors.push((1, "blockhash", &arr[0], "string"));
+            }
+            if arr.len() == 2 && !(arr[1].is_number() || arr[1].is_null()) {
+                type_errors.push((2, "timeout", &arr[1], "number"));
+            }
+            if !type_errors.is_empty() {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_list(&type_errors))),
+                );
+            }
+            // Body order: ParseHashV the hash, then the timeout int.
+            let hash: BlockHash =
+                match parse_hash_v(arr[0].as_str().unwrap_or_default(), "blockhash") {
+                    Ok(h) => h,
+                    Err(e) => return (Value::Null, Some(e)),
+                };
+            let timeout = match wait_timeout_ms(arr.get(1)) {
+                Ok(t) => t,
+                Err(e) => return (Value::Null, Some(e)),
+            };
+            // Core fires when the block gains BLOCK_HAVE_DATA — body in
+            // the store or the parked map, connected or not.
+            block_wait(queries, waiters, timeout, move |cs| cs.have_body(&hash))
+        }
+        "waitforblockheight" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.is_empty() || arr.len() > 2 {
+                return help_error(WAITFORBLOCKHEIGHT_HELP);
+            }
+            let mut type_errors: Vec<(usize, &str, &Value, &str)> = Vec::new();
+            if !arr[0].is_number() {
+                type_errors.push((1, "height", &arr[0], "number"));
+            }
+            if arr.len() == 2 && !(arr[1].is_number() || arr[1].is_null()) {
+                type_errors.push((2, "timeout", &arr[1], "number"));
+            }
+            if !type_errors.is_empty() {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_list(&type_errors))),
+                );
+            }
+            // Height is Core's getInt<int> — non-integral and
+            // out-of-i32 both land in the integer-range error. A height
+            // already reached (negatives included) returns instantly.
+            let Some(height) = arr[0].as_i64().and_then(|h| i32::try_from(h).ok()) else {
+                return (
+                    Value::Null,
+                    Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                );
+            };
+            let timeout = match wait_timeout_ms(arr.get(1)) {
+                Ok(t) => t,
+                Err(e) => return (Value::Null, Some(e)),
+            };
+            block_wait(queries, waiters, timeout, move |cs| {
+                cs.chain().len() as i64 > height as i64
+            })
+        }
+        "waitfornewblock" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() > 1 {
+                return help_error(WAITFORNEWBLOCK_HELP);
+            }
+            if let Some(timeout) = arr.first()
+                && !(timeout.is_number() || timeout.is_null())
+            {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_message(1, "timeout", timeout, "number"),
+                    )),
+                );
+            }
+            let timeout = match wait_timeout_ms(arr.first()) {
+                Ok(t) => t,
+                Err(e) => return (Value::Null, Some(e)),
+            };
+            // The tip the call started from — Core's `block` snapshot at
+            // WaitStart; the waiter fires on the first *different* tip.
+            let (start, start_err) = chain_query(queries, |cs, _| Ok(wait_tip_result(cs)));
+            if let Some(err) = start_err {
+                return (Value::Null, Some(err));
+            }
+            let start_hash = start
+                .get("hash")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            block_wait(queries, waiters, timeout, move |cs| {
+                cs.chain().last().map(ToString::to_string).as_deref() != Some(start_hash.as_str())
+            })
+        }
         "prioritisetransaction" => {
             let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
             if arr.len() != 3 {
@@ -3424,7 +3778,7 @@ fn dispatch(
                             o.insert("window_tx_count".into(), n.into());
                         }
                         if let Some(r) = s.tx_rate {
-                            o.insert("txrate".into(), r.into());
+                            o.insert("txrate".into(), float_g16(r));
                         }
                         Ok(Value::Object(o))
                     }
@@ -4822,7 +5176,9 @@ fn dispatch(
                  \x20   submitheader <hex>, generatetoaddress <n> <address> [maxtries],\n\
                  \x20   generateblock <output> [rawtx/txid,...],\n\
                  \x20   preciousblock <hash>, prioritisetransaction <txid> 0 <delta>,\n\
-                 \x20   getblockfrompeer <hash> <peer_id>\n\
+                 \x20   getblockfrompeer <hash> <peer_id>,\n\
+                 \x20   waitforblock <hash> [timeout], waitforblockheight <h> [timeout],\n\
+                 \x20   waitfornewblock [timeout]\n\
                  \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo,\n\
                  \x20   getnettotals, getnodeaddresses [count] [network],\n\
                  \x20   getaddrmaninfo,\n\
@@ -4871,7 +5227,7 @@ mod tests {
         params: &Value,
         snap: &SyncProgress,
     ) -> (Value, Option<(i64, String)>) {
-        dispatch(method, params, snap, None, None)
+        dispatch(method, params, snap, None, None, None)
     }
 
     #[test]
@@ -4891,7 +5247,7 @@ mod tests {
     #[test]
     fn chain_methods_need_the_query_channel() {
         let snap = snap();
-        let (_, e) = dispatch("getblockhash", &json!([0]), &snap, None, None);
+        let (_, e) = dispatch("getblockhash", &json!([0]), &snap, None, None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 
@@ -4935,12 +5291,12 @@ mod tests {
     fn stop_flips_the_cancel_flag() {
         let snap = snap();
         let flag = Arc::new(AtomicBool::new(false));
-        let (r, e) = dispatch("stop", &Value::Null, &snap, None, Some(&flag));
+        let (r, e) = dispatch("stop", &Value::Null, &snap, None, None, Some(&flag));
         assert!(e.is_none());
         assert_eq!(r, json!("Avila node stopping"));
         assert!(flag.load(Ordering::Relaxed));
         // Without a run loop the call reports honestly instead of lying.
-        let (_, e) = dispatch("stop", &Value::Null, &snap, None, None);
+        let (_, e) = dispatch("stop", &Value::Null, &snap, None, None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 
@@ -4964,7 +5320,14 @@ mod tests {
         let queries = query_server(cs);
         let snap = snap();
 
-        let (r, e) = dispatch("getblockhash", &json!([0]), &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getblockhash",
+            &json!([0]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none());
         let genesis = r.as_str().unwrap().to_string();
 
@@ -4973,6 +5336,7 @@ mod tests {
             &json!([genesis]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert!(e.is_none(), "{e:?}");
@@ -4990,6 +5354,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none());
         assert_eq!(r.as_str().unwrap().len(), 160);
@@ -5003,6 +5368,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["hash"], genesis);
@@ -5010,13 +5376,21 @@ mod tests {
         assert_eq!(r["tx"][0].as_str().unwrap().len(), 64);
 
         // Unknown heights/hashes get Core's error codes, not nulls.
-        let (_, e) = dispatch("getblockhash", &json!([99]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "getblockhash",
+            &json!([99]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
             "getblockheader",
             &json!([BlockHash::from_bytes([9u8; 32]).to_string()]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
@@ -5028,6 +5402,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none());
         let (r, _) = dispatch(
@@ -5035,6 +5410,7 @@ mod tests {
             &json!([Txid::from_bytes([1u8; 32]).to_string(), 0]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert!(r.is_null());
@@ -5045,6 +5421,7 @@ mod tests {
             &json!([Txid::from_bytes([1u8; 32]).to_string()]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
@@ -5062,6 +5439,7 @@ mod tests {
             &Value::Null,
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert!(e.is_none(), "{e:?}");
@@ -5087,7 +5465,14 @@ mod tests {
         assert_eq!(r["chain"], "regtest");
 
         // getmempoolinfo carries Core's counters.
-        let (r, e) = dispatch("getmempoolinfo", &Value::Null, &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getmempoolinfo",
+            &Value::Null,
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         for key in [
             "loaded",
@@ -5120,6 +5505,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["capabilities"], json!(["proposal"]));
@@ -5145,7 +5531,14 @@ mod tests {
         );
 
         // getmininginfo reports the next-block retarget.
-        let (r, e) = dispatch("getmininginfo", &Value::Null, &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getmininginfo",
+            &Value::Null,
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["chain"], "regtest");
         assert_eq!(r["next"]["height"], 1);
@@ -5153,7 +5546,14 @@ mod tests {
 
         // An empty pool has no confirmation samples — Core returns a
         // result object with `errors`, not an RPC error.
-        let (r, e) = dispatch("estimatesmartfee", &json!([6]), &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "estimatesmartfee",
+            &json!([6]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none());
         assert_eq!(
             r,
@@ -5161,7 +5561,14 @@ mod tests {
         );
 
         // getnetworkinfo splits in/out connections.
-        let (r, e) = dispatch("getnetworkinfo", &Value::Null, &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getnetworkinfo",
+            &Value::Null,
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["connections_in"], 0);
         assert_eq!(r["connections_out"], 0);
@@ -5295,6 +5702,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
         let (_, e) = dispatch(
@@ -5302,6 +5710,7 @@ mod tests {
             &json!(["00", -1]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
@@ -5313,6 +5722,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         let (_, e) = dispatch(
@@ -5320,6 +5730,7 @@ mod tests {
             &json!(["00ff"]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         let err = e.unwrap();
@@ -5336,13 +5747,21 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         let err = e.unwrap();
         assert_eq!(err.0, RPC_VERIFY_REJECTED);
         assert_eq!(err.1, "bad-cb-length");
 
         // Without the query channel the method reports honestly.
-        let (_, e) = dispatch("sendrawtransaction", &json!(["00"]), &snap, None, None);
+        let (_, e) = dispatch(
+            "sendrawtransaction",
+            &json!(["00"]),
+            &snap,
+            None,
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 
@@ -5353,9 +5772,16 @@ mod tests {
         let cs = Chainstate::new(&Network::Regtest.params());
         let queries = query_server(cs);
         let snap = snap();
-        let (_, e) = dispatch("savemempool", &Value::Null, &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "savemempool",
+            &Value::Null,
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
-        let (_, e) = dispatch("savemempool", &Value::Null, &snap, None, None);
+        let (_, e) = dispatch("savemempool", &Value::Null, &snap, None, None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 
@@ -5367,7 +5793,14 @@ mod tests {
         let cs = Chainstate::new(&Network::Regtest.params());
         let queries = query_server(cs);
         let snap = snap();
-        let (r, e) = dispatch("getblockstats", &json!([0]), &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getblockstats",
+            &json!([0]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none());
         assert_eq!(r["subsidy"], json!(5_000_000_000i64));
         assert_eq!(r["txs"], json!(1));
@@ -5381,19 +5814,28 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none());
         assert_eq!(r["txs"], json!(1));
         assert!(r.get("avgfee").is_none(), "filtered key must be absent");
 
         // Out-of-range height and malformed hash carry Core's wording.
-        let (_, e) = dispatch("getblockstats", &json!([99]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "getblockstats",
+            &json!([99]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().1, "Target block height 99 after current tip 0");
         let (_, e) = dispatch(
             "getblockstats",
             &json!(["deadbeef"]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(
@@ -5411,7 +5853,14 @@ mod tests {
         let cs = Chainstate::new(&Network::Regtest.params());
         let queries = query_server(cs);
         let snap = snap();
-        let (r, e) = dispatch("getdeploymentinfo", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getdeploymentinfo",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none());
         assert_eq!(r["height"], json!(0));
         let d = &r["deployments"];
@@ -5438,6 +5887,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(
             e.unwrap(),
@@ -5448,6 +5898,7 @@ mod tests {
             &json!(["deadbeef"]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(
@@ -5460,6 +5911,7 @@ mod tests {
             &json!(["ab".repeat(32), 1]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         let (code, msg) = e.unwrap();
@@ -5486,6 +5938,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         let proof = r.as_str().unwrap().to_string();
@@ -5494,6 +5947,7 @@ mod tests {
             &json!([proof]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert!(e.is_none(), "{e:?}");
@@ -5505,6 +5959,7 @@ mod tests {
             &json!([[&gtxid], &ghash, {"prove_witness": true}]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert!(e.is_none(), "{e:?}");
@@ -5518,6 +5973,7 @@ mod tests {
             &json!([wproof, {"verify_witness": true}]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert!(e.is_none(), "{e:?}");
@@ -5536,6 +5992,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none());
         assert_eq!(r, json!([]));
@@ -5551,9 +6008,23 @@ mod tests {
         let ghash = genesis.block_hash().to_string();
         let gtxid = genesis.transactions[0].txid().to_string();
 
-        let (_, e) = dispatch("gettxoutproof", &json!([]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "gettxoutproof",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
-        let (_, e) = dispatch("gettxoutproof", &json!([[]]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "gettxoutproof",
+            &json!([[]]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(
             e.unwrap(),
             (
@@ -5566,6 +6037,7 @@ mod tests {
             &json!([[&gtxid, &gtxid]]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(
@@ -5581,6 +6053,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(
             e.unwrap(),
@@ -5591,6 +6064,7 @@ mod tests {
             &json!([["ab".repeat(32)], &ghash]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(
@@ -5606,6 +6080,7 @@ mod tests {
             &json!(["00000030"]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(
@@ -5629,6 +6104,7 @@ mod tests {
             &json!([hex::encode(&bytes)]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(
@@ -5682,6 +6158,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null); // connected — Core's null
@@ -5691,14 +6168,22 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!("duplicate"));
 
         // Decode failures carry Core's -22.
-        let (_, e) = dispatch("submitblock", &json!(["aabb"]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "submitblock",
+            &json!(["aabb"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
-        let (_, e) = dispatch("submitblock", &json!([]), &snap, Some(&queries), None);
+        let (_, e) = dispatch("submitblock", &json!([]), &snap, Some(&queries), None, None);
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
     }
 
@@ -5736,6 +6221,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_VERIFY_ERROR);
@@ -5752,11 +6238,19 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
 
-        let (_, e) = dispatch("submitheader", &json!(["zz"]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "submitheader",
+            &json!(["zz"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
     }
 
@@ -5776,6 +6270,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         let hashes = r.as_array().unwrap();
@@ -5789,6 +6284,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
 
@@ -5798,6 +6294,7 @@ mod tests {
             &json!([format!("addr({addr})"), []]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert!(e.is_none(), "{e:?}");
@@ -5810,6 +6307,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_INVALID_ADDRESS_OR_KEY);
@@ -5820,6 +6318,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         // Bad output → -5.
@@ -5828,6 +6327,7 @@ mod tests {
             &json!(["zzz", []]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
@@ -5851,7 +6351,14 @@ mod tests {
             json!([cb_hex, true]),
             json!([cb_hex, false]),
         ] {
-            let (r, e) = dispatch("decoderawtransaction", &p, &snap, Some(&queries), None);
+            let (r, e) = dispatch(
+                "decoderawtransaction",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+            );
             assert!(e.is_none(), "{e:?}");
             assert_eq!(r["txid"], json!(cb_txid));
             assert!(r.get("hex").is_none(), "decoderawtransaction omits hex");
@@ -5867,6 +6374,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         let (_, e) = dispatch(
@@ -5875,6 +6383,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         let (_, e) = dispatch(
@@ -5882,6 +6391,7 @@ mod tests {
             &json!([cb_hex, 2]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         let (code, msg) = e.unwrap();
@@ -5893,6 +6403,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
         let (_, e) = dispatch(
@@ -5900,6 +6411,7 @@ mod tests {
             &json!([cb_hex, true, 1]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
@@ -5911,14 +6423,28 @@ mod tests {
     fn getindexinfo_reflects_txindex_state() {
         let snap = snap();
         let queries = query_server(Chainstate::new(&Network::Regtest.params()));
-        let (r, e) = dispatch("getindexinfo", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getindexinfo",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none());
         assert_eq!(r, json!({}));
 
         let mut cs = Chainstate::new(&Network::Regtest.params());
         cs.enable_txindex(None).unwrap();
         let queries = query_server(cs);
-        let (r, e) = dispatch("getindexinfo", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getindexinfo",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none());
         assert_eq!(r["txindex"]["synced"], json!(true));
         assert_eq!(r["txindex"]["best_block_height"], json!(0));
@@ -5930,6 +6456,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(r.get("txindex").is_some());
         let (r, _) = dispatch(
@@ -5938,16 +6465,25 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(r, json!({}));
         // Non-string name → Core's -3; extra args → the -1 help throw.
-        let (_, e) = dispatch("getindexinfo", &json!([5]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "getindexinfo",
+            &json!([5]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch(
             "getindexinfo",
             &json!(["a", "b"]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
@@ -5968,6 +6504,7 @@ mod tests {
             &json!([[{"txid": txid, "vout": 0}]]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert!(e.is_none(), "{e:?}");
@@ -6002,7 +6539,14 @@ mod tests {
                 RPC_MISC_ERROR,
             ),
         ] {
-            let (_, e) = dispatch("gettxspendingprevout", &p, &snap, Some(&queries), None);
+            let (_, e) = dispatch(
+                "gettxspendingprevout",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+            );
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
     }
@@ -6017,7 +6561,14 @@ mod tests {
         let snap = snap();
 
         // Genesis-only chain: pb->nHeight == 0 → 0, like Core.
-        let (r, e) = dispatch("getnetworkhashps", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getnetworkhashps",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!(0));
         let (r, _) = dispatch(
@@ -6025,6 +6576,7 @@ mod tests {
             &json!([120, 0]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(r, json!(0));
@@ -6040,7 +6592,7 @@ mod tests {
             (json!([120, 1]), RPC_INVALID_PARAMETER), // past the h0 tip
             (json!([1, 2, 3]), RPC_MISC_ERROR),
         ] {
-            let (_, e) = dispatch("getnetworkhashps", &p, &snap, Some(&queries), None);
+            let (_, e) = dispatch("getnetworkhashps", &p, &snap, Some(&queries), None, None);
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
     }
@@ -6052,7 +6604,14 @@ mod tests {
     fn getnettotals_reports_cumulative_counters() {
         let queries = query_server(Chainstate::new(&Network::Regtest.params()));
         let snap = snap();
-        let (r, e) = dispatch("getnettotals", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getnettotals",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["totalbytesrecv"], json!(0));
         assert_eq!(r["totalbytessent"], json!(0));
@@ -6060,7 +6619,14 @@ mod tests {
         assert_eq!(r["uploadtarget"]["target"], json!(0));
         assert_eq!(r["uploadtarget"]["timeframe"], json!(86400));
         assert_eq!(r["uploadtarget"]["serve_historical_blocks"], json!(true));
-        let (_, e) = dispatch("getnettotals", &json!([1]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "getnettotals",
+            &json!([1]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 
@@ -6072,10 +6638,10 @@ mod tests {
         let snap = snap();
 
         // ping: no args → null; any arg → -1 + help.
-        let (r, e) = dispatch("ping", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch("ping", &json!([]), &snap, Some(&queries), None, None);
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
-        let (_, e) = dispatch("ping", &json!([1]), &snap, Some(&queries), None);
+        let (_, e) = dispatch("ping", &json!([1]), &snap, Some(&queries), None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
         // disconnectnode: no match → -29; both ids → -32602; bad
@@ -6086,6 +6652,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_NOT_CONNECTED);
         let (_, e) = dispatch(
@@ -6093,6 +6660,7 @@ mod tests {
             &json!(["1.2.3.4:5", 6]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
@@ -6102,6 +6670,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch(
@@ -6109,6 +6678,7 @@ mod tests {
             &json!(["notanip/33"]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
@@ -6121,6 +6691,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -6130,6 +6701,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_ALREADY_ADDED);
         let (_, e) = dispatch(
@@ -6138,6 +6710,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (r, e) = dispatch(
@@ -6145,6 +6718,7 @@ mod tests {
             &json!(["1.2.3.4:8333", "remove"]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert!(e.is_none(), "{e:?}");
@@ -6155,6 +6729,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_NOT_ADDED);
         let (_, e) = dispatch(
@@ -6163,6 +6738,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -6170,6 +6746,7 @@ mod tests {
             &json!(["x", "add", true]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
@@ -6182,6 +6759,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!(false));
@@ -6191,12 +6769,27 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!(true));
-        let (_, e) = dispatch("setnetworkactive", &json!([5]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "setnetworkactive",
+            &json!([5]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
-        let (_, e) = dispatch("setnetworkactive", &json!([]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "setnetworkactive",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 
@@ -6209,15 +6802,22 @@ mod tests {
         let snap = snap();
 
         // Empty list to start; listbanned/clearbanned take no params.
-        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None, None);
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!([]));
-        let (_, e) = dispatch("listbanned", &json!([1]), &snap, Some(&queries), None);
+        let (_, e) = dispatch("listbanned", &json!([1]), &snap, Some(&queries), None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
-        let (r, e) = dispatch("clearbanned", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch("clearbanned", &json!([]), &snap, Some(&queries), None, None);
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
-        let (_, e) = dispatch("clearbanned", &json!([1]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "clearbanned",
+            &json!([1]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
         // add: null; the subnet normalizes to its prefix and lists
@@ -6228,10 +6828,11 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
-        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None, None);
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r.as_array().unwrap().len(), 1);
         assert_eq!(r[0]["address"], json!("10.1.0.0/16"));
@@ -6251,6 +6852,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_ALREADY_ADDED);
         let (r, e) = dispatch(
@@ -6258,6 +6860,7 @@ mod tests {
             &json!(["10.1.0.0/16", "remove"]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert!(e.is_none(), "{e:?}");
@@ -6268,9 +6871,10 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_INVALID_IP_OR_SUBNET);
-        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None, None);
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!([]));
 
@@ -6283,6 +6887,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (r, e) = dispatch(
@@ -6291,10 +6896,11 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
-        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None, None);
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r[0]["address"], json!("2001:db8::/32"));
         assert_eq!(r[0]["banned_until"], json!(now + 3600));
@@ -6318,15 +6924,15 @@ mod tests {
                 RPC_MISC_ERROR,
             ),
         ] {
-            let (_, e) = dispatch("setban", &p, &snap, Some(&queries), None);
+            let (_, e) = dispatch("setban", &p, &snap, Some(&queries), None, None);
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
 
         // clearbanned empties the list.
-        let (r, e) = dispatch("clearbanned", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch("clearbanned", &json!([]), &snap, Some(&queries), None, None);
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
-        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None, None);
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!([]));
     }
@@ -6349,7 +6955,7 @@ mod tests {
             json!([-1]),
             json!([null, null]),
         ] {
-            let (r, e) = dispatch("verifychain", &p, &snap, Some(&queries), None);
+            let (r, e) = dispatch("verifychain", &p, &snap, Some(&queries), None, None);
             assert!(e.is_none(), "{p}: {e:?}");
             assert_eq!(r, json!(true), "{p}");
         }
@@ -6360,7 +6966,7 @@ mod tests {
             (json!([4, 1.5]), RPC_MISC_ERROR),
             (json!([3, 10, "x"]), RPC_MISC_ERROR),
         ] {
-            let (_, e) = dispatch("verifychain", &p, &snap, Some(&queries), None);
+            let (_, e) = dispatch("verifychain", &p, &snap, Some(&queries), None, None);
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
     }
@@ -6372,12 +6978,26 @@ mod tests {
         let queries = query_server(Chainstate::new(&Network::Regtest.params()));
         let snap = snap();
 
-        let (r, e) = dispatch("getaddrmaninfo", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getaddrmaninfo",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         for net in ["ipv4", "ipv6", "onion", "i2p", "cjdns", "all_networks"] {
             assert_eq!(r[net], json!({"new": 0, "tried": 0, "total": 0}), "{net}");
         }
-        let (_, e) = dispatch("getaddrmaninfo", &json!([1]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "getaddrmaninfo",
+            &json!([1]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
         // A seeded entry lands under its network.
@@ -6387,10 +7007,18 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["success"], json!(true));
-        let (r, e) = dispatch("getaddrmaninfo", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getaddrmaninfo",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["ipv4"], json!({"new": 0, "tried": 1, "total": 1}));
         assert_eq!(r["all_networks"], json!({"new": 0, "tried": 1, "total": 1}));
@@ -6406,9 +7034,23 @@ mod tests {
 
         // Missing/extra args → -1 + help; non-string → -3 (Core's
         // Wrong-type "Position 1 (blockhash)" message).
-        let (_, e) = dispatch("preciousblock", &json!([]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "preciousblock",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
-        let (_, e) = dispatch("preciousblock", &json!([7]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "preciousblock",
+            &json!([7]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch(
             "preciousblock",
@@ -6416,11 +7058,19 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
         // ParseHashV: wrong length → -8, bad hex → -8.
-        let (_, e) = dispatch("preciousblock", &json!(["00"]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "preciousblock",
+            &json!(["00"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_INVALID_PARAMETER);
         assert!(msg.contains("length 64 (not 2"), "{msg}");
@@ -6433,6 +7083,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(
             e.unwrap(),
@@ -6440,7 +7091,14 @@ mod tests {
         );
 
         // Genesis is in the index — marking it returns null.
-        let (r, e) = dispatch("getblockhash", &json!([0]), &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getblockhash",
+            &json!([0]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none());
         let genesis = r.as_str().unwrap().to_string();
         let (r, e) = dispatch(
@@ -6448,6 +7106,7 @@ mod tests {
             &json!([genesis]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert!(e.is_none(), "{e:?}");
@@ -6472,7 +7131,14 @@ mod tests {
             json!([txid, 0]),
             json!([txid, 0, 0, 0]),
         ] {
-            let (_, e) = dispatch("prioritisetransaction", &p, &snap, Some(&queries), None);
+            let (_, e) = dispatch(
+                "prioritisetransaction",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+            );
             let (code, msg) = e.unwrap();
             assert_eq!(code, RPC_MISC_ERROR, "{p}");
             assert!(msg.starts_with("prioritisetransaction"), "{msg}");
@@ -6484,6 +7150,7 @@ mod tests {
             &json!([7, "x", "y"]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         let (code, msg) = e.unwrap();
@@ -6500,6 +7167,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -6507,6 +7175,7 @@ mod tests {
             &json!([txid, 0, 1.5]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(
@@ -6519,6 +7188,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_INVALID_PARAMETER);
@@ -6530,7 +7200,14 @@ mod tests {
             json!([txid, 0.0, -50]),
             json!([txid, null, 100]),
         ] {
-            let (r, e) = dispatch("prioritisetransaction", &p, &snap, Some(&queries), None);
+            let (r, e) = dispatch(
+                "prioritisetransaction",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+            );
             assert!(e.is_none(), "{p}: {e:?}");
             assert_eq!(r, json!(true), "{p}");
         }
@@ -6549,7 +7226,7 @@ mod tests {
         let hash = "00".repeat(32);
 
         for p in [json!([]), json!([hash]), json!([hash, 0, 0])] {
-            let (_, e) = dispatch("getblockfrompeer", &p, &snap, Some(&queries), None);
+            let (_, e) = dispatch("getblockfrompeer", &p, &snap, Some(&queries), None, None);
             let (code, msg) = e.unwrap();
             assert_eq!(code, RPC_MISC_ERROR, "{p}");
             assert!(msg.starts_with("getblockfrompeer"), "{msg}");
@@ -6561,6 +7238,7 @@ mod tests {
             &json!([7, "x"]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         let (code, msg) = e.unwrap();
@@ -6575,6 +7253,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -6582,6 +7261,7 @@ mod tests {
             &json!([hash, 1.5]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(
@@ -6596,6 +7276,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(
             e.unwrap(),
@@ -6604,7 +7285,14 @@ mod tests {
 
         // Genesis is downloaded (synthesized body) → "already
         // downloaded" beats the peer check.
-        let (r, _) = dispatch("getblockhash", &json!([0]), &snap, Some(&queries), None);
+        let (r, _) = dispatch(
+            "getblockhash",
+            &json!([0]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         let genesis = r.as_str().unwrap().to_string();
         let (_, e) = dispatch(
             "getblockfrompeer",
@@ -6612,11 +7300,146 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(
             e.unwrap(),
             (RPC_MISC_ERROR, "Block already downloaded".to_string())
         );
+    }
+
+    /// `waitforblock`/`waitforblockheight`/`waitfornewblock` — Core
+    /// 29.4's validation order (arity → collected -3 list → parse) and
+    /// the shared timeout contract: null/missing → forever, non-integral
+    /// → -1, negative → -1 "Negative timeout". Immediate and timed-out
+    /// waits both answer `{hash, height}` of the tip.
+    #[test]
+    fn waitforblock_family_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let waiters = Arc::new(BlockWaiters::new());
+        let d = |m, p: Value| dispatch(m, &p, &snap, Some(&queries), Some(&waiters), None);
+        let hash = "00".repeat(32);
+
+        // Arity → -1 + verbatim help.
+        for (m, p) in [
+            ("waitforblock", json!([])),
+            ("waitforblock", json!([hash, 0, 0])),
+            ("waitforblockheight", json!([])),
+            ("waitforblockheight", json!([1, 0, 0])),
+            ("waitfornewblock", json!([1, 2])),
+        ] {
+            let (_, e) = d(m, p.clone());
+            let (code, msg) = e.unwrap();
+            assert_eq!(code, RPC_MISC_ERROR, "{m} {p}");
+            assert!(msg.starts_with(m), "{m}: {msg}");
+        }
+
+        // Collected -3 type lists — all bad positions reported at once.
+        let (_, e) = d("waitforblock", json!([7, "x"]));
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert!(msg.contains("Position 1 (blockhash)"), "{msg}");
+        assert!(msg.contains("Position 2 (timeout)"), "{msg}");
+        let (_, e) = d("waitforblockheight", json!(["x", "x"]));
+        let (_, msg) = e.unwrap();
+        assert!(msg.contains("Position 1 (height)"), "{msg}");
+        assert!(msg.contains("Position 2 (timeout)"), "{msg}");
+        let (_, e) = d("waitfornewblock", json!(["x"]));
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert!(msg.contains("Position 1 (timeout)"), "{msg}");
+
+        // ParseHashV precedes the timeout getInt; non-integral ints and
+        // negatives get Core's -1s.
+        let (_, e) = d("waitforblock", json!(["00", 1.5]));
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        for p in [json!([hash, 1.5]), json!([hash, -1])] {
+            let (_, e) = d("waitforblock", p);
+            assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+        }
+        let (_, e) = d("waitforblockheight", json!([3_000_000_000i64, 1]));
+        assert_eq!(
+            e.unwrap(),
+            (RPC_MISC_ERROR, "JSON integer out of range".to_string())
+        );
+        let (_, e) = d("waitfornewblock", json!([-1]));
+        assert_eq!(e.unwrap(), (RPC_MISC_ERROR, "Negative timeout".to_string()));
+
+        // A target already reached answers instantly — genesis is a
+        // synthesized body and height -1 is already past.
+        let (r, _) = d("getblockhash", json!([0]));
+        let genesis = r.as_str().unwrap().to_string();
+        for (m, p) in [
+            ("waitforblock", json!([genesis, 100])),
+            ("waitforblockheight", json!([-5, 100])),
+            ("waitforblockheight", json!([0, 100])),
+        ] {
+            let (r, e) = d(m, p.clone());
+            assert!(e.is_none(), "{m} {p}: {e:?}");
+            assert_eq!(r["height"], 0, "{m} {p}");
+            assert!(r["hash"].is_string(), "{m} {p}");
+        }
+
+        // Unsatisfied waits block for the timeout then answer the tip.
+        let t0 = Instant::now();
+        let (r, e) = d("waitforblockheight", json!([9999, 60]));
+        assert!(t0.elapsed() >= Duration::from_millis(55));
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["height"], 0);
+        let t0 = Instant::now();
+        let (r, e) = d("waitfornewblock", json!([60]));
+        assert!(t0.elapsed() >= Duration::from_millis(55));
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["height"], 0);
+        let (r, e) = d("waitforblock", json!([hash, 60]));
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["height"], 0);
+    }
+
+    /// `g16` — Core's `setFloat` text: `%.16g` with its fixed/scientific
+    /// switch and trailing-zero strip. The 101/17 case is the observed
+    /// last-digit divergence from ryu's shortest repr.
+    #[test]
+    fn g16_matches_univalue_setfloat() {
+        assert_eq!(g16(101.0 / 17.0), "5.941176470588236");
+        assert_eq!(g16(0.0), "0");
+        assert_eq!(g16(-0.0), "-0");
+        assert_eq!(g16(1.5), "1.5");
+        assert_eq!(g16(100.0), "100");
+        assert_eq!(g16(-42.25), "-42.25");
+        // Exponent boundary: -4 ≤ exp < 16 stays fixed.
+        assert_eq!(g16(0.0001), "0.0001");
+        assert_eq!(g16(0.00001), "1e-05");
+        assert_eq!(g16(1e15), "1000000000000000");
+        assert_eq!(g16(1e16), "1e+16");
+        assert_eq!(g16(2.5e20), "2.5e+20");
+        assert_eq!(g16(-1.5e-5), "-1.5e-05");
+    }
+
+    /// `BlockWaiters` — `notify` fires satisfied predicates, `shutdown`
+    /// wakes everything, and the registry stays bounded.
+    #[test]
+    fn block_waiters_notify_and_shutdown() {
+        let cs = Chainstate::new(&Network::Regtest.params());
+        let waiters = BlockWaiters::new();
+
+        // A false predicate stays parked; a true one fires.
+        let (tx, rx) = mpsc::sync_channel(1);
+        assert!(waiters.register(Box::new(|_| false), tx));
+        waiters.notify(&cs);
+        assert!(rx.try_recv().is_err());
+        let (tx, rx) = mpsc::sync_channel(1);
+        assert!(waiters.register(Box::new(|_| true), tx));
+        waiters.notify(&cs);
+        assert!(rx.try_recv().is_ok());
+
+        // The un-fired waiter and a fresh one both wake on shutdown.
+        let (tx, rx) = mpsc::sync_channel(1);
+        assert!(waiters.register(Box::new(|_| false), tx));
+        waiters.shutdown();
+        assert!(rx.try_recv().is_ok());
+        assert!(!waiters.register(Box::new(|_| true), mpsc::sync_channel(1).0));
     }
 
     /// `getchaintxstats` — on the genesis-only fixture every window
@@ -6634,6 +7457,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_MISC_ERROR);
@@ -6645,6 +7469,7 @@ mod tests {
             &json!(["x", 1]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         let (code, msg) = e.unwrap();
@@ -6659,6 +7484,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
 
@@ -6669,6 +7495,7 @@ mod tests {
             &json!([1.5, unknown]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(
@@ -6683,6 +7510,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(
             e.unwrap(),
@@ -6692,7 +7520,7 @@ mod tests {
         // Genesis allows only the zero window — it answers with just
         // the final-block fields plus txcount, like Core at h0.
         for p in [json!([]), json!([0]), json!([null, null])] {
-            let (r, e) = dispatch("getchaintxstats", &p, &snap, Some(&queries), None);
+            let (r, e) = dispatch("getchaintxstats", &p, &snap, Some(&queries), None, None);
             assert!(e.is_none(), "{p}: {e:?}");
             assert_eq!(r["window_block_count"], json!(0), "{p}");
             assert_eq!(r["txcount"], json!(1), "{p}");
@@ -6701,7 +7529,7 @@ mod tests {
         }
         // A nonzero window on genesis and negative counts → -8.
         for p in [json!([1]), json!([-1])] {
-            let (_, e) = dispatch("getchaintxstats", &p, &snap, Some(&queries), None);
+            let (_, e) = dispatch("getchaintxstats", &p, &snap, Some(&queries), None, None);
             let (code, msg) = e.unwrap();
             assert_eq!(code, RPC_INVALID_PARAMETER, "{p}");
             assert!(msg.contains("block's height - 1"), "{msg}");
@@ -6723,6 +7551,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_MISC_ERROR);
@@ -6735,6 +7564,7 @@ mod tests {
             &json!([7, null, "x"]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         let (code, msg) = e.unwrap();
@@ -6750,6 +7580,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         let (_, msg) = e.unwrap();
         assert_eq!(msg, "'bogus' is not a valid hash_type");
@@ -6760,7 +7591,7 @@ mod tests {
             json!(["none", 0]),
             json!(["muhash", "00".repeat(32), false]),
         ] {
-            let (_, e) = dispatch("gettxoutsetinfo", &p, &snap, Some(&queries), None);
+            let (_, e) = dispatch("gettxoutsetinfo", &p, &snap, Some(&queries), None, None);
             assert_eq!(
                 e.unwrap(),
                 (
@@ -6777,7 +7608,7 @@ mod tests {
             (json!(["muhash"]), "muhash"),
             (json!([null, null, false]), "hash_serialized_3"),
         ] {
-            let (r, e) = dispatch("gettxoutsetinfo", &p, &snap, Some(&queries), None);
+            let (r, e) = dispatch("gettxoutsetinfo", &p, &snap, Some(&queries), None, None);
             assert!(e.is_none(), "{p}: {e:?}");
             assert_eq!(r["height"], json!(0), "{p}");
             assert_eq!(r["txouts"], json!(0), "{p}");
@@ -6790,6 +7621,7 @@ mod tests {
             &json!(["none"]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert!(e.is_none(), "{e:?}");
@@ -6806,16 +7638,23 @@ mod tests {
 
         // getrpcinfo: the in-flight command names itself; logpath is
         // empty without a store. Any arg → -1 + help.
-        let (r, e) = dispatch("getrpcinfo", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch("getrpcinfo", &json!([]), &snap, Some(&queries), None, None);
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["active_commands"][0]["method"], json!("getrpcinfo"));
         assert!(r["active_commands"][0]["duration"].is_u64());
         assert_eq!(r["logpath"], json!(""));
-        let (_, e) = dispatch("getrpcinfo", &json!([1]), &snap, Some(&queries), None);
+        let (_, e) = dispatch("getrpcinfo", &json!([1]), &snap, Some(&queries), None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
         // getmemoryinfo: stats shape; unknown mode → -8; bad type → -3.
-        let (r, e) = dispatch("getmemoryinfo", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getmemoryinfo",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["locked"]["total"], json!(0));
         let (_, e) = dispatch(
@@ -6824,14 +7663,22 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
-        let (_, e) = dispatch("getmemoryinfo", &json!([5]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "getmemoryinfo",
+            &json!([5]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
 
         // logging: 28 categories all-false at rest; include/exclude in
         // order; "all"/"1" specials; unknown → -8; bad types → -3.
-        let (r, e) = dispatch("logging", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch("logging", &json!([]), &snap, Some(&queries), None, None);
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r.as_object().unwrap().len(), 28);
         assert!(r.as_object().unwrap().values().all(|v| *v == json!(false)));
@@ -6840,6 +7687,7 @@ mod tests {
             &json!([["net", "mempool"]]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(r["net"], json!(true));
@@ -6850,6 +7698,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(r["net"], json!(false));
         assert_eq!(r["mempool"], json!(true));
@@ -6859,6 +7708,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(r["mempool"], json!(false));
         let (_, e) = dispatch(
@@ -6867,9 +7717,10 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
-        let (_, e) = dispatch("logging", &json!([5]), &snap, Some(&queries), None);
+        let (_, e) = dispatch("logging", &json!([5]), &snap, Some(&queries), None, None);
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         // Reset so other tests see a clean map.
         let _ = dispatch(
@@ -6877,6 +7728,7 @@ mod tests {
             &json!([[], ["all"]]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
     }
@@ -6894,6 +7746,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!({"success": true}));
@@ -6903,6 +7756,7 @@ mod tests {
             &json!(["127.0.0.1", 8333]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert!(e.is_none(), "{e:?}");
@@ -6916,6 +7770,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(r["success"], json!(false));
         // Unparseable → success:false with no error key.
@@ -6925,10 +7780,18 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(r, json!({"success": false}));
 
-        let (r, e) = dispatch("getnodeaddresses", &json!([]), &snap, Some(&queries), None);
+        let (r, e) = dispatch(
+            "getnodeaddresses",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         let entries = r.as_array().unwrap();
         assert_eq!(entries.len(), 1);
@@ -6943,6 +7806,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(r.as_array().unwrap().len(), 1);
         let (r, _) = dispatch(
@@ -6950,6 +7814,7 @@ mod tests {
             &json!([0, "onion"]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(r.as_array().unwrap().len(), 0);
@@ -6960,6 +7825,7 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -6967,6 +7833,7 @@ mod tests {
             &json!([5, "bogus"]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
@@ -6976,15 +7843,24 @@ mod tests {
             &snap,
             Some(&queries),
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
-        let (_, e) = dispatch("addpeeraddress", &json!([]), &snap, Some(&queries), None);
+        let (_, e) = dispatch(
+            "addpeeraddress",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
         let (_, e) = dispatch(
             "addpeeraddress",
             &json!(["1.2.3.4", 70000]),
             &snap,
             Some(&queries),
+            None,
             None,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);

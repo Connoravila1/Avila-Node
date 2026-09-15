@@ -332,6 +332,35 @@ def build_calls(height):
         ("getblockfrompeer", ["00" * 32, 9999]),
         ("getblockfrompeer", ["HASH", 9999]),
         ("getblockfrompeer", ["HASH", -1]),
+        # waitforblock* — Core 29.4's blocking wait family: arity →
+        # collected -3 list → hash/int parse → timeout getInt →
+        # "Negative timeout". Timeout results return the live tip —
+        # identical only while neither chain moves between the two
+        # calls (regtest blocks arrive by explicit generate, so the
+        # tips are stable).
+        ("waitforblock", []),
+        ("waitforblock", ["HASH", 0, 0]),
+        ("waitforblock", [7, "x"]),
+        ("waitforblock", ["00", 1.5]),
+        ("waitforblock", ["00" * 32, "x"]),
+        ("waitforblock", ["00" * 32, -1]),
+        ("waitforblock", ["00" * 32, 1.5]),
+        ("waitforblock", ["HASH", 100]),
+        ("waitforblock", ["00" * 32, 300]),
+        ("waitforblockheight", []),
+        ("waitforblockheight", [1, 0, 0]),
+        ("waitforblockheight", ["x", "x"]),
+        ("waitforblockheight", [1.5, "x"]),
+        ("waitforblockheight", [3000000000, 100]),
+        ("waitforblockheight", [0, 100]),
+        ("waitforblockheight", [-5, 100]),
+        ("waitforblockheight", [height, 100]),
+        ("waitforblockheight", [height + 100000, 300]),
+        ("waitfornewblock", ["x"]),
+        ("waitfornewblock", [1.5]),
+        ("waitfornewblock", [-1]),
+        ("waitfornewblock", [1, 2]),
+        ("waitfornewblock", [300]),
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),
         ("estimatesmartfee", [6]),

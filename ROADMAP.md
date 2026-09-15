@@ -256,8 +256,16 @@ operation. Compare complete initial download and catch-up, not only local replay
       depends/spentby/bip125-replaceable entry fields the RPC
       exposes), getblockfrompeer (targeted `getdata[MSG_WITNESS_BLOCK]`
       on a named session after Core's full -1 check chain — header
-      missing, already downloaded, peer does not exist). Outbound
-      dialing is
+      missing, already downloaded, peer does not exist),
+      waitforblock/waitforblockheight/waitfornewblock (Core's blocking
+      waits — predicates register atomically through the chain-query
+      channel, a bounded per-tick registry on the sync loop fires them,
+      and a drop guard wakes every waiter on shutdown; verified live by
+      a Core-mined block releasing parked calls with the new tip). RPC
+      doubles emit Core's `UniValue::setFloat` text (`%.16g` via `g16`)
+      rather than ryu's shortest repr — the two parse to different
+      f64s on values like 101/17, and `txrate` now matches
+      byte-for-byte. Outbound dialing is
       asynchronous —
       `maintain_outbounds` runs `connect_timeout` on slot-bounded
       worker threads and drains results on the tick, so a book of dead
