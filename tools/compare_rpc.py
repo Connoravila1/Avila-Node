@@ -32,7 +32,8 @@ import urllib.error
 # differences are per-node state, not incompatibility.
 # `savemempool` reports each daemon's own datadir path — presence is
 # checked, the path value itself is per-installation.
-DYNAMIC_METHODS = {"uptime", "help", "getrawmempool", "savemempool"}
+DYNAMIC_METHODS = {"uptime", "help", "getrawmempool", "savemempool",
+                   "getnodeaddresses", "addpeeraddress"}
 
 # Keys whose values are legitimately node- or time-specific. They are
 # still compared (structural presence is checked) but a value
@@ -128,6 +129,17 @@ def build_calls(height):
         ("getrawmempool", []),
         ("getnetworkinfo", []),
         ("getnettotals", []),
+        # getnodeaddresses: books are node-local — contents legitimately
+        # differ, but the arg contract and entry shape are checked on
+        # the error paths. addpeeraddress seeds each daemon's own book.
+        ("getnodeaddresses", [0]),
+        ("getnodeaddresses", [-1]),
+        ("getnodeaddresses", [1, "bogus"]),
+        ("getnodeaddresses", ["x"]),
+        ("addpeeraddress", ["127.0.0.1", 8333]),
+        ("addpeeraddress", ["notanip", 8333]),
+        ("addpeeraddress", ["1.2.3.4", "x"]),
+        ("addpeeraddress", []),
         ("getconnectioncount", []),
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),

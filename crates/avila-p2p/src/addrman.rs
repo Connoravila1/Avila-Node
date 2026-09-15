@@ -41,13 +41,21 @@ pub struct AddrInfo {
     pub attempts: u8,
 }
 
+/// Table key — `CAddress::GetKey` is (ip, port): services are a
+/// mutable property of the entry, not part of its identity.
+type AddrKey = ([u8; 16], u16);
+
+const fn key_of(addr: &NetAddr) -> AddrKey {
+    (addr.ip, addr.port)
+}
+
 /// A bounded, recency-ordered address table.
 #[derive(Default)]
 pub struct AddrBook {
     /// Keyed by (ip, port) — one entry per endpoint.
-    table: HashMap<NetAddr, AddrInfo>,
+    table: HashMap<AddrKey, AddrInfo>,
     /// Monotonic intake counter → deterministic "newest first" order.
-    seq: HashMap<NetAddr, u64>,
+    seq: HashMap<AddrKey, u64>,
     next_seq: u64,
     cap: usize,
 }
@@ -83,24 +91,30 @@ impl AddrBook {
     }
 
     /// Records `addr` as gossiped at `seen` (clamped to `now`; Core
-    /// discounts future timestamps by a week). Self-announcements and
-    /// unroutable-looking endpoints are still accepted — the selection
-    /// path decides who we actually dial.
-    pub fn add(&mut self, addr: NetAddr, seen: u32, now: u32) {
-        if self.table.contains_key(&addr) {
-            // Refresh recency only — don't reset tried/attempts.
-            if let Some(e) = self.table.get_mut(&addr) {
-                e.last_seen = seen.min(now).max(e.last_seen);
-            }
-            return;
+    /// discounts future timestamps by a week). Unroutable endpoints are
+    /// rejected like `AddrManImpl::AddSingle` — Core's book only ever
+    /// holds publicly-routable addresses. Returns whether a new entry
+    /// was inserted (`false` for duplicates and rejects).
+    pub fn add(&mut self, addr: NetAddr, seen: u32, now: u32) -> bool {
+        if network_of(&addr) == Network::Unroutable {
+            return false;
+        }
+        let key = key_of(&addr);
+        if let Some(e) = self.table.get_mut(&key) {
+            // Refresh recency and union services (Core's AddSingle does
+            // `nServices |= addr.nServices` even when nothing new is
+            // inserted) — but don't reset tried/attempts.
+            e.last_seen = seen.min(now).max(e.last_seen);
+            e.addr.services |= addr.services;
+            return false;
         }
         if self.table.len() >= self.cap {
             self.evict_oldest();
         }
-        self.seq.insert(addr, self.next_seq);
+        self.seq.insert(key, self.next_seq);
         self.next_seq += 1;
         self.table.insert(
-            addr,
+            key,
             AddrInfo {
                 addr,
                 last_seen: seen.min(now),
@@ -108,6 +122,7 @@ impl AddrBook {
                 attempts: 0,
             },
         );
+        true
     }
 
     /// Bulk gossip intake (`addr`/`addrv2` messages).
@@ -119,14 +134,14 @@ impl AddrBook {
 
     /// A connection attempt is starting.
     pub fn mark_attempt(&mut self, addr: &NetAddr) {
-        if let Some(e) = self.table.get_mut(addr) {
+        if let Some(e) = self.table.get_mut(&key_of(addr)) {
             e.attempts = e.attempts.saturating_add(1);
         }
     }
 
     /// A connection succeeded — Core's `CAddrInfo::fInTried`.
     pub fn mark_tried(&mut self, addr: &NetAddr) {
-        if let Some(e) = self.table.get_mut(addr) {
+        if let Some(e) = self.table.get_mut(&key_of(addr)) {
             e.tried = true;
             e.attempts = 0;
         }
@@ -134,8 +149,8 @@ impl AddrBook {
 
     /// Drops the entry (e.g. the peer proved unreachable or hostile).
     pub fn forget(&mut self, addr: &NetAddr) {
-        self.table.remove(addr);
-        self.seq.remove(addr);
+        self.table.remove(&key_of(addr));
+        self.seq.remove(&key_of(addr));
     }
 
     /// Picks the next outbound candidate: fewest attempts first, then
@@ -158,6 +173,24 @@ impl AddrBook {
             .into_iter()
             .take(GETADDR_REPLY_MAX)
             .map(|e| e.addr)
+            .collect()
+    }
+
+    /// Up to `count` entries for `getnodeaddresses` — Core's
+    /// `GetAddresses(count, 0, network)`: `0` means all, `network`
+    /// filters by [`Network`]. Newest first.
+    #[must_use]
+    pub fn entries(&self, count: usize, network: Option<Network>) -> Vec<AddrInfo> {
+        let mut entries: Vec<_> = self
+            .table
+            .values()
+            .filter(|e| network.is_none_or(|n| network_of(&e.addr) == n))
+            .collect();
+        entries.sort_by_key(|e| std::cmp::Reverse(e.last_seen));
+        entries
+            .into_iter()
+            .take(if count == 0 { usize::MAX } else { count })
+            .cloned()
             .collect()
     }
 
@@ -222,11 +255,12 @@ impl AddrBook {
             let ip = d.read_array::<16>().map_err(|_| bad())?;
             let port = d.read_u16_le().map_err(|_| bad())?;
             let addr = NetAddr { services, ip, port };
-            if !self.table.contains_key(&addr) {
-                self.seq.insert(addr, self.next_seq);
+            let key = key_of(&addr);
+            if network_of(&addr) != Network::Unroutable && !self.table.contains_key(&key) {
+                self.seq.insert(key, self.next_seq);
                 self.next_seq += 1;
                 self.table.insert(
-                    addr,
+                    key,
                     AddrInfo {
                         addr,
                         last_seen: last_seen.min(now),
@@ -307,6 +341,111 @@ pub fn loopback(port: u16, services: u64) -> NetAddr {
     )
 }
 
+/// The network class Core's `CNetAddr::GetNetClass` reports — drives
+/// `getnodeaddresses`' `network` field and its filter. Onion and I2P
+/// can't occur in the book: `NetAddr` only carries IP literals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Network {
+    /// Public IPv4 (including routable v6 forms with a linked IPv4).
+    Ipv4,
+    /// Public IPv6.
+    Ipv6,
+    /// Tor hidden service — parseable as a filter, never stored.
+    Onion,
+    /// I2P — parseable as a filter, never stored.
+    I2p,
+    /// CJDNS (`fc00::/7`).
+    Cjdns,
+    /// Everything `!CNetAddr::IsRoutable()` — Core reports
+    /// `not_publicly_routable` and never stores these.
+    Unroutable,
+}
+
+/// `GetNetworkName` — the string Core emits in `getnodeaddresses` and
+/// `getnetworkinfo`'s `networks` array.
+#[must_use]
+pub const fn network_name(net: Network) -> &'static str {
+    match net {
+        Network::Ipv4 => "ipv4",
+        Network::Ipv6 => "ipv6",
+        Network::Onion => "onion",
+        Network::I2p => "i2p",
+        Network::Cjdns => "cjdns",
+        Network::Unroutable => "not_publicly_routable",
+    }
+}
+
+/// `ParseNetwork` — the `network` filter values `getnodeaddresses`
+/// accepts. Case-insensitive; `tor` is the deprecated alias of `onion`.
+/// `None` means "not recognized" (`-8` on the RPC).
+#[must_use]
+pub fn parse_network(name: &str) -> Option<Network> {
+    match name.to_ascii_lowercase().as_str() {
+        "ipv4" => Some(Network::Ipv4),
+        "ipv6" => Some(Network::Ipv6),
+        "onion" | "tor" => Some(Network::Onion),
+        "i2p" => Some(Network::I2p),
+        "cjdns" => Some(Network::Cjdns),
+        _ => None,
+    }
+}
+
+/// `CNetAddr::GetNetClass` for our byte form: v4-mapped addresses are
+/// classified by their embedded IPv4; `fc00::/7` is CJDNS; all other
+/// v6 forms are IPv6. Routable 6to4/Teredo/SIIT prefixes report `ipv4`
+/// like Core's `HasLinkedIPv4`.
+#[must_use]
+pub fn network_of(addr: &NetAddr) -> Network {
+    let a = &addr.ip;
+    let v4_mapped = a[..10] == [0; 10] && a[10] == 0xff && a[11] == 0xff;
+    if v4_mapped {
+        let v = &a[12..16];
+        // IsValid: neither INADDR_ANY nor INADDR_NONE.
+        if v == [0; 4] || v == [255; 4] {
+            return Network::Unroutable;
+        }
+        let private = v[0] == 10
+            || (v[0] == 172 && (16..32).contains(&v[1]))
+            || (v[0] == 192 && v[1] == 168)
+            || (v[0] == 198 && (v[1] == 18 || v[1] == 19)) // RFC2544
+            || (v[0] == 169 && v[1] == 254) // RFC3927
+            || (v[0] == 100 && (64..=127).contains(&v[1])) // RFC6598
+            || (v[0] == 192 && v[1] == 0 && v[2] == 2) // RFC5737
+            || (v[0] == 198 && v[1] == 51 && v[2] == 100)
+            || (v[0] == 203 && v[1] == 0 && v[2] == 113)
+            || v[0] == 127
+            || v[0] == 0;
+        return if private {
+            Network::Unroutable
+        } else {
+            Network::Ipv4
+        };
+    }
+    // IsValid: ::/128 and RFC3849 documentation space are invalid.
+    if a == &[0; 16] || a[..4] == [0x20, 0x01, 0x0d, 0xb8] {
+        return Network::Unroutable;
+    }
+    // fc00::/7 lands in the unroutable set like Core without
+    // `-cjdnsreachable`: `MaybeFlipIPv6toCJDNS` only flips the class to
+    // NET_CJDNS when cjdns is reachable; otherwise the address stays
+    // NET_IPV6 and RFC4193 marks it unroutable.
+    let unroutable = a[..8] == [0xfe, 0x80, 0, 0, 0, 0, 0, 0] // RFC4862
+        || (a[0] & 0xfe) == 0xfc // RFC4193 (unreachable cjdns)
+        || (a[..3] == [0x20, 0x01, 0x00] && (a[3] & 0xf0) == 0x10) // RFC4843
+        || (a[..3] == [0x20, 0x01, 0x00] && (a[3] & 0xf0) == 0x20); // RFC7343
+    if unroutable || (a[..15] == [0; 15] && a[15] == 1) {
+        return Network::Unroutable;
+    }
+    // HasLinkedIPv4: 6to4, Teredo, SIIT — report ipv4 like Core.
+    if a[..2] == [0x20, 0x02]
+        || a[..4] == [0x20, 0x01, 0x00, 0x00]
+        || a[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0]
+    {
+        return Network::Ipv4;
+    }
+    Network::Ipv6
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -316,7 +455,7 @@ mod tests {
     fn addr(octet: u8, port: u16) -> NetAddr {
         NetAddr {
             services: NODE_NETWORK,
-            ip: Ipv4Addr::new(10, 0, 0, octet).to_ipv6_mapped().octets(),
+            ip: Ipv4Addr::new(93, 184, 216, octet).to_ipv6_mapped().octets(),
             port,
         }
     }
@@ -336,7 +475,7 @@ mod tests {
         book.add(addr(1, 8333), 100, 200);
         book.mark_attempt(&addr(1, 8333));
         book.add(addr(1, 8333), 190, 200);
-        let e = &book.table[&addr(1, 8333)];
+        let e = &book.table[&key_of(&addr(1, 8333))];
         assert_eq!(e.last_seen, 190);
         assert_eq!(e.attempts, 1); // preserved across re-gossip
     }
@@ -348,7 +487,7 @@ mod tests {
         book.add(addr(2, 8333), 150, 200);
         book.add(addr(3, 8333), 190, 200);
         assert_eq!(book.len(), 2);
-        assert!(!book.table.contains_key(&addr(1, 8333)));
+        assert!(!book.table.contains_key(&key_of(&addr(1, 8333))));
         assert_eq!(book.select(), Some(addr(3, 8333)));
     }
 
@@ -388,10 +527,79 @@ mod tests {
 
         let mut fresh = AddrBook::new();
         assert_eq!(fresh.load(&path, 200).unwrap(), 2);
-        assert!(fresh.table[&addr(1, 8333)].tried, "tried flag survives");
-        assert_eq!(fresh.table[&addr(2, 18333)].attempts, 1);
-        assert_eq!(fresh.table[&addr(2, 18333)].last_seen, 150);
+        assert!(
+            fresh.table[&key_of(&addr(1, 8333))].tried,
+            "tried flag survives"
+        );
+        assert_eq!(fresh.table[&key_of(&addr(2, 18333))].attempts, 1);
+        assert_eq!(fresh.table[&key_of(&addr(2, 18333))].last_seen, 150);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `network_of` — `CNetAddr::GetNetClass` for the byte form. These
+    /// cases were checked live against `addpeeraddress` on a Knots 29.3
+    /// daemon: unroutable inputs are rejected there, so `add` must
+    /// refuse them here.
+    #[test]
+    fn network_classification_matches_core() {
+        let net = |s: &str| {
+            let ip: IpAddr = s.parse().unwrap();
+            let sock = SocketAddr::new(ip, 8333);
+            network_of(&net_addr_of(sock, NODE_NETWORK))
+        };
+        assert_eq!(net("93.184.216.34"), Network::Ipv4);
+        assert_eq!(net("2001:4860:4860::8888"), Network::Ipv6);
+        // Routable v6 forms with a linked v4 report ipv4.
+        assert_eq!(net("2002::1"), Network::Ipv4); // 6to4
+        assert_eq!(net("2001::1"), Network::Ipv4); // Teredo
+        assert_eq!(net("64:ff9b::1"), Network::Ipv4); // SIIT
+        // Unroutable: private, loopback, link-local, doc ranges.
+        assert_eq!(net("10.0.0.1"), Network::Unroutable);
+        assert_eq!(net("172.16.0.1"), Network::Unroutable);
+        assert_eq!(net("192.168.0.1"), Network::Unroutable);
+        assert_eq!(net("169.254.0.1"), Network::Unroutable);
+        assert_eq!(net("100.64.0.1"), Network::Unroutable);
+        assert_eq!(net("192.0.2.1"), Network::Unroutable);
+        assert_eq!(net("198.51.100.1"), Network::Unroutable);
+        assert_eq!(net("203.0.113.1"), Network::Unroutable);
+        assert_eq!(net("198.18.0.1"), Network::Unroutable);
+        assert_eq!(net("127.0.0.1"), Network::Unroutable);
+        assert_eq!(net("0.0.0.0"), Network::Unroutable);
+        assert_eq!(net("255.255.255.255"), Network::Unroutable);
+        assert_eq!(net("::1"), Network::Unroutable);
+        assert_eq!(net("::"), Network::Unroutable);
+        assert_eq!(net("fe80::1"), Network::Unroutable);
+        assert_eq!(net("2001:db8::1"), Network::Unroutable);
+        assert_eq!(net("2001:10::1"), Network::Unroutable); // ORCHIDv1
+        assert_eq!(net("2001:20::1"), Network::Unroutable); // ORCHIDv2
+        // fc00::/7 without -cjdnsreachable stays IPv6 → RFC4193.
+        assert_eq!(net("fc00::1"), Network::Unroutable);
+        assert_eq!(net("fd00::1"), Network::Unroutable);
+        // v4-mapped notation classifies by the embedded v4.
+        assert_eq!(net("::ffff:1.2.3.4"), Network::Ipv4);
+        assert_eq!(net("::ffff:10.0.0.1"), Network::Unroutable);
+    }
+
+    #[test]
+    fn unroutable_never_enters_the_book() {
+        let mut book = AddrBook::new();
+        let local = net_addr_of("10.0.0.1:8333".parse().unwrap(), NODE_NETWORK);
+        assert!(!book.add(local, 100, 200));
+        assert!(book.is_empty());
+        // Duplicates are reported as non-inserts like Core.
+        assert!(book.add(addr(1, 8333), 100, 200));
+        assert!(!book.add(addr(1, 8333), 150, 200));
+        // Different services, same endpoint → one entry, OR'd flags.
+        let mut richer = addr(1, 8333);
+        richer.services |= 1 << 10; // NODE_NETWORK_LIMITED
+        assert!(!book.add(richer, 160, 200));
+        let e = &book.table[&key_of(&addr(1, 8333))];
+        assert_eq!(e.addr.services, NODE_NETWORK | (1 << 10));
+        assert_eq!(e.last_seen, 160);
+        // count/network filters drive getnodeaddresses.
+        assert_eq!(book.entries(0, None).len(), 1);
+        assert_eq!(book.entries(0, Some(Network::Ipv6)).len(), 0);
+        assert_eq!(book.entries(0, Some(Network::Ipv4)).len(), 1);
     }
 
     #[test]

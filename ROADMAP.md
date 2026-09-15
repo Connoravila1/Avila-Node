@@ -185,7 +185,10 @@ operation. Compare complete initial download and catch-up, not only local replay
       gettxspendingprevout (outpoint-indexed mempool spends,
       Core's full argument error taxonomy), getindexinfo
       (txindex state + name filter), getnettotals (cumulative
-      wire bytes across live and closed sessions)) — verified
+      wire bytes across live and closed sessions),
+      getnodeaddresses/addpeeraddress (Core's addrman surface —
+      entries keyed by (ip,port), unroutable addresses rejected
+      like AddSingle, services union on re-gossip)) — verified
       live over curl and the client.
       Genesis is served even though its body is never stored:
       `Params::genesis_block` reconstructs Core's per-network

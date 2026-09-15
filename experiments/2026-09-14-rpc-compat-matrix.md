@@ -227,6 +227,20 @@ surfaced:
   so a dropped peer's traffic doesn't vanish. `uploadtarget` reports
   the unlimited (`-maxuploadtarget=0`) shape since no cycle budget is
   enforced.
+- `getnodeaddresses`/`addpeeraddress` landed with Core's full
+  `GetNetClass`/`IsRoutable` model: the addrbook now keys entries by
+  (ip, port) like `CAddress::GetKey`, unions services on re-gossip
+  (`nServices |=`), and — the behavioral change — **rejects unroutable
+  addresses entirely**, matching `AddrManImpl::AddSingle`'s
+  `!IsRoutable()` gate. Gossip of loopback/private/doc-range addresses
+  no longer enters the book (Knots' regtest book is empty for the same
+  reason), and `load` drops stale unroutable rows from older
+  `peers.dat` files. `fc00::/7` classifies as unroutable because
+  `MaybeFlipIPv6toCJDNS` only flips when `-cjdnsreachable` is set —
+  verified live: `addpeeraddress "fc00::1"` is `failed-adding-to-new`
+  on both daemons, while `2002::1` (6to4 linked-v4) stores and reports
+  `network:"ipv4"`. Onion/I2P inputs return `{"success":false}` — our
+  16-byte `NetAddr` can't represent them.
 
 ### Known semantic differences
 

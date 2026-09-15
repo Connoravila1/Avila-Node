@@ -452,6 +452,12 @@ const GETNETWORKHASHPS_HELP: &str = "getnetworkhashps ( nblocks height )\n\nRetu
 /// Verbatim `help getnettotals` text (Bitcoin Core 29).
 const GETNETTOTALS_HELP: &str = "getnettotals\n\nReturns information about network traffic, including bytes in, bytes out,\nand current system time.\n\nResult:\n{                                              (json object)\n  \"totalbytesrecv\" : n,                        (numeric) Total bytes received\n  \"totalbytessent\" : n,                        (numeric) Total bytes sent\n  \"timemillis\" : xxx,                          (numeric) Current system UNIX epoch time in milliseconds\n  \"uploadtarget\" : {                           (json object)\n    \"timeframe\" : n,                           (numeric) Length of the measuring timeframe in seconds\n    \"target\" : n,                              (numeric) Target in bytes\n    \"target_reached\" : true|false,             (boolean) True if target is reached\n    \"serve_historical_blocks\" : true|false,    (boolean) True if serving historical blocks\n    \"bytes_left_in_cycle\" : n,                 (numeric) Bytes left in current time cycle\n    \"time_left_in_cycle\" : n                   (numeric) Seconds left in current time cycle\n  }\n}\n\nExamples:\n> bitcoin-cli getnettotals \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getnettotals\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+/// Verbatim `help getnodeaddresses` text (Bitcoin Core 29).
+const GETNODEADDRESSES_HELP: &str = "getnodeaddresses ( count \"network\" )\n\nReturn known addresses, after filtering for quality and recency.\nThese can potentially be used to find new peers in the network.\nThe total number of addresses known to the node may be higher.\n\nArguments:\n1. count      (numeric, optional, default=1) The maximum number of addresses to return. Specify 0 to return all known addresses.\n2. network    (string, optional, default=all networks) Return only addresses of the specified network. Can be one of: ipv4, ipv6, onion, i2p, cjdns.\n\nResult:\n[                         (json array)\n  {                       (json object)\n    \"time\" : xxx,         (numeric) The UNIX epoch time when the node was last seen\n    \"services\" : n,       (numeric) The services offered by the node\n    \"address\" : \"str\",    (string) The address of the node\n    \"port\" : n,           (numeric) The port number of the node\n    \"network\" : \"str\"     (string) The network (ipv4, ipv6, onion, i2p, cjdns) the node connected through\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli getnodeaddresses 8\n> bitcoin-cli getnodeaddresses 4 \"i2p\"\n> bitcoin-cli -named getnodeaddresses network=onion count=12\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getnodeaddresses\", \"params\": [8]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getnodeaddresses\", \"params\": [4, \"i2p\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help addpeeraddress` text (Bitcoin Core 29).
+const ADDPEERADDRESS_HELP: &str = "addpeeraddress \"address\" port ( tried )\n\nAdd the address of a potential peer to an address manager table. This RPC is for testing only.\n\nArguments:\n1. address    (string, required) The IP address of the peer\n2. port       (numeric, required) The port of the peer\n3. tried      (boolean, optional, default=false) If true, attempt to add the peer to the tried addresses table\n\nResult:\n{                            (json object)\n  \"success\" : true|false,    (boolean) whether the peer address was successfully added to the address manager table\n  \"error\" : \"str\"            (string, optional) error description, if the address could not be added\n}\n\nExamples:\n> bitcoin-cli addpeeraddress \"1.2.3.4\" 8333 true\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"addpeeraddress\", \"params\": [\"1.2.3.4\", 8333, true]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 /// Verbatim `help getindexinfo` text (Bitcoin Core 29).
 const GETINDEXINFO_HELP: &str = "getindexinfo ( \"index_name\" )\n\nReturns the status of one or all available indices currently running in the node.\n\nArguments:\n1. index_name    (string, optional) Filter results for an index with a specific name.\n\nResult:\n{                               (json object)\n  \"name\" : {                    (json object) The name of the index\n    \"synced\" : true|false,      (boolean) Whether the index is synced or not\n    \"best_block_height\" : n     (numeric) The block height to which the index is synced\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getindexinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> bitcoin-cli getindexinfo txindex\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": [txindex]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -2743,6 +2749,181 @@ fn dispatch(
                 }))
             })
         }
+        "getnodeaddresses" => {
+            // RPCHelpMan: 0–2 args.
+            if params.as_array().is_some_and(|a| a.len() > 2) {
+                return help_error(GETNODEADDRESSES_HELP);
+            }
+            // `count`: getInt<int> — float/out-of-i32 is -1, non-number
+            // is -3, negative is -8; 0 returns the whole (filtered) book.
+            let count = match param(params, 0, "count") {
+                None => 1i64,
+                Some(v) if v.is_null() => 1,
+                Some(v) if !v.is_number() => {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, wrong_type_message(1, "count", v, "number"))),
+                    );
+                }
+                Some(v) => match v.as_i64() {
+                    Some(n)
+                        if !v.is_f64() && n >= i64::from(i32::MIN) && n <= i64::from(i32::MAX) =>
+                    {
+                        if n < 0 {
+                            return (
+                                Value::Null,
+                                Some((RPC_INVALID_PARAMETER, "Address count out of range".into())),
+                            );
+                        }
+                        n
+                    }
+                    _ => {
+                        return (
+                            Value::Null,
+                            Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                        );
+                    }
+                },
+            };
+            // `network`: ParseNetwork — unknown names are -8.
+            let network = match param(params, 1, "network") {
+                None => None,
+                Some(v) if v.is_null() => None,
+                Some(v) if !v.is_string() => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(2, "network", v, "string"),
+                        )),
+                    );
+                }
+                Some(v) => {
+                    let name = v.as_str().unwrap_or_default();
+                    match avila_p2p::addrman::parse_network(name) {
+                        Some(n) => Some(n),
+                        None => {
+                            return (
+                                Value::Null,
+                                Some((
+                                    RPC_INVALID_PARAMETER,
+                                    format!("Network not recognized: {name}"),
+                                )),
+                            );
+                        }
+                    }
+                }
+            };
+            chain_query(queries, move |_, mgr| {
+                let entries = mgr.addr_book().entries(count as usize, network);
+                Ok(Value::Array(
+                    entries
+                        .iter()
+                        .map(|e| {
+                            json!({
+                                "time": e.last_seen,
+                                "services": e.addr.services,
+                                "address": avila_p2p::addrman::socket_addr(&e.addr)
+                                    .ip()
+                                    .to_string(),
+                                "port": e.addr.port,
+                                "network": avila_p2p::addrman::network_name(
+                                    avila_p2p::addrman::network_of(&e.addr),
+                                ),
+                            })
+                        })
+                        .collect(),
+                ))
+            })
+        }
+        // Test-only address injection — `addpeeraddress`. Onion/I2P
+        // names can't be represented in our 16-byte `NetAddr`, so they
+        // take the unparseable path (Core stores them; we report
+        // `success:false` without an error string).
+        "addpeeraddress" => {
+            let arity_ok = params
+                .as_array()
+                .is_some_and(|a| (2..=3).contains(&a.len()));
+            if !arity_ok {
+                return help_error(ADDPEERADDRESS_HELP);
+            }
+            let (Some(address), Some(port_v)) =
+                (param(params, 0, "address"), param(params, 1, "port"))
+            else {
+                return help_error(ADDPEERADDRESS_HELP);
+            };
+            let Some(addr_str) = address.as_str() else {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_message(1, "address", address, "string"),
+                    )),
+                );
+            };
+            let addr_str = addr_str.to_owned();
+            if !port_v.is_number() {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_message(2, "port", port_v, "number"),
+                    )),
+                );
+            }
+            let port = match port_v.as_i64() {
+                Some(n) if !port_v.is_f64() && (0..=65535).contains(&n) => n as u16,
+                _ => {
+                    return (
+                        Value::Null,
+                        Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                    );
+                }
+            };
+            let tried = match param(params, 2, "tried") {
+                None => false,
+                Some(v) if v.is_null() => false,
+                Some(v) if !v.is_boolean() => {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, wrong_type_message(3, "tried", v, "boolean"))),
+                    );
+                }
+                Some(v) => v.as_bool().unwrap_or(false),
+            };
+            chain_query(queries, move |_, mgr| {
+                let mut obj = serde_json::Map::new();
+                match addr_str.parse::<std::net::IpAddr>() {
+                    Ok(ip) => {
+                        use avila_p2p::addrman;
+                        use avila_p2p::message::{NODE_NETWORK, NODE_WITNESS};
+                        let addr = addrman::net_addr_of(
+                            std::net::SocketAddr::new(ip, port),
+                            NODE_NETWORK | NODE_WITNESS,
+                        );
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as u32)
+                            .unwrap_or(0);
+                        if mgr.addrbook().add(addr, now, now) {
+                            if tried {
+                                mgr.addrbook().mark_tried(&addr);
+                            }
+                            obj.insert("success".into(), json!(true));
+                        } else {
+                            // Duplicate or unroutable — Core's
+                            // AddSingle rejects both identically.
+                            obj.insert("error".into(), json!("failed-adding-to-new"));
+                            obj.insert("success".into(), json!(false));
+                        }
+                    }
+                    Err(_) => {
+                        obj.insert("success".into(), json!(false));
+                    }
+                }
+                Ok(Value::Object(obj))
+            })
+        }
         "getnetworkinfo" => chain_query(queries, |_cs, mgr| {
             let snaps = mgr.peer_snapshots();
             let inbound = snaps.iter().filter(|p| p.inbound).count();
@@ -2905,7 +3086,8 @@ fn dispatch(
                  \x20   submitheader <hex>, generatetoaddress <n> <address> [maxtries],\n\
                  \x20   generateblock <output> [rawtx/txid,...]\n\
                  \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo,\n\
-                 \x20   getnettotals\n\
+                 \x20   getnettotals, getnodeaddresses [count] [network],\n\
+                 \x20   addpeeraddress <address> <port> [tried]\n\
                  \x20 misc:  estimatesmartfee <target>, uptime, help, stop"
             ),
             None,
@@ -3888,6 +4070,115 @@ mod tests {
         assert_eq!(r["uploadtarget"]["timeframe"], json!(86400));
         assert_eq!(r["uploadtarget"]["serve_historical_blocks"], json!(true));
         let (_, e) = dispatch("getnettotals", &json!([1]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+    }
+
+    /// `getnodeaddresses` — Core's count/network argument contract and
+    /// `{time, services, address, port, network}` entry shape.
+    #[test]
+    fn getnodeaddresses_reports_book_entries() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        // Seed the book through the test-only injection RPC.
+        let (r, e) = dispatch(
+            "addpeeraddress",
+            &json!(["93.184.216.34", 18444]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, json!({"success": true}));
+        // Unroutable and duplicate adds fail like Core's AddSingle.
+        let (r, e) = dispatch(
+            "addpeeraddress",
+            &json!(["127.0.0.1", 8333]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(
+            r,
+            json!({"error": "failed-adding-to-new", "success": false})
+        );
+        let (r, _) = dispatch(
+            "addpeeraddress",
+            &json!(["93.184.216.34", 18444]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(r["success"], json!(false));
+        // Unparseable → success:false with no error key.
+        let (r, _) = dispatch(
+            "addpeeraddress",
+            &json!(["notanip", 8333]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(r, json!({"success": false}));
+
+        let (r, e) = dispatch("getnodeaddresses", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        let entries = r.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["address"], json!("93.184.216.34"));
+        assert_eq!(entries[0]["port"], json!(18444));
+        assert_eq!(entries[0]["network"], json!("ipv4"));
+        assert_eq!(entries[0]["services"], json!(9)); // NODE_NETWORK|NODE_WITNESS
+        // Filtered views: matching name returns, non-matching empties.
+        let (r, _) = dispatch(
+            "getnodeaddresses",
+            &json!([0, "ipv4"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(r.as_array().unwrap().len(), 1);
+        let (r, _) = dispatch(
+            "getnodeaddresses",
+            &json!([0, "onion"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(r.as_array().unwrap().len(), 0);
+        // Error paths.
+        let (_, e) = dispatch(
+            "getnodeaddresses",
+            &json!([-1]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        let (_, e) = dispatch(
+            "getnodeaddresses",
+            &json!([5, "bogus"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        let (_, e) = dispatch(
+            "getnodeaddresses",
+            &json!(["x"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
+        let (_, e) = dispatch("addpeeraddress", &json!([]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+        let (_, e) = dispatch(
+            "addpeeraddress",
+            &json!(["1.2.3.4", 70000]),
+            &snap,
+            Some(&queries),
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 }

@@ -1746,11 +1746,11 @@ mod tests {
         let gossip = vec![
             AddrEntry {
                 time: NOW - 10,
-                addr: addrman::loopback(18444, NODE_NETWORK),
+                addr: addrman::net_addr_of("93.184.216.34:18444".parse().unwrap(), NODE_NETWORK),
             },
             AddrEntry {
                 time: NOW - 5,
-                addr: addrman::loopback(18445, NODE_NETWORK),
+                addr: addrman::net_addr_of("93.184.216.35:18445".parse().unwrap(), NODE_NETWORK),
             },
         ];
         testpipe::inject(&mut peer, MAGIC, &Message::Addr(gossip));
@@ -1767,7 +1767,7 @@ mod tests {
 
         let gossip = vec![AddrEntry {
             time: NOW - 10,
-            addr: addrman::loopback(18444, NODE_NETWORK),
+            addr: addrman::net_addr_of("93.184.216.34:18444".parse().unwrap(), NODE_NETWORK),
         }];
         testpipe::inject(&mut peer, MAGIC, &Message::Addr(gossip));
         testpipe::inject(&mut peer, MAGIC, &Message::GetAddr);
