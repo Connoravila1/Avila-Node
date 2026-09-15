@@ -361,6 +361,28 @@ def build_calls(height):
         ("waitfornewblock", [-1]),
         ("waitfornewblock", [1, 2]),
         ("waitfornewblock", [300]),
+        # createrawtransaction — ConstructTransaction's contract:
+        # collected -3s skip the union-typed outputs arg; locktime
+        # parses before inputs; sequence defaults follow replaceable/
+        # locktime; outputs accept the array-of-pairs and dict forms.
+        ("createrawtransaction", []),
+        ("createrawtransaction", ["x"]),
+        ("createrawtransaction", ["x", "x", "x", "x"]),
+        ("createrawtransaction", [[], [{"data": "aa"}]]),
+        ("createrawtransaction", [[{"txid": "ab" * 32, "vout": 0}], [{"data": "aa"}]]),
+        ("createrawtransaction", [[{"txid": "ab" * 32, "vout": 0}], [{"data": "aa"}], 5]),
+        ("createrawtransaction", [[{"txid": "ab" * 32, "vout": 0}], [{"data": "aa"}], 5, False]),
+        ("createrawtransaction", [[{"txid": "ab" * 32, "vout": 0}], [{"data": "aa"}], 0, True]),
+        ("createrawtransaction", [[7], [{"data": "aa"}]]),
+        ("createrawtransaction", [[{}], [{"data": "aa"}]]),
+        ("createrawtransaction", [[{"txid": "ab" * 32}], [{"data": "aa"}]]),
+        ("createrawtransaction", [[{"txid": "ab" * 32, "vout": -1}], [{"data": "aa"}]]),
+        ("createrawtransaction", [[{"txid": "ab" * 32, "vout": 0}], [{"data": "aa"}, {"data": "bb"}]]),
+        ("createrawtransaction", [[{"txid": "ab" * 32, "vout": 0}], [{"data": 7}]]),
+        ("createrawtransaction", [[{"txid": "ab" * 32, "vout": 0}], [{"data2": 0.01}]]),
+        ("createrawtransaction", [[{"txid": "ab" * 32, "vout": 0}], [{"data2": "x"}]]),
+        ("createrawtransaction", [[{"txid": "ab" * 32, "vout": 0}], [{"data": "aa"}], -1]),
+        ("createrawtransaction", [[{"txid": "ab" * 32, "vout": 0, "sequence": 4294967295}], [{"data": "aa"}], 0, True]),
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),
         ("estimatesmartfee", [6]),

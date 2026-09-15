@@ -72,11 +72,11 @@ python3 tools/compare_rpc.py \
 
 ## Results
 
-Latest run vs **Core 29.4** at h163: 98 MATCH, 1 EXPECTED-DIFF
+Latest run vs **Core 29.4** at h163: 102 MATCH, 1 EXPECTED-DIFF
 (`getrawtransaction`'s `in_active_chain` — an upstream field added
 after 29.4, verified present in Core 31.1), 0 DIFFERS, 1 CORE-ERROR
 (`gettxoutproof prove_witness` — the witness-proof wire format is a
-Knots extension Core doesn't implement), 129 BOTH-ERROR (identical
+Knots extension Core doesn't implement), 143 BOTH-ERROR (identical
 error paths). `getpeerinfo` now matches fully once the peer pair
 settles — the earlier per-peer shape diff was connection-phase
 state. First matrix vs Knots: 46 MATCH, 2 EXPECTED-DIFF,
@@ -468,6 +468,25 @@ surfaced:
   `arbitrary_precision` feature so `float_g16`'s literal survives
   re-serialization; `txrate` emits through it and now matches
   byte-for-byte.
+- `createrawtransaction` landed as a faithful port of Core 29.4's
+  `ConstructTransaction` (`rpc/rawtransaction_util.cpp`): arity → the
+  collected `-3` list (which skips union-typed `outputs`, verified —
+  Position 2 never appears) → locktime `getInt`+u32 bound **before**
+  inputs → per-input object/`txid`/`vout`/`sequence` checks →
+  `NormalizeOutputs` (dict or single-pair-object array, preserving
+  order and duplicates) → `ParseOutputs` (data `ParseHexV` on the
+  stringified value; `AmountFromValue` before address validation;
+  dedup on the decoded destination) → the replaceable/sequence
+  combination check last. Sequence defaults follow Core exactly:
+  `0xfffffffd` when replaceable (the default), `0xfffffffe` when
+  locktime-activated, `0xffffffff` otherwise. Amounts go through a
+  faithful `ParseFixedPoint` port — the `10^18-1` overflow bound,
+  single-leading-zero rule, and `e`/`E` exponent — and serde_json
+  gained `preserve_order` so dict-form outputs serialize in the
+  caller's key order like UniValue. Verified live: 54 cases
+  byte-identical including string amounts (`"1e-3"`), dict/array
+  output ordering, scalar `data` stringification (`7` →
+  `"not '7'"`), and the OP_RETURN construction.
 
 ### Known semantic differences
 

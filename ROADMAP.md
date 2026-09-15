@@ -261,7 +261,14 @@ operation. Compare complete initial download and catch-up, not only local replay
       waits — predicates register atomically through the chain-query
       channel, a bounded per-tick registry on the sync loop fires them,
       and a drop guard wakes every waiter on shutdown; verified live by
-      a Core-mined block releasing parked calls with the new tip). RPC
+      a Core-mined block releasing parked calls with the new tip),
+      createrawtransaction (a faithful `ConstructTransaction` port —
+      union-typed `outputs` skips the collected `-3` list, locktime
+      parses before inputs, sequences default to `0xfffffffd`/
+      `0xfffffffe`/`0xffffffff` by replaceable+locktime, amounts go
+      through a `ParseFixedPoint` port including the `e`-exponent path,
+      and dict-form outputs preserve key order like UniValue via
+      serde_json's `preserve_order`). RPC
       doubles emit Core's `UniValue::setFloat` text (`%.16g` via `g16`)
       rather than ryu's shortest repr — the two parse to different
       f64s on values like 101/17, and `txrate` now matches

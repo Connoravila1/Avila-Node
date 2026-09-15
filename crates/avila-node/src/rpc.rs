@@ -765,6 +765,143 @@ where
     })
 }
 
+/// Core's `UniValue::getValStr` — the scalar string form: strings and
+/// numbers return their literal text, `true` returns `"1"`, and
+/// `false`, `null`, arrays and objects return `""`.
+fn val_str(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => if *b { "1" } else { "" }.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Core's `ParseFixedPoint` (`util/strencodings.cpp`) — a faithful port
+/// down to the overflow bound (`10^18 - 1`), the single leading zero
+/// rule, optional `e`/`E` exponent, and the trailing-garbage check.
+fn parse_fixed_point(val: &str, decimals: i64) -> Option<i64> {
+    const UPPER_BOUND: i64 = 1_000_000_000_000_000_000 - 1;
+    let b = val.as_bytes();
+    let (mut ptr, end) = (0usize, b.len());
+    let mut mantissa: i64 = 0;
+    let mut exponent: i64 = 0;
+    let mut mantissa_tzeros = 0i32;
+    let (mut mantissa_sign, mut exponent_sign) = (false, false);
+    let mut point_ofs = 0i64;
+
+    fn digit(m: &mut i64, tz: &mut i32, ch: u8) -> bool {
+        if ch == b'0' {
+            *tz += 1;
+        } else {
+            for _ in 0..=*tz {
+                if *m > UPPER_BOUND / 10 {
+                    return false;
+                }
+                *m *= 10;
+            }
+            *m += i64::from(ch - b'0');
+            *tz = 0;
+        }
+        true
+    }
+
+    if ptr < end && b[ptr] == b'-' {
+        mantissa_sign = true;
+        ptr += 1;
+    }
+    if ptr < end {
+        if b[ptr] == b'0' {
+            ptr += 1;
+        } else if b[ptr].is_ascii_digit() {
+            while ptr < end && b[ptr].is_ascii_digit() {
+                if !digit(&mut mantissa, &mut mantissa_tzeros, b[ptr]) {
+                    return None;
+                }
+                ptr += 1;
+            }
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    }
+    if ptr < end && b[ptr] == b'.' {
+        ptr += 1;
+        if ptr < end && b[ptr].is_ascii_digit() {
+            while ptr < end && b[ptr].is_ascii_digit() {
+                if !digit(&mut mantissa, &mut mantissa_tzeros, b[ptr]) {
+                    return None;
+                }
+                ptr += 1;
+                point_ofs += 1;
+            }
+        } else {
+            return None;
+        }
+    }
+    if ptr < end && (b[ptr] == b'e' || b[ptr] == b'E') {
+        ptr += 1;
+        if ptr < end && b[ptr] == b'+' {
+            ptr += 1;
+        } else if ptr < end && b[ptr] == b'-' {
+            exponent_sign = true;
+            ptr += 1;
+        }
+        if ptr < end && b[ptr].is_ascii_digit() {
+            while ptr < end && b[ptr].is_ascii_digit() {
+                if exponent > UPPER_BOUND / 10 {
+                    return None;
+                }
+                exponent = exponent * 10 + i64::from(b[ptr] - b'0');
+                ptr += 1;
+            }
+        } else {
+            return None;
+        }
+    }
+    if ptr != end {
+        return None;
+    }
+    if exponent_sign {
+        exponent = -exponent;
+    }
+    exponent += mantissa_tzeros as i64 - point_ofs;
+    if mantissa_sign {
+        mantissa = -mantissa;
+    }
+    exponent += decimals;
+    if !(0..18).contains(&exponent) {
+        return None;
+    }
+    for _ in 0..exponent {
+        if !(-(UPPER_BOUND / 10)..=UPPER_BOUND / 10).contains(&mantissa) {
+            return None;
+        }
+        mantissa *= 10;
+    }
+    if !(-UPPER_BOUND..=UPPER_BOUND).contains(&mantissa) {
+        return None;
+    }
+    Some(mantissa)
+}
+
+/// Core's `AmountFromValue` (`rpc/util.cpp`) — a number or string run
+/// through `ParseFixedPoint` at 8 decimals, then `MoneyRange`
+/// (`0 <= v <= 21000000*COIN`).
+fn amount_from_value(v: &Value) -> Result<i64, (i64, String)> {
+    if !v.is_number() && !v.is_string() {
+        return Err((RPC_TYPE_ERROR, "Amount is not a number or string".into()));
+    }
+    let Some(amount) = parse_fixed_point(&val_str(v), 8) else {
+        return Err((RPC_TYPE_ERROR, "Invalid amount".into()));
+    };
+    if !(0..=21_000_000 * 100_000_000).contains(&amount) {
+        return Err((RPC_TYPE_ERROR, "Amount out of range".into()));
+    }
+    Ok(amount)
+}
+
 /// `LookupSubNet` — parses `"a.b.c.d/n"` or `"v6::/n"` into the
 /// 16-byte network plus prefix length (v4 nets become v6-mapped with
 /// a +96 shift). `None` on anything unparseable.
@@ -817,6 +954,9 @@ fn epoch_secs() -> i64 {
 
 /// Verbatim `help decoderawtransaction` text (Bitcoin Core 29).
 const DECODERAWTRANSACTION_HELP: &str = "decoderawtransaction \"hexstring\" ( iswitness )\n\nReturn a JSON object representing the serialized, hex-encoded transaction.\n\nArguments:\n1. hexstring    (string, required) The transaction hex string\n2. iswitness    (boolean, optional, default=depends on heuristic tests) Whether the transaction hex is a serialized witness transaction.\n                If iswitness is not present, heuristic tests will be used in decoding.\n                If true, only witness deserialization will be tried.\n                If false, only non-witness deserialization will be tried.\n                This boolean should reflect whether the transaction has inputs\n                (e.g. fully valid, or on-chain transactions), if known by the caller.\n\nResult:\n{                             (json object)\n  \"txid\" : \"hex\",             (string) The transaction id\n  \"hash\" : \"hex\",             (string) The transaction hash (differs from txid for witness transactions)\n  \"size\" : n,                 (numeric) The serialized transaction size\n  \"vsize\" : n,                (numeric) The virtual transaction size (differs from size for witness transactions)\n  \"weight\" : n,               (numeric) The transaction's weight (between vsize*4-3 and vsize*4)\n  \"version\" : n,              (numeric) The version\n  \"locktime\" : xxx,           (numeric) The lock time\n  \"vin\" : [                   (json array)\n    {                         (json object)\n      \"coinbase\" : \"hex\",     (string, optional) The coinbase value (only if coinbase transaction)\n      \"txid\" : \"hex\",         (string, optional) The transaction id (if not coinbase transaction)\n      \"vout\" : n,             (numeric, optional) The output number (if not coinbase transaction)\n      \"scriptSig\" : {         (json object, optional) The script (if not coinbase transaction)\n        \"asm\" : \"str\",        (string) Disassembly of the signature script\n        \"hex\" : \"hex\"         (string) The raw signature script bytes, hex-encoded\n      },\n      \"txinwitness\" : [       (json array, optional)\n        \"hex\",                (string) hex-encoded witness data (if any)\n        ...\n      ],\n      \"sequence\" : n          (numeric) The script sequence number\n    },\n    ...\n  ],\n  \"vout\" : [                  (json array)\n    {                         (json object)\n      \"value\" : n,            (numeric) The value in BTC\n      \"n\" : n,                (numeric) index\n      \"scriptPubKey\" : {      (json object)\n        \"asm\" : \"str\",        (string) Disassembly of the output script\n        \"desc\" : \"str\",       (string) Inferred descriptor for the output\n        \"hex\" : \"hex\",        (string) The raw output script bytes, hex-encoded\n        \"address\" : \"str\",    (string, optional) The Bitcoin address (only if a well-defined address exists)\n        \"type\" : \"str\"        (string) The type (one of: nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n      }\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli decoderawtransaction \"hexstring\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"decoderawtransaction\", \"params\": [\"hexstring\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help createrawtransaction` text (Bitcoin Core 29).
+const CREATERAWTRANSACTION_HELP: &str = "createrawtransaction [{\"txid\":\"hex\",\"vout\":n,\"sequence\":n},...] [{\"address\":amount,...},{\"data\":\"hex\"},...] ( locktime replaceable )\n\nCreate a transaction spending the given inputs and creating new outputs.\nOutputs can be addresses or data.\nReturns hex-encoded raw transaction.\nNote that the transaction's inputs are not signed, and\nit is not stored in the wallet or transmitted to the network.\n\nArguments:\n1. inputs                      (json array, required) The inputs\n     [\n       {                       (json object)\n         \"txid\": \"hex\",        (string, required) The transaction id\n         \"vout\": n,            (numeric, required) The output number\n         \"sequence\": n,        (numeric, optional, default=depends on the value of the 'replaceable' and 'locktime' arguments) The sequence number\n       },\n       ...\n     ]\n2. outputs                     (json array, required) The outputs specified as key-value pairs.\n                               Each key may only appear once, i.e. there can only be one 'data' output, and no address may be duplicated.\n                               At least one output of either type must be specified.\n                               For compatibility reasons, a dictionary, which holds the key-value pairs directly, is also\n                               accepted as second parameter.\n     [\n       {                       (json object)\n         \"address\": amount,    (numeric or string, required) A key-value pair. The key (string) is the bitcoin address, the value (float or string) is the amount in BTC\n         ...\n       },\n       {                       (json object)\n         \"data\": \"hex\",        (string, required) A key-value pair. The key must be \"data\", the value is hex-encoded data\n       },\n       ...\n     ]\n3. locktime                    (numeric, optional, default=0) Raw locktime. Non-0 value also locktime-activates inputs\n4. replaceable                 (boolean, optional, default=true) Marks this transaction as BIP125-replaceable.\n                               Allows this transaction to be replaced by a transaction with higher fees. If provided, it is an error if explicit sequence numbers are incompatible.\n\nResult:\n\"hex\"    (string) hex string of the transaction\n\nExamples:\n> bitcoin-cli createrawtransaction \"[{\\\"txid\\\":\\\"myid\\\",\\\"vout\\\":0}]\" \"[{\\\"address\\\":0.01}]\"\n> bitcoin-cli createrawtransaction \"[{\\\"txid\\\":\\\"myid\\\",\\\"vout\\\":0}]\" \"[{\\\"data\\\":\\\"00010203\\\"}]\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"createrawtransaction\", \"params\": [\"[{\\\"txid\\\":\\\"myid\\\",\\\"vout\\\":0}]\", \"[{\\\"address\\\":0.01}]\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"createrawtransaction\", \"params\": [\"[{\\\"txid\\\":\\\"myid\\\",\\\"vout\\\":0}]\", \"[{\\\"data\\\":\\\"00010203\\\"}]\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help gettxspendingprevout` text (Bitcoin Core 29).
 const GETTXSPENDINGPREVOUT_HELP: &str = "gettxspendingprevout [{\"txid\":\"hex\",\"vout\":n},...]\n\nScans the mempool to find transactions spending any of the given outputs\n\nArguments:\n1. outputs                 (json array, required) The transaction outputs that we want to check, and within each, the txid (string) vout (numeric).\n     [\n       {                   (json object)\n         \"txid\": \"hex\",    (string, required) The transaction id\n         \"vout\": n,        (numeric, required) The output number\n       },\n       ...\n     ]\n\nResult:\n[                              (json array)\n  {                            (json object)\n    \"txid\" : \"hex\",            (string) the transaction id of the checked output\n    \"vout\" : n,                (numeric) the vout value of the checked output\n    \"spendingtxid\" : \"hex\"     (string, optional) the transaction id of the mempool transaction spending this output (omitted if unspent)\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli gettxspendingprevout \"[{\\\"txid\\\":\\\"a08e6907dbbd3d809776dbfc5d82e371b764ed838b5655e72f463568df1aadf0\\\",\\\"vout\\\":3}]\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxspendingprevout\", \"params\": [[{\"txid\":\"a08e6907dbbd3d809776dbfc5d82e371b764ed838b5655e72f463568df1aadf0\",\"vout\":3}]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
@@ -3556,6 +3696,239 @@ fn dispatch(
                 cs.chain().last().map(ToString::to_string).as_deref() != Some(start_hash.as_str())
             })
         }
+        // Core's createrawtransaction — pure construction (no signing,
+        // no wallet, no broadcast), following `ConstructTransaction`
+        // in rpc/rawtransaction_util.cpp step for step.
+        "createrawtransaction" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() < 2 || arr.len() > 4 {
+                return help_error(CREATERAWTRANSACTION_HELP);
+            }
+            // RPCHelpMan type pass. `outputs` is declared VARR|VOBJ —
+            // a union Core's check skips at this layer (the body's
+            // NormalizeOutputs rejects scalars itself).
+            let mut type_errors: Vec<(usize, &str, &Value, &str)> = Vec::new();
+            if !arr[0].is_array() {
+                type_errors.push((1, "inputs", &arr[0], "array"));
+            }
+            if let Some(locktime) = arr.get(2)
+                && !(locktime.is_number() || locktime.is_null())
+            {
+                type_errors.push((3, "locktime", locktime, "number"));
+            }
+            if let Some(replaceable) = arr.get(3)
+                && !(replaceable.is_boolean() || replaceable.is_null())
+            {
+                type_errors.push((4, "replaceable", replaceable, "bool"));
+            }
+            if !type_errors.is_empty() {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_list(&type_errors))),
+                );
+            }
+            // Body order: locktime parses before any input field.
+            let locktime = match arr.get(2) {
+                None | Some(Value::Null) => 0u32,
+                Some(v) => {
+                    let Some(n) = v.as_i64() else {
+                        return (
+                            Value::Null,
+                            Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                        );
+                    };
+                    if !(0..=u32::MAX as i64).contains(&n) {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_INVALID_PARAMETER,
+                                "Invalid parameter, locktime out of range".into(),
+                            )),
+                        );
+                    }
+                    n as u32
+                }
+            };
+            let rbf: Option<bool> = arr.get(3).and_then(Value::as_bool);
+            let inputs = arr[0].clone();
+            let outputs = arr[1].clone();
+            chain_query(queries, move |cs, _| {
+                let params = cs.tree().params();
+                // AddInputs — per element: object check, ParseHashO
+                // txid, vout num/i32/non-negative, then the sequence
+                // default and any explicit override.
+                let default_seq = if rbf.unwrap_or(true) {
+                    0xffff_fffd // MAX_BIP125_RBF_SEQUENCE
+                } else if locktime != 0 {
+                    0xffff_fffe // CTxIn::MAX_SEQUENCE_NONFINAL
+                } else {
+                    0xffff_ffff // CTxIn::SEQUENCE_FINAL
+                };
+                let mut txins = Vec::new();
+                for input in inputs.as_array().map(Vec::as_slice).unwrap_or(&[]) {
+                    let Some(obj) = input.as_object() else {
+                        return Err((RPC_TYPE_ERROR, field_type_message(input, "object")));
+                    };
+                    let txid_v = obj.get("txid").unwrap_or(&Value::Null);
+                    let Some(txid_s) = txid_v.as_str() else {
+                        return Err((RPC_TYPE_ERROR, field_type_message(txid_v, "string")));
+                    };
+                    let txid: Txid = parse_hash_v(txid_s, "txid")?;
+                    let Some(vout_v) = obj.get("vout").filter(|v| v.is_number()) else {
+                        return Err((
+                            RPC_INVALID_PARAMETER,
+                            "Invalid parameter, missing vout key".into(),
+                        ));
+                    };
+                    let Some(vout) = vout_v.as_i64().and_then(|n| i32::try_from(n).ok()) else {
+                        return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
+                    };
+                    if vout < 0 {
+                        return Err((
+                            RPC_INVALID_PARAMETER,
+                            "Invalid parameter, vout cannot be negative".into(),
+                        ));
+                    }
+                    let mut sequence = default_seq;
+                    if let Some(seq_v) = obj.get("sequence").filter(|v| v.is_number()) {
+                        let Some(seq) = seq_v.as_i64() else {
+                            return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
+                        };
+                        if !(0..=u32::MAX as i64).contains(&seq) {
+                            return Err((
+                                RPC_INVALID_PARAMETER,
+                                "Invalid parameter, sequence number is out of range".into(),
+                            ));
+                        }
+                        sequence = seq as u32;
+                    }
+                    txins.push(avila_consensus::transaction::TxIn {
+                        previous_output: OutPoint {
+                            txid,
+                            vout: vout as u32,
+                        },
+                        script_sig: Script::new(Vec::new()),
+                        sequence,
+                        witness: avila_consensus::transaction::Witness::EMPTY,
+                    });
+                }
+                // NormalizeOutputs + ParseOutputs — dict form iterates
+                // its key order; array form requires single-pair
+                // objects and preserves duplicates for the checks.
+                let pairs: Vec<(&str, &Value)> = match &outputs {
+                    Value::Null => {
+                        return Err((
+                            RPC_INVALID_PARAMETER,
+                            "Invalid parameter, output argument must be non-null".into(),
+                        ));
+                    }
+                    Value::Object(map) => map.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+                    Value::Array(items) => {
+                        let mut pairs = Vec::new();
+                        for item in items {
+                            let Some(obj) = item.as_object() else {
+                                return Err((
+                                    RPC_INVALID_PARAMETER,
+                                    "Invalid parameter, key-value pair not an object as expected"
+                                        .into(),
+                                ));
+                            };
+                            if obj.len() != 1 {
+                                return Err((
+                                    RPC_INVALID_PARAMETER,
+                                    "Invalid parameter, key-value pair must contain exactly one key"
+                                        .into(),
+                                ));
+                            }
+                            // len == 1 was just enforced — the sole
+                            // pair is the output's key and value.
+                            if let Some((k, v)) = obj.iter().next() {
+                                pairs.push((k.as_str(), v));
+                            }
+                        }
+                        pairs
+                    }
+                    other => {
+                        return Err((RPC_TYPE_ERROR, field_type_message(other, "array")));
+                    }
+                };
+                let mut txouts = Vec::new();
+                let mut seen_scripts = std::collections::HashSet::new();
+                let mut has_data = false;
+                for (key, value) in pairs {
+                    if key == "data" {
+                        if has_data {
+                            return Err((
+                                RPC_INVALID_PARAMETER,
+                                "Invalid parameter, duplicate key: data".into(),
+                            ));
+                        }
+                        has_data = true;
+                        // ParseHexV on getValStr — non-strings stringify
+                        // (data:7 → "7"), then IsHex: nonempty, even
+                        // length, all hex digits.
+                        let s = val_str(value);
+                        let ok = !s.is_empty()
+                            && s.len().is_multiple_of(2)
+                            && s.bytes().all(|c| c.is_ascii_hexdigit());
+                        let Some(bytes) = ok.then(|| hex::decode(&s).ok()).flatten() else {
+                            return Err((
+                                RPC_INVALID_PARAMETER,
+                                format!("Data must be hexadecimal string (not '{s}')"),
+                            ));
+                        };
+                        let mut script = vec![avila_consensus::script::OP_RETURN];
+                        script.extend_from_slice(&avila_consensus::script::push_slice(&bytes));
+                        txouts.push(avila_consensus::transaction::TxOut {
+                            value: 0,
+                            script_pubkey: Script::new(script),
+                        });
+                    } else {
+                        // ParseOutputs: the amount parses before the
+                        // address validates, and dedup is on the
+                        // decoded destination (its script here).
+                        let amount = amount_from_value(value)?;
+                        let Some(script) = avila_consensus::address::address_to_script(key, params)
+                        else {
+                            return Err((
+                                RPC_INVALID_ADDRESS_OR_KEY,
+                                format!("Invalid Bitcoin address: {key}"),
+                            ));
+                        };
+                        if !seen_scripts.insert(script.as_bytes().to_vec()) {
+                            return Err((
+                                RPC_INVALID_PARAMETER,
+                                format!("Invalid parameter, duplicated address: {key}"),
+                            ));
+                        }
+                        txouts.push(avila_consensus::transaction::TxOut {
+                            value: amount,
+                            script_pubkey: script,
+                        });
+                    }
+                }
+                // The combination check runs last — after every input
+                // and output parsed.
+                if rbf == Some(true)
+                    && !txins.is_empty()
+                    && !txins.iter().any(|i| i.sequence <= 0xffff_fffd)
+                {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "Invalid parameter combination: Sequence number(s) contradict replaceable \
+                         option"
+                            .into(),
+                    ));
+                }
+                let tx = Transaction {
+                    version: 2, // CTransaction::CURRENT_VERSION
+                    inputs: txins,
+                    outputs: txouts,
+                    lock_time: locktime,
+                };
+                Ok(json!(hex::encode(&tx.encode())))
+            })
+        }
         "prioritisetransaction" => {
             let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
             if arr.len() != 3 {
@@ -5170,6 +5543,7 @@ fn dispatch(
                  \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
                  \x20   gettxspendingprevout <outputs>,\n\
                  \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>,\n\
+                 \x20   createrawtransaction <inputs> <outputs> [locktime] [replaceable],\n\
                  \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount], savemempool\n\
                  \x20 mining: getblocktemplate, getmininginfo, getnetworkhashps,\n\
                  \x20   submitblock <hex>,\n\
@@ -7395,6 +7769,244 @@ mod tests {
         let (r, e) = d("waitforblock", json!([hash, 60]));
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["height"], 0);
+    }
+
+    /// `createrawtransaction` — Core's `ConstructTransaction` contract:
+    /// arity/help, the union-typed `outputs` gap in the collected type
+    /// list, input field order, sequence defaults, and the output
+    /// forms including `data` and duplicate checks.
+    #[test]
+    fn createrawtransaction_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let d = |p: Value| {
+            dispatch(
+                "createrawtransaction",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+            )
+        };
+        let txid = "ab".repeat(32);
+        let addr = "bcrt1q4474gjxvqsq7k5dsvejgfuh8u0qlnqq8djekgk";
+
+        // Arity — required inputs+outputs, at most 4 args.
+        for p in [json!([]), json!([[]]), json!([[], [], 0, true, 5])] {
+            let (code, msg) = d(p.clone()).1.unwrap();
+            assert_eq!(code, RPC_MISC_ERROR, "{p}");
+            assert!(msg.starts_with("createrawtransaction"), "{msg}");
+        }
+
+        // Collected -3 list: inputs not an array, locktime and
+        // replaceable wrong — `outputs` is union-typed and skipped.
+        let (code, msg) = d(json!([7, "x", "x", "x"])).1.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert!(msg.contains("Position 1 (inputs)"), "{msg}");
+        assert!(!msg.contains("Position 2"), "{msg}");
+        assert!(msg.contains("Position 3 (locktime)"), "{msg}");
+        assert!(msg.contains("Position 4 (replaceable)"), "{msg}");
+
+        // Input element checks — bare -3 for non-objects and bad txid
+        // types, ParseHashV for bad hashes, vout errors in order.
+        let (code, msg) = d(json!([[7], [{"data": "aa"}]])).1.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert_eq!(
+            msg,
+            "JSON value of type number is not of expected type object"
+        );
+        let (code, msg) = d(json!([[{}], [{"data": "aa"}]])).1.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert_eq!(
+            msg,
+            "JSON value of type null is not of expected type string"
+        );
+        let (code, msg) = d(json!([[{"txid": "xx", "vout": 0}], [{"data": "aa"}]]))
+            .1
+            .unwrap();
+        assert_eq!(code, RPC_INVALID_PARAMETER);
+        assert!(msg.contains("txid must be of length 64"), "{msg}");
+        for (input, expect) in [
+            (json!({"txid": txid}), "Invalid parameter, missing vout key"),
+            (
+                json!({"txid": txid, "vout": "x"}),
+                "Invalid parameter, missing vout key",
+            ),
+            (
+                json!({"txid": txid, "vout": -1}),
+                "Invalid parameter, vout cannot be negative",
+            ),
+        ] {
+            let (code, msg) = d(json!([[input], [{"data": "aa"}]])).1.unwrap();
+            assert_eq!((code, msg), (RPC_INVALID_PARAMETER, expect.to_string()));
+        }
+        for vout in [json!(1.5), json!(4_294_967_295u64)] {
+            let (_, e) = d(json!([[{"txid": txid, "vout": vout}], [{"data": "aa"}]]));
+            assert_eq!(
+                e.unwrap(),
+                (RPC_MISC_ERROR, "JSON integer out of range".to_string())
+            );
+        }
+
+        // Sequence: non-numeric values are ignored (treated as
+        // missing), out-of-range is -8, non-integral -1.
+        let (_, e) = d(json!([[{"txid": txid, "vout": 0, "sequence": 1.5}], [{"data": "aa"}]]));
+        assert_eq!(
+            e.unwrap(),
+            (RPC_MISC_ERROR, "JSON integer out of range".to_string())
+        );
+        for seq in [json!(-1), json!(4_294_967_296u64)] {
+            let (_, e) = d(json!([[{"txid": txid, "vout": 0, "sequence": seq}], [{"data": "aa"}]]));
+            assert_eq!(
+                e.unwrap(),
+                (
+                    RPC_INVALID_PARAMETER,
+                    "Invalid parameter, sequence number is out of range".to_string()
+                )
+            );
+        }
+
+        // Outputs normalization — null, scalar, non-object element,
+        // multi-pair object, duplicate data.
+        for (outputs, expect) in [
+            (
+                Value::Null,
+                "Invalid parameter, output argument must be non-null",
+            ),
+            (
+                json!([7]),
+                "Invalid parameter, key-value pair not an object as expected",
+            ),
+            (
+                json!([{}]),
+                "Invalid parameter, key-value pair must contain exactly one key",
+            ),
+            (
+                json!([{"data": "aa"}, {"data": "bb"}]),
+                "Invalid parameter, duplicate key: data",
+            ),
+        ] {
+            let (code, msg) = d(json!([[{"txid": txid, "vout": 0}], outputs])).1.unwrap();
+            assert_eq!((code, msg), (RPC_INVALID_PARAMETER, expect.to_string()));
+        }
+        let (code, msg) = d(json!([[{"txid": txid, "vout": 0}], "x"])).1.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert_eq!(
+            msg,
+            "JSON value of type string is not of expected type array"
+        );
+
+        // The data value stringifies scalars then requires hex.
+        let (code, msg) = d(json!([[{"txid": txid, "vout": 0}], [{"data": 7}]]))
+            .1
+            .unwrap();
+        assert_eq!(
+            (code, msg),
+            (
+                RPC_INVALID_PARAMETER,
+                "Data must be hexadecimal string (not '7')".to_string()
+            )
+        );
+
+        // Amounts parse before the address validates — the "data2"
+        // key is an address, so a garbage amount errors first.
+        for (key, val, expect) in [
+            ("data2", json!("x"), "Invalid amount"),
+            (addr, json!(-0.1), "Amount out of range"),
+            (addr, json!(21_000_001), "Amount out of range"),
+            (addr, json!(0.000000001), "Invalid amount"),
+            (addr, json!(true), "Amount is not a number or string"),
+        ] {
+            let (_, e) = d(json!([[{"txid": txid, "vout": 0}], [{key: val}]]));
+            assert_eq!(
+                e.unwrap(),
+                (RPC_TYPE_ERROR, expect.to_string()),
+                "{key}: {val}"
+            );
+        }
+        for (key, expect) in [
+            ("data2", "Invalid Bitcoin address: data2"),
+            (
+                "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+                "Invalid Bitcoin address: 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+            ),
+        ] {
+            let (_, e) = d(json!([[{"txid": txid, "vout": 0}], [{key: 0.01}]]));
+            assert_eq!(e.unwrap(), (RPC_INVALID_ADDRESS_OR_KEY, expect.to_string()));
+        }
+        let (_, e) = d(json!([[{"txid": txid, "vout": 0}], [{addr: 0.01}, {addr: 0.02}]]));
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_INVALID_PARAMETER,
+                format!("Invalid parameter, duplicated address: {addr}")
+            )
+        );
+
+        // Locktime — i64 parse then the u32 bound; explicit-replaceable
+        // with a final sequence is the combination error.
+        for (lt, expect) in [
+            (json!(-1), "Invalid parameter, locktime out of range"),
+            (
+                json!(4_294_967_296u64),
+                "Invalid parameter, locktime out of range",
+            ),
+        ] {
+            let (_, e) = d(json!([[{"txid": txid, "vout": 0}], [{"data": "aa"}], lt]));
+            assert_eq!(e.unwrap(), (RPC_INVALID_PARAMETER, expect.to_string()));
+        }
+        let (_, e) = d(json!([[{"txid": txid, "vout": 0}], [{"data": "aa"}], 1.5]));
+        assert_eq!(
+            e.unwrap(),
+            (RPC_MISC_ERROR, "JSON integer out of range".to_string())
+        );
+        for seq in [json!(u32::MAX), json!(u32::MAX - 1)] {
+            let (_, e) = d(json!([
+                [{"txid": txid, "vout": 0, "sequence": seq}],
+                [{"data": "aa"}],
+                0,
+                true
+            ]));
+            assert_eq!(
+                e.unwrap(),
+                (
+                    RPC_INVALID_PARAMETER,
+                    "Invalid parameter combination: Sequence number(s) contradict replaceable \
+                     option"
+                        .to_string()
+                )
+            );
+        }
+
+        // Valid shapes — the data-only empty-input transaction is the
+        // literal Core produced on regtest.
+        let (r, e) = d(json!([[], [{"data": "aa"}]]));
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, "0200000000010000000000000000036a01aa00000000");
+        // replaceable defaults to true → BIP125 sequence.
+        let (r, e) = d(json!([[{"txid": txid, "vout": 0}], [{"data": "aa"}]]));
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(
+            r,
+            format!("0200000001{txid}0000000000fdffffff010000000000000000036a01aa00000000")
+        );
+        // locktime without replaceable → SEQUENCE_FINAL - 1.
+        let (r, e) = d(json!([[{"txid": txid, "vout": 0}], [{"data": "aa"}], 5, false]));
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(
+            r,
+            format!("0200000001{txid}0000000000feffffff010000000000000000036a01aa05000000")
+        );
+        // Address + string amount; dict form preserves key order.
+        let (r, e) = d(json!([[{"txid": txid, "vout": 0}], {addr: "0.01"}, 0, false]));
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(
+            r,
+            format!(
+                "0200000001{txid}0000000000ffffffff0140420f0000000000160014ad7d5448cc0401eb51b0666484f2e7e3c1f9800700000000"
+            )
+        );
     }
 
     /// `g16` — Core's `setFloat` text: `%.16g` with its fixed/scientific
