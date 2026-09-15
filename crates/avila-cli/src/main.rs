@@ -45,6 +45,10 @@ enum Command {
         /// (e.g. 127.0.0.1:18443).
         #[arg(long)]
         rpc: Option<SocketAddr>,
+        /// Maintain a txid index (Core's -txindex) so getrawtransaction
+        /// finds transactions without a named block.
+        #[arg(long)]
+        txindex: bool,
     },
     /// Sync headers and blocks from live peers (headers-first, full
     /// consensus validation). Bounded by target height and timeout.
@@ -72,6 +76,9 @@ enum Command {
         /// Prune blk files to ~this many MiB after syncing (needs --store).
         #[arg(long)]
         prune_mb: Option<u64>,
+        /// Maintain a txid index (Core's -txindex) for txid lookups.
+        #[arg(long)]
+        txindex: bool,
     },
     /// Call a JSON-RPC method on a running daemon — the bitcoin-cli
     /// analog. Positional params are parsed as raw JSON values, falling
@@ -117,6 +124,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             connect,
             proxy,
             rpc,
+            txindex,
         } => {
             // A real daemon: unbounded headers-first sync — sync to the
             // tip, then keep serving, relaying, and announcing until
@@ -174,6 +182,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 data_dir: Some(data_dir.clone()),
                 cancel: Some(cancel),
                 prune_bytes: None,
+                txindex,
                 status: Some(status),
                 queries: Some(std::sync::Arc::new(std::sync::Mutex::new(query_rx))),
             };
@@ -206,6 +215,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             proxy,
             store,
             prune_mb,
+            txindex,
         } => {
             use avila_consensus::params::Network as ConsensusNet;
             let network = config.get().network;
@@ -225,6 +235,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 data_dir: store.then(|| config.network_data_dir()),
                 cancel: None,
                 prune_bytes: prune_mb.map(|m| m * 1024 * 1024),
+                txindex,
                 status: None,
                 queries: None,
             };

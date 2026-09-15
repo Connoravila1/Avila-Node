@@ -35,6 +35,10 @@ pub struct SyncConfig {
     /// When set with `data_dir`, prune blk files after the final flush
     /// so the on-disk total stays under this many bytes.
     pub prune_bytes: Option<u64>,
+    /// Core's `-txindex`: maintain a txid→block index (`txindex.dat`
+    /// under `data_dir`) so `getrawtransaction` can find transactions
+    /// without a named block.
+    pub txindex: bool,
     /// When set, publish each tick's progress into this snapshot so a
     /// query surface (RPC, GUI) can read it without blocking sync.
     pub status: Option<crate::rpc::SharedStatus>,
@@ -57,6 +61,7 @@ impl Default for SyncConfig {
             data_dir: None,
             cancel: None,
             prune_bytes: None,
+            txindex: false,
             status: None,
             queries: None,
         }
@@ -150,6 +155,10 @@ pub fn run(
         }
         None => Chainstate::new(params),
     };
+    if cfg.txindex {
+        cs.enable_txindex(cfg.data_dir.as_deref())
+            .map_err(SyncError::Store)?;
+    }
     let resumed_height = cs.chain().len() as u32 - 1;
     let mut mgr = PeerManager::new(cfg.max_peers);
     let started = Instant::now();

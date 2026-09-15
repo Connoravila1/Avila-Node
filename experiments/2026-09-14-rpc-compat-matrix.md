@@ -142,8 +142,11 @@ v0: raw hex), `getchaintips`, `getrawmempool`, `getconnectioncount`,
   29 enables full RBF. Real policy divergence to decide on.
 - `estimatesmartfee` errors when the sample set is empty rather than
   returning a floor — the estimator only reports rates it observed.
-- `getrawtransaction` requires a named block for non-pool txs; no
-  txindex (same failure mode as Core without `txindex=1`).
+- `getrawtransaction` without a named block now goes through the
+  `-txindex` index when enabled (`run --txindex`); without it the
+  error is Core's exact `-5` ("No such mempool transaction. Use
+  -txindex or provide a block hash …"). Index hits report
+  `in_active_chain` and active-only `confirmations` like Core.
 - Mutating methods are `stop`, `sendrawtransaction`, `submitblock`,
   `submitheader`, `generatetoaddress`, `generateblock` — the pool
   admission, block connect, and tip-announce paths are all live.

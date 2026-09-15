@@ -999,8 +999,10 @@ fn dispatch(
                 .and_then(Value::as_str)
                 .and_then(|s| s.parse::<BlockHash>().ok());
             chain_query(queries, move |cs, mgr| {
-                // Without txindex, Core serves mempool transactions and
-                // transactions in an explicitly named block only.
+                // Core's lookup order: mempool first, then the named
+                // block or the txindex; a plain txid without either is
+                // the documented -5.
+                let mut via_index = false;
                 let found = if let Some(bh) = block_hash {
                     cs.body(&bh).and_then(|block| {
                         block
@@ -1010,13 +1012,28 @@ fn dispatch(
                             .cloned()
                             .map(|tx| (tx, Some(bh)))
                     })
+                } else if let Some(tx) = mgr.mempool_ref().get(&txid) {
+                    Some((tx.clone(), None))
                 } else {
-                    mgr.mempool_ref().get(&txid).cloned().map(|tx| (tx, None))
+                    via_index = true;
+                    cs.find_transaction(&txid).and_then(|bh| {
+                        cs.body(&bh).and_then(|block| {
+                            block
+                                .transactions
+                                .iter()
+                                .find(|tx| tx.txid() == txid)
+                                .cloned()
+                                .map(|tx| (tx, Some(bh)))
+                        })
+                    })
                 };
                 let Some((tx, in_block)) = found else {
                     return Err((
                         RPC_INVALID_ADDRESS_OR_KEY,
-                        "No such mempool or blockchain transaction".into(),
+                        "No such mempool transaction. Use -txindex or provide a \
+                         block hash to enable blockchain transaction queries. \
+                         Use gettransaction for wallet transactions."
+                            .into(),
                     ));
                 };
                 match verbosity {
@@ -1026,11 +1043,22 @@ fn dispatch(
                         if let Some(bh) = in_block
                             && let Some(node) = cs.tree().get(&bh)
                         {
-                            let tip = cs.tree().tip().height;
                             out["blockhash"] = json!(bh.to_string());
-                            out["confirmations"] = json!(i64::from(tip - node.height) + 1);
                             out["blocktime"] = json!(node.header.time);
                             out["time"] = json!(node.header.time);
+                            // `in_active_chain` is emitted on the index
+                            // path only (Core's convention — a named
+                            // block is by definition where the caller
+                            // looked); confirmations count only for
+                            // active-chain blocks.
+                            let active = !via_index || cs.on_active_chain(&bh);
+                            if via_index {
+                                out["in_active_chain"] = json!(active);
+                            }
+                            if active {
+                                let tip = cs.tree().tip().height;
+                                out["confirmations"] = json!(i64::from(tip - node.height) + 1);
+                            }
                         }
                         Ok(out)
                     }

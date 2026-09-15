@@ -37,7 +37,7 @@ use crate::block::Block;
 use crate::chain::{ChainError, HeaderTree, InsertStatus};
 use crate::check::{self, BlockContext, BlockRuleError, ContextualBlockError, RuleError};
 use crate::connect::{self, BlockUndo, ConnectContext, ConnectError, UtxoSet};
-use crate::hash::BlockHash;
+use crate::hash::{BlockHash, Txid};
 use crate::header::BlockHeader;
 use crate::params::Params;
 use crate::store::{self, BlockStore, StateData};
@@ -147,6 +147,118 @@ pub struct Chainstate {
     /// The durable body store when this chainstate was opened with
     /// [`Chainstate::with_store`]; `None` keeps everything in memory.
     store: Option<BlockStore>,
+    /// txid → containing block index, Core's `-txindex`. `None` unless
+    /// [`Chainstate::enable_txindex`] ran; when present every body
+    /// retained by `accept_block` records its transactions here.
+    txindex: Option<TxIndex>,
+}
+
+/// The transaction index behind `-txindex`: every retained block's
+/// txids mapped to its hash, plus an append log (`txindex.dat`) that
+/// makes the index resumable — records are `blockhash || count ||
+/// txids`, so a restart loads the map and backfills only blocks the
+/// log never covered. Entries are never removed: Core's txindex
+/// keeps a transaction findable through its block even after a reorg
+/// disconnected that block.
+pub struct TxIndex {
+    map: HashMap<Txid, BlockHash>,
+    /// Block hashes already logged — restart backfill scans only the
+    /// store blocks missing from this set.
+    indexed: HashSet<BlockHash>,
+    /// The open append handle for `txindex.dat`, when persistence is on.
+    log: Option<std::fs::File>,
+}
+
+impl TxIndex {
+    const MAGIC: &'static [u8; 8] = b"txidx\x01\x00\x00";
+
+    fn empty() -> Self {
+        Self {
+            map: HashMap::new(),
+            indexed: HashSet::new(),
+            log: None,
+        }
+    }
+
+    /// Loads `dir/txindex.dat` and opens it for append. A missing file
+    /// starts empty; a corrupt or truncated tail is cut back to the
+    /// last whole record, the same recovery the blk store applies.
+    fn open(dir: &Path) -> std::io::Result<Self> {
+        use std::io::{Read, Write};
+        let path = dir.join("txindex.dat");
+        let mut idx = Self::empty();
+        let mut committed = Self::MAGIC.len() as u64;
+        let mut ok = false;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf)?;
+            if buf.len() >= Self::MAGIC.len() && buf[..8] == *Self::MAGIC {
+                let mut cursor = Self::MAGIC.len();
+                while cursor + 36 <= buf.len() {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&buf[cursor..cursor + 32]);
+                    let count = u32::from_le_bytes(
+                        buf[cursor + 32..cursor + 36].try_into().unwrap_or_default(),
+                    ) as usize;
+                    let rec_len = 36 + count * 32;
+                    if cursor + rec_len > buf.len() {
+                        break; // partial tail — truncate below
+                    }
+                    let block = BlockHash::from_bytes(hash);
+                    idx.indexed.insert(block);
+                    for i in 0..count {
+                        let mut t = [0u8; 32];
+                        let at = cursor + 36 + i * 32;
+                        t.copy_from_slice(&buf[at..at + 32]);
+                        idx.map.insert(Txid::from_bytes(t), block);
+                    }
+                    cursor += rec_len;
+                }
+                committed = cursor as u64;
+                ok = true;
+            }
+            // Cut back any partial tail; a missing or foreign magic
+            // means the file is not ours — start it over.
+            f.set_len(if ok { committed } else { 0 })?;
+        }
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        if !ok {
+            log.write_all(Self::MAGIC)?;
+        }
+        idx.log = Some(log);
+        Ok(idx)
+    }
+
+    /// Records one block's transactions; appends the log record when a
+    /// persistence handle is attached.
+    fn index_block(&mut self, hash: BlockHash, block: &Block) {
+        if !self.indexed.insert(hash) {
+            return; // already logged — reorg re-store or replay pass
+        }
+        let txids: Vec<Txid> = block.transactions.iter().map(|t| t.txid()).collect();
+        for txid in &txids {
+            self.map.insert(*txid, hash);
+        }
+        if let Some(log) = &mut self.log {
+            use std::io::Write;
+            let mut rec = Vec::with_capacity(36 + txids.len() * 32);
+            rec.extend_from_slice(hash.as_bytes());
+            rec.extend_from_slice(&(txids.len() as u32).to_le_bytes());
+            for txid in &txids {
+                rec.extend_from_slice(txid.as_bytes());
+            }
+            // A failed log write degrades the index to in-memory only —
+            // the map stays correct; the next restart backfills.
+            let _ = log.write_all(&rec);
+        }
+    }
 }
 
 impl Chainstate {
@@ -165,7 +277,61 @@ impl Chainstate {
             chain: vec![genesis],
             undos: Vec::new(),
             store: None,
+            txindex: None,
         }
+    }
+
+    /// Turns on the transaction index — Core's `-txindex`. With `dir`
+    /// the index persists as `txindex.dat` (append log; a restart
+    /// resumes from it and backfills only blocks never logged).
+    /// Without a directory the index is in-memory only and the
+    /// backfill scans whatever bodies this chainstate already holds.
+    ///
+    /// Like Core, enabling late does not erase history: every body
+    /// already retained is indexed, and entries survive reorgs — a
+    /// transaction stays findable through the block that carried it.
+    ///
+    /// # Errors
+    ///
+    /// `io::Error` when `dir` is given but `txindex.dat` cannot be
+    /// read or opened for append.
+    pub fn enable_txindex(&mut self, dir: Option<&Path>) -> std::io::Result<()> {
+        let mut index = match dir {
+            Some(dir) => TxIndex::open(dir)?,
+            None => TxIndex::empty(),
+        };
+        // Backfill: every retained body the log never covered. The
+        // store path scans blk files; the in-memory path the map.
+        if let Some(store) = &self.store {
+            for (hash, pos) in store.positions() {
+                if !index.indexed.contains(&hash) {
+                    index.index_block(hash, &store.read(pos)?);
+                }
+            }
+        }
+        for (hash, block) in &self.blocks {
+            index.index_block(*hash, block);
+        }
+        self.txindex = Some(index);
+        Ok(())
+    }
+
+    /// The block a transaction was retained in, when the index is on —
+    /// the `getrawtransaction` lookup for a txid with no named block.
+    /// Entries survive disconnects (Core's txindex never removes), so
+    /// the answer may name a side-branch block.
+    #[must_use]
+    pub fn find_transaction(&self, txid: &Txid) -> Option<BlockHash> {
+        self.txindex.as_ref()?.map.get(txid).copied()
+    }
+
+    /// Whether `hash` is on the connected chain — Core's
+    /// `in_active_chain` check for indexed lookups.
+    #[must_use]
+    pub fn on_active_chain(&self, hash: &BlockHash) -> bool {
+        self.tree
+            .get(hash)
+            .is_some_and(|n| self.chain.get(n.height as usize) == Some(hash))
     }
 
     /// A chainstate backed by a durable [`BlockStore`] in `dir`, resumed from
@@ -586,6 +752,9 @@ impl Chainstate {
                 .map_err(|err| BlockRejection::Store(err.kind()))?;
         } else {
             self.blocks.insert(hash, block.clone());
+        }
+        if let Some(index) = &mut self.txindex {
+            index.index_block(hash, block);
         }
         if block.header.prev_block_hash == self.connected {
             let ctx = ConnectContext {
@@ -1144,6 +1313,56 @@ mod tests {
                 Err(BlockRejection::Connect(ConnectError::ScriptVerify(_)))
             ));
         }
+    }
+
+    /// The txindex answers `find_transaction` for every retained body —
+    /// in-memory or store-backed — and the append log resumes the map
+    /// across a reopen without re-scanning.
+    #[test]
+    fn txindex_finds_and_persists() {
+        let params = params();
+        let dir = store_dir("txindex");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b, side) = {
+            let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+            cs.enable_txindex(Some(&dir)).unwrap();
+            let a = block_on(&genesis_header(), vec![coinbase_tx(1, subsidy(1))], &params);
+            let b = block_on(&a.header, vec![coinbase_tx(2, subsidy(2))], &params);
+            let side = block_on(
+                &genesis_header(),
+                vec![tagged_coinbase(1, subsidy(1), script::OP_RETURN)],
+                &params,
+            );
+            cs.accept_block(&a, NOW).unwrap();
+            cs.accept_block(&b, NOW).unwrap();
+            cs.accept_block(&side, NOW).unwrap(); // parked side branch
+            let atx = a.transactions[0].txid();
+            let btx = b.transactions[0].txid();
+            let stx = side.transactions[0].txid();
+            assert_eq!(cs.find_transaction(&atx), Some(a.block_hash()));
+            assert_eq!(cs.find_transaction(&btx), Some(b.block_hash()));
+            // Side-branch bodies index too — Core keeps them findable.
+            assert_eq!(cs.find_transaction(&stx), Some(side.block_hash()));
+            assert!(cs.on_active_chain(&a.block_hash()));
+            assert!(!cs.on_active_chain(&side.block_hash()));
+            assert_eq!(cs.find_transaction(&Txid::ZERO), None);
+            (a, b, side)
+        };
+        // Reopen: the log must carry the whole index — the backfill
+        // scans nothing because every block was already recorded.
+        let cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        let mut cs = cs;
+        cs.enable_txindex(Some(&dir)).unwrap();
+        assert_eq!(
+            cs.find_transaction(&b.transactions[0].txid()),
+            Some(b.block_hash())
+        );
+        assert_eq!(
+            cs.find_transaction(&side.transactions[0].txid()),
+            Some(side.block_hash())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = a;
     }
 
     /// A unique store dir — same pattern as the store tests.

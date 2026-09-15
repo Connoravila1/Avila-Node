@@ -177,7 +177,10 @@ operation. Compare complete initial download and catch-up, not only local replay
       getmininginfo, getnetworkinfo, getconnectioncount, stop,
       sendrawtransaction, submitblock, submitheader,
       generatetoaddress, generateblock) — verified live over curl and
-      the client. txindex and wallet functionality remain open.
+      the client. `run --txindex` maintains Core's txid→block index
+      (`txindex.dat` append log, resumable backfill, entries survive
+      reorgs); `getrawtransaction` resolves bare txids through it and
+      reports `in_active_chain`. Wallet functionality remains open.
 - [x] Implement mempool admission, packages, replacement, eviction,
       relay and reorg reconciliation (first slice): `avila-mempool`
       applies consensus input/script checks identically to block

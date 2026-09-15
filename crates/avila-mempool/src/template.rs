@@ -261,7 +261,7 @@ impl Mempool {
     ///
     /// # Errors
     ///
-    /// Same template failures as [`build_template`]
+    /// Same template failures as [`Self::build_template`]
     /// ([`TemplateError::NoContext`], [`TemplateError::Difficulty`]).
     pub fn build_explicit_block(
         &self,
