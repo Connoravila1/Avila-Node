@@ -24,7 +24,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,6 +34,7 @@ use avila_consensus::arith::difficulty_from_compact;
 use avila_consensus::chain::HeaderNode;
 use avila_consensus::chainstate::Chainstate;
 use avila_consensus::check::RuleError;
+use avila_consensus::descriptor::{infer_descriptor, parse_descriptors};
 use avila_consensus::hash::{BlockHash, Txid};
 use avila_consensus::header::BlockHeader;
 use avila_consensus::hex;
@@ -98,6 +99,7 @@ pub fn serve(
     status: SharedStatus,
     queries: Option<QuerySender>,
     waiters: Option<Arc<BlockWaiters>>,
+    scan: Option<Arc<TxoutScan>>,
     stop: Option<Arc<AtomicBool>>,
     auth: Option<String>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
@@ -109,6 +111,7 @@ pub fn serve(
                     let status = status.clone();
                     let queries = queries.clone();
                     let waiters = waiters.clone();
+                    let scan = scan.clone();
                     let stop = stop.clone();
                     let auth = auth.clone();
                     thread::spawn(move || {
@@ -117,6 +120,7 @@ pub fn serve(
                             &status,
                             queries.as_ref(),
                             waiters.as_ref(),
+                            scan.as_ref(),
                             stop.as_ref(),
                             auth.as_deref(),
                         );
@@ -299,15 +303,20 @@ pub fn call(addr: SocketAddr, auth: Option<&str>, request: &Value) -> Result<Val
         return Err("malformed HTTP response".into());
     };
     let status_line = text[..boundary].lines().next().unwrap_or_default();
-    if !status_line.contains(" 200") {
-        return Err(if status_line.contains("401") {
-            "unauthorized — bad or missing cookie credentials".into()
-        } else {
-            format!("HTTP {status_line}")
-        });
+    // Core replies 400/404/500 for JSON-RPC-level errors — the body
+    // still carries the error object, which is what callers compare.
+    if status_line.contains("401") {
+        return Err("unauthorized — bad or missing cookie credentials".into());
     }
-    serde_json::from_str(text[boundary + 4..].trim())
-        .map_err(|e| format!("invalid JSON-RPC response: {e}"))
+    if status_line.contains(" 204") {
+        return Ok(Value::Null);
+    }
+    let parsed: Value = serde_json::from_str(text[boundary + 4..].trim())
+        .map_err(|e| format!("invalid JSON-RPC response: {e}"))?;
+    if !status_line.contains(" 200") && parsed.get("error").is_none_or(Value::is_null) {
+        return Err(format!("HTTP {status_line}"));
+    }
+    Ok(parsed)
 }
 
 /// JSON-RPC error codes Core uses.
@@ -318,6 +327,8 @@ const RPC_INVALID_PARAMETER: i64 = -8;
 const RPC_DESERIALIZATION_ERROR: i64 = -22;
 const RPC_VERIFY_ERROR: i64 = -25;
 const RPC_VERIFY_REJECTED: i64 = -26;
+const RPC_PARSE_ERROR: i64 = -32700;
+const RPC_INVALID_REQUEST: i64 = -32600;
 const RPC_METHOD_NOT_FOUND: i64 = -32601;
 const RPC_INVALID_PARAMS: i64 = -32602;
 const RPC_INTERNAL_ERROR: i64 = -32603;
@@ -335,6 +346,7 @@ fn handle(
     status: &SharedStatus,
     queries: Option<&QuerySender>,
     waiters: Option<&Arc<BlockWaiters>>,
+    scan: Option<&Arc<TxoutScan>>,
     stop: Option<&Arc<AtomicBool>>,
     auth: Option<&str>,
 ) {
@@ -343,9 +355,23 @@ fn handle(
         return;
     };
     let mut reader = BufReader::new(read_half);
-    // Read headers until the blank line, bounded.
+    // Request line ("POST / HTTP/1.1") then headers until the blank
+    // line, all bounded. Non-POST gets Core's 405 before auth.
+    let mut request_line = String::new();
+    match reader.read_line(&mut request_line) {
+        Ok(0) | Err(_) => return,
+        Ok(_) => {}
+    }
+    if !request_line.starts_with("POST ") {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 41\r\nConnection: close\r\n\r\nJSONRPC server handles only POST requests"
+        );
+        let _ = stream.flush();
+        return;
+    }
     let mut content_length = 0usize;
-    let mut read_bytes = 0usize;
+    let mut read_bytes = request_line.len();
     let mut authorization = String::new();
     loop {
         let mut line = String::new();
@@ -380,7 +406,7 @@ fn handle(
     {
         let _ = write!(
             stream,
-            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"avila jsonrpc\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"jsonrpc\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
         let _ = stream.flush();
         return;
@@ -392,33 +418,209 @@ fn handle(
     if reader.read_exact(&mut body).is_err() {
         return;
     }
-    let request: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-    let params = request.get("params").cloned().unwrap_or(Value::Null);
-    let id = request.get("id").cloned().unwrap_or(Value::Null);
 
     let snap = match status.read() {
         Ok(s) => s.clone(),
         Err(_) => return,
     };
-    let (result, error) = dispatch(method, &params, &snap, queries, waiters, stop);
-    let response = match error {
-        Some((code, message)) => {
-            json!({"result": null, "error": {"code": code, "message": message}, "id": id})
-        }
-        None => json!({"result": result, "error": null, "id": id}),
+    let write_json = |stream: &mut TcpStream, status: &str, body: String| {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}\n",
+            body.len() + 1
+        );
+        let _ = stream.flush();
     };
-    let body = response.to_string();
-    let _ = write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = stream.flush();
+
+    // Core's request handling: `jreq.id` starts as VNULL-with-value so
+    // pre-parse failures still echo `"id":null`; a successful `parse`
+    // replaces it with the request's `id` member or clears it.
+    let request: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            let reply = reply_obj(
+                Value::Null,
+                Some((RPC_PARSE_ERROR, "Parse error".to_string())),
+                &Some(Value::Null),
+                false,
+            );
+            write_json(&mut stream, "500 Internal Server Error", reply.to_string());
+            return;
+        }
+    };
+    if request.is_array() {
+        // Batch: each element is parsed/executed independently and
+        // errors never produce an HTTP error. `id`/`jsonrpc` state
+        // persists across elements — a parse failure leaves the prior
+        // element's values in place (Core's `jreq` reuse). Elements
+        // that parse as V2 notifications produce no reply entry; a
+        // batch of only notifications gets 204 (empty batch → `[]`).
+        let elems = request.as_array().map_or(&[][..], Vec::as_slice);
+        let mut id = Some(Value::Null);
+        let mut v2 = false;
+        let mut replies = Vec::with_capacity(elems.len());
+        for elem in elems {
+            let reply = match parse_request(elem, &mut id, &mut v2) {
+                Err(e) => reply_obj(Value::Null, Some(e), &id, v2),
+                Ok((method, params)) => {
+                    let (result, error) =
+                        dispatch(&method, &params, &snap, queries, waiters, scan, stop);
+                    reply_obj(result, error, &id, v2)
+                }
+            };
+            if !(v2 && id.is_none()) {
+                replies.push(reply);
+            }
+        }
+        if replies.is_empty() && !elems.is_empty() {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.flush();
+            return;
+        }
+        write_json(&mut stream, "200 OK", Value::Array(replies).to_string());
+        return;
+    }
+    if !request.is_object() {
+        let reply = reply_obj(
+            Value::Null,
+            Some((RPC_PARSE_ERROR, "Top-level object parse error".to_string())),
+            &Some(Value::Null),
+            false,
+        );
+        write_json(&mut stream, "500 Internal Server Error", reply.to_string());
+        return;
+    }
+    let mut id = Some(Value::Null);
+    let mut v2 = false;
+    match parse_request(&request, &mut id, &mut v2) {
+        Err(e) => {
+            // Thrown before execution — replies even to would-be
+            // notifications, status by code like `JSONErrorReply`.
+            let status = status_for(e.0);
+            let reply = reply_obj(Value::Null, Some(e), &id, v2);
+            write_json(&mut stream, status, reply.to_string());
+        }
+        Ok((method, params)) => {
+            if v2 && id.is_none() {
+                // V2 notification — execute but never reply.
+                let _ = dispatch(&method, &params, &snap, queries, waiters, scan, stop);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.flush();
+                return;
+            }
+            let (result, error) = dispatch(&method, &params, &snap, queries, waiters, scan, stop);
+            let status = match (&error, v2) {
+                // V2 catches method errors into a 200 reply.
+                (_, true) | (None, false) => "200 OK",
+                (Some((code, _)), false) => status_for(*code),
+            };
+            write_json(
+                &mut stream,
+                status,
+                reply_obj(result, error, &id, v2).to_string(),
+            );
+        }
+    }
+}
+
+/// `JSONErrorReply`'s code→status mapping (V1 single requests; batch
+/// members are always embedded in a 200 array).
+fn status_for(code: i64) -> &'static str {
+    match code {
+        RPC_INVALID_REQUEST => "400 Bad Request",
+        RPC_METHOD_NOT_FOUND => "404 Not Found",
+        _ => "500 Internal Server Error",
+    }
+}
+
+/// `JSONRPCRequest::parse` — validates one request object and extracts
+/// `(method, params)`, updating the caller's `id`/`v2` in Core's order
+/// (id first, then version, then method, then params) so a thrown error
+/// carries whatever state was already parsed.
+fn parse_request(
+    req: &Value,
+    id: &mut Option<Value>,
+    v2: &mut bool,
+) -> Result<(String, Value), (i64, String)> {
+    let Some(obj) = req.as_object() else {
+        return Err((RPC_INVALID_REQUEST, "Invalid Request object".to_string()));
+    };
+    *id = obj.get("id").cloned();
+    *v2 = match obj.get("jsonrpc") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) if s == "1.0" => false,
+        Some(Value::String(s)) if s == "2.0" => true,
+        Some(Value::String(_)) => {
+            return Err((
+                RPC_INVALID_REQUEST,
+                "JSON-RPC version not supported".to_string(),
+            ));
+        }
+        Some(_) => {
+            return Err((
+                RPC_INVALID_REQUEST,
+                "jsonrpc field must be a string".to_string(),
+            ));
+        }
+    };
+    let method = match obj.get("method") {
+        None | Some(Value::Null) => {
+            return Err((RPC_INVALID_REQUEST, "Missing method".to_string()));
+        }
+        Some(Value::String(s)) => s.clone(),
+        Some(_) => {
+            return Err((RPC_INVALID_REQUEST, "Method must be a string".to_string()));
+        }
+    };
+    let params = match obj.get("params") {
+        Some(v @ (Value::Array(_) | Value::Object(_))) => v.clone(),
+        None | Some(Value::Null) => Value::Array(Vec::new()),
+        Some(_) => {
+            return Err((
+                RPC_INVALID_REQUEST,
+                "Params must be an array or object".to_string(),
+            ));
+        }
+    };
+    Ok((method, params))
+}
+
+/// `JSONRPCReplyObj` — V1 replies are `{"result","error","id"?}`;
+/// V2 replaces `result`/`error` placement with `"jsonrpc":"2.0"` and
+/// omits whichever of result/error doesn't apply. `id` appears only
+/// when the request carried one (or parse never ran).
+fn reply_obj(result: Value, error: Option<(i64, String)>, id: &Option<Value>, v2: bool) -> Value {
+    let mut obj = serde_json::Map::new();
+    if v2 {
+        obj.insert("jsonrpc".to_string(), Value::from("2.0"));
+    }
+    match error {
+        None => {
+            obj.insert("result".to_string(), result);
+            if !v2 {
+                obj.insert("error".to_string(), Value::Null);
+            }
+        }
+        Some((code, message)) => {
+            if !v2 {
+                obj.insert("result".to_string(), Value::Null);
+            }
+            obj.insert(
+                "error".to_string(),
+                json!({"code": code, "message": message}),
+            );
+        }
+    }
+    if let Some(i) = id {
+        obj.insert("id".to_string(), i.clone());
+    }
+    Value::Object(obj)
 }
 
 /// Runs `f` against the live chainstate through the query channel and
@@ -566,6 +768,95 @@ impl std::fmt::Debug for BlockWaiters {
             .field("shutdown", &self.is_shutdown())
             .finish()
     }
+}
+
+/// Shared `scantxoutset` state — Core's `g_scan_in_progress` /
+/// `g_scan_progress` / `g_should_abort_scan` atomics and the
+/// `CoinsViewScanReserver` RAII semantics. `status`/`abort` act on it
+/// directly; only `start` touches the chainstate.
+pub struct TxoutScan {
+    in_progress: AtomicBool,
+    progress: AtomicU64,
+    abort: AtomicBool,
+}
+
+impl TxoutScan {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            in_progress: AtomicBool::new(false),
+            progress: AtomicU64::new(0),
+            abort: AtomicBool::new(false),
+        }
+    }
+
+    /// `CoinsViewScanReserver::reserve` — `false` when a scan is
+    /// already running (or has been started concurrently).
+    fn reserve(&self) -> bool {
+        self.in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Reserver drop — clears the flag and resets progress to 0.
+    fn finish(&self) {
+        self.progress.store(0, Ordering::SeqCst);
+        self.in_progress.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Default for TxoutScan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for TxoutScan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxoutScan")
+            .field("in_progress", &self.in_progress.load(Ordering::SeqCst))
+            .finish()
+    }
+}
+
+/// `ParseDescriptorRange` — a number means `[0, n]`; a two-element
+/// numeric array means `[begin, end]`; bounds checked per Core.
+fn parse_descriptor_range(v: &Value) -> Result<(i64, i64), (i64, String)> {
+    let range_err = |msg: &str| (RPC_INVALID_PARAMETER, msg.to_string());
+    let (lo, hi) = if v.is_number() {
+        let Some(h) = v.as_i64() else {
+            return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
+        };
+        (0i64, h)
+    } else if let Some(a) = v.as_array()
+        && a.len() == 2
+        && a[0].is_number()
+        && a[1].is_number()
+    {
+        let (Some(l), Some(h)) = (a[0].as_i64(), a[1].as_i64()) else {
+            return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
+        };
+        if l > h {
+            return Err(range_err(
+                "Range specified as [begin,end] must not have begin after end",
+            ));
+        }
+        (l, h)
+    } else {
+        return Err(range_err(
+            "Range must be specified as end or as [begin,end]",
+        ));
+    };
+    if lo < 0 {
+        return Err(range_err("Range should be greater or equal than 0"));
+    }
+    if hi >> 31 != 0 {
+        return Err(range_err("End of range is too high"));
+    }
+    if hi >= lo + 1_000_000 {
+        return Err(range_err("Range is too large"));
+    }
+    Ok((lo, hi))
 }
 
 /// The `{hash, height}` answer all three wait calls produce — the
@@ -1089,6 +1380,7 @@ const DERIVEADDRESSES_HELP: &str = "deriveaddresses \"descriptor\" ( range )\n\n
 const GENERATETODESCRIPTOR_HELP: &str = "generatetodescriptor num_blocks \"descriptor\" ( maxtries )\n\nMine to a specified descriptor and return the block hashes.\n\nArguments:\n1. num_blocks    (numeric, required) How many blocks are generated.\n2. descriptor    (string, required) The descriptor to send the newly generated bitcoin to.\n3. maxtries      (numeric, optional, default=1000000) How many iterations to try.\n\nResult:\n[           (json array) hashes of blocks generated\n  \"hex\",    (string) blockhash\n  ...\n]\n\nExamples:\n\nGenerate 11 blocks to mydesc\n> bitcoin-cli generatetodescriptor 11 \"mydesc\"\n";
 
 /// Verbatim `help verifychain` text (Bitcoin Core 29.4).
+const SCANTXOUTSET_HELP: &str = "scantxoutset \"action\" ( [scanobjects,...] )\n\nScans the unspent transaction output set for entries that match certain output descriptors.\nExamples of output descriptors are:\n    addr(<address>)                      Outputs whose output script corresponds to the specified address (does not include P2PK)\n    raw(<hex script>)                    Outputs whose output script equals the specified hex-encoded bytes\n    combo(<pubkey>)                      P2PK, P2PKH, P2WPKH, and P2SH-P2WPKH outputs for the given pubkey\n    pkh(<pubkey>)                        P2PKH outputs for the given pubkey\n    sh(multi(<n>,<pubkey>,<pubkey>,...)) P2SH-multisig outputs for the given threshold and pubkeys\n    tr(<pubkey>)                         P2TR\n    tr(<pubkey>,{pk(<pubkey>)})          P2TR with single fallback pubkey in tapscript\n    rawtr(<pubkey>)                      P2TR with the specified key as output key rather than inner\n    wsh(and_v(v:pk(<pubkey>),after(2)))  P2WSH miniscript with mandatory pubkey and a timelock\n\nIn the above, <pubkey> either refers to a fixed public key in hexadecimal notation, or to an xpub/xprv optionally followed by one\nor more path elements separated by \"/\", and optionally ending in \"/*\" (unhardened), or \"/*'\" or \"/*h\" (hardened) to specify all\nunhardened or hardened child keys.\nIn the latter case, a range needs to be specified by below if different from 1000.\nFor more information on output descriptors, see the documentation in the doc/descriptors.md file.\n\nArguments:\n1. action                        (string, required) The action to execute\n                                 \"start\" for starting a scan\n                                 \"abort\" for aborting the current scan (returns true when abort was successful)\n                                 \"status\" for progress report (in %) of the current scan\n2. scanobjects                   (json array, optional) Array of scan objects. Required for \"start\" action\n                                 Every scan object is either a string descriptor or an object:\n     [\n       \"descriptor\",             (string) An output descriptor\n       {                         (json object) An object with output descriptor and metadata\n         \"desc\": \"str\",          (string, required) An output descriptor\n         \"range\": n or [n,n],    (numeric or array, optional, default=1000) The range of HD chain indexes to explore (either end or [begin,end])\n       },\n       ...\n     ]\n\nResult (when action=='start'; only returns after scan completes):\n{                                 (json object)\n  \"success\" : true|false,         (boolean) Whether the scan was completed\n  \"txouts\" : n,                   (numeric) The number of unspent transaction outputs scanned\n  \"height\" : n,                   (numeric) The block height at which the scan was done\n  \"bestblock\" : \"hex\",            (string) The hash of the block at the tip of the chain\n  \"unspents\" : [                  (json array)\n    {                             (json object)\n      \"txid\" : \"hex\",             (string) The transaction id\n      \"vout\" : n,                 (numeric) The vout value\n      \"scriptPubKey\" : \"hex\",     (string) The output script\n      \"desc\" : \"str\",             (string) A specialized descriptor for the matched output script\n      \"amount\" : n,               (numeric) The total amount in BTC of the unspent output\n      \"coinbase\" : true|false,    (boolean) Whether this is a coinbase output\n      \"height\" : n,               (numeric) Height of the unspent transaction output\n      \"blockhash\" : \"hex\",        (string) Blockhash of the unspent transaction output\n      \"confirmations\" : n         (numeric) Number of confirmations of the unspent transaction output when the scan was done\n    },\n    ...\n  ],\n  \"total_amount\" : n              (numeric) The total amount of all found unspent outputs in BTC\n}\n\nResult (when action=='abort'):\ntrue|false    (boolean) True if scan will be aborted (not necessarily before this RPC returns), or false if there is no scan to abort\n\nResult (when action=='status' and a scan is currently in progress):\n{                    (json object)\n  \"progress\" : n     (numeric) Approximate percent complete\n}\n\nResult (when action=='status' and no scan is in progress - possibly already completed):\nnull    (json null)\n\nExamples:\n> bitcoin-cli scantxoutset start '[\"raw(76a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3188ac)#fm24fxxy\"]'\n> bitcoin-cli scantxoutset status\n> bitcoin-cli scantxoutset abort\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"scantxoutset\", \"params\": [\"start\", [\"raw(76a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3188ac)#fm24fxxy\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"scantxoutset\", \"params\": [\"status\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"scantxoutset\", \"params\": [\"abort\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const VERIFYCHAIN_HELP: &str = "verifychain ( checklevel nblocks )\n\nVerifies blockchain database.\n\nArguments:\n1. checklevel    (numeric, optional, default=3, range=0-4) How thorough the block verification is:\n                 - level 0 reads the blocks from disk\n                 - level 1 verifies block validity\n                 - level 2 verifies undo data\n                 - level 3 checks disconnection of tip blocks\n                 - level 4 tries to reconnect the blocks\n                 - each level includes the checks of the previous levels\n2. nblocks       (numeric, optional, default=6, 0=all) The number of blocks to check.\n\nResult:\ntrue|false    (boolean) Verification finished successfully. If false, check debug.log for reason.\n\nExamples:\n> bitcoin-cli verifychain \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"verifychain\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help setban` text (Bitcoin Core 29.4).
@@ -1923,6 +2215,7 @@ fn dispatch(
     snap: &SyncProgress,
     queries: Option<&QuerySender>,
     waiters: Option<&Arc<BlockWaiters>>,
+    scan: Option<&Arc<TxoutScan>>,
     stop: Option<&Arc<AtomicBool>>,
 ) -> (Value, Option<(i64, String)>) {
     // `getrpcinfo` reports the in-flight command's runtime — Core's
@@ -4383,45 +4676,7 @@ fn dispatch(
                 if let Some(v) = &range_arg
                     && !v.is_null()
                 {
-                    // ParseRange: a number means [0,n]; a two-element
-                    // numeric array means [begin,end].
-                    let pair = if v.is_number() {
-                        let Some(h) = v.as_i64() else {
-                            return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
-                        };
-                        Some((0i64, h))
-                    } else if let Some(a) = v.as_array()
-                        && a.len() == 2
-                        && a[0].is_number()
-                        && a[1].is_number()
-                    {
-                        let (Some(l), Some(h)) = (a[0].as_i64(), a[1].as_i64()) else {
-                            return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
-                        };
-                        if l > h {
-                            return Err(range_err(
-                                "Range specified as [begin,end] must not have begin after end",
-                            ));
-                        }
-                        Some((l, h))
-                    } else {
-                        None
-                    };
-                    let Some((l, h)) = pair else {
-                        return Err(range_err(
-                            "Range must be specified as end or as [begin,end]",
-                        ));
-                    };
-                    (lo, hi) = (l, h);
-                    if lo < 0 {
-                        return Err(range_err("Range should be greater or equal than 0"));
-                    }
-                    if hi >> 31 != 0 {
-                        return Err(range_err("End of range is too high"));
-                    }
-                    if hi >= lo + 1_000_000 {
-                        return Err(range_err("Range is too large"));
-                    }
+                    (lo, hi) = parse_descriptor_range(v)?;
                 }
                 let (descs, provider, _checksum) =
                     match avila_consensus::descriptor::parse_descriptors(&desc_text, params, true) {
@@ -4838,6 +5093,266 @@ fn dispatch(
                 o.insert("disk_size".into(), s.disk_size.into());
                 Ok(Value::Object(o))
             })
+        }
+        // Core's scantxoutset — `action` dispatch after the declared-arg
+        // type pass; `start` reserves the scan slot, expands each scan
+        // object through `EvalDescriptorStringOrObject` semantics, then
+        // walks the UTXO set via `FindScriptPubKey` semantics.
+        "scantxoutset" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.is_empty() || arr.len() > 2 {
+                return help_error(SCANTXOUTSET_HELP);
+            }
+            // RPCHelpMan declared-arg pass: `action` must be a string,
+            // `scanobjects` (when present) an array — for every action.
+            let mut type_errors: Vec<(usize, &str, &Value, &str)> = Vec::new();
+            if let Some(v) = arr.first().filter(|v| !v.is_string()) {
+                type_errors.push((1, "action", v, "string"));
+            }
+            if let Some(v) = arr.get(1).filter(|v| !(v.is_array() || v.is_null())) {
+                type_errors.push((2, "scanobjects", v, "array"));
+            }
+            if !type_errors.is_empty() {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_list(&type_errors))),
+                );
+            }
+            let action = arr[0].as_str().unwrap_or_default();
+            match action {
+                "status" => {
+                    // `CoinsViewScanReserver::reserve` probes without
+                    // holding — claim-and-release when free.
+                    match scan {
+                        Some(s) if !s.reserve() => {
+                            (json!({"progress": s.progress.load(Ordering::SeqCst)}), None)
+                        }
+                        Some(s) => {
+                            s.finish();
+                            (Value::Null, None)
+                        }
+                        None => (Value::Null, None),
+                    }
+                }
+                "abort" => match scan {
+                    Some(s) if !s.reserve() => {
+                        s.abort.store(true, Ordering::SeqCst);
+                        (Value::Bool(true), None)
+                    }
+                    Some(s) => {
+                        s.finish();
+                        (Value::Bool(false), None)
+                    }
+                    None => (Value::Bool(false), None),
+                },
+                "start" => {
+                    let Some(scan) = scan else {
+                        return (
+                            Value::Null,
+                            Some((RPC_MISC_ERROR, "txout scanning unavailable".into())),
+                        );
+                    };
+                    if !scan.reserve() {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_INVALID_PARAMETER,
+                                "Scan already in progress, use action \"abort\" or \"status\""
+                                    .into(),
+                            )),
+                        );
+                    }
+                    // RAII: every exit path releases the reservation —
+                    // the closure runs synchronously inside
+                    // `chain_query`, before `_guard` drops.
+                    struct ScanGuard<'a>(&'a TxoutScan);
+                    impl Drop for ScanGuard<'_> {
+                        fn drop(&mut self) {
+                            self.0.finish();
+                        }
+                    }
+                    let _guard = ScanGuard(scan);
+                    if arr.len() < 2 {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_MISC_ERROR,
+                                "scanobjects argument is required for the start action".into(),
+                            )),
+                        );
+                    }
+                    let scanobjects = arr[1].clone();
+                    let scan = Arc::clone(scan);
+                    chain_query(queries, move |cs, _mgr| {
+                        let params = cs.tree().params();
+                        // EvalDescriptorStringOrObject per scan object:
+                        // expand every position, collect the script set
+                        // and each script's inferred `desc` (first
+                        // scanobject to produce a script wins — Core's
+                        // `descriptors.emplace`).
+                        let mut needles: std::collections::HashSet<Vec<u8>> =
+                            std::collections::HashSet::new();
+                        let mut descriptors: std::collections::HashMap<Vec<u8>, String> =
+                            std::collections::HashMap::new();
+                        for scanobject in scanobjects.as_array().map(Vec::as_slice).unwrap_or(&[]) {
+                            let (desc_str, mut range) = match scanobject {
+                                Value::String(s) => (s.clone(), (0i64, 1000i64)),
+                                Value::Object(o) => {
+                                    let desc_v = o.get("desc");
+                                    if desc_v.is_none_or(Value::is_null) {
+                                        return Err((
+                                            RPC_INVALID_PARAMETER,
+                                            "Descriptor needs to be provided in scan object".into(),
+                                        ));
+                                    }
+                                    let desc_v = desc_v.unwrap_or(&Value::Null);
+                                    let Some(desc_str) = desc_v.as_str() else {
+                                        return Err((
+                                            RPC_TYPE_ERROR,
+                                            field_type_message(desc_v, "string"),
+                                        ));
+                                    };
+                                    let mut range = (0i64, 1000i64);
+                                    if let Some(range_v) = o.get("range").filter(|v| !v.is_null()) {
+                                        range = parse_descriptor_range(range_v)?;
+                                    }
+                                    (desc_str.to_string(), range)
+                                }
+                                _ => {
+                                    return Err((
+                                        RPC_INVALID_PARAMETER,
+                                        "Scan object needs to be either a string or an object"
+                                            .into(),
+                                    ));
+                                }
+                            };
+                            let (descs, provider, _checksum) =
+                                match parse_descriptors(&desc_str, params, false) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        return Err((RPC_INVALID_ADDRESS_OR_KEY, e));
+                                    }
+                                };
+                            if !descs.first().is_some_and(|d| d.is_range()) {
+                                range = (0, 0);
+                            }
+                            // `Expand` reads private material from the
+                            // provider while `MakeScripts` writes origins
+                            // into it — the fields are disjoint, so a
+                            // snapshot of the parse-time keys serves as
+                            // the read side (bounded to the descriptor).
+                            let signing = provider.clone();
+                            let mut out_provider = provider;
+                            for i in range.0..=range.1 {
+                                for desc in &descs {
+                                    let Some(scripts) = desc.expand_into(
+                                        i as u32,
+                                        &signing,
+                                        &mut out_provider,
+                                        params,
+                                    ) else {
+                                        return Err((
+                                            RPC_INVALID_ADDRESS_OR_KEY,
+                                            format!(
+                                                "Cannot derive script without private keys: '{desc_str}'"
+                                            ),
+                                        ));
+                                    };
+                                    for script in scripts {
+                                        if needles.insert(script.clone()) {
+                                            let inferred =
+                                                infer_descriptor(&script, &out_provider, params);
+                                            descriptors.insert(script, inferred);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // `FindScriptPubKey` — iterate the UTXO set,
+                        // count every entry, match exact output
+                        // scripts, poll abort every 8192, progress every
+                        // 256 from the outpoint's first two hash bytes.
+                        let tip_height = cs.chain().len().saturating_sub(1) as u32;
+                        let tip_hash = cs
+                            .chain()
+                            .last()
+                            .map(ToString::to_string)
+                            .unwrap_or_default();
+                        scan.progress.store(0, Ordering::SeqCst);
+                        scan.abort.store(false, Ordering::SeqCst);
+                        let mut count: u64 = 0;
+                        let mut coins: Vec<(OutPoint, avila_consensus::connect::Coin)> = Vec::new();
+                        let mut completed = true;
+                        for (outpoint, coin) in cs.utxo().iter() {
+                            count += 1;
+                            if count.is_multiple_of(8192) && scan.abort.load(Ordering::SeqCst) {
+                                completed = false;
+                                break;
+                            }
+                            if count.is_multiple_of(256) {
+                                let b = outpoint.txid.to_bytes();
+                                let high = 0x100 * b[0] as u64 + b[1] as u64;
+                                scan.progress.store(
+                                    (high as f64 * 100.0 / 65536.0 + 0.5) as u64,
+                                    Ordering::SeqCst,
+                                );
+                            }
+                            if needles.contains(coin.out.script_pubkey.as_bytes()) {
+                                coins.push((*outpoint, coin.clone()));
+                            }
+                        }
+                        if completed {
+                            scan.progress.store(100, Ordering::SeqCst);
+                        }
+                        // Core's std::map<COutPoint,Coin> output order:
+                        // internal (little-endian) txid, then vout.
+                        coins.sort_by(|a, b| {
+                            a.0.txid
+                                .to_bytes()
+                                .cmp(&b.0.txid.to_bytes())
+                                .then(a.0.vout.cmp(&b.0.vout))
+                        });
+                        let mut total_in: i64 = 0;
+                        let mut unspents = Vec::with_capacity(coins.len());
+                        for (outpoint, coin) in &coins {
+                            total_in = total_in.saturating_add(coin.out.value);
+                            let blockhash = cs
+                                .chain()
+                                .get(coin.height as usize)
+                                .map(ToString::to_string)
+                                .unwrap_or_default();
+                            unspents.push(json!({
+                                "txid": outpoint.txid.to_string(),
+                                "vout": outpoint.vout,
+                                "scriptPubKey":
+                                    hex::encode(coin.out.script_pubkey.as_bytes()),
+                                "desc": descriptors
+                                    .get(coin.out.script_pubkey.as_bytes())
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                "amount": coin.out.value as f64 / 100_000_000.0,
+                                "coinbase": coin.coinbase,
+                                "height": coin.height,
+                                "blockhash": blockhash,
+                                "confirmations":
+                                    tip_height.saturating_sub(coin.height) + 1,
+                            }));
+                        }
+                        Ok(json!({
+                            "success": completed,
+                            "txouts": count,
+                            "height": tip_height,
+                            "bestblock": tip_hash,
+                            "unspents": unspents,
+                            "total_amount": total_in as f64 / 100_000_000.0,
+                        }))
+                    })
+                }
+                other => (
+                    Value::Null,
+                    Some((RPC_INVALID_PARAMETER, format!("Invalid action '{other}'"))),
+                ),
+            }
         }
         "generatetoaddress" => {
             let Some(nblocks) = param(params, 0, "nblocks").and_then(Value::as_u64) else {
@@ -6233,6 +6748,7 @@ fn dispatch(
                  \x20   verifychain [checklevel] [nblocks],\n\
                  \x20   getchaintxstats [nblocks] [blockhash],\n\
                  \x20   gettxoutsetinfo [hash_type] [hash_or_height] [use_index]\n\
+                 \x20   scantxoutset <action> [scanobjects,...]\n\
                  \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
                  \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
                  \x20   gettxspendingprevout <outputs>,\n\
@@ -6267,7 +6783,7 @@ fn dispatch(
         ),
         _ => (
             Value::Null,
-            Some((RPC_METHOD_NOT_FOUND, format!("method not found: {method}"))),
+            Some((RPC_METHOD_NOT_FOUND, "Method not found".to_string())),
         ),
     }
 }
@@ -6299,7 +6815,7 @@ mod tests {
         params: &Value,
         snap: &SyncProgress,
     ) -> (Value, Option<(i64, String)>) {
-        dispatch(method, params, snap, None, None, None)
+        dispatch(method, params, snap, None, None, None, None)
     }
 
     #[test]
@@ -6319,7 +6835,7 @@ mod tests {
     #[test]
     fn chain_methods_need_the_query_channel() {
         let snap = snap();
-        let (_, e) = dispatch("getblockhash", &json!([0]), &snap, None, None, None);
+        let (_, e) = dispatch("getblockhash", &json!([0]), &snap, None, None, None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 
@@ -6363,12 +6879,12 @@ mod tests {
     fn stop_flips_the_cancel_flag() {
         let snap = snap();
         let flag = Arc::new(AtomicBool::new(false));
-        let (r, e) = dispatch("stop", &Value::Null, &snap, None, None, Some(&flag));
+        let (r, e) = dispatch("stop", &Value::Null, &snap, None, None, None, Some(&flag));
         assert!(e.is_none());
         assert_eq!(r, json!("Avila node stopping"));
         assert!(flag.load(Ordering::Relaxed));
         // Without a run loop the call reports honestly instead of lying.
-        let (_, e) = dispatch("stop", &Value::Null, &snap, None, None, None);
+        let (_, e) = dispatch("stop", &Value::Null, &snap, None, None, None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 
@@ -6399,6 +6915,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none());
         let genesis = r.as_str().unwrap().to_string();
@@ -6408,6 +6925,7 @@ mod tests {
             &json!([genesis]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -6427,6 +6945,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none());
         assert_eq!(r.as_str().unwrap().len(), 160);
@@ -6439,6 +6958,7 @@ mod tests {
             &json!([genesis, 1]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -6455,6 +6975,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -6462,6 +6983,7 @@ mod tests {
             &json!([BlockHash::from_bytes([9u8; 32]).to_string()]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -6475,6 +6997,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none());
         let (r, _) = dispatch(
@@ -6482,6 +7005,7 @@ mod tests {
             &json!([Txid::from_bytes([1u8; 32]).to_string(), 0]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -6493,6 +7017,7 @@ mod tests {
             &json!([Txid::from_bytes([1u8; 32]).to_string()]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -6511,6 +7036,7 @@ mod tests {
             &Value::Null,
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -6542,6 +7068,7 @@ mod tests {
             &Value::Null,
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -6578,6 +7105,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["capabilities"], json!(["proposal"]));
@@ -6610,6 +7138,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["chain"], "regtest");
@@ -6625,6 +7154,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none());
         assert_eq!(
@@ -6638,6 +7168,7 @@ mod tests {
             &Value::Null,
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -6775,6 +7306,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
         let (_, e) = dispatch(
@@ -6782,6 +7314,7 @@ mod tests {
             &json!(["00", -1]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -6795,6 +7328,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         let (_, e) = dispatch(
@@ -6802,6 +7336,7 @@ mod tests {
             &json!(["00ff"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -6820,6 +7355,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         let err = e.unwrap();
         assert_eq!(err.0, RPC_VERIFY_REJECTED);
@@ -6830,6 +7366,7 @@ mod tests {
             "sendrawtransaction",
             &json!(["00"]),
             &snap,
+            None,
             None,
             None,
             None,
@@ -6851,9 +7388,10 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
-        let (_, e) = dispatch("savemempool", &Value::Null, &snap, None, None, None);
+        let (_, e) = dispatch("savemempool", &Value::Null, &snap, None, None, None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 
@@ -6872,6 +7410,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none());
         assert_eq!(r["subsidy"], json!(5_000_000_000i64));
@@ -6887,6 +7426,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none());
         assert_eq!(r["txs"], json!(1));
@@ -6900,6 +7440,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().1, "Target block height 99 after current tip 0");
         let (_, e) = dispatch(
@@ -6907,6 +7448,7 @@ mod tests {
             &json!(["deadbeef"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -6930,6 +7472,7 @@ mod tests {
             &json!([]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -6960,6 +7503,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(
             e.unwrap(),
@@ -6970,6 +7514,7 @@ mod tests {
             &json!(["deadbeef"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -6983,6 +7528,7 @@ mod tests {
             &json!(["ab".repeat(32), 1]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7011,6 +7557,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         let proof = r.as_str().unwrap().to_string();
@@ -7019,6 +7566,7 @@ mod tests {
             &json!([proof]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7033,6 +7581,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["proven"]["blockindex"], Value::Null);
@@ -7045,6 +7594,7 @@ mod tests {
             &json!([wproof, {"verify_witness": true}]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7063,6 +7613,7 @@ mod tests {
             &json!([wproof]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7087,6 +7638,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
         let (_, e) = dispatch(
@@ -7094,6 +7646,7 @@ mod tests {
             &json!([[]]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7111,6 +7664,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(
             e.unwrap(),
@@ -7126,6 +7680,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(
             e.unwrap(),
@@ -7136,6 +7691,7 @@ mod tests {
             &json!([["ab".repeat(32)], &ghash]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7152,6 +7708,7 @@ mod tests {
             &json!(["00000030"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7176,6 +7733,7 @@ mod tests {
             &json!([hex::encode(&bytes)]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7231,6 +7789,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null); // connected — Core's null
@@ -7239,6 +7798,7 @@ mod tests {
             &json!([hexdata]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7253,9 +7813,18 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
-        let (_, e) = dispatch("submitblock", &json!([]), &snap, Some(&queries), None, None);
+        let (_, e) = dispatch(
+            "submitblock",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
     }
 
@@ -7294,6 +7863,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_VERIFY_ERROR);
@@ -7311,6 +7881,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -7320,6 +7891,7 @@ mod tests {
             &json!(["zz"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7343,6 +7915,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         let hashes = r.as_array().unwrap();
@@ -7357,6 +7930,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
 
@@ -7366,6 +7940,7 @@ mod tests {
             &json!([format!("addr({addr})"), []]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7380,6 +7955,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_INVALID_ADDRESS_OR_KEY);
@@ -7391,6 +7967,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         // Bad output → -5.
@@ -7399,6 +7976,7 @@ mod tests {
             &json!(["zzz", []]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7430,6 +8008,7 @@ mod tests {
                 Some(&queries),
                 None,
                 None,
+                None,
             );
             assert!(e.is_none(), "{e:?}");
             assert_eq!(r["txid"], json!(cb_txid));
@@ -7447,6 +8026,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         let (_, e) = dispatch(
@@ -7456,6 +8036,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         let (_, e) = dispatch(
@@ -7463,6 +8044,7 @@ mod tests {
             &json!([cb_hex, 2]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7476,6 +8058,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
         let (_, e) = dispatch(
@@ -7483,6 +8066,7 @@ mod tests {
             &json!([cb_hex, true, 1]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7502,6 +8086,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none());
         assert_eq!(r, json!({}));
@@ -7514,6 +8099,7 @@ mod tests {
             &json!([]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7529,6 +8115,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(r.get("txindex").is_some());
         let (r, _) = dispatch(
@@ -7536,6 +8123,7 @@ mod tests {
             &json!(["coinstatsindex"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7548,6 +8136,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch(
@@ -7555,6 +8144,7 @@ mod tests {
             &json!(["a", "b"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7576,6 +8166,7 @@ mod tests {
             &json!([[{"txid": txid, "vout": 0}]]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7618,6 +8209,7 @@ mod tests {
                 Some(&queries),
                 None,
                 None,
+                None,
             );
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
@@ -7640,6 +8232,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!(0));
@@ -7648,6 +8241,7 @@ mod tests {
             &json!([120, 0]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7664,7 +8258,15 @@ mod tests {
             (json!([120, 1]), RPC_INVALID_PARAMETER), // past the h0 tip
             (json!([1, 2, 3]), RPC_MISC_ERROR),
         ] {
-            let (_, e) = dispatch("getnetworkhashps", &p, &snap, Some(&queries), None, None);
+            let (_, e) = dispatch(
+                "getnetworkhashps",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+            );
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
     }
@@ -7683,6 +8285,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["totalbytesrecv"], json!(0));
@@ -7698,6 +8301,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
@@ -7710,10 +8314,10 @@ mod tests {
         let snap = snap();
 
         // ping: no args → null; any arg → -1 + help.
-        let (r, e) = dispatch("ping", &json!([]), &snap, Some(&queries), None, None);
+        let (r, e) = dispatch("ping", &json!([]), &snap, Some(&queries), None, None, None);
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
-        let (_, e) = dispatch("ping", &json!([1]), &snap, Some(&queries), None, None);
+        let (_, e) = dispatch("ping", &json!([1]), &snap, Some(&queries), None, None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
         // disconnectnode: no match → -29; both ids → -32602; bad
@@ -7725,6 +8329,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_NOT_CONNECTED);
         let (_, e) = dispatch(
@@ -7732,6 +8337,7 @@ mod tests {
             &json!(["1.2.3.4:5", 6]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7743,6 +8349,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch(
@@ -7750,6 +8357,7 @@ mod tests {
             &json!(["notanip/33"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7764,6 +8372,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -7772,6 +8381,7 @@ mod tests {
             &json!(["1.2.3.4:8333", "add"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7783,6 +8393,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (r, e) = dispatch(
@@ -7790,6 +8401,7 @@ mod tests {
             &json!(["1.2.3.4:8333", "remove"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7802,6 +8414,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_NOT_ADDED);
         let (_, e) = dispatch(
@@ -7811,6 +8424,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -7818,6 +8432,7 @@ mod tests {
             &json!(["x", "add", true]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7832,6 +8447,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!(false));
@@ -7840,6 +8456,7 @@ mod tests {
             &json!([true]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7852,6 +8469,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch(
@@ -7859,6 +8477,7 @@ mod tests {
             &json!([]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7874,12 +8493,36 @@ mod tests {
         let snap = snap();
 
         // Empty list to start; listbanned/clearbanned take no params.
-        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None, None);
+        let (r, e) = dispatch(
+            "listbanned",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!([]));
-        let (_, e) = dispatch("listbanned", &json!([1]), &snap, Some(&queries), None, None);
+        let (_, e) = dispatch(
+            "listbanned",
+            &json!([1]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
-        let (r, e) = dispatch("clearbanned", &json!([]), &snap, Some(&queries), None, None);
+        let (r, e) = dispatch(
+            "clearbanned",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
         let (_, e) = dispatch(
@@ -7887,6 +8530,7 @@ mod tests {
             &json!([1]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7901,10 +8545,19 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
-        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None, None);
+        let (r, e) = dispatch(
+            "listbanned",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r.as_array().unwrap().len(), 1);
         assert_eq!(r[0]["address"], json!("10.1.0.0/16"));
@@ -7925,6 +8578,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_ALREADY_ADDED);
         let (r, e) = dispatch(
@@ -7932,6 +8586,7 @@ mod tests {
             &json!(["10.1.0.0/16", "remove"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -7944,9 +8599,18 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_INVALID_IP_OR_SUBNET);
-        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None, None);
+        let (r, e) = dispatch(
+            "listbanned",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!([]));
 
@@ -7960,6 +8624,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (r, e) = dispatch(
@@ -7969,10 +8634,19 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
-        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None, None);
+        let (r, e) = dispatch(
+            "listbanned",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r[0]["address"], json!("2001:db8::/32"));
         assert_eq!(r[0]["banned_until"], json!(now + 3600));
@@ -7996,15 +8670,31 @@ mod tests {
                 RPC_MISC_ERROR,
             ),
         ] {
-            let (_, e) = dispatch("setban", &p, &snap, Some(&queries), None, None);
+            let (_, e) = dispatch("setban", &p, &snap, Some(&queries), None, None, None);
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
 
         // clearbanned empties the list.
-        let (r, e) = dispatch("clearbanned", &json!([]), &snap, Some(&queries), None, None);
+        let (r, e) = dispatch(
+            "clearbanned",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
-        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None, None);
+        let (r, e) = dispatch(
+            "listbanned",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!([]));
     }
@@ -8027,7 +8717,7 @@ mod tests {
             json!([-1]),
             json!([null, null]),
         ] {
-            let (r, e) = dispatch("verifychain", &p, &snap, Some(&queries), None, None);
+            let (r, e) = dispatch("verifychain", &p, &snap, Some(&queries), None, None, None);
             assert!(e.is_none(), "{p}: {e:?}");
             assert_eq!(r, json!(true), "{p}");
         }
@@ -8038,7 +8728,7 @@ mod tests {
             (json!([4, 1.5]), RPC_MISC_ERROR),
             (json!([3, 10, "x"]), RPC_MISC_ERROR),
         ] {
-            let (_, e) = dispatch("verifychain", &p, &snap, Some(&queries), None, None);
+            let (_, e) = dispatch("verifychain", &p, &snap, Some(&queries), None, None, None);
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
     }
@@ -8057,6 +8747,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         for net in ["ipv4", "ipv6", "onion", "i2p", "cjdns", "all_networks"] {
@@ -8067,6 +8758,7 @@ mod tests {
             &json!([1]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -8080,6 +8772,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["success"], json!(true));
@@ -8088,6 +8781,7 @@ mod tests {
             &json!([]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -8113,6 +8807,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
         let (_, e) = dispatch(
@@ -8120,6 +8815,7 @@ mod tests {
             &json!([7]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -8131,6 +8827,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
@@ -8140,6 +8837,7 @@ mod tests {
             &json!(["00"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -8156,6 +8854,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(
             e.unwrap(),
@@ -8170,6 +8869,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none());
         let genesis = r.as_str().unwrap().to_string();
@@ -8178,6 +8878,7 @@ mod tests {
             &json!([genesis]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -8210,6 +8911,7 @@ mod tests {
                 Some(&queries),
                 None,
                 None,
+                None,
             );
             let (code, msg) = e.unwrap();
             assert_eq!(code, RPC_MISC_ERROR, "{p}");
@@ -8222,6 +8924,7 @@ mod tests {
             &json!([7, "x", "y"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -8240,6 +8943,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -8247,6 +8951,7 @@ mod tests {
             &json!([txid, 0, 1.5]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -8259,6 +8964,7 @@ mod tests {
             &json!([txid, 5, 100]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -8277,6 +8983,7 @@ mod tests {
                 &p,
                 &snap,
                 Some(&queries),
+                None,
                 None,
                 None,
             );
@@ -8298,7 +9005,15 @@ mod tests {
         let hash = "00".repeat(32);
 
         for p in [json!([]), json!([hash]), json!([hash, 0, 0])] {
-            let (_, e) = dispatch("getblockfrompeer", &p, &snap, Some(&queries), None, None);
+            let (_, e) = dispatch(
+                "getblockfrompeer",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+            );
             let (code, msg) = e.unwrap();
             assert_eq!(code, RPC_MISC_ERROR, "{p}");
             assert!(msg.starts_with("getblockfrompeer"), "{msg}");
@@ -8310,6 +9025,7 @@ mod tests {
             &json!([7, "x"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -8326,6 +9042,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -8333,6 +9050,7 @@ mod tests {
             &json!([hash, 1.5]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -8347,6 +9065,7 @@ mod tests {
             &json!([hash, 0]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -8364,6 +9083,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         let genesis = r.as_str().unwrap().to_string();
         let (_, e) = dispatch(
@@ -8371,6 +9091,7 @@ mod tests {
             &json!([genesis, 9999]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -8390,7 +9111,7 @@ mod tests {
         let queries = query_server(Chainstate::new(&Network::Regtest.params()));
         let snap = snap();
         let waiters = Arc::new(BlockWaiters::new());
-        let d = |m, p: Value| dispatch(m, &p, &snap, Some(&queries), Some(&waiters), None);
+        let d = |m, p: Value| dispatch(m, &p, &snap, Some(&queries), Some(&waiters), None, None);
         let hash = "00".repeat(32);
 
         // Arity → -1 + verbatim help.
@@ -8483,6 +9204,7 @@ mod tests {
                 &p,
                 &snap,
                 Some(&queries),
+                None,
                 None,
                 None,
             )
@@ -8715,7 +9437,17 @@ mod tests {
     fn createmultisig_dispatch_contract() {
         let queries = query_server(Chainstate::new(&Network::Regtest.params()));
         let snap = snap();
-        let d = |p: Value| dispatch("createmultisig", &p, &snap, Some(&queries), None, None);
+        let d = |p: Value| {
+            dispatch(
+                "createmultisig",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+            )
+        };
         let k1 = "035b29c4f18c17f8f1142ca109c0590a3872f91a32be254a045a31481581f098d6";
         let k2 = "02cbef9c21d191602794a1f7cf07ade94ba8d435ae017e1fa841ba6a20ae5208bc";
         let uncompr = "04989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f\
@@ -8887,8 +9619,28 @@ mod tests {
     fn descriptor_dispatch_contract() {
         let queries = query_server(Chainstate::new(&Network::Regtest.params()));
         let snap = snap();
-        let info = |p: Value| dispatch("getdescriptorinfo", &p, &snap, Some(&queries), None, None);
-        let derive = |p: Value| dispatch("deriveaddresses", &p, &snap, Some(&queries), None, None);
+        let info = |p: Value| {
+            dispatch(
+                "getdescriptorinfo",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+            )
+        };
+        let derive = |p: Value| {
+            dispatch(
+                "deriveaddresses",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+            )
+        };
         let k = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
 
         // Arity — exactly one arg for getdescriptorinfo, 1–2 for
@@ -9037,6 +9789,7 @@ mod tests {
                 Some(&queries),
                 None,
                 None,
+                None,
             )
         };
         let k = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
@@ -9104,6 +9857,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(
@@ -9121,12 +9875,179 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(
             b["tx"][0]["vout"][0]["scriptPubKey"]["hex"],
             json!("001406afd46bcdfd22ef94ac122aa11f241244a37ecc")
         );
+    }
+
+    /// `scantxoutset` — the action dispatch contract, scan-object
+    /// validation, and a live `start` that finds a seeded UTXO.
+    #[test]
+    fn scantxoutset_dispatch_contract() {
+        let mut cs = Chainstate::new(&Network::Regtest.params());
+        // Seed one P2PKH coin for the known test key.
+        let k1 = "035b29c4f18c17f8f1142ca109c0590a3872f91a32be254a045a31481581f098d6";
+        let pkh_script = {
+            let pk = hex::decode(k1).unwrap();
+            let h = avila_consensus::hash::hash160(&pk);
+            [&[0x76, 0xa9, 0x14], &h[..], &[0x88, 0xac]].concat()
+        };
+        let outpoint = OutPoint {
+            txid: Txid::from_bytes([0x11; 32]),
+            vout: 0,
+        };
+        cs.utxo_mut().insert_synthetic(
+            outpoint,
+            avila_consensus::connect::Coin {
+                out: avila_consensus::transaction::TxOut {
+                    value: 12345,
+                    script_pubkey: Script::new(pkh_script.clone()),
+                },
+                height: 0,
+                coinbase: true,
+            },
+        );
+        let queries = query_server(cs);
+        let scan = std::sync::Arc::new(TxoutScan::new());
+        let snap = snap();
+        let g = |p: Value| {
+            dispatch(
+                "scantxoutset",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                Some(&scan),
+                None,
+            )
+        };
+
+        // Arity and the declared-arg type pass.
+        let (_, e) = g(json!([]));
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+        let (_, e) = g(json!(["start", ["raw(deadbeef)"], 5]));
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+        let (_, e) = g(json!([5]));
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_TYPE_ERROR,
+                "Wrong type passed:\n{\n    \"Position 1 (action)\": \"JSON value of type number is not of expected type string\"\n}".to_string()
+            )
+        );
+        let (_, e) = g(json!(["start", 5]));
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_TYPE_ERROR,
+                "Wrong type passed:\n{\n    \"Position 2 (scanobjects)\": \"JSON value of type number is not of expected type array\"\n}".to_string()
+            )
+        );
+        // `status`/`abort` with no scan.
+        assert_eq!(g(json!(["status"])), (Value::Null, None));
+        assert_eq!(g(json!(["abort"])), (json!(false), None));
+        // Invalid action beats nothing else once types pass.
+        let (_, e) = g(json!(["bogus"]));
+        assert_eq!(
+            e.unwrap(),
+            (RPC_INVALID_PARAMETER, "Invalid action 'bogus'".to_string())
+        );
+        // start's own validation ladder.
+        let (_, e) = g(json!(["start"]));
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_MISC_ERROR,
+                "scanobjects argument is required for the start action".to_string()
+            )
+        );
+        let (_, e) = g(json!(["start", [5]]));
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_INVALID_PARAMETER,
+                "Scan object needs to be either a string or an object".to_string()
+            )
+        );
+        for obj in [json!({}), json!({"desc": null})] {
+            let (_, e) = g(json!(["start", [obj]]));
+            assert_eq!(
+                e.unwrap(),
+                (
+                    RPC_INVALID_PARAMETER,
+                    "Descriptor needs to be provided in scan object".to_string()
+                )
+            );
+        }
+        let (_, e) = g(json!(["start", [{"desc": 5}]]));
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_TYPE_ERROR,
+                "JSON value of type number is not of expected type string".to_string()
+            )
+        );
+        for (range, msg) in [
+            (
+                json!("x"),
+                "Range must be specified as end or as [begin,end]",
+            ),
+            (
+                json!([3, 1]),
+                "Range specified as [begin,end] must not have begin after end",
+            ),
+            (json!(-1), "End of range is too high"),
+            (json!([-1, 5]), "Range should be greater or equal than 0"),
+            (json!([0, 1000000]), "Range is too large"),
+        ] {
+            let (_, e) = g(json!(["start", [{"desc": "raw(deadbeef)", "range": range}]]));
+            assert_eq!(e.unwrap(), (RPC_INVALID_PARAMETER, msg.to_string()));
+        }
+        let (_, e) = g(json!(["start", ["bogus("]]));
+        assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
+
+        // A real scan: `raw` matches the seeded coin but its provider
+        // knows no pubkey for the hash — Core infers `addr(...)`.
+        let (r, e) = g(json!([
+            "start",
+            [format!("raw({})", hex::encode(&pkh_script))]
+        ]));
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["success"], json!(true));
+        assert_eq!(r["txouts"], json!(1));
+        assert_eq!(r["unspents"].as_array().unwrap().len(), 1);
+        let u = &r["unspents"][0];
+        assert_eq!(u["txid"], json!(Txid::from_bytes([0x11; 32]).to_string()));
+        assert_eq!(u["vout"], json!(0));
+        assert_eq!(u["scriptPubKey"], json!(hex::encode(&pkh_script)));
+        assert_eq!(u["amount"], json!(0.00012345));
+        assert_eq!(u["coinbase"], json!(true));
+        assert_eq!(u["height"], json!(0));
+        assert_eq!(u["confirmations"], json!(1));
+        let desc = u["desc"].as_str().unwrap().to_owned();
+        assert!(desc.starts_with("addr("), "{desc}");
+
+        // `pkh(<key>)` expansion records the pubkey — inference emits
+        // `pkh([<keyid-prefix>]<key>)`.
+        let (r, e) = g(json!(["start", [format!("pkh({k1})")]]));
+        assert!(e.is_none(), "{e:?}");
+        let desc = r["unspents"][0]["desc"].as_str().unwrap().to_owned();
+        assert!(desc.starts_with("pkh(["), "{desc}");
+        assert!(desc.contains(&format!("]{k1})#")), "{desc}");
+
+        // Scanning for an unrelated script reports the full `txouts`
+        // count with no matches; object form accepts `range`.
+        let (r, e) = g(json!(["start", [{"desc": "raw(deadbeef)", "range": 3}]]));
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["txouts"], json!(1));
+        assert_eq!(r["unspents"].as_array().unwrap().len(), 0);
+        assert_eq!(r["total_amount"], json!(0.0));
+        // Slot released after the scan — `status` is null again.
+        assert_eq!(g(json!(["status"])), (Value::Null, None));
     }
 
     /// `verifymessage`/`signmessagewithprivkey` — Core's compact-sig
@@ -9137,7 +10058,8 @@ mod tests {
     fn message_signing_dispatch_contract() {
         let queries = query_server(Chainstate::new(&Network::Regtest.params()));
         let snap = snap();
-        let d = |method: &str, p: Value| dispatch(method, &p, &snap, Some(&queries), None, None);
+        let d =
+            |method: &str, p: Value| dispatch(method, &p, &snap, Some(&queries), None, None, None);
         // Secret 0x07…07 — Core 29.4 outputs captured live.
         let wif_c = "cMpMxK92W1DjqDvWV3pMn4xLwAuQJhNF3MFqkEHUQRPQofUJku8R";
         let wif_u = "91e1fpA4xxnUq5jwFxvKkk37nMNPVw1HKf7zGES2gHrV3uSs7pU";
@@ -9270,7 +10192,7 @@ mod tests {
     fn getprioritisedtransactions_dispatch_contract() {
         let queries = query_server(Chainstate::new(&Network::Regtest.params()));
         let snap = snap();
-        let d = |m, p: Value| dispatch(m, &p, &snap, Some(&queries), None, None);
+        let d = |m, p: Value| dispatch(m, &p, &snap, Some(&queries), None, None, None);
 
         // Any argument is a -1 + help, whatever its type.
         for p in [json!([1]), json!(["x"]), json!([true])] {
@@ -9382,6 +10304,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_MISC_ERROR);
@@ -9393,6 +10316,7 @@ mod tests {
             &json!(["x", 1]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -9409,6 +10333,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
 
@@ -9419,6 +10344,7 @@ mod tests {
             &json!([1.5, unknown]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -9435,6 +10361,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(
             e.unwrap(),
@@ -9444,7 +10371,15 @@ mod tests {
         // Genesis allows only the zero window — it answers with just
         // the final-block fields plus txcount, like Core at h0.
         for p in [json!([]), json!([0]), json!([null, null])] {
-            let (r, e) = dispatch("getchaintxstats", &p, &snap, Some(&queries), None, None);
+            let (r, e) = dispatch(
+                "getchaintxstats",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+            );
             assert!(e.is_none(), "{p}: {e:?}");
             assert_eq!(r["window_block_count"], json!(0), "{p}");
             assert_eq!(r["txcount"], json!(1), "{p}");
@@ -9453,7 +10388,15 @@ mod tests {
         }
         // A nonzero window on genesis and negative counts → -8.
         for p in [json!([1]), json!([-1])] {
-            let (_, e) = dispatch("getchaintxstats", &p, &snap, Some(&queries), None, None);
+            let (_, e) = dispatch(
+                "getchaintxstats",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+            );
             let (code, msg) = e.unwrap();
             assert_eq!(code, RPC_INVALID_PARAMETER, "{p}");
             assert!(msg.contains("block's height - 1"), "{msg}");
@@ -9476,6 +10419,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_MISC_ERROR);
@@ -9488,6 +10432,7 @@ mod tests {
             &json!([7, null, "x"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -9505,6 +10450,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         let (_, msg) = e.unwrap();
         assert_eq!(msg, "'bogus' is not a valid hash_type");
@@ -9515,7 +10461,15 @@ mod tests {
             json!(["none", 0]),
             json!(["muhash", "00".repeat(32), false]),
         ] {
-            let (_, e) = dispatch("gettxoutsetinfo", &p, &snap, Some(&queries), None, None);
+            let (_, e) = dispatch(
+                "gettxoutsetinfo",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+            );
             assert_eq!(
                 e.unwrap(),
                 (
@@ -9532,7 +10486,15 @@ mod tests {
             (json!(["muhash"]), "muhash"),
             (json!([null, null, false]), "hash_serialized_3"),
         ] {
-            let (r, e) = dispatch("gettxoutsetinfo", &p, &snap, Some(&queries), None, None);
+            let (r, e) = dispatch(
+                "gettxoutsetinfo",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+            );
             assert!(e.is_none(), "{p}: {e:?}");
             assert_eq!(r["height"], json!(0), "{p}");
             assert_eq!(r["txouts"], json!(0), "{p}");
@@ -9545,6 +10507,7 @@ mod tests {
             &json!(["none"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -9562,12 +10525,28 @@ mod tests {
 
         // getrpcinfo: the in-flight command names itself; logpath is
         // empty without a store. Any arg → -1 + help.
-        let (r, e) = dispatch("getrpcinfo", &json!([]), &snap, Some(&queries), None, None);
+        let (r, e) = dispatch(
+            "getrpcinfo",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["active_commands"][0]["method"], json!("getrpcinfo"));
         assert!(r["active_commands"][0]["duration"].is_u64());
         assert_eq!(r["logpath"], json!(""));
-        let (_, e) = dispatch("getrpcinfo", &json!([1]), &snap, Some(&queries), None, None);
+        let (_, e) = dispatch(
+            "getrpcinfo",
+            &json!([1]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
         // getmemoryinfo: stats shape; unknown mode → -8; bad type → -3.
@@ -9576,6 +10555,7 @@ mod tests {
             &json!([]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -9588,6 +10568,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -9597,12 +10578,21 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
 
         // logging: 28 categories all-false at rest; include/exclude in
         // order; "all"/"1" specials; unknown → -8; bad types → -3.
-        let (r, e) = dispatch("logging", &json!([]), &snap, Some(&queries), None, None);
+        let (r, e) = dispatch(
+            "logging",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r.as_object().unwrap().len(), 28);
         assert!(r.as_object().unwrap().values().all(|v| *v == json!(false)));
@@ -9611,6 +10601,7 @@ mod tests {
             &json!([["net", "mempool"]]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -9623,6 +10614,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(r["net"], json!(false));
         assert_eq!(r["mempool"], json!(true));
@@ -9631,6 +10623,7 @@ mod tests {
             &json!([["mempool"], ["mempool"]]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -9642,9 +10635,18 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
-        let (_, e) = dispatch("logging", &json!([5]), &snap, Some(&queries), None, None);
+        let (_, e) = dispatch(
+            "logging",
+            &json!([5]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         // Reset so other tests see a clean map.
         let _ = dispatch(
@@ -9652,6 +10654,7 @@ mod tests {
             &json!([[], ["all"]]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -9671,6 +10674,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!({"success": true}));
@@ -9680,6 +10684,7 @@ mod tests {
             &json!(["127.0.0.1", 8333]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -9695,6 +10700,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(r["success"], json!(false));
         // Unparseable → success:false with no error key.
@@ -9705,6 +10711,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(r, json!({"success": false}));
 
@@ -9713,6 +10720,7 @@ mod tests {
             &json!([]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -9731,6 +10739,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(r.as_array().unwrap().len(), 1);
         let (r, _) = dispatch(
@@ -9738,6 +10747,7 @@ mod tests {
             &json!([0, "onion"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -9750,6 +10760,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -9757,6 +10768,7 @@ mod tests {
             &json!([5, "bogus"]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );
@@ -9768,6 +10780,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch(
@@ -9777,6 +10790,7 @@ mod tests {
             Some(&queries),
             None,
             None,
+            None,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
         let (_, e) = dispatch(
@@ -9784,6 +10798,7 @@ mod tests {
             &json!(["1.2.3.4", 70000]),
             &snap,
             Some(&queries),
+            None,
             None,
             None,
         );

@@ -163,8 +163,10 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             }
             let data_dir = config.network_data_dir();
             // The waitforblock* registry — RPC handlers park predicates,
-            // the sync loop fires them on tick and on shutdown.
+            // the sync loop fires them on tick and on shutdown. The
+            // scantxoutset slot is pure RPC state (no sync-loop input).
             let waiters = std::sync::Arc::new(avila_node::rpc::BlockWaiters::new());
+            let scan = std::sync::Arc::new(avila_node::rpc::TxoutScan::new());
             if let Some(addr) = rpc {
                 // Cookie auth, regenerated per run exactly like Core's
                 // .cookie — the file lives in the network data dir with
@@ -176,6 +178,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     status.clone(),
                     Some(query_tx),
                     Some(waiters.clone()),
+                    Some(scan.clone()),
                     Some(cancel.clone()),
                     Some(avila_node::rpc::cookie_auth_header(&token)),
                 )

@@ -295,7 +295,21 @@ operation. Compare complete initial download and catch-up, not only local replay
       parsed), generatetodescriptor (Core's getScriptFromDescriptor —
       no checksum needed, multipath/ranged refuse before expansion,
       and the coinbase pays the expansion's picked script: [0]/[2]/[1]
-      for 1/4/2-script forms). RPC
+      for 1/4/2-script forms), scantxoutset (Core's
+      `EvalDescriptorStringOrObject` + `FindScriptPubKey` +
+      `InferDescriptor` — a single process-wide scan slot, the
+      string/object scan-object forms with `[0,1000]` ranged
+      defaults, the full range grammar, and a provider accumulated
+      during expansion that reconstructs inferred descriptors:
+      pubkeys, `[fp/path]` origins, wrapped scripts by HASH160
+      (P2WSH via `RIPEMD160(program)`), and taproot spend data so
+      `tr()` trees infer as `pk`/`multi_a` leaves; unmatched or
+      uninferable scripts fall back to `addr`/`raw` exactly like
+      Core). The HTTP envelope is Core-faithful too — 405 on
+      non-POST, `jsonrpc` cookie realm, 400/404/500 status mapping,
+      `id` echoed only when present, `\n`-terminated bodies, batch
+      arrays with the stale-`id` quirk, and V2 envelopes plus 204
+      notifications. RPC
       doubles emit Core's `UniValue::setFloat` text (`%.16g` via `g16`)
       rather than ryu's shortest repr — the two parse to different
       f64s on values like 101/17, and `txrate` now matches

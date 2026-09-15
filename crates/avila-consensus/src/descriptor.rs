@@ -264,15 +264,48 @@ pub enum Provider {
 
 /// `FlatSigningProvider` — the private material collected while
 /// parsing, used both for `hasprivatekeys` and for hardened-range
-/// derivation at `Expand` time.
-#[derive(Default, Debug)]
+/// derivation at `Expand` time. The remaining maps accumulate during
+/// `Expand` exactly like Core's `out` provider: expanded pubkeys,
+/// per-key origins, wrapped subscripts, and taproot spend data.
+#[derive(Clone, Default, Debug)]
 pub struct FlatProvider {
     /// `hash160(pubkey)` → secret, for WIF keys and xprv roots alike.
     pub keys: HashMap<[u8; 20], secp256k1::SecretKey>,
     /// `hash160(root pubkey)` → the decoded xprv (chain code needed
     /// for private derivation beyond the root).
     pub xprvs: HashMap<[u8; 20], ExtKey>,
+    /// `hash160(pubkey)` → pubkey — written by the hash-locked
+    /// `MakeScripts` (`pkh`/`wpkh`/`combo`/`tr`) so inferred
+    /// descriptors can name the key.
+    pub pubkeys: HashMap<[u8; 20], Vec<u8>>,
+    /// `hash160(pubkey)` → `(pubkey, (fingerprint, path))` — every
+    /// expanded key's origin info (`ExpandHelper`'s `out.origins`).
+    pub origins: HashMap<[u8; 20], (Vec<u8>, KeyOrigin)>,
+    /// `hash160(script)` → script — wrapped subscripts (`sh`, `wsh`,
+    /// and combo's P2SH-P2WPKH member) for inference.
+    pub scripts: HashMap<[u8; 20], Vec<u8>>,
+    /// `xonly output key` → spend data (`TaprootSpendData` — merkle
+    /// root, internal key, and `(script, leaf_ver)` → control blocks).
+    pub tr_trees: HashMap<[u8; 32], TaprootSpendData>,
 }
+
+/// Core's `TaprootSpendData` — what a `tr()` expansion records so the
+/// output script can later be inferred back into `tr(...)` form.
+#[derive(Clone, Debug, Default)]
+pub struct TaprootSpendData {
+    /// Root of the script tree — `None` for a key-path-only output.
+    pub merkle_root: Option<[u8; 32]>,
+    /// The untweaked internal key.
+    pub internal_key: [u8; 32],
+    /// `(depth, script, leaf_version)` per leaf in descriptor order.
+    /// Core stores control blocks and re-inverts them in
+    /// `InferTaprootTree`; since this provider is only populated by
+    /// our own expansions the leaves are kept directly.
+    pub leaves: Vec<(usize, Vec<u8>, u8)>,
+}
+
+/// `KeyOriginInfo` — a key's origin fingerprint and derivation path.
+type KeyOrigin = ([u8; 4], Vec<u32>);
 
 /// A parsed descriptor — Core's `DescriptorImpl` hierarchy flattened
 /// into one enum.
@@ -1204,30 +1237,8 @@ impl Descriptor {
             } => {
                 let mut parts = vec![provider_string(internal)];
                 if !depths.is_empty() {
-                    let mut path: Vec<bool> = Vec::new();
-                    let mut tree = String::new();
-                    for (pos, (sub, &depth)) in subs.iter().zip(depths).enumerate() {
-                        if pos > 0 {
-                            tree.push(',');
-                        }
-                        while path.len() <= depth {
-                            if !path.is_empty() {
-                                tree.push('{');
-                            }
-                            path.push(false);
-                        }
-                        tree.push_str(&sub.canonical_body());
-                        while path.last() == Some(&true) {
-                            if path.len() > 1 {
-                                tree.push('}');
-                            }
-                            path.pop();
-                        }
-                        if let Some(last) = path.last_mut() {
-                            *last = true;
-                        }
-                    }
-                    parts.push(tree);
+                    let leaf_strs: Vec<String> = subs.iter().map(|s| s.canonical_body()).collect();
+                    parts.push(render_tr_tree(&leaf_strs, depths));
                 }
                 join_descriptors("tr", "", &parts)
             }
@@ -1278,15 +1289,36 @@ fn tagged_hash(tag: &str, msg: &[u8]) -> [u8; 32] {
     crate::hash::sha256(&data)
 }
 
+/// `GetPubKey` — the expanded pubkey plus its `KeyOriginInfo`
+/// `(fingerprint, path)`: a const key reports its own
+/// `hash160[..4]` with an empty path, a BIP32 key reports the root's
+/// fingerprint with `path + [pos]` (`pos | 0x80000000` under a
+/// hardened wildcard), and an origin wrapper overrides the
+/// fingerprint and prepends its path — exactly Core's
+/// `OriginPubkeyProvider` semantics.
 fn provider_pubkey(
     provider: &Provider,
     pos: u32,
     signing: &FlatProvider,
     params: &Params,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, KeyOrigin)> {
     match provider {
-        Provider::Const { pubkey, .. } => Some(pubkey.clone()),
-        Provider::Origin { inner, .. } => provider_pubkey(inner, pos, signing, params),
+        Provider::Const { pubkey, .. } => {
+            let mut fp = [0u8; 4];
+            fp.copy_from_slice(&key_id_of(pubkey)[..4]);
+            Some((pubkey.clone(), (fp, Vec::new())))
+        }
+        Provider::Origin {
+            fingerprint,
+            path,
+            inner,
+            ..
+        } => {
+            let (pubkey, (_, inner_path)) = provider_pubkey(inner, pos, signing, params)?;
+            let mut full = path.clone();
+            full.extend_from_slice(&inner_path);
+            Some((pubkey, (*fingerprint, full)))
+        }
         Provider::Bip32 {
             extpub,
             path,
@@ -1322,24 +1354,42 @@ fn provider_pubkey(
                 }
                 node
             };
-            Some(node.public_key()?.serialize().to_vec())
+            let mut fp = [0u8; 4];
+            fp.copy_from_slice(&key_id_of(&extpub.key)[..4]);
+            let mut full_path = path.clone();
+            match derive {
+                Derive::No => {}
+                Derive::Unhardened => full_path.push(pos),
+                Derive::Hardened => full_path.push(pos | HARDENED),
+            }
+            Some((node.public_key()?.serialize().to_vec(), (fp, full_path)))
         }
     }
 }
 
 /// `ExpandHelper` — writes the descriptor's output scripts for
-/// position `pos` into `out`.
+/// position `pos` into `out` and the signing data Core's
+/// `MakeScripts`/`GetPubKey` record into `out_provider` (origins for
+/// every key, pubkeys for hash-locked types, subscripts for the
+/// wrappers, and taproot spend data for `tr`).
 fn expand_descriptor(
     desc: &Descriptor,
     pos: u32,
     signing: &FlatProvider,
     params: &Params,
     out: &mut Vec<Vec<u8>>,
+    out_provider: &mut FlatProvider,
 ) -> Option<()> {
-    let key = |p: &Provider| provider_pubkey(p, pos, signing, params);
+    let key = |p: &Provider, out_provider: &mut FlatProvider| {
+        let (pubkey, info) = provider_pubkey(p, pos, signing, params)?;
+        out_provider
+            .origins
+            .insert(key_id_of(&pubkey), (pubkey.clone(), info));
+        Some(pubkey)
+    };
     match desc {
         Descriptor::Pk { key: k, xonly } => {
-            let pubkey = key(k)?;
+            let pubkey = key(k, out_provider)?;
             let mut script = if *xonly {
                 script::push_slice(&pubkey[1..])
             } else {
@@ -1349,22 +1399,30 @@ fn expand_descriptor(
             out.push(script);
         }
         Descriptor::Pkh { key: k } => {
-            let h = crate::hash::hash160(&key(k)?);
+            let pubkey = key(k, out_provider)?;
+            let h = crate::hash::hash160(&pubkey);
+            out_provider.pubkeys.insert(h, pubkey);
             out.push([&[0x76, 0xa9, 0x14], &h[..], &[0x88, 0xac]].concat());
         }
         Descriptor::Wpkh { key: k } => {
-            let h = crate::hash::hash160(&key(k)?);
+            let pubkey = key(k, out_provider)?;
+            let h = crate::hash::hash160(&pubkey);
+            out_provider.pubkeys.insert(h, pubkey);
             out.push([&[script::OP_0, 0x14], &h[..]].concat());
         }
         Descriptor::Combo { key: k } => {
-            let pubkey = key(k)?;
+            let pubkey = key(k, out_provider)?;
             let h = crate::hash::hash160(&pubkey);
+            out_provider.pubkeys.insert(h, pubkey.clone());
             out.push([script::push_slice(&pubkey), vec![script::OP_CHECKSIG]].concat());
             out.push([&[0x76, 0xa9, 0x14], &h[..], &[0x88, 0xac]].concat());
             if pubkey.len() == 33 {
                 let p2wpkh = [&[script::OP_0, 0x14], &h[..]].concat();
-                out.push(p2wpkh.clone());
+                out_provider
+                    .scripts
+                    .insert(crate::hash::hash160(&p2wpkh), p2wpkh.clone());
                 let sh = crate::hash::hash160(&p2wpkh);
+                out.push(p2wpkh);
                 out.push([&[0xa9, 0x14], &sh[..], &[0x87]].concat());
             }
         }
@@ -1376,7 +1434,7 @@ fn expand_descriptor(
         } => {
             let mut pubkeys: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
             for k in keys {
-                pubkeys.push(key(k)?);
+                pubkeys.push(key(k, out_provider)?);
             }
             let mut script = Vec::new();
             if *checksig_add {
@@ -1408,17 +1466,19 @@ fn expand_descriptor(
         }
         Descriptor::Sh(sub) => {
             let mut inner = Vec::new();
-            expand_descriptor(sub, pos, signing, params, &mut inner)?;
+            expand_descriptor(sub, pos, signing, params, &mut inner, out_provider)?;
             for s in inner {
                 let h = crate::hash::hash160(&s);
+                out_provider.scripts.insert(h, s);
                 out.push([&[0xa9, 0x14], &h[..], &[0x87]].concat());
             }
         }
         Descriptor::Wsh(sub) => {
             let mut inner = Vec::new();
-            expand_descriptor(sub, pos, signing, params, &mut inner)?;
+            expand_descriptor(sub, pos, signing, params, &mut inner, out_provider)?;
             for s in inner {
                 let h = crate::hash::sha256(&s);
+                out_provider.scripts.insert(crate::hash::hash160(&s), s);
                 out.push([&[script::OP_0, 0x20], &h[..]].concat());
             }
         }
@@ -1427,15 +1487,26 @@ fn expand_descriptor(
             subs,
             depths,
         } => {
-            let pubkey = key(internal)?;
-            let xonly = &pubkey[pubkey.len() - 32..];
+            let pubkey = key(internal, out_provider)?;
+            let xonly: &[u8] = &pubkey[pubkey.len() - 32..];
+            let mut internal_key = [0u8; 32];
+            internal_key.copy_from_slice(xonly);
             let output = if subs.is_empty() {
-                taproot_output_key(xonly)?
+                let out_key = taproot_output_key(xonly)?;
+                out_provider.tr_trees.insert(
+                    out_key,
+                    TaprootSpendData {
+                        merkle_root: None,
+                        internal_key,
+                        leaves: Vec::new(),
+                    },
+                );
+                out_key
             } else {
                 let mut scripts = Vec::with_capacity(subs.len());
                 for sub in subs {
                     let mut s = Vec::new();
-                    expand_descriptor(sub, pos, signing, params, &mut s)?;
+                    expand_descriptor(sub, pos, signing, params, &mut s, out_provider)?;
                     if s.len() != 1 {
                         return None;
                     }
@@ -1446,18 +1517,35 @@ fn expand_descriptor(
                 msg.extend_from_slice(xonly);
                 msg.extend_from_slice(&root);
                 let tweak_hash = tagged_hash("TapTweak", &msg);
-                let internal_key = secp256k1::XOnlyPublicKey::from_slice(xonly).ok()?;
+                let internal = secp256k1::XOnlyPublicKey::from_slice(xonly).ok()?;
                 let tweak = secp256k1::Scalar::from_be_bytes(tweak_hash).ok()?;
                 let secp = secp256k1::Secp256k1::verification_only();
-                let (output_key, _) = internal_key.add_tweak(&secp, &tweak).ok()?;
-                output_key.serialize()
+                let (output_key, parity) = internal.add_tweak(&secp, &tweak).ok()?;
+                let output = output_key.serialize();
+                let _ = parity;
+                let leaves = depths
+                    .iter()
+                    .copied()
+                    .zip(scripts.iter().cloned())
+                    .map(|(d, s)| (d, s, TAPROOT_LEAF_TAPSCRIPT))
+                    .collect();
+                out_provider.tr_trees.insert(
+                    output,
+                    TaprootSpendData {
+                        merkle_root: Some(root),
+                        internal_key,
+                        leaves,
+                    },
+                );
+                output
             };
+            out_provider.pubkeys.insert(key_id_of(&pubkey), pubkey);
             let mut script = vec![script::OP_1];
             script.extend_from_slice(&script::push_slice(&output));
             out.push(script);
         }
         Descriptor::RawTr { key: k } => {
-            let pubkey = key(k)?;
+            let pubkey = key(k, out_provider)?;
             let xonly = &pubkey[pubkey.len() - 32..];
             let mut script = vec![script::OP_1];
             script.extend_from_slice(&script::push_slice(xonly));
@@ -1522,6 +1610,337 @@ fn taproot_merkle_root(scripts: &[Vec<u8>], depths: &[usize]) -> Option<[u8; 32]
     (stack.len() == 1 && stack[0].0 == 0).then_some(stack[0].1)
 }
 
+/// `TRDescriptor`'s tree rendering — leaf expressions paired into
+/// `{a,b}` braces by depth (`{` opens while descending below the
+/// current path length, `}` closes completed pairs).
+fn render_tr_tree(leaves: &[String], depths: &[usize]) -> String {
+    let mut path: Vec<bool> = Vec::new();
+    let mut tree = String::new();
+    for (pos, (leaf, &depth)) in leaves.iter().zip(depths).enumerate() {
+        if pos > 0 {
+            tree.push(',');
+        }
+        while path.len() <= depth {
+            if !path.is_empty() {
+                tree.push('{');
+            }
+            path.push(false);
+        }
+        tree.push_str(leaf);
+        while path.last() == Some(&true) {
+            if path.len() > 1 {
+                tree.push('}');
+            }
+            path.pop();
+        }
+        if let Some(last) = path.last_mut() {
+            *last = true;
+        }
+    }
+    tree
+}
+
+/// `FormatHDKeypath` with `apostrophe=false` — `/`-joined indices
+/// with `h` for hardened steps.
+fn format_keypath(path: &[u32]) -> String {
+    let mut out = String::new();
+    for &i in path {
+        out.push('/');
+        out.push_str(&(i & !0x8000_0000).to_string());
+        if i & 0x8000_0000 != 0 {
+            out.push('h');
+        }
+    }
+    out
+}
+
+/// Wrap a rendered key expression in its `[fp/path]` origin prefix,
+/// as `OriginPubkeyProvider::ToStringHelper` does.
+fn with_origin(key_str: String, info: Option<&([u8; 4], Vec<u32>)>) -> String {
+    match info {
+        Some((fp, path)) => format!("[{}{}]{key_str}", hex::encode(fp), format_keypath(path)),
+        None => key_str,
+    }
+}
+
+/// `InferPubkey` — a `ConstPubkeyProvider` (wrapped in the stored
+/// origin when the provider knows one) for a full-size script pubkey,
+/// or `None` when the key can't appear in a descriptor.
+fn infer_pubkey(pubkey: &[u8], ctx: Ctx, provider: &FlatProvider) -> Option<String> {
+    // `IsValidNonHybrid`: 33-byte compressed or 65-byte uncompressed.
+    let valid = (pubkey.len() == 33 && matches!(pubkey[0], 0x02 | 0x03))
+        || (pubkey.len() == 65 && pubkey[0] == 0x04);
+    if !valid || (ctx != Ctx::Top && ctx != Ctx::P2sh && pubkey.len() != 33) {
+        return None;
+    }
+    let info = provider
+        .origins
+        .get(&key_id_of(pubkey))
+        .map(|(_, info)| info);
+    Some(with_origin(hex::encode(pubkey), info))
+}
+
+/// `InferXOnlyPubkey` — looks the key origin up under both parity
+/// key IDs (`XOnlyPubKey::GetKeyIDs`) and renders the 32-byte form.
+fn infer_xonly(xonly: &[u8; 32], provider: &FlatProvider) -> String {
+    let info = [0x02u8, 0x03].iter().find_map(|prefix| {
+        let mut full = Vec::with_capacity(33);
+        full.push(*prefix);
+        full.extend_from_slice(xonly);
+        provider.origins.get(&key_id_of(&full)).map(|(_, i)| i)
+    });
+    with_origin(hex::encode(xonly), info)
+}
+
+/// `MatchMultiA` — `<32B> OP_CHECKSIG (<32B> OP_CHECKSIGADD)* OP_m
+/// OP_NUMEQUAL`. Returns `(threshold, keys)` in script order.
+fn match_multi_a(script: &[u8]) -> Option<(u32, Vec<[u8; 32]>)> {
+    const MAX_PUBKEYS_PER_MULTI_A: usize = 999;
+    if script.len() < 36 || script[0] != 32 || *script.last()? != 0x9c {
+        return None;
+    }
+    let mut keys = Vec::new();
+    let mut it = 0usize;
+    while script.len() - it >= 34 {
+        if script[it] != 32 {
+            return None;
+        }
+        it += 1;
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&script[it..it + 32]);
+        keys.push(k);
+        it += 32;
+        if script[it]
+            != if keys.len() == 1 {
+                script::OP_CHECKSIG
+            } else {
+                0xba
+            }
+        {
+            return None;
+        }
+        it += 1;
+    }
+    if keys.is_empty() || keys.len() > MAX_PUBKEYS_PER_MULTI_A {
+        return None;
+    }
+    // `GetScriptNumber(opcode, data, 1, n)` — OP_1..OP_16 encode the
+    // threshold directly (a push-encoded value is also legal in the
+    // pattern but `push_script_num` only emits OP_n here).
+    let (threshold, used) = read_script_num(script, it)?;
+    it += used;
+    if it >= script.len() || script[it] != 0x9c {
+        return None;
+    }
+    it += 1;
+    if it != script.len() || threshold < 1 || threshold > keys.len() as u32 {
+        return None;
+    }
+    Some((threshold, keys))
+}
+
+/// Read a CScriptNum at `pos` — either a single `OP_n` opcode or a
+/// minimal push of up to 4 bytes. Returns `(value, bytes_consumed)`.
+fn read_script_num(script: &[u8], pos: usize) -> Option<(u32, usize)> {
+    let op = *script.get(pos)?;
+    if op == 0 {
+        return Some((0, 1));
+    }
+    if (0x51..=0x60).contains(&op) {
+        return Some(((op - 0x50) as u32, 1));
+    }
+    if (1..=4).contains(&op) {
+        let end = pos + 1 + op as usize;
+        let data = script.get(pos + 1..end)?;
+        // CScriptNum deserialization (minimal form already guaranteed
+        // for our own emissions; arbitrary inputs still decode).
+        let mut v: i64 = 0;
+        for (i, &b) in data.iter().enumerate() {
+            v |= (b as i64) << (8 * i);
+        }
+        if let Some(&last) = data.last()
+            && last & 0x80 != 0
+        {
+            v &= !(0x80i64 << (8 * (data.len() - 1)));
+            v = -v;
+        }
+        return u32::try_from(v).ok().map(|v| (v, 1 + op as usize));
+    }
+    None
+}
+
+/// `InferScript` — the best descriptor expression for `script` in
+/// context `ctx`, using `provider` for pubkey/origin/subscript/
+/// taproot lookups. Returns the descriptor *body* (no checksum).
+fn infer_script(
+    script: &[u8],
+    ctx: Ctx,
+    provider: &FlatProvider,
+    params: &Params,
+) -> Option<String> {
+    // Tapscript leaves: `pk()` for a lone x-only key, else multi_a.
+    if ctx == Ctx::P2tr
+        && script.len() == 34
+        && script[0] == 32
+        && script[33] == script::OP_CHECKSIG
+    {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&script[1..33]);
+        return Some(format!("pk({})", infer_xonly(&k, provider)));
+    }
+    if ctx == Ctx::P2tr
+        && let Some((threshold, keys)) = match_multi_a(script)
+    {
+        let key_strs: Vec<String> = keys.iter().map(|k| infer_xonly(k, provider)).collect();
+        return Some(format!("multi_a({threshold},{})", key_strs.join(",")));
+    }
+
+    let script_obj = Script::new(script.to_vec());
+    let specialized = match script_obj.classify() {
+        crate::script::ScriptType::PubKey(pk)
+            if matches!(ctx, Ctx::Top | Ctx::P2sh | Ctx::P2wsh) =>
+        {
+            infer_pubkey(&pk, ctx, provider).map(|k| format!("pk({k})"))
+        }
+        crate::script::ScriptType::PubKeyHash(hash)
+            if matches!(ctx, Ctx::Top | Ctx::P2sh | Ctx::P2wsh) =>
+        {
+            provider
+                .pubkeys
+                .get(&hash)
+                .and_then(|pk| infer_pubkey(pk, ctx, provider))
+                .map(|k| format!("pkh({k})"))
+        }
+        crate::script::ScriptType::Witness {
+            version: 0,
+            program,
+        } if program.len() == 20 && matches!(ctx, Ctx::Top | Ctx::P2sh) => {
+            let mut hash = [0u8; 20];
+            hash.copy_from_slice(&program);
+            provider
+                .pubkeys
+                .get(&hash)
+                .and_then(|pk| infer_pubkey(pk, Ctx::P2wpkh, provider))
+                .map(|k| format!("wpkh({k})"))
+        }
+        crate::script::ScriptType::Multisig { required, keys }
+            if matches!(ctx, Ctx::Top | Ctx::P2sh | Ctx::P2wsh) =>
+        {
+            let key_strs: Option<Vec<String>> = keys
+                .iter()
+                .map(|k| infer_pubkey(k, ctx, provider))
+                .collect();
+            key_strs.map(|ks| format!("multi({},{})", required, ks.join(",")))
+        }
+        crate::script::ScriptType::ScriptHash(hash) if ctx == Ctx::Top => provider
+            .scripts
+            .get(&hash)
+            .and_then(|sub| infer_script(sub, Ctx::P2sh, provider, params))
+            .map(|d| format!("sh({d})")),
+        crate::script::ScriptType::Witness {
+            version: 0,
+            program,
+        } if program.len() == 32 && matches!(ctx, Ctx::Top | Ctx::P2sh) => {
+            // `CScriptID{RIPEMD160(program)}` — the stored key is
+            // hash160 of the witness script, which equals ripemd160
+            // of this sha256'd program.
+            let scriptid = crate::hash::ripemd160(&program);
+            provider
+                .scripts
+                .get(&scriptid)
+                .and_then(|sub| infer_script(sub, Ctx::P2wsh, provider, params))
+                .map(|d| format!("wsh({d})"))
+        }
+        crate::script::ScriptType::Witness {
+            version: 1,
+            program,
+        } if program.len() == 32 && ctx == Ctx::Top => {
+            let mut output = [0u8; 32];
+            output.copy_from_slice(&program);
+            if let Some(tap) = provider.tr_trees.get(&output) {
+                // `InferTaprootTree`: verify the tweak reconstructs
+                // the output key, then infer each leaf.
+                let tweaked = match tap.merkle_root {
+                    Some(root) => {
+                        let mut msg = Vec::with_capacity(64);
+                        msg.extend_from_slice(&tap.internal_key);
+                        msg.extend_from_slice(&root);
+                        let tweak_hash = tagged_hash("TapTweak", &msg);
+                        let internal =
+                            secp256k1::XOnlyPublicKey::from_slice(&tap.internal_key).ok();
+                        let tweak = secp256k1::Scalar::from_be_bytes(tweak_hash).ok();
+                        match (internal, tweak) {
+                            (Some(i), Some(t)) => {
+                                let secp = secp256k1::Secp256k1::verification_only();
+                                i.add_tweak(&secp, &t).ok().map(|(k, _)| k.serialize())
+                            }
+                            _ => None,
+                        }
+                    }
+                    None => taproot_output_key(&tap.internal_key),
+                };
+                if tweaked.as_ref() == Some(&output) {
+                    let mut parts: Option<Vec<String>> = Some(Vec::new());
+                    for &(_, ref leaf_script, leaf_ver) in &tap.leaves {
+                        if leaf_ver != TAPROOT_LEAF_TAPSCRIPT {
+                            parts = None;
+                            break;
+                        }
+                        match infer_script(leaf_script, Ctx::P2tr, provider, params) {
+                            Some(d) => {
+                                if let Some(p) = parts.as_mut() {
+                                    p.push(d);
+                                }
+                            }
+                            None => {
+                                parts = None;
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(leaf_strs) = parts {
+                        let key = infer_xonly(&tap.internal_key, provider);
+                        if leaf_strs.is_empty() {
+                            return Some(format!("tr({key})"));
+                        }
+                        let depths: Vec<usize> = tap.leaves.iter().map(|(d, _, _)| *d).collect();
+                        let tree = render_tr_tree(&leaf_strs, &depths);
+                        return Some(format!("tr({key},{tree})"));
+                    }
+                }
+            }
+            if secp256k1::XOnlyPublicKey::from_slice(&output).is_ok() {
+                let key = infer_xonly(&output, provider);
+                return Some(format!("rawtr({key})"));
+            }
+            None
+        }
+        _ => None,
+    };
+    if specialized.is_some() {
+        return specialized;
+    }
+    // Miniscript inside wsh/tr isn't inferable (not parsed). The
+    // remaining descriptors are top-level only.
+    if ctx != Ctx::Top {
+        return None;
+    }
+    match script_address(&script_obj, params) {
+        Some(addr) => Some(format!("addr({addr})")),
+        None => Some(format!("raw({})", hex::encode(script))),
+    }
+}
+
+/// `InferDescriptor` — Core's inferred `desc` field for
+/// `scantxoutset`: the canonical descriptor (with checksum) for
+/// `script` under the provider accumulated during scan expansion.
+#[must_use]
+pub fn infer_descriptor(script: &[u8], provider: &FlatProvider, params: &Params) -> String {
+    let body = infer_script(script, Ctx::Top, provider, params)
+        .unwrap_or_else(|| format!("raw({})", hex::encode(script)));
+    format!("{body}#{}", descriptor_checksum(&body))
+}
+
 impl Descriptor {
     /// `Expand` — the output scripts this descriptor produces for
     /// derivation position `pos`. Fails when hardened derivation needs
@@ -1534,7 +1953,23 @@ impl Descriptor {
         params: &Params,
     ) -> Option<Vec<Vec<u8>>> {
         let mut out = Vec::new();
-        expand_descriptor(self, pos, signing, params, &mut out)?;
+        let mut provider = FlatProvider::default();
+        expand_descriptor(self, pos, signing, params, &mut out, &mut provider)?;
+        Some(out)
+    }
+
+    /// `Expand` with Core's `out` provider — returns the scripts plus
+    /// the accumulated pubkeys/origins/subscripts/spend data that
+    /// `scantxoutset` needs for `InferDescriptor`.
+    pub fn expand_into(
+        &self,
+        pos: u32,
+        signing: &FlatProvider,
+        out_provider: &mut FlatProvider,
+        params: &Params,
+    ) -> Option<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        expand_descriptor(self, pos, signing, params, &mut out, out_provider)?;
         Some(out)
     }
 }

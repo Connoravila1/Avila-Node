@@ -38,6 +38,13 @@ pub fn hash160(data: &[u8]) -> [u8; 20] {
     ripemd::Ripemd160::digest(sha256(data)).into()
 }
 
+/// Computes `RIPEMD160(data)` — `CScriptID`'s wrap of a P2WSH witness
+/// program in Core's `InferScript`.
+#[must_use]
+pub fn ripemd160(data: &[u8]) -> [u8; 20] {
+    ripemd::Ripemd160::digest(data).into()
+}
+
 /// An incremental double-SHA-256 hasher.
 ///
 /// Feed data with repeated calls to [`Sha256d::update`], then call [`Sha256d::finalize`] once

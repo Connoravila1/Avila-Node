@@ -564,6 +564,39 @@ surfaced:
   coinbase `scriptPubKey` matched Core's pick for `combo` (both key
   forms), `tr`, `raw`, `pkh`, `pk`, `sh(wpkh)`, `addr`, and
   `wsh(sortedmulti)`.
+- `scantxoutset` ports `EvalDescriptorStringOrObject` +
+  `FindScriptPubKey` + `InferDescriptor`: `start`/`status`/`abort`
+  with a single process-wide scan slot, string scan objects default
+  to range `[0,1000]` on ranged descriptors, and the full range
+  grammar (scalar end, `[begin,end]`, `-8` on reversed/negative/too-
+  high/too-large). Expansion feeds a `FlatProvider` with pubkeys,
+  key origins (`[fp/path]` rendered `h`-suffixed), wrapped scripts
+  keyed by HASH160 — P2WSH lookup via `RIPEMD160(program)` like
+  Core's `CScriptID` — and taproot spend data (internal key, merkle
+  root, leaves verbatim). The scan walks the whole UTXO set,
+  matching exact output scripts and emitting Core's per-unspent
+  shape (`txid`/`vout`/`scriptPubKey`/inferred `desc`/`amount`/
+  `coinbase`/`height`/`blockhash`/`confirmations`) plus `success`,
+  `txouts`, `bestblock`, and `total_amount`. Inference covers pk,
+  pkh, wpkh, multi (sorted keys), sh, wsh, tr (key-path and script
+  trees — `pk`/`multi_a` leaves, both-parity x-only origin probes),
+  rawtr, addr, and raw fallbacks. Verified live against Core 29.4 on
+  a shared regtest chain: all error/action paths and real scans for
+  `raw`, `combo`, `pkh`, `wpkh`, `wsh(sortedmulti)`, `sh(multi)`,
+  `tr` key-path, `tr` with a `{pk,multi_a}` tree, `rawtr`, and
+  ranged/multipath `tpub` descriptors — byte-identical including
+  inferred origins and checksums.
+- The JSON-RPC envelope itself now matches Core: non-POST → 405
+  (before auth), cookie realm `jsonrpc`, `-32600`→400 /
+  `-32601`→404 / other errors→500 with `\n`-terminated bodies, `id`
+  echoed only when the request carried one (parse-time failures
+  still emit `"id":null`), `Missing method` / `Method must be a
+  string` / `Params must be an array or object` request validation,
+  batch arrays with Core's stale-`id` quirk on unparseable elements,
+  V2 (`"jsonrpc":"2.0"`) envelopes with `"jsonrpc"` first and no
+  `result`/`error` counterpart, and 204 for V2 notifications
+  (single, batch, and all-notification). Verified: 27 envelope rows
+  byte-identical.
 
 ### Known semantic differences
 
@@ -579,3 +612,9 @@ surfaced:
 - Mutating methods are `stop`, `sendrawtransaction`, `submitblock`,
   `submitheader`, `generatetoaddress`, `generateblock` — the pool
   admission, block connect, and tip-announce paths are all live.
+- Arity: Core throws `-1` with the method's help text when required
+  args are missing or extras are passed (its `RPCHelpMan` required/
+  total checks). Some older method arms still emit `-32602`
+  "missing parameter" or silently ignore trailing args — a sweep to
+  `-1`+help everywhere is queued. Named-object `params` (Core
+  resolves arguments by name) is not yet supported.
