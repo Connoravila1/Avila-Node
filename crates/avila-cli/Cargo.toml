@@ -21,6 +21,7 @@ avila-core.workspace = true
 avila-node.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+signal-hook.workspace = true
 
 [lints]
 workspace = true

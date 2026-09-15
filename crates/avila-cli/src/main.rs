@@ -152,6 +152,15 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 }));
             let (query_tx, query_rx) = std::sync::mpsc::channel();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // SIGTERM/SIGINT take the same path as `stop`: the loop
+            // exits cleanly and the shutdown block persists the chain,
+            // peers.dat, mempool.dat, and banlist. Without this every
+            // kill silently dropped the address book.
+            for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+                if let Err(e) = signal_hook::flag::register(sig, cancel.clone()) {
+                    eprintln!("warning: signal handler for {sig} not installed: {e}");
+                }
+            }
             let data_dir = config.network_data_dir();
             if let Some(addr) = rpc {
                 // Cookie auth, regenerated per run exactly like Core's
