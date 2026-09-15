@@ -209,9 +209,14 @@ impl BanList {
     }
 
     /// `LoadBanlist` — parse `banlist.json`; unknown/malformed rows are
-    /// skipped (a corrupt file costs the bans, not the boot).
+    /// skipped (a corrupt file costs the bans, not the boot). The read
+    /// is size-capped: a banlist is thousands of small rows at most, so
+    /// anything larger is treated as corrupt rather than buffered.
     #[must_use]
     pub fn load(path: &Path) -> Option<Self> {
+        if fs::metadata(path).ok()?.len() > 8 * 1024 * 1024 {
+            return None;
+        }
         let text = fs::read_to_string(path).ok()?;
         let doc: Value = serde_json::from_str(&text).ok()?;
         let mut out = Self::new();
