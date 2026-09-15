@@ -576,7 +576,7 @@ impl Psbt {
 
 /// Decodes a BIP32-derivation value (`fingerprint || u32 path*`).
 pub fn bip32_derivation_value(v: &[u8]) -> Option<(u32, Vec<u32>)> {
-    if v.len() < 4 || (v.len() - 4) % 4 != 0 {
+    if v.len() < 4 || !(v.len() - 4).is_multiple_of(4) {
         return None;
     }
     let mut dec = Decoder::new(v);
@@ -612,6 +612,7 @@ pub fn non_witness_utxo_txid(v: &[u8]) -> Option<Txid> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::hex;

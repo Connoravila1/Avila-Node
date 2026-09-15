@@ -2077,6 +2077,75 @@ Examples:
 const DECODERAWTRANSACTION_HELP: &str = "decoderawtransaction \"hexstring\" ( iswitness )\n\nReturn a JSON object representing the serialized, hex-encoded transaction.\n\nArguments:\n1. hexstring    (string, required) The transaction hex string\n2. iswitness    (boolean, optional, default=depends on heuristic tests) Whether the transaction hex is a serialized witness transaction.\n                If iswitness is not present, heuristic tests will be used in decoding.\n                If true, only witness deserialization will be tried.\n                If false, only non-witness deserialization will be tried.\n                This boolean should reflect whether the transaction has inputs\n                (e.g. fully valid, or on-chain transactions), if known by the caller.\n\nResult:\n{                             (json object)\n  \"txid\" : \"hex\",             (string) The transaction id\n  \"hash\" : \"hex\",             (string) The transaction hash (differs from txid for witness transactions)\n  \"size\" : n,                 (numeric) The serialized transaction size\n  \"vsize\" : n,                (numeric) The virtual transaction size (differs from size for witness transactions)\n  \"weight\" : n,               (numeric) The transaction's weight (between vsize*4-3 and vsize*4)\n  \"version\" : n,              (numeric) The version\n  \"locktime\" : xxx,           (numeric) The lock time\n  \"vin\" : [                   (json array)\n    {                         (json object)\n      \"coinbase\" : \"hex\",     (string, optional) The coinbase value (only if coinbase transaction)\n      \"txid\" : \"hex\",         (string, optional) The transaction id (if not coinbase transaction)\n      \"vout\" : n,             (numeric, optional) The output number (if not coinbase transaction)\n      \"scriptSig\" : {         (json object, optional) The script (if not coinbase transaction)\n        \"asm\" : \"str\",        (string) Disassembly of the signature script\n        \"hex\" : \"hex\"         (string) The raw signature script bytes, hex-encoded\n      },\n      \"txinwitness\" : [       (json array, optional)\n        \"hex\",                (string) hex-encoded witness data (if any)\n        ...\n      ],\n      \"sequence\" : n          (numeric) The script sequence number\n    },\n    ...\n  ],\n  \"vout\" : [                  (json array)\n    {                         (json object)\n      \"value\" : n,            (numeric) The value in BTC\n      \"n\" : n,                (numeric) index\n      \"scriptPubKey\" : {      (json object)\n        \"asm\" : \"str\",        (string) Disassembly of the output script\n        \"desc\" : \"str\",       (string) Inferred descriptor for the output\n        \"hex\" : \"hex\",        (string) The raw output script bytes, hex-encoded\n        \"address\" : \"str\",    (string, optional) The Bitcoin address (only if a well-defined address exists)\n        \"type\" : \"str\"        (string) The type (one of: nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n      }\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli decoderawtransaction \"hexstring\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"decoderawtransaction\", \"params\": [\"hexstring\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help createrawtransaction` text (Bitcoin Core 29).
+const CONVERTTOPSBT_HELP: &str = "converttopsbt \"hexstring\" ( permitsigdata iswitness )
+
+Converts a network serialized transaction to a PSBT. This should be used only with createrawtransaction and fundrawtransaction
+createpsbt and walletcreatefundedpsbt should be used for new applications.
+
+Arguments:
+1. hexstring        (string, required) The hex string of a raw transaction
+2. permitsigdata    (boolean, optional, default=false) If true, any signatures in the input will be discarded and conversion
+                    will continue. If false, RPC will fail if any signatures are present.
+3. iswitness        (boolean, optional, default=depends on heuristic tests) Whether the transaction hex is a serialized witness transaction.
+                    If iswitness is not present, heuristic tests will be used in decoding.
+                    If true, only witness deserialization will be tried.
+                    If false, only non-witness deserialization will be tried.
+                    This boolean should reflect whether the transaction has inputs
+                    (e.g. fully valid, or on-chain transactions), if known by the caller.
+
+Result:
+\"str\"    (string) The resulting raw transaction (base64-encoded string)
+
+Examples:
+
+Create a transaction
+> bitcoin-cli createrawtransaction \"[{\\\"txid\\\":\\\"myid\\\",\\\"vout\\\":0}]\" \"[{\\\"data\\\":\\\"00010203\\\"}]\"
+
+Convert the transaction to a PSBT
+> bitcoin-cli converttopsbt \"rawtransaction\"
+";
+
+const CREATEPSBT_HELP: &str = "createpsbt [{\"txid\":\"hex\",\"vout\":n,\"sequence\":n},...] [{\"address\":amount,...},{\"data\":\"hex\"},...] ( locktime replaceable )
+
+Creates a transaction in the Partially Signed Transaction format.
+Implements the Creator role.
+
+Arguments:
+1. inputs                      (json array, required) The inputs
+     [
+       {                       (json object)
+         \"txid\": \"hex\",        (string, required) The transaction id
+         \"vout\": n,            (numeric, required) The output number
+         \"sequence\": n,        (numeric, optional, default=depends on the value of the 'replaceable' and 'locktime' arguments) The sequence number
+       },
+       ...
+     ]
+2. outputs                     (json array, required) The outputs specified as key-value pairs.
+                               Each key may only appear once, i.e. there can only be one 'data' output, and no address may be duplicated.
+                               At least one output of either type must be specified.
+                               For compatibility reasons, a dictionary, which holds the key-value pairs directly, is also
+                               accepted as second parameter.
+     [
+       {                       (json object)
+         \"address\": amount,    (numeric or string, required) A key-value pair. The key (string) is the bitcoin address, the value (float or string) is the amount in BTC
+         ...
+       },
+       {                       (json object)
+         \"data\": \"hex\",        (string, required) A key-value pair. The key must be \"data\", the value is hex-encoded data
+       },
+       ...
+     ]
+3. locktime                    (numeric, optional, default=0) Raw locktime. Non-0 value also locktime-activates inputs
+4. replaceable                 (boolean, optional, default=true) Marks this transaction as BIP125-replaceable.
+                               Allows this transaction to be replaced by a transaction with higher fees. If provided, it is an error if explicit sequence numbers are incompatible.
+
+Result:
+\"str\"    (string) The resulting raw transaction (base64-encoded string)
+
+Examples:
+> bitcoin-cli createpsbt \"[{\\\"txid\\\":\\\"myid\\\",\\\"vout\\\":0}]\" \"[{\\\"data\\\":\\\"00010203\\\"}]\"
+";
+
 const CREATERAWTRANSACTION_HELP: &str = "createrawtransaction [{\"txid\":\"hex\",\"vout\":n,\"sequence\":n},...] [{\"address\":amount,...},{\"data\":\"hex\"},...] ( locktime replaceable )\n\nCreate a transaction spending the given inputs and creating new outputs.\nOutputs can be addresses or data.\nReturns hex-encoded raw transaction.\nNote that the transaction's inputs are not signed, and\nit is not stored in the wallet or transmitted to the network.\n\nArguments:\n1. inputs                      (json array, required) The inputs\n     [\n       {                       (json object)\n         \"txid\": \"hex\",        (string, required) The transaction id\n         \"vout\": n,            (numeric, required) The output number\n         \"sequence\": n,        (numeric, optional, default=depends on the value of the 'replaceable' and 'locktime' arguments) The sequence number\n       },\n       ...\n     ]\n2. outputs                     (json array, required) The outputs specified as key-value pairs.\n                               Each key may only appear once, i.e. there can only be one 'data' output, and no address may be duplicated.\n                               At least one output of either type must be specified.\n                               For compatibility reasons, a dictionary, which holds the key-value pairs directly, is also\n                               accepted as second parameter.\n     [\n       {                       (json object)\n         \"address\": amount,    (numeric or string, required) A key-value pair. The key (string) is the bitcoin address, the value (float or string) is the amount in BTC\n         ...\n       },\n       {                       (json object)\n         \"data\": \"hex\",        (string, required) A key-value pair. The key must be \"data\", the value is hex-encoded data\n       },\n       ...\n     ]\n3. locktime                    (numeric, optional, default=0) Raw locktime. Non-0 value also locktime-activates inputs\n4. replaceable                 (boolean, optional, default=true) Marks this transaction as BIP125-replaceable.\n                               Allows this transaction to be replaced by a transaction with higher fees. If provided, it is an error if explicit sequence numbers are incompatible.\n\nResult:\n\"hex\"    (string) hex string of the transaction\n\nExamples:\n> bitcoin-cli createrawtransaction \"[{\\\"txid\\\":\\\"myid\\\",\\\"vout\\\":0}]\" \"[{\\\"address\\\":0.01}]\"\n> bitcoin-cli createrawtransaction \"[{\\\"txid\\\":\\\"myid\\\",\\\"vout\\\":0}]\" \"[{\\\"data\\\":\\\"00010203\\\"}]\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"createrawtransaction\", \"params\": [\"[{\\\"txid\\\":\\\"myid\\\",\\\"vout\\\":0}]\", \"[{\\\"address\\\":0.01}]\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"createrawtransaction\", \"params\": [\"[{\\\"txid\\\":\\\"myid\\\",\\\"vout\\\":0}]\", \"[{\\\"data\\\":\\\"00010203\\\"}]\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help gettxspendingprevout` text (Bitcoin Core 29).
@@ -3148,6 +3217,25 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         CREATERAWTRANSACTION_HELP,
     ),
     (
+        "converttopsbt",
+        &[
+            ("hexstring", Some("string"), true),
+            ("permitsigdata", Some("bool"), false),
+            ("iswitness", Some("bool"), false),
+        ],
+        CONVERTTOPSBT_HELP,
+    ),
+    (
+        "createpsbt",
+        &[
+            ("inputs", Some("array"), true),
+            ("outputs", None, true),
+            ("locktime", Some("number"), false),
+            ("replaceable", Some("bool"), false),
+        ],
+        CREATEPSBT_HELP,
+    ),
+    (
         "decodepsbt",
         &[("psbt", Some("string"), true)],
         DECODEPSBT_HELP,
@@ -3648,6 +3736,184 @@ fn arg_errors(method: &str, params: &Value) -> Option<(i64, String)> {
 fn method_help(name: &str) -> Option<&'static str> {
     METHOD_ARGS.iter().find(|r| r.0 == name).map(|r| r.2)
 }
+
+/// `CreateTransaction` — the shared body of `createrawtransaction` and
+/// `createpsbt` once the RPCHelpMan arity/type pass has run. All errors
+/// are Core's verbatim strings and codes.
+fn build_raw_tx(
+    inputs: &Value,
+    outputs: &Value,
+    locktime: u32,
+    rbf: Option<bool>,
+    params: &avila_consensus::params::Params,
+) -> Result<Transaction, (i64, String)> {
+    // AddInputs — per element: object check, ParseHashO
+    // txid, vout num/i32/non-negative, then the sequence
+    // default and any explicit override.
+    let default_seq = if rbf.unwrap_or(true) {
+        0xffff_fffd // MAX_BIP125_RBF_SEQUENCE
+    } else if locktime != 0 {
+        0xffff_fffe // CTxIn::MAX_SEQUENCE_NONFINAL
+    } else {
+        0xffff_ffff // CTxIn::SEQUENCE_FINAL
+    };
+    let mut txins = Vec::new();
+    for input in inputs.as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        let Some(obj) = input.as_object() else {
+            return Err((RPC_TYPE_ERROR, field_type_message(input, "object")));
+        };
+        let txid_v = obj.get("txid").unwrap_or(&Value::Null);
+        let Some(txid_s) = txid_v.as_str() else {
+            return Err((RPC_TYPE_ERROR, field_type_message(txid_v, "string")));
+        };
+        let txid: Txid = parse_hash_v(txid_s, "txid")?;
+        let Some(vout_v) = obj.get("vout").filter(|v| v.is_number()) else {
+            return Err((
+                RPC_INVALID_PARAMETER,
+                "Invalid parameter, missing vout key".into(),
+            ));
+        };
+        let Some(vout) = vout_v.as_i64().and_then(|n| i32::try_from(n).ok()) else {
+            return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
+        };
+        if vout < 0 {
+            return Err((
+                RPC_INVALID_PARAMETER,
+                "Invalid parameter, vout cannot be negative".into(),
+            ));
+        }
+        let mut sequence = default_seq;
+        if let Some(seq_v) = obj.get("sequence").filter(|v| v.is_number()) {
+            let Some(seq) = seq_v.as_i64() else {
+                return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
+            };
+            if !(0..=u32::MAX as i64).contains(&seq) {
+                return Err((
+                    RPC_INVALID_PARAMETER,
+                    "Invalid parameter, sequence number is out of range".into(),
+                ));
+            }
+            sequence = seq as u32;
+        }
+        txins.push(avila_consensus::transaction::TxIn {
+            previous_output: OutPoint {
+                txid,
+                vout: vout as u32,
+            },
+            script_sig: Script::new(Vec::new()),
+            sequence,
+            witness: avila_consensus::transaction::Witness::EMPTY,
+        });
+    }
+    // NormalizeOutputs + ParseOutputs — dict form iterates
+    // its key order; array form requires single-pair
+    // objects and preserves duplicates for the checks.
+    let pairs: Vec<(&str, &Value)> = match outputs {
+        Value::Null => {
+            return Err((
+                RPC_INVALID_PARAMETER,
+                "Invalid parameter, output argument must be non-null".into(),
+            ));
+        }
+        Value::Object(map) => map.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+        Value::Array(items) => {
+            let mut pairs = Vec::new();
+            for item in items {
+                let Some(obj) = item.as_object() else {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "Invalid parameter, key-value pair not an object as expected".into(),
+                    ));
+                };
+                if obj.len() != 1 {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "Invalid parameter, key-value pair must contain exactly one key".into(),
+                    ));
+                }
+                // len == 1 was just enforced — the sole
+                // pair is the output's key and value.
+                if let Some((k, v)) = obj.iter().next() {
+                    pairs.push((k.as_str(), v));
+                }
+            }
+            pairs
+        }
+        other => {
+            return Err((RPC_TYPE_ERROR, field_type_message(other, "array")));
+        }
+    };
+    let mut txouts = Vec::new();
+    let mut seen_scripts = std::collections::HashSet::new();
+    let mut has_data = false;
+    for (key, value) in pairs {
+        if key == "data" {
+            if has_data {
+                return Err((
+                    RPC_INVALID_PARAMETER,
+                    "Invalid parameter, duplicate key: data".into(),
+                ));
+            }
+            has_data = true;
+            // ParseHexV on getValStr — non-strings stringify
+            // (data:7 → "7"), then IsHex: nonempty, even
+            // length, all hex digits.
+            let s = val_str(value);
+            let ok = !s.is_empty()
+                && s.len().is_multiple_of(2)
+                && s.bytes().all(|c| c.is_ascii_hexdigit());
+            let Some(bytes) = ok.then(|| hex::decode(&s).ok()).flatten() else {
+                return Err((
+                    RPC_INVALID_PARAMETER,
+                    format!("Data must be hexadecimal string (not '{s}')"),
+                ));
+            };
+            let mut script = vec![avila_consensus::script::OP_RETURN];
+            script.extend_from_slice(&avila_consensus::script::push_slice(&bytes));
+            txouts.push(avila_consensus::transaction::TxOut {
+                value: 0,
+                script_pubkey: Script::new(script),
+            });
+        } else {
+            // ParseOutputs: the amount parses before the
+            // address validates, and dedup is on the
+            // decoded destination (its script here).
+            let amount = amount_from_value(value)?;
+            let Some(script) = avila_consensus::address::address_to_script(key, params) else {
+                return Err((
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    format!("Invalid Bitcoin address: {key}"),
+                ));
+            };
+            if !seen_scripts.insert(script.as_bytes().to_vec()) {
+                return Err((
+                    RPC_INVALID_PARAMETER,
+                    format!("Invalid parameter, duplicated address: {key}"),
+                ));
+            }
+            txouts.push(avila_consensus::transaction::TxOut {
+                value: amount,
+                script_pubkey: script,
+            });
+        }
+    }
+    // The combination check runs last — after every input
+    // and output parsed.
+    if rbf == Some(true) && !txins.is_empty() && !txins.iter().any(|i| i.sequence <= 0xffff_fffd) {
+        return Err((
+            RPC_INVALID_PARAMETER,
+            "Invalid parameter combination: Sequence number(s) contradict replaceable option"
+                .into(),
+        ));
+    }
+    Ok(Transaction {
+        version: 2, // CTransaction::CURRENT_VERSION
+        inputs: txins,
+        outputs: txouts,
+        lock_time: locktime,
+    })
+}
+
 fn dispatch(
     method: &str,
     params: &Value,
@@ -6050,181 +6316,131 @@ fn dispatch(
             let inputs = arr[0].clone();
             let outputs = arr[1].clone();
             chain_query(queries, move |cs, _| {
-                let params = cs.tree().params();
-                // AddInputs — per element: object check, ParseHashO
-                // txid, vout num/i32/non-negative, then the sequence
-                // default and any explicit override.
-                let default_seq = if rbf.unwrap_or(true) {
-                    0xffff_fffd // MAX_BIP125_RBF_SEQUENCE
-                } else if locktime != 0 {
-                    0xffff_fffe // CTxIn::MAX_SEQUENCE_NONFINAL
-                } else {
-                    0xffff_ffff // CTxIn::SEQUENCE_FINAL
-                };
-                let mut txins = Vec::new();
-                for input in inputs.as_array().map(Vec::as_slice).unwrap_or(&[]) {
-                    let Some(obj) = input.as_object() else {
-                        return Err((RPC_TYPE_ERROR, field_type_message(input, "object")));
-                    };
-                    let txid_v = obj.get("txid").unwrap_or(&Value::Null);
-                    let Some(txid_s) = txid_v.as_str() else {
-                        return Err((RPC_TYPE_ERROR, field_type_message(txid_v, "string")));
-                    };
-                    let txid: Txid = parse_hash_v(txid_s, "txid")?;
-                    let Some(vout_v) = obj.get("vout").filter(|v| v.is_number()) else {
-                        return Err((
-                            RPC_INVALID_PARAMETER,
-                            "Invalid parameter, missing vout key".into(),
-                        ));
-                    };
-                    let Some(vout) = vout_v.as_i64().and_then(|n| i32::try_from(n).ok()) else {
-                        return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
-                    };
-                    if vout < 0 {
-                        return Err((
-                            RPC_INVALID_PARAMETER,
-                            "Invalid parameter, vout cannot be negative".into(),
-                        ));
-                    }
-                    let mut sequence = default_seq;
-                    if let Some(seq_v) = obj.get("sequence").filter(|v| v.is_number()) {
-                        let Some(seq) = seq_v.as_i64() else {
-                            return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
-                        };
-                        if !(0..=u32::MAX as i64).contains(&seq) {
-                            return Err((
-                                RPC_INVALID_PARAMETER,
-                                "Invalid parameter, sequence number is out of range".into(),
-                            ));
-                        }
-                        sequence = seq as u32;
-                    }
-                    txins.push(avila_consensus::transaction::TxIn {
-                        previous_output: OutPoint {
-                            txid,
-                            vout: vout as u32,
-                        },
-                        script_sig: Script::new(Vec::new()),
-                        sequence,
-                        witness: avila_consensus::transaction::Witness::EMPTY,
-                    });
-                }
-                // NormalizeOutputs + ParseOutputs — dict form iterates
-                // its key order; array form requires single-pair
-                // objects and preserves duplicates for the checks.
-                let pairs: Vec<(&str, &Value)> = match &outputs {
-                    Value::Null => {
-                        return Err((
-                            RPC_INVALID_PARAMETER,
-                            "Invalid parameter, output argument must be non-null".into(),
-                        ));
-                    }
-                    Value::Object(map) => map.iter().map(|(k, v)| (k.as_str(), v)).collect(),
-                    Value::Array(items) => {
-                        let mut pairs = Vec::new();
-                        for item in items {
-                            let Some(obj) = item.as_object() else {
-                                return Err((
-                                    RPC_INVALID_PARAMETER,
-                                    "Invalid parameter, key-value pair not an object as expected"
-                                        .into(),
-                                ));
-                            };
-                            if obj.len() != 1 {
-                                return Err((
-                                    RPC_INVALID_PARAMETER,
-                                    "Invalid parameter, key-value pair must contain exactly one key"
-                                        .into(),
-                                ));
-                            }
-                            // len == 1 was just enforced — the sole
-                            // pair is the output's key and value.
-                            if let Some((k, v)) = obj.iter().next() {
-                                pairs.push((k.as_str(), v));
-                            }
-                        }
-                        pairs
-                    }
-                    other => {
-                        return Err((RPC_TYPE_ERROR, field_type_message(other, "array")));
-                    }
-                };
-                let mut txouts = Vec::new();
-                let mut seen_scripts = std::collections::HashSet::new();
-                let mut has_data = false;
-                for (key, value) in pairs {
-                    if key == "data" {
-                        if has_data {
-                            return Err((
-                                RPC_INVALID_PARAMETER,
-                                "Invalid parameter, duplicate key: data".into(),
-                            ));
-                        }
-                        has_data = true;
-                        // ParseHexV on getValStr — non-strings stringify
-                        // (data:7 → "7"), then IsHex: nonempty, even
-                        // length, all hex digits.
-                        let s = val_str(value);
-                        let ok = !s.is_empty()
-                            && s.len().is_multiple_of(2)
-                            && s.bytes().all(|c| c.is_ascii_hexdigit());
-                        let Some(bytes) = ok.then(|| hex::decode(&s).ok()).flatten() else {
-                            return Err((
-                                RPC_INVALID_PARAMETER,
-                                format!("Data must be hexadecimal string (not '{s}')"),
-                            ));
-                        };
-                        let mut script = vec![avila_consensus::script::OP_RETURN];
-                        script.extend_from_slice(&avila_consensus::script::push_slice(&bytes));
-                        txouts.push(avila_consensus::transaction::TxOut {
-                            value: 0,
-                            script_pubkey: Script::new(script),
-                        });
-                    } else {
-                        // ParseOutputs: the amount parses before the
-                        // address validates, and dedup is on the
-                        // decoded destination (its script here).
-                        let amount = amount_from_value(value)?;
-                        let Some(script) = avila_consensus::address::address_to_script(key, params)
-                        else {
-                            return Err((
-                                RPC_INVALID_ADDRESS_OR_KEY,
-                                format!("Invalid Bitcoin address: {key}"),
-                            ));
-                        };
-                        if !seen_scripts.insert(script.as_bytes().to_vec()) {
-                            return Err((
-                                RPC_INVALID_PARAMETER,
-                                format!("Invalid parameter, duplicated address: {key}"),
-                            ));
-                        }
-                        txouts.push(avila_consensus::transaction::TxOut {
-                            value: amount,
-                            script_pubkey: script,
-                        });
-                    }
-                }
-                // The combination check runs last — after every input
-                // and output parsed.
-                if rbf == Some(true)
-                    && !txins.is_empty()
-                    && !txins.iter().any(|i| i.sequence <= 0xffff_fffd)
-                {
-                    return Err((
-                        RPC_INVALID_PARAMETER,
-                        "Invalid parameter combination: Sequence number(s) contradict replaceable \
-                         option"
-                            .into(),
-                    ));
-                }
-                let tx = Transaction {
-                    version: 2, // CTransaction::CURRENT_VERSION
-                    inputs: txins,
-                    outputs: txouts,
-                    lock_time: locktime,
-                };
+                let tx = build_raw_tx(&inputs, &outputs, locktime, rbf, cs.tree().params())?;
                 Ok(json!(hex::encode(&tx.encode())))
             })
+        }
+        // createpsbt — identical construction to createrawtransaction,
+        // then Core's `CreatePSBT` wrap (unsigned tx + empty maps).
+        "createpsbt" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() < 2 || arr.len() > 4 {
+                return help_error(CREATEPSBT_HELP);
+            }
+            let mut type_errors: Vec<(usize, &str, &Value, &str)> = Vec::new();
+            if !arr[0].is_array() {
+                type_errors.push((1, "inputs", &arr[0], "array"));
+            }
+            if let Some(locktime) = arr.get(2)
+                && !(locktime.is_number() || locktime.is_null())
+            {
+                type_errors.push((3, "locktime", locktime, "number"));
+            }
+            if let Some(replaceable) = arr.get(3)
+                && !(replaceable.is_boolean() || replaceable.is_null())
+            {
+                type_errors.push((4, "replaceable", replaceable, "bool"));
+            }
+            if !type_errors.is_empty() {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_list(&type_errors))),
+                );
+            }
+            let locktime = match arr.get(2) {
+                None | Some(Value::Null) => 0u32,
+                Some(v) => {
+                    let Some(n) = v.as_i64() else {
+                        return (
+                            Value::Null,
+                            Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                        );
+                    };
+                    if !(0..=u32::MAX as i64).contains(&n) {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_INVALID_PARAMETER,
+                                "Invalid parameter, locktime out of range".into(),
+                            )),
+                        );
+                    }
+                    n as u32
+                }
+            };
+            let rbf: Option<bool> = arr.get(3).and_then(Value::as_bool);
+            let inputs = arr[0].clone();
+            let outputs = arr[1].clone();
+            chain_query(queries, move |cs, _| {
+                let tx = build_raw_tx(&inputs, &outputs, locktime, rbf, cs.tree().params())?;
+                Ok(json!(base64_encode(
+                    &avila_consensus::psbt::Psbt::from_unsigned_tx(tx).encode()
+                )))
+            })
+        }
+        // converttopsbt — decode with `iswitness` semantics, reject
+        // signed input data unless `permitsigdata`, then wrap.
+        "converttopsbt" => {
+            let hexstr = match params[0].as_str() {
+                Some(s) => s,
+                None => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(1, "hexstring", &params[0], "string"),
+                        )),
+                    );
+                }
+            };
+            let permitsigdata = param(params, 1, "permitsigdata")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let iswitness = param(params, 2, "iswitness").and_then(Value::as_bool);
+            let Ok(bytes) = hex::decode(hexstr) else {
+                return (
+                    Value::Null,
+                    Some((RPC_DESERIALIZATION_ERROR, "TX decode failed".into())),
+                );
+            };
+            let decoded = match iswitness {
+                Some(true) => Transaction::decode(&bytes).ok(),
+                Some(false) => Transaction::decode_no_witness(&bytes).ok(),
+                None => Transaction::decode_no_witness(&bytes)
+                    .or_else(|_| Transaction::decode(&bytes))
+                    .ok(),
+            };
+            let Some(mut tx) = decoded else {
+                return (
+                    Value::Null,
+                    Some((RPC_DESERIALIZATION_ERROR, "TX decode failed".into())),
+                );
+            };
+            let signed = tx
+                .inputs
+                .iter()
+                .any(|i| !i.script_sig.as_bytes().is_empty() || !i.witness.is_empty());
+            if signed {
+                if !permitsigdata {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_DESERIALIZATION_ERROR,
+                            "Inputs must not have scriptSigs and scriptWitnesses".into(),
+                        )),
+                    );
+                }
+                for i in &mut tx.inputs {
+                    i.script_sig = Script::new(Vec::new());
+                    i.witness = avila_consensus::transaction::Witness::EMPTY;
+                }
+            }
+            (
+                json!(base64_encode(
+                    &avila_consensus::psbt::Psbt::from_unsigned_tx(tx).encode()
+                )),
+                None,
+            )
         }
         // Core's createmultisig (rpc/output_script.cpp) — n-of-m
         // multisig construction: keys parse first (HexToPubKey), then
@@ -8958,6 +9174,7 @@ fn dispatch(
                      \x20   getrawtransaction <txid> [verbosity] [blockhash],\n\
                      \x20   decoderawtransaction <hex> [iswitness], getindexinfo [index_name],\n\
                      \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>, decodepsbt <psbt>,\n\
+                     \x20   createpsbt <in> <out> [lt] [rbf], converttopsbt <hex> [ok] [wit],\n\
                      \x20   gettxoutproof <txids> [blockhash] [options],\n\
                      \x20   verifytxoutproof <proof> [options], validateaddress <address>,\n\
                      \x20   verifymessage <address> <sig> <msg>,\n\
