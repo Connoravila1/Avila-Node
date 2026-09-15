@@ -112,6 +112,19 @@ def build_calls(height):
         ("getpeerinfo", []),
         ("getorphantxs", []),
         ("savemempool", []),
+        # validateaddress: valid P2PKH/P2SH/bech32/bech32m plus each
+        # error class — wrong-network, bad checksum, mixed case, junk.
+        ("validateaddress", ["mzuLyXXJdpC2ZJvBwfZJz7vfRtWFzch3HE"]),
+        ("validateaddress", ["2N16To2TZ3V9DaveY9e57kAGtKhVFuPCMbK"]),
+        ("validateaddress", ["bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"]),
+        ("validateaddress", ["BCRT1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KYGT080"]),
+        ("validateaddress", ["bcrt1pnqmehk4fjszhda70em7gqsfyqx839hgjmnypf4esl5raq3sur33qp3q8s8"]),
+        ("validateaddress", ["bcrt1znqmehk4fjszhda70em7gqsfyqx839hgjmnypf4esl5raq3sur33qfveg7v"]),
+        ("validateaddress", ["bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"]),
+        ("validateaddress", ["bcrt1QW508d6qejxtdg4y5r3zarvary0c5xw7kygt080"]),
+        ("validateaddress", ["bcrt1p5xu6lmdlytyj4e3hajxw2u0jfyr8g7mh5zszs0axkzfq2tdlymqkwm4h7a"]),
+        ("validateaddress", ["1111111111111111111114oLvT2"]),
+        ("validateaddress", ["notanaddress"]),
         ("help", []),
         ("stop-token-check", None),  # placeholder, never called
     ]

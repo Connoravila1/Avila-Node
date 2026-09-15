@@ -47,11 +47,11 @@ python3 tools/compare_rpc.py \
 
 ## Results
 
-21 MATCH (every shared field byte-identical), 2 EXPECTED-DIFF
-(presence gaps only), **1 DIFFERS** — `fullrbf` reports `false` vs
-Knots' `true`: a genuine policy divergence, not a serialization bug.
-Our pool enforces BIP125 opt-in signaling for replacements; Knots 29
-ships mempoolfullrbf semantics. One AVILA-ERROR (`estimatesmartfee` —
+33 MATCH (every shared field byte-identical), 1 EXPECTED-DIFF
+(presence gaps only), 3 DIFFERS — one is a genuine policy divergence
+(`fullrbf`: our pool enforces BIP125 opt-in signaling; Knots 29 ships
+mempoolfullrbf semantics) and two are environmental (`getpeerinfo`,
+`getconnectioncount` — the daemons hold different peer sets). One AVILA-ERROR (`estimatesmartfee` —
 honest "insufficient data" on a fresh chain with no confirmation
 samples; Knots returned its fallback). `sendrawtransaction` error
 paths match: `-22` decode failures, `-26`/`bad-cb-length` consensus

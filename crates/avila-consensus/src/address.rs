@@ -228,6 +228,287 @@ pub fn witness_decode(s: &str) -> Option<(String, u8, Vec<u8>)> {
     Some((hrp.to_owned(), version, program))
 }
 
+/// What [`validate_address`] reports for a decodable destination.
+#[derive(Clone, Debug)]
+pub struct AddressInfo {
+    /// The scriptPubKey this address pays to.
+    pub script: Script,
+    /// Core's `isscript` field: `Some(true)` for P2SH and v1-32B
+    /// taproot (both can carry script paths), `Some(false)` for P2PKH
+    /// and v0 witness, `None` for unknown witness versions where Core
+    /// omits the field entirely.
+    pub is_script: Option<bool>,
+    /// `(version, program)` for segwit destinations — Core's
+    /// `iswitness`/`witness_version`/`witness_program` fields.
+    pub witness: Option<(u8, Vec<u8>)>,
+}
+
+/// The checksum alphabet a bech32 string actually encoded with —
+/// BIP173 requires `Bech32` for v0 and `Bech32m` for v1+.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Bech32Encoding {
+    /// BIP173 constant.
+    Bech32,
+    /// BIP350 constant.
+    Bech32m,
+}
+
+/// Core's `validateaddress` failure shape: the message and the
+/// character positions its error locator found.
+pub type DestError = (String, Vec<i32>);
+
+/// A decoded bech32 string: HRP, the 5-bit data values (version +
+/// program + checksum tail), and which checksum constant verified.
+type Bech32Decoded = (String, Vec<u8>, Bech32Encoding);
+
+/// Bech32 decode with Core's `bech32::Decode` + `LocateErrors` error
+/// vocabulary. The BCH syndrome locator (which can pinpoint ≤2 wrong
+/// checksum characters) is not replicated: checksum failures report
+/// `"Invalid checksum"` with no locations, which is also what Core
+/// emits whenever corruption exceeds its locator.
+fn bech32_decode_full(s: &str) -> Result<Bech32Decoded, DestError> {
+    if s.len() > 90 {
+        return Err((
+            "Bech32 string too long".into(),
+            (90..s.len() as i32).collect(),
+        ));
+    }
+    // Core's CheckCharacters: the first cased letter fixes the case;
+    // every later char of the other case — and any non-printable —
+    // is an error position.
+    let mut lower = false;
+    let mut upper = false;
+    let mut locs = Vec::new();
+    for (i, &c) in s.as_bytes().iter().enumerate() {
+        match c {
+            b'a'..=b'z' if upper => locs.push(i as i32),
+            b'a'..=b'z' => lower = true,
+            b'A'..=b'Z' if lower => locs.push(i as i32),
+            b'A'..=b'Z' => upper = true,
+            0..=32 | 127.. => locs.push(i as i32),
+            _ => {}
+        }
+    }
+    if !locs.is_empty() {
+        return Err(("Invalid character or mixed case".into(), locs));
+    }
+    let lower_s = s.to_ascii_lowercase();
+    let Some(pos) = lower_s.rfind('1') else {
+        return Err(("Missing separator".into(), vec![]));
+    };
+    if pos == 0 || pos + 6 >= s.len() {
+        return Err(("Invalid separator position".into(), vec![pos as i32]));
+    }
+    let hrp = &lower_s[..pos];
+    let mut values = Vec::with_capacity(s.len() - pos - 1);
+    for (i, &c) in lower_s.as_bytes()[pos + 1..].iter().enumerate() {
+        let Some(v) = BECH32_CHARSET.iter().position(|&b| b == c) else {
+            return Err((
+                "Invalid Base 32 character".into(),
+                vec![(pos + 1 + i) as i32],
+            ));
+        };
+        values.push(v as u8);
+    }
+    // Values include the 6-symbol checksum tail; polymod over
+    // hrp+values identifies the encoding.
+    let pm = polymod(hrp, &values);
+    let enc = if pm == BECH32_CONST {
+        Bech32Encoding::Bech32
+    } else if pm == BECH32M_CONST {
+        Bech32Encoding::Bech32m
+    } else {
+        return Err(("Invalid checksum".into(), vec![]));
+    };
+    Ok((hrp.to_owned(), values, enc))
+}
+
+/// Base58 decode without the checksum — Core's `DecodeBase58`: pure
+/// charset/length validity (its `max_ret_len` is 100 here).
+fn base58_decode(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut num: Vec<u8> = Vec::new();
+    let mut seen_nonzero = false;
+    for c in s.bytes() {
+        let Some(digit) = BASE58_ALPHABET.iter().position(|&b| b == c) else {
+            return false;
+        };
+        if !seen_nonzero && c == b'1' {
+            continue;
+        }
+        seen_nonzero = true;
+        let mut carry = digit as u32;
+        for byte in num.iter_mut().rev() {
+            let acc = u32::from(*byte) * 58 + carry;
+            *byte = (acc & 0xff) as u8;
+            carry = acc >> 8;
+        }
+        while carry > 0 {
+            if num.len() + 1 > 96 {
+                return false; // beyond Core's max_ret_len
+            }
+            num.insert(0, (carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+    true
+}
+
+/// Core's `DecodeDestination` for `validateaddress`: classifies a
+/// string as this network's P2PKH/P2SH/witness destination or reports
+/// Core's exact failure message and error positions.
+///
+/// The decode order matches Core: unless the string starts with this
+/// network's bech32 HRP (case-insensitively), it is treated as base58;
+/// an HRP-prefixed string is decoded as bech32/bech32m and reports
+/// bech32's own error strings.
+pub fn validate_address(s: &str, params: &Params) -> Result<AddressInfo, DestError> {
+    let hrp = &params.bech32_hrp;
+    let is_bech32 = s.len() >= hrp.len() && s[..hrp.len()].eq_ignore_ascii_case(hrp);
+
+    if !is_bech32 {
+        if let Some((version, payload)) = base58check_decode(s) {
+            if payload.len() == 20 && version == params.base58_pubkey_prefix {
+                let mut script = Vec::with_capacity(25);
+                script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+                script.extend_from_slice(&payload);
+                script.extend_from_slice(&[0x88, 0xac]);
+                return Ok(AddressInfo {
+                    script: Script::new(script),
+                    is_script: Some(false),
+                    witness: None,
+                });
+            }
+            if payload.len() == 20 && version == params.base58_script_prefix {
+                let mut script = Vec::with_capacity(23);
+                script.extend_from_slice(&[0xa9, 0x14]);
+                script.extend_from_slice(&payload);
+                script.push(0x87);
+                return Ok(AddressInfo {
+                    script: Script::new(script),
+                    is_script: Some(true),
+                    witness: None,
+                });
+            }
+            // Prefix right but payload short → length error; a foreign
+            // version byte → unsupported.
+            let msg = if version == params.base58_pubkey_prefix
+                || version == params.base58_script_prefix
+            {
+                "Invalid length for Base58 address (P2PKH or P2SH)"
+            } else {
+                "Invalid or unsupported Base58-encoded address."
+            };
+            return Err((msg.into(), vec![]));
+        }
+        return Err(if base58_decode(s) {
+            (
+                "Invalid checksum or length of Base58 address (P2PKH or P2SH)".into(),
+                vec![],
+            )
+        } else {
+            (
+                "Invalid or unsupported Segwit (Bech32) or Base58 encoding.".into(),
+                vec![],
+            )
+        });
+    }
+
+    let (got_hrp, values, enc) = bech32_decode_full(s)?;
+    if values.is_empty() {
+        return Err(("Empty Bech32 data section".into(), vec![]));
+    }
+    if got_hrp != *hrp {
+        return Err((
+            format!(
+                "Invalid or unsupported prefix for Segwit (Bech32) address (expected {hrp}, got {got_hrp})."
+            ),
+            vec![],
+        ));
+    }
+    let version = u32::from(values[0]);
+    match (version, enc) {
+        (0, Bech32Encoding::Bech32m) => {
+            return Err((
+                "Version 0 witness address must use Bech32 checksum".into(),
+                vec![],
+            ));
+        }
+        (v, Bech32Encoding::Bech32) if v != 0 => {
+            return Err((
+                "Version 1+ witness address must use Bech32m checksum".into(),
+                vec![],
+            ));
+        }
+        _ => {}
+    }
+    // 5→8 regroup the data part (version symbol + checksum excluded).
+    let mut program = Vec::with_capacity(values.len() * 5 / 8);
+    {
+        let mut acc = 0u32;
+        let mut bits = 0u32;
+        for v in &values[1..values.len() - 6] {
+            acc = (acc << 5) | u32::from(*v);
+            bits += 5;
+            if bits >= 8 {
+                bits -= 8;
+                program.push((acc >> bits) as u8);
+            }
+        }
+        if bits >= 5 || (acc << (8 - bits)) & 0xff != 0 {
+            return Err(("Invalid padding in Bech32 data section".into(), vec![]));
+        }
+    }
+    let unit = if program.len() == 1 { "byte" } else { "bytes" };
+    // Core's DescribeAddress: v0 keyhash/scripthash and v1 taproot are
+    // named witness types; anything else is WitnessUnknown, which gets
+    // no `isscript` field.
+    let is_script = if version == 0 {
+        if program.len() != 20 && program.len() != 32 {
+            return Err((
+                format!(
+                    "Invalid Bech32 v0 address program size ({} {unit}), per BIP141",
+                    program.len()
+                ),
+                vec![],
+            ));
+        }
+        Some(false)
+    } else {
+        if version > 16 {
+            return Err(("Invalid Bech32 address witness version".into(), vec![]));
+        }
+        if !(2..=40).contains(&program.len()) {
+            return Err((
+                format!(
+                    "Invalid Bech32 address program size ({} {unit})",
+                    program.len()
+                ),
+                vec![],
+            ));
+        }
+        if version == 1 && program.len() == 32 {
+            Some(true)
+        } else {
+            None
+        }
+    };
+    let opcode = if version == 0 {
+        crate::script::OP_0
+    } else {
+        crate::script::OP_1 + version as u8 - 1
+    };
+    let mut script = vec![opcode];
+    script.extend_from_slice(&crate::script::push_slice(&program));
+    Ok(AddressInfo {
+        script: Script::new(script),
+        is_script,
+        witness: Some((version as u8, program)),
+    })
+}
+
 /// The scriptPubKey an address pays to — the inverse of
 /// [`script_address`], Core's `GetScriptForDestination`. `None` when
 /// the string is neither a valid base58check address for this

@@ -30,6 +30,7 @@ use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use avila_consensus::address::{script_address, validate_address};
 use avila_consensus::arith::difficulty_from_compact;
 use avila_consensus::chain::HeaderNode;
 use avila_consensus::chainstate::Chainstate;
@@ -826,6 +827,54 @@ fn dispatch(
                 "warnings": [],
             }))
         }),
+        // Core's validateaddress — address decode reporting. Without a
+        // wallet the wallet-derived fields (ismine, iswatchonly, …)
+        // are absent, matching Core run wallet-free.
+        "validateaddress" => {
+            let Some(addr) = param(params, 0, "address").and_then(Value::as_str) else {
+                return missing_params("address");
+            };
+            let addr = addr.to_owned();
+            chain_query(queries, move |cs, _| {
+                match validate_address(&addr, cs.tree().params()) {
+                    Ok(info) => {
+                        // Core re-encodes the destination (canonical
+                        // lowercase bech32); fall back to the input.
+                        let canonical =
+                            script_address(&info.script, cs.tree().params()).unwrap_or(addr);
+                        let mut out = json!({
+                            "isvalid": true,
+                            "address": canonical,
+                            "scriptPubKey": hex::encode(info.script.as_bytes()),
+                            "iswitness": info.witness.is_some(),
+                        });
+                        // Core omits isscript on unknown witness
+                        // versions (WitnessUnknown has none).
+                        if let Some(is_script) = info.is_script {
+                            out["isscript"] = json!(is_script);
+                        }
+                        if let Some((version, program)) = info.witness {
+                            out["witness_version"] = json!(version);
+                            out["witness_program"] = json!(hex::encode(&program));
+                        }
+                        Ok(out)
+                    }
+                    Err((error, locations)) => {
+                        let mut out = json!({
+                            "isvalid": false,
+                            "error_locations": locations,
+                            "error": error,
+                        });
+                        // Core emits error_index = the first located
+                        // position when any were found.
+                        if let Some(first) = locations.first() {
+                            out["error_index"] = json!(first);
+                        }
+                        Ok(out)
+                    }
+                }
+            })
+        }
         "decodescript" => {
             let Some(hexstr) = param(params, 0, "hexstring").and_then(Value::as_str) else {
                 return missing_params("hexstring");
@@ -1982,7 +2031,8 @@ fn dispatch(
                  \x20 chain: getblockcount, getbestblockhash, getblockchaininfo, getchaintips,\n\
                  \x20   getblockhash <height>, getblockheader <hash> [verbose],\n\
                  \x20   getblock <hash> [verbosity 0-2], getrawtransaction <txid> [verbosity] [blockhash],\n\
-                 \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>\n\
+                 \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>,\n\
+                 \x20   validateaddress <address>\n\
                  \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
                  \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
                  \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>,\n\
