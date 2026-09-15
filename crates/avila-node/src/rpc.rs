@@ -1018,6 +1018,8 @@ const GETBLOCKFROMPEER_HELP: &str = "getblockfrompeer \"blockhash\" peer_id\n\nA
 const PRIORITISETRANSACTION_HELP: &str = "prioritisetransaction \"txid\" ( dummy ) fee_delta\n\nAccepts the transaction into mined blocks at a higher (or lower) priority\n\nArguments:\n1. txid         (string, required) The transaction id.\n2. dummy        (numeric, optional) API-Compatibility for previous API. Must be zero or null.\n                DEPRECATED. For forward compatibility use named arguments and omit this parameter.\n3. fee_delta    (numeric, required) The fee value (in satoshis) to add (or subtract, if negative).\n                Note, that this value is not a fee rate. It is a value to modify absolute fee of the TX.\n                The fee is not actually paid, only the algorithm for selecting transactions into a block\n                considers the transaction as it would have paid a higher (or lower) fee.\n\nResult:\ntrue|false    (boolean) Returns true\n\nExamples:\n> bitcoin-cli prioritisetransaction \"txid\" 0.0 10000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"prioritisetransaction\", \"params\": [\"txid\", 0.0, 10000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help getprioritisedtransactions` text (Bitcoin Core 29).
+const CREATEMULTISIG_HELP: &str = "createmultisig nrequired [\"key\",...] ( \"address_type\" )\n\nCreates a multi-signature address with n signature of m keys required.\nIt returns a json object with the address and redeemScript.\n\nArguments:\n1. nrequired       (numeric, required) The number of required signatures out of the n keys.\n2. keys            (json array, required) The hex-encoded public keys.\n     [\n       \"key\",      (string) The hex-encoded public key\n       ...\n     ]\n3. address_type    (string, optional, default=\"legacy\") The address type to use. Options are \"legacy\", \"p2sh-segwit\", and \"bech32\".\n\nResult:\n{                            (json object)\n  \"address\" : \"str\",         (string) The value of the new multisig address.\n  \"redeemScript\" : \"hex\",    (string) The string value of the hex-encoded redemption script.\n  \"descriptor\" : \"str\",      (string) The descriptor for this multisig\n  \"warnings\" : [             (json array, optional) Any warnings resulting from the creation of this multisig\n    \"str\",                   (string)\n    ...\n  ]\n}\n\nExamples:\n\nCreate a multisig address from 2 public keys\n> bitcoin-cli createmultisig 2 \"[\\\"03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd\\\",\\\"03dbc6764b8884a92e871274b87583e6d5c2a58819473e17e107ef3f6aa5a61626\\\"]\"\n\nAs a JSON-RPC call\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"createmultisig\", \"params\": [2, [\"03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd\",\"03dbc6764b8884a92e871274b87583e6d5c2a58819473e17e107ef3f6aa5a61626\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 const GETPRIORITISEDTRANSACTIONS_HELP: &str = "getprioritisedtransactions\n\nReturns a map of all user-created (see prioritisetransaction) fee deltas by txid, and whether the tx is present in mempool.\n\nResult:\n{                                 (json object) prioritisation keyed by txid\n  \"<transactionid>\" : {           (json object)\n    \"fee_delta\" : n,              (numeric) transaction fee delta in satoshis\n    \"in_mempool\" : true|false,    (boolean) whether this transaction is currently in mempool\n    \"modified_fee\" : n            (numeric, optional) modified fee in satoshis. Only returned if in_mempool=true\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getprioritisedtransactions \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getprioritisedtransactions\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help waitforblock` text (Bitcoin Core 29.4).
@@ -3932,6 +3934,234 @@ fn dispatch(
                 Ok(json!(hex::encode(&tx.encode())))
             })
         }
+        // Core's createmultisig (rpc/output_script.cpp) — n-of-m
+        // multisig construction: keys parse first (HexToPubKey), then
+        // the address type, then AddAndGetMultisigDestination's checks
+        // in order (required ≥ 1, enough keys, ≤ 20 keys, ≤ 520-byte
+        // redeemScript). Uncompressed keys silently drop segwit types
+        // to legacy with a warning.
+        "createmultisig" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() < 2 || arr.len() > 3 {
+                return help_error(CREATEMULTISIG_HELP);
+            }
+            let mut type_errors: Vec<(usize, &str, &Value, &str)> = Vec::new();
+            if !arr[0].is_number() {
+                type_errors.push((1, "nrequired", &arr[0], "number"));
+            }
+            if !arr[1].is_array() {
+                type_errors.push((2, "keys", &arr[1], "array"));
+            }
+            if let Some(at) = arr.get(2)
+                && !(at.is_string() || at.is_null())
+            {
+                type_errors.push((3, "address_type", at, "string"));
+            }
+            if !type_errors.is_empty() {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_list(&type_errors))),
+                );
+            }
+            // getInt<int> on nrequired, then HexToPubKey per element —
+            // get_str (non-string → bare -3), hex check, then the
+            // curve-point check.
+            let Some(required) = arr[0].as_i64().and_then(|n| i32::try_from(n).ok()) else {
+                return (
+                    Value::Null,
+                    Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                );
+            };
+            let mut pubkeys: Vec<Vec<u8>> = Vec::new();
+            for key in arr[1].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+                let Some(s) = key.as_str() else {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, field_type_message(key, "string"))),
+                    );
+                };
+                // IsHex: nonempty, even length, all hex digits.
+                let is_hex = !s.is_empty()
+                    && s.len().is_multiple_of(2)
+                    && s.bytes().all(|c| c.is_ascii_hexdigit());
+                let Some(pk) = is_hex.then(|| hex::decode(s).ok()).flatten() else {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_INVALID_ADDRESS_OR_KEY,
+                            format!("Pubkey \"{s}\" must be a hex string"),
+                        )),
+                    );
+                };
+                if !avila_consensus::descriptor::pubkey_is_valid(&pk) {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_INVALID_ADDRESS_OR_KEY,
+                            format!("Pubkey \"{s}\" must be cryptographically valid."),
+                        )),
+                    );
+                }
+                pubkeys.push(pk);
+            }
+            // ParseOutputType — absent/null is legacy; bech32m is a
+            // named-but-refused type.
+            let output_type = match arr.get(2) {
+                None | Some(Value::Null) => "legacy".to_string(),
+                Some(Value::String(s)) => match s.as_str() {
+                    "legacy" | "p2sh-segwit" | "bech32" => s.clone(),
+                    "bech32m" => {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_INVALID_ADDRESS_OR_KEY,
+                                "createmultisig cannot create bech32m multisig addresses".into(),
+                            )),
+                        );
+                    }
+                    _ => {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_INVALID_ADDRESS_OR_KEY,
+                                format!("Unknown address type '{s}'"),
+                            )),
+                        );
+                    }
+                },
+                _ => unreachable!("address_type type-checked above"),
+            };
+            let keys: Vec<String> = arr[1]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|k| k.as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            chain_query(queries, move |cs, _| {
+                let params = cs.tree().params();
+                // AddAndGetMultisigDestination — bounds before build.
+                if required < 1 {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "a multisignature address must require at least one key to redeem".into(),
+                    ));
+                }
+                if pubkeys.len() < required as usize {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        format!(
+                            "not enough keys supplied (got {} keys, but need at least {required} \
+                             to redeem)",
+                            pubkeys.len()
+                        ),
+                    ));
+                }
+                if pubkeys.len() > 20 {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "Number of keys involved in the multisignature address creation > 20\n\
+                         Reduce the number"
+                            .into(),
+                    ));
+                }
+                // OP_n <pk>… OP_m OP_CHECKMULTISIG, insertion order —
+                // duplicate keys are allowed.
+                let mut inner = avila_consensus::script::push_int(i64::from(required));
+                for pk in &pubkeys {
+                    inner.extend_from_slice(&avila_consensus::script::push_slice(pk));
+                }
+                inner.extend_from_slice(&avila_consensus::script::push_int(pubkeys.len() as i64));
+                inner.push(avila_consensus::script::OP_CHECKMULTISIG);
+                if inner.len() > 520 {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        format!("redeemScript exceeds size limit: {} > 520", inner.len()),
+                    ));
+                }
+                // Any uncompressed key disables segwit — the output
+                // silently becomes legacy and the warning fires.
+                let uncompressed = pubkeys.iter().any(|pk| pk.len() == 65);
+                let mut warnings = Vec::new();
+                let effective_type = if uncompressed && output_type != "legacy" {
+                    warnings.push(
+                        "Unable to make chosen address type, please ensure no uncompressed public \
+                         keys are present."
+                            .to_string(),
+                    );
+                    "legacy"
+                } else {
+                    output_type.as_str()
+                };
+                // Destination script: P2SH(inner) for legacy,
+                // P2WSH(inner) for bech32, P2SH-P2WSH for p2sh-segwit.
+                let (dest_script, descriptor) = match effective_type {
+                    "bech32" => {
+                        let wsh = Script::new(
+                            [
+                                &[avila_consensus::script::OP_0][..],
+                                &avila_consensus::script::push_slice(
+                                    &avila_consensus::hash::sha256(&inner),
+                                )[..],
+                            ]
+                            .concat(),
+                        );
+                        (wsh, format!("wsh(multi({},{}))", required, keys.join(",")))
+                    }
+                    "p2sh-segwit" => {
+                        let wsh = Script::new(
+                            [
+                                &[avila_consensus::script::OP_0][..],
+                                &avila_consensus::script::push_slice(
+                                    &avila_consensus::hash::sha256(&inner),
+                                )[..],
+                            ]
+                            .concat(),
+                        );
+                        let sh = Script::new(
+                            [
+                                &[avila_consensus::script::OP_HASH160, 0x14][..],
+                                &avila_consensus::hash::hash160(wsh.as_bytes())[..],
+                                &[avila_consensus::script::OP_EQUAL][..],
+                            ]
+                            .concat(),
+                        );
+                        (
+                            sh,
+                            format!("sh(wsh(multi({},{})))", required, keys.join(",")),
+                        )
+                    }
+                    _ => {
+                        let sh = Script::new(
+                            [
+                                &[avila_consensus::script::OP_HASH160, 0x14][..],
+                                &avila_consensus::hash::hash160(&inner)[..],
+                                &[avila_consensus::script::OP_EQUAL][..],
+                            ]
+                            .concat(),
+                        );
+                        (sh, format!("sh(multi({},{}))", required, keys.join(",")))
+                    }
+                };
+                let inner_hex = hex::encode(&inner);
+                let Some(address) = script_address(&dest_script, params) else {
+                    return Err((RPC_MISC_ERROR, "internal error".into()));
+                };
+                let mut out = json!({
+                    "address": address,
+                    "redeemScript": inner_hex,
+                    "descriptor": format!(
+                        "{descriptor}#{}",
+                        avila_consensus::descriptor::descriptor_checksum(&descriptor)
+                    ),
+                });
+                if !warnings.is_empty() {
+                    out["warnings"] = json!(warnings);
+                }
+                Ok(out)
+            })
+        }
         "prioritisetransaction" => {
             let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
             if arr.len() != 3 {
@@ -5580,6 +5810,7 @@ fn dispatch(
                  \x20   gettxspendingprevout <outputs>,\n\
                  \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>,\n\
                  \x20   createrawtransaction <inputs> <outputs> [locktime] [replaceable],\n\
+                 \x20   createmultisig <nrequired> [keys] [address_type],\n\
                  \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount], savemempool\n\
                  \x20 mining: getblocktemplate, getmininginfo, getnetworkhashps,\n\
                  \x20   submitblock <hex>,\n\
@@ -8044,6 +8275,178 @@ mod tests {
                 "0200000001{txid}0000000000ffffffff0140420f0000000000160014ad7d5448cc0401eb51b0666484f2e7e3c1f9800700000000"
             )
         );
+    }
+
+    /// `createmultisig` — Core's `AddAndGetMultisigDestination`
+    /// contract: keys parse before the address type, bounds in order
+    /// (required ≥ 1, enough keys, ≤ 20, ≤ 520-byte script), and
+    /// uncompressed keys drop segwit types to legacy with a warning.
+    #[test]
+    fn createmultisig_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let d = |p: Value| dispatch("createmultisig", &p, &snap, Some(&queries), None, None);
+        let k1 = "035b29c4f18c17f8f1142ca109c0590a3872f91a32be254a045a31481581f098d6";
+        let k2 = "02cbef9c21d191602794a1f7cf07ade94ba8d435ae017e1fa841ba6a20ae5208bc";
+        let uncompr = "04989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f\
+                       631f4d05b3ae518776ee08755a7703e64b2ebc32547504de0b55a142d4ecdf80";
+        let uncompr = uncompr.replace(' ', "");
+        let redeem = format!("5221{k1}21{k2}52ae");
+
+        // Arity — two required args, at most three.
+        for p in [json!([]), json!([2]), json!([2, [k1, k2], "legacy", 0])] {
+            let (code, msg) = d(p.clone()).1.unwrap();
+            assert_eq!(code, RPC_MISC_ERROR, "{p}");
+            assert!(msg.starts_with("createmultisig"), "{msg}");
+        }
+
+        // Collected -3 list: all three positions report together.
+        let (code, msg) = d(json!(["x", 1, 2])).1.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert!(msg.contains("Position 1 (nrequired)"), "{msg}");
+        assert!(msg.contains("Position 2 (keys)"), "{msg}");
+        assert!(msg.contains("Position 3 (address_type)"), "{msg}");
+
+        // Non-integral / out-of-i32 nrequired.
+        for n in [json!(1.5), json!("1"), json!(4294967296u64)] {
+            // "1" string triggers the collected -3, not the -1 range.
+            let (code, msg) = d(json!([n, [k1]])).1.unwrap();
+            if code == RPC_MISC_ERROR {
+                assert_eq!(msg, "JSON integer out of range", "{msg}");
+            } else {
+                assert_eq!(code, RPC_TYPE_ERROR, "{msg}");
+            }
+        }
+
+        // Keys elements: non-string → bare -3; bad hex and bad point →
+        // -5 with the pubkey echoed.
+        assert_eq!(
+            d(json!([1, [7]])).1.unwrap(),
+            (
+                RPC_TYPE_ERROR,
+                "JSON value of type number is not of expected type string".to_string()
+            )
+        );
+        assert_eq!(
+            d(json!([1, ["xx"]])).1.unwrap(),
+            (
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "Pubkey \"xx\" must be a hex string".to_string()
+            )
+        );
+        let bad = "04".repeat(33); // wrong length → invalid point
+        assert_eq!(
+            d(json!([1, [bad]])).1.unwrap().0,
+            RPC_INVALID_ADDRESS_OR_KEY
+        );
+        assert!(
+            d(json!([1, [bad]]))
+                .1
+                .unwrap()
+                .1
+                .contains("cryptographically valid")
+        );
+
+        // AddAndGetMultisigDestination bounds, in Core's check order.
+        assert_eq!(
+            d(json!([0, [k1]])).1.unwrap(),
+            (
+                RPC_INVALID_PARAMETER,
+                "a multisignature address must require at least one key to redeem".to_string()
+            )
+        );
+        assert_eq!(
+            d(json!([3, [k1, k2]])).1.unwrap(),
+            (
+                RPC_INVALID_PARAMETER,
+                "not enough keys supplied (got 2 keys, but need at least 3 to redeem)".to_string()
+            )
+        );
+        // >20 keys beats the not-enough-keys check.
+        let (code, msg) = d(json!([2, vec![k1; 21]])).1.unwrap();
+        assert_eq!(code, RPC_INVALID_PARAMETER);
+        assert!(
+            msg.starts_with("Number of keys involved in the multisignature address creation > 20"),
+            "{msg}"
+        );
+        // 520-byte cap: 15 uncompressed keys = 1+15*66+2 = 693 > 520.
+        let (code, msg) = d(json!([15, vec![uncompr.as_str(); 15]])).1.unwrap();
+        assert_eq!(code, RPC_INVALID_PARAMETER);
+        assert!(msg.starts_with("redeemScript exceeds size limit:"), "{msg}");
+
+        // Address types — exact Core 29.4 outputs for k1/k2.
+        let cases: [(Option<&str>, &str, &str); 4] = [
+            (None, "2N5mNBUAv6pMgxsoNcLf1y4TyoFYm4Mqu3Q", "sh"),
+            (Some("legacy"), "2N5mNBUAv6pMgxsoNcLf1y4TyoFYm4Mqu3Q", "sh"),
+            (
+                Some("p2sh-segwit"),
+                "2NFJNKEsV9Jcveaz8Mx7Bgxqkwcennt3s1E",
+                "sh(wsh",
+            ),
+            (
+                Some("bech32"),
+                "bcrt1qzeyrz7mnwfkxnk9f9fh79x8zdddvwlc3uetchjv9k2ypa4syr4ks2zry75",
+                "wsh",
+            ),
+        ];
+        for (at, addr, desc_prefix) in cases {
+            let mut p = json!([2, [k1, k2]]);
+            if let Some(at) = at {
+                p.as_array_mut().unwrap().push(json!(at));
+            }
+            let (r, e) = d(p);
+            assert!(e.is_none(), "{e:?}");
+            assert_eq!(r["address"], addr);
+            assert_eq!(r["redeemScript"], redeem);
+            let desc = r["descriptor"].as_str().unwrap();
+            assert!(desc.starts_with(desc_prefix), "{desc}");
+            assert!(desc.contains(&format!("multi(2,{k1},{k2})")), "{desc}");
+            assert!(r["warnings"].is_null(), "no warnings for {at:?}");
+        }
+        // The descriptor checksum is Core's own algorithm.
+        let (r, _) = d(json!([2, [k1, k2]]));
+        assert_eq!(
+            r["descriptor"],
+            "sh(multi(2,035b29c4f18c17f8f1142ca109c0590a3872f91a32be254a045a31481581f098d6,02cbef9c21d191602794a1f7cf07ade94ba8d435ae017e1fa841ba6a20ae5208bc))#r47h6hf6"
+        );
+
+        // bech32m is named-but-refused; unknown types -5.
+        assert_eq!(
+            d(json!([2, [k1, k2], "bech32m"])).1.unwrap(),
+            (
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "createmultisig cannot create bech32m multisig addresses".to_string()
+            )
+        );
+        assert_eq!(
+            d(json!([2, [k1, k2], "bogus"])).1.unwrap(),
+            (
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "Unknown address type 'bogus'".to_string()
+            )
+        );
+
+        // Uncompressed keys silently drop segwit to legacy + warn;
+        // legacy itself stays silent.
+        let (r, e) = d(json!([2, [k1, uncompr.as_str()], "bech32"]));
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["address"], "2N2WdGWrh4Vd74Z3QyYU6Wm2euJmzE2nrpm");
+        assert_eq!(
+            r["warnings"],
+            json!([
+                "Unable to make chosen address type, please ensure no uncompressed public keys are present."
+            ])
+        );
+        assert!(
+            r["descriptor"].as_str().unwrap().starts_with("sh(multi("),
+            "{}",
+            r["descriptor"]
+        );
+        let (r, _) = d(json!([2, [k1, uncompr.as_str()], "legacy"]));
+        assert!(r["warnings"].is_null(), "no warning for plain legacy");
+
+        // Empty key list hits the required-count checks, not a crash.
+        assert_eq!(d(json!([1, []])).1.unwrap().0, RPC_INVALID_PARAMETER);
     }
 
     /// `getprioritisedtransactions` — the mapDeltas dump: txid-keyed in

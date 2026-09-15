@@ -271,7 +271,13 @@ operation. Compare complete initial download and catch-up, not only local replay
       `0xfffffffe`/`0xffffffff` by replaceable+locktime, amounts go
       through a `ParseFixedPoint` port including the `e`-exponent path,
       and dict-form outputs preserve key order like UniValue via
-      serde_json's `preserve_order`). RPC
+      serde_json's `preserve_order`),
+      createmultisig (Core's `AddAndGetMultisigDestination` — keys
+      parse through a `CPubKey::IsFullyValid` port before the address
+      type resolves, bounds check in order (required ≥ 1, enough keys,
+      ≤ 20 keys, ≤ 520-byte redeemScript), uncompressed keys drop
+      segwit types to legacy with Core's warning string, and the
+      descriptor carries the BIP380 checksum). RPC
       doubles emit Core's `UniValue::setFloat` text (`%.16g` via `g16`)
       rather than ryu's shortest repr — the two parse to different
       f64s on values like 101/17, and `txrate` now matches

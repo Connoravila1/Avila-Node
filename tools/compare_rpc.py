@@ -48,6 +48,15 @@ DYNAMIC_METHODS = {"uptime", "help", "getrawmempool", "savemempool",
                    # Bare tip-hash echo — forks legitimately diverge it.
                    "getbestblockhash"}
 
+
+# Valid secp256k1 keys for createmultisig — two compressed and one
+# uncompressed (secret key 0x07…07, 65-byte form). Generated once;
+# fixed so both daemons see identical inputs.
+K1 = "035b29c4f18c17f8f1142ca109c0590a3872f91a32be254a045a31481581f098d6"
+K2 = "02cbef9c21d191602794a1f7cf07ade94ba8d435ae017e1fa841ba6a20ae5208bc"
+UC = ("04989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f"
+      "631f4d05b3ae518776ee08755a7703e64b2ebc32547504de0b55a142d4ecdf80")
+
 # Keys whose values are legitimately node- or time-specific. They are
 # still compared (structural presence is checked) but a value
 # difference is reported as expected rather than a failure.
@@ -391,6 +400,30 @@ def build_calls(height):
         ("createrawtransaction", [[{"txid": "ab" * 32, "vout": 0}], [{"data2": "x"}]]),
         ("createrawtransaction", [[{"txid": "ab" * 32, "vout": 0}], [{"data": "aa"}], -1]),
         ("createrawtransaction", [[{"txid": "ab" * 32, "vout": 0, "sequence": 4294967295}], [{"data": "aa"}], 0, True]),
+        # createmultisig — AddAndGetMultisigDestination: key parse
+        # before address type, bounds in order (required ≥ 1, enough
+        # keys, ≤ 20, ≤ 520-byte script), uncompressed keys drop segwit
+        # to legacy with a warning.
+        ("createmultisig", []),
+        ("createmultisig", [2]),
+        ("createmultisig", [2, [K1, K2], "legacy", 0]),
+        ("createmultisig", ["x", 1, 2]),
+        ("createmultisig", [1.5, [K1, K2]]),
+        ("createmultisig", [1, [7]]),
+        ("createmultisig", [1, ["xx"]]),
+        ("createmultisig", [1, ["04" * 33]]),
+        ("createmultisig", [0, [K1]]),
+        ("createmultisig", [3, [K1, K2]]),
+        ("createmultisig", [2, [K1] * 21]),
+        ("createmultisig", [15, [UC] * 15]),
+        ("createmultisig", [2, [K1, K2]]),
+        ("createmultisig", [2, [K1, K2], "legacy"]),
+        ("createmultisig", [2, [K1, K2], "p2sh-segwit"]),
+        ("createmultisig", [2, [K1, K2], "bech32"]),
+        ("createmultisig", [2, [K1, K2], "bech32m"]),
+        ("createmultisig", [2, [K1, K2], "bogus"]),
+        ("createmultisig", [2, [K1, UC], "bech32"]),
+        ("createmultisig", [2, [K1, UC], "legacy"]),
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),
         ("estimatesmartfee", [6]),

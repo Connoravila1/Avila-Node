@@ -72,11 +72,11 @@ python3 tools/compare_rpc.py \
 
 ## Results
 
-Latest run vs **Core 29.4** at h163: 103 MATCH, 1 EXPECTED-DIFF
+Latest run vs **Core 29.4** at h163: 110 MATCH, 1 EXPECTED-DIFF
 (`getrawtransaction`'s `in_active_chain` — an upstream field added
 after 29.4, verified present in Core 31.1), 0 DIFFERS, 1 CORE-ERROR
 (`gettxoutproof prove_witness` — the witness-proof wire format is a
-Knots extension Core doesn't implement), 144 BOTH-ERROR (identical
+Knots extension Core doesn't implement), 157 BOTH-ERROR (identical
 error paths). `getpeerinfo` now matches fully once the peer pair
 settles — the earlier per-peer shape diff was connection-phase
 state. First matrix vs Knots: 46 MATCH, 2 EXPECTED-DIFF,
@@ -496,6 +496,22 @@ surfaced:
   `in_mempool:false` without `modified_fee`. Any argument is
   `-1`+help. The harness counts the method as per-node state — the
   map accumulates each daemon's own prioritisetransaction history.
+- `createmultisig` ports Core 29.4's `AddAndGetMultisigDestination`
+  (`rpc/output_script.cpp`): arity `-1`+help → the collected `-3`
+  position list → `nrequired` `getInt<int>` (non-integral is `-1`
+  "JSON integer out of range") → `HexToPubKey` per key (bare `-3` on
+  non-strings, `-5` "must be a hex string" on `IsHex` failures — empty
+  or odd-length included — `-5` "must be cryptographically valid" via
+  a `CPubKey::IsFullyValid` port on libsecp256k1) → `ParseOutputType`
+  (absent/null is `legacy`; `bech32m` is the named-but-refused
+  `-5`) → bounds in order: required ≥ 1, `len < required`, `len > 20`,
+  then the 520-byte `redeemScript` cap. Output types build
+  P2SH / P2SH-P2WSH / P2WSH, and any uncompressed key silently drops
+  segwit to legacy with Core's warning string — the `warnings` field
+  is omitted entirely when no fallback happened. The `descriptor`
+  (`sh`/`sh(wsh(…))`/`wsh(…)` over `multi(n,k…)`) carries the BIP380
+  checksum. Verified live: 30 cases byte-identical including every
+  address type, both fallback paths, and the full error ordering.
 
 ### Known semantic differences
 

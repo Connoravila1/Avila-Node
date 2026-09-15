@@ -80,6 +80,15 @@ pub fn descriptor_checksum(body: &str) -> String {
         .collect()
 }
 
+/// `CPubKey::IsFullyValid` — a 33-byte compressed or 65-byte
+/// uncompressed key whose point is on the curve. libsecp256k1's parser
+/// enforces both the length form and curve membership, matching Core's
+/// `HexToPubKey` acceptance exactly.
+#[must_use]
+pub fn pubkey_is_valid(bytes: &[u8]) -> bool {
+    secp256k1::PublicKey::from_slice(bytes).is_ok()
+}
+
 /// The BIP341 key-path tweak: `Q = P + H_taptweak(P)·G` for an
 /// x-only internal key. `tr(key)` descriptors without a script tree
 /// reduce to this single tweak — the output program is Q's x-only
