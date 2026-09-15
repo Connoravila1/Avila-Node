@@ -184,8 +184,9 @@ operation. Compare complete initial download and catch-up, not only local replay
       (witness/`iswitness` semantics, TxToUniv without the hex echo),
       gettxspendingprevout (outpoint-indexed mempool spends,
       Core's full argument error taxonomy), getindexinfo
-      (txindex state + name filter)) — verified live over curl
-      and the client.
+      (txindex state + name filter), getnettotals (cumulative
+      wire bytes across live and closed sessions)) — verified
+      live over curl and the client.
       Genesis is served even though its body is never stored:
       `Params::genesis_block` reconstructs Core's per-network
       `CreateGenesisBlock` coinbase and `Chainstate::body` falls back

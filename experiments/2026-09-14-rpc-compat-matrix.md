@@ -221,6 +221,12 @@ surfaced:
   `height=-1` resolves to the tip, and the result goes through
   `core_num` (`%.16g`). The shared `network_hashps` helper also
   fixed `getmininginfo`'s stale below-120-returns-0 shortcut.
+- `getnettotals` reports cumulative wire bytes across *all* sessions
+  — `PeerManager` now absorbs each closed session's telemetry into
+  `closed_bytes_*` on every removal path (evict, dead, disconnect),
+  so a dropped peer's traffic doesn't vanish. `uploadtarget` reports
+  the unlimited (`-maxuploadtarget=0`) shape since no cycle budget is
+  enforced.
 
 ### Known semantic differences
 

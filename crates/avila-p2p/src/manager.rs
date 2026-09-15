@@ -211,6 +211,12 @@ pub struct PeerManager<S> {
     /// `inv` relay, and block-connect reconciliation stay atomic with
     /// the tick loop.
     mempool: avila_mempool::Mempool,
+    /// Wire bytes absorbed from sessions that have already ended —
+    /// `getnettotals` is cumulative over all sessions since startup
+    /// (Core's `CConnman::nTotalBytesSent`/`nTotalBytesRecv`), so a
+    /// disconnected peer's traffic must not vanish with its entry.
+    closed_bytes_sent: u64,
+    closed_bytes_recv: u64,
 }
 
 impl<S: Read + Write> PeerManager<S> {
@@ -225,7 +231,35 @@ impl<S: Read + Write> PeerManager<S> {
             max_in_flight_total: MAX_BLOCKS_IN_TRANSIT_TOTAL,
             addrbook: AddrBook::new(),
             mempool: avila_mempool::Mempool::new(),
+            closed_bytes_sent: 0,
+            closed_bytes_recv: 0,
         }
+    }
+
+    /// Removes a peer, folding its wire counters into the cumulative
+    /// totals so `getnettotals` keeps counting past sessions.
+    fn drop_peer(&mut self, id: u64) {
+        if let Some(p) = self.peers.remove(&id) {
+            let t = p.session.telemetry();
+            self.closed_bytes_sent = self.closed_bytes_sent.saturating_add(t.bytes_sent);
+            self.closed_bytes_recv = self.closed_bytes_recv.saturating_add(t.bytes_recv);
+        }
+    }
+
+    /// `getnettotals` — cumulative wire bytes since startup: closed
+    /// sessions plus every live session's current counters.
+    #[must_use]
+    pub fn net_totals(&self) -> (u64, u64) {
+        self.peers.values().fold(
+            (self.closed_bytes_sent, self.closed_bytes_recv),
+            |(sent, recv), p| {
+                let t = p.session.telemetry();
+                (
+                    sent.saturating_add(t.bytes_sent),
+                    recv.saturating_add(t.bytes_recv),
+                )
+            },
+        )
     }
 
     /// Live peer count.
@@ -365,7 +399,7 @@ impl<S: Read + Write> PeerManager<S> {
             .or_else(|| scored.first())
             .map(|(.., id)| *id);
         if let Some(id) = worst {
-            self.peers.remove(&id);
+            self.drop_peer(id);
         }
         worst
     }
@@ -473,7 +507,7 @@ impl<S: Read + Write> PeerManager<S> {
             }
         }
         for (id, reason) in dead {
-            self.peers.remove(&id);
+            self.drop_peer(id);
             if self.headers_leader == Some(id) {
                 self.headers_leader = None;
             }
@@ -902,7 +936,7 @@ impl<S: Read + Write> PeerManager<S> {
 
     /// Forcibly removes a peer (caller-initiated disconnect).
     pub fn disconnect(&mut self, id: u64) {
-        self.peers.remove(&id);
+        self.drop_peer(id);
     }
 }
 

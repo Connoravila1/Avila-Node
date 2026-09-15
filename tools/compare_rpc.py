@@ -69,6 +69,9 @@ DYNAMIC_KEYS = {
     # restarts like Core's mempool.dat, so these reflect each daemon's
     # live pool.
     "size", "total_fee", "unbroadcastcount", "maxmempool",
+    # getnettotals — cumulative wire bytes and wall-clock millis are
+    # per-node counters.
+    "totalbytesrecv", "totalbytessent", "timemillis",
 }
 
 # Method -> params factory. `h` is a recent height valid on both nodes;
@@ -124,6 +127,7 @@ def build_calls(height):
         ("getmempoolinfo", []),
         ("getrawmempool", []),
         ("getnetworkinfo", []),
+        ("getnettotals", []),
         ("getconnectioncount", []),
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),

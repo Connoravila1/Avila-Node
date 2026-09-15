@@ -449,6 +449,9 @@ const ESTIMATESMARTFEE_HELP: &str = "estimatesmartfee conf_target ( \"estimate_m
 /// Verbatim `help getnetworkhashps` text (Bitcoin Core 29).
 const GETNETWORKHASHPS_HELP: &str = "getnetworkhashps ( nblocks height )\n\nReturns the estimated network hashes per second based on the last n blocks.\nPass in [blocks] to override # of blocks, -1 specifies since last difficulty change.\nPass in [height] to estimate the network speed at the time when a certain block was found.\n\nArguments:\n1. nblocks    (numeric, optional, default=120) The number of previous blocks to calculate estimate from, or -1 for blocks since last difficulty change.\n2. height     (numeric, optional, default=-1) To estimate at the time of the given height.\n\nResult:\nn    (numeric) Hashes per second estimated\n\nExamples:\n> bitcoin-cli getnetworkhashps \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getnetworkhashps\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+/// Verbatim `help getnettotals` text (Bitcoin Core 29).
+const GETNETTOTALS_HELP: &str = "getnettotals\n\nReturns information about network traffic, including bytes in, bytes out,\nand current system time.\n\nResult:\n{                                              (json object)\n  \"totalbytesrecv\" : n,                        (numeric) Total bytes received\n  \"totalbytessent\" : n,                        (numeric) Total bytes sent\n  \"timemillis\" : xxx,                          (numeric) Current system UNIX epoch time in milliseconds\n  \"uploadtarget\" : {                           (json object)\n    \"timeframe\" : n,                           (numeric) Length of the measuring timeframe in seconds\n    \"target\" : n,                              (numeric) Target in bytes\n    \"target_reached\" : true|false,             (boolean) True if target is reached\n    \"serve_historical_blocks\" : true|false,    (boolean) True if serving historical blocks\n    \"bytes_left_in_cycle\" : n,                 (numeric) Bytes left in current time cycle\n    \"time_left_in_cycle\" : n                   (numeric) Seconds left in current time cycle\n  }\n}\n\nExamples:\n> bitcoin-cli getnettotals \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getnettotals\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 /// Verbatim `help getindexinfo` text (Bitcoin Core 29).
 const GETINDEXINFO_HELP: &str = "getindexinfo ( \"index_name\" )\n\nReturns the status of one or all available indices currently running in the node.\n\nArguments:\n1. index_name    (string, optional) Filter results for an index with a specific name.\n\nResult:\n{                               (json object)\n  \"name\" : {                    (json object) The name of the index\n    \"synced\" : true|false,      (boolean) Whether the index is synced or not\n    \"best_block_height\" : n     (numeric) The block height to which the index is synced\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getindexinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> bitcoin-cli getindexinfo txindex\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": [txindex]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -2713,6 +2716,33 @@ fn dispatch(
                 Ok(core_num(network_hashps(cs, nblocks, height)))
             })
         }
+        "getnettotals" => {
+            if params.as_array().is_some_and(|a| !a.is_empty()) {
+                return help_error(GETNETTOTALS_HELP);
+            }
+            chain_query(queries, |_, mgr| {
+                let (sent, recv) = mgr.net_totals();
+                let timemillis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                // `uploadtarget` mirrors `-maxuploadtarget=0`
+                // (unlimited): no cycle budget is tracked.
+                Ok(json!({
+                    "totalbytesrecv": recv,
+                    "totalbytessent": sent,
+                    "timemillis": timemillis,
+                    "uploadtarget": {
+                        "timeframe": 86400,
+                        "target": 0,
+                        "target_reached": false,
+                        "serve_historical_blocks": true,
+                        "bytes_left_in_cycle": 0,
+                        "time_left_in_cycle": 0,
+                    },
+                }))
+            })
+        }
         "getnetworkinfo" => chain_query(queries, |_cs, mgr| {
             let snaps = mgr.peer_snapshots();
             let inbound = snaps.iter().filter(|p| p.inbound).count();
@@ -2874,7 +2904,8 @@ fn dispatch(
                  \x20   submitblock <hex>,\n\
                  \x20   submitheader <hex>, generatetoaddress <n> <address> [maxtries],\n\
                  \x20   generateblock <output> [rawtx/txid,...]\n\
-                 \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo\n\
+                 \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo,\n\
+                 \x20   getnettotals\n\
                  \x20 misc:  estimatesmartfee <target>, uptime, help, stop"
             ),
             None,
@@ -3839,5 +3870,24 @@ mod tests {
             let (_, e) = dispatch("getnetworkhashps", &p, &snap, Some(&queries), None);
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
+    }
+
+    /// `getnettotals` — Core's shape: cumulative byte counters, wall
+    /// `timemillis`, and the unlimited `uploadtarget` block. Any arg
+    /// is Core's -1 help throw.
+    #[test]
+    fn getnettotals_reports_cumulative_counters() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let (r, e) = dispatch("getnettotals", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["totalbytesrecv"], json!(0));
+        assert_eq!(r["totalbytessent"], json!(0));
+        assert!(r["timemillis"].as_u64().unwrap() > 0);
+        assert_eq!(r["uploadtarget"]["target"], json!(0));
+        assert_eq!(r["uploadtarget"]["timeframe"], json!(86400));
+        assert_eq!(r["uploadtarget"]["serve_historical_blocks"], json!(true));
+        let (_, e) = dispatch("getnettotals", &json!([1]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 }
