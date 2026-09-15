@@ -248,12 +248,24 @@ pub struct PeerManager<S> {
     /// Where `bans` persists — `<net-datadir>/banlist.json`, written on
     /// every mutation like Core's `DumpBanlist`.
     banlist_path: Option<std::path::PathBuf>,
+    /// Completed dial attempts — workers send `(addr, connect result)`
+    /// here and `maintain_outbounds` drains it on the tick, so an
+    /// unreachable candidate costs a worker's 5s timeout instead of
+    /// blocking the sync loop (Core's `ThreadOpenConnections` runs
+    /// dials off the message loop the same way).
+    dial_tx: std::sync::mpsc::Sender<(SocketAddr, std::io::Result<TcpStream>)>,
+    dial_rx: std::sync::mpsc::Receiver<(SocketAddr, std::io::Result<TcpStream>)>,
+    /// Dials in flight — counted against outbound slots so a dead
+    /// network can't queue unbounded workers, and deduplicated so the
+    /// same address is never dialed twice at once.
+    pending_dials: std::collections::HashSet<SocketAddr>,
 }
 
 impl<S: Read + Write> PeerManager<S> {
     /// An empty manager — `max_peers` bounds the set.
     #[must_use]
     pub fn new(max_peers: usize) -> Self {
+        let dial_channel = std::sync::mpsc::channel();
         Self {
             peers: HashMap::new(),
             next_id: 0,
@@ -270,6 +282,9 @@ impl<S: Read + Write> PeerManager<S> {
             last_maintained: None,
             bans: crate::banman::BanList::new(),
             banlist_path: None,
+            dial_tx: dial_channel.0,
+            dial_rx: dial_channel.1,
+            pending_dials: std::collections::HashSet::new(),
         }
     }
 
@@ -1255,21 +1270,47 @@ impl PeerManager<TcpStream> {
         events
     }
 
-    /// Dials the operator's `addnode` entries plus address-book
+    /// Drains completed dial workers into sessions, then queues new
+    /// dials for the operator's `addnode` entries plus address-book
     /// candidates until the peer set is full — the caller runs this
-    /// between `tick`s to keep outbound connectivity up. No-op while
-    /// `setnetworkactive false` is in effect. Returns the endpoints
-    /// attempted.
+    /// between `tick`s to keep outbound connectivity up. Dials run on
+    /// worker threads (`TcpStream::connect_timeout`), so unreachable
+    /// candidates never block the sync loop; sessions register here on
+    /// completion. No-op while `setnetworkactive false` is in effect.
+    /// Returns the endpoints attempted this round.
     pub fn maintain_outbounds(&mut self, magic: [u8; 4], start_height: i32) -> Vec<SocketAddr> {
         let mut dialed = Vec::new();
+        // Completed workers first: a ban or a full peer set that
+        // landed mid-dial still applies — Core rechecks IsBanned after
+        // connect for the same reason.
+        while let Ok((addr, result)) = self.dial_rx.try_recv() {
+            self.pending_dials.remove(&addr);
+            let Ok(stream) = result else { continue };
+            let remote = addrman::net_addr_of(addr, 0);
+            let admissible = self.network_active
+                && self.has_slot()
+                && !self.bans.is_banned(&remote.ip, epoch_now())
+                && stream.set_nonblocking(true).is_ok()
+                && stream.set_nodelay(true).is_ok();
+            if admissible
+                && let Ok(session) = PeerSession::initiate(
+                    stream,
+                    magic,
+                    build_version(addr.port() as u64, start_height, remote),
+                    SEND_BUDGET_PER_PEER,
+                )
+            {
+                self.add(session, Some(remote), false);
+            }
+        }
         if !self.network_active {
             return dialed;
         }
         // addnode entries are operator intent — try them ahead of the
-        // book, each bounded by connect's 5s timeout like book dials.
-        // A 30s retry backoff keeps a dead entry from spin-dialing.
+        // book. A 30s retry backoff keeps a dead entry from
+        // re-queueing every round.
         for (node, _) in self.added_nodes.clone() {
-            if !self.has_slot() {
+            if !self.outbound_open() {
                 break;
             }
             if self
@@ -1284,13 +1325,16 @@ impl PeerManager<TcpStream> {
                 // Already talking to this node — Core's AddNode thread
                 // skips connected entries rather than double-dialing.
                 // Don't stamp the backoff either, so a drop redials fast.
-                if socks.iter().any(|s| self.connected_to(*s)) {
+                if socks
+                    .iter()
+                    .any(|s| self.connected_to(*s) || self.pending_dials.contains(s))
+                {
                     continue;
                 }
                 self.addnode_dial.insert(node.clone(), Instant::now());
                 let now = epoch_now();
                 for sock in socks {
-                    if !self.has_slot() {
+                    if !self.outbound_open() {
                         break;
                     }
                     // Banned addresses are never dialed (Core's
@@ -1298,12 +1342,7 @@ impl PeerManager<TcpStream> {
                     if self.is_banned(&addrman::net_addr_of(sock, 0).ip, now) {
                         continue;
                     }
-                    dialed.push(sock);
-                    match self.connect(sock, magic, sock.port() as u64, start_height) {
-                        Ok(Some(_)) => break, // one session per node string
-                        Ok(None) => break,    // raced to full
-                        Err(_) => continue,   // try the next resolved addr
-                    }
+                    self.queue_dial(sock, &mut dialed);
                 }
             }
         }
@@ -1313,7 +1352,7 @@ impl PeerManager<TcpStream> {
         // can't starve or spin the loop.
         let probes_left = self.addrbook.len();
         let mut tried = 0usize;
-        while self.has_slot()
+        while self.outbound_open()
             && tried < probes_left
             && let Some(candidate) = self.addrbook.select()
         {
@@ -1322,17 +1361,37 @@ impl PeerManager<TcpStream> {
             if self.is_banned(&candidate.ip, now) {
                 continue; // banned candidates aren't dialed
             }
-            let sock = addrman::socket_addr(&candidate);
-            dialed.push(sock);
-            match self.connect(sock, magic, sock.port() as u64, start_height) {
-                Ok(Some(_)) => {}
-                Ok(None) => break,  // raced to full
-                Err(_) => continue, // unreachable — try the next candidate
-            }
+            self.queue_dial(addrman::socket_addr(&candidate), &mut dialed);
         }
         dialed
     }
+
+    /// Whether another outbound peer may be *dialed* — open slots minus
+    /// the dials already in flight, so the worker count is bounded by
+    /// `max_peers` even when every candidate is unreachable.
+    fn outbound_open(&self) -> bool {
+        self.peers.len() + self.pending_dials.len() < self.max_peers
+    }
+
+    /// Spawns a dial worker for `addr` — the worker's only job is the
+    /// blocking `connect_timeout`; everything else (session init,
+    /// ban recheck, slot check) happens on the tick that drains it.
+    fn queue_dial(&mut self, addr: SocketAddr, dialed: &mut Vec<SocketAddr>) {
+        if !self.pending_dials.insert(addr) {
+            return; // already in flight
+        }
+        dialed.push(addr);
+        let tx = self.dial_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((addr, TcpStream::connect_timeout(&addr, DIAL_TIMEOUT)));
+        });
+    }
 }
+
+/// The per-dial worker timeout — Core's `connect()` default is 5s
+/// (`nConnectTimeout` is only honored by proxies; direct dials use
+/// the same bound here).
+const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `AddrV2Entry` → `NetAddr` for the networks we understand (IPv4 = 1,
 /// IPv6 = 2); other BIP155 networks are opaque and skipped.
@@ -2078,5 +2137,42 @@ mod tests {
             }
             _ => panic!("no addrv2 reply in {sent:?}"),
         }
+    }
+
+    /// Dead endpoints must never block the tick: dials run on worker
+    /// threads bounded by the open-slot count, and completions drain
+    /// on the next maintenance round. Closed localhost ports refuse
+    /// instantly, so no real network is touched.
+    #[test]
+    fn maintain_outbounds_dials_are_bounded_workers() {
+        let mut mgr = PeerManager::<TcpStream>::new(2);
+        for p in 1u16..=3 {
+            assert!(mgr.add_node(format!("127.0.0.1:{p}"), false));
+        }
+
+        // First round: two slots open → at most two workers queued,
+        // and the call itself never waits on a connection timeout.
+        let t0 = Instant::now();
+        let dialed = mgr.maintain_outbounds(MAGIC, 0);
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        assert_eq!(dialed.len(), 2);
+        assert_eq!(mgr.pending_dials.len(), 2);
+        assert_eq!(mgr.len(), 0);
+
+        // Workers report refusal back on the channel; rounds drain
+        // them — pending dials clear and refused connections never
+        // become sessions. The 30s addnode backoff keeps the dead
+        // entries from re-queueing meanwhile.
+        let mut dialed = Vec::new();
+        for _ in 0..40 {
+            dialed = mgr.maintain_outbounds(MAGIC, 0);
+            if mgr.pending_dials.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(dialed.is_empty());
+        assert!(mgr.pending_dials.is_empty());
+        assert_eq!(mgr.len(), 0);
     }
 }
