@@ -446,6 +446,9 @@ const GETTXSPENDINGPREVOUT_HELP: &str = "gettxspendingprevout [{\"txid\":\"hex\"
 /// Verbatim `help estimatesmartfee` text (Bitcoin Core 29).
 const ESTIMATESMARTFEE_HELP: &str = "estimatesmartfee conf_target ( \"estimate_mode\" )\n\nEstimates the approximate fee per kilobyte needed for a transaction to begin\nconfirmation within conf_target blocks if possible and return the number of blocks\nfor which the estimate is valid. Uses virtual transaction size as defined\nin BIP 141 (witness data is discounted).\n\nArguments:\n1. conf_target      (numeric, required) Confirmation target in blocks (1 - 1008)\n2. estimate_mode    (string, optional, default=\"economical\") The fee estimate mode.\n                    unset, economical, conservative \n                    unset means no mode set (default mode will be used). \n                    economical estimates use a shorter time horizon, making them more\n                    responsive to short-term drops in the prevailing fee market. This mode\n                    potentially returns a lower fee rate estimate.\n                    conservative estimates use a longer time horizon, making them\n                    less responsive to short-term drops in the prevailing fee market. This mode\n                    potentially returns a higher fee rate estimate.\n                    \n\nResult:\n{                   (json object)\n  \"feerate\" : n,    (numeric, optional) estimate fee rate in BTC/kvB (only present if no errors were encountered)\n  \"errors\" : [      (json array, optional) Errors encountered during processing (if there are any)\n    \"str\",          (string) error\n    ...\n  ],\n  \"blocks\" : n      (numeric) block number where estimate was found\n                    The request target will be clamped between 2 and the highest target\n                    fee estimation is able to return based on how long it has been running.\n                    An error is returned if not enough transactions and blocks\n                    have been observed to make an estimate for any number of blocks.\n}\n\nExamples:\n> bitcoin-cli estimatesmartfee 6\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"estimatesmartfee\", \"params\": [6]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+/// Verbatim `help getnetworkhashps` text (Bitcoin Core 29).
+const GETNETWORKHASHPS_HELP: &str = "getnetworkhashps ( nblocks height )\n\nReturns the estimated network hashes per second based on the last n blocks.\nPass in [blocks] to override # of blocks, -1 specifies since last difficulty change.\nPass in [height] to estimate the network speed at the time when a certain block was found.\n\nArguments:\n1. nblocks    (numeric, optional, default=120) The number of previous blocks to calculate estimate from, or -1 for blocks since last difficulty change.\n2. height     (numeric, optional, default=-1) To estimate at the time of the given height.\n\nResult:\nn    (numeric) Hashes per second estimated\n\nExamples:\n> bitcoin-cli getnetworkhashps \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getnetworkhashps\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 /// Verbatim `help getindexinfo` text (Bitcoin Core 29).
 const GETINDEXINFO_HELP: &str = "getindexinfo ( \"index_name\" )\n\nReturns the status of one or all available indices currently running in the node.\n\nArguments:\n1. index_name    (string, optional) Filter results for an index with a specific name.\n\nResult:\n{                               (json object)\n  \"name\" : {                    (json object) The name of the index\n    \"synced\" : true|false,      (boolean) Whether the index is synced or not\n    \"best_block_height\" : n     (numeric) The block height to which the index is synced\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getindexinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> bitcoin-cli getindexinfo txindex\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": [txindex]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -454,6 +457,53 @@ fn missing_params(what: &str) -> (Value, Option<(i64, String)>) {
         Value::Null,
         Some((RPC_INVALID_PARAMS, format!("missing parameter: {what}"))),
     )
+}
+
+/// Core's `GetNetworkHashPS` (rpc/mining.cpp): the chainwork delta
+/// over the `lookup`-block window ending at `height` (-1 = tip),
+/// divided by the window's min→max timestamp span. `lookup <= 0`
+/// means "since the last difficulty change" (`height % interval + 1`);
+/// a lookup past the window start clamps to the block's own height.
+/// Zero on genesis or a timestamp-degenerate window (min == max).
+fn network_hashps(cs: &Chainstate, lookup: i64, height: i64) -> f64 {
+    let chain = cs.chain();
+    let h = if height < 0 {
+        chain.len() as i64 - 1
+    } else {
+        height
+    };
+    let Some(node) = chain
+        .get(usize::try_from(h).unwrap_or(usize::MAX))
+        .and_then(|hash| cs.tree().get(hash))
+    else {
+        return 0.0;
+    };
+    if node.height == 0 {
+        return 0.0;
+    }
+    let mut lookup = if lookup <= 0 {
+        i64::from(node.height) % cs.tree().params().difficulty_adjustment_interval() as i64 + 1
+    } else {
+        lookup
+    };
+    lookup = lookup.min(i64::from(node.height));
+    let start_h = node.height - lookup as u32;
+    let (mut min_t, mut max_t) = (node.header.time, node.header.time);
+    for hh in start_h..node.height {
+        if let Some(n) = chain.get(hh as usize).and_then(|hash| cs.tree().get(hash)) {
+            min_t = min_t.min(n.header.time);
+            max_t = max_t.max(n.header.time);
+        }
+    }
+    if min_t == max_t {
+        return 0.0;
+    }
+    chain
+        .get(start_h as usize)
+        .and_then(|hash| cs.tree().get(hash))
+        .and_then(|base| node.chainwork.0.checked_sub(base.chainwork.0))
+        .map(|w| w.to_f64() / f64::from(max_t - min_t))
+        .unwrap_or(0.0)
 }
 
 /// Core's `GetDifficulty` (pow.cpp), matching bitcoind's printed value.
@@ -2562,40 +2612,9 @@ fn dispatch(
                 .mempool_ref()
                 .build_template(cs, Script::new(vec![avila_consensus::script::OP_1]), now)
                 .ok();
-            // networkhashps — Core's GetNetworkHashPS(120, tip): chainwork
-            // delta over the window divided by its time span; 0 when the
-            // chain is shorter than the window or the window is
-            // timestamp-degenerate.
-            const HASHPS_LOOKUP: u32 = 120;
-            let networkhashps = if node.height < HASHPS_LOOKUP {
-                0.0
-            } else {
-                let start_h = node.height - HASHPS_LOOKUP;
-                let base = cs.tree().get_ancestor(&tip, start_h);
-                let (mut min_t, mut max_t) = (node.header.time, node.header.time);
-                for h in start_h..node.height {
-                    if let Some(n) = cs
-                        .chain()
-                        .get(h as usize)
-                        .and_then(|hash| cs.tree().get(hash))
-                    {
-                        min_t = min_t.min(n.header.time);
-                        max_t = max_t.max(n.header.time);
-                    }
-                }
-                match base {
-                    Some(base) if min_t != max_t => {
-                        // Core: (workDiff as double) / timeDiff — a
-                        // floating quotient, not integer division.
-                        node.chainwork
-                            .0
-                            .checked_sub(base.chainwork.0)
-                            .map(|w| w.to_f64() / f64::from(max_t - min_t))
-                            .unwrap_or(0.0)
-                    }
-                    _ => 0.0,
-                }
-            };
+            // networkhashps — Core's GetNetworkHashPS(120, -1): the
+            // default 120-block window at the tip.
+            let networkhashps = network_hashps(cs, 120, -1);
             let mut out = json!({
                 "blocks": node.height,
                 "currentblocksize": current.as_ref().map(|t| t.block.encode().len()).unwrap_or(0),
@@ -2619,6 +2638,81 @@ fn dispatch(
             }
             Ok(out)
         }),
+        "getnetworkhashps" => {
+            // RPCHelpMan: 0–2 args.
+            if params.as_array().is_some_and(|a| a.len() > 2) {
+                return help_error(GETNETWORKHASHPS_HELP);
+            }
+            // `nblocks`: getInt<int> — a float/out-of-i32 value is -1,
+            // non-number is -3, 0 and below -1 are -8.
+            let nblocks = match param(params, 0, "nblocks") {
+                None => 120i64,
+                Some(v) if !v.is_number() => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(1, "nblocks", v, "number"),
+                        )),
+                    );
+                }
+                Some(v) => match v.as_i64() {
+                    Some(n)
+                        if !v.is_f64() && n >= i64::from(i32::MIN) && n <= i64::from(i32::MAX) =>
+                    {
+                        if n == 0 || n < -1 {
+                            return (
+                                Value::Null,
+                                Some((
+                                    RPC_INVALID_PARAMETER,
+                                    "Invalid nblocks. Must be a positive number or -1.".into(),
+                                )),
+                            );
+                        }
+                        n
+                    }
+                    _ => {
+                        return (
+                            Value::Null,
+                            Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                        );
+                    }
+                },
+            };
+            let height = match param(params, 1, "height") {
+                None => -1i64,
+                Some(v) if v.is_null() => -1,
+                Some(v) if !v.is_number() => {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, wrong_type_message(2, "height", v, "number"))),
+                    );
+                }
+                Some(v) => match v.as_i64() {
+                    Some(n)
+                        if !v.is_f64() && n >= i64::from(i32::MIN) && n <= i64::from(i32::MAX) =>
+                    {
+                        n
+                    }
+                    _ => {
+                        return (
+                            Value::Null,
+                            Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                        );
+                    }
+                },
+            };
+            chain_query(queries, move |cs, _| {
+                let tip_h = cs.chain().len() as i64 - 1;
+                if height < -1 || height > tip_h {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "Block does not exist at specified height".into(),
+                    ));
+                }
+                Ok(core_num(network_hashps(cs, nblocks, height)))
+            })
+        }
         "getnetworkinfo" => chain_query(queries, |_cs, mgr| {
             let snaps = mgr.peer_snapshots();
             let inbound = snaps.iter().filter(|p| p.inbound).count();
@@ -2776,7 +2870,8 @@ fn dispatch(
                  \x20   gettxspendingprevout <outputs>,\n\
                  \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>,\n\
                  \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount], savemempool\n\
-                 \x20 mining: getblocktemplate, getmininginfo, submitblock <hex>,\n\
+                 \x20 mining: getblocktemplate, getmininginfo, getnetworkhashps,\n\
+                 \x20   submitblock <hex>,\n\
                  \x20   submitheader <hex>, generatetoaddress <n> <address> [maxtries],\n\
                  \x20   generateblock <output> [rawtx/txid,...]\n\
                  \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo\n\
@@ -3704,6 +3799,44 @@ mod tests {
             ),
         ] {
             let (_, e) = dispatch("gettxspendingprevout", &p, &snap, Some(&queries), None);
+            assert_eq!(e.unwrap().0, code, "params {p}");
+        }
+    }
+
+    /// `getnetworkhashps` — on a genesis-only chain every window
+    /// degenerates to 0, and the arg validation is Core's: -3 wrong
+    /// type, -1 integer range, -8 for nblocks 0/<-1 and for heights
+    /// past the tip or below -1.
+    #[test]
+    fn getnetworkhashps_validates_and_reports() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+
+        // Genesis-only chain: pb->nHeight == 0 → 0, like Core.
+        let (r, e) = dispatch("getnetworkhashps", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, json!(0));
+        let (r, _) = dispatch(
+            "getnetworkhashps",
+            &json!([120, 0]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(r, json!(0));
+
+        for (p, code) in [
+            (json!(["x"]), RPC_TYPE_ERROR),
+            (json!([120, "x"]), RPC_TYPE_ERROR),
+            (json!([1.5]), RPC_MISC_ERROR),
+            (json!([120, 1.5]), RPC_MISC_ERROR),
+            (json!([0]), RPC_INVALID_PARAMETER),
+            (json!([-2]), RPC_INVALID_PARAMETER),
+            (json!([120, -2]), RPC_INVALID_PARAMETER),
+            (json!([120, 1]), RPC_INVALID_PARAMETER), // past the h0 tip
+            (json!([1, 2, 3]), RPC_MISC_ERROR),
+        ] {
+            let (_, e) = dispatch("getnetworkhashps", &p, &snap, Some(&queries), None);
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
     }

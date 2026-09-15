@@ -29,7 +29,7 @@ drift: any `DIFFERS` verdict on a shared field is a compatibility bug.
 
 ## Workload and method
 
-`tools/compare_rpc.py` calls 30 methods with identical parameters on
+`tools/compare_rpc.py` calls 31 methods with identical parameters on
 both endpoints (block hash, coinbase txid, raw block hex, and raw tx
 hex resolved live at the shared height), flattens each response to
 field paths, and reports
@@ -48,7 +48,7 @@ python3 tools/compare_rpc.py \
 
 ## Results
 
-43 MATCH (every shared field byte-identical), 2 EXPECTED-DIFF
+46 MATCH (every shared field byte-identical), 2 EXPECTED-DIFF
 (presence gaps only), 3 DIFFERS — one is a genuine policy divergence
 (`fullrbf`: our pool enforces BIP125 opt-in signaling; Knots 29 ships
 mempoolfullrbf semantics) and two are environmental (`getpeerinfo`,
@@ -215,6 +215,12 @@ surfaced:
   range-checked 1–1008 (`-8`), non-numeric targets are `-3`, and
   `estimate_mode` accepts unset/economical/conservative
   case-insensitively (`FeeModeFromString`).
+- `getnetworkhashps` landed with Core's two-arg form (`nblocks`,
+  `height`): `-1` selects the since-last-retarget window
+  (`height % interval + 1`), windows clamp to the block's height,
+  `height=-1` resolves to the tip, and the result goes through
+  `core_num` (`%.16g`). The shared `network_hashps` helper also
+  fixed `getmininginfo`'s stale below-120-returns-0 shortcut.
 
 ### Known semantic differences
 

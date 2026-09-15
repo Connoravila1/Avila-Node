@@ -131,6 +131,13 @@ def build_calls(height):
         ("estimatesmartfee", [0]),
         ("estimatesmartfee", ["x"]),
         ("estimatesmartfee", [6, "bogus"]),
+        # getnetworkhashps: default window, -1 (since last retarget),
+        # a specific height, and each error class.
+        ("getnetworkhashps", []),
+        ("getnetworkhashps", [-1]),
+        ("getnetworkhashps", [120, height]),
+        ("getnetworkhashps", [0]),
+        ("getnetworkhashps", [120, 999999]),
         # sendrawtransaction: deterministic error paths only — a valid
         # tx can't be in the static matrix since pool state differs per
         # daemon (verified live separately).

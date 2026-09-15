@@ -179,8 +179,9 @@ operation. Compare complete initial download and catch-up, not only local replay
       generatetoaddress, generateblock, savemempool,
       validateaddress, getblockstats (undo-backed fee/UTXO
       aggregates, Core's selector errors and stats filter),
-      getdifficulty, decoderawtransaction (witness/`iswitness`
-      semantics, TxToUniv without the hex echo),
+      getdifficulty, getnetworkhashps (Core's nblocks/height form,
+      since-last-retarget and clamped windows), decoderawtransaction
+      (witness/`iswitness` semantics, TxToUniv without the hex echo),
       gettxspendingprevout (outpoint-indexed mempool spends,
       Core's full argument error taxonomy), getindexinfo
       (txindex state + name filter)) — verified live over curl
