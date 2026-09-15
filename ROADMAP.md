@@ -216,7 +216,16 @@ operation. Compare complete initial download and catch-up, not only local replay
       stats honestly zeroed (no locked allocator; `mallocinfo` needs
       unsafe FFI so it takes Core's !HAVE_MALLOC_INFO build-variant
       error), and the 28-category include/exclude map with the
-      `all`/`1` specials and ordered include-then-exclude evaluation)
+      `all`/`1` specials and ordered include-then-exclude evaluation),
+      setban/listbanned/clearbanned (the BanMan trio — a persistent
+      `banlist.json` in Core's format, CIDR subnets normalized and
+      matched as v4-mapped-v6 prefixes, 24h default or relative/
+      absolute bantimes, expired entries swept on load and list,
+      re-adds of active bans rejected `-23` while expired ones
+      re-ban cleanly, banning drops every live peer under the subnet
+      and the dial paths (direct, SOCKS, addrbook, addnode) refuse
+      banned targets — with the candidate scan bounded so a banned
+      deterministic pick can't spin)
       — verified live over curl and the client.
       Genesis is served even though its body is never stored:
       `Params::genesis_block` reconstructs Core's per-network
@@ -258,7 +267,7 @@ operation. Compare complete initial download and catch-up, not only local replay
   compatibility matrix has a tested start: `tools/compare_rpc.py`
   diffs every shared field against live reference daemons — primary
   Bitcoin Core 29.4 (regtest, `-txindex`), secondary Knots 29.3.0 —
-  with 63 calls exact-match including `decodescript` (asm, descriptor
+  with 69 calls exact-match including `decodescript` (asm, descriptor
   checksums, P2SH/segwit wraps), `gettxout`, `getblock` verbosity 2,
   `getblocktemplate` and `getmininginfo` (incl. `networkhashps` via
   256-bit chainwork division). The mempool matches Core 29.x policy:

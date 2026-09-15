@@ -167,6 +167,9 @@ pub fn run(
     // costs us gossip history, so load errors are ignored by design.
     if let Some(dir) = &cfg.data_dir {
         let _ = mgr.addrbook().load(&dir.join("peers.dat"), unix_now());
+        // banlist.json — Core's LoadBanlist: operator bans survive
+        // restarts; a corrupt file just costs the list.
+        mgr.set_banlist_path(dir.join("banlist.json"), unix_now() as i64);
         // mempool.dat — Core's LoadMempool: entries re-run full
         // admission against the resumed chainstate; what fails is
         // skipped, not fatal.

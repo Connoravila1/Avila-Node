@@ -275,6 +275,7 @@ const RPC_INTERNAL_ERROR: i64 = -32603;
 const RPC_CLIENT_NODE_ALREADY_ADDED: i64 = -23;
 const RPC_CLIENT_NODE_NOT_ADDED: i64 = -24;
 const RPC_CLIENT_NODE_NOT_CONNECTED: i64 = -29;
+const RPC_CLIENT_INVALID_IP_OR_SUBNET: i64 = -30;
 
 /// Core's `DEFAULT_MAX_RAW_TX_FEE_RATE` — `sendrawtransaction` refuses
 /// txs paying more than this unless the caller raises it (BTC/kvB).
@@ -551,6 +552,15 @@ fn help_error(text: &'static str) -> (Value, Option<(i64, String)>) {
     (Value::Null, Some((RPC_MISC_ERROR, text.to_string())))
 }
 
+/// Wall-clock UNIX seconds — the ban list's timestamps live on wall
+/// time (`ban_created`/`banned_until` are epoch values).
+fn epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Verbatim `help decoderawtransaction` text (Bitcoin Core 29).
 const DECODERAWTRANSACTION_HELP: &str = "decoderawtransaction \"hexstring\" ( iswitness )\n\nReturn a JSON object representing the serialized, hex-encoded transaction.\n\nArguments:\n1. hexstring    (string, required) The transaction hex string\n2. iswitness    (boolean, optional, default=depends on heuristic tests) Whether the transaction hex is a serialized witness transaction.\n                If iswitness is not present, heuristic tests will be used in decoding.\n                If true, only witness deserialization will be tried.\n                If false, only non-witness deserialization will be tried.\n                This boolean should reflect whether the transaction has inputs\n                (e.g. fully valid, or on-chain transactions), if known by the caller.\n\nResult:\n{                             (json object)\n  \"txid\" : \"hex\",             (string) The transaction id\n  \"hash\" : \"hex\",             (string) The transaction hash (differs from txid for witness transactions)\n  \"size\" : n,                 (numeric) The serialized transaction size\n  \"vsize\" : n,                (numeric) The virtual transaction size (differs from size for witness transactions)\n  \"weight\" : n,               (numeric) The transaction's weight (between vsize*4-3 and vsize*4)\n  \"version\" : n,              (numeric) The version\n  \"locktime\" : xxx,           (numeric) The lock time\n  \"vin\" : [                   (json array)\n    {                         (json object)\n      \"coinbase\" : \"hex\",     (string, optional) The coinbase value (only if coinbase transaction)\n      \"txid\" : \"hex\",         (string, optional) The transaction id (if not coinbase transaction)\n      \"vout\" : n,             (numeric, optional) The output number (if not coinbase transaction)\n      \"scriptSig\" : {         (json object, optional) The script (if not coinbase transaction)\n        \"asm\" : \"str\",        (string) Disassembly of the signature script\n        \"hex\" : \"hex\"         (string) The raw signature script bytes, hex-encoded\n      },\n      \"txinwitness\" : [       (json array, optional)\n        \"hex\",                (string) hex-encoded witness data (if any)\n        ...\n      ],\n      \"sequence\" : n          (numeric) The script sequence number\n    },\n    ...\n  ],\n  \"vout\" : [                  (json array)\n    {                         (json object)\n      \"value\" : n,            (numeric) The value in BTC\n      \"n\" : n,                (numeric) index\n      \"scriptPubKey\" : {      (json object)\n        \"asm\" : \"str\",        (string) Disassembly of the output script\n        \"desc\" : \"str\",       (string) Inferred descriptor for the output\n        \"hex\" : \"hex\",        (string) The raw output script bytes, hex-encoded\n        \"address\" : \"str\",    (string, optional) The Bitcoin address (only if a well-defined address exists)\n        \"type\" : \"str\"        (string) The type (one of: nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n      }\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli decoderawtransaction \"hexstring\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"decoderawtransaction\", \"params\": [\"hexstring\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -595,6 +605,15 @@ const VERIFYTXOUTPROOF_HELP: &str = "verifytxoutproof \"proof\" ( {\"verify_witn
 
 /// Verbatim `help getindexinfo` text (Bitcoin Core 29).
 const GETINDEXINFO_HELP: &str = "getindexinfo ( \"index_name\" )\n\nReturns the status of one or all available indices currently running in the node.\n\nArguments:\n1. index_name    (string, optional) Filter results for an index with a specific name.\n\nResult:\n{                               (json object)\n  \"name\" : {                    (json object) The name of the index\n    \"synced\" : true|false,      (boolean) Whether the index is synced or not\n    \"best_block_height\" : n     (numeric) The block height to which the index is synced\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getindexinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> bitcoin-cli getindexinfo txindex\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": [txindex]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help setban` text (Bitcoin Core 29.4).
+const SETBAN_HELP: &str = "setban \"subnet\" \"command\" ( bantime absolute )\n\nAttempts to add or remove an IP/Subnet from the banned list.\n\nArguments:\n1. subnet      (string, required) The IP/Subnet (see getpeerinfo for nodes IP) with an optional netmask (default is /32 = single IP)\n2. command     (string, required) 'add' to add an IP/Subnet to the list, 'remove' to remove an IP/Subnet from the list\n3. bantime     (numeric, optional, default=0) time in seconds how long (or until when if [absolute] is set) the IP is banned (0 or empty means using the default time of 24h which can also be overwritten by the -bantime startup argument)\n4. absolute    (boolean, optional, default=false) If set, the bantime must be an absolute timestamp expressed in UNIX epoch time\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli setban \"192.168.0.6\" \"add\" 86400\n> bitcoin-cli setban \"192.168.0.0/24\" \"add\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"setban\", \"params\": [\"192.168.0.6\", \"add\", 86400]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help listbanned` text (Bitcoin Core 29.4).
+const LISTBANNED_HELP: &str = "listbanned\n\nList all manually banned IPs/Subnets.\n\nResult:\n[                              (json array)\n  {                            (json object)\n    \"address\" : \"str\",         (string) The IP/Subnet of the banned node\n    \"ban_created\" : xxx,       (numeric) The UNIX epoch time the ban was created\n    \"banned_until\" : xxx,      (numeric) The UNIX epoch time the ban expires\n    \"ban_duration\" : xxx,      (numeric) The ban duration, in seconds\n    \"time_remaining\" : xxx     (numeric) The time remaining until the ban expires, in seconds\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli listbanned \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"listbanned\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help clearbanned` text (Bitcoin Core 29.4).
+const CLEARBANNED_HELP: &str = "clearbanned\n\nClear all banned IPs.\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli clearbanned \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"clearbanned\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 const GETRPCINFO_HELP: &str = "getrpcinfo\n\nReturns details of the RPC server.\n\nResult:\n{                          (json object)\n  \"active_commands\" : [    (json array) All active commands\n    {                      (json object) Information about an active command\n      \"method\" : \"str\",    (string) The name of the RPC command\n      \"duration\" : n       (numeric) The running time in microseconds\n    },\n    ...\n  ],\n  \"logpath\" : \"str\"        (string) The complete file path to the debug log\n}\n\nExamples:\n> bitcoin-cli getrpcinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getrpcinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -3732,6 +3751,144 @@ fn dispatch(
                 Ok(json!(state))
             })
         }
+        "setban" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if !(2..=4).contains(&arr.len()) {
+                return help_error(SETBAN_HELP);
+            }
+            // RPCHelpMan's type pass runs before the command parse:
+            // subnet str, command str, bantime num, absolute bool.
+            if let Some(v) = arr.first().filter(|v| !v.is_string()) {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_message(1, "subnet", v, "string"))),
+                );
+            }
+            if let Some(v) = arr.get(1).filter(|v| !v.is_string()) {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_message(2, "command", v, "string"))),
+                );
+            }
+            if let Some(v) = arr.get(2).filter(|v| !v.is_number()) {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_message(3, "bantime", v, "number"))),
+                );
+            }
+            if let Some(v) = arr.get(3).filter(|v| !v.is_boolean()) {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_message(4, "absolute", v, "bool"))),
+                );
+            }
+            let command = arr[1].as_str().unwrap_or_default().to_owned();
+            // Command is validated before the subnet (a bad command is
+            // the help throw even with a bad subnet).
+            if command != "add" && command != "remove" {
+                return help_error(SETBAN_HELP);
+            }
+            let Some(net) = avila_p2p::banman::SubNet::parse(arr[0].as_str().unwrap_or_default())
+            else {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_CLIENT_INVALID_IP_OR_SUBNET,
+                        "Error: Invalid IP/Subnet".into(),
+                    )),
+                );
+            };
+            // getInt<int64>: a non-integral or out-of-range number is
+            // UniValue's -1 "JSON integer out of range".
+            let bantime = match arr.get(2) {
+                None | Some(Value::Null) => 0,
+                Some(v) => match v.as_i64() {
+                    Some(n) => n,
+                    None => {
+                        return (
+                            Value::Null,
+                            Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                        );
+                    }
+                },
+            };
+            let absolute = arr.get(3).and_then(Value::as_bool).unwrap_or(false);
+            chain_query(queries, move |_, mgr| {
+                let now = epoch_secs();
+                match command.as_str() {
+                    "add" => {
+                        // Core checks IsBanned before the bantime math —
+                        // an active entry rejects the re-add (a listed-
+                        // but-expired one can be re-banned).
+                        if mgr.is_subnet_banned(&net, now) {
+                            return Err((
+                                RPC_CLIENT_NODE_ALREADY_ADDED,
+                                "Error: IP/Subnet already banned".into(),
+                            ));
+                        }
+                        let until = if absolute {
+                            if bantime <= now {
+                                return Err((
+                                    RPC_INVALID_PARAMETER,
+                                    "Error: Absolute timestamp is in the past".into(),
+                                ));
+                            }
+                            bantime
+                        } else {
+                            now + if bantime <= 0 {
+                                avila_p2p::banman::DEFAULT_BANTIME
+                            } else {
+                                bantime
+                            }
+                        };
+                        mgr.ban(net, now, until);
+                        Ok(Value::Null)
+                    }
+                    _ => {
+                        if !mgr.unban(&net) {
+                            return Err((
+                                RPC_CLIENT_INVALID_IP_OR_SUBNET,
+                                "Error: Unban failed. Requested address/subnet was not previously \
+                                 manually banned."
+                                    .into(),
+                            ));
+                        }
+                        Ok(Value::Null)
+                    }
+                }
+            })
+        }
+        "listbanned" => {
+            if params.as_array().is_some_and(|a| !a.is_empty()) {
+                return help_error(LISTBANNED_HELP);
+            }
+            chain_query(queries, |_, mgr| {
+                let now = epoch_secs();
+                let rows: Vec<Value> = mgr
+                    .banned_list(now)
+                    .iter()
+                    .map(|(net, e)| {
+                        json!({
+                            "address": net.to_string(),
+                            "ban_created": e.created,
+                            "banned_until": e.until,
+                            "ban_duration": e.until - e.created,
+                            "time_remaining": e.until - now,
+                        })
+                    })
+                    .collect();
+                Ok(Value::Array(rows))
+            })
+        }
+        "clearbanned" => {
+            if params.as_array().is_some_and(|a| !a.is_empty()) {
+                return help_error(CLEARBANNED_HELP);
+            }
+            chain_query(queries, |_, mgr| {
+                mgr.clear_bans();
+                Ok(Value::Null)
+            })
+        }
         "getrpcinfo" => {
             if params.as_array().is_some_and(|a| !a.is_empty()) {
                 return help_error(GETRPCINFO_HELP);
@@ -4203,7 +4360,9 @@ fn dispatch(
                  \x20   getnettotals, getnodeaddresses [count] [network],\n\
                  \x20   addpeeraddress <address> <port> [tried], ping,\n\
                  \x20   disconnectnode [address] [nodeid], addnode <node> <cmd>,\n\
-                 \x20   setnetworkactive <state>\n\
+                 \x20   setnetworkactive <state>,\n\
+                 \x20   setban <subnet> <add|remove> [bantime] [absolute],\n\
+                 \x20   listbanned, clearbanned\n\
                  \x20 misc:  estimatesmartfee <target>, getrpcinfo,\n\
                  \x20   getmemoryinfo [mode], logging [include] [exclude],\n\
                  \x20   uptime, help, stop"
@@ -5571,6 +5730,137 @@ mod tests {
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch("setnetworkactive", &json!([]), &snap, Some(&queries), None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+    }
+
+    /// `setban`/`listbanned`/`clearbanned` — the banlist lifecycle on a
+    /// real `PeerManager`, with Core's validation order (command help
+    /// throw before the subnet parse) and error codes.
+    #[test]
+    fn ban_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+
+        // Empty list to start; listbanned/clearbanned take no params.
+        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, json!([]));
+        let (_, e) = dispatch("listbanned", &json!([1]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+        let (r, e) = dispatch("clearbanned", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, Value::Null);
+        let (_, e) = dispatch("clearbanned", &json!([1]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+
+        // add: null; the subnet normalizes to its prefix and lists
+        // with Core's fields (default 24h duration).
+        let (r, e) = dispatch(
+            "setban",
+            &json!(["10.1.2.3/16", "add"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, Value::Null);
+        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r.as_array().unwrap().len(), 1);
+        assert_eq!(r[0]["address"], json!("10.1.0.0/16"));
+        assert_eq!(
+            r[0]["ban_duration"],
+            json!(avila_p2p::banman::DEFAULT_BANTIME)
+        );
+        for k in ["ban_created", "banned_until", "time_remaining"] {
+            assert!(r[0][k].is_i64(), "{k}: {r}");
+        }
+
+        // Re-adding the active subnet → -23; removing → null; a
+        // second remove → -30 "not previously manually banned".
+        let (_, e) = dispatch(
+            "setban",
+            &json!(["10.1.0.0/16", "add"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_ALREADY_ADDED);
+        let (r, e) = dispatch(
+            "setban",
+            &json!(["10.1.0.0/16", "remove"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, Value::Null);
+        let (_, e) = dispatch(
+            "setban",
+            &json!(["10.1.0.0/16", "remove"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_CLIENT_INVALID_IP_OR_SUBNET);
+        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, json!([]));
+
+        // Absolute bantime in the past → -8; in the future → ok and
+        // `banned_until` equals it exactly.
+        let now = epoch_secs();
+        let (_, e) = dispatch(
+            "setban",
+            &json!(["2001:db8::/32", "add", now - 10, true]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        let (r, e) = dispatch(
+            "setban",
+            &json!(["2001:db8::/32", "add", now + 3600, true]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, Value::Null);
+        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r[0]["address"], json!("2001:db8::/32"));
+        assert_eq!(r[0]["banned_until"], json!(now + 3600));
+
+        // Validation order: bad command → -1 help even with a bad
+        // subnet; bad subnet + good command → -30; type errors → -3;
+        // non-integral bantime → -1 "out of range"; arity → -1.
+        for (p, code) in [
+            (json!(["999.1.1.1", "bogus"]), RPC_MISC_ERROR),
+            (json!(["999.1.1.1", "add"]), RPC_CLIENT_INVALID_IP_OR_SUBNET),
+            (json!(["10.0.0.1", "bogus"]), RPC_MISC_ERROR),
+            (json!([5, "add"]), RPC_TYPE_ERROR),
+            (json!(["10.0.0.1", 5]), RPC_TYPE_ERROR),
+            (json!(["10.0.0.1", "add", "x"]), RPC_TYPE_ERROR),
+            (json!(["10.0.0.1", "add", 100, "x"]), RPC_TYPE_ERROR),
+            (json!(["10.0.0.1", "add", 1.5]), RPC_MISC_ERROR),
+            (json!([]), RPC_MISC_ERROR),
+            (json!(["10.0.0.1"]), RPC_MISC_ERROR),
+            (
+                json!(["10.0.0.1", "add", 0, false, "extra"]),
+                RPC_MISC_ERROR,
+            ),
+        ] {
+            let (_, e) = dispatch("setban", &p, &snap, Some(&queries), None);
+            assert_eq!(e.unwrap().0, code, "params {p}");
+        }
+
+        // clearbanned empties the list.
+        let (r, e) = dispatch("clearbanned", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, Value::Null);
+        let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, json!([]));
     }
 
     /// `getrpcinfo`/`getmemoryinfo`/`logging` — the introspection

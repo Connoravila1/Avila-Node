@@ -499,6 +499,7 @@ version = "0.1.0-dev"
 dependencies = [
  "avila-consensus",
  "avila-mempool",
+ "serde_json",
  "thiserror 2.0.20",
 ]
 

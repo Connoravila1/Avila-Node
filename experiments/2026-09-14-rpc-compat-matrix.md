@@ -311,6 +311,25 @@ surfaced:
   every error path, mode mismatches, and tampered/truncated proofs.
   Decoding caps allocation at what the input can contain — a
   CompactSize count is never trusted for `with_capacity`.
+- `setban`/`listbanned`/`clearbanned` implement Core's `BanMan`:
+  `crates/avila-p2p/src/banman.rs` keeps the subnet map (CIDR
+  normalized, v4 stored as v4-mapped-v6, prefix matching through
+  `addrman::net_match`), persists `banlist.json` in Core's exact
+  format (loaded at startup, expired entries swept, corrupt files
+  tolerated), and `PeerManager` enforces it — banning drops every
+  live peer under the subnet and the dial paths (direct, SOCKS,
+  addrbook, addnode) refuse banned targets, with the addrbook scan
+  bounded by the book's size so a banned deterministic pick can't
+  spin. RPC parity verified live on Core 29.4: command help-throw
+  precedes the subnet parse (`-1` vs `-30`), `-3` for type errors,
+  `-1` "JSON integer out of range" for non-integral bantime, `-8`
+  for a past absolute timestamp, `-23` for re-adding an active ban
+  (expired entries re-ban cleanly), `-30` for removing an unlisted
+  subnet, default 24h duration, and `listbanned` rows carry
+  `address`/`ban_created`/`banned_until`/`ban_duration`/
+  `time_remaining` in Core's sort order (v4-mapped before native
+  v6). Inbound-listener enforcement lands when sockets carry remote
+  addresses into `add_inbound`.
 
 ### Known semantic differences
 

@@ -33,6 +33,15 @@ pub const DEFAULT_MAX_PEERS: usize = 8;
 /// predictable (Core bounds this through `BLOCK_DOWNLOAD_WINDOW`).
 pub const MAX_BLOCKS_IN_TRANSIT_TOTAL: usize = 1024;
 
+/// Wall-clock epoch seconds — the ban list lives on wall time
+/// (`banned_until` is a UNIX timestamp), not the `Instant` domain.
+fn epoch_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Peers that delivered useful headers or blocks within this window are
 /// protected from inbound eviction (Core protects for ~30 min; our
 /// window is shorter since sessions are lighter).
@@ -232,6 +241,13 @@ pub struct PeerManager<S> {
     /// When `maintain_outbounds` last ran — paces the periodic
     /// self-heal dial so a starved peer set doesn't spin.
     last_maintained: Option<Instant>,
+    /// The operator ban list — Core's `BanMan`/`m_banned`: consulted
+    /// on every dial and (future) inbound accept; `setban add` also
+    /// drops matching live peers.
+    bans: crate::banman::BanList,
+    /// Where `bans` persists — `<net-datadir>/banlist.json`, written on
+    /// every mutation like Core's `DumpBanlist`.
+    banlist_path: Option<std::path::PathBuf>,
 }
 
 impl<S: Read + Write> PeerManager<S> {
@@ -252,6 +268,8 @@ impl<S: Read + Write> PeerManager<S> {
             network_active: true,
             addnode_dial: HashMap::new(),
             last_maintained: None,
+            bans: crate::banman::BanList::new(),
+            banlist_path: None,
         }
     }
 
@@ -1077,6 +1095,70 @@ impl<S: Read + Write> PeerManager<S> {
     pub fn added_nodes(&self) -> &[(String, bool)] {
         &self.added_nodes
     }
+
+    /// Points ban persistence at `<net-datadir>/banlist.json` and
+    /// loads any existing file — Core's `LoadBanlist` at startup.
+    /// Expired entries are swept on load.
+    pub fn set_banlist_path(&mut self, path: std::path::PathBuf, now: i64) {
+        self.bans = crate::banman::BanList::load(&path).unwrap_or_default();
+        self.bans.sweep(now);
+        self.banlist_path = Some(path);
+    }
+
+    /// `BanMan::IsBanned` for a 16-byte address — the dial/accept gate.
+    #[must_use]
+    pub fn is_banned(&self, ip: &[u8; 16], now: i64) -> bool {
+        self.bans.is_banned(ip, now)
+    }
+
+    /// `IsBanned(CSubNet)` — listed and active; setban's re-add check.
+    #[must_use]
+    pub fn is_subnet_banned(&self, net: &crate::banman::SubNet, now: i64) -> bool {
+        self.bans.is_banned_subnet(net, now)
+    }
+
+    /// `listbanned`'s rows in Core's `CSubNet` sort order; expired
+    /// entries are swept first (`GetBanned`'s view).
+    pub fn banned_list(&mut self, now: i64) -> Vec<(crate::banman::SubNet, crate::banman::BanEntry)> {
+        self.bans.sweep(now);
+        self.bans.entries().map(|(n, e)| (*n, *e)).collect()
+    }
+
+    /// `setban add` — records the ban, drops every peer under it, and
+    /// persists. `false` when the subnet is already listed (Core's
+    /// `RPC_CLIENT_NODE_ALREADY_ADDED` path).
+    pub fn ban(&mut self, net: crate::banman::SubNet, created: i64, until: i64) -> bool {
+        if !self.bans.ban(net, created, until) {
+            return false;
+        }
+        self.disconnect_by_subnet(&net.network, net.plen);
+        self.save_bans();
+        true
+    }
+
+    /// `setban remove` — `false` when the subnet wasn't listed
+    /// (Core's "not previously manually banned" path).
+    pub fn unban(&mut self, net: &crate::banman::SubNet) -> bool {
+        if !self.bans.unban(net) {
+            return false;
+        }
+        self.save_bans();
+        true
+    }
+
+    /// `clearbanned` — drops the whole list and persists.
+    pub fn clear_bans(&mut self) {
+        self.bans.clear();
+        self.save_bans();
+    }
+
+    /// `DumpBanlist` — best-effort like Core (a write failure loses
+    /// the file, not the in-memory list).
+    fn save_bans(&self) {
+        if let Some(path) = &self.banlist_path {
+            let _ = self.bans.save(path);
+        }
+    }
 }
 
 impl PeerManager<TcpStream> {
@@ -1089,16 +1171,18 @@ impl PeerManager<TcpStream> {
         our_version: u64, // nonce for build_version
         start_height: i32,
     ) -> Result<Option<u64>, SessionError> {
+        let remote = crate::addrman::net_addr_of(addr, 0);
+        // `BanMan::IsBanned` gates dialing — Core never opens a
+        // connection to a banned address.
+        if self.bans.is_banned(&remote.ip, epoch_now()) {
+            return Ok(None);
+        }
         let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
-        let version = build_version(
-            our_version,
-            start_height,
-            crate::addrman::net_addr_of(addr, 0),
-        );
+        let version = build_version(our_version, start_height, remote);
         let session = PeerSession::initiate(stream, magic, version, SEND_BUDGET_PER_PEER)?;
-        Ok(self.add(session, Some(crate::addrman::net_addr_of(addr, 0)), false))
+        Ok(self.add(session, Some(remote), false))
     }
 
     /// Connects to `target` through a SOCKS5 `proxy` and registers the
@@ -1112,14 +1196,17 @@ impl PeerManager<TcpStream> {
         our_version: u64,
         start_height: i32,
     ) -> Result<Option<u64>, SessionError> {
-        let stream = crate::proxy::socks5_connect(proxy, target, Duration::from_secs(10))?;
-        stream.set_nonblocking(true)?;
-        stream.set_nodelay(true)?;
         let remote = match target {
             crate::proxy::SocksTarget::Ip(addr) => crate::addrman::net_addr_of(*addr, 0),
             // A domain target has no numeric address to gossip.
             crate::proxy::SocksTarget::Domain(..) => NetAddr::unspecified(),
         };
+        if self.bans.is_banned(&remote.ip, epoch_now()) {
+            return Ok(None);
+        }
+        let stream = crate::proxy::socks5_connect(proxy, target, Duration::from_secs(10))?;
+        stream.set_nonblocking(true)?;
+        stream.set_nodelay(true)?;
         let version = build_version(our_version, start_height, remote);
         let session = PeerSession::initiate(stream, magic, version, SEND_BUDGET_PER_PEER)?;
         Ok(self.add(session, Some(remote), false))
@@ -1198,9 +1285,15 @@ impl PeerManager<TcpStream> {
                     continue;
                 }
                 self.addnode_dial.insert(node.clone(), Instant::now());
+                let now = epoch_now();
                 for sock in socks {
                     if !self.has_slot() {
                         break;
+                    }
+                    // Banned addresses are never dialed (Core's
+                    // `IsBanned` gate in the addnode/open threads).
+                    if self.is_banned(&addrman::net_addr_of(sock, 0).ip, now) {
+                        continue;
                     }
                     dialed.push(sock);
                     match self.connect(sock, magic, sock.port() as u64, start_height) {
@@ -1211,11 +1304,22 @@ impl PeerManager<TcpStream> {
                 }
             }
         }
+        let now = epoch_now();
+        // `select` is deterministic, so each probe marks its candidate —
+        // the round is bounded by the book size and a banned candidate
+        // can't starve or spin the loop.
+        let probes_left = self.addrbook.len();
+        let mut tried = 0usize;
         while self.has_slot()
+            && tried < probes_left
             && let Some(candidate) = self.addrbook.select()
         {
-            let sock = addrman::socket_addr(&candidate);
+            tried += 1;
             self.addrbook.mark_attempt(&candidate);
+            if self.is_banned(&candidate.ip, now) {
+                continue; // banned candidates aren't dialed
+            }
+            let sock = addrman::socket_addr(&candidate);
             dialed.push(sock);
             match self.connect(sock, magic, sock.port() as u64, start_height) {
                 Ok(Some(_)) => {}
