@@ -130,6 +130,143 @@ pub fn witness_address(hrp: &str, version: u8, program: &[u8]) -> String {
     out
 }
 
+/// Base58Check decode — the inverse of [`base58check`]. `None` on a
+/// non-base58 character or a checksum mismatch (Core's
+/// `DecodeBase58Check` behavior: no partial results).
+#[must_use]
+pub fn base58check_decode(s: &str) -> Option<(u8, Vec<u8>)> {
+    let mut zeros = 0usize;
+    let mut num: Vec<u8> = Vec::new();
+    let mut seen_nonzero = false;
+    for c in s.bytes() {
+        let digit = BASE58_ALPHABET.iter().position(|&b| b == c)? as u32;
+        if !seen_nonzero && c == b'1' {
+            zeros += 1;
+            continue;
+        }
+        seen_nonzero = true;
+        // num = num * 58 + digit (big-endian).
+        let mut carry = digit;
+        for byte in num.iter_mut().rev() {
+            let acc = u32::from(*byte) * 58 + carry;
+            *byte = (acc & 0xff) as u8;
+            carry = acc >> 8;
+        }
+        while carry > 0 {
+            num.insert(0, (carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+    let mut data = vec![0u8; zeros];
+    data.extend_from_slice(&num);
+    if data.len() < 5 {
+        return None;
+    }
+    let (body, check) = data.split_at(data.len() - 4);
+    if sha256d(body)[..4] != *check {
+        return None;
+    }
+    Some((body[0], body[1..].to_vec()))
+}
+
+/// BIP173/BIP350 decode: returns `(hrp, version, program)` — the
+/// inverse of [`witness_address`]. Enforces the uniform-case rule,
+/// checksum-constant-by-version (v0 → bech32, v1+ → bech32m), and the
+/// BIP173 program rules (2–40 bytes; v0 must be 20 or 32).
+#[must_use]
+pub fn witness_decode(s: &str) -> Option<(String, u8, Vec<u8>)> {
+    let lower = s.to_ascii_lowercase();
+    // Mixed case is invalid (BIP173's case rule).
+    if lower != s && s.to_ascii_uppercase() != s {
+        return None;
+    }
+    let sep = lower.rfind('1')?;
+    if sep == 0 || lower.len() - sep - 1 < 6 || lower.len() > 90 {
+        return None;
+    }
+    let hrp = &lower[..sep];
+    let mut values = Vec::with_capacity(lower.len() - sep - 1);
+    for c in lower[sep + 1..].bytes() {
+        values.push(BECH32_CHARSET.iter().position(|&b| b == c)? as u8);
+    }
+    let version = *values.first()?;
+    if version > 16 {
+        return None;
+    }
+    let expected = if version == 0 {
+        BECH32_CONST
+    } else {
+        BECH32M_CONST
+    };
+    if polymod(hrp, &values) != expected {
+        return None;
+    }
+    // 5→8 bit regrouping of the data part (checksum excluded); the
+    // leftover group must be zero-padded, not data-bearing.
+    let mut program = Vec::with_capacity(values.len() * 5 / 8);
+    {
+        let mut acc = 0u32;
+        let mut bits = 0u32;
+        for v in &values[1..values.len() - 6] {
+            acc = (acc << 5) | u32::from(*v);
+            bits += 5;
+            if bits >= 8 {
+                bits -= 8;
+                program.push((acc >> bits) as u8);
+            }
+        }
+        if bits >= 5 || (acc << (8 - bits)) & 0xff != 0 {
+            return None;
+        }
+    }
+    if !(2..=40).contains(&program.len()) {
+        return None;
+    }
+    if version == 0 && program.len() != 20 && program.len() != 32 {
+        return None;
+    }
+    Some((hrp.to_owned(), version, program))
+}
+
+/// The scriptPubKey an address pays to — the inverse of
+/// [`script_address`], Core's `GetScriptForDestination`. `None` when
+/// the string is neither a valid base58check address for this
+/// network's prefixes nor a bech32/bech32m address for its hrp.
+#[must_use]
+pub fn address_to_script(address: &str, params: &Params) -> Option<Script> {
+    if let Some((version, payload)) = base58check_decode(address)
+        && payload.len() == 20
+    {
+        let mut script = Vec::with_capacity(25);
+        if version == params.base58_pubkey_prefix {
+            script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+            script.extend_from_slice(&payload);
+            script.extend_from_slice(&[0x88, 0xac]);
+            return Some(Script::new(script));
+        }
+        if version == params.base58_script_prefix {
+            script.extend_from_slice(&[0xa9, 0x14]);
+            script.extend_from_slice(&payload);
+            script.push(0x87);
+            return Some(Script::new(script));
+        }
+        return None;
+    }
+    if let Some((hrp, version, program)) = witness_decode(address)
+        && hrp == params.bech32_hrp
+    {
+        let opcode = if version == 0 {
+            crate::script::OP_0
+        } else {
+            crate::script::OP_1 + version - 1
+        };
+        let mut script = vec![opcode];
+        script.extend_from_slice(&crate::script::push_slice(&program));
+        return Some(Script::new(script));
+    }
+    None
+}
+
 /// The address a standard scriptPubKey pays to, when one exists —
 /// Core's `ExtractDestination`: base58check for P2PKH/P2SH, bech32
 /// for v0 witness programs, bech32m for v1+ (including

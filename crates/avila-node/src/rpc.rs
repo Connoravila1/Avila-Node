@@ -10,16 +10,18 @@
 //!   validated state without locking the sync path (the role Core's
 //!   `cs_main` critical section plays for its RPC thread).
 //!
-//! There is no wallet; the only state mutation is `sendrawtransaction`
-//! (pool admission + peer relay). Every answer is "what this node has
-//! itself observed", never a remote claim. The single control method is
-//! `stop`, which flips the same cancellation flag a GUI Stop button or
-//! SIGINT handler would.
+//! There is no wallet; the mutation methods are `sendrawtransaction`
+//! (pool admission + peer relay), `submitblock`/`submitheader`
+//! (chainstate connect + tip announce), `generatetoaddress`/
+//! `generateblock` (template → grind → connect → announce), and the
+//! `stop` control method (the same cancellation flag a GUI Stop
+//! button or SIGINT handler flips). Every answer is "what this node
+//! has itself observed", never a remote claim.
 //!
 //! Not implemented (by design, this slice): HTTP keep-alive, chunked
 //! encoding, TLS, authentication beyond localhost binding, batch
-//! requests, txindex-backed `getrawtransaction`, and any method that
-//! would mutate chain, pool or peer state.
+//! requests, txindex-backed `getrawtransaction`, and the wallet
+//! method surface.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -712,6 +714,51 @@ fn family_json(
         Value::Object(map)
     } else {
         json!(ids.iter().map(|t| t.to_string()).collect::<Vec<_>>())
+    }
+}
+
+/// Grinds `block`'s nonce until its hash meets `bits` (bounded by
+/// `maxtries`, timestamp-bumped on nonce wrap like Core's
+/// `GenerateBlock`), then submits it through `accept_block` and, on
+/// connect, purges confirmed pool entries and announces the new tip —
+/// the shared tail of `generatetoaddress` and `generateblock`.
+fn mine_and_connect(
+    cs: &mut Chainstate,
+    mgr: &mut PeerManager<TcpStream>,
+    mut block: avila_consensus::block::Block,
+    maxtries: u64,
+    now: u32,
+) -> Result<String, (i64, String)> {
+    let params = *cs.tree().params();
+    let mut tries = 0u64;
+    while avila_consensus::pow::check_proof_of_work(&block.block_hash(), block.header.bits, &params)
+        .is_err()
+    {
+        tries += 1;
+        if tries > maxtries {
+            return Err((RPC_MISC_ERROR, "generate: out of tries".to_string()));
+        }
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+        if block.header.nonce == 0 {
+            block.header.time += 1;
+        }
+    }
+    match cs.accept_block(&block, now) {
+        Ok(avila_consensus::chainstate::Acceptance::Connected { height, .. }) => {
+            mgr.mempool().on_block_connected(&block, height);
+            mgr.announce_tip(cs);
+            Ok(block.block_hash().to_string())
+        }
+        Ok(avila_consensus::chainstate::Acceptance::AlreadyKnown { .. }) => {
+            Err((RPC_VERIFY_ERROR, "duplicate".to_string()))
+        }
+        Ok(avila_consensus::chainstate::Acceptance::Parked { .. }) => {
+            Err((RPC_VERIFY_ERROR, "inconclusive".to_string()))
+        }
+        Err(rejection) => Err((
+            RPC_VERIFY_ERROR,
+            format!("Block validation failed: {}", rejection.reason()),
+        )),
     }
 }
 
@@ -1440,6 +1487,153 @@ fn dispatch(
                 }
             })
         }
+        "submitheader" => {
+            let Some(raw) = param(params, 0, "hexdata").and_then(Value::as_str) else {
+                return missing_params("hexdata");
+            };
+            let Ok(bytes) = hex::decode(raw) else {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_DESERIALIZATION_ERROR,
+                        "Block header decode failed".into(),
+                    )),
+                );
+            };
+            chain_query(queries, move |cs, _mgr| {
+                let Ok(header) = avila_consensus::header::BlockHeader::decode(&bytes) else {
+                    return Err((
+                        RPC_DESERIALIZATION_ERROR,
+                        "Block header decode failed".into(),
+                    ));
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                match cs.accept_header(&header, now) {
+                    Ok(_) => Ok(Value::Null),
+                    Err(avila_consensus::chainstate::BlockRejection::Header(
+                        avila_consensus::chain::ChainError::UnknownParent(prev),
+                    )) => Err((
+                        RPC_VERIFY_ERROR,
+                        format!("Must submit previous header ({prev}) first"),
+                    )),
+                    Err(rejection) => Err((RPC_VERIFY_ERROR, rejection.reason().into_owned())),
+                }
+            })
+        }
+        "generatetoaddress" => {
+            let Some(nblocks) = param(params, 0, "nblocks").and_then(Value::as_u64) else {
+                return missing_params("nblocks address");
+            };
+            let Some(address) = param(params, 1, "address")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                return missing_params("address");
+            };
+            let maxtries = param(params, 2, "maxtries")
+                .and_then(Value::as_u64)
+                .unwrap_or(1_000_000);
+            chain_query(queries, move |cs, mgr| {
+                let params = *cs.tree().params();
+                let Some(script) = avila_consensus::address::address_to_script(&address, &params)
+                else {
+                    return Err((
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        "Error: Invalid address".to_string(),
+                    ));
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                let mut hashes = Vec::with_capacity(nblocks as usize);
+                for _ in 0..nblocks {
+                    let template = mgr
+                        .mempool_ref()
+                        .build_template(cs, script.clone(), now)
+                        .map_err(|e| (RPC_MISC_ERROR, format!("template: {e}")))?;
+                    hashes.push(mine_and_connect(cs, mgr, template.block, maxtries, now)?);
+                }
+                Ok(json!(hashes))
+            })
+        }
+        "generateblock" => {
+            let Some(output) = param(params, 0, "output")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                return missing_params("output transactions");
+            };
+            let Some(tx_args) = param(params, 1, "transactions").and_then(Value::as_array) else {
+                return missing_params("transactions");
+            };
+            // Owned strings — the closure is 'static.
+            let tx_args: Vec<String> = tx_args
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            chain_query(queries, move |cs, mgr| {
+                let params = *cs.tree().params();
+                let script = avila_consensus::descriptor::output_to_script(&output, &params)
+                    .map_err(|_| {
+                        (
+                            RPC_INVALID_ADDRESS_OR_KEY,
+                            "Error: Invalid address or descriptor".to_string(),
+                        )
+                    })?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                // Core resolves each entry as a mempool txid first (the
+                // string parses as a 64-hex hash) and falls back to a
+                // raw transaction, which is admitted to the pool before
+                // mining — the block's connect then purges it anyway.
+                let mut txs: Vec<(Transaction, i64)> = Vec::with_capacity(tx_args.len());
+                for s in &tx_args {
+                    if let Ok(txid) = s.parse::<Txid>() {
+                        let Some(entry) = mgr.mempool_ref().entry(&txid) else {
+                            return Err((
+                                RPC_INVALID_ADDRESS_OR_KEY,
+                                format!("Transaction {s} not in mempool."),
+                            ));
+                        };
+                        txs.push((entry.tx.clone(), entry.fee));
+                        continue;
+                    }
+                    let tx = hex::decode(s)
+                        .ok()
+                        .and_then(|b| Transaction::decode(&b).ok())
+                        .ok_or_else(|| {
+                            (
+                                RPC_DESERIALIZATION_ERROR,
+                                format!(
+                                    "Transaction decode failed for {s}. Make sure the tx has at least one input."
+                                ),
+                            )
+                        })?;
+                    let txid = mgr
+                        .mempool()
+                        .accept_tx(tx, cs, now)
+                        .map_err(|e| (RPC_VERIFY_ERROR, e.to_string()))?;
+                    let entry = mgr
+                        .mempool_ref()
+                        .entry(&txid)
+                        .ok_or((RPC_VERIFY_ERROR, "tx lost after admission".to_string()))?;
+                    txs.push((entry.tx.clone(), entry.fee));
+                }
+                let block = mgr
+                    .mempool_ref()
+                    .build_explicit_block(cs, script, &txs, now)
+                    .map_err(|e| (RPC_MISC_ERROR, format!("template: {e}")))?;
+                let hash = mine_and_connect(cs, mgr, block, 1_000_000, now)?;
+                Ok(json!({ "hash": hash }))
+            })
+        }
         "getblocktemplate" => chain_query(queries, |cs, mgr| {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1747,7 +1941,9 @@ fn dispatch(
                  \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
                  \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>,\n\
                  \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount]\n\
-                 \x20 mining: getblocktemplate, getmininginfo, submitblock <hex>\n\
+                 \x20 mining: getblocktemplate, getmininginfo, submitblock <hex>,\n\
+                 \x20   submitheader <hex>, generatetoaddress <n> <address> [maxtries],\n\
+                 \x20   generateblock <output> [rawtx/txid,...]\n\
                  \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo\n\
                  \x20 misc:  estimatesmartfee <target>, uptime, help, stop"
             ),
@@ -2307,5 +2503,136 @@ mod tests {
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         let (_, e) = dispatch("submitblock", &json!([]), &snap, Some(&queries), None);
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
+    }
+
+    /// `submitheader` — a known header returns null, an orphan carries
+    /// Core's "Must submit previous header" -25, decode failures are -22.
+    #[test]
+    fn submitheader_reports_core_status() {
+        let params = Network::Regtest.params();
+        let queries = query_server(Chainstate::new(&params));
+        let snap = snap();
+
+        // A valid-PoW header with an unknown parent: regtest's target
+        // is near-maximal so a few nonces suffice.
+        let unknown = BlockHash::from_bytes([0x42; 32]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        let bits = params.genesis_header.bits;
+        let mut header = avila_consensus::header::BlockHeader {
+            version: 0x2000_0000,
+            prev_block_hash: unknown,
+            merkle_root: params.genesis_header.merkle_root,
+            time: now,
+            bits,
+            nonce: 0,
+        };
+        while avila_consensus::pow::check_proof_of_work(&header.hash(), bits, &params).is_err() {
+            header.nonce += 1;
+        }
+        let hexdata = hex::encode(&header.encode());
+        let (_, e) = dispatch(
+            "submitheader",
+            &json!([hexdata]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_VERIFY_ERROR);
+        assert_eq!(
+            msg,
+            format!("Must submit previous header ({unknown}) first")
+        );
+
+        // Genesis's own header is already known → null, like Core.
+        let genesis = hex::encode(&params.genesis_header.encode());
+        let (r, e) = dispatch(
+            "submitheader",
+            &json!([genesis]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, Value::Null);
+
+        let (_, e) = dispatch("submitheader", &json!(["zz"]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
+    }
+
+    /// `generatetoaddress` mines real blocks to a decoded address and
+    /// `generateblock` covers the tx-resolution error paths. Both
+    /// grow the chain — the query server's state advances.
+    #[test]
+    fn generate_methods_mine_and_validate() {
+        let params = Network::Regtest.params();
+        let queries = query_server(Chainstate::new(&params));
+        let snap = snap();
+        let addr = "bcrt1q9mc2hc2f6x2lsxh7xnuu3fdjj628hvjatzgxcr"; // real regtest P2WPKH
+
+        let (r, e) = dispatch(
+            "generatetoaddress",
+            &json!([1, addr]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        let hashes = r.as_array().unwrap();
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0].as_str().unwrap().len(), 64);
+
+        // Bad address → Core's -5.
+        let (_, e) = dispatch(
+            "generatetoaddress",
+            &json!([1, "notanaddress"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
+
+        // generateblock: coinbase-only block pays a descriptor.
+        let (r, e) = dispatch(
+            "generateblock",
+            &json!([format!("addr({addr})"), []]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["hash"].as_str().unwrap().len(), 64);
+
+        // Unknown txid → -5 "not in mempool"; bad hex → -22.
+        let (_, e) = dispatch(
+            "generateblock",
+            &json!([addr, ["aa".repeat(32)]]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_INVALID_ADDRESS_OR_KEY);
+        assert!(msg.contains("not in mempool"), "{msg}");
+        let (_, e) = dispatch(
+            "generateblock",
+            &json!([addr, ["zz"]]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
+        // Bad output → -5.
+        let (_, e) = dispatch(
+            "generateblock",
+            &json!(["zzz", []]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
     }
 }

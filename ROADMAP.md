@@ -175,9 +175,9 @@ operation. Compare complete initial download and catch-up, not only local replay
       testmempoolaccept with a per-gate policy trace,
       getblocktemplate built from live chainstate + pool,
       getmininginfo, getnetworkinfo, getconnectioncount, stop,
-      sendrawtransaction, submitblock) — verified live over curl and
-      the client. txindex, wallet functionality, and further
-      mutation methods remain open.
+      sendrawtransaction, submitblock, submitheader,
+      generatetoaddress, generateblock) — verified live over curl and
+      the client. txindex and wallet functionality remain open.
 - [x] Implement mempool admission, packages, replacement, eviction,
       relay and reorg reconciliation (first slice): `avila-mempool`
       applies consensus input/script checks identically to block
@@ -220,7 +220,14 @@ operation. Compare complete initial download and catch-up, not only local replay
   submitted over RPC connected to our chainstate and was announced to
   and accepted by Knots at h121; Core's status strings match
   (`null`/`duplicate`/`inconclusive`/`duplicate-invalid`, `-22` decode
-  failures).
+  failures). `generatetoaddress`, `generateblock` and `submitheader`
+  complete the mining surface — `generatetoaddress` mined h122–h124
+  live to a decoded address (new base58check/bech32/bech32m decode
+  direction) with Knots accepting every announced block;
+  `generateblock` mines an explicit tx set (txid-in-pool or raw hex
+  admitted first) to an address or descriptor (`addr`/`raw`/`pk`/
+  `pkh`/`wpkh`/`tr`/`rawtr` — `tr` applies the real BIP341 tweak);
+  `submitheader` matches Core's orphan and decode errors.
   Fee information started:
   `FeeEstimator` records (rate, blocks-to-confirm) samples and
   `estimatesmartfee` serves any target with data, erroring honestly

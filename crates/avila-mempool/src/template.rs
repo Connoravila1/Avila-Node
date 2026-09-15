@@ -12,9 +12,10 @@
 
 use std::collections::HashSet;
 
+use avila_consensus::arith::CompactTarget;
 use avila_consensus::block::{Block, MAX_BLOCK_WEIGHT};
 use avila_consensus::connect::block_subsidy;
-use avila_consensus::hash::Txid;
+use avila_consensus::hash::{BlockHash, Txid};
 use avila_consensus::header::BlockHeader;
 use avila_consensus::script;
 use avila_consensus::transaction::{OutPoint, Script, Transaction, TxIn, TxOut, Witness};
@@ -129,6 +130,47 @@ impl Mempool {
 
         // Coinbase: BIP34 height prefix, subsidy + fees to the miner.
         let subsidy = block_subsidy(height, cs.tree().params());
+        let txs: Vec<(Transaction, i64)> = chosen.iter().map(|e| (e.tx.clone(), e.fee)).collect();
+        let block = Self::assemble_block(
+            cs,
+            miner_script_pubkey,
+            &txs,
+            height,
+            &tip_node.header,
+            tip,
+            mtp,
+            bits,
+            subsidy,
+            now,
+        )?;
+        Ok(BlockTemplate {
+            weight: block.weight(),
+            block,
+            height,
+            fees,
+            tx_count: chosen.len(),
+        })
+    }
+
+    /// Assembles the candidate block — the tail of [`build_template`]
+    /// factored out so `generateblock` can mine an explicit,
+    /// caller-ordered transaction set (Core's `generateblock`
+    /// semantics: exactly the listed txs, in order, plus the
+    /// coinbase). Returns the block plus the count of non-coinbase
+    /// transactions included.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_block(
+        cs: &avila_consensus::chainstate::Chainstate,
+        miner_script_pubkey: Script,
+        txs: &[(Transaction, i64)],
+        height: u32,
+        tip_header: &avila_consensus::header::BlockHeader,
+        tip: BlockHash,
+        mtp: u32,
+        bits: CompactTarget,
+        subsidy: i64,
+        now: u32,
+    ) -> Result<Block, TemplateError> {
         // Core's CreateNewBlock adds the witness commitment to every
         // block once segwit is active — even with no witness txs the
         // coinbase carries the reserved value and the zero-root
@@ -138,9 +180,10 @@ impl Mempool {
             avila_consensus::script::block_script_flags(cs.tree().params(), height, &tip)
                 .contains(avila_consensus::script::ScriptFlags::WITNESS);
         let has_witness = segwit_active
-            || chosen
+            || txs
                 .iter()
-                .any(|e| e.tx.inputs.iter().any(|i| !i.witness.is_empty()));
+                .any(|(tx, _)| tx.inputs.iter().any(|i| !i.witness.is_empty()));
+        let fees: i64 = txs.iter().map(|(_, fee)| fee).sum();
         let mut coinbase = Transaction {
             version: 2,
             inputs: vec![TxIn {
@@ -176,16 +219,16 @@ impl Mempool {
             header: BlockHeader {
                 version: 0x2000_0000,
                 prev_block_hash: tip,
-                merkle_root: tip_node.header.merkle_root,
+                merkle_root: tip_header.merkle_root,
                 time: now.max(mtp + 1),
                 bits,
                 nonce: 0,
             },
-            transactions: Vec::with_capacity(chosen.len() + 1),
+            transactions: Vec::with_capacity(txs.len() + 1),
         };
         block.transactions.push(coinbase.clone());
-        for entry in &chosen {
-            block.transactions.push(entry.tx.clone());
+        for (tx, _) in txs {
+            block.transactions.push(tx.clone());
         }
 
         if has_witness {
@@ -208,13 +251,52 @@ impl Mempool {
 
         let (root, _) = block.merkle_root();
         block.header.merkle_root = root;
-        let total_weight = block.weight();
-        Ok(BlockTemplate {
-            block,
+        Ok(block)
+    }
+
+    /// `generateblock`'s tx set: a block containing exactly `txs` in
+    /// the caller's order plus the coinbase — no pool selection. `txs`
+    /// pairs each transaction with its fee in sats so the coinbase
+    /// carries subsidy + fees, matching `CreateNewBlock`'s payout.
+    ///
+    /// # Errors
+    ///
+    /// Same template failures as [`build_template`]
+    /// ([`TemplateError::NoContext`], [`TemplateError::Difficulty`]).
+    pub fn build_explicit_block(
+        &self,
+        cs: &avila_consensus::chainstate::Chainstate,
+        miner_script_pubkey: Script,
+        txs: &[(Transaction, i64)],
+        now: u32,
+    ) -> Result<Block, TemplateError> {
+        let tip = cs.tip_hash();
+        let tip_node = cs.tree().tip();
+        let height = tip_node.height + 1;
+        let mtp = cs
+            .tree()
+            .median_time_past(&tip)
+            .ok_or(TemplateError::NoContext)?;
+        let bits = avila_consensus::pow::required_bits(
+            tip_node.height,
+            &tip_node.header,
+            now.max(mtp + 1),
+            cs.tree().params(),
+            cs.tree(),
+        )
+        .map_err(|e| TemplateError::Difficulty(e.to_string()))?;
+        let subsidy = block_subsidy(height, cs.tree().params());
+        Self::assemble_block(
+            cs,
+            miner_script_pubkey,
+            txs,
             height,
-            fees,
-            tx_count: chosen.len(),
-            weight: total_weight,
-        })
+            &tip_node.header,
+            tip,
+            mtp,
+            bits,
+            subsidy,
+            now,
+        )
     }
 }

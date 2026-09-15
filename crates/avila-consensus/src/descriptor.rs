@@ -1,12 +1,15 @@
-//! Output descriptors — display-layer emission only.
+//! Output descriptors — display-layer emission plus the parse
+//! direction `generateblock`'s `output` argument needs.
 //!
 //! `script_desc` mirrors what Core's `InferDescriptor` produces for a
 //! bare `scriptPubKey` (no key material available): `addr(...)` for
 //! addressable templates, `pk(...)`/`multi(...)` for bare-key scripts,
 //! `rawtr(...)` for taproot programs, `raw(...)` otherwise — each
 //! suffixed with the descriptor checksum from `doc/descriptors.md`.
-//! Parsing/importing descriptors (watch-only wallets) is a separate,
-//! larger task; this module only writes them.
+//! `output_to_script` parses the useful subset back to a
+//! `scriptPubKey`: bare addresses plus `addr`/`raw`/`pk`/`pkh`/`wpkh`/
+//! `tr` (key-path only) and `rawtr` descriptor forms. Full descriptor
+//! wallets (ranges, wildcards, nested trees) remain out of scope.
 
 use crate::address::script_address;
 use crate::hex;
@@ -75,6 +78,104 @@ pub fn descriptor_checksum(body: &str) -> String {
     (0..8)
         .map(|i| CHECKSUM_CHARSET[((chk >> (5 * (7 - i))) & 31) as usize] as char)
         .collect()
+}
+
+/// The BIP341 key-path tweak: `Q = P + H_taptweak(P)·G` for an
+/// x-only internal key. `tr(key)` descriptors without a script tree
+/// reduce to this single tweak — the output program is Q's x-only
+/// encoding.
+#[must_use]
+fn taproot_output_key(internal: &[u8]) -> Option<[u8; 32]> {
+    let internal = secp256k1::XOnlyPublicKey::from_slice(internal).ok()?;
+    // TapTweak = sha256(sha256("TapTweak") || sha256("TapTweak") || key).
+    let tag = crate::hash::sha256(b"TapTweak");
+    let mut data = Vec::with_capacity(96);
+    data.extend_from_slice(&tag);
+    data.extend_from_slice(&tag);
+    data.extend_from_slice(&internal.serialize());
+    let tweak = secp256k1::Scalar::from_be_bytes(crate::hash::sha256(&data)).ok()?;
+    let ctx = secp256k1::Secp256k1::verification_only();
+    let (output, _parity) = internal.add_tweak(&ctx, &tweak).ok()?;
+    Some(output.serialize())
+}
+
+/// `GetScriptForDestination`/`InferScript` — the direction
+/// `generateblock`'s `output` argument needs: parse a string that is
+/// either a network address or a descriptor (optionally
+/// `#checksum`-suffixed, verified when present) and return the
+/// scriptPubKey it pays to.
+///
+/// The descriptor subset is what a bare-script argument can express
+/// without a wallet's key store: `addr(...)`, `raw(...)`, `pk(...)`,
+/// `pkh(...)`, `wpkh(...)`, `tr(...)` (single x-only key, no tree)
+/// and `rawtr(...)`. `pkh`/`wpkh` take a hex pubkey; `tr` takes a
+/// 32-byte x-only internal key and applies the BIP341 key-path
+/// tweak. Everything else errors.
+pub fn output_to_script(output: &str, params: &Params) -> Result<Script, String> {
+    let body = match output.rsplit_once('#') {
+        Some((body, checksum)) => {
+            if descriptor_checksum(body) != checksum {
+                return Err("invalid descriptor checksum".to_string());
+            }
+            body
+        }
+        None => output,
+    };
+    // No parens — try the address forms.
+    let Some(open) = body.find('(') else {
+        return crate::address::address_to_script(body, params)
+            .ok_or_else(|| "invalid address".to_string());
+    };
+    if !body.ends_with(')') {
+        return Err("malformed descriptor".to_string());
+    }
+    let (name, arg) = (&body[..open], &body[open + 1..body.len() - 1]);
+    let key = hex::decode(arg);
+    let err = || "invalid descriptor".to_string();
+    match name {
+        "addr" => crate::address::address_to_script(arg, params).ok_or_else(err),
+        "raw" => key.map(Script::new).map_err(|_| err()),
+        "pk" => key
+            .ok()
+            .filter(|k| k.len() == 33 || k.len() == 65)
+            .map(|k| {
+                Script::new(
+                    [
+                        crate::script::push_slice(&k),
+                        vec![crate::script::OP_CHECKSIG],
+                    ]
+                    .concat(),
+                )
+            })
+            .ok_or_else(err),
+        "pkh" | "wpkh" => {
+            let k = key
+                .ok()
+                .filter(|k| k.len() == 33 || k.len() == 65)
+                .ok_or_else(err)?;
+            let h = crate::hash::hash160(&k);
+            let script = if name == "pkh" {
+                [&[0x76, 0xa9, 0x14], &h[..], &[0x88, 0xac]].concat()
+            } else {
+                [&[crate::script::OP_0, 0x14], &h[..]].concat()
+            };
+            Ok(Script::new(script))
+        }
+        "tr" => {
+            let k = key.ok().filter(|k| k.len() == 32).ok_or_else(err)?;
+            let out = taproot_output_key(&k).ok_or_else(err)?;
+            Ok(Script::new(
+                [&[crate::script::OP_1], &crate::script::push_slice(&out)[..]].concat(),
+            ))
+        }
+        "rawtr" => {
+            let k = key.ok().filter(|k| k.len() == 32).ok_or_else(err)?;
+            Ok(Script::new(
+                [&[crate::script::OP_1], &crate::script::push_slice(&k)[..]].concat(),
+            ))
+        }
+        _ => Err("unsupported descriptor".to_string()),
+    }
 }
 
 /// `InferDescriptor` for a bare scriptPubKey, including the `#`

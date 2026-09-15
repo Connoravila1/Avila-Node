@@ -84,6 +84,23 @@ BIP34 height as a bare `OP_N` push, a 1-byte scriptSig at heights
 `CScript() << nHeight << OP_0` appends a trailing `OP_0`; the
 template now does the same.
 
+The rest of Core's mining surface then landed, verified live against
+Knots: `generatetoaddress` mined h122–h124 through our RPC (address →
+scriptPubKey via the new base58check/bech32/bech32m decoder), each
+block announced and accepted by Knots as tip; `generateblock` mined a
+pooled tx by txid reference and returned `{"hash": …}` (raw-hex
+entries are admitted to the pool first, matching Core's temp-pool
+step); `submitheader` returns `null` for a known header,
+`-25`/`Must submit previous header (…) first` for an orphan, and
+`-22`/`Block header decode failed` for undecodable input. Error
+paths verified byte-identical against Knots: `-5 "Error: Invalid
+address"` / `"Error: Invalid address or descriptor"`,
+`-5 "Transaction <txid> not in mempool."`, `-22 "Transaction decode
+failed for <s>. Make sure the tx has at least one input."`.
+`generateblock`'s `output` accepts an address or a descriptor subset
+(`addr`/`raw`/`pk`/`pkh`/`wpkh`/`tr` key-path/`rawtr`, `#checksum`
+verified); `tr()` applies the real BIP341 x-only tweak.
+
 Exact matches now include the full display layer: `decodescript` on
 P2PKH, taproot, unknown-witness, and nonstandard scripts returns
 byte-identical `asm`, `desc` (with the descriptor polymod checksum),
@@ -127,6 +144,6 @@ v0: raw hex), `getchaintips`, `getrawmempool`, `getconnectioncount`,
   returning a floor — the estimator only reports rates it observed.
 - `getrawtransaction` requires a named block for non-pool txs; no
   txindex (same failure mode as Core without `txindex=1`).
-- Mutating methods are `stop`, `sendrawtransaction`, `submitblock`;
-  `sendrawtransaction` admits to our pool and relays to peers,
-  `submitblock` connects to the chainstate and announces the tip.
+- Mutating methods are `stop`, `sendrawtransaction`, `submitblock`,
+  `submitheader`, `generatetoaddress`, `generateblock` — the pool
+  admission, block connect, and tip-announce paths are all live.
