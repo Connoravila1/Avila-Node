@@ -597,6 +597,18 @@ surfaced:
   `result`/`error` counterpart, and 204 for V2 notifications
   (single, batch, and all-notification). Verified: 27 envelope rows
   byte-identical.
+- Node-admin quartet added: `getaddednodeinfo` (added-nodes list
+  with live per-peer `inbound`/`outbound` rows; unknown node →
+  `-24 "Error: Node has not been added."`), `getzmqnotifications`
+  (empty list — no ZMQ publishers exist, matching a Core built
+  without it), `getchainstates` (Core's single-entry no-snapshot
+  shape: `headers`, `blocks`, `bestblockhash`, `bits`, `target`,
+  `difficulty`, `verificationprogress`, `validated`), and
+  `pruneblockchain` (`-1 "Cannot prune blocks because node is not
+  in prune mode."` — no prune mode exists). Verified live: every
+  arity/type/error row byte-identical; `getaddednodeinfo`'s list
+  contents and `getchainstates`'s `coins_*_cache_bytes` fields are
+  per-node state/design differences (see below).
 
 ### Known semantic differences
 
@@ -645,3 +657,11 @@ surfaced:
   `subversion`).
 - Named-object `params` (Core resolves arguments by name) is still
   not supported — it bypasses the gate like Core's named-arg path.
+- `getaddednodeinfo` lists our `--connect` peers: sync registers
+  them as added nodes (operator intent, redialed on drop) where
+  Core keeps `-connect` out of `connman.m_added_nodes`. Entries
+  added via `addnode ... add` behave identically on both sides.
+- `getchainstates` reports `coins_db_cache_bytes` /
+  `coins_tip_cache_bytes` as 0: Core prints its configured cache
+  budgets (`-dbcache` splits) and we have no bounded coins caches —
+  the UTXO set is the state itself, not a budgeted cache.

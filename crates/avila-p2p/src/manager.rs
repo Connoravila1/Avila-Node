@@ -1073,6 +1073,36 @@ impl<S: Read + Write> PeerManager<S> {
         !hit.is_empty()
     }
 
+    /// `getaddednodeinfo` — each `added_nodes` name plus its live
+    /// connection list `(address, "inbound"|"outbound")`, the shape
+    /// Core's `connected`/`addresses` fields render.
+    pub fn added_node_info(&self) -> Vec<(String, Vec<(String, &'static str)>)> {
+        self.added_nodes
+            .iter()
+            .map(|(name, _)| {
+                let conns: Vec<(String, &'static str)> = self
+                    .peers
+                    .iter()
+                    .filter(|(_, p)| {
+                        p.remote.as_ref().is_some_and(|r| {
+                            let s = crate::addrman::addr_string(r);
+                            s == name.as_str() || s.split(':').next() == Some(name.as_str())
+                        })
+                    })
+                    .map(|(_, p)| {
+                        let addr = p
+                            .remote
+                            .as_ref()
+                            .map(crate::addrman::addr_string)
+                            .unwrap_or_default();
+                        (addr, if p.inbound { "inbound" } else { "outbound" })
+                    })
+                    .collect();
+                (name.clone(), conns)
+            })
+            .collect()
+    }
+
     /// `disconnectnode` by subnet — drops every peer whose remote ip
     /// sits under `plen` bits of `net`.
     pub fn disconnect_by_subnet(&mut self, net: &[u8; 16], plen: u8) -> bool {

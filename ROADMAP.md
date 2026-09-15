@@ -319,7 +319,11 @@ operation. Compare complete initial download and catch-up, not only local replay
       doubles emit Core's `UniValue::setFloat` text (`%.16g` via `g16`)
       rather than ryu's shortest repr — the two parse to different
       f64s on values like 101/17, and `txrate` now matches
-      byte-for-byte. Outbound dialing is
+      byte-for-byte. The node-admin surface covers getaddednodeinfo
+      (added nodes with live inbound/outbound rows, -24 on unknown),
+      getzmqnotifications (empty — no ZMQ publishers), getchainstates
+      (Core's single-entry no-snapshot shape), and pruneblockchain
+      (Core's no-prune refusal). Outbound dialing is
       asynchronous —
       `maintain_outbounds` runs `connect_timeout` on slot-bounded
       worker threads and drains results on the tick, so a book of dead

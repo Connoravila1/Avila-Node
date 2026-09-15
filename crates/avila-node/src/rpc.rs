@@ -1115,6 +1115,19 @@ where
     })
 }
 
+/// `getaddednodeinfo`'s per-node record — `connected` mirrors the
+/// addresses list, matching Core (empty list → `connected:false`).
+fn added_node_json((name, conns): &(String, Vec<(String, &'static str)>)) -> Value {
+    json!({
+        "addednode": name,
+        "connected": !conns.is_empty(),
+        "addresses": conns
+            .iter()
+            .map(|(addr, dir)| json!({"address": addr, "connected": dir}))
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// The `Value`-level `ParseHashV` — non-strings throw the bare `-3`
 /// from its `RPCTypeCheck` before the length/hex wording.
 fn parse_hash_arg<T: std::str::FromStr>(v: &Value, name: &str) -> Result<T, (i64, String)> {
@@ -1452,6 +1465,11 @@ const STOP_HELP: &str = "stop\n\nRequest a graceful shutdown of Bitcoin Core.\n\
 const HELP_HELP: &str = "help ( \"command\" )\n\nList all commands, or get help for a specified command.\n\nArguments:\n1. command    (string, optional, default=all commands) The command to get help on\n\nResult:\n\"str\"    (string) The help text\n";
 
 const GETMEMORYINFO_HELP: &str = "getmemoryinfo ( \"mode\" )\n\nReturns an object containing information about memory usage.\n\nArguments:\n1. mode    (string, optional, default=\"stats\") determines what kind of information is returned.\n           - \"stats\" returns general statistics about memory usage in the daemon.\n           - \"mallocinfo\" returns an XML string describing low-level heap state (only available if compiled with glibc).\n\nResult (mode \"stats\"):\n{                         (json object)\n  \"locked\" : {            (json object) Information about locked memory manager\n    \"used\" : n,           (numeric) Number of bytes used\n    \"free\" : n,           (numeric) Number of bytes available in current arenas\n    \"total\" : n,          (numeric) Total number of bytes managed\n    \"locked\" : n,         (numeric) Amount of bytes that succeeded locking. If this number is smaller than total, locking pages failed at some point and key data could be swapped to disk.\n    \"chunks_used\" : n,    (numeric) Number allocated chunks\n    \"chunks_free\" : n     (numeric) Number unused chunks\n  }\n}\n\nResult (mode \"mallocinfo\"):\n\"str\"    (string) \"<malloc version=\"1\">...\"\n\nExamples:\n> bitcoin-cli getmemoryinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getmemoryinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+const GETADDEDNODEINFO_HELP: &str = "getaddednodeinfo ( \"node\" )\n\nReturns information about the given added node, or all added nodes\n(note that onetry addnodes are not listed here)\n\nArguments:\n1. node    (string, optional, default=all nodes) If provided, return information about this specific node, otherwise all nodes are returned.\n\nResult:\n[                                (json array)\n  {                              (json object)\n    \"addednode\" : \"str\",         (string) The node IP address or name (as provided to addnode)\n    \"connected\" : true|false,    (boolean) If connected\n    \"addresses\" : [              (json array) Only when connected = true\n      {                          (json object)\n        \"address\" : \"str\",       (string) The bitcoin server IP and port we're connected to\n        \"connected\" : \"str\"      (string) connection, inbound or outbound\n      },\n      ...\n    ]\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli getaddednodeinfo \"192.168.0.201\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getaddednodeinfo\", \"params\": [\"192.168.0.201\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETZMQNOTIFICATIONS_HELP: &str = "getzmqnotifications\n\nReturns information about the active ZeroMQ notifications.\n\nResult:\n[                         (json array)\n  {                       (json object)\n    \"type\" : \"str\",       (string) Type of notification\n    \"address\" : \"str\",    (string) Address of the publisher\n    \"hwm\" : n             (numeric) Outbound message high water mark\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli getzmqnotifications \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getzmqnotifications\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETCHAINSTATES_HELP: &str = "getchainstates\n\nReturn information about chainstates.\n\nResult:\n{                                      (json object)\n  \"headers\" : n,                       (numeric) the number of headers seen so far\n  \"chainstates\" : [                    (json array) list of the chainstates ordered by work, with the most-work (active) chainstate last\n    {                                  (json object)\n      \"blocks\" : n,                    (numeric) number of blocks in this chainstate\n      \"bestblockhash\" : \"hex\",         (string) blockhash of the tip\n      \"bits\" : \"hex\",                  (string) nBits: compact representation of the block difficulty target\n      \"target\" : \"hex\",                (string) The difficulty target\n      \"difficulty\" : n,                (numeric) difficulty of the tip\n      \"verificationprogress\" : n,      (numeric) progress towards the network tip\n      \"snapshot_blockhash\" : \"hex\",    (string, optional) the base block of the snapshot this chainstate is based on, if any\n      \"coins_db_cache_bytes\" : n,      (numeric) size of the coinsdb cache\n      \"coins_tip_cache_bytes\" : n,     (numeric) size of the coinstip cache\n      \"validated\" : true|false         (boolean) whether the chainstate is fully validated. True if all blocks in the chainstate were validated, false if the chain is based on a snapshot and the snapshot has not yet been validated.\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli getchainstates \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getchainstates\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const PRUNEBLOCKCHAIN_HELP: &str = "pruneblockchain height\n\nAttempts to delete block and undo data up to a specified height or timestamp, if eligible for pruning.\nRequires `-prune` to be enabled at startup. While pruned data may be re-fetched in some cases (e.g., via `getblockfrompeer`), local deletion is irreversible.\n\nArguments:\n1. height    (numeric, required) The block height to prune up to. May be set to a discrete height, or to a UNIX epoch time\n             to prune blocks whose block time is at least 2 hours older than the provided timestamp.\n\nResult:\nn    (numeric) Height of the last block pruned\n\nExamples:\n> bitcoin-cli pruneblockchain 1000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"pruneblockchain\", \"params\": [1000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 const LOGGING_HELP: &str = "logging ( [\"include_category\",...] [\"exclude_category\",...] )\n\nGets and sets the logging configuration.\nWhen called without an argument, returns the list of categories with status that are currently being debug logged or not.\nWhen called with arguments, adds or removes categories from debug logging and return the lists above.\nThe arguments are evaluated in order \"include\", \"exclude\".\nIf an item is both included and excluded, it will thus end up being excluded.\nThe valid logging categories are: addrman, bench, blockstorage, cmpctblock, coindb, estimatefee, http, i2p, ipc, leveldb, libevent, mempool, mempoolrej, net, proxy, prune, qt, rand, reindex, rpc, scan, selectcoins, tor, txpackages, txreconciliation, validation, walletdb, zmq\nIn addition, the following are available as category names with special meanings:\n  - \"all\",  \"1\" : represent all logging categories.\n\nArguments:\n1. include                    (json array, optional) The categories to add to debug logging\n     [\n       \"include_category\",    (string) the valid logging category\n       ...\n     ]\n2. exclude                    (json array, optional) The categories to remove from debug logging\n     [\n       \"exclude_category\",    (string) the valid logging category\n       ...\n     ]\n\nResult:\n{                             (json object) keys are the logging categories, and values indicates its status\n  \"category\" : true|false,    (boolean) if being debug logged or not. false:inactive, true:active\n  ...\n}\n\nExamples:\n> bitcoin-cli logging \"[\\\"all\\\"]\" \"[\\\"http\\\"]\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"logging\", \"params\": [[\"all\"], [\"libevent\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -2663,6 +2681,18 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         VERIFYCHAIN_HELP,
     ),
     (
+        "pruneblockchain",
+        &[("height", Some("number"), true)],
+        PRUNEBLOCKCHAIN_HELP,
+    ),
+    (
+        "getaddednodeinfo",
+        &[("node", Some("string"), false)],
+        GETADDEDNODEINFO_HELP,
+    ),
+    ("getzmqnotifications", &[], GETZMQNOTIFICATIONS_HELP),
+    ("getchainstates", &[], GETCHAINSTATES_HELP),
+    (
         "verifymessage",
         &[
             ("address", Some("string"), true),
@@ -2833,6 +2863,16 @@ fn dispatch(
             // clamps depth to the tip and level < 0 checks nothing.
             chain_query(queries, move |cs, _| Ok(json!(cs.verify_tip(level, depth))))
         }
+        "pruneblockchain" => {
+            // No prune mode exists — Core's exact refusal.
+            (
+                Value::Null,
+                Some((
+                    RPC_MISC_ERROR,
+                    "Cannot prune blocks because node is not in prune mode.".into(),
+                )),
+            )
+        }
         "getblockchaininfo" => chain_query(queries, |cs, _mgr| {
             let tip = cs.tip_hash();
             let connected = cs.chain().len().saturating_sub(1) as u32;
@@ -2879,6 +2919,36 @@ fn dispatch(
                 "size_on_disk": size_on_disk,
                 "pruned": cs.store().and_then(|s| s.pruned_through()).is_some(),
                 "warnings": [],
+            }))
+        }),
+        "getchainstates" => chain_query(queries, |cs, _| {
+            // One chainstate — we never snapshot-load (assumeutxo),
+            // so the list is Core's single-entry case.
+            let tip = cs.tip_hash();
+            let connected = cs.chain().len().saturating_sub(1) as u32;
+            let best_header = cs.tree().tip();
+            let Some(node) = cs.tree().get(&tip) else {
+                return Err((RPC_MISC_ERROR, "tip not indexed".into()));
+            };
+            Ok(json!({
+                "headers": best_header.height,
+                "chainstates": [{
+                    "blocks": connected,
+                    "bestblockhash": tip.to_string(),
+                    "bits": format!("{:08x}", node.header.bits.0),
+                    "target": node.header.bits.expand().value.to_hex(),
+                    "difficulty": core_num(difficulty(node.header.bits.0)),
+                    "verificationprogress": core_num(if best_header.height > 0 {
+                        connected as f64 / best_header.height as f64
+                    } else {
+                        1.0
+                    }),
+                    // No bounded coins caches — our UTXO set is the
+                    // state itself, held without a byte budget.
+                    "coins_db_cache_bytes": 0,
+                    "coins_tip_cache_bytes": 0,
+                    "validated": true,
+                }],
             }))
         }),
         "getdeploymentinfo" => {
@@ -6665,6 +6735,24 @@ fn dispatch(
                 Ok(Value::Null)
             })
         }
+        "getaddednodeinfo" => {
+            // Optional `node` filter — a name absent from the
+            // added-nodes list is -24, like Core.
+            let filter = params.get(0).and_then(Value::as_str).map(str::to_string);
+            chain_query(queries, move |_, mgr| {
+                let all = mgr.added_node_info();
+                if let Some(f) = &filter {
+                    let Some(entry) = all.iter().find(|(n, _)| n == f) else {
+                        return Err((
+                            RPC_CLIENT_NODE_NOT_ADDED,
+                            "Error: Node has not been added.".into(),
+                        ));
+                    };
+                    return Ok(json!([added_node_json(entry)]));
+                }
+                Ok(json!(all.iter().map(added_node_json).collect::<Vec<_>>()))
+            })
+        }
         "setnetworkactive" => {
             let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
             if arr.len() != 1 {
@@ -7168,6 +7256,9 @@ fn dispatch(
                 Ok(Value::Object(obj))
             })
         }
+        // No ZMQ support — Core built without it returns the empty
+        // notification list, not an error.
+        "getzmqnotifications" => (json!([]), None),
         "getnetworkinfo" => chain_query(queries, |_cs, mgr| {
             let snaps = mgr.peer_snapshots();
             let inbound = snaps.iter().filter(|p| p.inbound).count();
@@ -7330,7 +7421,7 @@ fn dispatch(
                      \x20   verifymessage <address> <sig> <msg>,\n\
                      \x20   signmessagewithprivkey <wif> <msg>,\n\
                      \x20   verifychain [checklevel] [nblocks],\n\
-                     \x20   getchaintxstats [nblocks] [blockhash],\n\
+                     \x20   getchainstates, pruneblockchain <height>,\n\
                      \x20   gettxoutsetinfo [hash_type] [hash_or_height] [use_index]\n\
                      \x20   scantxoutset <action> [scanobjects,...]\n\
                      \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
@@ -7356,6 +7447,7 @@ fn dispatch(
                      \x20   getaddrmaninfo,\n\
                      \x20   addpeeraddress <address> <port> [tried], ping,\n\
                      \x20   disconnectnode [address] [nodeid], addnode <node> <cmd>,\n\
+                     \x20   getaddednodeinfo [node], getzmqnotifications,\n\
                      \x20   setnetworkactive <state>,\n\
                      \x20   setban <subnet> <add|remove> [bantime] [absolute],\n\
                      \x20   listbanned, clearbanned\n\
@@ -9341,6 +9433,94 @@ mod tests {
             let (_, e) = dispatch("verifychain", &p, &snap, Some(&queries), None, None, None);
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
+    }
+
+    /// Node-admin quartet: `getchainstates` shape, `pruneblockchain`'s
+    /// no-prune refusal, `getzmqnotifications`' empty list, and
+    /// `getaddednodeinfo`'s -24 on an unknown node.
+    #[test]
+    fn node_admin_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+
+        let (r, e) = dispatch(
+            "getchainstates",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["headers"], json!(0));
+        assert_eq!(r["chainstates"].as_array().unwrap().len(), 1);
+        assert_eq!(r["chainstates"][0]["validated"], json!(true));
+
+        for (p, code) in [
+            (json!([]), RPC_MISC_ERROR),     // -1 + help
+            (json!([null]), RPC_TYPE_ERROR), // -3 collected
+            (json!([100]), RPC_MISC_ERROR),  // no-prune refusal
+            (json!([1, 2]), RPC_MISC_ERROR), // -1 + help
+        ] {
+            let (_, e) = dispatch(
+                "pruneblockchain",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+            );
+            assert_eq!(e.unwrap().0, code, "params {p}");
+        }
+        let (_, e) = dispatch(
+            "pruneblockchain",
+            &json!([100]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            e.unwrap().1,
+            "Cannot prune blocks because node is not in prune mode."
+        );
+
+        let (r, e) = dispatch(
+            "getzmqnotifications",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none());
+        assert_eq!(r, json!([]));
+
+        let (r, e) = dispatch(
+            "getaddednodeinfo",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none());
+        assert_eq!(r, json!([]));
+        let (_, e) = dispatch(
+            "getaddednodeinfo",
+            &json!(["nope"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_NOT_ADDED);
     }
 
     /// `getaddrmaninfo` — Core's fixed network keys each carrying
