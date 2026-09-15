@@ -228,8 +228,14 @@ operation. Compare complete initial download and catch-up, not only local replay
       deterministic pick can't spin), verifychain (VerifyDB on a
       cloned coins view — undo-disconnect backward, full
       CheckBlock/ConnectBlock forward, live state untouchable;
-      Core's ungated level/depth semantics including 0/negative = all)
-      — verified live over curl and the client.
+      Core's ungated level/depth semantics including 0/negative = all),
+      getaddrmaninfo (per-network new/tried/total book counts with all
+      of Core's fixed keys; onion/I2P/CJDNS stay structurally zero
+      while `NetAddr` is 16 bytes). Outbound dialing is asynchronous —
+      `maintain_outbounds` runs `connect_timeout` on slot-bounded
+      worker threads and drains results on the tick, so a book of dead
+      ends can't serialize RPC queries behind dial timeouts — verified
+      live over curl and the client.
       Genesis is served even though its body is never stored:
       `Params::genesis_block` reconstructs Core's per-network
       `CreateGenesisBlock` coinbase and `Chainstate::body` falls back

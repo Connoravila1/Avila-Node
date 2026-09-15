@@ -38,6 +38,9 @@ DYNAMIC_METHODS = {"uptime", "help", "getrawmempool", "savemempool",
                    # in-flight duration, locked-pool counters (we run no
                    # LockedPool), and the mutable logging category map.
                    "getrpcinfo", "getmemoryinfo", "logging",
+                   # Address-manager counts — book contents differ
+                   # legitimately across nodes (gossip history, seeds).
+                   "getaddrmaninfo",
                    # Bare tip-hash echo — forks legitimately diverge it.
                    "getbestblockhash"}
 
@@ -183,6 +186,9 @@ def build_calls(height):
         ("addpeeraddress", ["1.2.3.4", "x"]),
         ("addpeeraddress", []),
         ("getconnectioncount", []),
+        # getaddrmaninfo — counts are book state; shape + error only.
+        ("getaddrmaninfo", []),
+        ("getaddrmaninfo", [1]),
         # Network admin — deterministic error paths plus the no-arg
         # shapes. `ping`/`disconnectnode`/`addnode` onetry live-compare
         # statefully (peer sets differ); setnetworkactive returns the

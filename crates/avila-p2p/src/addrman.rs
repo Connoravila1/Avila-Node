@@ -194,6 +194,29 @@ impl AddrBook {
             .collect()
     }
 
+    /// `getaddrmaninfo` counts — `(new, tried)` per [`Network`]. The
+    /// flat table carries the flag rather than Core's bucket layout;
+    /// networks with no entries return `(0, 0)` — the caller emits
+    /// every Core key regardless.
+    #[must_use]
+    pub fn network_counts(&self) -> Vec<(Network, usize, usize)> {
+        let mut counts: Vec<(Network, usize, usize)> = Vec::new();
+        for e in self.table.values() {
+            let net = network_of(&e.addr);
+            match counts.iter_mut().find(|(n, _, _)| *n == net) {
+                Some((_, new, tried)) => {
+                    if e.tried {
+                        *tried += 1;
+                    } else {
+                        *new += 1;
+                    }
+                }
+                None => counts.push(if e.tried { (net, 0, 1) } else { (net, 1, 0) }),
+            }
+        }
+        counts
+    }
+
     /// Writes the table to `path` — Core's `peers.dat`: versioned,
     /// checksummed, and atomic (tmp + rename) so a crash mid-write never
     /// leaves a torn file. A corrupted file just loses gossip history —

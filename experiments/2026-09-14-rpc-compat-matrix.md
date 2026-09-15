@@ -340,6 +340,21 @@ surfaced:
   verify — levels compose by threshold), `nblocks` 0/negative/past-tip
   clamps to the whole chain, explicit nulls take the defaults
   (3 / 6), non-integral args throw `-1` "JSON integer out of range".
+- `getaddrmaninfo` counts the address book per network —
+  `{ipv4,ipv6,onion,i2p,cjdns,all_networks}.{new,tried,total}` — with
+  every Core key emitted even when empty. Onion/I2P/CJDNS are
+  structurally zero: the 16-byte `NetAddr` can't represent them, and
+  Core keys them off the address type anyway. Marked dynamic in the
+  harness since two nodes' books legitimately differ.
+- Outbound dials run on worker threads — `maintain_outbounds` queues
+  `TcpStream::connect_timeout` calls (5s bound) instead of running
+  them on the sync loop, and drains results back through a channel on
+  the next round. Sessions, ban rechecks, and slot checks all happen
+  on the tick; in-flight dials count against the open-slot bound so a
+  book of dead ends can't spawn unbounded workers or starve RPC
+  queries. Verified live: with four unroutable book entries mid-dial,
+  chain RPCs answer in ~10ms where synchronous dialing serialized
+  them behind ~5s per candidate.
 
 ### Known semantic differences
 

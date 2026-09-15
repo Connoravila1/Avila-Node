@@ -589,6 +589,9 @@ const ADDNODE_HELP: &str = "addnode \"node\" \"command\" ( v2transport \"connect
 /// Verbatim `help setnetworkactive` text (Bitcoin Core 29).
 const SETNETWORKACTIVE_HELP: &str = "setnetworkactive state\n\nDisable/enable all p2p network activity.\n\nArguments:\n1. state    (boolean, required) true to enable networking, false to disable\n\nResult:\ntrue|false    (boolean) The value that was passed in\n\nExamples:\n> bitcoin-cli setnetworkactive true\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"setnetworkactive\", \"params\": [true]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+/// Verbatim `help getaddrmaninfo` text (Bitcoin Core 29.4).
+const GETADDRMANINFO_HELP: &str = "getaddrmaninfo\n\nProvides information about the node's address manager by returning the number of addresses in the `new` and `tried` tables and their sum for all networks.\n\nResult:\n{                   (json object) json object with network type as keys\n  \"network\" : {     (json object) the network (ipv4, ipv6, onion, i2p, cjdns, all_networks)\n    \"new\" : n,      (numeric) number of addresses in the new table, which represent potential peers the node has discovered but hasn't yet successfully connected to.\n    \"tried\" : n,    (numeric) number of addresses in the tried table, which represent peers the node has successfully connected to in the past.\n    \"total\" : n     (numeric) total number of addresses in both new/tried tables\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getaddrmaninfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getaddrmaninfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 const GETNODEADDRESSES_HELP: &str = "getnodeaddresses ( count \"network\" )\n\nReturn known addresses, after filtering for quality and recency.\nThese can potentially be used to find new peers in the network.\nThe total number of addresses known to the node may be higher.\n\nArguments:\n1. count      (numeric, optional, default=1) The maximum number of addresses to return. Specify 0 to return all known addresses.\n2. network    (string, optional, default=all networks) Return only addresses of the specified network. Can be one of: ipv4, ipv6, onion, i2p, cjdns.\n\nResult:\n[                         (json array)\n  {                       (json object)\n    \"time\" : xxx,         (numeric) The UNIX epoch time when the node was last seen\n    \"services\" : n,       (numeric) The services offered by the node\n    \"address\" : \"str\",    (string) The address of the node\n    \"port\" : n,           (numeric) The port number of the node\n    \"network\" : \"str\"     (string) The network (ipv4, ipv6, onion, i2p, cjdns) the node connected through\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli getnodeaddresses 8\n> bitcoin-cli getnodeaddresses 4 \"i2p\"\n> bitcoin-cli -named getnodeaddresses network=onion count=12\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getnodeaddresses\", \"params\": [8]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getnodeaddresses\", \"params\": [4, \"i2p\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help addpeeraddress` text (Bitcoin Core 29).
@@ -4165,6 +4168,45 @@ fn dispatch(
                 ))
             })
         }
+        "getaddrmaninfo" => {
+            if params.as_array().is_some_and(|a| !a.is_empty()) {
+                return help_error(GETADDRMANINFO_HELP);
+            }
+            chain_query(queries, |_, mgr| {
+                let counts = mgr.addr_book().network_counts();
+                let mut new_total = 0usize;
+                let mut tried_total = 0usize;
+                let mut out = serde_json::Map::new();
+                for net in [
+                    avila_p2p::addrman::Network::Ipv4,
+                    avila_p2p::addrman::Network::Ipv6,
+                    avila_p2p::addrman::Network::Onion,
+                    avila_p2p::addrman::Network::I2p,
+                    avila_p2p::addrman::Network::Cjdns,
+                ] {
+                    let (new, tried) = counts
+                        .iter()
+                        .find(|(n, _, _)| *n == net)
+                        .map(|(_, n, t)| (*n, *t))
+                        .unwrap_or((0, 0));
+                    new_total += new;
+                    tried_total += tried;
+                    out.insert(
+                        avila_p2p::addrman::network_name(net).into(),
+                        json!({"new": new, "tried": tried, "total": new + tried}),
+                    );
+                }
+                out.insert(
+                    "all_networks".into(),
+                    json!({
+                        "new": new_total,
+                        "tried": tried_total,
+                        "total": new_total + tried_total,
+                    }),
+                );
+                Ok(Value::Object(out))
+            })
+        }
         // Test-only address injection — `addpeeraddress`. Onion/I2P
         // names can't be represented in our 16-byte `NetAddr`, so they
         // take the unparseable path (Core stores them; we report
@@ -4422,6 +4464,7 @@ fn dispatch(
                  \x20   generateblock <output> [rawtx/txid,...]\n\
                  \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo,\n\
                  \x20   getnettotals, getnodeaddresses [count] [network],\n\
+                 \x20   getaddrmaninfo,\n\
                  \x20   addpeeraddress <address> <port> [tried], ping,\n\
                  \x20   disconnectnode [address] [nodeid], addnode <node> <cmd>,\n\
                  \x20   setnetworkactive <state>,\n\
@@ -5959,6 +6002,37 @@ mod tests {
             let (_, e) = dispatch("verifychain", &p, &snap, Some(&queries), None);
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
+    }
+
+    /// `getaddrmaninfo` — Core's fixed network keys each carrying
+    /// {new, tried, total}, plus the help throw on any arg.
+    #[test]
+    fn getaddrmaninfo_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+
+        let (r, e) = dispatch("getaddrmaninfo", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        for net in ["ipv4", "ipv6", "onion", "i2p", "cjdns", "all_networks"] {
+            assert_eq!(r[net], json!({"new": 0, "tried": 0, "total": 0}), "{net}");
+        }
+        let (_, e) = dispatch("getaddrmaninfo", &json!([1]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+
+        // A seeded entry lands under its network.
+        let (r, e) = dispatch(
+            "addpeeraddress",
+            &json!(["1.2.3.4", 8333, true]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["success"], json!(true));
+        let (r, e) = dispatch("getaddrmaninfo", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["ipv4"], json!({"new": 0, "tried": 1, "total": 1}));
+        assert_eq!(r["all_networks"], json!({"new": 0, "tried": 1, "total": 1}));
     }
 
     /// `getrpcinfo`/`getmemoryinfo`/`logging` — the introspection
