@@ -215,9 +215,21 @@ impl Mempool {
             lock_time: 0,
         };
 
+        // Core's ComputeBlockVersion: VERSIONBITS_TOP_BITS plus the bit
+        // of every deployment in started/locked_in at the tip.
+        let params = cs.tree().params();
+        let mut version = 0x2000_0000i32;
+        for dep in params.bip9_deployments.iter() {
+            let st = avila_consensus::bip9::state(cs.tree(), Some(&tip), dep, params);
+            use avila_consensus::bip9::Bip9State;
+            if matches!(st, Bip9State::Started | Bip9State::LockedIn) {
+                version |= 1 << dep.bit;
+            }
+        }
+
         let mut block = Block {
             header: BlockHeader {
-                version: 0x2000_0000,
+                version,
                 prev_block_hash: tip,
                 merkle_root: tip_header.merkle_root,
                 time: now.max(mtp + 1),

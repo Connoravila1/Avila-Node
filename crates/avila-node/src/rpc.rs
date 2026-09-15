@@ -459,6 +459,8 @@ const GETNODEADDRESSES_HELP: &str = "getnodeaddresses ( count \"network\" )\n\nR
 const ADDPEERADDRESS_HELP: &str = "addpeeraddress \"address\" port ( tried )\n\nAdd the address of a potential peer to an address manager table. This RPC is for testing only.\n\nArguments:\n1. address    (string, required) The IP address of the peer\n2. port       (numeric, required) The port of the peer\n3. tried      (boolean, optional, default=false) If true, attempt to add the peer to the tried addresses table\n\nResult:\n{                            (json object)\n  \"success\" : true|false,    (boolean) whether the peer address was successfully added to the address manager table\n  \"error\" : \"str\"            (string, optional) error description, if the address could not be added\n}\n\nExamples:\n> bitcoin-cli addpeeraddress \"1.2.3.4\" 8333 true\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"addpeeraddress\", \"params\": [\"1.2.3.4\", 8333, true]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help getindexinfo` text (Bitcoin Core 29).
+const GETDEPLOYMENTINFO_HELP: &str = "getdeploymentinfo ( \"blockhash\" )\n\nReturns an object containing various state info regarding deployments of consensus changes.\n\nArguments:\n1. blockhash    (string, optional, default=\"hash of current chain tip\") The block hash at which to query deployment state\n\nResult:\n{                                       (json object)\n  \"hash\" : \"str\",                       (string) requested block hash (or tip)\n  \"height\" : n,                         (numeric) requested block height (or tip)\n  \"deployments\" : {                     (json object)\n    \"xxxx\" : {                          (json object) name of the deployment\n      \"type\" : \"str\",                   (string) one of \"buried\", \"bip9\"\n      \"height\" : n,                     (numeric, optional) height of the first block which enforces the rules (only for \"buried\" type, or \"bip9\" type with \"active\" status)\n      \"height_end\" : n,                 (numeric, optional) height of the last block which enforces the rules (only for \"bip9\" type with \"active\" status and temporary deployments)\n      \"active\" : true|false,            (boolean) true if the rules are enforced for the mempool and the next block\n      \"bip9\" : {                        (json object, optional) status of bip9 softforks (only for \"bip9\" type)\n        \"bit\" : n,                      (numeric, optional) the bit (0-28) in the block version field used to signal this softfork (only for \"started\" and \"locked_in\" status)\n        \"start_time\" : xxx,             (numeric) the minimum median time past of a block at which the bit gains its meaning\n        \"timeout\" : xxx,                (numeric) the median time past of a block at which the deployment is considered failed if not yet locked in\n        \"min_activation_height\" : n,    (numeric) minimum height of blocks for which the rules may be enforced\n        \"max_activation_height\" : n,    (numeric, optional) height at which the deployment will unconditionally activate (absent for miner-vetoable deployments)\n        \"status\" : \"str\",               (string) status of deployment at specified block (one of \"defined\", \"started\", \"locked_in\", \"active\", \"failed\", \"expired\")\n        \"since\" : n,                    (numeric) height of the first block to which the status applies\n        \"status_next\" : \"str\",          (string) status of deployment at the next block\n        \"statistics\" : {                (json object, optional) numeric statistics about signalling for a softfork (only for \"started\" and \"locked_in\" status)\n          \"period\" : n,                 (numeric) the length in blocks of the signalling period\n          \"period_start\" : n,           (numeric) height of the first block of this signalling period\n          \"threshold\" : n,              (numeric, optional) the number of blocks with the version bit set required to activate the feature (only for \"started\" status)\n          \"elapsed\" : n,                (numeric) the number of blocks elapsed since the beginning of the current period\n          \"count\" : n,                  (numeric) the number of blocks with the version bit set in the current period\n          \"possible\" : true|false       (boolean, optional) returns false if there are not enough blocks left in this period to pass activation threshold (only for \"started\" status)\n        },\n        \"signalling\" : \"str\"            (string, optional) indicates blocks that signalled with a # and blocks that did not with a -\n      }\n    },\n    ...\n  }\n}\n\nExamples:\n> bitcoin-cli getdeploymentinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getdeploymentinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 const GETINDEXINFO_HELP: &str = "getindexinfo ( \"index_name\" )\n\nReturns the status of one or all available indices currently running in the node.\n\nArguments:\n1. index_name    (string, optional) Filter results for an index with a specific name.\n\nResult:\n{                               (json object)\n  \"name\" : {                    (json object) The name of the index\n    \"synced\" : true|false,      (boolean) Whether the index is synced or not\n    \"best_block_height\" : n     (numeric) The block height to which the index is synced\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getindexinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> bitcoin-cli getindexinfo txindex\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": [txindex]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 fn missing_params(what: &str) -> (Value, Option<(i64, String)>) {
@@ -608,6 +610,100 @@ fn service_names(services: u64) -> Vec<String> {
 /// Whether `hash` sits on the active (connected, fully validated) chain.
 fn on_active_chain(cs: &Chainstate, hash: &BlockHash, height: u32) -> bool {
     cs.chain().get(height as usize) == Some(hash)
+}
+
+// Core's getdeploymentinfo — rpc/deploymentinfo.cpp.
+fn deploymentinfo_json(cs: &Chainstate, node: &HeaderNode) -> Value {
+    use avila_consensus::bip9::{self, Bip9State};
+    let params = cs.tree().params();
+    let mut deployments = serde_json::Map::new();
+    for (name, height) in [
+        ("bip34", params.bip34_height),
+        ("bip66", params.bip66_height),
+        ("bip65", params.bip65_height),
+        ("csv", params.csv_height),
+        ("segwit", params.segwit_height),
+    ] {
+        // DeploymentActiveAfter: active for the block following
+        // `node`, i.e. node.height + 1 >= deployment height.
+        let active = u64::from(node.height) + 1 >= u64::from(height);
+        deployments.insert(
+            name.to_string(),
+            json!({
+                "type": "buried",
+                "active": active,
+                "height": height,
+            }),
+        );
+    }
+    for dep in params.bip9_deployments.iter() {
+        // Next state = state given `node` as pindexPrev; current state
+        // is computed at node's own parent (both are period-aligned).
+        // Genesis has no parent: pindexPrev = nullptr → DEFINED.
+        let parent = (node.height > 0).then_some(&node.header.prev_block_hash);
+        let next = bip9::state(cs.tree(), Some(&node.hash()), dep, params);
+        let cur = bip9::state(cs.tree(), parent, dep, params);
+        let signalling = matches!(cur, Bip9State::Started | Bip9State::LockedIn);
+        let mut bip = serde_json::Map::new();
+        if signalling {
+            bip.insert("bit".into(), json!(dep.bit));
+        }
+        bip.insert("start_time".into(), json!(dep.start_time));
+        bip.insert("timeout".into(), json!(dep.timeout));
+        bip.insert(
+            "min_activation_height".into(),
+            json!(dep.min_activation_height),
+        );
+        bip.insert("status".into(), json!(cur.name()));
+        bip.insert(
+            "since".into(),
+            json!(bip9::state_since(cs.tree(), parent, dep, params)),
+        );
+        bip.insert("status_next".into(), json!(next.name()));
+        if signalling {
+            // GetStateStatisticsFor evaluates the window containing the
+            // *current* block — Core passes the blockindex itself.
+            let stats = bip9::stats(cs.tree(), &node.hash(), dep, params);
+            bip.insert(
+                "statistics".into(),
+                json!({
+                    "period": stats.period,
+                    "period_start": stats.period_start,
+                    "elapsed": stats.elapsed,
+                    "count": stats.count,
+                    "threshold": stats.threshold,
+                    "possible": stats.possible,
+                }),
+            );
+            let s: String = stats
+                .signalling
+                .iter()
+                .map(|&b| if b { '#' } else { '-' })
+                .collect();
+            bip.insert("signalling".into(), json!(s));
+        }
+        let mut d = serde_json::Map::new();
+        d.insert("type".into(), json!("bip9"));
+        if next == Bip9State::Active {
+            d.insert(
+                "height".into(),
+                json!(bip9::state_since(
+                    cs.tree(),
+                    Some(&node.hash()),
+                    dep,
+                    params
+                )),
+            );
+        }
+        d.insert("active".into(), json!(next == Bip9State::Active));
+        d.insert("bip9".into(), Value::Object(bip));
+        deployments.insert(dep.name.to_string(), Value::Object(d));
+    }
+    json!({
+        "hash": node.hash().to_string(),
+        "height": node.height,
+        "deployments": deployments,
+    })
 }
 
 /// The Core-shaped header object shared by `getblockheader`/`getblock`.
@@ -1217,6 +1313,55 @@ fn dispatch(
                 "warnings": [],
             }))
         }),
+        "getdeploymentinfo" => {
+            // RPCHelpMan: 0–1 args.
+            if params.as_array().is_some_and(|a| a.len() > 1) {
+                return help_error(GETDEPLOYMENTINFO_HELP);
+            }
+            let sel = param(params, 0, "blockhash").cloned();
+            chain_query(queries, move |cs, _| {
+                let node = match sel {
+                    None | Some(Value::Null) => {
+                        let tip = cs.tip_hash();
+                        cs.tree().get(&tip)
+                    }
+                    Some(Value::String(s)) => {
+                        // ParseHashV wording, as in getblockstats.
+                        if s.len() != 64 {
+                            return Err((
+                                RPC_INVALID_PARAMETER,
+                                format!(
+                                    "blockhash must be of length 64 (not {}, for '{s}')",
+                                    s.len()
+                                ),
+                            ));
+                        }
+                        match s.parse::<BlockHash>() {
+                            Ok(hash) => Some(cs.tree().get(&hash).ok_or((
+                                RPC_INVALID_ADDRESS_OR_KEY,
+                                "Block not found".to_string(),
+                            ))?),
+                            Err(_) => {
+                                return Err((
+                                    RPC_INVALID_PARAMETER,
+                                    format!("blockhash must be hexadecimal string (not '{s}')"),
+                                ));
+                            }
+                        }
+                    }
+                    Some(v) => {
+                        return Err((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(1, "blockhash", &v, "string"),
+                        ));
+                    }
+                };
+                let Some(node) = node else {
+                    return Err((RPC_MISC_ERROR, "tip not indexed".into()));
+                };
+                Ok(deploymentinfo_json(cs, node))
+            })
+        }
         // Core's validateaddress — address decode reporting. Without a
         // wallet the wallet-derived fields (ismine, iswatchonly, …)
         // are absent, matching Core run wallet-free.
@@ -2541,13 +2686,27 @@ fn dispatch(
             if flags.contains(avila_consensus::script::ScriptFlags::TAPROOT) {
                 rules.push("taproot");
             }
+            // `vbavailable` advertises BIP9 deployments in
+            // started/locked_in at the tip — keyed by name, valued by
+            // the version bit number (Core's getblocktemplate).
+            let params = cs.tree().params();
+            let tip_node = cs.tree().tip();
+            let mut vbavailable = serde_json::Map::new();
+            for dep in params.bip9_deployments.iter() {
+                let st =
+                    avila_consensus::bip9::state(cs.tree(), Some(&tip_node.hash()), dep, params);
+                use avila_consensus::bip9::Bip9State;
+                if matches!(st, Bip9State::Started | Bip9State::LockedIn) {
+                    vbavailable.insert(dep.name.to_string(), json!(dep.bit));
+                }
+            }
             let mut out = json!({
                 // Core's modern capability set — `proposal` is the only
                 // extension bitcoind 25+ advertises.
                 "capabilities": ["proposal"],
                 "version": block.header.version,
                 "rules": rules,
-                "vbavailable": {},
+                "vbavailable": vbavailable,
                 "vbrequired": 0,
                 "previousblockhash": tip.to_string(),
                 "transactions": txs,
@@ -3072,6 +3231,7 @@ fn dispatch(
                  \x20   getdifficulty,\n\
                  \x20   getblockhash <height>, getblockheader <hash> [verbose],\n\
                  \x20   getblock <hash> [verbosity 0-2], getblockstats <hash|height> [stats],\n\
+                 \x20   getdeploymentinfo [blockhash],\n\
                  \x20   getrawtransaction <txid> [verbosity] [blockhash],\n\
                  \x20   decoderawtransaction <hex> [iswitness], getindexinfo [index_name],\n\
                  \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>,\n\
@@ -3647,6 +3807,71 @@ mod tests {
             e.unwrap().1,
             "hash_or_height must be of length 64 (not 8, for 'deadbeef')"
         );
+    }
+
+    /// `getdeploymentinfo` — genesis-tip chainstate: regtest buries at
+    /// h1 are already active (the flag describes the block *following*
+    /// the queried one), always-active taproot reports active, and
+    /// testdummy (start_time 0) is `defined` before its first window.
+    #[test]
+    fn getdeploymentinfo_reports_genesis_tip() {
+        let cs = Chainstate::new(&Network::Regtest.params());
+        let queries = query_server(cs);
+        let snap = snap();
+        let (r, e) = dispatch("getdeploymentinfo", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none());
+        assert_eq!(r["height"], json!(0));
+        let d = &r["deployments"];
+        assert_eq!(
+            d["bip34"],
+            json!({"type":"buried","active":true,"height":1})
+        );
+        assert_eq!(
+            d["segwit"],
+            json!({"type":"buried","active":true,"height":0})
+        );
+        assert_eq!(d["taproot"]["type"], json!("bip9"));
+        assert_eq!(d["taproot"]["active"], json!(true));
+        assert_eq!(d["taproot"]["height"], json!(0));
+        assert_eq!(d["taproot"]["bip9"]["status"], json!("active"));
+        assert_eq!(d["testdummy"]["bip9"]["status"], json!("defined"));
+        assert_eq!(d["testdummy"]["active"], json!(false));
+        assert!(d["testdummy"].get("height").is_none());
+
+        // A 64-hex unknown hash is Core's -5; malformed strings -8.
+        let (_, e) = dispatch(
+            "getdeploymentinfo",
+            &json!(["ab".repeat(32)]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into())
+        );
+        let (_, e) = dispatch(
+            "getdeploymentinfo",
+            &json!(["deadbeef"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap().1,
+            "blockhash must be of length 64 (not 8, for 'deadbeef')"
+        );
+        // Too many args → -1 + full help.
+        let (_, e) = dispatch(
+            "getdeploymentinfo",
+            &json!(["ab".repeat(32), 1]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_MISC_ERROR);
+        assert!(msg.starts_with("getdeploymentinfo ( \"blockhash\" )"));
     }
 
     /// `submitblock` — the mining loop end to end: a template-built

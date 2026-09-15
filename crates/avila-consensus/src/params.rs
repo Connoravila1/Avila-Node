@@ -77,6 +77,23 @@ impl Network {
                 // uint256S("000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8")
                 bip34_hash: Some(BlockHash::from_bytes(MAINNET_BIP34_HASH)),
                 script_flag_exceptions: &MAINNET_SCRIPT_FLAG_EXCEPTIONS,
+                rule_change_activation_threshold: 1815,
+                bip9_deployments: [
+                    Bip9Deployment {
+                        name: "testdummy",
+                        bit: 28,
+                        start_time: BIP9_NEVER_ACTIVE,
+                        timeout: BIP9_NO_TIMEOUT,
+                        min_activation_height: 0,
+                    },
+                    Bip9Deployment {
+                        name: "taproot",
+                        bit: 2,
+                        start_time: 1_619_222_400,
+                        timeout: 1_628_640_000,
+                        min_activation_height: 709_632,
+                    },
+                ],
                 genesis_header: MAINNET_GENESIS,
             },
             Network::Testnet4 => Params {
@@ -113,6 +130,23 @@ impl Network {
                 subsidy_halving_interval: 210_000,
                 bip34_hash: None,
                 script_flag_exceptions: &[],
+                rule_change_activation_threshold: 1512,
+                bip9_deployments: [
+                    Bip9Deployment {
+                        name: "testdummy",
+                        bit: 28,
+                        start_time: BIP9_NEVER_ACTIVE,
+                        timeout: BIP9_NO_TIMEOUT,
+                        min_activation_height: 0,
+                    },
+                    Bip9Deployment {
+                        name: "taproot",
+                        bit: 2,
+                        start_time: BIP9_ALWAYS_ACTIVE,
+                        timeout: BIP9_NO_TIMEOUT,
+                        min_activation_height: 0,
+                    },
+                ],
                 genesis_header: TESTNET4_GENESIS,
             },
             Network::Signet => Params {
@@ -149,6 +183,23 @@ impl Network {
                 subsidy_halving_interval: 210_000,
                 bip34_hash: None,
                 script_flag_exceptions: &[],
+                rule_change_activation_threshold: 1815,
+                bip9_deployments: [
+                    Bip9Deployment {
+                        name: "testdummy",
+                        bit: 28,
+                        start_time: BIP9_NEVER_ACTIVE,
+                        timeout: BIP9_NO_TIMEOUT,
+                        min_activation_height: 0,
+                    },
+                    Bip9Deployment {
+                        name: "taproot",
+                        bit: 2,
+                        start_time: BIP9_ALWAYS_ACTIVE,
+                        timeout: BIP9_NO_TIMEOUT,
+                        min_activation_height: 0,
+                    },
+                ],
                 genesis_header: SIGNET_GENESIS,
             },
             Network::Regtest => Params {
@@ -186,11 +237,55 @@ impl Network {
                 subsidy_halving_interval: 150,
                 bip34_hash: None,
                 script_flag_exceptions: &[],
+                rule_change_activation_threshold: 108,
+                bip9_deployments: [
+                    Bip9Deployment {
+                        name: "testdummy",
+                        bit: 28,
+                        start_time: 0,
+                        timeout: BIP9_NO_TIMEOUT,
+                        min_activation_height: 0,
+                    },
+                    Bip9Deployment {
+                        name: "taproot",
+                        bit: 2,
+                        start_time: BIP9_ALWAYS_ACTIVE,
+                        timeout: BIP9_NO_TIMEOUT,
+                        min_activation_height: 0,
+                    },
+                ],
                 genesis_header: REGTEST_GENESIS,
             },
         }
     }
 }
+
+/// One `consensus.vDeployments` entry — a BIP9 versionbits deployment
+/// position. Core ships two: `testdummy` (bit 28) and `taproot` (bit 2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Bip9Deployment {
+    /// `VersionBitsDeploymentInfo[].name` — the `deployments` key in
+    /// `getdeploymentinfo`.
+    pub name: &'static str,
+    /// `vDeployments[].bit`.
+    pub bit: i32,
+    /// `vDeployments[].nStartTime`: `-1` = `ALWAYS_ACTIVE`,
+    /// `-2` = `NEVER_ACTIVE`.
+    pub start_time: i64,
+    /// `vDeployments[].nTimeout`; `i64::MAX` = `NO_TIMEOUT`.
+    pub timeout: i64,
+    /// `vDeployments[].min_activation_height`.
+    pub min_activation_height: u32,
+}
+
+/// `Consensus::BIP9Deployment::ALWAYS_ACTIVE` — the `nStartTime` sentinel
+/// for deployments active from genesis.
+pub const BIP9_ALWAYS_ACTIVE: i64 = -1;
+/// `Consensus::BIP9Deployment::NEVER_ACTIVE` — the `nStartTime` sentinel
+/// for deployments that can never activate.
+pub const BIP9_NEVER_ACTIVE: i64 = -2;
+/// `Consensus::BIP9Deployment::NO_TIMEOUT` — the `nTimeout` sentinel.
+pub const BIP9_NO_TIMEOUT: i64 = i64::MAX;
 
 /// Consensus parameters for one network (the header-relevant slice of Core's
 /// `Consensus::Params`).
@@ -323,6 +418,15 @@ pub struct Params {
     /// [`crate::script::block_script_flags`]; the stored values are raw
     /// `script/interpreter.h` flag bits.
     pub script_flag_exceptions: &'static [(BlockHash, u32)],
+    /// `consensus.nRuleChangeActivationThreshold` — the BIP9 signalling
+    /// threshold (1815 mainnet/signet, 1512 testchains, 108 regtest).
+    /// The BIP9 period is [`Self::difficulty_adjustment_interval`]
+    /// (`nMinerConfirmationWindow = nPowTargetTimespan/nPowTargetSpacing`
+    /// on every built-in network).
+    pub rule_change_activation_threshold: u32,
+    /// `consensus.vDeployments` — the BIP9 positions Core ships, in
+    /// `DeploymentInfo` order: `testdummy` then `taproot`.
+    pub bip9_deployments: [Bip9Deployment; 2],
     /// The network's genesis block header: the anchor every [`crate::chain::HeaderTree`]
     /// is seeded with.
     pub genesis_header: BlockHeader,

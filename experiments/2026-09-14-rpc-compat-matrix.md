@@ -29,7 +29,7 @@ drift: any `DIFFERS` verdict on a shared field is a compatibility bug.
 
 ## Workload and method
 
-`tools/compare_rpc.py` calls 31 methods with identical parameters on
+`tools/compare_rpc.py` calls 35 methods with identical parameters on
 both endpoints (block hash, coinbase txid, raw block hex, and raw tx
 hex resolved live at the shared height), flattens each response to
 field paths, and reports
@@ -241,6 +241,24 @@ surfaced:
   on both daemons, while `2002::1` (6to4 linked-v4) stores and reports
   `network:"ipv4"`. Onion/I2P inputs return `{"success":false}` — our
   16-byte `NetAddr` can't represent them.
+- `getdeploymentinfo` implements Core's `versionbits.cpp`
+  state machine (`crates/avila-consensus/src/bip9.rs`): state is
+  evaluated against `pindexPrev` aligned to the last block of its
+  completed confirmation period, transitions replay one window at a
+  time, DEFINED checks the timeout *before* the start time, STARTED
+  checks timeout *before* counting (a window that reaches threshold
+  on the deadline still fails), and LOCKED_IN→ACTIVE waits for
+  `min_activation_height`. Per-network `Params` carry Core's
+  `vDeployments` table — mainnet taproot (bit 2, start 1619222400,
+  timeout 1628640000, min-activation 709632), regtest testdummy
+  (bit 28, start 0, NO_TIMEOUT, threshold 108/144), and the
+  ALWAYS_ACTIVE/NEVER_ACTIVE sentinels. Live-verified past the first
+  regtest window: `status:"started"`, `since:144`, `statistics`
+  `{period:144, period_start:144, elapsed:6, count:6, threshold:108,
+  possible:true}`, `signalling:"######"` — byte-identical to Knots.
+  The same machine drives `getblocktemplate`'s `vbavailable` and
+  `ComputeBlockVersion` (template version `0x30000000` once testdummy
+  is started, matching Knots).
 
 ### Known semantic differences
 

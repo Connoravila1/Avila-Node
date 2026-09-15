@@ -5,6 +5,7 @@
 
 pub mod address;
 pub mod arith;
+pub mod bip9;
 pub mod block;
 pub mod chain;
 pub mod chainstate;

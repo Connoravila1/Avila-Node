@@ -33,7 +33,9 @@ import urllib.error
 # `savemempool` reports each daemon's own datadir path — presence is
 # checked, the path value itself is per-installation.
 DYNAMIC_METHODS = {"uptime", "help", "getrawmempool", "savemempool",
-                   "getnodeaddresses", "addpeeraddress"}
+                   "getnodeaddresses", "addpeeraddress",
+                   # Bare tip-hash echo — forks legitimately diverge it.
+                   "getbestblockhash"}
 
 # Keys whose values are legitimately node- or time-specific. They are
 # still compared (structural presence is checked) but a value
@@ -73,6 +75,10 @@ DYNAMIC_KEYS = {
     # getnettotals — cumulative wire bytes and wall-clock millis are
     # per-node counters.
     "totalbytesrecv", "totalbytessent", "timemillis",
+    # Tip-dependent — equal-work regtest forks mean each daemon can sit
+    # on a different (valid) tip; the reported hashes diverge without
+    # either node being wrong.
+    "bestblockhash", "bestblock", "previousblockhash",
 }
 
 # Method -> params factory. `h` is a recent height valid on both nodes;
@@ -100,6 +106,15 @@ def build_calls(height):
         ("getblockstats", ["HASH", ["avgfee", "txs", "utxo_increase"]]),
         ("getblockstats", [999999]),
         ("getblockstats", ["deadbeef"]),
+        # getdeploymentinfo: tip, explicit hash, null (tip), and the
+        # ParseHashV / unknown / wrong-type / arg-count error paths.
+        ("getdeploymentinfo", []),
+        ("getdeploymentinfo", ["HASH"]),
+        ("getdeploymentinfo", [None]),
+        ("getdeploymentinfo", ["deadbeef"]),
+        ("getdeploymentinfo", ["0" * 64]),
+        ("getdeploymentinfo", [1234]),
+        ("getdeploymentinfo", ["HASH", 1]),
         ("getrawtransaction", ["TXID", 1]),
         ("gettxout", ["TXID", 0]),
         # decoderawtransaction: the shared-height coinbase hex plus

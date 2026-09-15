@@ -188,7 +188,14 @@ operation. Compare complete initial download and catch-up, not only local replay
       wire bytes across live and closed sessions),
       getnodeaddresses/addpeeraddress (Core's addrman surface —
       entries keyed by (ip,port), unroutable addresses rejected
-      like AddSingle, services union on re-gossip)) — verified
+      like AddSingle, services union on re-gossip)),
+      getdeploymentinfo (Core's BIP9 versionbits state machine —
+      period-aligned DEFINED/STARTED/LOCKED_IN/ACTIVE/FAILED
+      transitions, timeout-before-count ordering,
+      min_activation_height gating, StateSinceHeight, and the
+      started/locked_in statistics+signalling block — plus
+      getblocktemplate's vbavailable/version-bit advertisement
+      via ComputeBlockVersion)) — verified
       live over curl and the client.
       Genesis is served even though its body is never stored:
       `Params::genesis_block` reconstructs Core's per-network
