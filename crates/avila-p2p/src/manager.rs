@@ -1119,7 +1119,10 @@ impl<S: Read + Write> PeerManager<S> {
 
     /// `listbanned`'s rows in Core's `CSubNet` sort order; expired
     /// entries are swept first (`GetBanned`'s view).
-    pub fn banned_list(&mut self, now: i64) -> Vec<(crate::banman::SubNet, crate::banman::BanEntry)> {
+    pub fn banned_list(
+        &mut self,
+        now: i64,
+    ) -> Vec<(crate::banman::SubNet, crate::banman::BanEntry)> {
         self.bans.sweep(now);
         self.bans.entries().map(|(n, e)| (*n, *e)).collect()
     }

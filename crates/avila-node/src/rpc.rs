@@ -3767,13 +3767,19 @@ fn dispatch(
             if let Some(v) = arr.get(1).filter(|v| !v.is_string()) {
                 return (
                     Value::Null,
-                    Some((RPC_TYPE_ERROR, wrong_type_message(2, "command", v, "string"))),
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_message(2, "command", v, "string"),
+                    )),
                 );
             }
             if let Some(v) = arr.get(2).filter(|v| !v.is_number()) {
                 return (
                     Value::Null,
-                    Some((RPC_TYPE_ERROR, wrong_type_message(3, "bantime", v, "number"))),
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_message(3, "bantime", v, "number"),
+                    )),
                 );
             }
             if let Some(v) = arr.get(3).filter(|v| !v.is_boolean()) {

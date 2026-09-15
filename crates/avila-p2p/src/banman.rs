@@ -67,10 +67,7 @@ impl SubNet {
                 return None;
             }
             let network = mask_network(&v6.octets(), plen);
-            return Some(Self {
-                network,
-                plen,
-            });
+            return Some(Self { network, plen });
         }
         None
     }
