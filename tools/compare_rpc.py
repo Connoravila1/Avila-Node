@@ -57,6 +57,19 @@ K2 = "02cbef9c21d191602794a1f7cf07ade94ba8d435ae017e1fa841ba6a20ae5208bc"
 UC = ("04989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f"
       "631f4d05b3ae518776ee08755a7703e64b2ebc32547504de0b55a142d4ecdf80")
 
+# Message-signing fixtures — WIFs and regtest P2PKH addresses for
+# secret key 0x07…07 in both pubkey forms, plus Core's own signatures
+# over "hi". Deterministic (RFC6979) so both daemons return identical
+# base64.
+WIF_C = "cMpMxK92W1DjqDvWV3pMn4xLwAuQJhNF3MFqkEHUQRPQofUJku8R"
+WIF_U = "91e1fpA4xxnUq5jwFxvKkk37nMNPVw1HKf7zGES2gHrV3uSs7pU"
+ADDR_C = "mvSvTtvD9H9fkgi8MGDyLALgRaR2LhnWFM"
+ADDR_U = "mtag3YhK77meX1xqYrvdRhFPZdgNmt9Bdu"
+SIG_C = ("IC93+OZbt0MJurMvm3NHxjW3mBdHGcrY6IlCuw2LiX9kerUXaMAMXxlM4vv6mBtD/"
+         "G81gwpyitAQp53tC0GMXx8=")
+SIG_U = ("HC93+OZbt0MJurMvm3NHxjW3mBdHGcrY6IlCuw2LiX9kerUXaMAMXxlM4vv6mBtD/"
+         "G81gwpyitAQp53tC0GMXx8=")
+
 # Keys whose values are legitimately node- or time-specific. They are
 # still compared (structural presence is checked) but a value
 # difference is reported as expected rather than a failure.
@@ -424,6 +437,27 @@ def build_calls(height):
         ("createmultisig", [2, [K1, K2], "bogus"]),
         ("createmultisig", [2, [K1, UC], "bech32"]),
         ("createmultisig", [2, [K1, UC], "legacy"]),
+        # signmessagewithprivkey / verifymessage — compact-sig
+        # recovery. RFC6979 makes signatures deterministic, so the
+        # base64 outputs compare byte-for-byte.
+        ("signmessagewithprivkey", []),
+        ("signmessagewithprivkey", [WIF_C]),
+        ("signmessagewithprivkey", [WIF_C, "m", "x"]),
+        ("signmessagewithprivkey", [1, 2]),
+        ("signmessagewithprivkey", ["bogus", "hi"]),
+        ("signmessagewithprivkey", [WIF_C, "hi"]),
+        ("signmessagewithprivkey", [WIF_U, "hi"]),
+        ("verifymessage", []),
+        ("verifymessage", [ADDR_C, SIG_C]),
+        ("verifymessage", [1, 2, 3]),
+        ("verifymessage", ["bogus", SIG_C, "hi"]),
+        ("verifymessage", ["2N5mNBUAv6pMgxsoNcLf1y4TyoFYm4Mqu3Q", SIG_C, "hi"]),
+        ("verifymessage", [ADDR_C, "!!!", "hi"]),
+        ("verifymessage", [ADDR_C, "AAAA", "hi"]),
+        ("verifymessage", [ADDR_C, SIG_C, "bye"]),
+        ("verifymessage", [ADDR_U, SIG_C, "hi"]),
+        ("verifymessage", [ADDR_C, SIG_C, "hi"]),
+        ("verifymessage", [ADDR_U, SIG_U, "hi"]),
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),
         ("estimatesmartfee", [6]),

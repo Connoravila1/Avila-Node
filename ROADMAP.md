@@ -277,7 +277,11 @@ operation. Compare complete initial download and catch-up, not only local replay
       type resolves, bounds check in order (required ≥ 1, enough keys,
       ≤ 20 keys, ≤ 520-byte redeemScript), uncompressed keys drop
       segwit types to legacy with Core's warning string, and the
-      descriptor carries the BIP380 checksum). RPC
+      descriptor carries the BIP380 checksum),
+      verifymessage/signmessagewithprivkey (compact-sig recovery on
+      libsecp256k1's `recovery` feature — WIF decode, the `27+recid(+4)`
+      header, strict `DecodeBase64`, and RFC6979 deterministic
+      signatures that match Core's output byte-for-byte). RPC
       doubles emit Core's `UniValue::setFloat` text (`%.16g` via `g16`)
       rather than ryu's shortest repr — the two parse to different
       f64s on values like 101/17, and `txrate` now matches

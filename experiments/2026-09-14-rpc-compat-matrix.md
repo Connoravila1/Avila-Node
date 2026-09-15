@@ -72,11 +72,11 @@ python3 tools/compare_rpc.py \
 
 ## Results
 
-Latest run vs **Core 29.4** at h163: 110 MATCH, 1 EXPECTED-DIFF
+Latest run vs **Core 29.4** at h163: 117 MATCH, 1 EXPECTED-DIFF
 (`getrawtransaction`'s `in_active_chain` — an upstream field added
 after 29.4, verified present in Core 31.1), 0 DIFFERS, 1 CORE-ERROR
 (`gettxoutproof prove_witness` — the witness-proof wire format is a
-Knots extension Core doesn't implement), 157 BOTH-ERROR (identical
+Knots extension Core doesn't implement), 168 BOTH-ERROR (identical
 error paths). `getpeerinfo` now matches fully once the peer pair
 settles — the earlier per-peer shape diff was connection-phase
 state. First matrix vs Knots: 46 MATCH, 2 EXPECTED-DIFF,
@@ -512,6 +512,17 @@ surfaced:
   (`sh`/`sh(wsh(…))`/`wsh(…)` over `multi(n,k…)`) carries the BIP380
   checksum. Verified live: 30 cases byte-identical including every
   address type, both fallback paths, and the full error ordering.
+- `verifymessage`/`signmessagewithprivkey` port Core's
+  `common/signmessage.cpp` on secp256k1's `recovery` feature: WIF
+  `DecodeSecret` (version byte + 32B payload + optional `0x01`
+  compression flag), the `27+recid(+4)` compact header, strict
+  `DecodeBase64` (no whitespace, tail-only `=` padding), and the
+  `MessageVerify` chain — bad address `-5`, non-P2PKH `-3 "Address
+  does not refer to key"`, malformed b64 `-3`, everything else `false`.
+  RFC6979 makes signatures deterministic, so
+  `signmessagewithprivkey` output matches Core byte-for-byte
+  (compressed `I…` and uncompressed `H…` headers included). Verified
+  live: 29 cases byte-identical.
 
 ### Known semantic differences
 

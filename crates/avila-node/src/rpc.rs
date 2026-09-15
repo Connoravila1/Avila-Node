@@ -154,6 +154,52 @@ pub fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+/// Core's strict `DecodeBase64` — alphabet bytes and `=` padding only
+/// at the tail, no whitespace, length a multiple of 4. `None` on any
+/// violation, which `verifymessage` maps to "Malformed base64
+/// encoding".
+fn base64_decode_strict(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(4) {
+        return None;
+    }
+    fn digit(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a' + 26)),
+            b'0'..=b'9' => Some(u32::from(c - b'0' + 52)),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    for (i, chunk) in text.as_bytes().chunks(4).enumerate() {
+        let last = (i + 1) * 4 == text.len();
+        let data_len = chunk.iter().take_while(|&&c| c != b'=').count();
+        // `=` may only pad the final chunk, at most twice, and only at
+        // the tail of the chunk itself.
+        if !chunk[data_len..].iter().all(|&c| c == b'=') {
+            return None;
+        }
+        let pad = 4 - data_len;
+        if pad > 0 && (!last || pad > 2) {
+            return None;
+        }
+        let (d0, d1) = (digit(chunk[0])?, digit(chunk[1])?);
+        let d2 = if pad >= 2 { 0 } else { digit(chunk[2])? };
+        let d3 = if pad >= 1 { 0 } else { digit(chunk[3])? };
+        let n = (d0 << 18) | (d1 << 12) | (d2 << 6) | d3;
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
 /// The `Authorization` header value Core-compatible clients send for a
 /// cookie token: `Basic base64("__cookie__:<token>")`.
 #[must_use]
@@ -1019,6 +1065,10 @@ const PRIORITISETRANSACTION_HELP: &str = "prioritisetransaction \"txid\" ( dummy
 
 /// Verbatim `help getprioritisedtransactions` text (Bitcoin Core 29).
 const CREATEMULTISIG_HELP: &str = "createmultisig nrequired [\"key\",...] ( \"address_type\" )\n\nCreates a multi-signature address with n signature of m keys required.\nIt returns a json object with the address and redeemScript.\n\nArguments:\n1. nrequired       (numeric, required) The number of required signatures out of the n keys.\n2. keys            (json array, required) The hex-encoded public keys.\n     [\n       \"key\",      (string) The hex-encoded public key\n       ...\n     ]\n3. address_type    (string, optional, default=\"legacy\") The address type to use. Options are \"legacy\", \"p2sh-segwit\", and \"bech32\".\n\nResult:\n{                            (json object)\n  \"address\" : \"str\",         (string) The value of the new multisig address.\n  \"redeemScript\" : \"hex\",    (string) The string value of the hex-encoded redemption script.\n  \"descriptor\" : \"str\",      (string) The descriptor for this multisig\n  \"warnings\" : [             (json array, optional) Any warnings resulting from the creation of this multisig\n    \"str\",                   (string)\n    ...\n  ]\n}\n\nExamples:\n\nCreate a multisig address from 2 public keys\n> bitcoin-cli createmultisig 2 \"[\\\"03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd\\\",\\\"03dbc6764b8884a92e871274b87583e6d5c2a58819473e17e107ef3f6aa5a61626\\\"]\"\n\nAs a JSON-RPC call\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"createmultisig\", \"params\": [2, [\"03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd\",\"03dbc6764b8884a92e871274b87583e6d5c2a58819473e17e107ef3f6aa5a61626\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+const VERIFYMESSAGE_HELP: &str = "verifymessage \"address\" \"signature\" \"message\"\n\nVerify a signed message.\n\nArguments:\n1. address      (string, required) The bitcoin address to use for the signature.\n2. signature    (string, required) The signature provided by the signer in base 64 encoding (see signmessage).\n3. message      (string, required) The message that was signed.\n\nResult:\ntrue|false    (boolean) If the signature is verified or not.\n\nExamples:\n\nUnlock the wallet for 30 seconds\n> bitcoin-cli walletpassphrase \"mypassphrase\" 30\n\nCreate the signature\n> bitcoin-cli signmessage \"1D1ZrZNe3JUo7ZycKEYQQiQAWd9y54F4XX\" \"my message\"\n\nVerify the signature\n> bitcoin-cli verifymessage \"1D1ZrZNe3JUo7ZycKEYQQiQAWd9y54F4XX\" \"signature\" \"my message\"\n\nAs a JSON-RPC call\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"verifymessage\", \"params\": [\"1D1ZrZNe3JUo7ZycKEYQQiQAWd9y54F4XX\", \"signature\", \"my message\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+const SIGNMESSAGEWITHPRIVKEY_HELP: &str = "signmessagewithprivkey \"privkey\" \"message\"\n\nSign a message with the private key of an address\n\nArguments:\n1. privkey    (string, required) The private key to sign the message with.\n2. message    (string, required) The message to create a signature of.\n\nResult:\n\"str\"    (string) The signature of the message encoded in base 64\n\nExamples:\n\nCreate the signature\n> bitcoin-cli signmessagewithprivkey \"privkey\" \"my message\"\n\nVerify the signature\n> bitcoin-cli verifymessage \"1D1ZrZNe3JUo7ZycKEYQQiQAWd9y54F4XX\" \"signature\" \"my message\"\n\nAs a JSON-RPC call\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"signmessagewithprivkey\", \"params\": [\"privkey\", \"my message\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 const GETPRIORITISEDTRANSACTIONS_HELP: &str = "getprioritisedtransactions\n\nReturns a map of all user-created (see prioritisetransaction) fee deltas by txid, and whether the tx is present in mempool.\n\nResult:\n{                                 (json object) prioritisation keyed by txid\n  \"<transactionid>\" : {           (json object)\n    \"fee_delta\" : n,              (numeric) transaction fee delta in satoshis\n    \"in_mempool\" : true|false,    (boolean) whether this transaction is currently in mempool\n    \"modified_fee\" : n            (numeric, optional) modified fee in satoshis. Only returned if in_mempool=true\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getprioritisedtransactions \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getprioritisedtransactions\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -2076,6 +2126,90 @@ fn dispatch(
                         "error": error,
                     })),
                 }
+            })
+        }
+        // Core's verifymessage (rpc/signmessage.cpp) — compact-sig
+        // recovery against a P2PKH destination. The check chain:
+        // decode → PKHash? → strict base64 → recover+compare, with
+        // every signature-level failure collapsing to `false`.
+        "verifymessage" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() != 3 {
+                return help_error(VERIFYMESSAGE_HELP);
+            }
+            let names = ["address", "signature", "message"];
+            let mut type_errors: Vec<(usize, &str, &Value, &str)> = Vec::new();
+            for (i, name) in names.iter().enumerate() {
+                if !arr[i].is_string() {
+                    type_errors.push((i + 1, name, &arr[i], "string"));
+                }
+            }
+            if !type_errors.is_empty() {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_list(&type_errors))),
+                );
+            }
+            let (addr, sig, msg) = (
+                arr[0].as_str().unwrap_or_default().to_owned(),
+                arr[1].as_str().unwrap_or_default().to_owned(),
+                arr[2].as_str().unwrap_or_default().to_owned(),
+            );
+            chain_query(queries, move |cs, _| {
+                let params = cs.tree().params();
+                let Some(script) = avila_consensus::address::address_to_script(&addr, params)
+                else {
+                    return Err((RPC_INVALID_ADDRESS_OR_KEY, "Invalid address".into()));
+                };
+                let avila_consensus::script::ScriptType::PubKeyHash(pk_hash) = script.classify()
+                else {
+                    return Err((RPC_TYPE_ERROR, "Address does not refer to key".into()));
+                };
+                let Some(sig_bytes) = base64_decode_strict(&sig) else {
+                    return Err((RPC_TYPE_ERROR, "Malformed base64 encoding".into()));
+                };
+                Ok(json!(avila_consensus::message::verify_message(
+                    &pk_hash, &sig_bytes, &msg
+                )))
+            })
+        }
+        // Core's signmessagewithprivkey — DecodeSecret then the
+        // compact-sig MessageSign; the header byte records the WIF's
+        // compressed flag so the verifier recovers the right address.
+        "signmessagewithprivkey" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() != 2 {
+                return help_error(SIGNMESSAGEWITHPRIVKEY_HELP);
+            }
+            let mut type_errors: Vec<(usize, &str, &Value, &str)> = Vec::new();
+            if !arr[0].is_string() {
+                type_errors.push((1, "privkey", &arr[0], "string"));
+            }
+            if !arr[1].is_string() {
+                type_errors.push((2, "message", &arr[1], "string"));
+            }
+            if !type_errors.is_empty() {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_list(&type_errors))),
+                );
+            }
+            let (wif, msg) = (
+                arr[0].as_str().unwrap_or_default().to_owned(),
+                arr[1].as_str().unwrap_or_default().to_owned(),
+            );
+            chain_query(queries, move |cs, _| {
+                let Some((key, compressed)) = avila_consensus::message::decode_secret(
+                    &wif,
+                    cs.tree().params().base58_secret_prefix,
+                ) else {
+                    return Err((RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key".into()));
+                };
+                let Some(sig) = avila_consensus::message::sign_message(&key, compressed, &msg)
+                else {
+                    return Err((RPC_INVALID_ADDRESS_OR_KEY, "Sign failed".into()));
+                };
+                Ok(json!(base64_encode(&sig)))
             })
         }
         "decodescript" => {
@@ -5802,6 +5936,8 @@ fn dispatch(
                  \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>,\n\
                  \x20   gettxoutproof <txids> [blockhash] [options],\n\
                  \x20   verifytxoutproof <proof> [options], validateaddress <address>,\n\
+                 \x20   verifymessage <address> <sig> <msg>,\n\
+                 \x20   signmessagewithprivkey <wif> <msg>,\n\
                  \x20   verifychain [checklevel] [nblocks],\n\
                  \x20   getchaintxstats [nblocks] [blockhash],\n\
                  \x20   gettxoutsetinfo [hash_type] [hash_or_height] [use_index]\n\
@@ -8447,6 +8583,141 @@ mod tests {
 
         // Empty key list hits the required-count checks, not a crash.
         assert_eq!(d(json!([1, []])).1.unwrap().0, RPC_INVALID_PARAMETER);
+    }
+
+    /// `verifymessage`/`signmessagewithprivkey` — Core's compact-sig
+    /// pair: `verifymessage` walks decode → PKHash → base64 → recover,
+    /// and `signmessagewithprivkey` emits Core's exact base64 for a
+    /// WIF+message.
+    #[test]
+    fn message_signing_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let d = |method: &str, p: Value| dispatch(method, &p, &snap, Some(&queries), None, None);
+        // Secret 0x07…07 — Core 29.4 outputs captured live.
+        let wif_c = "cMpMxK92W1DjqDvWV3pMn4xLwAuQJhNF3MFqkEHUQRPQofUJku8R";
+        let wif_u = "91e1fpA4xxnUq5jwFxvKkk37nMNPVw1HKf7zGES2gHrV3uSs7pU";
+        let addr_c = "mvSvTtvD9H9fkgi8MGDyLALgRaR2LhnWFM"; // compressed pubkey p2pkh
+        let addr_u = "mtag3YhK77meX1xqYrvdRhFPZdgNmt9Bdu"; // uncompressed p2pkh
+        let sig_c = "IC93+OZbt0MJurMvm3NHxjW3mBdHGcrY6IlCuw2LiX9kerUXaMAMXxlM4vv6mBtD/G81gwpyitAQp53tC0GMXx8=";
+        let sig_u = "HC93+OZbt0MJurMvm3NHxjW3mBdHGcrY6IlCuw2LiX9kerUXaMAMXxlM4vv6mBtD/G81gwpyitAQp53tC0GMXx8=";
+
+        // signmessagewithprivkey — arity and collected types.
+        for p in [json!([]), json!([wif_c]), json!([wif_c, "m", "x"])] {
+            let (code, msg) = d("signmessagewithprivkey", p).1.unwrap();
+            assert_eq!(code, RPC_MISC_ERROR);
+            assert!(msg.starts_with("signmessagewithprivkey"), "{msg}");
+        }
+        let (code, msg) = d("signmessagewithprivkey", json!([1, 2])).1.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert!(msg.contains("Position 1 (privkey)"), "{msg}");
+        assert!(msg.contains("Position 2 (message)"), "{msg}");
+        assert_eq!(
+            d("signmessagewithprivkey", json!(["bogus", "hi"]))
+                .1
+                .unwrap(),
+            (
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "Invalid private key".to_string()
+            )
+        );
+        // Byte-identical signatures to Core for both key forms.
+        assert_eq!(
+            d("signmessagewithprivkey", json!([wif_c, "hi"])).0,
+            json!(sig_c)
+        );
+        assert_eq!(
+            d("signmessagewithprivkey", json!([wif_u, "hi"])).0,
+            json!(sig_u)
+        );
+        // Wrong-network WIF is an invalid private key.
+        assert_eq!(
+            d(
+                "signmessagewithprivkey",
+                json!(["KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn", "hi"])
+            )
+            .1
+            .unwrap()
+            .0,
+            RPC_INVALID_ADDRESS_OR_KEY
+        );
+
+        // verifymessage — arity and the 3-position collected list.
+        for p in [
+            json!([]),
+            json!([addr_c]),
+            json!([addr_c, sig_c]),
+            json!([addr_c, sig_c, "m", "x"]),
+        ] {
+            let (code, msg) = d("verifymessage", p).1.unwrap();
+            assert_eq!(code, RPC_MISC_ERROR);
+            assert!(msg.starts_with("verifymessage"), "{msg}");
+        }
+        let (code, msg) = d("verifymessage", json!([1, 2, 3])).1.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        for pos in [
+            "Position 1 (address)",
+            "Position 2 (signature)",
+            "Position 3 (message)",
+        ] {
+            assert!(msg.contains(pos), "{pos}: {msg}");
+        }
+        // Decode order: bad address → -5, non-PKHash → -3, bad b64 →
+        // -3, then verify-only → bool.
+        assert_eq!(
+            d("verifymessage", json!(["bogus", sig_c, "hi"])).1.unwrap(),
+            (RPC_INVALID_ADDRESS_OR_KEY, "Invalid address".to_string())
+        );
+        for addr in [
+            "2N5mNBUAv6pMgxsoNcLf1y4TyoFYm4Mqu3Q",          // p2sh
+            "bcrt1q60mkz939j6a95lw70x0a8hnq4urve6xw8j63jv", // bech32
+        ] {
+            assert_eq!(
+                d("verifymessage", json!([addr, sig_c, "hi"])).1.unwrap(),
+                (RPC_TYPE_ERROR, "Address does not refer to key".to_string())
+            );
+        }
+        assert_eq!(
+            d("verifymessage", json!([addr_c, "!!!", "hi"])).1.unwrap(),
+            (RPC_TYPE_ERROR, "Malformed base64 encoding".to_string())
+        );
+        assert_eq!(
+            d("verifymessage", json!([addr_c, "A A A", "hi"]))
+                .1
+                .unwrap(),
+            (RPC_TYPE_ERROR, "Malformed base64 encoding".to_string())
+        );
+        // Wrong-length-but-valid b64, wrong message, wrong address,
+        // wrong encoding form — all `false`.
+        assert_eq!(
+            d("verifymessage", json!([addr_c, "AAAA", "hi"])).0,
+            json!(false)
+        );
+        assert_eq!(
+            d("verifymessage", json!([addr_c, "", "hi"])).0,
+            json!(false)
+        );
+        assert_eq!(
+            d("verifymessage", json!([addr_c, sig_c, "bye"])).0,
+            json!(false)
+        );
+        assert_eq!(
+            d("verifymessage", json!([addr_u, sig_c, "hi"])).0,
+            json!(false)
+        );
+        assert_eq!(
+            d("verifymessage", json!([addr_c, sig_u, "hi"])).0,
+            json!(false)
+        );
+        // Genuine verifications — each sig against its own address.
+        assert_eq!(
+            d("verifymessage", json!([addr_c, sig_c, "hi"])).0,
+            json!(true)
+        );
+        assert_eq!(
+            d("verifymessage", json!([addr_u, sig_u, "hi"])).0,
+            json!(true)
+        );
     }
 
     /// `getprioritisedtransactions` — the mapDeltas dump: txid-keyed in

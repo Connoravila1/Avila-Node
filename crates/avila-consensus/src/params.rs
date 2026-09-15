@@ -55,6 +55,7 @@ impl Network {
                 default_port: 8333,
                 base58_pubkey_prefix: 0x00,
                 base58_script_prefix: 0x05,
+                base58_secret_prefix: 0x80,
                 bech32_hrp: "bc",
                 dns_seeds: &[
                     "seed.bitcoin.sipa.be",
@@ -115,6 +116,7 @@ impl Network {
                 default_port: 48333,
                 base58_pubkey_prefix: 0x6f,
                 base58_script_prefix: 0xc4,
+                base58_secret_prefix: 0xef,
                 bech32_hrp: "tb",
                 dns_seeds: &[
                     "seed.testnet4.bitcoin.sprovoost.nl",
@@ -169,6 +171,7 @@ impl Network {
                 default_port: 38333,
                 base58_pubkey_prefix: 0x6f,
                 base58_script_prefix: 0xc4,
+                base58_secret_prefix: 0xef,
                 bech32_hrp: "tb",
                 dns_seeds: &[
                     "seed.signet.bitcoin.sprovoost.nl",
@@ -224,6 +227,7 @@ impl Network {
                 default_port: 18444,
                 base58_pubkey_prefix: 0x6f,
                 base58_script_prefix: 0xc4,
+                base58_secret_prefix: 0xef,
                 bech32_hrp: "bcrt",
                 dns_seeds: &[],
                 // Core's regtest defaults bury BIP34/65/66/CSV at height 1 and activate
@@ -362,6 +366,9 @@ pub struct Params {
     /// `base58Prefixes[SCRIPT_ADDRESS]` — the version byte on base58check
     /// pay-to-script-hash addresses (0x05 mainnet, 0xc4 elsewhere).
     pub base58_script_prefix: u8,
+    /// `base58Prefixes[SECRET_KEY]` — the version byte on WIF private
+    /// keys (0x80 mainnet, 0xef elsewhere).
+    pub base58_secret_prefix: u8,
     /// `bech32_hrp` — the human-readable part of segwit addresses
     /// (`bc`, `tb`, `tb`, `bcrt`).
     pub bech32_hrp: &'static str,
