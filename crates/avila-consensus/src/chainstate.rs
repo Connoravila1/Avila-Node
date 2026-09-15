@@ -491,13 +491,23 @@ impl Chainstate {
     }
 
     /// `hash`'s body, from memory or the store. Public for the P2P serving
-    /// path (`getdata` → block bytes).
+    /// path (`getdata` → block bytes). The genesis body is synthesized
+    /// from params when nothing stored it — Core's blk files always
+    /// carry it, and `getblock 0` must not report "not found".
     pub fn body(&self, hash: &BlockHash) -> Option<Block> {
         if let Some(block) = self.blocks.get(hash) {
             return Some(block.clone());
         }
-        let store = self.store.as_ref()?;
-        store.read(store.position(hash)?).ok()
+        if let Some(store) = self.store.as_ref()
+            && let Some(pos) = store.position(hash)
+            && let Ok(block) = store.read(pos)
+        {
+            return Some(block);
+        }
+        if *hash == self.tree.params().genesis_header.hash() {
+            return self.tree.params().genesis_block();
+        }
+        None
     }
 
     /// The snapshot of the current validation state for `state.dat`.
@@ -599,6 +609,19 @@ impl Chainstate {
     #[must_use]
     pub fn block(&self, hash: &BlockHash) -> Option<&Block> {
         self.blocks.get(hash)
+    }
+
+    /// The undo data for the *active-chain* block at `height` — Core's
+    /// `ReadBlockUndo`. `undos[h-1]` reverses `chain[h]`; genesis and
+    /// heights above the connected tip have none, and side-branch
+    /// blocks never get undo entries, matching Core's rev*.dat
+    /// semantics where undo exists only for the active chain.
+    #[must_use]
+    pub fn undo(&self, height: u32) -> Option<&BlockUndo> {
+        if height == 0 {
+            return None;
+        }
+        self.undos.get(height as usize - 1)
     }
 
     /// Indexes a header without a body — Core's `ProcessNewBlockHeaders` →

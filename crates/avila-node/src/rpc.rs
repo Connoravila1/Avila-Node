@@ -421,6 +421,59 @@ fn difficulty(bits: u32) -> f64 {
     difficulty_from_compact(avila_consensus::arith::CompactTarget(bits))
 }
 
+/// The `Value` Core's UniValue emits for a double: `std::setprecision(16)`
+/// on an ostream is C `%.16g` — 16 significant digits, trailing zeros and
+/// the decimal point stripped. Two consequences: a 17-digit round-trip
+/// value gets emitted as a *different* double (regtest `difficulty`), and
+/// an integral value prints as `1`, not `1.0`. Reproduce both: format to
+/// 16 sig digits, then emit an i64 when the text is integer-form.
+fn core_num(v: f64) -> Value {
+    let sci = format!("{v:.15e}");
+    let (mant, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let text = if (-4..16).contains(&exp) {
+        // %g fixed notation: shift the decimal point into the mantissa.
+        let digits: String = mant.chars().filter(|c| *c != '.').collect();
+        let (sign, digits) = digits
+            .strip_prefix('-')
+            .map_or(("", digits.as_str()), |d| ("-", d));
+        let point = (exp + 1).max(0) as usize;
+        let mut s = String::from(sign);
+        if point >= digits.len() {
+            s.push_str(digits);
+            s.push_str(&"0".repeat(point - digits.len()));
+        } else if point == 0 {
+            s.push_str("0.");
+            s.push_str(&"0".repeat((-exp - 1) as usize));
+            s.push_str(digits);
+        } else {
+            s.push_str(&digits[..point]);
+            s.push('.');
+            s.push_str(&digits[point..]);
+        }
+        while s.contains('.') && s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+        s
+    } else {
+        // %g scientific: mantissa without trailing zeros, `e±NN` exponent.
+        let mut m = mant.trim_end_matches('0').to_string();
+        if m.ends_with('.') {
+            m.pop();
+        }
+        format!("{m}e{exp:+03}")
+    };
+    if !text.contains(['.', 'e', 'E'])
+        && let Ok(i) = text.parse::<i64>()
+    {
+        return json!(i);
+    }
+    json!(text.parse::<f64>().unwrap_or(v))
+}
+
 /// Decode a service bitfield the way Core's `servicesnames` does —
 /// known bits named, unknown bits reported as `UNKNOWN[2^n]`.
 fn service_names(services: u64) -> Vec<String> {
@@ -483,7 +536,7 @@ fn header_json(cs: &Chainstate, node: &HeaderNode) -> Value {
         "nonce": node.header.nonce,
         "bits": format!("{:08x}", node.header.bits.0),
         "target": node.header.bits.expand().value.to_hex(),
-        "difficulty": difficulty(node.header.bits.0),
+        "difficulty": core_num(difficulty(node.header.bits.0)),
         "chainwork": node.chainwork.0.to_hex(),
     });
     if !node.header.prev_block_hash.is_zero() {
@@ -495,6 +548,233 @@ fn header_json(cs: &Chainstate, node: &HeaderNode) -> Value {
         && let Some(next) = cs.chain().get(node.height as usize + 1)
     {
         out["nextblockhash"] = json!(next.to_string());
+    }
+    out
+}
+
+/// Core's `PER_UTXO_OVERHEAD` — `sizeof(COutPoint) + sizeof(uint32_t)
+/// `+ sizeof(bool)` = 36 + 4 + 1 = 41 bytes of UTXO-set overhead
+/// attributed to every coin created or destroyed.
+const PER_UTXO_OVERHEAD: i64 = 41;
+
+/// The serialized size of a [`TxOut`]: `value || compactsize(script
+/// len) || script` — Core's `GetSerializeSize(CTxOut)`.
+fn txout_ser_size(out: &avila_consensus::transaction::TxOut) -> i64 {
+    (8 + avila_consensus::encode::compact_size_len(out.script_pubkey.as_bytes().len() as u64)
+        + out.script_pubkey.as_bytes().len()) as i64
+}
+
+/// Core's `CalculateTruncatedMedian`: sort, middle element, or the
+/// mean of the two middles (truncated).
+fn truncated_median(scores: &mut [i64]) -> i64 {
+    if scores.is_empty() {
+        return 0;
+    }
+    scores.sort_unstable();
+    let size = scores.len();
+    if size.is_multiple_of(2) {
+        (scores[size / 2 - 1] + scores[size / 2]) / 2
+    } else {
+        scores[size / 2]
+    }
+}
+
+/// Core's `CalculatePercentilesByWeight`: feerates sorted ascending,
+/// each weighted by its tx's weight; the 10/25/50/75/90th percentile
+/// *weight unit* reads off the element whose cumulative weight first
+/// crosses each threshold.
+fn percentiles_by_weight(scores: &mut [(i64, i64)], total_weight: i64) -> [i64; 5] {
+    let mut result = [0i64; 5];
+    if scores.is_empty() {
+        return result;
+    }
+    scores.sort_unstable();
+    let weights = [
+        total_weight as f64 / 10.0,
+        total_weight as f64 / 4.0,
+        total_weight as f64 / 2.0,
+        total_weight as f64 * 3.0 / 4.0,
+        total_weight as f64 * 9.0 / 10.0,
+    ];
+    let mut next = 0usize;
+    let mut cumulative = 0i64;
+    for &(feerate, weight) in scores.iter() {
+        cumulative += weight;
+        while next < 5 && cumulative as f64 >= weights[next] {
+            result[next] = feerate;
+            next += 1;
+        }
+    }
+    for r in &mut result[next..] {
+        *r = scores.last().map_or(0, |(f, _)| *f);
+    }
+    result
+}
+
+/// `getblockstats` — Core's per-block aggregate computation. `undo`
+/// carries the coins each non-coinbase tx spent (active-chain heights
+/// only); `wanted` restricts the emitted keys when present.
+fn getblockstats_json(
+    cs: &Chainstate,
+    node: &HeaderNode,
+    block: &avila_consensus::block::Block,
+    undo: Option<&avila_consensus::connect::BlockUndo>,
+    wanted: Option<&std::collections::HashSet<String>>,
+) -> Value {
+    let height = node.height;
+    let mut inputs = 0i64;
+    let mut outputs = 0i64;
+    let mut utxos = 0i64;
+    let mut utxo_size_inc = 0i64;
+    let mut utxo_size_inc_actual = 0i64;
+    let mut total_out = 0i64;
+    let mut totalfee = 0i64;
+    let mut total_size = 0i64;
+    let mut total_weight = 0i64;
+    let mut swtotal_size = 0i64;
+    let mut swtotal_weight = 0i64;
+    let mut swtxs = 0i64;
+    let mut maxfee = 0i64;
+    let mut maxfeerate = 0i64;
+    let mut minfee = i64::MAX;
+    let mut minfeerate = i64::MAX;
+    let mut maxtxsize = 0i64;
+    let mut mintxsize = i64::MAX;
+    let mut fee_array = Vec::new();
+    let mut feerate_array = Vec::new();
+    let mut txsize_array = Vec::new();
+
+    for (i, tx) in block.transactions.iter().enumerate() {
+        outputs += tx.outputs.len() as i64;
+        let mut tx_total_out = 0i64;
+        for out in &tx.outputs {
+            tx_total_out += out.value;
+            let out_size = txout_ser_size(out) + PER_UTXO_OVERHEAD;
+            utxo_size_inc += out_size;
+            // Genesis (and BIP30-repeat coinbases) don't touch the UTXO
+            // count; unspendable outputs never enter the set.
+            if height != 0 && !out.script_pubkey.is_unspendable() {
+                utxos += 1;
+                utxo_size_inc_actual += out_size;
+            }
+        }
+        if tx.is_coinbase() {
+            continue;
+        }
+        inputs += tx.inputs.len() as i64;
+        total_out += tx_total_out;
+
+        let tx_size = tx.encode().len() as i64;
+        let weight = tx.weight() as i64;
+        txsize_array.push(tx_size);
+        maxtxsize = maxtxsize.max(tx_size);
+        mintxsize = mintxsize.min(tx_size);
+        total_size += tx_size;
+        total_weight += weight;
+        if tx.has_witness() {
+            swtxs += 1;
+            swtotal_size += tx_size;
+            swtotal_weight += weight;
+        }
+
+        // Input values come from the undo record: `txs[i]` holds the
+        // coins tx `i` spent (`txs[0]` is the coinbase's empty entry).
+        let tx_total_in: i64 = undo
+            .and_then(|u| u.txs.get(i))
+            .map(|u| {
+                u.spent
+                    .iter()
+                    .map(|coin| {
+                        let prev_size = txout_ser_size(&coin.out) + PER_UTXO_OVERHEAD;
+                        utxo_size_inc -= prev_size;
+                        utxo_size_inc_actual -= prev_size;
+                        coin.out.value
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        let txfee = tx_total_in - tx_total_out;
+        fee_array.push(txfee);
+        maxfee = maxfee.max(txfee);
+        minfee = minfee.min(txfee);
+        totalfee += txfee;
+        let feerate = if weight > 0 { txfee * 4 / weight } else { 0 };
+        feerate_array.push((feerate, weight));
+        maxfeerate = maxfeerate.max(feerate);
+        minfeerate = minfeerate.min(feerate);
+    }
+
+    let ntx = block.transactions.len() as i64;
+    let percentile_fees = percentiles_by_weight(&mut feerate_array, total_weight);
+    let subsidy = avila_consensus::connect::block_subsidy(height, cs.tree().params());
+    let median_time = cs
+        .tree()
+        .median_time_past(&node.hash())
+        .unwrap_or(node.header.time);
+
+    // Emit only the keys Core would: everything by default, the
+    // requested subset when the stats array was given.
+    let want = |key: &str| wanted.is_none_or(|w| w.contains(key));
+    let mut out = json!({});
+    for (key, value) in [
+        (
+            "avgfee",
+            json!(if ntx > 1 { totalfee / (ntx - 1) } else { 0 }),
+        ),
+        (
+            "avgfeerate",
+            json!(if total_weight > 0 {
+                totalfee * 4 / total_weight
+            } else {
+                0
+            }),
+        ),
+        (
+            "avgtxsize",
+            json!(if ntx > 1 { total_size / (ntx - 1) } else { 0 }),
+        ),
+        ("blockhash", json!(node.hash().to_string())),
+        ("feerate_percentiles", json!(percentile_fees)),
+        ("height", json!(height)),
+        ("ins", json!(inputs)),
+        ("maxfee", json!(maxfee)),
+        ("maxfeerate", json!(maxfeerate)),
+        ("maxtxsize", json!(maxtxsize)),
+        ("medianfee", json!(truncated_median(&mut fee_array))),
+        ("mediantime", json!(median_time)),
+        ("mediantxsize", json!(truncated_median(&mut txsize_array))),
+        ("minfee", json!(if minfee == i64::MAX { 0 } else { minfee })),
+        (
+            "minfeerate",
+            json!(if minfeerate == i64::MAX {
+                0
+            } else {
+                minfeerate
+            }),
+        ),
+        (
+            "mintxsize",
+            json!(if mintxsize == i64::MAX { 0 } else { mintxsize }),
+        ),
+        ("outs", json!(outputs)),
+        ("subsidy", json!(subsidy)),
+        ("swtotal_size", json!(swtotal_size)),
+        ("swtotal_weight", json!(swtotal_weight)),
+        ("swtxs", json!(swtxs)),
+        ("time", json!(node.header.time)),
+        ("total_out", json!(total_out)),
+        ("total_size", json!(total_size)),
+        ("total_weight", json!(total_weight)),
+        ("totalfee", json!(totalfee)),
+        ("txs", json!(ntx)),
+        ("utxo_increase", json!(outputs - inputs)),
+        ("utxo_size_inc", json!(utxo_size_inc)),
+        ("utxo_increase_actual", json!(utxos - inputs)),
+        ("utxo_size_inc_actual", json!(utxo_size_inc_actual)),
+    ] {
+        if want(key) {
+            out[key] = value;
+        }
     }
     out
 }
@@ -779,6 +1059,13 @@ fn dispatch(
                 .unwrap_or(Value::Null),
             None,
         ),
+        "getdifficulty" => chain_query(queries, |cs, _mgr| {
+            let tip = cs.tip_hash();
+            let node = cs.tree().get(&tip);
+            Ok(node
+                .map(|n| core_num(difficulty(n.header.bits.0)))
+                .unwrap_or(Value::Null))
+        }),
         "getblockchaininfo" => chain_query(queries, |cs, _mgr| {
             let tip = cs.tip_hash();
             let connected = cs.chain().len().saturating_sub(1) as u32;
@@ -809,17 +1096,17 @@ fn dispatch(
                 "bestblockhash": tip.to_string(),
                 "bits": format!("{:08x}", node.header.bits.0),
                 "target": node.header.bits.expand().value.to_hex(),
-                "difficulty": difficulty(node.header.bits.0),
+                "difficulty": core_num(difficulty(node.header.bits.0)),
                 "time": node.header.time,
                 "mediantime": cs
                     .tree()
                     .median_time_past(&tip)
                     .unwrap_or(node.header.time),
-                "verificationprogress": if best_header.height > 0 {
+                "verificationprogress": core_num(if best_header.height > 0 {
                     connected as f64 / best_header.height as f64
                 } else {
                     1.0
-                },
+                }),
                 "initialblockdownload": best_header.height > connected,
                 "chainwork": node.chainwork.0.to_hex(),
                 "size_on_disk": size_on_disk,
@@ -981,6 +1268,109 @@ fn dispatch(
                 }
             })
         }
+        // Core's getblockstats — per-block fee/size/UTXO aggregates.
+        // Input values come from the block's undo record (active-chain
+        // heights only, like Core's rev*.dat); the optional stats array
+        // restricts which keys are emitted.
+        "getblockstats" => {
+            let Some(selector) = param(params, 0, "hash_or_height") else {
+                return missing_params("hash_or_height");
+            };
+            // The optional stats filter: only these keys are emitted.
+            let wanted: Option<std::collections::HashSet<String>> =
+                params.get(1).and_then(Value::as_array).map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                });
+            let selector = selector.clone();
+            chain_query(queries, move |cs, _| {
+                // ParseHashOrHeight: a number walks the active chain, a
+                // string is a block hash known to the header tree.
+                let node = match &selector {
+                    Value::Number(n) => {
+                        let h = n.as_i64().unwrap_or(i64::MAX);
+                        let tip = cs.chain().len() as i64 - 1;
+                        if h < 0 {
+                            return Err((
+                                RPC_INVALID_PARAMETER,
+                                format!("Target block height {h} is negative"),
+                            ));
+                        }
+                        if h > tip {
+                            return Err((
+                                RPC_INVALID_PARAMETER,
+                                format!("Target block height {h} after current tip {tip}"),
+                            ));
+                        }
+                        // h ≤ tip, so the active chain has an entry
+                        // and the header is necessarily in the tree.
+                        let hash = cs.chain()[h as usize];
+                        match cs.tree().get(&hash) {
+                            Some(n) => n,
+                            None => {
+                                return Err((
+                                    RPC_MISC_ERROR,
+                                    "block header missing from tree".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    Value::String(s) => {
+                        // Core's ParseHashV wording, checked live.
+                        if s.len() != 64 {
+                            return Err((
+                                RPC_INVALID_PARAMETER,
+                                format!(
+                                    "hash_or_height must be of length 64 (not {}, for '{s}')",
+                                    s.len()
+                                ),
+                            ));
+                        }
+                        match s.parse::<BlockHash>() {
+                            Ok(hash) => cs.tree().get(&hash).ok_or((
+                                RPC_INVALID_ADDRESS_OR_KEY,
+                                "Block not found".to_string(),
+                            ))?,
+                            Err(_) => {
+                                return Err((
+                                    RPC_INVALID_PARAMETER,
+                                    format!(
+                                        "hash_or_height must be hexadecimal string (not '{s}')"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err((
+                            RPC_INVALID_PARAMS,
+                            "missing parameter: hash_or_height".to_string(),
+                        ));
+                    }
+                };
+                let height = node.height;
+                let hash = node.hash();
+                let Some(block) = cs.body(&hash) else {
+                    return Err((RPC_MISC_ERROR, "Block not found on disk".into()));
+                };
+                // Undo exists only for connected active-chain blocks;
+                // anything else (genesis is the exception) fails like
+                // Core's GetUndoChecked.
+                let undo = if height == 0 {
+                    None
+                } else {
+                    match cs.undo(height) {
+                        Some(u) if cs.chain().get(height as usize) == Some(&hash) => Some(u),
+                        _ => {
+                            return Err((RPC_MISC_ERROR, "Can't read undo data from disk".into()));
+                        }
+                    }
+                };
+                Ok(getblockstats_json(cs, node, &block, undo, wanted.as_ref()))
+            })
+        }
         "gettxout" => {
             let Some(txid) = param(params, 0, "txid")
                 .and_then(Value::as_str)
@@ -1050,7 +1440,21 @@ fn dispatch(
             chain_query(queries, move |cs, mgr| {
                 // Core's lookup order: mempool first, then the named
                 // block or the txindex; a plain txid without either is
-                // the documented -5.
+                // the documented -5. The genesis coinbase is refused on
+                // every path — it predates the txindex contract.
+                if cs
+                    .tree()
+                    .params()
+                    .genesis_block()
+                    .is_some_and(|g| g.transactions[0].txid() == txid)
+                {
+                    return Err((
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        "The genesis block coinbase is not considered an \
+                         ordinary transaction and cannot be retrieved"
+                            .into(),
+                    ));
+                }
                 let mut via_index = false;
                 let found = if let Some(bh) = block_hash {
                     cs.body(&bh).and_then(|block| {
@@ -1933,10 +2337,10 @@ fn dispatch(
                 "currentblocksize": current.as_ref().map(|t| t.block.encode().len()).unwrap_or(0),
                 "currentblockweight": current.as_ref().map(|t| t.weight).unwrap_or(0),
                 "currentblocktx": current.as_ref().map(|t| t.tx_count).unwrap_or(0),
-                "difficulty": difficulty(node.header.bits.0),
+                "difficulty": core_num(difficulty(node.header.bits.0)),
                 "bits": format!("{:08x}", node.header.bits.0),
                 "target": node.header.bits.expand().value.to_hex(),
-                "networkhashps": networkhashps,
+                "networkhashps": core_num(networkhashps),
                 "pooledtx": mgr.mempool_ref().len(),
                 "chain": format!("{:?}", cs.tree().params().network).to_lowercase(),
                 "warnings": [],
@@ -2029,8 +2433,10 @@ fn dispatch(
             json!(
                 "avila-node JSON-RPC:\n\
                  \x20 chain: getblockcount, getbestblockhash, getblockchaininfo, getchaintips,\n\
+                 \x20   getdifficulty,\n\
                  \x20   getblockhash <height>, getblockheader <hash> [verbose],\n\
-                 \x20   getblock <hash> [verbosity 0-2], getrawtransaction <txid> [verbosity] [blockhash],\n\
+                 \x20   getblock <hash> [verbosity 0-2], getblockstats <hash|height> [stats],\n\
+                 \x20   getrawtransaction <txid> [verbosity] [blockhash],\n\
                  \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>,\n\
                  \x20   validateaddress <address>\n\
                  \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
@@ -2202,17 +2608,20 @@ mod tests {
         assert!(e.is_none());
         assert_eq!(r.as_str().unwrap().len(), 160);
 
-        // The genesis header is indexed but its body was never stored
-        // (genesis is never connected) — getblock says so honestly,
-        // the same error Core gives for missing block data.
-        let (_, e) = dispatch(
+        // The genesis header's body is never stored (genesis is never
+        // connected), but `body()` synthesizes it from params — Core's
+        // blk files always carry it, so getblock must serve it.
+        let (r, e) = dispatch(
             "getblock",
             &json!([genesis, 1]),
             &snap,
             Some(&queries),
             None,
         );
-        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["hash"], genesis);
+        assert_eq!(r["height"], 0);
+        assert_eq!(r["tx"][0].as_str().unwrap().len(), 64);
 
         // Unknown heights/hashes get Core's error codes, not nulls.
         let (_, e) = dispatch("getblockhash", &json!([99]), &snap, Some(&queries), None);
@@ -2550,6 +2959,49 @@ mod tests {
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
         let (_, e) = dispatch("savemempool", &Value::Null, &snap, None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+    }
+
+    /// `getblockstats` — genesis is the simplest block with stats:
+    /// subsidy 50 BTC, one tx, and zero *actual* UTXO delta (Core
+    /// excludes genesis outputs from the actual counters).
+    #[test]
+    fn getblockstats_reports_genesis() {
+        let cs = Chainstate::new(&Network::Regtest.params());
+        let queries = query_server(cs);
+        let snap = snap();
+        let (r, e) = dispatch("getblockstats", &json!([0]), &snap, Some(&queries), None);
+        assert!(e.is_none());
+        assert_eq!(r["subsidy"], json!(5_000_000_000i64));
+        assert_eq!(r["txs"], json!(1));
+        assert_eq!(r["utxo_increase_actual"], json!(0));
+        assert_eq!(r["height"], json!(0));
+
+        // The stats filter restricts emitted keys.
+        let (r, e) = dispatch(
+            "getblockstats",
+            &json!([0, ["subsidy", "txs"]]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none());
+        assert_eq!(r["txs"], json!(1));
+        assert!(r.get("avgfee").is_none(), "filtered key must be absent");
+
+        // Out-of-range height and malformed hash carry Core's wording.
+        let (_, e) = dispatch("getblockstats", &json!([99]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().1, "Target block height 99 after current tip 0");
+        let (_, e) = dispatch(
+            "getblockstats",
+            &json!(["deadbeef"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap().1,
+            "hash_or_height must be of length 64 (not 8, for 'deadbeef')"
+        );
     }
 
     /// `submitblock` — the mining loop end to end: a template-built

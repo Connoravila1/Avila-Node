@@ -47,19 +47,21 @@ python3 tools/compare_rpc.py \
 
 ## Results
 
-33 MATCH (every shared field byte-identical), 1 EXPECTED-DIFF
+39 MATCH (every shared field byte-identical), 1 EXPECTED-DIFF
 (presence gaps only), 3 DIFFERS — one is a genuine policy divergence
 (`fullrbf`: our pool enforces BIP125 opt-in signaling; Knots 29 ships
 mempoolfullrbf semantics) and two are environmental (`getpeerinfo`,
 `getconnectioncount` — the daemons hold different peer sets). One AVILA-ERROR (`estimatesmartfee` —
 honest "insufficient data" on a fresh chain with no confirmation
-samples; Knots returned its fallback). `sendrawtransaction` error
+samples; Knots returned its fallback). One CORE-ERROR
+(`getrawtransaction` on a buried coinbase — a flag asymmetry: Knots
+runs without `-txindex`, we run with it, so the bare-txid lookup
+resolves only on our side). `sendrawtransaction` error
 paths match: `-22` decode failures, `-26`/`bad-cb-length` consensus
 rejects. `savemempool` matches (`{"filename": <abs path>}`) and the
 pool survives restart: `mempool.dat` is written on shutdown, entries
 re-admit through full policy on start, spent-input entries are
-skipped. One BOTH-ERROR (`getrawtransaction` — neither side indexes
-arbitrary txids).
+skipped.
 
 `sendrawtransaction` was also verified live end-to-end (outside the
 static matrix since pool state is per-daemon): a wallet-signed tx
@@ -118,6 +120,39 @@ division, `currentblocksize/weight/tx` from a live template build),
 `getblockchaininfo` (13), `getblockheader` (15), `getblock` (v1: 20,
 v0: raw hex), `getchaintips`, `getrawmempool`, `getconnectioncount`,
 `getorphantxs`, `getblockcount`, `getbestblockhash`, `getblockhash`.
+
+`getblockstats` landed at full parity (all 31 fields): the
+`hash_or_height` selector replicates Core's `ParseHashV` errors
+("hash_or_height must be of length 64 (not N, for '…')" / "must be
+hexadecimal string"), the optional `stats` filter projects the
+requested keys, and per-block fee/size/UTXO aggregates use the active
+chain's undo data (`undo.txs[i]` is indexed including the coinbase).
+Verified byte-identical against Knots at h100/h120 and at a
+fee-bearing h124, including the five feerate percentiles and both
+`utxo_size_inc` variants.
+
+Serving genesis surfaced two deeper compat fixes:
+
+- `Params::genesis_block()` now reconstructs Core's
+  `CreateGenesisBlock` output per network — the shared
+  `push(486604799) << push(4) << push(msg)` scriptSig (mainnet nBits
+  is hardcoded even on regtest) with the "Times 03/Jan/2009" coinbase
+  for mainnet/testnet3/signet/regtest and testnet4's own message plus
+  its 33-zero-byte push + `OP_CHECKSIG` output. `Chainstate::body()`
+  falls back to it for the genesis hash, so `getblock 0` /
+  `getblockstats 0` / verbosity-0 hex are byte-identical to Core even
+  though the body is never stored. The constructor returns `None`
+  when the rebuilt coinbase doesn't anchor `genesis_header`'s merkle
+  root (custom params), so it can't serve a wrong block.
+- Core's UniValue serializes doubles through
+  `std::setprecision(16)` — C `%.16g`, not shortest-round-trip. Two
+  observable differences: a value needing 17 digits emits as a
+  *different* double (regtest `difficulty`: `4.656542373906925e-10`
+  vs the exact `…9247e-10`), and integral values print without a
+  decimal point (`1`, not `1.0`). `core_num()` reproduces both, and
+  now wraps `difficulty`, `verificationprogress`, and
+  `networkhashps`. `getdifficulty` was also added (tip difficulty,
+  Core's mining RPC).
 
 ### Documented gaps (presence-only, never wrong values)
 

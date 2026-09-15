@@ -176,8 +176,17 @@ operation. Compare complete initial download and catch-up, not only local replay
       getblocktemplate built from live chainstate + pool,
       getmininginfo, getnetworkinfo, getconnectioncount, stop,
       sendrawtransaction, submitblock, submitheader,
-      generatetoaddress, generateblock, savemempool) — verified live
-      over curl and the client. The pool survives clean restarts like
+      generatetoaddress, generateblock, savemempool,
+      validateaddress, getblockstats (undo-backed fee/UTXO
+      aggregates, Core's selector errors and stats filter),
+      getdifficulty) — verified live over curl and the client.
+      Genesis is served even though its body is never stored:
+      `Params::genesis_block` reconstructs Core's per-network
+      `CreateGenesisBlock` coinbase and `Chainstate::body` falls back
+      to it, so `getblock 0` is byte-identical. JSON doubles serialize
+      through Core's `%.16g` rule (`core_num`), reproducing UniValue's
+      16-significant-digit rounding and integer-form `1`. The pool
+      survives clean restarts like
       Core's mempool.dat: saved on shutdown (and via savemempool),
       re-admitted through full policy on start — entries whose inputs
       a newer tip spent are skipped, not fatal. `run --txindex`
@@ -209,7 +218,7 @@ operation. Compare complete initial download and catch-up, not only local replay
   per-session `.cookie` (Core format, 0600, HTTP Basic, 401 without
   it, removed on shutdown) plus the `avila-node rpc` client. The
   compatibility matrix has a tested start: `tools/compare_rpc.py`
-  diffs every shared field against a live Knots daemon — 21 calls
+  diffs every shared field against a live Knots daemon — 39 calls
   exact-match including `decodescript` (asm, descriptor checksums,
   P2SH/segwit wraps), `gettxout`, `getblock` verbosity 2,
   `getblocktemplate` (22 fields) and `getmininginfo` (incl.

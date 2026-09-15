@@ -78,11 +78,24 @@ def build_calls(height):
         ("getblockcount", []),
         ("getbestblockhash", []),
         ("getblockchaininfo", []),
+        ("getdifficulty", []),
         ("getblockhash", [height]),
         ("getblockheader", ["HASH"]),
         ("getblock", ["HASH", 1]),
         ("getblock", ["HASH", 0]),
         ("getblock", ["HASH", 2]),
+        # Genesis at verbosity 0 exercises the synthesized body path —
+        # Core serves genesis bytes from its blk files, we build them
+        # from params; the payloads must be byte-identical.
+        ("getblock", ["GHASH", 0]),
+        # getblockstats: by height and by hash, genesis (synthesized
+        # body), the stats filter, and the error paths.
+        ("getblockstats", [height]),
+        ("getblockstats", [0]),
+        ("getblockstats", ["HASH"]),
+        ("getblockstats", ["HASH", ["avgfee", "txs", "utxo_increase"]]),
+        ("getblockstats", [999999]),
+        ("getblockstats", ["deadbeef"]),
         ("getrawtransaction", ["TXID", 1]),
         ("gettxout", ["TXID", 0]),
         # decodescript: one call per standard template family — the
@@ -222,6 +235,8 @@ def main():
     txid = core_block["tx"][0] if s == "ok" and core_block.get("tx") else None
     s, core_block_hex = call(args.core, auth_c, "getblock", [core_hash, 0])
     blockhex = core_block_hex if s == "ok" else None
+    s, ghash = call(args.core, auth_c, "getblockhash", [0])
+    ghash = ghash if s == "ok" else None
 
     calls = build_calls(h)
     total = {"MATCH": 0, "EXPECTED-DIFF": 0, "DIFFERS": 0,
@@ -235,6 +250,7 @@ def main():
         resolved = [core_hash if v == "HASH" else v for v in params]
         resolved = [txid if v == "TXID" else v for v in resolved]
         resolved = [blockhex if v == "BLOCKHEX" else v for v in resolved]
+        resolved = [ghash if v == "GHASH" else v for v in resolved]
         if any(v is None for v in resolved):
             total["SKIPPED"] += 1
             continue

@@ -329,6 +329,74 @@ pub struct Params {
 }
 
 impl Params {
+    /// The genesis block — `genesis_header` over the single coinbase
+    /// transaction Core's `CreateGenesisBlock` produces: every network
+    /// shares the `push(486604799) << push(4) << push(msg)` scriptSig
+    /// shape, but the message and output script are per-network
+    /// (`CreateGenesisBlock`'s first two arguments). Serving it from
+    /// params lets RPC answer `getblock`/stats for height 0 like Core,
+    /// whose blk files always contain the genesis body.
+    ///
+    /// `None` when the reconstructed body doesn't anchor
+    /// `genesis_header`'s merkle root — i.e. a custom [`Params`] whose
+    /// genesis coinbase isn't one of Core's built-in recipes.
+    #[must_use]
+    pub fn genesis_block(&self) -> Option<crate::block::Block> {
+        use crate::script::{self, push_slice};
+        use crate::transaction::{OutPoint, Script, Transaction, TxIn, TxOut, Witness};
+        const HEADLINE: &[u8] =
+            b"The Times 03/Jan/2009 Chancellor on brink of second bailout for banks";
+        // `chainparams.cpp`'s `testnet4_genesis_msg`.
+        const TESTNET4_MSG: &[u8] =
+            b"03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e";
+        // The fixed 65-byte pubkey main/testnet3/signet/regtest pay to.
+        const GENESIS_PUBKEY: [u8; 65] = [
+            0x04, 0x67, 0x8a, 0xfd, 0xb0, 0xfe, 0x55, 0x48, 0x27, 0x19, 0x67, 0xf1, 0xa6, 0x71,
+            0x30, 0xb7, 0x10, 0x5c, 0xd6, 0xa8, 0x28, 0xe0, 0x39, 0x09, 0xa6, 0x79, 0x62, 0xe0,
+            0xea, 0x1f, 0x61, 0xde, 0xb6, 0x49, 0xf6, 0xbc, 0x3f, 0x4c, 0xef, 0x38, 0xc4, 0xf3,
+            0x55, 0x04, 0xe5, 0x1e, 0xc1, 0x12, 0xde, 0x5c, 0x38, 0x4d, 0xf7, 0xba, 0x0b, 0x8d,
+            0x57, 0x8a, 0x4c, 0x70, 0x2b, 0x6b, 0xf1, 0x1d, 0x5f,
+        ];
+        let (message, script_pubkey) = match self.network {
+            // testnet4: `<< <33 zero bytes> << OP_CHECKSIG` — Core's
+            // `"0000…00"_hex` literal is 33 bytes, not 32.
+            Network::Testnet4 => (
+                TESTNET4_MSG,
+                [&push_slice(&[0u8; 33])[..], &[script::OP_CHECKSIG]].concat(),
+            ),
+            _ => (
+                HEADLINE,
+                [&push_slice(&GENESIS_PUBKEY)[..], &[script::OP_CHECKSIG]].concat(),
+            ),
+        };
+        // scriptSig: `<< 486604799 << CScriptNum(4) << message` — the
+        // 486604799 literal is mainnet's nBits and Core hardcodes it for
+        // every network, including regtest. `CScript << CScriptNum` is a
+        // *data* push of the serialized number (01 04), not `OP_4`.
+        let mut script_sig = push_slice(&0x1d00_ffffu32.to_le_bytes());
+        script_sig.extend_from_slice(&push_slice(&[0x04]));
+        script_sig.extend_from_slice(&push_slice(message));
+        let block = crate::block::Block {
+            header: self.genesis_header,
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint::NULL,
+                    script_sig: Script::new(script_sig),
+                    sequence: u32::MAX,
+                    witness: Witness::default(),
+                }],
+                outputs: vec![TxOut {
+                    value: 5_000_000_000,
+                    script_pubkey: Script::new(script_pubkey),
+                }],
+                lock_time: 0,
+            }],
+        };
+        let (root, mutated) = block.merkle_root();
+        (!mutated && root == block.header.merkle_root).then_some(block)
+    }
+
     /// `consensus.DifficultyAdjustmentInterval()`: `nPowTargetTimespan / nPowTargetSpacing`
     /// (2016 on every built-in network).
     ///
@@ -390,7 +458,7 @@ const SHARED_GENESIS_MERKLE_ROOT: MerkleRoot = MerkleRoot::from_bytes([
 ]);
 
 /// The testnet4 genesis merkle root in wire byte order: display form
-/// `7aa0a7ae1e22340ecb807ecde657e667b718e42aaf9306db9102fe28912b7b4e`.
+/// `7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e`.
 const TESTNET4_GENESIS_MERKLE_ROOT: MerkleRoot = MerkleRoot::from_bytes([
     0x4e, 0x7b, 0x2b, 0x91, 0x28, 0xfe, 0x02, 0x91, 0xdb, 0x06, 0x93, 0xaf, 0x2a, 0xe4, 0x18, 0xb7,
     0x67, 0xe6, 0x57, 0xcd, 0x40, 0x7e, 0x80, 0xcb, 0x14, 0x34, 0x22, 0x1e, 0xae, 0xa7, 0xa0, 0x7a,
@@ -675,5 +743,57 @@ mod tests {
         params = Network::Mainnet.params();
         params.pow_target_spacing = params.pow_target_timespan + 1;
         assert_eq!(params.difficulty_adjustment_interval(), 0);
+    }
+
+    /// The synthesized genesis body must hash to `genesis_header`'s own
+    /// merkle root, making the block hash equal the genesis hash on every
+    /// network. The mainnet txid/blockhash constants are the well-known
+    /// values; the regtest pair is what Core's `getblock 0` serves.
+    #[test]
+    fn genesis_block_hashes_to_header_on_every_network() {
+        for network in [
+            Network::Mainnet,
+            Network::Testnet4,
+            Network::Signet,
+            Network::Regtest,
+        ] {
+            let params = network.params();
+            let block = params
+                .genesis_block()
+                .unwrap_or_else(|| panic!("{network:?} genesis"));
+            assert_eq!(block.transactions.len(), 1);
+            let (root, mutated) = block.merkle_root();
+            assert!(!mutated);
+            assert_eq!(
+                root, block.header.merkle_root,
+                "{network:?} genesis coinbase must anchor the header"
+            );
+            assert_eq!(block.header.hash(), params.genesis_header.hash());
+        }
+        let mainnet = Network::Mainnet.params().genesis_block().unwrap();
+        assert_eq!(
+            mainnet.transactions[0].txid().to_string(),
+            "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+        );
+        assert_eq!(
+            mainnet.header.hash().to_string(),
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+        );
+        let regtest = Network::Regtest.params().genesis_block().unwrap();
+        assert_eq!(
+            regtest.encode(),
+            crate::hex::decode(concat!(
+                "0100000000000000000000000000000000000000000000000000000000000000",
+                "000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa",
+                "4b1e5e4adae5494dffff7f200200000001010000000100000000000000000000",
+                "00000000000000000000000000000000000000000000ffffffff4d04ffff001d",
+                "0104455468652054696d65732030332f4a616e2f32303039204368616e63656c",
+                "6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f75742066",
+                "6f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe554827",
+                "1967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4",
+                "f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000",
+            ))
+            .unwrap()
+        );
     }
 }
