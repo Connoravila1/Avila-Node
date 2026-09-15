@@ -44,10 +44,11 @@ use crate::sync::SyncProgress;
 pub type SharedStatus = Arc<RwLock<SyncProgress>>;
 
 /// The query body: act on live state, produce a JSON result or a
-/// JSON-RPC `(code, message)` error. `&mut PeerManager` lets mutation
-/// methods (e.g. `sendrawtransaction`) reach the mempool and relay.
+/// JSON-RPC `(code, message)` error. `&mut` receivers let mutation
+/// methods (`sendrawtransaction`, `submitblock`) reach the mempool,
+/// the chainstate, and relay.
 type QueryFn = Box<
-    dyn FnOnce(&Chainstate, &mut PeerManager<TcpStream>) -> Result<Value, (i64, String)> + Send,
+    dyn FnOnce(&mut Chainstate, &mut PeerManager<TcpStream>) -> Result<Value, (i64, String)> + Send,
 >;
 
 /// A query the sync loop answers against the live chainstate
@@ -62,7 +63,7 @@ impl ChainQuery {
     /// Executes the query against the live node state and delivers the
     /// answer. Called by the sync loop; a dropped receiver just means the
     /// caller gave up waiting.
-    pub fn answer(self, cs: &Chainstate, mgr: &mut PeerManager<TcpStream>) {
+    pub fn answer(self, cs: &mut Chainstate, mgr: &mut PeerManager<TcpStream>) {
         let _ = self.reply.send((self.run)(cs, mgr));
     }
 }
@@ -365,7 +366,7 @@ fn handle(
 /// shapes the outcome as `dispatch`'s `(result, error)` pair.
 fn chain_query(
     queries: Option<&QuerySender>,
-    f: impl FnOnce(&Chainstate, &mut PeerManager<TcpStream>) -> Result<Value, (i64, String)>
+    f: impl FnOnce(&mut Chainstate, &mut PeerManager<TcpStream>) -> Result<Value, (i64, String)>
     + Send
     + 'static,
 ) -> (Value, Option<(i64, String)>) {
@@ -1394,6 +1395,53 @@ fn dispatch(
                 }
             })
         }
+        "submitblock" => {
+            let Some(raw) = param(params, 0, "hexdata").and_then(Value::as_str) else {
+                return missing_params("hexdata");
+            };
+            let Ok(bytes) = hex::decode(raw) else {
+                return (
+                    Value::Null,
+                    Some((RPC_DESERIALIZATION_ERROR, "Block decode failed".into())),
+                );
+            };
+            chain_query(queries, move |cs, mgr| {
+                let block = match avila_consensus::block::Block::decode(&bytes) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        return Err((RPC_DESERIALIZATION_ERROR, "Block decode failed".into()))
+                    }
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                // Core's submitblock reports a status STRING in result —
+                // errors are only for decode/parameter failures.
+                match cs.accept_block(&block, now) {
+                    Ok(avila_consensus::chainstate::Acceptance::Connected {
+                        height, ..
+                    }) => {
+                        // Purge confirmed txs, then relay the new tip
+                        // (Core's NewPoWValidBlock fan-out — no source
+                        // peer for a local submission).
+                        mgr.mempool().on_block_connected(&block, height);
+                        mgr.announce_tip(cs);
+                        Ok(Value::Null)
+                    }
+                    Ok(avila_consensus::chainstate::Acceptance::AlreadyKnown { .. }) => {
+                        Ok(json!("duplicate"))
+                    }
+                    Ok(avila_consensus::chainstate::Acceptance::Parked { .. }) => {
+                        Ok(json!("inconclusive"))
+                    }
+                    Err(avila_consensus::chainstate::BlockRejection::CachedInvalid) => {
+                        Ok(json!("duplicate-invalid"))
+                    }
+                    Err(rejection) => Ok(json!(rejection.reason().into_owned())),
+                }
+            })
+        }
         "getblocktemplate" => chain_query(queries, |cs, mgr| {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1701,7 +1749,7 @@ fn dispatch(
                  \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
                  \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>,\n\
                  \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount]\n\
-                 \x20 mining: getblocktemplate, getmininginfo\n\
+                 \x20 mining: getblocktemplate, getmininginfo, submitblock <hex>\n\
                  \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo\n\
                  \x20 misc:  estimatesmartfee <target>, uptime, help, stop"
             ),
@@ -1819,9 +1867,10 @@ mod tests {
     fn query_server(cs: Chainstate) -> QuerySender {
         let (tx, rx) = mpsc::channel::<ChainQuery>();
         let mut mgr: PeerManager<TcpStream> = PeerManager::new(8);
+        let mut cs = cs;
         thread::spawn(move || {
             while let Ok(q) = rx.recv() {
-                q.answer(&cs, &mut mgr);
+                q.answer(&mut cs, &mut mgr);
             }
         });
         tx
@@ -2198,5 +2247,69 @@ mod tests {
         // Without the query channel the method reports honestly.
         let (_, e) = dispatch("sendrawtransaction", &json!(["00"]), &snap, None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+    }
+
+    /// `submitblock` — the mining loop end to end: a template-built
+    /// block connects (Core returns null) and a resubmit reports
+    /// "duplicate". Decode failures are -22 like Core.
+    #[test]
+    fn submitblock_connects_and_reports_core_status() {
+        let params = Network::Regtest.params();
+        // A genesis-tip regtest chainstate is deterministic — the block
+        // built here connects identically on the query server's copy.
+        let mine_cs = Chainstate::new(&params);
+        let pool = avila_mempool::Mempool::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        let mut block = pool
+            .build_template(&mine_cs, Script::new(vec![avila_consensus::script::OP_1]), now)
+            .unwrap()
+            .block;
+        // Regtest's target is near-maximal — a few nonces at most.
+        while avila_consensus::pow::check_proof_of_work(
+            &block.block_hash(),
+            block.header.bits,
+            &params,
+        )
+        .is_err()
+        {
+            block.header.nonce += 1;
+        }
+        let hexdata = hex::encode(&block.encode());
+
+        let queries = query_server(Chainstate::new(&params));
+        let snap = snap();
+        let (r, e) = dispatch(
+            "submitblock",
+            &json!([hexdata]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, Value::Null); // connected — Core's null
+        let (r, e) = dispatch(
+            "submitblock",
+            &json!([hexdata]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, json!("duplicate"));
+
+        // Decode failures carry Core's -22.
+        let (_, e) = dispatch(
+            "submitblock",
+            &json!(["aabb"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
+        let (_, e) = dispatch("submitblock", &json!([]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
     }
 }

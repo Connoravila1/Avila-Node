@@ -102,6 +102,10 @@ def build_calls(height):
         # daemon (verified live separately).
         ("sendrawtransaction", ["00ff"]),
         ("sendrawtransaction", ["02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0151ffffffff010000000000000000015100000000"]),
+        # Resubmitting a known block is deterministic: "duplicate" both
+        # sides. The end-to-end mine+connect path is verified live.
+        ("submitblock", ["BLOCKHEX"]),
+        ("submitblock", ["aabb"]),
         ("uptime", []),
         ("getpeerinfo", []),
         ("getorphantxs", []),
@@ -200,6 +204,8 @@ def main():
         return 2
     s, core_block = call(args.core, auth_c, "getblock", [core_hash, 1])
     txid = core_block["tx"][0] if s == "ok" and core_block.get("tx") else None
+    s, core_block_hex = call(args.core, auth_c, "getblock", [core_hash, 0])
+    blockhex = core_block_hex if s == "ok" else None
 
     calls = build_calls(h)
     total = {"MATCH": 0, "EXPECTED-DIFF": 0, "DIFFERS": 0,
@@ -212,6 +218,7 @@ def main():
             continue
         resolved = [core_hash if v == "HASH" else v for v in params]
         resolved = [txid if v == "TXID" else v for v in resolved]
+        resolved = [blockhex if v == "BLOCKHEX" else v for v in resolved]
         if any(v is None for v in resolved):
             total["SKIPPED"] += 1
             continue

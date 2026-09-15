@@ -481,31 +481,8 @@ impl<S: Read + Write> PeerManager<S> {
         }
         // Announce a newly connected tip to every established peer except
         // the one that delivered it (Core's `NewPoWValidBlock` relay).
-        if let Some(source) = announce_tip {
-            // The connected tip — not `tree().tip()`, which is the best
-            // *header* and may sit above the connected chain.
-            let tip_hash = cs.chain().last().copied();
-            let tip_header = tip_hash.and_then(|h| cs.tree().get(&h)).map(|n| n.header);
-            for (&id, peer) in &mut self.peers {
-                if id == source || !peer.session.established() {
-                    continue;
-                }
-                let msg = if peer.wants_headers_announce {
-                    match tip_header {
-                        Some(header) => Message::Headers(vec![header]),
-                        None => continue,
-                    }
-                } else {
-                    match tip_hash {
-                        Some(hash) => Message::Inv(vec![crate::message::InvVector {
-                            inv_type: crate::message::InvType::Block,
-                            hash,
-                        }]),
-                        None => continue,
-                    }
-                };
-                let _ = peer.session.send(&msg);
-            }
+        if announce_tip.is_some() {
+            self.send_tip_announce(cs, announce_tip);
         }
         // Relay an accepted tx: wtxid inv for wtxidrelay peers, txid
         // otherwise (Core's BIP339 split); the source peer is excluded.
@@ -562,6 +539,43 @@ impl<S: Read + Write> PeerManager<S> {
         wtxid: avila_consensus::hash::Wtxid,
     ) {
         self.send_tx_inv(None, &txid, &wtxid);
+    }
+
+    /// Announces the connected tip to every established peer — `headers`
+    /// for sendheaders peers, `inv` otherwise (Core's `NewPoWValidBlock`
+    /// fan-out). `exclude` spares the peer that delivered the block;
+    /// `None` for locally submitted/mined blocks.
+    fn send_tip_announce(&mut self, cs: &Chainstate, exclude: Option<u64>) {
+        // The connected tip — not `tree().tip()`, which is the best
+        // *header* and may sit above the connected chain.
+        let tip_hash = cs.chain().last().copied();
+        let tip_header = tip_hash.and_then(|h| cs.tree().get(&h)).map(|n| n.header);
+        for (&id, peer) in &mut self.peers {
+            if Some(id) == exclude || !peer.session.established() {
+                continue;
+            }
+            let msg = if peer.wants_headers_announce {
+                match tip_header {
+                    Some(header) => Message::Headers(vec![header]),
+                    None => continue,
+                }
+            } else {
+                match tip_hash {
+                    Some(hash) => Message::Inv(vec![crate::message::InvVector {
+                        inv_type: crate::message::InvType::Block,
+                        hash,
+                    }]),
+                    None => continue,
+                }
+            };
+            let _ = peer.session.send(&msg);
+        }
+    }
+
+    /// Announces a locally submitted or mined tip to every peer — the
+    /// relay half of `submitblock`.
+    pub fn announce_tip(&mut self, cs: &Chainstate) {
+        self.send_tip_announce(cs, None);
     }
 
     /// The download scheduler: every tick, each established peer gets a

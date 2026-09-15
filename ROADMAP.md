@@ -174,10 +174,10 @@ operation. Compare complete initial download and catch-up, not only local replay
       getmempoolancestors/descendants, getorphantxs,
       testmempoolaccept with a per-gate policy trace,
       getblocktemplate built from live chainstate + pool,
-      getmininginfo, getnetworkinfo, getconnectioncount, stop) —
-      verified live over curl and the client. Mutation methods
-      beyond stop, txindex, and the Core compatibility matrix
-      remain open.
+      getmininginfo, getnetworkinfo, getconnectioncount, stop,
+      sendrawtransaction, submitblock) — verified live over curl and
+      the client. txindex, wallet functionality, and further
+      mutation methods remain open.
 - [x] Implement mempool admission, packages, replacement, eviction,
       relay and reorg reconciliation (first slice): `avila-mempool`
       applies consensus input/script checks identically to block
@@ -216,6 +216,11 @@ operation. Compare complete initial download and catch-up, not only local replay
   verified end-to-end (Knots fetched and pooled our submission), with
   Core's exact error paths (`-22` decode, `-26` reason strings,
   `-25` maxfeerate/maxburnamount gates, silent success on resubmit).
+  The mining loop closed with `submitblock`: a template-built block
+  submitted over RPC connected to our chainstate and was announced to
+  and accepted by Knots at h121; Core's status strings match
+  (`null`/`duplicate`/`inconclusive`/`duplicate-invalid`, `-22` decode
+  failures).
   Fee information started:
   `FeeEstimator` records (rate, blocks-to-confirm) samples and
   `estimatesmartfee` serves any target with data, erroring honestly

@@ -22,15 +22,16 @@ drift: any `DIFFERS` verdict on a shared field is a compatibility bug.
 - Baseline: `bitcoind` Knots 29.3.0 (`/Satoshi:29.3.0/Knots:20260508/`)
   regtest, datadir `target/p2p-interop/datadir`, RPC `:58321`.
 - Candidate: `avila-node` @ commit under test, regtest, RPC `:18443`,
-  synced to the same chain tip (h120 at measurement).
+  synced to the same chain tip (h121 at measurement — see the
+  `submitblock` paragraph; the matrix itself grew the chain).
 - Both endpoints authenticated via Core-format `.cookie` over HTTP
   Basic — the same code path on both sides.
 
 ## Workload and method
 
-`tools/compare_rpc.py` calls 24 methods with identical parameters on
-both endpoints (block hash and a coinbase txid resolved live at the
-shared height), flattens each response to field paths, and reports
+`tools/compare_rpc.py` calls 26 methods with identical parameters on
+both endpoints (block hash, coinbase txid, and raw block hex resolved
+live at the shared height), flattens each response to field paths, and reports
 matched / expected-dynamic / differing / one-side-only fields.
 `DYNAMIC_KEYS`/`DYNAMIC_METHODS` mark legitimately node- or
 time-specific values (time, curtime, peers, uptime, help text).
@@ -68,6 +69,20 @@ configured by user (e.g. -maxtxfee, maxfeerate)"; a valued OP_RETURN
 output over `maxburnamount` returns `-25` "Unspendable output exceeds
 maximum configured by user (maxburnamount)" — both byte-identical to
 Knots.
+
+`submitblock` closes the mining loop end-to-end: a block assembled
+from our `getblocktemplate` output (BIP34 coinbase, witness
+commitment, correct merkle root, regtest nonce grinding) was
+submitted through our RPC, connected to our chainstate, and announced
+to Knots — which accepted it as the valid tip. Both nodes reported
+h121 `3e696862313319ec73cf5cbf1963b3ca2f3d12a3e1569f2bf6fb9cee080b2004`.
+Status strings match Core: `null` on connect, `"duplicate"` on
+resubmit, `-22`/`Block decode failed` on undecodable input. The run
+also surfaced a template bug now fixed: `build_template` wrote the
+BIP34 height as a bare `OP_N` push, a 1-byte scriptSig at heights
+1–16 — below the consensus coinbase minimum (`bad-cb-length`). Core's
+`CScript() << nHeight << OP_0` appends a trailing `OP_0`; the
+template now does the same.
 
 Exact matches now include the full display layer: `decodescript` on
 P2PKH, taproot, unknown-witness, and nonstandard scripts returns
@@ -112,5 +127,6 @@ v0: raw hex), `getchaintips`, `getrawmempool`, `getconnectioncount`,
   returning a floor — the estimator only reports rates it observed.
 - `getrawtransaction` requires a named block for non-pool txs; no
   txindex (same failure mode as Core without `txindex=1`).
-- `stop` and `sendrawtransaction` are the only mutating methods;
-  `sendrawtransaction` admits to our pool and relays to peers.
+- Mutating methods are `stop`, `sendrawtransaction`, `submitblock`;
+  `sendrawtransaction` admits to our pool and relays to peers,
+  `submitblock` connects to the chainstate and announces the tip.

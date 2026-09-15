@@ -148,7 +148,15 @@ impl Mempool {
                     txid: Txid::ZERO,
                     vout: u32::MAX,
                 },
-                script_sig: Script::new(script::push_int(i64::from(height))),
+                // Core's `CScript() << nHeight << OP_0`: the OP_N prefix
+                // alone is a single byte at heights 1–16, below the
+                // consensus coinbase-scriptSig minimum — the trailing
+                // OP_0 keeps even the shortest height encodings valid.
+                script_sig: Script::new({
+                    let mut s = script::push_int(i64::from(height));
+                    s.push(script::OP_0);
+                    s
+                }),
                 sequence: u32::MAX,
                 witness: if has_witness {
                     // BIP141: the coinbase carries the 32-byte nonce slot.
