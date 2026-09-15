@@ -72,11 +72,11 @@ python3 tools/compare_rpc.py \
 
 ## Results
 
-Latest run vs **Core 29.4** at h163: 102 MATCH, 1 EXPECTED-DIFF
+Latest run vs **Core 29.4** at h163: 103 MATCH, 1 EXPECTED-DIFF
 (`getrawtransaction`'s `in_active_chain` — an upstream field added
 after 29.4, verified present in Core 31.1), 0 DIFFERS, 1 CORE-ERROR
 (`gettxoutproof prove_witness` — the witness-proof wire format is a
-Knots extension Core doesn't implement), 143 BOTH-ERROR (identical
+Knots extension Core doesn't implement), 144 BOTH-ERROR (identical
 error paths). `getpeerinfo` now matches fully once the peer pair
 settles — the earlier per-peer shape diff was connection-phase
 state. First matrix vs Knots: 46 MATCH, 2 EXPECTED-DIFF,
@@ -487,6 +487,15 @@ surfaced:
   byte-identical including string amounts (`"1e-3"`), dict/array
   output ordering, scalar `data` stringification (`7` →
   `"not '7'"`), and the OP_RETURN construction.
+- `getprioritisedtransactions` dumps `mapDeltas` in Core's `std::map`
+  order — txid raw bytes, the reverse of display order — with
+  `in_mempool`/`modified_fee` (base fee + delta, in sats) only for
+  pooled transactions. Verified live: a prioritised pooled tx reports
+  `{"fee_delta":10000,"in_mempool":true,"modified_fee":11000}`
+  identically on both daemons, and unknown-txid slots report
+  `in_mempool:false` without `modified_fee`. Any argument is
+  `-1`+help. The harness counts the method as per-node state — the
+  map accumulates each daemon's own prioritisetransaction history.
 
 ### Known semantic differences
 

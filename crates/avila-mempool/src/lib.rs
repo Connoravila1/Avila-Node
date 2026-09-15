@@ -1299,6 +1299,13 @@ impl Mempool {
         }
     }
 
+    /// The `mapDeltas` map itself, for `getprioritisedtransactions` —
+    /// Core iterates `std::map<Txid,...>` (txid raw-byte order), so
+    /// callers sort `Txid`'s raw bytes to match.
+    pub fn deltas(&self) -> &HashMap<Txid, i64> {
+        &self.deltas
+    }
+
     /// Drops every tx that spends a block's *newly spent* outpoints or
     /// whose txid the block now confirms — Core's
     /// `removeForBlock`-lite: confirmed txs leave the pool, and so do

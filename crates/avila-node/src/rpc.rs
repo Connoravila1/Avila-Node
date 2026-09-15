@@ -1017,6 +1017,9 @@ const GETBLOCKFROMPEER_HELP: &str = "getblockfrompeer \"blockhash\" peer_id\n\nA
 /// Verbatim `help prioritisetransaction` text (Bitcoin Core 29.4).
 const PRIORITISETRANSACTION_HELP: &str = "prioritisetransaction \"txid\" ( dummy ) fee_delta\n\nAccepts the transaction into mined blocks at a higher (or lower) priority\n\nArguments:\n1. txid         (string, required) The transaction id.\n2. dummy        (numeric, optional) API-Compatibility for previous API. Must be zero or null.\n                DEPRECATED. For forward compatibility use named arguments and omit this parameter.\n3. fee_delta    (numeric, required) The fee value (in satoshis) to add (or subtract, if negative).\n                Note, that this value is not a fee rate. It is a value to modify absolute fee of the TX.\n                The fee is not actually paid, only the algorithm for selecting transactions into a block\n                considers the transaction as it would have paid a higher (or lower) fee.\n\nResult:\ntrue|false    (boolean) Returns true\n\nExamples:\n> bitcoin-cli prioritisetransaction \"txid\" 0.0 10000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"prioritisetransaction\", \"params\": [\"txid\", 0.0, 10000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+/// Verbatim `help getprioritisedtransactions` text (Bitcoin Core 29).
+const GETPRIORITISEDTRANSACTIONS_HELP: &str = "getprioritisedtransactions\n\nReturns a map of all user-created (see prioritisetransaction) fee deltas by txid, and whether the tx is present in mempool.\n\nResult:\n{                                 (json object) prioritisation keyed by txid\n  \"<transactionid>\" : {           (json object)\n    \"fee_delta\" : n,              (numeric) transaction fee delta in satoshis\n    \"in_mempool\" : true|false,    (boolean) whether this transaction is currently in mempool\n    \"modified_fee\" : n            (numeric, optional) modified fee in satoshis. Only returned if in_mempool=true\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getprioritisedtransactions \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getprioritisedtransactions\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 /// Verbatim `help waitforblock` text (Bitcoin Core 29.4).
 const WAITFORBLOCK_HELP: &str = "waitforblock \"blockhash\" ( timeout )\n\nWaits for a specific new block and returns useful info about it.\n\nReturns the current block on timeout or exit.\n\nMake sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\n\nArguments:\n1. blockhash    (string, required) Block hash to wait for.\n2. timeout      (numeric, optional, default=0) Time in milliseconds to wait for a response. 0 indicates no timeout.\n\nResult:\n{                    (json object)\n  \"hash\" : \"hex\",    (string) The blockhash\n  \"height\" : n       (numeric) Block height\n}\n\nExamples:\n> bitcoin-cli waitforblock \"0000000000079f8ef3d2c688c244eb7a4570b24c9ed7b4a8c619eb02596f8862\" 1000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"waitforblock\", \"params\": [\"0000000000079f8ef3d2c688c244eb7a4570b24c9ed7b4a8c619eb02596f8862\", 1000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -3981,6 +3984,39 @@ fn dispatch(
                 Ok(json!(true))
             })
         }
+        // Core's getprioritisedtransactions — the mapDeltas dump:
+        // txid-keyed, sorted by the txid's raw bytes (Core's std::map
+        // order), modified_fee present only for pooled transactions.
+        "getprioritisedtransactions" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if !arr.is_empty() {
+                return help_error(GETPRIORITISEDTRANSACTIONS_HELP);
+            }
+            chain_query(queries, |_cs, mgr| {
+                let pool = mgr.mempool();
+                let mut deltas: Vec<(&Txid, &i64)> = pool.deltas().iter().collect();
+                deltas.sort_by_key(|(txid, _)| *txid.as_bytes());
+                let mut out = serde_json::Map::new();
+                for (txid, delta) in deltas {
+                    let entry = pool.entry(txid);
+                    out.insert(
+                        txid.to_string(),
+                        match entry {
+                            Some(e) => json!({
+                                "fee_delta": delta,
+                                "in_mempool": true,
+                                "modified_fee": e.modified_fee(),
+                            }),
+                            None => json!({
+                                "fee_delta": delta,
+                                "in_mempool": false,
+                            }),
+                        },
+                    );
+                }
+                Ok(Value::Object(out))
+            })
+        }
         "submitblock" => {
             let Some(raw) = param(params, 0, "hexdata").and_then(Value::as_str) else {
                 return missing_params("hexdata");
@@ -5550,6 +5586,7 @@ fn dispatch(
                  \x20   submitheader <hex>, generatetoaddress <n> <address> [maxtries],\n\
                  \x20   generateblock <output> [rawtx/txid,...],\n\
                  \x20   preciousblock <hash>, prioritisetransaction <txid> 0 <delta>,\n\
+                 \x20   getprioritisedtransactions,\n\
                  \x20   getblockfrompeer <hash> <peer_id>,\n\
                  \x20   waitforblock <hash> [timeout], waitforblockheight <h> [timeout],\n\
                  \x20   waitfornewblock [timeout]\n\
@@ -8007,6 +8044,63 @@ mod tests {
                 "0200000001{txid}0000000000ffffffff0140420f0000000000160014ad7d5448cc0401eb51b0666484f2e7e3c1f9800700000000"
             )
         );
+    }
+
+    /// `getprioritisedtransactions` — the mapDeltas dump: txid-keyed in
+    /// raw-byte order, `in_mempool`/`modified_fee` only for pooled txs.
+    #[test]
+    fn getprioritisedtransactions_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let d = |m, p: Value| dispatch(m, &p, &snap, Some(&queries), None, None);
+
+        // Any argument is a -1 + help, whatever its type.
+        for p in [json!([1]), json!(["x"]), json!([true])] {
+            let (code, msg) = d("getprioritisedtransactions", p).1.unwrap();
+            assert_eq!(code, RPC_MISC_ERROR);
+            assert!(msg.starts_with("getprioritisedtransactions"), "{msg}");
+        }
+
+        // Empty pool → empty object.
+        let (r, e) = d("getprioritisedtransactions", json!([]));
+        assert!(e.is_none());
+        assert_eq!(r, json!({}));
+
+        // Seed two deltas via prioritisetransaction — unknown txids
+        // land in mapDeltas with in_mempool=false and no modified_fee.
+        d("prioritisetransaction", json!(["cd".repeat(32), 0, 70_000]));
+        d("prioritisetransaction", json!(["ab".repeat(32), 0, -5_000]));
+        let (r, e) = d("getprioritisedtransactions", json!([]));
+        assert!(e.is_none());
+        // Raw-byte order: "ab"*32's bytes are 0xabab..; "cd"*32's are
+        // 0xcdcd.. — display order and internal order agree for
+        // palindromic hex, so also check the non-palindromic pair.
+        assert_eq!(
+            r["abababababababababababababababababababababababababababababababab"],
+            json!({"fee_delta": -5_000, "in_mempool": false})
+        );
+        assert_eq!(
+            r["cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"],
+            json!({"fee_delta": 70_000, "in_mempool": false})
+        );
+        assert_eq!(r.as_object().unwrap().len(), 2);
+        // Non-palindromic txids: internal byte order is the *reverse*
+        // of display order — "00..ff" displays with ff at the end but
+        // its raw bytes start 0xff, sorting after "ff..00" whose raw
+        // bytes start 0x00.
+        d(
+            "prioritisetransaction",
+            json!([format!("00{}ff", "11".repeat(30)), 0, 1]),
+        );
+        d(
+            "prioritisetransaction",
+            json!([format!("ff{}00", "22".repeat(30)), 0, 2]),
+        );
+        let (r, _) = d("getprioritisedtransactions", json!([]));
+        let keys: Vec<&String> = r.as_object().unwrap().keys().collect();
+        let first_new = keys.iter().position(|k| k.starts_with("ff22")).unwrap();
+        let second_new = keys.iter().position(|k| k.starts_with("0011")).unwrap();
+        assert!(first_new < second_new, "{keys:?}");
     }
 
     /// `g16` — Core's `setFloat` text: `%.16g` with its fixed/scientific

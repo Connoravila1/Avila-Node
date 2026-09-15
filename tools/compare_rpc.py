@@ -41,6 +41,10 @@ DYNAMIC_METHODS = {"uptime", "help", "getrawmempool", "savemempool",
                    # Address-manager counts — book contents differ
                    # legitimately across nodes (gossip history, seeds).
                    "getaddrmaninfo",
+                   # The mapDeltas dump accumulates each node's own
+                   # prioritisetransaction history — contents differ
+                   # whenever the two daemons' call histories do.
+                   "getprioritisedtransactions",
                    # Bare tip-hash echo — forks legitimately diverge it.
                    "getbestblockhash"}
 
@@ -318,6 +322,10 @@ def build_calls(height):
         ("prioritisetransaction", ["00" * 32, 5, 100]),
         ("prioritisetransaction", ["00" * 32, 0, 100]),
         ("prioritisetransaction", ["00" * 32, 0, -50]),
+        # getprioritisedtransactions — the mapDeltas dump; seeded by
+        # the rows above. Empty on a fresh node, args → -1+help.
+        ("getprioritisedtransactions", []),
+        ("getprioritisedtransactions", [1]),
         # getblockfrompeer — two required args, collected -3 list,
         # then "Block header missing" / "Block already downloaded" /
         # "Peer does not exist" (all -1). HASH is on the active chain

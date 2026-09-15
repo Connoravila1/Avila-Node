@@ -254,7 +254,10 @@ operation. Compare complete initial download and catch-up, not only local replay
       totals, and template ordering while template `"fee"` stays
       base like Core — plus the unbroadcast set and the
       depends/spentby/bip125-replaceable entry fields the RPC
-      exposes), getblockfrompeer (targeted `getdata[MSG_WITNESS_BLOCK]`
+      exposes), getprioritisedtransactions (the mapDeltas dump in
+      Core's std::map raw-txid order, with in_mempool/modified_fee
+      only for pooled txs),
+      getblockfrompeer (targeted `getdata[MSG_WITNESS_BLOCK]`
       on a named session after Core's full -1 check chain — header
       missing, already downloaded, peer does not exist),
       waitforblock/waitforblockheight/waitfornewblock (Core's blocking
