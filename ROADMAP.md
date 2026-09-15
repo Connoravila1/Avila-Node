@@ -231,11 +231,18 @@ operation. Compare complete initial download and catch-up, not only local replay
       Core's ungated level/depth semantics including 0/negative = all),
       getaddrmaninfo (per-network new/tried/total book counts with all
       of Core's fixed keys; onion/I2P/CJDNS stay structurally zero
-      while `NetAddr` is 16 bytes). Outbound dialing is asynchronous —
+      while `NetAddr` is 16 bytes), preciousblock (the equal-work
+      tie-break — an in-memory mark that wins `chainwork` ties in
+      `maybe_reorg` and re-runs tip selection immediately, so a later
+      call overrides the earlier one and nothing survives a restart,
+      like Core's nSequenceId). Outbound dialing is asynchronous —
       `maintain_outbounds` runs `connect_timeout` on slot-bounded
       worker threads and drains results on the tick, so a book of dead
       ends can't serialize RPC queries behind dial timeouts — verified
-      live over curl and the client.
+      live over curl and the client. SIGTERM/SIGINT take the `stop`
+      path — the loop exits through the normal shutdown block, so
+      peers.dat, mempool.dat, and banlist.json persist across kills
+      instead of being silently dropped.
       Genesis is served even though its body is never stored:
       `Params::genesis_block` reconstructs Core's per-network
       `CreateGenesisBlock` coinbase and `Chainstate::body` falls back

@@ -346,6 +346,21 @@ surfaced:
   structurally zero: the 16-byte `NetAddr` can't represent them, and
   Core keys them off the address type anyway. Marked dynamic in the
   harness since two nodes' books legitimately differ.
+- `preciousblock` marks a block as the equal-work tie winner — Core's
+  `nSequenceId` bump plus an `ActivateBestChain` re-run. The mark is a
+  single in-memory slot (a later call overrides, restarts forget it —
+  Core's behavior verbatim). Validation order matches: arity ≠ 1
+  throws `-1` + help, non-string throws `-3` with the Position-1
+  `Wrong type passed` list, ParseHashV throws `-8`, an out-of-index
+  hash throws `-5` "Block not found", and marking the tip returns
+  `null`. Verified live on Core 29.4 across every path; the tie-flip
+  itself is covered by a unit test on a three-way equal-work fork.
+- SIGTERM/SIGINT now land on the same `cancel` flag as `stop` — the
+  run loop exits through the normal shutdown block, so `peers.dat`,
+  `mempool.dat`, and `banlist.json` persist across kills. Previously a
+  signal killed the process outright and the address book never
+  reached disk (verified live: seed → TERM → peers.dat written →
+  restart → `getaddrmaninfo` shows the entry).
 - Outbound dials run on worker threads — `maintain_outbounds` queues
   `TcpStream::connect_timeout` calls (5s bound) instead of running
   them on the sync loop, and drains results back through a channel on

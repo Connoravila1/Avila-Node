@@ -151,6 +151,12 @@ pub struct Chainstate {
     /// [`Chainstate::enable_txindex`] ran; when present every body
     /// retained by `accept_block` records its transactions here.
     txindex: Option<TxIndex>,
+    /// `preciousblock` — the block that wins equal-work tie-breaks.
+    /// Core implements it as the lowest `nSequenceId` (reception order
+    /// settles work ties); a later call overrides the earlier one, and
+    /// nothing persists it across restarts — hence a plain in-memory
+    /// slot here.
+    precious: Option<BlockHash>,
 }
 
 /// The transaction index behind `-txindex`: every retained block's
@@ -278,6 +284,7 @@ impl Chainstate {
             undos: Vec::new(),
             store: None,
             txindex: None,
+            precious: None,
         }
     }
 
@@ -921,7 +928,13 @@ impl Chainstate {
         let Some(conn_node) = self.tree.get(&self.connected) else {
             return Err(ConnectError::Internal("connected tip not in tree"));
         };
-        if new_node.chainwork <= conn_node.chainwork {
+        // Equal work only activates when the candidate tip is the
+        // `preciousblock` — Core's nSequenceId tie-break where the
+        // precious block counts as received earliest.
+        let wins_tie = new_node.chainwork == conn_node.chainwork && self.precious == Some(hash);
+        if new_node.chainwork < conn_node.chainwork
+            || (new_node.chainwork == conn_node.chainwork && !wins_tie)
+        {
             return Ok(None);
         }
         // Activation pruning: `FindMostWorkChain` skips a candidate whose
@@ -1001,6 +1014,31 @@ impl Chainstate {
         self.undos.extend(new_undos);
         self.connected = hash;
         Ok(Some(disconnected))
+    }
+
+    /// `preciousblock` — marks `hash` as the equal-work tie winner and
+    /// re-runs tip selection, like Core's `PreciousBlock` bumping the
+    /// block's `nSequenceId` then calling `ActivateBestChain`. Returns
+    /// `Ok(false)` when `hash` isn't in the block index (the caller
+    /// maps that to "Block not found"); `Ok(true)` after the mark —
+    /// a less-work or header-only candidate simply stays parked, which
+    /// is still a Core success. The mark is in-memory only: Core's
+    /// sequence ids don't persist either, so a restart forgets it.
+    ///
+    /// # Errors
+    ///
+    /// `ConnectError` when the marked block wins its tie but fails to
+    /// connect during the reorg.
+    pub fn precious_block(&mut self, hash: &BlockHash) -> Result<bool, ConnectError> {
+        if !self.tree.contains(hash) {
+            return Ok(false);
+        }
+        self.precious = Some(*hash);
+        // Immediate re-evaluation — a precious side-branch tip with
+        // equal work activates on the spot (Core: ActivateBestChain).
+        let params = *self.tree.params();
+        self.maybe_reorg(*hash, &params)?;
+        Ok(true)
     }
 }
 
@@ -1184,6 +1222,51 @@ mod tests {
             Ok(Acceptance::Parked { height: 1 })
         );
         assert_eq!(cs.tip_hash(), a.block_hash());
+    }
+
+    /// `preciousblock` flips an equal-work parked tip onto the active
+    /// chain and a later call overrides it — Core's nSequenceId
+    /// tie-break. An unknown hash reports not-found; a shorter-work
+    /// branch stays parked.
+    #[test]
+    fn precious_block_wins_equal_work_ties() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        let a = block_on(&genesis_header(), vec![coinbase_tx(1, subsidy(1))], &params);
+        cs.accept_block(&a, NOW).unwrap();
+        let b = block_on(
+            &genesis_header(),
+            vec![tagged_coinbase(1, subsidy(1), script::OP_RETURN)],
+            &params,
+        );
+        let c = block_on(
+            &genesis_header(),
+            vec![tagged_coinbase(1, subsidy(1), script::OP_EQUAL)],
+            &params,
+        );
+        cs.accept_block(&b, NOW).unwrap();
+        cs.accept_block(&c, NOW).unwrap();
+        assert_eq!(cs.tip_hash(), a.block_hash());
+
+        // Unknown hash → not found; the tip is unchanged.
+        assert_eq!(
+            cs.precious_block(&BlockHash::from_bytes([0xee; 32])),
+            Ok(false)
+        );
+        assert_eq!(cs.tip_hash(), a.block_hash());
+
+        // Precious b activates its equal-work branch immediately.
+        assert_eq!(cs.precious_block(&b.block_hash()), Ok(true));
+        assert_eq!(cs.tip_hash(), b.block_hash());
+        assert_eq!(cs.chain()[1], b.block_hash());
+
+        // A later call overrides: precious c re-flips the tie.
+        assert_eq!(cs.precious_block(&c.block_hash()), Ok(true));
+        assert_eq!(cs.tip_hash(), c.block_hash());
+
+        // Precious on the active tip is a harmless no-op.
+        assert_eq!(cs.precious_block(&c.block_hash()), Ok(true));
+        assert_eq!(cs.tip_hash(), c.block_hash());
     }
 
     #[test]

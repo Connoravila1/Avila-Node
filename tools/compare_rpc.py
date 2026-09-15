@@ -254,6 +254,13 @@ def build_calls(height):
         ("verifychain", [3, "x"]),
         ("verifychain", [1.5]),
         ("verifychain", [3, 10, "x"]),
+        # preciousblock — the active tip is a valid (if vacuous) mark.
+        ("preciousblock", []),
+        ("preciousblock", [7]),
+        ("preciousblock", ["00"]),
+        ("preciousblock", ["00" * 32]),
+        ("preciousblock", ["HASH"]),
+        ("preciousblock", ["00", "x"]),
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),
         ("estimatesmartfee", [6]),

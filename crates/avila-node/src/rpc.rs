@@ -609,6 +609,9 @@ const VERIFYTXOUTPROOF_HELP: &str = "verifytxoutproof \"proof\" ( {\"verify_witn
 /// Verbatim `help getindexinfo` text (Bitcoin Core 29).
 const GETINDEXINFO_HELP: &str = "getindexinfo ( \"index_name\" )\n\nReturns the status of one or all available indices currently running in the node.\n\nArguments:\n1. index_name    (string, optional) Filter results for an index with a specific name.\n\nResult:\n{                               (json object)\n  \"name\" : {                    (json object) The name of the index\n    \"synced\" : true|false,      (boolean) Whether the index is synced or not\n    \"best_block_height\" : n     (numeric) The block height to which the index is synced\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getindexinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> bitcoin-cli getindexinfo txindex\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": [txindex]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+/// Verbatim `help preciousblock` text (Bitcoin Core 29.4).
+const PRECIOUSBLOCK_HELP: &str = "preciousblock \"blockhash\"\n\nTreats a block as if it were received before others with the same work.\n\nA later preciousblock call can override the effect of an earlier one.\n\nThe effects of preciousblock are not retained across restarts.\n\nArguments:\n1. blockhash    (string, required) the hash of the block to mark as precious\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli preciousblock \"blockhash\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"preciousblock\", \"params\": [\"blockhash\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 /// Verbatim `help verifychain` text (Bitcoin Core 29.4).
 const VERIFYCHAIN_HELP: &str = "verifychain ( checklevel nblocks )\n\nVerifies blockchain database.\n\nArguments:\n1. checklevel    (numeric, optional, default=3, range=0-4) How thorough the block verification is:\n                 - level 0 reads the blocks from disk\n                 - level 1 verifies block validity\n                 - level 2 verifies undo data\n                 - level 3 checks disconnection of tip blocks\n                 - level 4 tries to reconnect the blocks\n                 - each level includes the checks of the previous levels\n2. nblocks       (numeric, optional, default=6, 0=all) The number of blocks to check.\n\nResult:\ntrue|false    (boolean) Verification finished successfully. If false, check debug.log for reason.\n\nExamples:\n> bitcoin-cli verifychain \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"verifychain\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -3167,6 +3170,29 @@ fn dispatch(
                 }
             })
         }
+        "preciousblock" => {
+            let [v] = params.as_array().map(Vec::as_slice).unwrap_or(&[]) else {
+                return help_error(PRECIOUSBLOCK_HELP);
+            };
+            let Some(s) = v.as_str() else {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_message(1, "blockhash", v, "string"),
+                    )),
+                );
+            };
+            let hash: BlockHash = match parse_hash_v(s, "blockhash") {
+                Ok(h) => h,
+                Err(e) => return (Value::Null, Some(e)),
+            };
+            chain_query(queries, move |cs, _mgr| match cs.precious_block(&hash) {
+                Ok(true) => Ok(Value::Null),
+                Ok(false) => Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into())),
+                Err(_) => Err((RPC_MISC_ERROR, "preciousblock revalidation failed".into())),
+            })
+        }
         "generatetoaddress" => {
             let Some(nblocks) = param(params, 0, "nblocks").and_then(Value::as_u64) else {
                 return missing_params("nblocks address");
@@ -4461,7 +4487,8 @@ fn dispatch(
                  \x20 mining: getblocktemplate, getmininginfo, getnetworkhashps,\n\
                  \x20   submitblock <hex>,\n\
                  \x20   submitheader <hex>, generatetoaddress <n> <address> [maxtries],\n\
-                 \x20   generateblock <output> [rawtx/txid,...]\n\
+                 \x20   generateblock <output> [rawtx/txid,...],\n\
+                 \x20   preciousblock <hash>\n\
                  \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo,\n\
                  \x20   getnettotals, getnodeaddresses [count] [network],\n\
                  \x20   getaddrmaninfo,\n\
@@ -6033,6 +6060,64 @@ mod tests {
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["ipv4"], json!({"new": 0, "tried": 1, "total": 1}));
         assert_eq!(r["all_networks"], json!({"new": 0, "tried": 1, "total": 1}));
+    }
+
+    /// `preciousblock` — ParseHashV errors, `-5` for a hash outside
+    /// the index, `null` on success (genesis is in the index, so
+    /// marking it is a valid no-op).
+    #[test]
+    fn preciousblock_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+
+        // Missing/extra args → -1 + help; non-string → -3 (Core's
+        // Wrong-type "Position 1 (blockhash)" message).
+        let (_, e) = dispatch("preciousblock", &json!([]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+        let (_, e) = dispatch("preciousblock", &json!([7]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
+        let (_, e) = dispatch(
+            "preciousblock",
+            &json!(["00", "x"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+
+        // ParseHashV: wrong length → -8, bad hex → -8.
+        let (_, e) = dispatch("preciousblock", &json!(["00"]), &snap, Some(&queries), None);
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_INVALID_PARAMETER);
+        assert!(msg.contains("length 64 (not 2"), "{msg}");
+
+        // A well-formed hash with no index entry → -5 Block not found.
+        let unknown = "00".repeat(32);
+        let (_, e) = dispatch(
+            "preciousblock",
+            &json!([unknown]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (RPC_INVALID_ADDRESS_OR_KEY, "Block not found".to_string())
+        );
+
+        // Genesis is in the index — marking it returns null.
+        let (r, e) = dispatch("getblockhash", &json!([0]), &snap, Some(&queries), None);
+        assert!(e.is_none());
+        let genesis = r.as_str().unwrap().to_string();
+        let (r, e) = dispatch(
+            "preciousblock",
+            &json!([genesis]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, Value::Null);
     }
 
     /// `getrpcinfo`/`getmemoryinfo`/`logging` — the introspection
