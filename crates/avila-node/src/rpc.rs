@@ -606,6 +606,9 @@ const VERIFYTXOUTPROOF_HELP: &str = "verifytxoutproof \"proof\" ( {\"verify_witn
 /// Verbatim `help getindexinfo` text (Bitcoin Core 29).
 const GETINDEXINFO_HELP: &str = "getindexinfo ( \"index_name\" )\n\nReturns the status of one or all available indices currently running in the node.\n\nArguments:\n1. index_name    (string, optional) Filter results for an index with a specific name.\n\nResult:\n{                               (json object)\n  \"name\" : {                    (json object) The name of the index\n    \"synced\" : true|false,      (boolean) Whether the index is synced or not\n    \"best_block_height\" : n     (numeric) The block height to which the index is synced\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getindexinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> bitcoin-cli getindexinfo txindex\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": [txindex]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+/// Verbatim `help verifychain` text (Bitcoin Core 29.4).
+const VERIFYCHAIN_HELP: &str = "verifychain ( checklevel nblocks )\n\nVerifies blockchain database.\n\nArguments:\n1. checklevel    (numeric, optional, default=3, range=0-4) How thorough the block verification is:\n                 - level 0 reads the blocks from disk\n                 - level 1 verifies block validity\n                 - level 2 verifies undo data\n                 - level 3 checks disconnection of tip blocks\n                 - level 4 tries to reconnect the blocks\n                 - each level includes the checks of the previous levels\n2. nblocks       (numeric, optional, default=6, 0=all) The number of blocks to check.\n\nResult:\ntrue|false    (boolean) Verification finished successfully. If false, check debug.log for reason.\n\nExamples:\n> bitcoin-cli verifychain \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"verifychain\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 /// Verbatim `help setban` text (Bitcoin Core 29.4).
 const SETBAN_HELP: &str = "setban \"subnet\" \"command\" ( bantime absolute )\n\nAttempts to add or remove an IP/Subnet from the banned list.\n\nArguments:\n1. subnet      (string, required) The IP/Subnet (see getpeerinfo for nodes IP) with an optional netmask (default is /32 = single IP)\n2. command     (string, required) 'add' to add an IP/Subnet to the list, 'remove' to remove an IP/Subnet from the list\n3. bantime     (numeric, optional, default=0) time in seconds how long (or until when if [absolute] is set) the IP is banned (0 or empty means using the default time of 24h which can also be overwritten by the -bantime startup argument)\n4. absolute    (boolean, optional, default=false) If set, the bantime must be an absolute timestamp expressed in UNIX epoch time\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli setban \"192.168.0.6\" \"add\" 86400\n> bitcoin-cli setban \"192.168.0.0/24\" \"add\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"setban\", \"params\": [\"192.168.0.6\", \"add\", 86400]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -1425,6 +1428,60 @@ fn dispatch(
                 .map(|n| core_num(difficulty(n.header.bits.0)))
                 .unwrap_or(Value::Null))
         }),
+        "verifychain" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() > 2 {
+                return help_error(VERIFYCHAIN_HELP);
+            }
+            // RPCHelpMan's type pass: both args numeric; an explicit
+            // null is the "use default" marker, not a type error.
+            if let Some(v) = arr.first().filter(|v| !(v.is_number() || v.is_null())) {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_message(1, "checklevel", v, "number"),
+                    )),
+                );
+            }
+            if let Some(v) = arr.get(1).filter(|v| !(v.is_number() || v.is_null())) {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_message(2, "nblocks", v, "number"),
+                    )),
+                );
+            }
+            // getInt<int>: non-integral or out-of-range is UniValue's -1.
+            let level = match arr.first() {
+                None | Some(Value::Null) => 3, // -checklevel default
+                Some(v) => match v.as_i64().and_then(|n| i32::try_from(n).ok()) {
+                    Some(n) => n,
+                    None => {
+                        return (
+                            Value::Null,
+                            Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                        );
+                    }
+                },
+            };
+            let depth = match arr.get(1) {
+                None | Some(Value::Null) => 6, // -checkdepth default (29.x)
+                Some(v) => match v.as_i64() {
+                    Some(n) => n,
+                    None => {
+                        return (
+                            Value::Null,
+                            Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                        );
+                    }
+                },
+            };
+            // Core applies no range gate on either value — VerifyDB
+            // clamps depth to the tip and level < 0 checks nothing.
+            chain_query(queries, move |cs, _| Ok(json!(cs.verify_tip(level, depth))))
+        }
         "getblockchaininfo" => chain_query(queries, |cs, _mgr| {
             let tip = cs.tip_hash();
             let connected = cs.chain().len().saturating_sub(1) as u32;
@@ -4352,7 +4409,8 @@ fn dispatch(
                  \x20   decoderawtransaction <hex> [iswitness], getindexinfo [index_name],\n\
                  \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>,\n\
                  \x20   gettxoutproof <txids> [blockhash] [options],\n\
-                 \x20   verifytxoutproof <proof> [options], validateaddress <address>\n\
+                 \x20   verifytxoutproof <proof> [options], validateaddress <address>,\n\
+                 \x20   verifychain [checklevel] [nblocks]\n\
                  \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
                  \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
                  \x20   gettxspendingprevout <outputs>,\n\
@@ -5867,6 +5925,40 @@ mod tests {
         let (r, e) = dispatch("listbanned", &json!([]), &snap, Some(&queries), None);
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!([]));
+    }
+
+    /// `verifychain` — the bool result plus Core's arg contract: no
+    /// range gate on checklevel/nblocks, -3 type errors per position,
+    /// -1 for non-integral or excess args.
+    #[test]
+    fn verifychain_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+
+        // Genesis-only chain: every level/depth verifies (vacuous).
+        for p in [
+            json!([]),
+            json!([3]),
+            json!([4, 10]),
+            json!([0, 0]),
+            json!([5]),
+            json!([-1]),
+            json!([null, null]),
+        ] {
+            let (r, e) = dispatch("verifychain", &p, &snap, Some(&queries), None);
+            assert!(e.is_none(), "{p}: {e:?}");
+            assert_eq!(r, json!(true), "{p}");
+        }
+        for (p, code) in [
+            (json!(["x"]), RPC_TYPE_ERROR),
+            (json!([3, "x"]), RPC_TYPE_ERROR),
+            (json!([1.5]), RPC_MISC_ERROR),
+            (json!([4, 1.5]), RPC_MISC_ERROR),
+            (json!([3, 10, "x"]), RPC_MISC_ERROR),
+        ] {
+            let (_, e) = dispatch("verifychain", &p, &snap, Some(&queries), None);
+            assert_eq!(e.unwrap().0, code, "params {p}");
+        }
     }
 
     /// `getrpcinfo`/`getmemoryinfo`/`logging` — the introspection

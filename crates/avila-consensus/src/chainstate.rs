@@ -631,6 +631,79 @@ impl Chainstate {
         self.undos.get(height as usize - 1)
     }
 
+    /// `CVerifyDB::VerifyDB` — re-validates the last `depth` connected
+    /// blocks, walking backwards through their undo records on a cloned
+    /// UTXO set (level ≥ 3) then forwards again through `CheckBlock`,
+    /// `ContextualCheckBlock`, and a full `ConnectBlock` with the same
+    /// per-block script-check decision the live connect used (level 4).
+    /// Level 0 checks body presence, ≥ 1 adds `CheckBlock`, ≥ 2 undo
+    /// records, ≥ 3 the disconnect pass. The live UTXO set is never
+    /// touched, so a `false` verdict leaves the chainstate consistent.
+    /// `depth <= 0` or a depth past the tip means the whole chain
+    /// (VerifyDB's `check_depth` clamp); `check_level < 0` runs no
+    /// checks and returns `true`, like Core.
+    #[must_use]
+    pub fn verify_tip(&self, check_level: i32, depth: i64) -> bool {
+        let tip = self.chain.len() as u32 - 1; // chain[0] is genesis
+        if check_level < 0 {
+            return true;
+        }
+        let depth = if depth <= 0 || depth > i64::from(tip) {
+            i64::from(tip)
+        } else {
+            depth
+        };
+        let start = (u64::from(tip) + 1 - depth as u64) as u32;
+        let params = *self.tree.params();
+        let mut utxo = self.utxo.clone();
+        // VerifyDB's backward pass: bodies present (level 0), CheckBlock
+        // (≥ 1), undo present (≥ 2), DisconnectBlock applies (≥ 3).
+        for height in (start..=tip).rev() {
+            let hash = self.chain[height as usize];
+            let Some(block) = self.body(&hash) else {
+                return false;
+            };
+            if check_level >= 1 && check::check_block(&block, &params).is_err() {
+                return false;
+            }
+            let Some(undo) = self.undos.get(height as usize - 1) else {
+                return check_level < 2;
+            };
+            if check_level >= 3 && connect::disconnect_block(&block, &mut utxo, undo).is_err() {
+                return false;
+            }
+        }
+        if check_level < 4 {
+            return true;
+        }
+        // Forward pass: full reconnect — contextual checks plus
+        // ConnectBlock under the live assumevalid script decision.
+        for height in start..=tip {
+            let hash = self.chain[height as usize];
+            let Some(block) = self.body(&hash) else {
+                return false;
+            };
+            let ctx = BlockContext {
+                params: &params,
+                height,
+                parent_median_time_past: self.tree.median_time_past(&block.header.prev_block_hash),
+            };
+            if check::contextual_check_block(&block, &ctx).is_err() {
+                return false;
+            }
+            let cctx = ConnectContext {
+                params: &params,
+                tree: &self.tree,
+                block_hash: hash,
+                script_checks: self.script_checks(&hash, &params),
+            };
+            if connect::connect_block(&block, &mut utxo, &cctx).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Indexes a header without a body — Core's `ProcessNewBlockHeaders` →
     /// `AcceptBlockHeader`. Headers-first intake matters for `assume_valid`:
     /// `ConnectBlock` only skips script checks when the best *header* sits far
@@ -1042,6 +1115,50 @@ mod tests {
         assert_eq!(cs.chain().len(), 4);
         assert_eq!(cs.tip_hash(), parent.hash());
         assert_eq!(cs.utxo().len(), 3);
+    }
+
+    #[test]
+    fn verify_tip_revalidates_at_each_level() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        let mut parent = genesis_header();
+        for height in 1..=5u32 {
+            let block = block_on(&parent, vec![coinbase_tx(height, subsidy(height))], &params);
+            parent = block.header;
+            assert!(cs.accept_block(&block, NOW).is_ok());
+        }
+        // Honest chain: every level and depth verifies. 0 means "all"
+        // and a depth past the tip clamps to it — Core's VerifyDB.
+        for level in 0..=4 {
+            assert!(cs.verify_tip(level, 5), "level {level}");
+            assert!(cs.verify_tip(level, 3), "level {level} partial");
+        }
+        assert!(cs.verify_tip(4, 0));
+        assert!(cs.verify_tip(4, 100));
+        assert!(cs.verify_tip(-1, 5)); // level < 0 checks nothing
+        assert!(cs.verify_tip(4, -7)); // depth < 0: whole chain
+        assert!(Chainstate::new(&params).verify_tip(4, 10));
+    }
+
+    #[test]
+    fn verify_tip_fails_when_bodies_are_gone() {
+        let params = params();
+        let dir = store_dir("verify-pruned");
+        let blocks = probe_chain(6, &[], &params);
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        for block in &blocks {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        assert!(cs.verify_tip(4, 0)); // whole chain verifies
+        // Drop the blk file under the live store — the index still
+        // names positions but reads fail, so `body` reports None and
+        // verification fails at every level like Core's
+        // `ReadBlockFromDisk` failure does.
+        std::fs::remove_file(dir.join("blk00000.dat")).unwrap();
+        assert!(!cs.verify_tip(4, 0));
+        assert!(!cs.verify_tip(0, 6));
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

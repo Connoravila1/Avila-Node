@@ -330,6 +330,16 @@ surfaced:
   `time_remaining` in Core's sort order (v4-mapped before native
   v6). Inbound-listener enforcement lands when sockets carry remote
   addresses into `add_inbound`.
+- `verifychain` runs `Chainstate::verify_tip` — VerifyDB's backward
+  pass disconnects the last `nblocks` blocks through their undo
+  records on a cloned coins view (level ≥ 3), then reconnects each
+  through `CheckBlock`/`ContextualCheckBlock`/`ConnectBlock` with the
+  live assumevalid script decision (level 4). The real UTXO set is
+  never touched, so a false verdict can't corrupt state. Core's arg
+  semantics reproduce exactly: `checklevel` is ungated (5 and -1
+  verify — levels compose by threshold), `nblocks` 0/negative/past-tip
+  clamps to the whole chain, explicit nulls take the defaults
+  (3 / 6), non-integral args throw `-1` "JSON integer out of range".
 
 ### Known semantic differences
 
