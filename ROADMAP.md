@@ -175,7 +175,7 @@ operation. Compare complete initial download and catch-up, not only local replay
       testmempoolaccept with a per-gate policy trace,
       getblocktemplate built from live chainstate + pool,
       getmininginfo, getnetworkinfo, getconnectioncount, stop,
-      sendrawtransaction, submitblock, submitheader,
+      sendrawtransaction, submitpackage, submitblock, submitheader,
       generatetoaddress, generateblock, savemempool,
       validateaddress, getblockstats (undo-backed fee/UTXO
       aggregates, Core's selector errors and stats filter),
@@ -336,8 +336,20 @@ operation. Compare complete initial download and catch-up, not only local replay
       named blocks — spend events from undo data, receive events
       from outputs, plus mempool coverage — with ScriptToUniv-shaped
       script objects (the classifier now names the v28+ ephemeral-
-      anchor template "anchor"). Verified byte-identical against
-      Core 29.4 including a live spend+receive. Outbound
+      anchor template "anchor"), and submitpackage performs Core's
+      child-with-unconfirmed-parents package admission: 1–25 member
+      bounds, ParseFeeRate/AmountFromValue on maxfeerate/
+      maxburnamount, per-output burn checks, topology enforcement
+      (-25 "package topology disallowed…"), package-level
+      duplicates/conflict states with empty tx-results, ordered
+      admission where in-package children resolve their parents
+      through the pool, and per-member wtxid-keyed results
+      ({txid, vsize, fees{base, effective-feerate,
+      effective-includes}} on accept, {txid, error} on reject,
+      pooled-member and different-witness shapes) plus
+      replaced-transactions. Verified byte-identical against
+      Core 29.4 including a live spend+receive and a real
+      parent+child package. Outbound
       dialing is
       asynchronous —
       `maintain_outbounds` runs `connect_timeout` on slot-bounded

@@ -647,6 +647,33 @@ surfaced:
   Verified live: 24-row error/arity matrix byte-identical, plus
   real spend+receive events on a shared regtest block and a
   mempool receive — all byte-identical to Core 29.4.
+- `submitpackage` added (Core 29.4 package relay): the args are
+  `["rawtx",...] ( maxfeerate maxburnamount )` — 1–25 members (`-8`
+  bounds), `ParseFeeRate`/`AmountFromValue` on the two optional
+  amounts (`-3` "Invalid amount"/"Amount out of range", `-8` once
+  the rate reaches 1 BTC/kvB), per-element string type errors
+  (`-3` "JSON value of type X is not of expected type string"),
+  `-22` decode failures that echo the raw member, per-output burn
+  checks (`-25`), and `IsChildWithParentsTree` topology — every
+  earlier member must be a direct input parent of the last and no
+  parent may spend another (`-25 "package topology disallowed…"`).
+  Package-level `CheckPackage` failures (`package-contains-
+  duplicates`, `conflict-in-package`) return before any evaluation
+  with empty `tx-results`. Otherwise each member is admitted in
+  order — in-package children resolve their unconfirmed parents
+  through the pool — and reported under its wtxid: `{txid, vsize,
+  fees:{base, effective-feerate, effective-includes}}` on accept,
+  `{txid, error}` on reject, `{txid, vsize, fees:{base}}` when
+  already pooled, and `{txid, other-wtxid}` on same-txid-different-
+  witness. `package_msg` is `"success"`/`"transaction failed"` and
+  `replaced-transactions` collects the BIP125 victims. Verified
+  live against Core 29.4: the full error matrix, a real
+  parent+child package (byte-identical including effective-feerate
+  and effective-includes), a resubmission (MEMPOOL_ENTRY shape),
+  conflicting parents, and a failing member's per-tx errors. Note:
+  `effective-feerate` reports the member's own rate; Core's
+  package-feerate chunking for a child whose own rate is lower
+  than the package's is not yet reproduced.
 
 ### Known semantic differences
 

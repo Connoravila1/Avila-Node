@@ -35,7 +35,7 @@ use avila_consensus::chain::HeaderNode;
 use avila_consensus::chainstate::Chainstate;
 use avila_consensus::check::RuleError;
 use avila_consensus::descriptor::{infer_descriptor, parse_descriptors};
-use avila_consensus::hash::{BlockHash, Txid};
+use avila_consensus::hash::{BlockHash, Txid, Wtxid};
 use avila_consensus::header::BlockHeader;
 use avila_consensus::hex;
 use avila_consensus::transaction::{OutPoint, Script, Transaction, TxIn, TxOut};
@@ -1584,6 +1584,59 @@ const GETMEMPOOLENTRY_HELP: &str = "getmempoolentry \"txid\"\n\nReturns mempool 
 const GETMEMPOOLANCESTORS_HELP: &str = "getmempoolancestors \"txid\" ( verbose )\n\nIf txid is in the mempool, returns all in-mempool ancestors.\n\nArguments:\n1. txid       (string, required) The transaction id (must be in mempool)\n2. verbose    (boolean, optional, default=false) True for a json object, false for array of transaction ids\n\nResult (for verbose = false):\n[           (json array)\n  \"hex\",    (string) The transaction id of an in-mempool ancestor transaction\n  ...\n]\n\nResult (for verbose = true):\n{                                         (json object)\n  \"transactionid\" : {                     (json object)\n    \"vsize\" : n,                          (numeric) virtual transaction size as defined in BIP 141. This is different from actual serialized size for witness transactions as witness data is discounted.\n    \"weight\" : n,                         (numeric) transaction weight as defined in BIP 141.\n    \"time\" : xxx,                         (numeric) local time transaction entered pool in seconds since 1 Jan 1970 GMT\n    \"height\" : n,                         (numeric) block height when transaction entered pool\n    \"descendantcount\" : n,                (numeric) number of in-mempool descendant transactions (including this one)\n    \"descendantsize\" : n,                 (numeric) virtual transaction size of in-mempool descendants (including this one)\n    \"ancestorcount\" : n,                  (numeric) number of in-mempool ancestor transactions (including this one)\n    \"ancestorsize\" : n,                   (numeric) virtual transaction size of in-mempool ancestors (including this one)\n    \"wtxid\" : \"hex\",                      (string) hash of serialized transaction, including witness data\n    \"fees\" : {                            (json object)\n      \"base\" : n,                         (numeric) transaction fee, denominated in BTC\n      \"modified\" : n,                     (numeric) transaction fee with fee deltas used for mining priority, denominated in BTC\n      \"ancestor\" : n,                     (numeric) transaction fees of in-mempool ancestors (including this one) with fee deltas used for mining priority, denominated in BTC\n      \"descendant\" : n                    (numeric) transaction fees of in-mempool descendants (including this one) with fee deltas used for mining priority, denominated in BTC\n    },\n    \"depends\" : [                         (json array) unconfirmed transactions used as inputs for this transaction\n      \"hex\",                              (string) parent transaction id\n      ...\n    ],\n    \"spentby\" : [                         (json array) unconfirmed transactions spending outputs from this transaction\n      \"hex\",                              (string) child transaction id\n      ...\n    ],\n    \"bip125-replaceable\" : true|false,    (boolean) Whether this transaction signals BIP125 replaceability or has an unconfirmed ancestor signaling BIP125 replaceability. (DEPRECATED)\n                                          \n    \"unbroadcast\" : true|false            (boolean) Whether this transaction is currently unbroadcast (initial broadcast not yet acknowledged by any peers)\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getmempoolancestors \"mytxid\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getmempoolancestors\", \"params\": [\"mytxid\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const GETMEMPOOLDESCENDANTS_HELP: &str = "getmempooldescendants \"txid\" ( verbose )\n\nIf txid is in the mempool, returns all in-mempool descendants.\n\nArguments:\n1. txid       (string, required) The transaction id (must be in mempool)\n2. verbose    (boolean, optional, default=false) True for a json object, false for array of transaction ids\n\nResult (for verbose = false):\n[           (json array)\n  \"hex\",    (string) The transaction id of an in-mempool descendant transaction\n  ...\n]\n\nResult (for verbose = true):\n{                                         (json object)\n  \"transactionid\" : {                     (json object)\n    \"vsize\" : n,                          (numeric) virtual transaction size as defined in BIP 141. This is different from actual serialized size for witness transactions as witness data is discounted.\n    \"weight\" : n,                         (numeric) transaction weight as defined in BIP 141.\n    \"time\" : xxx,                         (numeric) local time transaction entered pool in seconds since 1 Jan 1970 GMT\n    \"height\" : n,                         (numeric) block height when transaction entered pool\n    \"descendantcount\" : n,                (numeric) number of in-mempool descendant transactions (including this one)\n    \"descendantsize\" : n,                 (numeric) virtual transaction size of in-mempool descendants (including this one)\n    \"ancestorcount\" : n,                  (numeric) number of in-mempool ancestor transactions (including this one)\n    \"ancestorsize\" : n,                   (numeric) virtual transaction size of in-mempool ancestors (including this one)\n    \"wtxid\" : \"hex\",                      (string) hash of serialized transaction, including witness data\n    \"fees\" : {                            (json object)\n      \"base\" : n,                         (numeric) transaction fee, denominated in BTC\n      \"modified\" : n,                     (numeric) transaction fee with fee deltas used for mining priority, denominated in BTC\n      \"ancestor\" : n,                     (numeric) transaction fees of in-mempool ancestors (including this one) with fee deltas used for mining priority, denominated in BTC\n      \"descendant\" : n                    (numeric) transaction fees of in-mempool descendants (including this one) with fee deltas used for mining priority, denominated in BTC\n    },\n    \"depends\" : [                         (json array) unconfirmed transactions used as inputs for this transaction\n      \"hex\",                              (string) parent transaction id\n      ...\n    ],\n    \"spentby\" : [                         (json array) unconfirmed transactions spending outputs from this transaction\n      \"hex\",                              (string) child transaction id\n      ...\n    ],\n    \"bip125-replaceable\" : true|false,    (boolean) Whether this transaction signals BIP125 replaceability or has an unconfirmed ancestor signaling BIP125 replaceability. (DEPRECATED)\n                                          \n    \"unbroadcast\" : true|false            (boolean) Whether this transaction is currently unbroadcast (initial broadcast not yet acknowledged by any peers)\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getmempooldescendants \"mytxid\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getmempooldescendants\", \"params\": [\"mytxid\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const TESTMEMPOOLACCEPT_HELP: &str = "testmempoolaccept [\"rawtx\",...] ( maxfeerate )\n\nReturns result of mempool acceptance tests indicating if raw transaction(s) (serialized, hex-encoded) would be accepted by mempool.\n\nIf multiple transactions are passed in, parents must come before children and package policies apply: the transactions cannot conflict with any mempool transactions or each other.\n\nIf one transaction fails, other transactions may not be fully validated (the 'allowed' key will be blank).\n\nThe maximum number of transactions allowed is 25.\n\nThis checks if transactions violate the consensus or policy rules.\n\nSee sendrawtransaction call.\n\nArguments:\n1. rawtxs          (json array, required) An array of hex strings of raw transactions.\n     [\n       \"rawtx\",    (string)\n       ...\n     ]\n2. maxfeerate      (numeric or string, optional, default=\"0.10\") Reject transactions whose fee rate is higher than the specified value, expressed in BTC/kvB.\n                   Fee rates larger than 1BTC/kvB are rejected.\n                   Set to 0 to accept any fee rate.\n\nResult:\n[                                 (json array) The result of the mempool acceptance test for each raw transaction in the input array.\n                                  Returns results for each transaction in the same order they were passed in.\n                                  Transactions that cannot be fully validated due to failures in other transactions will not contain an 'allowed' result.\n                                  \n  {                               (json object)\n    \"txid\" : \"hex\",               (string) The transaction hash in hex\n    \"wtxid\" : \"hex\",              (string) The transaction witness hash in hex\n    \"package-error\" : \"str\",      (string, optional) Package validation error, if any (only possible if rawtxs had more than 1 transaction).\n    \"allowed\" : true|false,       (boolean, optional) Whether this tx would be accepted to the mempool and pass client-specified maxfeerate. If not present, the tx was not fully validated due to a failure in another tx in the list.\n    \"vsize\" : n,                  (numeric, optional) Virtual transaction size as defined in BIP 141. This is different from actual serialized size for witness transactions as witness data is discounted (only present when 'allowed' is true)\n    \"fees\" : {                    (json object, optional) Transaction fees (only present if 'allowed' is true)\n      \"base\" : n,                 (numeric) transaction fee in BTC\n      \"effective-feerate\" : n,    (numeric) the effective feerate in BTC per KvB. May differ from the base feerate if, for example, there are modified fees from prioritisetransaction or a package feerate was used.\n      \"effective-includes\" : [    (json array) transactions whose fees and vsizes are included in effective-feerate.\n        \"hex\",                    (string) transaction wtxid in hex\n        ...\n      ]\n    },\n    \"reject-reason\" : \"str\",      (string, optional) Rejection reason (only present when 'allowed' is false)\n    \"reject-details\" : \"str\"      (string, optional) Rejection details (only present when 'allowed' is false and rejection details exist)\n  },\n  ...\n]\n\nExamples:\n\nCreate a transaction\n> bitcoin-cli createrawtransaction \"[{\\\"txid\\\" : \\\"mytxid\\\",\\\"vout\\\":0}]\" \"{\\\"myaddress\\\":0.01}\"\nSign the transaction, and get back the hex\n> bitcoin-cli signrawtransactionwithwallet \"myhex\"\n\nTest acceptance of the transaction (signed hex)\n> bitcoin-cli testmempoolaccept '[\"signedhex\"]'\n\nAs a JSON-RPC call\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"testmempoolaccept\", \"params\": [[\"signedhex\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+const SUBMITPACKAGE_HELP: &str = "submitpackage [\"rawtx\",...] ( maxfeerate maxburnamount )
+
+Submit a package of raw transactions (serialized, hex-encoded) to local node.
+The package will be validated according to consensus and mempool policy rules. If any transaction passes, it will be accepted to mempool.
+This RPC is experimental and the interface may be unstable. Refer to doc/policy/packages.md for documentation on package policies.
+Warning: successful submission does not mean the transactions will propagate throughout the network.
+
+Arguments:
+1. package          (json array, required) An array of raw transactions.
+                    The package must solely consist of a child transaction and all of its unconfirmed parents, if any. None of the parents may depend on each other.
+                    The package must be topologically sorted, with the child being the last element in the array.
+     [
+       \"rawtx\",     (string)
+       ...
+     ]
+2. maxfeerate       (numeric or string, optional, default=\"0.10\") Reject transactions whose fee rate is higher than the specified value, expressed in BTC/kvB.
+                    Fee rates larger than 1BTC/kvB are rejected.
+                    Set to 0 to accept any fee rate.
+3. maxburnamount    (numeric or string, optional, default=\"0.00\") Reject transactions with provably unspendable outputs (e.g. 'datacarrier' outputs that use the OP_RETURN opcode) greater than the specified value, expressed in BTC.
+                    If burning funds through unspendable outputs is desired, increase this value.
+                    This check is based on heuristics and does not guarantee spendability of outputs.
+                    
+
+Result:
+{                                   (json object)
+  \"package_msg\" : \"str\",            (string) The transaction package result message. \"success\" indicates all transactions were accepted into or are already in the mempool.
+  \"tx-results\" : {                  (json object) transaction results keyed by wtxid
+    \"wtxid\" : {                     (json object) transaction wtxid
+      \"txid\" : \"hex\",               (string) The transaction hash in hex
+      \"other-wtxid\" : \"hex\",        (string, optional) The wtxid of a different transaction with the same txid but different witness found in the mempool. This means the submitted transaction was ignored.
+      \"vsize\" : n,                  (numeric, optional) Sigops-adjusted virtual transaction size.
+      \"fees\" : {                    (json object, optional) Transaction fees
+        \"base\" : n,                 (numeric) transaction fee in BTC
+        \"effective-feerate\" : n,    (numeric, optional) if the transaction was not already in the mempool, the effective feerate in BTC per KvB. For example, the package feerate and/or feerate with modified fees from prioritisetransaction.
+        \"effective-includes\" : [    (json array, optional) if effective-feerate is provided, the wtxids of the transactions whose fees and vsizes are included in effective-feerate.
+          \"hex\",                    (string) transaction wtxid in hex
+          ...
+        ]
+      },
+      \"error\" : \"str\"               (string, optional) The transaction error string, if it was rejected by the mempool
+    },
+    ...
+  },
+  \"replaced-transactions\" : [       (json array, optional) List of txids of replaced transactions
+    \"hex\",                          (string) The transaction id
+    ...
+  ]
+}
+
+Examples:
+> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"submitpackage\", \"params\": [[\"raw-parent-tx-1\", \"raw-parent-tx-2\", \"raw-child-tx\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/
+> bitcoin-cli submitpackage '[\"raw-tx-without-unconfirmed-parents\"]'\n";
 const SENDRAWTRANSACTION_HELP: &str = "sendrawtransaction \"hexstring\" ( maxfeerate maxburnamount )\n\nSubmit a raw transaction (serialized, hex-encoded) to local node and network.\n\nThe transaction will be sent unconditionally to all peers, so using sendrawtransaction\nfor manual rebroadcast may degrade privacy by leaking the transaction's origin, as\nnodes will normally not rebroadcast non-wallet transactions already in their mempool.\n\nA specific exception, RPC_TRANSACTION_ALREADY_IN_UTXO_SET, may throw if the transaction cannot be added to the mempool.\n\nRelated RPCs: createrawtransaction, signrawtransactionwithkey\n\nArguments:\n1. hexstring        (string, required) The hex string of the raw transaction\n2. maxfeerate       (numeric or string, optional, default=\"0.10\") Reject transactions whose fee rate is higher than the specified value, expressed in BTC/kvB.\n                    Fee rates larger than 1BTC/kvB are rejected.\n                    Set to 0 to accept any fee rate.\n3. maxburnamount    (numeric or string, optional, default=\"0.00\") Reject transactions with provably unspendable outputs (e.g. 'datacarrier' outputs that use the OP_RETURN opcode) greater than the specified value, expressed in BTC.\n                    If burning funds through unspendable outputs is desired, increase this value.\n                    This check is based on heuristics and does not guarantee spendability of outputs.\n                    \n\nResult:\n\"hex\"    (string) The transaction hash in hex\n\nExamples:\n\nCreate a transaction\n> bitcoin-cli createrawtransaction \"[{\\\"txid\\\" : \\\"mytxid\\\",\\\"vout\\\":0}]\" \"{\\\"myaddress\\\":0.01}\"\nSign the transaction, and get back the hex\n> bitcoin-cli signrawtransactionwithwallet \"myhex\"\n\nSend the transaction (signed hex)\n> bitcoin-cli sendrawtransaction \"signedhex\"\n\nAs a JSON-RPC call\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"sendrawtransaction\", \"params\": [\"signedhex\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const SUBMITBLOCK_HELP: &str = "submitblock \"hexdata\" ( \"dummy\" )\n\nAttempts to submit new block to network.\nSee https://en.bitcoin.it/wiki/BIP_0022 for full specification.\n\nArguments:\n1. hexdata    (string, required) the hex-encoded block data to submit\n2. dummy      (string, optional, default=ignored) dummy value, for compatibility with BIP22. This value is ignored.\n\nResult (If the block was accepted):\nnull    (json null)\n\nResult (Otherwise):\n\"str\"    (string) According to BIP22\n\nExamples:\n> bitcoin-cli submitblock \"mydata\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"submitblock\", \"params\": [\"mydata\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const SUBMITHEADER_HELP: &str = "submitheader \"hexdata\"\n\nDecode the given hexdata as a header and submit it as a candidate chain tip if valid.\nThrows when the header is invalid.\n\nArguments:\n1. hexdata    (string, required) the hex-encoded block header data\n\nResult:\nnull    (json null) None\n\nExamples:\n> bitcoin-cli submitheader \"aabbcc\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"submitheader\", \"params\": [\"aabbcc\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
@@ -2801,6 +2854,15 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         "submitheader",
         &[("hexdata", Some("string"), true)],
         SUBMITHEADER_HELP,
+    ),
+    (
+        "submitpackage",
+        &[
+            ("package", Some("array"), true),
+            ("maxfeerate", None, false),
+            ("maxburnamount", None, false),
+        ],
+        SUBMITPACKAGE_HELP,
     ),
     (
         "testmempoolaccept",
@@ -4816,6 +4878,286 @@ fn dispatch(
                         },
                     )),
                 }
+            })
+        }
+        "submitpackage" => {
+            // Core's ProcessNewPackage flow: array bounds → fee/burn
+            // args → per-tx decode+burn → child-with-parents topology →
+            // sequential admission with per-wtxid results.
+            let raws = params[0].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if raws.is_empty() || raws.len() > 25 {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_INVALID_PARAMETER,
+                        "Array must contain between 1 and 25 transactions.".into(),
+                    )),
+                );
+            }
+            // AMOUNT args: `ParseFeeRate`/`AmountFromValue` — -3 on
+            // unparseable or out-of-range, -8 once past 1 BTC/kvB.
+            let maxfeerate_sats = match params.get(1).filter(|v| !v.is_null()) {
+                Some(v) => match amount_from_value(v) {
+                    Ok(a) => a,
+                    Err(e) => return (Value::Null, Some(e)),
+                },
+                None => (DEFAULT_MAX_RAW_TX_FEE_RATE * 100_000_000.0) as i64,
+            };
+            if maxfeerate_sats >= 100_000_000 {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_INVALID_PARAMETER,
+                        "Fee rates larger than or equal to 1BTC/kvB are not accepted".into(),
+                    )),
+                );
+            }
+            let maxburn_sats = match params.get(2).filter(|v| !v.is_null()) {
+                Some(v) => match amount_from_value(v) {
+                    Ok(a) => a,
+                    Err(e) => return (Value::Null, Some(e)),
+                },
+                None => 0,
+            };
+            let mut txns: Vec<Transaction> = Vec::with_capacity(raws.len());
+            for raw in raws {
+                let Some(raw) = raw.as_str() else {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, field_type_message(raw, "string"))),
+                    );
+                };
+                let tx = hex::decode(raw)
+                    .ok()
+                    .and_then(|b| Transaction::decode(&b).ok());
+                let Some(tx) = tx else {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_DESERIALIZATION_ERROR,
+                            format!(
+                                "TX decode failed: {raw} Make sure the tx has at least one input."
+                            ),
+                        )),
+                    );
+                };
+                // The burn check runs per output, pre-admission —
+                // IsUnspendable covers the OP_RETURN heads and
+                // HasValidOps the malformed ones.
+                for out in &tx.outputs {
+                    if (out.script_pubkey.is_unspendable() || !out.script_pubkey.has_valid_ops())
+                        && out.value > maxburn_sats
+                    {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_VERIFY_ERROR,
+                                "Unspendable output exceeds maximum configured by user \
+                                 (maxburnamount)"
+                                    .into(),
+                            )),
+                        );
+                    }
+                }
+                txns.push(tx);
+            }
+            // `IsChildWithParentsTree` — only multi-tx packages, and
+            // only the child-with-unconfirmed-parents shape: every
+            // earlier tx must appear in the child's inputs and no
+            // parent may spend another parent.
+            if let (true, Some(child)) = (txns.len() > 1, txns.last()) {
+                let child_inputs: std::collections::HashSet<Txid> = child
+                    .inputs
+                    .iter()
+                    .map(|i| i.previous_output.txid)
+                    .collect();
+                let parents = &txns[..txns.len() - 1];
+                let parent_txids: std::collections::HashSet<Txid> =
+                    parents.iter().map(|t| t.txid()).collect();
+                let topo_ok = parents.iter().all(|p| child_inputs.contains(&p.txid()))
+                    && parents.iter().all(|p| {
+                        p.inputs
+                            .iter()
+                            .all(|i| !parent_txids.contains(&i.previous_output.txid))
+                    });
+                if !topo_ok {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_VERIFY_ERROR,
+                            "package topology disallowed. not child-with-parents or parents \
+                             depend on each other."
+                                .into(),
+                        )),
+                    );
+                }
+            }
+            chain_query(queries, move |cs, mgr| {
+                // CheckPackage's remaining package-wide rules, reached
+                // only after the topology throw above and only for
+                // multi-tx packages: intra-package input conflicts,
+                // then duplicate txids (IsConsistentPackage runs
+                // first, so identical members report the conflict).
+                // A package-level failure returns before any tx is
+                // evaluated — Core reports an empty tx-results.
+                let package_level: Option<&str> = if txns.len() > 1 {
+                    let mut spent_inputs = std::collections::HashSet::new();
+                    let mut conflict = false;
+                    for tx in &txns {
+                        for i in &tx.inputs {
+                            conflict |= !spent_inputs
+                                .insert((i.previous_output.txid, i.previous_output.vout));
+                        }
+                    }
+                    if conflict {
+                        Some("conflict-in-package")
+                    } else {
+                        let mut seen = std::collections::HashSet::new();
+                        txns
+                            .iter()
+                            .any(|tx| !seen.insert(tx.txid()))
+                            .then_some("package-contains-duplicates")
+                    }
+                } else {
+                    None
+                };
+                if let Some(reason) = package_level {
+                    return Ok(json!({
+                        "package_msg": reason,
+                        "tx-results": {},
+                        "replaced-transactions": [],
+                    }));
+                }
+                let mut results = serde_json::Map::new();
+                let mut replaced: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                let mut all_ok = true;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                for tx in &txns {
+                    let txid = tx.txid();
+                    let wtxid = tx.wtxid();
+                    let mut inner = json!({ "txid": txid.to_string() });
+                    // All pool reads happen in this scope so the
+                    // `&mut` admission borrow can follow.
+                    enum Seen {
+                        Pooled {
+                            in_pool_wtxid: Wtxid,
+                            vsize: usize,
+                            fee: i64,
+                        },
+                        Fresh {
+                            input_sum: Option<i64>,
+                            replaced: Vec<String>,
+                        },
+                    }
+                    let seen = {
+                        let pool = mgr.mempool_ref();
+                        match pool.entry(&txid) {
+                            Some(entry) => Seen::Pooled {
+                                in_pool_wtxid: entry.tx.wtxid(),
+                                vsize: entry.vsize,
+                                fee: entry.fee,
+                            },
+                            None => Seen::Fresh {
+                                input_sum: tx
+                                    .inputs
+                                    .iter()
+                                    .map(|i| {
+                                        pool.resolve(cs, &i.previous_output).map(|c| c.out.value)
+                                    })
+                                    .sum(),
+                                // Capture the BIP125 conflicts before
+                                // admission drops them — Core's
+                                // m_replaced_transactions.
+                                replaced: tx
+                                    .inputs
+                                    .iter()
+                                    .filter_map(|i| {
+                                        pool.spent_by(&i.previous_output)
+                                            .map(|s| s.txid().to_string())
+                                    })
+                                    .collect(),
+                            },
+                        }
+                    };
+                    match seen {
+                        Seen::Pooled { in_pool_wtxid, .. } if in_pool_wtxid != wtxid => {
+                            // DIFFERENT_WITNESS — same txid, other
+                            // witness: ignored, Core reports the
+                            // pooled wtxid and fails the package.
+                            inner["other-wtxid"] = json!(in_pool_wtxid.to_string());
+                            all_ok = false;
+                        }
+                        Seen::Pooled { vsize, fee, .. } => {
+                            // MEMPOOL_ENTRY — already pooled: vsize and
+                            // base fee only, no effective-*.
+                            inner["vsize"] = json!(vsize);
+                            inner["fees"] = json!({ "base": value_from_amount(fee) });
+                        }
+                        Seen::Fresh {
+                            input_sum,
+                            replaced: conflicts,
+                        } => {
+                            let output_sum: i64 = tx.outputs.iter().map(|o| o.value).sum();
+                            let vsize = tx.weight().div_ceil(4).max(1) as i64;
+                            // Client feerate check runs before
+                            // admission — individual fee vs the
+                            // BTC/kvB cap.
+                            if let Some(input_sum) = input_sum {
+                                let fee = input_sum - output_sum;
+                                if maxfeerate_sats > 0 && fee * 1000 > maxfeerate_sats * vsize {
+                                    inner["error"] = json!("max feerate exceeded");
+                                    all_ok = false;
+                                    results.insert(wtxid.to_string(), inner);
+                                    continue;
+                                }
+                            }
+                            replaced.extend(conflicts);
+                            match mgr.mempool().accept_tx(tx.clone(), cs, now) {
+                                Ok(_) => {
+                                    let fee = input_sum.map(|s| s - output_sum).unwrap_or(0);
+                                    inner["vsize"] = json!(vsize);
+                                    inner["fees"] = json!({
+                                        "base": value_from_amount(fee),
+                                        // Own feerate — Core reports
+                                        // the effective rate the tx was
+                                        // evaluated at; for a tx with
+                                        // no lower-feerate in-pool
+                                        // ancestors that is its own.
+                                        "effective-feerate":
+                                            value_from_amount(fee * 1000 / vsize),
+                                        "effective-includes": [wtxid.to_string()],
+                                    });
+                                }
+                                Err(reject) => {
+                                    inner["error"] = json!(match &reject {
+                                        avila_mempool::MempoolReject::Consensus(e) =>
+                                            e.reason().to_string(),
+                                        avila_mempool::MempoolReject::Inputs(e) =>
+                                            e.reason().into_owned(),
+                                        _ => reject.to_string(),
+                                    });
+                                    all_ok = false;
+                                }
+                            }
+                        }
+                    }
+                    results.insert(wtxid.to_string(), inner);
+                }
+                let package_msg = if all_ok {
+                    "success"
+                } else {
+                    "transaction failed"
+                }
+                .to_string();
+                Ok(json!({
+                    "package_msg": package_msg,
+                    "tx-results": Value::Object(results),
+                    "replaced-transactions": replaced.into_iter().collect::<Vec<_>>(),
+                }))
             })
         }
         "getblockfrompeer" => {
@@ -7956,7 +8298,8 @@ fn dispatch(
                      \x20   createrawtransaction <inputs> <outputs> [locktime] [replaceable],\n\
                      \x20   createmultisig <nrequired> [keys] [address_type],\n\
                      \x20   getdescriptorinfo <desc>, deriveaddresses <desc> [range],\n\
-                     \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount], savemempool\n\
+                     \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount], savemempool,\n\
+                     \x20   submitpackage <[rawtx,...]> [maxfeerate] [maxburnamount]\n\
                      \x20 mining: getblocktemplate, getmininginfo, getnetworkhashps,\n\
                      \x20   submitblock <hex>,\n\
                      \x20   submitheader <hex>, generatetoaddress <n> <address> [maxtries],\n\
@@ -8598,6 +8941,144 @@ mod tests {
             None,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+    }
+
+    /// `submitpackage`'s deterministic validation — array bounds,
+    /// element types, decode, and topology all fire before the pool.
+    #[test]
+    fn submitpackage_validation() {
+        let cs = Chainstate::new(&Network::Regtest.params());
+        let queries = query_server(cs);
+        let snap = snap();
+
+        // Bounds: empty and oversized arrays are -8 before decode.
+        for pkg in [json!([]), json!(vec!["00"; 26])] {
+            let (_, e) = dispatch(
+                "submitpackage",
+                &json!([pkg]),
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+            );
+            let err = e.unwrap();
+            assert_eq!(err.0, RPC_INVALID_PARAMETER);
+            assert_eq!(err.1, "Array must contain between 1 and 25 transactions.");
+        }
+
+        // Non-string elements are bare -3 type errors.
+        for elem in [json!(5), json!(null)] {
+            let (_, e) = dispatch(
+                "submitpackage",
+                &json!([[elem]]),
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+            );
+            let err = e.unwrap();
+            assert_eq!(err.0, RPC_TYPE_ERROR);
+            assert!(err.1.contains("expected type string"), "{err:?}");
+        }
+
+        // Bad hex inside the array carries the raw string and the
+        // submitpackage-specific decode suffix.
+        let (_, e) = dispatch(
+            "submitpackage",
+            &json!([["xx"]]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        let err = e.unwrap();
+        assert_eq!(err.0, RPC_DESERIALIZATION_ERROR);
+        assert_eq!(
+            err.1,
+            "TX decode failed: xx Make sure the tx has at least one input."
+        );
+
+        // Fee/burn arg validation: out-of-range amounts are -3 and a
+        // >= 1 BTC/kvB rate is -8 — both before topology.
+        let coinbase = "02000000010000000000000000000000000000000000000000000000000000\
+        000000000000ffffffff0151ffffffff010000000000000000015100000000";
+        let coinbase: String = coinbase.chars().filter(|c| !c.is_whitespace()).collect();
+        let (_, e) = dispatch(
+            "submitpackage",
+            &json!([[&coinbase], -0.01]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(e.unwrap(), (RPC_TYPE_ERROR, "Amount out of range".into()));
+        let (_, e) = dispatch(
+            "submitpackage",
+            &json!([[&coinbase], 1.0]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_INVALID_PARAMETER,
+                "Fee rates larger than or equal to 1BTC/kvB are not accepted".into()
+            )
+        );
+
+        // Two transactions whose child doesn't reference the parent —
+        // the topology gate is -25.
+        let other = "0200000001ffffffffffffffffffffffffffffffffffffffffffffffffffffffff\
+        ffffffff000000000151ffffffff010000000000000000015100000000";
+        let other: String = other.chars().filter(|c| !c.is_whitespace()).collect();
+        let (_, e) = dispatch(
+            "submitpackage",
+            &json!([[&coinbase, &other]]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        let err = e.unwrap();
+        assert_eq!(err.0, RPC_VERIFY_ERROR);
+        assert_eq!(
+            err.1,
+            "package topology disallowed. not child-with-parents or parents \
+             depend on each other."
+        );
+
+        // A single malformed member reports per-transaction inside the
+        // success envelope — the coinbase is a consensus reject.
+        let (r, e) = dispatch(
+            "submitpackage",
+            &json!([[&coinbase]]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["package_msg"], json!("transaction failed"));
+        let txid = Transaction::decode(&hex::decode(&coinbase).unwrap())
+            .unwrap()
+            .txid();
+        let wtxid = Transaction::decode(&hex::decode(&coinbase).unwrap())
+            .unwrap()
+            .wtxid();
+        assert_eq!(
+            r["tx-results"][wtxid.to_string()],
+            json!({"txid": txid.to_string(), "error": "bad-cb-length"})
+        );
+        assert_eq!(r["replaced-transactions"], json!([]));
     }
 
     /// `savemempool` — without a block store there is nowhere to write;
