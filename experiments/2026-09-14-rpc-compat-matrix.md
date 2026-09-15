@@ -609,6 +609,22 @@ surfaced:
   arity/type/error row byte-identical; `getaddednodeinfo`'s list
   contents and `getchainstates`'s `coins_*_cache_bytes` fields are
   per-node state/design differences (see below).
+- `dumptxoutset` + `importmempool` added: the snapshot writer emits
+  Core's exact file format — `utxo\xff` + u16 version,
+  `SnapshotMetadata` (network magic, base hash, coin count), and
+  per-txid groups of `CompactSize(vout)` + compressed `Coin` rows
+  (`VARINT(height*2+coinbase)`, `CompressAmount`, `CompressScript`'s
+  p2pkh/p2sh/p2pk IDs — witness IDs 28–30 are decode-only since v23,
+  so witness scripts serialize `len+6`+raw). "latest" dumps the tip;
+  "rollback" disconnects the tip chain into a *cloned* UTXO set via
+  stored undo data (Core's `TemporaryRollback`, but the live tip
+  never moves); a bare "rollback" targets the largest
+  chainparams assumeutxo height (regtest {110,200,299}). Verified
+  live: every error row byte-identical, and both the `latest` and
+  `rollback:180` snapshot files are **byte-for-byte identical** to
+  Core 29.4's output on the shared regtest chain. `importmempool`
+  loads our own `mempool.dat` format (Core's file format differs)
+  and maps any unreadable file to Core's opaque `-1` — result `{}`.
 
 ### Known semantic differences
 

@@ -97,6 +97,7 @@ impl Network {
                         min_activation_height: 709_632,
                     },
                 ],
+                assumeutxo_snapshot_heights: &[840_000, 880_000],
                 genesis_header: MAINNET_GENESIS,
             },
             Network::Testnet4 => Params {
@@ -153,6 +154,7 @@ impl Network {
                         min_activation_height: 0,
                     },
                 ],
+                assumeutxo_snapshot_heights: &[2_500_000],
                 genesis_header: TESTNET4_GENESIS,
             },
             Network::Signet => Params {
@@ -209,6 +211,7 @@ impl Network {
                         min_activation_height: 0,
                     },
                 ],
+                assumeutxo_snapshot_heights: &[160_000],
                 genesis_header: SIGNET_GENESIS,
             },
             Network::Regtest => Params {
@@ -266,6 +269,7 @@ impl Network {
                         min_activation_height: 0,
                     },
                 ],
+                assumeutxo_snapshot_heights: &[110, 200, 299],
                 genesis_header: REGTEST_GENESIS,
             },
         }
@@ -448,6 +452,11 @@ pub struct Params {
     /// `consensus.vDeployments` — the BIP9 positions Core ships, in
     /// `DeploymentInfo` order: `testdummy` then `taproot`.
     pub bip9_deployments: [Bip9Deployment; 2],
+    /// `m_assumeutxo_data` heights — the snapshot heights `loadtxoutset`
+    /// accepts and `dumptxoutset rollback` (without an explicit target)
+    /// rolls back to. Heights only: the serialized hashes belong to
+    /// Core's own chain history and can't be reproduced here.
+    pub assumeutxo_snapshot_heights: &'static [u32],
     /// The network's genesis block header: the anchor every [`crate::chain::HeaderTree`]
     /// is seeded with.
     pub genesis_header: BlockHeader,

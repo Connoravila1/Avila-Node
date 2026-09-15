@@ -30,3 +30,4 @@ pub mod sigchecker;
 pub mod signet;
 pub mod store;
 pub mod transaction;
+pub mod utxo_snapshot;

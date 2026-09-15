@@ -323,7 +323,13 @@ operation. Compare complete initial download and catch-up, not only local replay
       (added nodes with live inbound/outbound rows, -24 on unknown),
       getzmqnotifications (empty — no ZMQ publishers), getchainstates
       (Core's single-entry no-snapshot shape), and pruneblockchain
-      (Core's no-prune refusal). Outbound dialing is
+      (Core's no-prune refusal). dumptxoutset writes Core's exact
+      assumeutxo snapshot format (utxo magic + version + metadata +
+      compressed Coin rows) — verified byte-identical to Core 29.4
+      for both latest and rollback dumps, the latter by disconnecting
+      into a cloned UTXO set via stored undo data; importmempool
+      reloads our mempool.dat through full admission. Outbound
+      dialing is
       asynchronous —
       `maintain_outbounds` runs `connect_timeout` on slot-bounded
       worker threads and drains results on the tick, so a book of dead

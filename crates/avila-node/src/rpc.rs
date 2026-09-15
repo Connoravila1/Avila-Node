@@ -1115,6 +1115,46 @@ where
     })
 }
 
+/// Core's `ParseHashOrHeight` — a number walks the active chain, a
+/// 64-hex string resolves through the block index, and anything else
+/// throws `ParseHashV`'s bare `-3` ("expected type string").
+fn parse_hash_or_height<'a>(
+    v: &Value,
+    cs: &'a Chainstate,
+) -> Result<&'a avila_consensus::chain::HeaderNode, (i64, String)> {
+    match v {
+        Value::Number(n) => {
+            let h = n
+                .as_i64()
+                .ok_or((RPC_MISC_ERROR, "JSON integer out of range".to_string()))?;
+            let tip = cs.chain().len() as i64 - 1;
+            if h < 0 {
+                return Err((
+                    RPC_INVALID_PARAMETER,
+                    format!("Target block height {h} is negative"),
+                ));
+            }
+            if h > tip {
+                return Err((
+                    RPC_INVALID_PARAMETER,
+                    format!("Target block height {h} after current tip {tip}"),
+                ));
+            }
+            let hash = cs.chain()[h as usize];
+            cs.tree()
+                .get(&hash)
+                .ok_or((RPC_MISC_ERROR, "block header missing from tree".to_string()))
+        }
+        Value::String(_) => {
+            let hash: BlockHash = parse_hash_arg(v, "hash_or_height")?;
+            cs.tree()
+                .get(&hash)
+                .ok_or((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".to_string()))
+        }
+        v => Err((RPC_TYPE_ERROR, field_type_message(v, "string"))),
+    }
+}
+
 /// `getaddednodeinfo`'s per-node record — `connected` mirrors the
 /// addresses list, matching Core (empty list → `connected:false`).
 fn added_node_json((name, conns): &(String, Vec<(String, &'static str)>)) -> Value {
@@ -1465,6 +1505,9 @@ const STOP_HELP: &str = "stop\n\nRequest a graceful shutdown of Bitcoin Core.\n\
 const HELP_HELP: &str = "help ( \"command\" )\n\nList all commands, or get help for a specified command.\n\nArguments:\n1. command    (string, optional, default=all commands) The command to get help on\n\nResult:\n\"str\"    (string) The help text\n";
 
 const GETMEMORYINFO_HELP: &str = "getmemoryinfo ( \"mode\" )\n\nReturns an object containing information about memory usage.\n\nArguments:\n1. mode    (string, optional, default=\"stats\") determines what kind of information is returned.\n           - \"stats\" returns general statistics about memory usage in the daemon.\n           - \"mallocinfo\" returns an XML string describing low-level heap state (only available if compiled with glibc).\n\nResult (mode \"stats\"):\n{                         (json object)\n  \"locked\" : {            (json object) Information about locked memory manager\n    \"used\" : n,           (numeric) Number of bytes used\n    \"free\" : n,           (numeric) Number of bytes available in current arenas\n    \"total\" : n,          (numeric) Total number of bytes managed\n    \"locked\" : n,         (numeric) Amount of bytes that succeeded locking. If this number is smaller than total, locking pages failed at some point and key data could be swapped to disk.\n    \"chunks_used\" : n,    (numeric) Number allocated chunks\n    \"chunks_free\" : n     (numeric) Number unused chunks\n  }\n}\n\nResult (mode \"mallocinfo\"):\n\"str\"    (string) \"<malloc version=\"1\">...\"\n\nExamples:\n> bitcoin-cli getmemoryinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getmemoryinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+const DUMPTXOUTSET_HELP: &str = "dumptxoutset \"path\" ( \"type\" {\"rollback\":n,...} )\n\nWrite the serialized UTXO set to a file. This can be used in loadtxoutset afterwards if this snapshot height is supported in the chainparams as well.\n\nUnless the \"latest\" type is requested, the node will roll back to the requested height and network activity will be suspended during this process. Because of this it is discouraged to interact with the node in any other way during the execution of this call to avoid inconsistent results and race conditions, particularly RPCs that interact with blockstorage.\n\nThis call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\n\nArguments:\n1. path       (string, required) Path to the output file. If relative, will be prefixed by datadir.\n2. type       (string, optional, default=\"\") The type of snapshot to create. Can be \"latest\" to create a snapshot of the current UTXO set or \"rollback\" to temporarily roll back the state of the node to a historical block before creating the snapshot of a historical UTXO set. This parameter can be omitted if a separate \"rollback\" named parameter is specified indicating the height or hash of a specific historical block. If \"rollback\" is specified and separate \"rollback\" named parameter is not specified, this will roll back to the latest valid snapshot block that can currently be loaded with loadtxoutset.\n3. options    (json object, optional) Options object that can be used to pass named arguments, listed below.\n\nNamed Arguments:\nrollback    (string or numeric, optional) Height or hash of the block to roll back to before creating the snapshot. Note: The further this number is from the tip, the longer this process will take. Consider setting a higher -rpcclienttimeout value in this case.\n\nResult:\n{                             (json object)\n  \"coins_written\" : n,        (numeric) the number of coins written in the snapshot\n  \"base_hash\" : \"hex\",        (string) the hash of the base of the snapshot\n  \"base_height\" : n,          (numeric) the height of the base of the snapshot\n  \"path\" : \"str\",             (string) the absolute path that the snapshot was written to\n  \"txoutset_hash\" : \"hex\",    (string) the hash of the UTXO set contents\n  \"nchaintx\" : n              (numeric) the number of transactions in the chain up to and including the base block\n}\n\nExamples:\n> bitcoin-cli -rpcclienttimeout=0 dumptxoutset utxo.dat latest\n> bitcoin-cli -rpcclienttimeout=0 dumptxoutset utxo.dat rollback\n> bitcoin-cli -rpcclienttimeout=0 -named dumptxoutset utxo.dat rollback=853456\n";
+const IMPORTMEMPOOL_HELP: &str = "importmempool \"filepath\" ( options )\n\nImport a mempool.dat file and attempt to add its contents to the mempool.\nWarning: Importing untrusted files is dangerous, especially if metadata from the file is taken over.\n\nArguments:\n1. filepath    (string, required) The mempool file\n2. options     (json object, optional) Options object that can be used to pass named arguments, listed below.\n\nNamed Arguments:\nuse_current_time            (boolean, optional, default=true) Whether to use the current system time or use the entry time metadata from the mempool file.\n                            Warning: Importing untrusted metadata may lead to unexpected issues and undesirable behavior.\napply_fee_delta_priority    (boolean, optional, default=false) Whether to apply the fee delta metadata from the mempool file.\n                            It will be added to any existing fee deltas.\n                            The fee delta can be set by the prioritisetransaction RPC.\n                            Warning: Importing untrusted metadata may lead to unexpected issues and undesirable behavior.\n                            Only set this bool if you understand what it does.\napply_unbroadcast_set       (boolean, optional, default=false) Whether to apply the unbroadcast set metadata from the mempool file.\n                            Warning: Importing untrusted metadata may lead to unexpected issues and undesirable behavior.\n\nResult:\n{}    (empty JSON object)\n\nExamples:\n> bitcoin-cli importmempool /path/to/mempool.dat\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"importmempool\", \"params\": [/path/to/mempool.dat]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 const GETADDEDNODEINFO_HELP: &str = "getaddednodeinfo ( \"node\" )\n\nReturns information about the given added node, or all added nodes\n(note that onetry addnodes are not listed here)\n\nArguments:\n1. node    (string, optional, default=all nodes) If provided, return information about this specific node, otherwise all nodes are returned.\n\nResult:\n[                                (json array)\n  {                              (json object)\n    \"addednode\" : \"str\",         (string) The node IP address or name (as provided to addnode)\n    \"connected\" : true|false,    (boolean) If connected\n    \"addresses\" : [              (json array) Only when connected = true\n      {                          (json object)\n        \"address\" : \"str\",       (string) The bitcoin server IP and port we're connected to\n        \"connected\" : \"str\"      (string) connection, inbound or outbound\n      },\n      ...\n    ]\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli getaddednodeinfo \"192.168.0.201\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getaddednodeinfo\", \"params\": [\"192.168.0.201\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const GETZMQNOTIFICATIONS_HELP: &str = "getzmqnotifications\n\nReturns information about the active ZeroMQ notifications.\n\nResult:\n[                         (json array)\n  {                       (json object)\n    \"type\" : \"str\",       (string) Type of notification\n    \"address\" : \"str\",    (string) Address of the publisher\n    \"hwm\" : n             (numeric) Outbound message high water mark\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli getzmqnotifications \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getzmqnotifications\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
@@ -2692,6 +2735,23 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
     ),
     ("getzmqnotifications", &[], GETZMQNOTIFICATIONS_HELP),
     ("getchainstates", &[], GETCHAINSTATES_HELP),
+    (
+        "dumptxoutset",
+        &[
+            ("path", Some("string"), true),
+            ("type", Some("string"), false),
+            ("options", Some("object"), false),
+        ],
+        DUMPTXOUTSET_HELP,
+    ),
+    (
+        "importmempool",
+        &[
+            ("filepath", Some("string"), true),
+            ("options", Some("object"), false),
+        ],
+        IMPORTMEMPOOL_HELP,
+    ),
     (
         "verifymessage",
         &[
@@ -4182,6 +4242,47 @@ fn dispatch(
                 Err(e) => Err((RPC_MISC_ERROR, format!("save mempool: {e}"))),
             }
         }),
+        // `importmempool` — reload a mempool.dat and re-run every entry
+        // through admission (`LoadMempool`). Any file failure is Core's
+        // single opaque -1; per-entry failures are skipped silently.
+        "importmempool" => {
+            let path_arg = params
+                .get(0)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            chain_query(queries, move |cs, mgr| {
+                // Relative paths resolve against the network datadir
+                // (Core's AbsPathJoin); without a store, the arg is
+                // used as given.
+                let path = match cs.store() {
+                    Some(store) if !std::path::Path::new(&path_arg).is_absolute() => {
+                        store.dir().join(&path_arg)
+                    }
+                    _ => std::path::PathBuf::from(&path_arg),
+                };
+                // Core's importmempool errors on a missing/unreadable
+                // file — `load`'s missing-file-is-empty rule is a
+                // startup convenience, not the RPC contract.
+                if !path.is_file() {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "Unable to import mempool file, see debug.log for details.".into(),
+                    ));
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                match mgr.mempool().load(&path, cs, now) {
+                    Ok(_) => Ok(json!({})),
+                    Err(_) => Err((
+                        RPC_MISC_ERROR,
+                        "Unable to import mempool file, see debug.log for details.".into(),
+                    )),
+                }
+            })
+        }
         "getpeerinfo" => chain_query(queries, |cs, mgr| {
             Ok(Value::Array(
                 mgr.peer_snapshots()
@@ -5706,6 +5807,137 @@ fn dispatch(
         // type pass; `start` reserves the scan slot, expands each scan
         // object through `EvalDescriptorStringOrObject` semantics, then
         // walks the UTXO set via `FindScriptPubKey` semantics.
+        // Core's `dumptxoutset` — `CreateUTXOSnapshot`. "latest" dumps
+        // the tip; "rollback" (or a `rollback` option) targets a
+        // historical active-chain block, reached by disconnecting into
+        // a cloned UTXO set so the live tip never moves.
+        "dumptxoutset" => {
+            let path_arg = params
+                .get(0)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let snap_type = params
+                .get(1)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let rollback_opt = params.get(2).and_then(|o| o.get("rollback")).cloned();
+            chain_query(queries, move |cs, _| {
+                let tip_hash = cs.tip_hash();
+                // Target resolution happens before any file handling —
+                // Core's order (ParseHashOrHeight, then AbsPathJoin).
+                let target = if let Some(rb) = &rollback_opt {
+                    if !snap_type.is_empty() && snap_type != "rollback" {
+                        return Err((
+                            RPC_INVALID_PARAMETER,
+                            format!(
+                                "Invalid snapshot type \"{snap_type}\" specified with rollback option"
+                            ),
+                        ));
+                    }
+                    parse_hash_or_height(rb, cs)?
+                } else if snap_type == "rollback" {
+                    // No explicit target: Core rolls back to the
+                    // largest chainparams assumeutxo height.
+                    let max_h = *cs
+                        .tree()
+                        .params()
+                        .assumeutxo_snapshot_heights
+                        .iter()
+                        .max()
+                        .unwrap_or(&0);
+                    parse_hash_or_height(&json!(max_h), cs)?
+                } else if snap_type == "latest" {
+                    cs.tree()
+                        .get(&tip_hash)
+                        .ok_or((RPC_MISC_ERROR, "tip not indexed".to_string()))?
+                } else {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        format!(
+                            "Invalid snapshot type \"{snap_type}\" specified. Please specify \"rollback\" or \"latest\""
+                        ),
+                    ));
+                };
+                let Some(store) = cs.store() else {
+                    return Err((RPC_MISC_ERROR, "no data directory configured".into()));
+                };
+                let path = if std::path::Path::new(&path_arg).is_absolute() {
+                    std::path::PathBuf::from(&path_arg)
+                } else {
+                    store.dir().join(&path_arg)
+                };
+                if path.exists() {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        format!(
+                            "{} already exists. If you are sure this is what you want, move it out of the way first",
+                            path.display()
+                        ),
+                    ));
+                }
+                // Roll back on a clone: disconnect the tip chain down
+                // to the target height. Core does a TemporaryRollback
+                // of the live chain; the clone gets the same UTXO set
+                // without suspending the node's own state.
+                let mut utxo = cs.utxo().clone();
+                let tip_h = cs.chain().len() - 1;
+                for h in ((target.height + 1)..=tip_h as u32).rev() {
+                    let hash = cs.chain()[h as usize];
+                    let undo = cs.undo(h).ok_or((
+                        RPC_MISC_ERROR,
+                        "Could not roll back to requested height.".to_string(),
+                    ))?;
+                    let body = cs.body(&hash).ok_or((
+                        RPC_MISC_ERROR,
+                        "Could not roll back to requested height.".to_string(),
+                    ))?;
+                    if avila_consensus::connect::disconnect_block(&body, &mut utxo, undo).is_err() {
+                        return Err((
+                            RPC_MISC_ERROR,
+                            "Could not roll back to requested height.".to_string(),
+                        ));
+                    }
+                }
+                let stats = avila_consensus::coinstats::compute(
+                    &utxo,
+                    i64::from(target.height),
+                    target.hash(),
+                    avila_consensus::coinstats::CoinStatsHashType::HashSerialized,
+                );
+                let coins = avila_consensus::utxo_snapshot::sorted_coins(&utxo);
+                let temppath = {
+                    let mut t = path.clone().into_os_string();
+                    t.push(".incomplete");
+                    std::path::PathBuf::from(t)
+                };
+                let mut file = std::fs::File::create(&temppath).map_err(|_| {
+                    (
+                        RPC_INVALID_PARAMETER,
+                        format!("Couldn't open file {} for writing.", temppath.display()),
+                    )
+                })?;
+                let written = avila_consensus::utxo_snapshot::write_snapshot(
+                    &mut file,
+                    cs.tree().params().message_start,
+                    &target.hash(),
+                    coins.len() as u64,
+                    &coins,
+                )
+                .map_err(|e| (RPC_MISC_ERROR, format!("writing UTXO snapshot: {e}")))?;
+                drop(file);
+                let _ = std::fs::rename(&temppath, &path);
+                Ok(json!({
+                    "coins_written": written,
+                    "base_hash": target.hash().to_string(),
+                    "base_height": target.height,
+                    "path": path.to_string_lossy(),
+                    "txoutset_hash": stats.hash_serialized.map(|h| h.to_string()),
+                    "nchaintx": target.n_chain_tx,
+                }))
+            })
+        }
         "scantxoutset" => {
             let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
             if arr.is_empty() || arr.len() > 2 {
@@ -7423,7 +7655,9 @@ fn dispatch(
                      \x20   verifychain [checklevel] [nblocks],\n\
                      \x20   getchainstates, pruneblockchain <height>,\n\
                      \x20   gettxoutsetinfo [hash_type] [hash_or_height] [use_index]\n\
-                     \x20   scantxoutset <action> [scanobjects,...]\n\
+                     \x20   scantxoutset <action> [scanobjects,...],\n\
+                     \x20   dumptxoutset <path> [type] [options],\n\
+                     \x20   importmempool <path> [options], savemempool\n\
                      \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
                      \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
                      \x20   gettxspendingprevout <outputs>,\n\
@@ -9521,6 +9755,91 @@ mod tests {
             None,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_NOT_ADDED);
+    }
+
+    /// `dumptxoutset`/`importmempool` — arity, type, and target
+    /// resolution match Core; file writes need a store-backed node.
+    #[test]
+    fn dump_and_import_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+
+        // Arity/type gate rows (verbatim Core probes).
+        for (m, p, code) in [
+            ("dumptxoutset", json!([]), RPC_MISC_ERROR),
+            ("dumptxoutset", json!([null]), RPC_TYPE_ERROR),
+            ("dumptxoutset", json!([["x"]]), RPC_TYPE_ERROR),
+            ("dumptxoutset", json!(["x", "latest", "x"]), RPC_TYPE_ERROR),
+            ("importmempool", json!([]), RPC_MISC_ERROR),
+            ("importmempool", json!([null]), RPC_TYPE_ERROR),
+            ("importmempool", json!([[]]), RPC_TYPE_ERROR),
+            ("importmempool", json!(["x", "x"]), RPC_TYPE_ERROR),
+        ] {
+            let (_, e) = dispatch(m, &p, &snap, Some(&queries), None, None, None);
+            assert_eq!(e.unwrap().0, code, "{m} {p}");
+        }
+
+        // A genesis-only chain: rollback past the tip and the
+        // no-such-type error both fire before any file work.
+        let (_, e) = dispatch(
+            "dumptxoutset",
+            &json!(["/tmp/avila-x", "bogus"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        let (_, e) = dispatch(
+            "dumptxoutset",
+            &json!(["/tmp/avila-x", "latest", {"rollback": 5}]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            e.unwrap().1,
+            "Invalid snapshot type \"latest\" specified with rollback option"
+        );
+        // regtest snapshot heights {110,200,299} — bare "rollback"
+        // targets 299, past a genesis-only tip.
+        let (_, e) = dispatch(
+            "dumptxoutset",
+            &json!(["/tmp/avila-x", "rollback"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_INVALID_PARAMETER,
+                "Target block height 299 after current tip 0".to_string()
+            )
+        );
+
+        // importmempool on a missing file — Core's opaque -1.
+        let (_, e) = dispatch(
+            "importmempool",
+            &json!(["definitely-not-there.dat"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_MISC_ERROR,
+                "Unable to import mempool file, see debug.log for details.".to_string()
+            )
+        );
     }
 
     /// `getaddrmaninfo` — Core's fixed network keys each carrying
