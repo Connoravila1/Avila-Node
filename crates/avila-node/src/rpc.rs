@@ -1409,7 +1409,7 @@ fn dispatch(
                 let block = match avila_consensus::block::Block::decode(&bytes) {
                     Ok(b) => b,
                     Err(_) => {
-                        return Err((RPC_DESERIALIZATION_ERROR, "Block decode failed".into()))
+                        return Err((RPC_DESERIALIZATION_ERROR, "Block decode failed".into()));
                     }
                 };
                 let now = std::time::SystemTime::now()
@@ -1419,9 +1419,7 @@ fn dispatch(
                 // Core's submitblock reports a status STRING in result —
                 // errors are only for decode/parameter failures.
                 match cs.accept_block(&block, now) {
-                    Ok(avila_consensus::chainstate::Acceptance::Connected {
-                        height, ..
-                    }) => {
+                    Ok(avila_consensus::chainstate::Acceptance::Connected { height, .. }) => {
                         // Purge confirmed txs, then relay the new tip
                         // (Core's NewPoWValidBlock fan-out — no source
                         // peer for a local submission).
@@ -2264,7 +2262,11 @@ mod tests {
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
         let mut block = pool
-            .build_template(&mine_cs, Script::new(vec![avila_consensus::script::OP_1]), now)
+            .build_template(
+                &mine_cs,
+                Script::new(vec![avila_consensus::script::OP_1]),
+                now,
+            )
             .unwrap()
             .block;
         // Regtest's target is near-maximal — a few nonces at most.
@@ -2301,13 +2303,7 @@ mod tests {
         assert_eq!(r, json!("duplicate"));
 
         // Decode failures carry Core's -22.
-        let (_, e) = dispatch(
-            "submitblock",
-            &json!(["aabb"]),
-            &snap,
-            Some(&queries),
-            None,
-        );
+        let (_, e) = dispatch("submitblock", &json!(["aabb"]), &snap, Some(&queries), None);
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         let (_, e) = dispatch("submitblock", &json!([]), &snap, Some(&queries), None);
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
