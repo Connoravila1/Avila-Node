@@ -1085,6 +1085,9 @@ const GETDESCRIPTORINFO_HELP: &str = "getdescriptorinfo \"descriptor\"\n\nAnalys
 
 const DERIVEADDRESSES_HELP: &str = "deriveaddresses \"descriptor\" ( range )\n\nDerives one or more addresses corresponding to an output descriptor.\nExamples of output descriptors are:\n    pkh(<pubkey>)                                     P2PKH outputs for the given pubkey\n    wpkh(<pubkey>)                                    Native segwit P2PKH outputs for the given pubkey\n    sh(multi(<n>,<pubkey>,<pubkey>,...))              P2SH-multisig outputs for the given threshold and pubkeys\n    raw(<hex script>)                                 Outputs whose output script equals the specified hex-encoded bytes\n    tr(<pubkey>,multi_a(<n>,<pubkey>,<pubkey>,...))   P2TR-multisig outputs for the given threshold and pubkeys\n\nIn the above, <pubkey> either refers to a fixed public key in hexadecimal notation, or to an xpub/xprv optionally followed by one\nor more path elements separated by \"/\", where \"h\" represents a hardened child key.\nFor more information on output descriptors, see the documentation in the doc/descriptors.md file.\n\nArguments:\n1. descriptor    (string, required) The descriptor.\n2. range         (numeric or array, optional) If a ranged descriptor is used, this specifies the end or the range (in [begin,end] notation) to derive.\n\nResult (for single derivation descriptors):\n[           (json array)\n  \"str\",    (string) the derived addresses\n  ...\n]\n\nResult (for multipath descriptors):\n[             (json array) The derived addresses for each of the multipath expansions of the descriptor, in multipath specifier order\n  [           (json array) The derived addresses for a multipath descriptor expansion\n    \"str\",    (string) the derived address\n    ...\n  ],\n  ...\n]\n\nExamples:\nFirst three native segwit receive addresses\n> bitcoin-cli deriveaddresses \"wpkh([d34db33f/84h/0h/0h]xpub6DJ2dNUysrn5Vt36jH2KLBT2i1auw1tTSSomg8PhqNiUtx8QX2SvC9nrHu81fT41fvDUnhMjEzQgXnQjKEu3oaqMSzhSrHMxyyoEAmUHQbY/0/*)#cjjspncu\" \"[0,2]\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"deriveaddresses\", \"params\": [\"wpkh([d34db33f/84h/0h/0h]xpub6DJ2dNUysrn5Vt36jH2KLBT2i1auw1tTSSomg8PhqNiUtx8QX2SvC9nrHu81fT41fvDUnhMjEzQgXnQjKEu3oaqMSzhSrHMxyyoEAmUHQbY/0/*)#cjjspncu\", \"[0,2]\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+/// Verbatim `RPCHelpMan` text for `generatetodescriptor` (Core 29.4).
+const GENERATETODESCRIPTOR_HELP: &str = "generatetodescriptor num_blocks \"descriptor\" ( maxtries )\n\nMine to a specified descriptor and return the block hashes.\n\nArguments:\n1. num_blocks    (numeric, required) How many blocks are generated.\n2. descriptor    (string, required) The descriptor to send the newly generated bitcoin to.\n3. maxtries      (numeric, optional, default=1000000) How many iterations to try.\n\nResult:\n[           (json array) hashes of blocks generated\n  \"hex\",    (string) blockhash\n  ...\n]\n\nExamples:\n\nGenerate 11 blocks to mydesc\n> bitcoin-cli generatetodescriptor 11 \"mydesc\"\n";
+
 /// Verbatim `help verifychain` text (Bitcoin Core 29.4).
 const VERIFYCHAIN_HELP: &str = "verifychain ( checklevel nblocks )\n\nVerifies blockchain database.\n\nArguments:\n1. checklevel    (numeric, optional, default=3, range=0-4) How thorough the block verification is:\n                 - level 0 reads the blocks from disk\n                 - level 1 verifies block validity\n                 - level 2 verifies undo data\n                 - level 3 checks disconnection of tip blocks\n                 - level 4 tries to reconnect the blocks\n                 - each level includes the checks of the previous levels\n2. nblocks       (numeric, optional, default=6, 0=all) The number of blocks to check.\n\nResult:\ntrue|false    (boolean) Verification finished successfully. If false, check debug.log for reason.\n\nExamples:\n> bitcoin-cli verifychain \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"verifychain\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -4873,6 +4876,110 @@ fn dispatch(
                 Ok(json!(hashes))
             })
         }
+        // Core's generatetodescriptor (rpc/mining.cpp) — mines to the
+        // descriptor's output *script* (no address needed, no checksum
+        // required). getScriptFromDescriptor: parse → multipath and
+        // ranged refusals → Expand(0) → pick scripts[0]/[2]/[1] for
+        // 1/4/2-script expansions (combo's p2wpkh sits at index 2).
+        "generatetodescriptor" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() < 2 || arr.len() > 3 {
+                return help_error(GENERATETODESCRIPTOR_HELP);
+            }
+            let mut type_errors: Vec<(usize, &str, &Value, &str)> = Vec::new();
+            if !arr[0].is_number() {
+                type_errors.push((1, "num_blocks", &arr[0], "number"));
+            }
+            if !arr[1].is_string() {
+                type_errors.push((2, "descriptor", &arr[1], "string"));
+            }
+            if let Some(v) = arr.get(2)
+                && !v.is_number()
+            {
+                type_errors.push((3, "maxtries", v, "number"));
+            }
+            if !type_errors.is_empty() {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_list(&type_errors))),
+                );
+            }
+            // Arg<int> / Arg<uint64_t> — getInt's out-of-range throw.
+            let Some(nblocks) = arr[0].as_i64().and_then(|n| i32::try_from(n).ok()) else {
+                return (
+                    Value::Null,
+                    Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                );
+            };
+            let maxtries = match arr.get(2) {
+                Some(v) => match v.as_u64() {
+                    Some(n) => n,
+                    None => {
+                        return (
+                            Value::Null,
+                            Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                        );
+                    }
+                },
+                None => 1_000_000,
+            };
+            let desc_text = arr[1].as_str().unwrap_or_default().to_owned();
+            chain_query(queries, move |cs, mgr| {
+                let params = *cs.tree().params();
+                let (descs, provider, _) = match avila_consensus::descriptor::parse_descriptors(
+                    &desc_text, &params, false,
+                ) {
+                    Ok(v) if !v.0.is_empty() => v,
+                    Ok(_) => return Err((RPC_INVALID_ADDRESS_OR_KEY, String::new())),
+                    Err(e) => return Err((RPC_INVALID_ADDRESS_OR_KEY, e)),
+                };
+                if descs.len() > 1 {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "Multipath descriptor not accepted".into(),
+                    ));
+                }
+                let desc = &descs[0];
+                if desc.is_range() {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?"
+                            .into(),
+                    ));
+                }
+                let Some(scripts) = desc.expand(0, &provider, &params) else {
+                    return Err((
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        "Cannot derive script without private keys".into(),
+                    ));
+                };
+                if scripts.is_empty() || scripts.len() > 4 {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "CHECK_NONFATAL: unexpected script count".into(),
+                    ));
+                }
+                let script = match scripts.len() {
+                    1 => scripts[0].clone(),
+                    4 => scripts[2].clone(),
+                    _ => scripts[1].clone(),
+                };
+                let script = Script::new(script);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                let mut hashes = Vec::new();
+                for _ in 0..nblocks.max(0) {
+                    let template = mgr
+                        .mempool_ref()
+                        .build_template(cs, script.clone(), now)
+                        .map_err(|e| (RPC_MISC_ERROR, format!("template: {e}")))?;
+                    hashes.push(mine_and_connect(cs, mgr, template.block, maxtries, now)?);
+                }
+                Ok(json!(hashes))
+            })
+        }
         "generateblock" => {
             let Some(output) = param(params, 0, "output")
                 .and_then(Value::as_str)
@@ -6138,6 +6245,7 @@ fn dispatch(
                  \x20   submitblock <hex>,\n\
                  \x20   submitheader <hex>, generatetoaddress <n> <address> [maxtries],\n\
                  \x20   generateblock <output> [rawtx/txid,...],\n\
+                 \x20   generatetodescriptor <n> <desc> [maxtries],\n\
                  \x20   preciousblock <hash>, prioritisetransaction <txid> 0 <delta>,\n\
                  \x20   getprioritisedtransactions,\n\
                  \x20   getblockfrompeer <hash> <peer_id>,\n\
@@ -8910,6 +9018,114 @@ mod tests {
         assert_eq!(
             r,
             json!(["bcrt1pet7ep3czdu9k4wvdlz2fp5p8x2yp7t6ttyqg2c6cmh0lgeuu9laspse7la"])
+        );
+    }
+
+    /// `generatetodescriptor` — Core's `getScriptFromDescriptor`
+    /// contract: the parse/range/multipath check chain, then a real
+    /// mine whose coinbase pays the descriptor's selected script
+    /// (`combo` picks index 2 — p2wpkh — of its 4-script expansion).
+    #[test]
+    fn generatetodescriptor_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let g = |p: Value| {
+            dispatch(
+                "generatetodescriptor",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+            )
+        };
+        let k = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+        let tpub = "tpubDC7jtehYfSDGXbAgBuLKNyJBdHbyQoMX9V8oUMgfzgiL5pGrFCnv6cyoRt2dovvP3nMEaeFc2jW1aChYQpUZFdnbsaXVcc7t2WMA27AvJ4W";
+
+        // Arity 2–3, then the collected -3 type list.
+        for p in [json!([]), json!([1]), json!([1, "x", 1, 1])] {
+            let (code, msg) = g(p.clone()).1.unwrap();
+            assert_eq!(code, RPC_MISC_ERROR, "{p}");
+            assert!(msg.starts_with("generatetodescriptor"), "{msg}");
+        }
+        let (code, msg) = g(json!(["x", 1, "y"])).1.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert!(msg.contains("Position 1 (num_blocks)"), "{msg}");
+        assert!(msg.contains("Position 3 (maxtries)"), "{msg}");
+
+        // getInt<int>/getInt<uint64_t> bounds — floats, negatives on
+        // maxtries, and >i32 num_blocks all throw -1.
+        for p in [
+            json!([1.5, "raw(deadbeef)"]),
+            json!([2147483648u64, "raw(deadbeef)"]),
+            json!([1, "raw(deadbeef)", -1]),
+            json!([1, "raw(deadbeef)", 1.5]),
+        ] {
+            assert_eq!(g(p.clone()).1.unwrap().0, RPC_MISC_ERROR, "{p}");
+        }
+
+        // Descriptor checks in Core's order — parse -5, multipath -8,
+        // ranged -8.
+        let (code, msg) = g(json!([1, "bogus"])).1.unwrap();
+        assert_eq!(
+            (code, msg.as_str()),
+            (
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "'bogus' is not a valid descriptor function"
+            )
+        );
+        let (code, msg) = g(json!([1, format!("wpkh({tpub}/<0;1>/*)")])).1.unwrap();
+        assert_eq!(
+            (code, msg.as_str()),
+            (RPC_INVALID_PARAMETER, "Multipath descriptor not accepted")
+        );
+        let (code, msg) = g(json!([1, format!("wpkh({tpub}/0/*)")])).1.unwrap();
+        assert_eq!(
+            (code, msg.as_str()),
+            (
+                RPC_INVALID_PARAMETER,
+                "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?"
+            )
+        );
+
+        // nblocks ≤ 0 mines nothing and errors nothing.
+        assert_eq!(g(json!([-1, "raw(deadbeef)"])), (json!([]), None));
+        assert_eq!(g(json!([0, "raw(deadbeef)"])), (json!([]), None));
+
+        // A real mine: raw() pays its literal script, combo() picks
+        // the p2wpkh member (index 2 of the 4-script expansion).
+        let (r, e) = g(json!([1, "raw(deadbeef)"]));
+        assert!(e.is_none(), "{e:?}");
+        let hash = r[0].as_str().unwrap().to_owned();
+        let (b, e) = dispatch(
+            "getblock",
+            &json!([hash, 2]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(
+            b["tx"][0]["vout"][0]["scriptPubKey"]["hex"],
+            json!("deadbeef")
+        );
+
+        let (r, e) = g(json!([1, format!("combo({k})")]));
+        assert!(e.is_none(), "{e:?}");
+        let hash = r[0].as_str().unwrap().to_owned();
+        let (b, e) = dispatch(
+            "getblock",
+            &json!([hash, 2]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(
+            b["tx"][0]["vout"][0]["scriptPubKey"]["hex"],
+            json!("001406afd46bcdfd22ef94ac122aa11f241244a37ecc")
         );
     }
 

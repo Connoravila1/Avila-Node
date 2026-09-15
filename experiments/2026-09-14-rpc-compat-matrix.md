@@ -550,6 +550,20 @@ surfaced:
   BOTH-ERROR including tpub derivation at positions 0/1, `tr()`
   key-path and `{pk,pk}` script-tree addresses, and the
   hardened-vs-xpub failure split.
+- `generatetodescriptor` ports `rpc/mining.cpp`'s
+  `getScriptFromDescriptor` on the same parser: arity `-1`+help,
+  the collected `-3` type list, `getInt<int>`/`getInt<uint64_t>`
+  out-of-range throws, parse `-5`, then `-8` "Multipath descriptor
+  not accepted" before `-8` "Ranged descriptor not accepted…", and
+  `Expand(0)` failures map to `-5` "Cannot derive script without
+  private keys". Script selection follows Core exactly — 1 script →
+  `[0]`, 4 → `[2]` (combo's p2wpkh), 2 → `[1]` (uncompressed combo's
+  p2pkh) — and the mined coinbase pays that script verbatim
+  (`raw(deadbeef)` yields an unspendable `deadbeef` coinbase).
+  Verified live: 13 error rows byte-identical, and 9 real mines whose
+  coinbase `scriptPubKey` matched Core's pick for `combo` (both key
+  forms), `tr`, `raw`, `pkh`, `pk`, `sh(wpkh)`, `addr`, and
+  `wsh(sortedmulti)`.
 
 ### Known semantic differences
 

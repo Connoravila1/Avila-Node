@@ -292,7 +292,10 @@ operation. Compare complete initial download and catch-up, not only local replay
       isrange/issolvable/hasprivatekeys, Core's ParseDescriptorRange
       ordering, nested multipath output, taproot key-path and
       script-tree expansion; miniscript inside wsh()/tr() is not yet
-      parsed). RPC
+      parsed), generatetodescriptor (Core's getScriptFromDescriptor —
+      no checksum needed, multipath/ranged refuse before expansion,
+      and the coinbase pays the expansion's picked script: [0]/[2]/[1]
+      for 1/4/2-script forms). RPC
       doubles emit Core's `UniValue::setFloat` text (`%.16g` via `g16`)
       rather than ryu's shortest repr — the two parse to different
       f64s on values like 101/17, and `txrate` now matches
