@@ -241,7 +241,13 @@ operation. Compare complete initial download and catch-up, not only local replay
       clamped to `max(0, height-1)`, median-time-past window
       intervals, and Core's exact validation order — hash format and
       index lookup before the integer count, every wrong-typed
-      argument collected into one `-3` list). Outbound dialing is
+      argument collected into one `-3` list), gettxoutsetinfo
+      (Core's kernel/coinstats contract — `hash_serialized_3` as
+      SHA256d over sorted `TxOutSer` bytes, a verified MuHash-3072
+      port matching Core's crypto test vectors and live digests,
+      plus the coinstatsindex gate on hash_or_height; `disk_size`
+      reports our serialized-size estimate where Core reports
+      LevelDB's). Outbound dialing is
       asynchronous —
       `maintain_outbounds` runs `connect_timeout` on slot-bounded
       worker threads and drains results on the tick, so a book of dead

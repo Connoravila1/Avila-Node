@@ -36,6 +36,7 @@ use thiserror::Error;
 use crate::block::Block;
 use crate::chain::{ChainError, HeaderTree, InsertStatus};
 use crate::check::{self, BlockContext, BlockRuleError, ContextualBlockError, RuleError};
+use crate::coinstats::{self, CoinStats, CoinStatsHashType};
 use crate::connect::{self, BlockUndo, ConnectContext, ConnectError, UtxoSet};
 use crate::hash::{BlockHash, Txid};
 use crate::header::BlockHeader;
@@ -845,6 +846,19 @@ impl Chainstate {
             }
         }
         true
+    }
+
+    /// UTXO-set statistics over the active tip — `gettxoutsetinfo`'s
+    /// non-index path (Core's `GetUTXOStats` with no coinstatsindex and
+    /// no target pindex: the view's own best block is reported).
+    #[must_use]
+    pub fn coin_stats(&self, hash_type: CoinStatsHashType) -> CoinStats {
+        coinstats::compute(
+            &self.utxo,
+            i64::from(self.chain.len() as u32 - 1),
+            self.connected,
+            hash_type,
+        )
     }
 
     /// Indexes a header without a body — Core's `ProcessNewBlockHeaders` →

@@ -72,13 +72,13 @@ python3 tools/compare_rpc.py \
 
 ## Results
 
-Latest run vs **Core 29.4** at h160: 83 MATCH, 2 EXPECTED-DIFF
+Latest run vs **Core 29.4** at h160: 88 MATCH, 2 EXPECTED-DIFF
 (`getpeerinfo` per-peer field shape — our extra observability fields
 vs Core's direction-specific `addrbind`/`addrlocal`/`last_block`;
 `getrawtransaction`'s `in_active_chain` — an upstream field added
 after 29.4, verified present in Core 31.1), 0 DIFFERS, 1 CORE-ERROR
 (`gettxoutproof prove_witness` — the witness-proof wire format is a
-Knots extension Core doesn't implement), 86 BOTH-ERROR (identical
+Knots extension Core doesn't implement), 93 BOTH-ERROR (identical
 error paths). First matrix vs Knots: 46 MATCH, 2 EXPECTED-DIFF,
 3 DIFFERS — `fullrbf` was a genuine policy divergence then; the
 mempool has since been aligned to Core 29.x (below).
@@ -374,6 +374,26 @@ surfaced:
   reported `Connected` where Core's `ActivateBestChain` early-exits —
   `maybe_reorg` now stops on the connected tip, so `submitblock`
   reports `"duplicate"` again.
+- `gettxoutsetinfo` computes Core's `kernel/coinstats.cpp` contract
+  over the live UTXO set. `hash_serialized_3` is SHA256d over the
+  concatenated `TxOutSer` bytes of every coin in cursor order
+  (`(txid, vout)` ascending on raw bytes — our `HashMap` entries are
+  sorted by reference once, never copied); `muhash` is a from-scratch
+  MuHash-3072 port (Num3072 field arithmetic, divstep inverse,
+  ChaCha20 element mapping) verified against Core's `crypto_tests`
+  vectors — the fixed insert/remove/finalize digest, the 768-byte
+  numerator‖denominator serialization, and the overflow-reduction
+  case — then live-verified: both digests plus `height`, `bestblock`,
+  `txouts`, `bogosize`, `transactions`, and `total_amount` are
+  byte-identical to Core 29.4 on the h160 chain. `disk_size` is the
+  one documented estimate: Core reports LevelDB's `EstimateSize`, we
+  report the set's serialized size (dynamic key). Without
+  coinstatsindex every non-null `hash_or_height` throws `-8`
+  "Querying specific block heights requires coinstatsindex" after
+  hash-type parsing but before any index work, and the `-3`
+  wrong-type list collects `hash_type`/`use_index` while
+  `hash_or_height` stays `skip_type_check` — all verified against
+  Core's ordering.
 - SIGTERM/SIGINT now land on the same `cancel` flag as `stop` — the
   run loop exits through the normal shutdown block, so `peers.dat`,
   `mempool.dat`, and `banlist.json` persist across kills. Previously a

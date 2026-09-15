@@ -199,6 +199,10 @@ hash_newtype!(
     "The `sha256d` hash of a transaction's witness serialization (BIP141)."
 );
 hash_newtype!(MerkleRoot, "The root of a block's transaction merkle tree.");
+hash_newtype!(
+    Hash256,
+    "A generic 32-byte digest — e.g. the `hash_serialized_3`/`muhash` UTXO-set commitment."
+);
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

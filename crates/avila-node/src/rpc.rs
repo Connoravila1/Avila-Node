@@ -627,6 +627,9 @@ const PRECIOUSBLOCK_HELP: &str = "preciousblock \"blockhash\"\n\nTreats a block 
 
 const GETCHAINTXSTATS_HELP: &str = "getchaintxstats ( nblocks \"blockhash\" )\n\nCompute statistics about the total number and rate of transactions in the chain.\n\nArguments:\n1. nblocks      (numeric, optional, default=one month) Size of the window in number of blocks\n2. blockhash    (string, optional, default=chain tip) The hash of the block that ends the window.\n\nResult:\n{                                       (json object)\n  \"time\" : xxx,                         (numeric) The timestamp for the final block in the window, expressed in UNIX epoch time\n  \"txcount\" : n,                        (numeric, optional) The total number of transactions in the chain up to that point, if known. It may be unknown when using assumeutxo.\n  \"window_final_block_hash\" : \"hex\",    (string) The hash of the final block in the window\n  \"window_final_block_height\" : n,      (numeric) The height of the final block in the window.\n  \"window_block_count\" : n,             (numeric) Size of the window in number of blocks\n  \"window_interval\" : n,                (numeric, optional) The elapsed time in the window in seconds. Only returned if \"window_block_count\" is > 0\n  \"window_tx_count\" : n,                (numeric, optional) The number of transactions in the window. Only returned if \"window_block_count\" is > 0 and if txcount exists for the start and end of the window.\n  \"txrate\" : n                          (numeric, optional) The average rate of transactions per second in the window. Only returned if \"window_interval\" is > 0 and if window_tx_count exists.\n}\n\nExamples:\n> bitcoin-cli getchaintxstats \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getchaintxstats\", \"params\": [2016]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+/// Verbatim `help gettxoutsetinfo` text (Bitcoin Core 29.4).
+const GETTXOUTSETINFO_HELP: &str = "gettxoutsetinfo ( \"hash_type\" hash_or_height use_index )\n\nReturns statistics about the unspent transaction output set.\nNote this call may take some time if you are not using coinstatsindex.\n\nArguments:\n1. hash_type         (string, optional, default=\"hash_serialized_3\") Which UTXO set hash should be calculated. Options: 'hash_serialized_3' (the legacy algorithm), 'muhash', 'none'.\n2. hash_or_height    (string or numeric, optional, default=the current best block) The block hash or height of the target height (only available with coinstatsindex).\n3. use_index         (boolean, optional, default=true) Use coinstatsindex, if available.\n\nResult:\n{                                     (json object)\n  \"height\" : n,                       (numeric) The block height (index) of the returned statistics\n  \"bestblock\" : \"hex\",                (string) The hash of the block at which these statistics are calculated\n  \"txouts\" : n,                       (numeric) The number of unspent transaction outputs\n  \"bogosize\" : n,                     (numeric) Database-independent, meaningless metric indicating the UTXO set size\n  \"hash_serialized_3\" : \"hex\",        (string, optional) The serialized hash (only present if 'hash_serialized_3' hash_type is chosen)\n  \"muhash\" : \"hex\",                   (string, optional) The serialized hash (only present if 'muhash' hash_type is chosen)\n  \"transactions\" : n,                 (numeric, optional) The number of transactions with unspent outputs (not available when coinstatsindex is used)\n  \"disk_size\" : n,                    (numeric, optional) The estimated size of the chainstate on disk (not available when coinstatsindex is used)\n  \"total_amount\" : n,                 (numeric) The total amount of coins in the UTXO set\n  \"total_unspendable_amount\" : n,     (numeric, optional) The total amount of coins permanently excluded from the UTXO set (only available if coinstatsindex is used)\n  \"block_info\" : {                    (json object, optional) Info on amounts in the block at this block height (only available if coinstatsindex is used)\n    \"prevout_spent\" : n,              (numeric) Total amount of all prevouts spent in this block\n    \"coinbase\" : n,                   (numeric) Coinbase subsidy amount of this block\n    \"new_outputs_ex_coinbase\" : n,    (numeric) Total amount of new outputs created by this block\n    \"unspendable\" : n,                (numeric) Total amount of unspendable outputs created in this block\n    \"unspendables\" : {                (json object) Detailed view of the unspendable categories\n      \"genesis_block\" : n,            (numeric) The unspendable amount of the Genesis block subsidy\n      \"bip30\" : n,                    (numeric) Transactions overridden by duplicates (no longer possible with BIP30)\n      \"scripts\" : n,                  (numeric) Amounts sent to scripts that are unspendable (for example OP_RETURN outputs)\n      \"unclaimed_rewards\" : n         (numeric) Fee rewards that miners did not claim in their coinbase transaction\n    }\n  }\n}\n\nExamples:\n> bitcoin-cli gettxoutsetinfo \n> bitcoin-cli gettxoutsetinfo \"none\"\n> bitcoin-cli gettxoutsetinfo \"none\" 1000\n> bitcoin-cli gettxoutsetinfo \"none\" '\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"'\n> bitcoin-cli -named gettxoutsetinfo hash_type='muhash' use_index='false'\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxoutsetinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxoutsetinfo\", \"params\": [\"none\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxoutsetinfo\", \"params\": [\"none\", 1000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxoutsetinfo\", \"params\": [\"none\", \"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 /// Verbatim `help verifychain` text (Bitcoin Core 29.4).
 const VERIFYCHAIN_HELP: &str = "verifychain ( checklevel nblocks )\n\nVerifies blockchain database.\n\nArguments:\n1. checklevel    (numeric, optional, default=3, range=0-4) How thorough the block verification is:\n                 - level 0 reads the blocks from disk\n                 - level 1 verifies block validity\n                 - level 2 verifies undo data\n                 - level 3 checks disconnection of tip blocks\n                 - level 4 tries to reconnect the blocks\n                 - each level includes the checks of the previous levels\n2. nblocks       (numeric, optional, default=6, 0=all) The number of blocks to check.\n\nResult:\ntrue|false    (boolean) Verification finished successfully. If false, check debug.log for reason.\n\nExamples:\n> bitcoin-cli verifychain \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"verifychain\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -3289,6 +3292,91 @@ fn dispatch(
                 }
             })
         }
+        "gettxoutsetinfo" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() > 3 {
+                return help_error(GETTXOUTSETINFO_HELP);
+            }
+            // RPCHelpMan type pass: hash_type a string, use_index a
+            // boolean; hash_or_height is declared skip_type_check, so
+            // any JSON value reaches the body. Null means default.
+            let mut type_errors: Vec<(usize, &str, &Value, &str)> = Vec::new();
+            if let Some(v) = arr.first().filter(|v| !(v.is_string() || v.is_null())) {
+                type_errors.push((1, "hash_type", v, "string"));
+            }
+            if let Some(v) = arr.get(2).filter(|v| !(v.is_boolean() || v.is_null())) {
+                type_errors.push((3, "use_index", v, "bool"));
+            }
+            if !type_errors.is_empty() {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_list(&type_errors))),
+                );
+            }
+            // The body parses hash_type before touching the others — a
+            // bad value beats the coinstatsindex check.
+            let hash_type = match arr.first() {
+                None | Some(Value::Null) => {
+                    avila_consensus::coinstats::CoinStatsHashType::HashSerialized
+                }
+                Some(Value::String(s)) => match s.as_str() {
+                    "hash_serialized_3" => {
+                        avila_consensus::coinstats::CoinStatsHashType::HashSerialized
+                    }
+                    "muhash" => avila_consensus::coinstats::CoinStatsHashType::MuHash,
+                    "none" => avila_consensus::coinstats::CoinStatsHashType::None,
+                    other => {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_INVALID_PARAMETER,
+                                format!("'{other}' is not a valid hash_type"),
+                            )),
+                        );
+                    }
+                },
+                _ => unreachable!(),
+            };
+            // No coinstatsindex: any non-null target is rejected before
+            // use_index or the value itself are consulted.
+            if arr.get(1).is_some_and(|v| !v.is_null()) {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_INVALID_PARAMETER,
+                        "Querying specific block heights requires coinstatsindex".into(),
+                    )),
+                );
+            }
+            chain_query(queries, move |cs, _mgr| {
+                let s = cs.coin_stats(hash_type);
+                let mut o = serde_json::Map::new();
+                o.insert("height".into(), s.height.into());
+                o.insert("bestblock".into(), s.best_block.to_string().into());
+                o.insert("txouts".into(), s.txouts.into());
+                o.insert("bogosize".into(), s.bogo_size.into());
+                use avila_consensus::coinstats::CoinStatsHashType as H;
+                match (hash_type, s.hash_serialized) {
+                    (H::HashSerialized, Some(h)) => {
+                        o.insert("hash_serialized_3".into(), h.to_string().into());
+                    }
+                    (H::MuHash, Some(h)) => {
+                        o.insert("muhash".into(), h.to_string().into());
+                    }
+                    _ => {}
+                }
+                let Some(total) = s.total_amount else {
+                    return Err((
+                        RPC_INTERNAL_ERROR,
+                        "total_amount overflowed MoneyRange".into(),
+                    ));
+                };
+                o.insert("total_amount".into(), (total as f64 / 100_000_000.0).into());
+                o.insert("transactions".into(), s.transactions.into());
+                o.insert("disk_size".into(), s.disk_size.into());
+                Ok(Value::Object(o))
+            })
+        }
         "generatetoaddress" => {
             let Some(nblocks) = param(params, 0, "nblocks").and_then(Value::as_u64) else {
                 return missing_params("nblocks address");
@@ -4575,7 +4663,8 @@ fn dispatch(
                  \x20   gettxoutproof <txids> [blockhash] [options],\n\
                  \x20   verifytxoutproof <proof> [options], validateaddress <address>,\n\
                  \x20   verifychain [checklevel] [nblocks],\n\
-                 \x20   getchaintxstats [nblocks] [blockhash]\n\
+                 \x20   getchaintxstats [nblocks] [blockhash],\n\
+                 \x20   gettxoutsetinfo [hash_type] [hash_or_height] [use_index]\n\
                  \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
                  \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
                  \x20   gettxspendingprevout <outputs>,\n\
@@ -6304,6 +6393,95 @@ mod tests {
             assert_eq!(code, RPC_INVALID_PARAMETER, "{p}");
             assert!(msg.contains("block's height - 1"), "{msg}");
         }
+    }
+
+    /// `gettxoutsetinfo` — hash-type selection, the collected type list,
+    /// the coinstatsindex gate on `hash_or_height`, and the genesis-only
+    /// (empty UTXO set) result shape.
+    #[test]
+    fn gettxoutsetinfo_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+
+        // Arity → -1 + help.
+        let (_, e) = dispatch(
+            "gettxoutsetinfo",
+            &json!(["none", null, true, 4]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_MISC_ERROR);
+        assert!(msg.starts_with("gettxoutsetinfo"), "{msg}");
+
+        // Wrong types collected across positions — hash_or_height
+        // (position 2) is skip_type_check, so a number there is fine.
+        let (_, e) = dispatch(
+            "gettxoutsetinfo",
+            &json!([7, null, "x"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert!(msg.contains("Position 1 (hash_type)"), "{msg}");
+        assert!(msg.contains("Position 3 (use_index)"), "{msg}");
+        assert!(!msg.contains("hash_or_height"), "{msg}");
+
+        // An invalid hash_type is -8 before the index gate.
+        let (_, e) = dispatch(
+            "gettxoutsetinfo",
+            &json!(["bogus"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        let (_, msg) = e.unwrap();
+        assert_eq!(msg, "'bogus' is not a valid hash_type");
+
+        // Any non-null target without coinstatsindex → -8, whatever
+        // use_index says.
+        for p in [
+            json!(["none", 0]),
+            json!(["muhash", "00".repeat(32), false]),
+        ] {
+            let (_, e) = dispatch("gettxoutsetinfo", &p, &snap, Some(&queries), None);
+            assert_eq!(
+                e.unwrap(),
+                (
+                    RPC_INVALID_PARAMETER,
+                    "Querying specific block heights requires coinstatsindex".to_string()
+                ),
+                "{p}"
+            );
+        }
+
+        // The empty genesis set: each hash type flips which key appears.
+        for (p, key) in [
+            (json!([]), "hash_serialized_3"),
+            (json!(["muhash"]), "muhash"),
+            (json!([null, null, false]), "hash_serialized_3"),
+        ] {
+            let (r, e) = dispatch("gettxoutsetinfo", &p, &snap, Some(&queries), None);
+            assert!(e.is_none(), "{p}: {e:?}");
+            assert_eq!(r["height"], json!(0), "{p}");
+            assert_eq!(r["txouts"], json!(0), "{p}");
+            assert_eq!(r["transactions"], json!(0), "{p}");
+            assert_eq!(r["total_amount"], json!(0.0), "{p}");
+            assert!(r.get(key).is_some(), "{p}");
+        }
+        let (r, e) = dispatch(
+            "gettxoutsetinfo",
+            &json!(["none"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert!(r.get("hash_serialized_3").is_none());
+        assert!(r.get("muhash").is_none());
     }
 
     /// `getrpcinfo`/`getmemoryinfo`/`logging` — the introspection

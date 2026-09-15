@@ -86,6 +86,10 @@ DYNAMIC_KEYS = {
     # getnettotals — cumulative wire bytes and wall-clock millis are
     # per-node counters.
     "totalbytesrecv", "totalbytessent", "timemillis",
+    # gettxoutsetinfo — Core reports a LevelDB EstimateSize; we report
+    # the UTXO set's serialized size. Both are estimates of different
+    # storage layouts, so only presence/shape is comparable.
+    "disk_size",
     # Tip-dependent — equal-work regtest forks mean each daemon can sit
     # on a different (valid) tip; the reported hashes diverge without
     # either node being wrong.
@@ -280,6 +284,21 @@ def build_calls(height):
         ("getchaintxstats", [None, "HASH"]),
         ("getchaintxstats", [7, "HASH"]),
         ("getchaintxstats", [1, 2, 3]),
+        # gettxoutsetinfo — all three hash types over the same live UTXO
+        # set; disk_size is a DYNAMIC_KEYS estimate (LevelDB vs our
+        # serialized-size), every other field is a consensus value.
+        ("gettxoutsetinfo", []),
+        ("gettxoutsetinfo", ["hash_serialized_3"]),
+        ("gettxoutsetinfo", ["muhash"]),
+        ("gettxoutsetinfo", ["none"]),
+        ("gettxoutsetinfo", ["bogus"]),
+        ("gettxoutsetinfo", [1]),
+        ("gettxoutsetinfo", ["none", 5]),
+        ("gettxoutsetinfo", ["muhash", "00" * 32, False]),
+        ("gettxoutsetinfo", ["none", "00" * 32, 5]),
+        ("gettxoutsetinfo", [7, 5, "x"]),
+        ("gettxoutsetinfo", [["none"]]),
+        ("gettxoutsetinfo", ["a", "b", "c", "d"]),
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),
         ("estimatesmartfee", [6]),
