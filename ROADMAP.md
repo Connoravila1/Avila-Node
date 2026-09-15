@@ -254,7 +254,10 @@ operation. Compare complete initial download and catch-up, not only local replay
       totals, and template ordering while template `"fee"` stays
       base like Core — plus the unbroadcast set and the
       depends/spentby/bip125-replaceable entry fields the RPC
-      exposes). Outbound dialing is
+      exposes), getblockfrompeer (targeted `getdata[MSG_WITNESS_BLOCK]`
+      on a named session after Core's full -1 check chain — header
+      missing, already downloaded, peer does not exist). Outbound
+      dialing is
       asynchronous —
       `maintain_outbounds` runs `connect_timeout` on slot-bounded
       worker threads and drains results on the tick, so a book of dead

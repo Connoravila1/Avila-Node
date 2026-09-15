@@ -318,6 +318,20 @@ def build_calls(height):
         ("prioritisetransaction", ["00" * 32, 5, 100]),
         ("prioritisetransaction", ["00" * 32, 0, 100]),
         ("prioritisetransaction", ["00" * 32, 0, -50]),
+        # getblockfrompeer — two required args, collected -3 list,
+        # then "Block header missing" / "Block already downloaded" /
+        # "Peer does not exist" (all -1). HASH is on the active chain
+        # so it's downloaded; "00"*32 is unknown.
+        ("getblockfrompeer", []),
+        ("getblockfrompeer", ["00" * 32]),
+        ("getblockfrompeer", ["00" * 32, 0, 0]),
+        ("getblockfrompeer", [7, "x"]),
+        ("getblockfrompeer", ["00", 1.5]),
+        ("getblockfrompeer", ["00" * 32, 1.5]),
+        ("getblockfrompeer", ["00" * 32, 0]),
+        ("getblockfrompeer", ["00" * 32, 9999]),
+        ("getblockfrompeer", ["HASH", 9999]),
+        ("getblockfrompeer", ["HASH", -1]),
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),
         ("estimatesmartfee", [6]),

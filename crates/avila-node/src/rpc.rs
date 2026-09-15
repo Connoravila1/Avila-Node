@@ -630,6 +630,9 @@ const GETCHAINTXSTATS_HELP: &str = "getchaintxstats ( nblocks \"blockhash\" )\n\
 /// Verbatim `help gettxoutsetinfo` text (Bitcoin Core 29.4).
 const GETTXOUTSETINFO_HELP: &str = "gettxoutsetinfo ( \"hash_type\" hash_or_height use_index )\n\nReturns statistics about the unspent transaction output set.\nNote this call may take some time if you are not using coinstatsindex.\n\nArguments:\n1. hash_type         (string, optional, default=\"hash_serialized_3\") Which UTXO set hash should be calculated. Options: 'hash_serialized_3' (the legacy algorithm), 'muhash', 'none'.\n2. hash_or_height    (string or numeric, optional, default=the current best block) The block hash or height of the target height (only available with coinstatsindex).\n3. use_index         (boolean, optional, default=true) Use coinstatsindex, if available.\n\nResult:\n{                                     (json object)\n  \"height\" : n,                       (numeric) The block height (index) of the returned statistics\n  \"bestblock\" : \"hex\",                (string) The hash of the block at which these statistics are calculated\n  \"txouts\" : n,                       (numeric) The number of unspent transaction outputs\n  \"bogosize\" : n,                     (numeric) Database-independent, meaningless metric indicating the UTXO set size\n  \"hash_serialized_3\" : \"hex\",        (string, optional) The serialized hash (only present if 'hash_serialized_3' hash_type is chosen)\n  \"muhash\" : \"hex\",                   (string, optional) The serialized hash (only present if 'muhash' hash_type is chosen)\n  \"transactions\" : n,                 (numeric, optional) The number of transactions with unspent outputs (not available when coinstatsindex is used)\n  \"disk_size\" : n,                    (numeric, optional) The estimated size of the chainstate on disk (not available when coinstatsindex is used)\n  \"total_amount\" : n,                 (numeric) The total amount of coins in the UTXO set\n  \"total_unspendable_amount\" : n,     (numeric, optional) The total amount of coins permanently excluded from the UTXO set (only available if coinstatsindex is used)\n  \"block_info\" : {                    (json object, optional) Info on amounts in the block at this block height (only available if coinstatsindex is used)\n    \"prevout_spent\" : n,              (numeric) Total amount of all prevouts spent in this block\n    \"coinbase\" : n,                   (numeric) Coinbase subsidy amount of this block\n    \"new_outputs_ex_coinbase\" : n,    (numeric) Total amount of new outputs created by this block\n    \"unspendable\" : n,                (numeric) Total amount of unspendable outputs created in this block\n    \"unspendables\" : {                (json object) Detailed view of the unspendable categories\n      \"genesis_block\" : n,            (numeric) The unspendable amount of the Genesis block subsidy\n      \"bip30\" : n,                    (numeric) Transactions overridden by duplicates (no longer possible with BIP30)\n      \"scripts\" : n,                  (numeric) Amounts sent to scripts that are unspendable (for example OP_RETURN outputs)\n      \"unclaimed_rewards\" : n         (numeric) Fee rewards that miners did not claim in their coinbase transaction\n    }\n  }\n}\n\nExamples:\n> bitcoin-cli gettxoutsetinfo \n> bitcoin-cli gettxoutsetinfo \"none\"\n> bitcoin-cli gettxoutsetinfo \"none\" 1000\n> bitcoin-cli gettxoutsetinfo \"none\" '\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"'\n> bitcoin-cli -named gettxoutsetinfo hash_type='muhash' use_index='false'\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxoutsetinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxoutsetinfo\", \"params\": [\"none\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxoutsetinfo\", \"params\": [\"none\", 1000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxoutsetinfo\", \"params\": [\"none\", \"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+/// Verbatim `help getblockfrompeer` text (Bitcoin Core 29.4).
+const GETBLOCKFROMPEER_HELP: &str = "getblockfrompeer \"blockhash\" peer_id\n\nAttempt to fetch block from a given peer.\n\nWe must have the header for this block, e.g. using submitheader.\nThe block will not have any undo data which can limit the usage of the block data in a context where the undo data is needed.\nSubsequent calls for the same block may cause the response from the previous peer to be ignored.\nPeers generally ignore requests for a stale block that they never fully verified, or one that is more than a month old.\nWhen a peer does not respond with a block, we will disconnect.\nNote: The block could be re-pruned as soon as it is received.\n\nReturns an empty JSON object if the request was successfully scheduled.\n\nArguments:\n1. blockhash    (string, required) The block hash to try to fetch\n2. peer_id      (numeric, required) The peer to fetch it from (see getpeerinfo for peer IDs)\n\nResult:\n{}    (empty JSON object)\n\nExamples:\n> bitcoin-cli getblockfrompeer \"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\" 0\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockfrompeer\", \"params\": [\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\" 0]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 /// Verbatim `help prioritisetransaction` text (Bitcoin Core 29.4).
 const PRIORITISETRANSACTION_HELP: &str = "prioritisetransaction \"txid\" ( dummy ) fee_delta\n\nAccepts the transaction into mined blocks at a higher (or lower) priority\n\nArguments:\n1. txid         (string, required) The transaction id.\n2. dummy        (numeric, optional) API-Compatibility for previous API. Must be zero or null.\n                DEPRECATED. For forward compatibility use named arguments and omit this parameter.\n3. fee_delta    (numeric, required) The fee value (in satoshis) to add (or subtract, if negative).\n                Note, that this value is not a fee rate. It is a value to modify absolute fee of the TX.\n                The fee is not actually paid, only the algorithm for selecting transactions into a block\n                considers the transaction as it would have paid a higher (or lower) fee.\n\nResult:\ntrue|false    (boolean) Returns true\n\nExamples:\n> bitcoin-cli prioritisetransaction \"txid\" 0.0 10000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"prioritisetransaction\", \"params\": [\"txid\", 0.0, 10000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -3149,6 +3152,56 @@ fn dispatch(
                 }
             })
         }
+        "getblockfrompeer" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() != 2 {
+                return help_error(GETBLOCKFROMPEER_HELP);
+            }
+            let mut type_errors: Vec<(usize, &str, &Value, &str)> = Vec::new();
+            if !arr[0].is_string() {
+                type_errors.push((1, "blockhash", &arr[0], "string"));
+            }
+            if !arr[1].is_number() {
+                type_errors.push((2, "peer_id", &arr[1], "number"));
+            }
+            if !type_errors.is_empty() {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_list(&type_errors))),
+                );
+            }
+            // Core's body order: ParseHashV → getInt<int64> → header
+            // index → already-downloaded → peer → schedule.
+            let hash: BlockHash =
+                match parse_hash_v(arr[0].as_str().unwrap_or_default(), "blockhash") {
+                    Ok(h) => h,
+                    Err(e) => return (Value::Null, Some(e)),
+                };
+            let Some(peer_id) = arr[1].as_i64() else {
+                return (
+                    Value::Null,
+                    Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                );
+            };
+            chain_query(queries, move |cs, mgr| {
+                if !cs.tree().contains(&hash) {
+                    return Err((RPC_MISC_ERROR, "Block header missing".into()));
+                }
+                if cs.body(&hash).is_some() {
+                    return Err((RPC_MISC_ERROR, "Block already downloaded".into()));
+                }
+                // Core's NodeId is signed — a negative id can't name a
+                // peer, so it lands in "does not exist" like Core.
+                let peer_id = peer_id as u64;
+                if !mgr.peer_ids().contains(&peer_id) {
+                    return Err((RPC_MISC_ERROR, "Peer does not exist".into()));
+                }
+                if !mgr.fetch_block(peer_id, hash) {
+                    return Err((RPC_MISC_ERROR, "Failed to fetch block from peer".into()));
+                }
+                Ok(json!({}))
+            })
+        }
         "prioritisetransaction" => {
             let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
             if arr.len() != 3 {
@@ -4768,7 +4821,8 @@ fn dispatch(
                  \x20   submitblock <hex>,\n\
                  \x20   submitheader <hex>, generatetoaddress <n> <address> [maxtries],\n\
                  \x20   generateblock <output> [rawtx/txid,...],\n\
-                 \x20   preciousblock <hash>, prioritisetransaction <txid> 0 <delta>\n\
+                 \x20   preciousblock <hash>, prioritisetransaction <txid> 0 <delta>,\n\
+                 \x20   getblockfrompeer <hash> <peer_id>\n\
                  \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo,\n\
                  \x20   getnettotals, getnodeaddresses [count] [network],\n\
                  \x20   getaddrmaninfo,\n\
@@ -6480,6 +6534,89 @@ mod tests {
             assert!(e.is_none(), "{p}: {e:?}");
             assert_eq!(r, json!(true), "{p}");
         }
+    }
+
+    /// `getblockfrompeer` — Core 29.4's order: exactly two args, the
+    /// collected -3 type list, ParseHashV, getInt<int64>, then
+    /// "Block header missing" → "Block already downloaded" →
+    /// "Peer does not exist". The fixture has no peers, so the last
+    /// check is the terminal one; the scheduling path is exercised
+    /// live and by `fetch_block`'s own test.
+    #[test]
+    fn getblockfrompeer_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let hash = "00".repeat(32);
+
+        for p in [json!([]), json!([hash]), json!([hash, 0, 0])] {
+            let (_, e) = dispatch("getblockfrompeer", &p, &snap, Some(&queries), None);
+            let (code, msg) = e.unwrap();
+            assert_eq!(code, RPC_MISC_ERROR, "{p}");
+            assert!(msg.starts_with("getblockfrompeer"), "{msg}");
+        }
+
+        // Both positions wrong-typed → the collected two-line list.
+        let (_, e) = dispatch(
+            "getblockfrompeer",
+            &json!([7, "x"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert!(msg.contains("Position 1 (blockhash)"), "{msg}");
+        assert!(msg.contains("Position 2 (peer_id)"), "{msg}");
+
+        // ParseHashV precedes the peer_id getInt.
+        let (_, e) = dispatch(
+            "getblockfrompeer",
+            &json!(["00", 1.5]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        let (_, e) = dispatch(
+            "getblockfrompeer",
+            &json!([hash, 1.5]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (RPC_MISC_ERROR, "JSON integer out of range".to_string())
+        );
+
+        // An unknown well-formed hash → "Block header missing".
+        let (_, e) = dispatch(
+            "getblockfrompeer",
+            &json!([hash, 0]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (RPC_MISC_ERROR, "Block header missing".to_string())
+        );
+
+        // Genesis is downloaded (synthesized body) → "already
+        // downloaded" beats the peer check.
+        let (r, _) = dispatch("getblockhash", &json!([0]), &snap, Some(&queries), None);
+        let genesis = r.as_str().unwrap().to_string();
+        let (_, e) = dispatch(
+            "getblockfrompeer",
+            &json!([genesis, 9999]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (RPC_MISC_ERROR, "Block already downloaded".to_string())
+        );
     }
 
     /// `getchaintxstats` — on the genesis-only fixture every window

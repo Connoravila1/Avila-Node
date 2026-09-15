@@ -72,14 +72,14 @@ python3 tools/compare_rpc.py \
 
 ## Results
 
-Latest run vs **Core 29.4** at h161: 90 MATCH, 2 EXPECTED-DIFF
-(`getpeerinfo` per-peer field shape — our extra observability fields
-vs Core's direction-specific `addrbind`/`addrlocal`/`last_block`;
-`getrawtransaction`'s `in_active_chain` — an upstream field added
+Latest run vs **Core 29.4** at h161: 91 MATCH, 1 EXPECTED-DIFF
+(`getrawtransaction`'s `in_active_chain` — an upstream field added
 after 29.4, verified present in Core 31.1), 0 DIFFERS, 1 CORE-ERROR
 (`gettxoutproof prove_witness` — the witness-proof wire format is a
-Knots extension Core doesn't implement), 103 BOTH-ERROR (identical
-error paths). First matrix vs Knots: 46 MATCH, 2 EXPECTED-DIFF,
+Knots extension Core doesn't implement), 113 BOTH-ERROR (identical
+error paths). `getpeerinfo` now matches fully once the peer pair
+settles — the earlier per-peer shape diff was connection-phase
+state. First matrix vs Knots: 46 MATCH, 2 EXPECTED-DIFF,
 3 DIFFERS — `fullrbf` was a genuine policy divergence then; the
 mempool has since been aligned to Core 29.x (below).
 
@@ -423,6 +423,19 @@ surfaced:
   the child's `fees.ancestor`. Block-template ordering now sorts by
   modified-fee rate (the reported per-tx `"fee"` stays the base fee,
   matching Core's template output).
+- `getblockfrompeer` landed with Core's scheduling semantics: two
+  required args, the collected `-3` list, ParseHashV, `getInt<int64>`
+  on `peer_id` (negatives are valid ints — they land on the peer
+  check, not the range error), then the `-1` chain "Block header
+  missing" → "Block already downloaded" (body presence is the
+  synthesized-genesis-aware `body()`) → "Peer does not exist" → the
+  `FetchBlock` send. The fetch is a single `getdata[MSG_WITNESS_BLOCK]`
+  on the named session — verified live: a `submitheader`'d side-branch
+  header produced `{}` and the getdata reached Core's receive
+  counters. Arrival is the normal `Message::Block` path, so a fetched
+  side block parks and stores through `accept_block`. One documented
+  gap: Core disconnects a peer that never answers the fetch; our
+  getdata tracking doesn't yet age non-responses into a disconnect.
 - Outbound dials run on worker threads — `maintain_outbounds` queues
   `TcpStream::connect_timeout` calls (5s bound) instead of running
   them on the sync loop, and drains results back through a channel on

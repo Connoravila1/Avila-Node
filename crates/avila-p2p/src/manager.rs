@@ -1035,6 +1035,23 @@ impl<S: Read + Write> PeerManager<S> {
         false
     }
 
+    /// `getblockfrompeer` — asks `id` for `hash` via getdata, the way
+    /// Core's `FetchBlock` requests `MSG_WITNESS_BLOCK`. `false` when
+    /// no such peer exists or the send fails; arrival handling is the
+    /// normal block path (the body parks or connects through
+    /// `accept_block`).
+    pub fn fetch_block(&mut self, id: u64, hash: BlockHash) -> bool {
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return false;
+        };
+        peer.session
+            .send(&Message::GetData(vec![crate::message::InvVector {
+                inv_type: crate::message::InvType::WitnessBlock,
+                hash,
+            }]))
+            .is_ok()
+    }
+
     /// `disconnectnode` by `address` — Core matches the peer's
     /// `m_addr_name` string (`"ip:port"` for our dials; a bare host
     /// matches the address part). Returns whether anyone dropped.
