@@ -328,7 +328,16 @@ operation. Compare complete initial download and catch-up, not only local replay
       compressed Coin rows) — verified byte-identical to Core 29.4
       for both latest and rollback dumps, the latter by disconnecting
       into a cloned UTXO set via stored undo data; importmempool
-      reloads our mempool.dat through full admission. Outbound
+      reloads our mempool.dat through full admission.
+      getblockfilter/scanblocks serve Core's no-filter-index paths
+      (-1 "Index is not enabled for filtertype basic" after hash/
+      action validation; status→null, abort→false), and
+      getdescriptoractivity runs Core's real descriptor scan over
+      named blocks — spend events from undo data, receive events
+      from outputs, plus mempool coverage — with ScriptToUniv-shaped
+      script objects (the classifier now names the v28+ ephemeral-
+      anchor template "anchor"). Verified byte-identical against
+      Core 29.4 including a live spend+receive. Outbound
       dialing is
       asynchronous —
       `maintain_outbounds` runs `connect_timeout` on slot-bounded

@@ -612,6 +612,9 @@ pub fn script_address(script: &Script, params: &Params) -> Option<String> {
         ScriptType::Witness { version, program } => {
             Some(witness_address(params.bech32_hrp, version, &program))
         }
+        // The anchor script is a v1 program `4e73` — `ExtractDestination`
+        // yields the witness destination, same as Core.
+        ScriptType::Anchor => Some(witness_address(params.bech32_hrp, 1, &[0x4e, 0x73])),
         _ => None,
     }
 }

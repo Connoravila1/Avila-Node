@@ -38,7 +38,7 @@ use avila_consensus::descriptor::{infer_descriptor, parse_descriptors};
 use avila_consensus::hash::{BlockHash, Txid};
 use avila_consensus::header::BlockHeader;
 use avila_consensus::hex;
-use avila_consensus::transaction::{OutPoint, Script, Transaction};
+use avila_consensus::transaction::{OutPoint, Script, Transaction, TxIn, TxOut};
 use avila_p2p::manager::PeerManager;
 use serde_json::{Value, json};
 
@@ -859,6 +859,100 @@ fn parse_descriptor_range(v: &Value) -> Result<(i64, i64), (i64, String)> {
     Ok((lo, hi))
 }
 
+/// `EvalDescriptorStringOrObject` — expands one scan object (bare
+/// descriptor string or `{desc, range}` object) into its output
+/// scripts plus the provider `MakeScripts` accumulated (origins,
+/// pubkeys, subscripts, taproot spend data). Shared by
+/// `scantxoutset` and `getdescriptoractivity`.
+type ScanObjectScripts = (Vec<Vec<u8>>, avila_consensus::descriptor::FlatProvider);
+fn eval_scan_object(
+    scanobject: &Value,
+    params: &avila_consensus::params::Params,
+) -> Result<ScanObjectScripts, (i64, String)> {
+    let (desc_str, mut range) = match scanobject {
+        Value::String(s) => (s.clone(), (0i64, 1000i64)),
+        Value::Object(o) => {
+            let desc_v = o.get("desc");
+            if desc_v.is_none_or(Value::is_null) {
+                return Err((
+                    RPC_INVALID_PARAMETER,
+                    "Descriptor needs to be provided in scan object".into(),
+                ));
+            }
+            let Some(desc_str) = desc_v.and_then(Value::as_str) else {
+                return Err((
+                    RPC_TYPE_ERROR,
+                    field_type_message(desc_v.unwrap_or(&Value::Null), "string"),
+                ));
+            };
+            let mut range = (0i64, 1000i64);
+            if let Some(range_v) = o.get("range").filter(|v| !v.is_null()) {
+                range = parse_descriptor_range(range_v)?;
+            }
+            (desc_str.to_string(), range)
+        }
+        _ => {
+            return Err((
+                RPC_INVALID_PARAMETER,
+                "Scan object needs to be either a string or an object".into(),
+            ));
+        }
+    };
+    let (descs, provider, _checksum) =
+        parse_descriptors(&desc_str, params, false).map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
+    if !descs.first().is_some_and(|d| d.is_range()) {
+        range = (0, 0);
+    }
+    // `Expand` reads private material from the provider while
+    // `MakeScripts` writes origins into it — the fields are disjoint,
+    // so a snapshot of the parse-time keys serves as the read side
+    // (bounded to the descriptor).
+    let signing = provider.clone();
+    let mut out_provider = provider;
+    let mut scripts = Vec::new();
+    for i in range.0..=range.1 {
+        for desc in &descs {
+            let Some(s) = desc.expand_into(i as u32, &signing, &mut out_provider, params) else {
+                return Err((
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    format!("Cannot derive script without private keys: '{desc_str}'"),
+                ));
+            };
+            scripts.extend(s);
+        }
+    }
+    Ok((scripts, out_provider))
+}
+
+/// Core's `ScriptToUniv` with `include_hex`/`include_address` — the
+/// `{asm, desc, hex, address?, type}` object `getdescriptoractivity`
+/// embeds for each matched output. `desc` is inferred under the dummy
+/// provider, so dest-bearing scripts read `addr(...)`.
+fn script_to_univ(
+    script: &avila_consensus::transaction::Script,
+    params: &avila_consensus::params::Params,
+) -> Value {
+    let class = script.classify();
+    let mut out = json!({
+        "asm": script.asm(),
+        "desc": infer_descriptor(
+            script.as_bytes(),
+            &avila_consensus::descriptor::FlatProvider::default(),
+            params,
+        ),
+        "hex": hex::encode(script.as_bytes()),
+    });
+    // `ExtractDestination && type != PUBKEY` — bare pubkey scripts
+    // carry no address in this object.
+    if !matches!(class, avila_consensus::script::ScriptType::PubKey(_))
+        && let Some(addr) = avila_consensus::address::script_address(script, params)
+    {
+        out["address"] = json!(addr);
+    }
+    out["type"] = json!(class.name());
+    out
+}
+
 /// The `{hash, height}` answer all three wait calls produce — the
 /// connected tip at the moment the wait ends, not the target.
 fn wait_tip_result(cs: &Chainstate) -> Value {
@@ -1509,6 +1603,10 @@ const GETMEMORYINFO_HELP: &str = "getmemoryinfo ( \"mode\" )\n\nReturns an objec
 const DUMPTXOUTSET_HELP: &str = "dumptxoutset \"path\" ( \"type\" {\"rollback\":n,...} )\n\nWrite the serialized UTXO set to a file. This can be used in loadtxoutset afterwards if this snapshot height is supported in the chainparams as well.\n\nUnless the \"latest\" type is requested, the node will roll back to the requested height and network activity will be suspended during this process. Because of this it is discouraged to interact with the node in any other way during the execution of this call to avoid inconsistent results and race conditions, particularly RPCs that interact with blockstorage.\n\nThis call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\n\nArguments:\n1. path       (string, required) Path to the output file. If relative, will be prefixed by datadir.\n2. type       (string, optional, default=\"\") The type of snapshot to create. Can be \"latest\" to create a snapshot of the current UTXO set or \"rollback\" to temporarily roll back the state of the node to a historical block before creating the snapshot of a historical UTXO set. This parameter can be omitted if a separate \"rollback\" named parameter is specified indicating the height or hash of a specific historical block. If \"rollback\" is specified and separate \"rollback\" named parameter is not specified, this will roll back to the latest valid snapshot block that can currently be loaded with loadtxoutset.\n3. options    (json object, optional) Options object that can be used to pass named arguments, listed below.\n\nNamed Arguments:\nrollback    (string or numeric, optional) Height or hash of the block to roll back to before creating the snapshot. Note: The further this number is from the tip, the longer this process will take. Consider setting a higher -rpcclienttimeout value in this case.\n\nResult:\n{                             (json object)\n  \"coins_written\" : n,        (numeric) the number of coins written in the snapshot\n  \"base_hash\" : \"hex\",        (string) the hash of the base of the snapshot\n  \"base_height\" : n,          (numeric) the height of the base of the snapshot\n  \"path\" : \"str\",             (string) the absolute path that the snapshot was written to\n  \"txoutset_hash\" : \"hex\",    (string) the hash of the UTXO set contents\n  \"nchaintx\" : n              (numeric) the number of transactions in the chain up to and including the base block\n}\n\nExamples:\n> bitcoin-cli -rpcclienttimeout=0 dumptxoutset utxo.dat latest\n> bitcoin-cli -rpcclienttimeout=0 dumptxoutset utxo.dat rollback\n> bitcoin-cli -rpcclienttimeout=0 -named dumptxoutset utxo.dat rollback=853456\n";
 const IMPORTMEMPOOL_HELP: &str = "importmempool \"filepath\" ( options )\n\nImport a mempool.dat file and attempt to add its contents to the mempool.\nWarning: Importing untrusted files is dangerous, especially if metadata from the file is taken over.\n\nArguments:\n1. filepath    (string, required) The mempool file\n2. options     (json object, optional) Options object that can be used to pass named arguments, listed below.\n\nNamed Arguments:\nuse_current_time            (boolean, optional, default=true) Whether to use the current system time or use the entry time metadata from the mempool file.\n                            Warning: Importing untrusted metadata may lead to unexpected issues and undesirable behavior.\napply_fee_delta_priority    (boolean, optional, default=false) Whether to apply the fee delta metadata from the mempool file.\n                            It will be added to any existing fee deltas.\n                            The fee delta can be set by the prioritisetransaction RPC.\n                            Warning: Importing untrusted metadata may lead to unexpected issues and undesirable behavior.\n                            Only set this bool if you understand what it does.\napply_unbroadcast_set       (boolean, optional, default=false) Whether to apply the unbroadcast set metadata from the mempool file.\n                            Warning: Importing untrusted metadata may lead to unexpected issues and undesirable behavior.\n\nResult:\n{}    (empty JSON object)\n\nExamples:\n> bitcoin-cli importmempool /path/to/mempool.dat\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"importmempool\", \"params\": [/path/to/mempool.dat]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+const GETBLOCKFILTER_HELP: &str = "getblockfilter \"blockhash\" ( \"filtertype\" )\n\nRetrieve a BIP 157 content filter for a particular block.\n\nArguments:\n1. blockhash     (string, required) The hash of the block\n2. filtertype    (string, optional, default=\"basic\") The type name of the filter\n\nResult:\n{                      (json object)\n  \"filter\" : \"hex\",    (string) the hex-encoded filter data\n  \"header\" : \"hex\"     (string) the hex-encoded filter header\n}\n\nExamples:\n> bitcoin-cli getblockfilter \"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\" \"basic\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockfilter\", \"params\": [\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\", \"basic\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const SCANBLOCKS_HELP: &str = "scanblocks \"action\" ( [scanobjects,...] start_height stop_height \"filtertype\" options )\n\nReturn relevant blockhashes for given descriptors (requires blockfilterindex).\nThis call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\n\nArguments:\n1. action                        (string, required) The action to execute\n                                 \"start\" for starting a scan\n                                 \"abort\" for aborting the current scan (returns true when abort was successful)\n                                 \"status\" for progress report (in %) of the current scan\n2. scanobjects                   (json array, optional) Array of scan objects. Required for \"start\" action\n                                 Every scan object is either a string descriptor or an object:\n     [\n       \"descriptor\",             (string) An output descriptor\n       {                         (json object) An object with output descriptor and metadata\n         \"desc\": \"str\",          (string, required) An output descriptor\n         \"range\": n or [n,n],    (numeric or array, optional, default=1000) The range of HD chain indexes to explore (either end or [begin,end])\n       },\n       ...\n     ]\n3. start_height                  (numeric, optional, default=0) Height to start to scan from\n4. stop_height                   (numeric, optional, default=chain tip) Height to stop to scan\n5. filtertype                    (string, optional, default=\"basic\") The type name of the filter\n6. options                       (json object, optional) Options object that can be used to pass named arguments, listed below.\n\nNamed Arguments:\nfilter_false_positives    (boolean, optional, default=false) Filter false positives (slower and may fail on pruned nodes). Otherwise they may occur at a rate of 1/M\n\nResult (when action=='status' and no scan is in progress - possibly already completed):\nnull    (json null)\n\nResult (When action=='start'; only returns after scan completes):\n{                              (json object)\n  \"from_height\" : n,           (numeric) The height we started the scan from\n  \"to_height\" : n,             (numeric) The height we ended the scan at\n  \"relevant_blocks\" : [        (json array) Blocks that may have matched a scanobject.\n    \"hex\",                     (string) A relevant blockhash\n    ...\n  ],\n  \"completed\" : true|false     (boolean) true if the scan process was not aborted\n}\n\nResult (when action=='status' and a scan is currently in progress):\n{                          (json object)\n  \"progress\" : n,          (numeric) Approximate percent complete\n  \"current_height\" : n     (numeric) Height of the block currently being scanned\n}\n\nResult (when action=='abort'):\ntrue|false    (boolean) True if scan will be aborted (not necessarily before this RPC returns), or false if there is no scan to abort\n\nExamples:\n> bitcoin-cli scanblocks start '[\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"]' 300000\n> bitcoin-cli scanblocks start '[\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"]' 100 150 basic\n> bitcoin-cli scanblocks status\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"scanblocks\", \"params\": [\"start\", [\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"], 300000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"scanblocks\", \"params\": [\"start\", [\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"], 100, 150, \"basic\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"scanblocks\", \"params\": [\"status\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+const GETDESCRIPTORACTIVITY_HELP: &str = "getdescriptoractivity ( [\"blockhash\",...] [scanobjects,...] include_mempool )\n\nGet spend and receive activity associated with a set of descriptors for a set of blocks. This command pairs well with the `relevant_blocks` output of `scanblocks()`.\nThis call may take several minutes. If you encounter timeouts, try specifying no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\n\nArguments:\n1. blockhashes                   (json array, optional) The list of blockhashes to examine for activity. Order doesn't matter. Must be along main chain or an error is thrown.\n                                 \n     [\n       \"blockhash\",              (string) A valid blockhash\n       ...\n     ]\n2. scanobjects                   (json array, optional) Array of scan objects. Required for \"start\" action\n                                 Every scan object is either a string descriptor or an object:\n     [\n       \"descriptor\",             (string) An output descriptor\n       {                         (json object) An object with output descriptor and metadata\n         \"desc\": \"str\",          (string, required) An output descriptor\n         \"range\": n or [n,n],    (numeric or array, optional, default=1000) The range of HD chain indexes to explore (either end or [begin,end])\n       },\n       ...\n     ]\n3. include_mempool               (boolean, optional, default=true) Whether to include unconfirmed activity\n\nResult:\n{                                (json object)\n  \"activity\" : [                 (json array) events\n    {                            (json object)\n      \"type\" : \"str\",            (string) always 'spend'\n      \"amount\" : n,              (numeric) The total amount in BTC of the spent output\n      \"blockhash\" : \"hex\",       (string, optional) The blockhash this spend appears in (omitted if unconfirmed)\n      \"height\" : n,              (numeric, optional) Height of the spend (omitted if unconfirmed)\n      \"spend_txid\" : \"hex\",      (string) The txid of the spending transaction\n      \"spend_vin\" : n,           (numeric) The input index of the spend\n      \"prevout_txid\" : \"hex\",    (string) The txid of the prevout\n      \"prevout_vout\" : n,        (numeric) The vout of the prevout\n      \"prevout_spk\" : {          (json object)\n        \"asm\" : \"str\",           (string) Disassembly of the output script\n        \"desc\" : \"str\",          (string) Inferred descriptor for the output\n        \"hex\" : \"hex\",           (string) The raw output script bytes, hex-encoded\n        \"address\" : \"str\",       (string, optional) The Bitcoin address (only if a well-defined address exists)\n        \"type\" : \"str\"           (string) The type (one of: nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n      }\n    },\n    {                            (json object)\n      \"type\" : \"str\",            (string) always 'receive'\n      \"amount\" : n,              (numeric) The total amount in BTC of the new output\n      \"blockhash\" : \"hex\",       (string, optional) The block that this receive is in (omitted if unconfirmed)\n      \"height\" : n,              (numeric, optional) The height of the receive (omitted if unconfirmed)\n      \"txid\" : \"hex\",            (string) The txid of the receiving transaction\n      \"vout\" : n,                (numeric) The vout of the receiving output\n      \"output_spk\" : {           (json object)\n        \"asm\" : \"str\",           (string) Disassembly of the output script\n        \"desc\" : \"str\",          (string) Inferred descriptor for the output\n        \"hex\" : \"hex\",           (string) The raw output script bytes, hex-encoded\n        \"address\" : \"str\",       (string, optional) The Bitcoin address (only if a well-defined address exists)\n        \"type\" : \"str\"           (string) The type (one of: nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n      }\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli getdescriptoractivity '[\"000000000000000000001347062c12fded7c528943c8ce133987e2e2f5a840ee\"]' '[\"addr(bc1qzl6nsgqzu89a66l50cvwapnkw5shh23zarqkw9)\"]'\n";
 const GETADDEDNODEINFO_HELP: &str = "getaddednodeinfo ( \"node\" )\n\nReturns information about the given added node, or all added nodes\n(note that onetry addnodes are not listed here)\n\nArguments:\n1. node    (string, optional, default=all nodes) If provided, return information about this specific node, otherwise all nodes are returned.\n\nResult:\n[                                (json array)\n  {                              (json object)\n    \"addednode\" : \"str\",         (string) The node IP address or name (as provided to addnode)\n    \"connected\" : true|false,    (boolean) If connected\n    \"addresses\" : [              (json array) Only when connected = true\n      {                          (json object)\n        \"address\" : \"str\",       (string) The bitcoin server IP and port we're connected to\n        \"connected\" : \"str\"      (string) connection, inbound or outbound\n      },\n      ...\n    ]\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli getaddednodeinfo \"192.168.0.201\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getaddednodeinfo\", \"params\": [\"192.168.0.201\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const GETZMQNOTIFICATIONS_HELP: &str = "getzmqnotifications\n\nReturns information about the active ZeroMQ notifications.\n\nResult:\n[                         (json array)\n  {                       (json object)\n    \"type\" : \"str\",       (string) Type of notification\n    \"address\" : \"str\",    (string) Address of the publisher\n    \"hwm\" : n             (numeric) Outbound message high water mark\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli getzmqnotifications \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getzmqnotifications\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const GETCHAINSTATES_HELP: &str = "getchainstates\n\nReturn information about chainstates.\n\nResult:\n{                                      (json object)\n  \"headers\" : n,                       (numeric) the number of headers seen so far\n  \"chainstates\" : [                    (json array) list of the chainstates ordered by work, with the most-work (active) chainstate last\n    {                                  (json object)\n      \"blocks\" : n,                    (numeric) number of blocks in this chainstate\n      \"bestblockhash\" : \"hex\",         (string) blockhash of the tip\n      \"bits\" : \"hex\",                  (string) nBits: compact representation of the block difficulty target\n      \"target\" : \"hex\",                (string) The difficulty target\n      \"difficulty\" : n,                (numeric) difficulty of the tip\n      \"verificationprogress\" : n,      (numeric) progress towards the network tip\n      \"snapshot_blockhash\" : \"hex\",    (string, optional) the base block of the snapshot this chainstate is based on, if any\n      \"coins_db_cache_bytes\" : n,      (numeric) size of the coinsdb cache\n      \"coins_tip_cache_bytes\" : n,     (numeric) size of the coinstip cache\n      \"validated\" : true|false         (boolean) whether the chainstate is fully validated. True if all blocks in the chainstate were validated, false if the chain is based on a snapshot and the snapshot has not yet been validated.\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli getchainstates \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getchainstates\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
@@ -2735,6 +2833,35 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
     ),
     ("getzmqnotifications", &[], GETZMQNOTIFICATIONS_HELP),
     ("getchainstates", &[], GETCHAINSTATES_HELP),
+    (
+        "getblockfilter",
+        &[
+            ("blockhash", Some("string"), true),
+            ("filtertype", Some("string"), false),
+        ],
+        GETBLOCKFILTER_HELP,
+    ),
+    (
+        "scanblocks",
+        &[
+            ("action", Some("string"), true),
+            ("scanobjects", Some("array"), false),
+            ("start_height", Some("number"), false),
+            ("stop_height", Some("number"), false),
+            ("filtertype", Some("string"), false),
+            ("options", Some("object"), false),
+        ],
+        SCANBLOCKS_HELP,
+    ),
+    (
+        "getdescriptoractivity",
+        &[
+            ("blockhashes", Some("array"), false),
+            ("scanobjects", Some("array"), false),
+            ("include_mempool", Some("bool"), false),
+        ],
+        GETDESCRIPTORACTIVITY_HELP,
+    ),
     (
         "dumptxoutset",
         &[
@@ -5938,6 +6065,232 @@ fn dispatch(
                 }))
             })
         }
+        // BIP157 filters need a block filter index — none exists, so
+        // both methods take Core's no-index path after the arg checks.
+        "getblockfilter" => {
+            // Core's order: ParseHashV → filtertype name → index.
+            let hash_s = params.get(0).and_then(Value::as_str).unwrap_or_default();
+            if let Err(e) = parse_hash_v::<BlockHash>(hash_s, "blockhash") {
+                return (Value::Null, Some(e));
+            }
+            let ft = params.get(1).and_then(Value::as_str).unwrap_or("basic");
+            if ft != "basic" {
+                return (
+                    Value::Null,
+                    Some((RPC_INVALID_ADDRESS_OR_KEY, "Unknown filtertype".into())),
+                );
+            }
+            (
+                Value::Null,
+                Some((
+                    RPC_MISC_ERROR,
+                    "Index is not enabled for filtertype basic".into(),
+                )),
+            )
+        }
+        "scanblocks" => {
+            let action = params.get(0).and_then(Value::as_str).unwrap_or_default();
+            match action {
+                // No scan ever runs — Core's idle "status" is null,
+                // "abort" reports nothing was cancelled.
+                "status" => (Value::Null, None),
+                "abort" => (json!(false), None),
+                "start" => {
+                    let ft = params.get(4).and_then(Value::as_str).unwrap_or("basic");
+                    if ft != "basic" {
+                        return (
+                            Value::Null,
+                            Some((RPC_INVALID_ADDRESS_OR_KEY, "Unknown filtertype".into())),
+                        );
+                    }
+                    (
+                        Value::Null,
+                        Some((
+                            RPC_MISC_ERROR,
+                            "Index is not enabled for filtertype basic".into(),
+                        )),
+                    )
+                }
+                _ => (
+                    Value::Null,
+                    Some((RPC_INVALID_PARAMETER, format!("Invalid action '{action}'"))),
+                ),
+            }
+        }
+        "getdescriptoractivity" => {
+            // `blockhashes`/`scanobjects` are declared optional but the
+            // body unconditionally `get_array()`s them — a missing or
+            // null argument is Core's bare -3, not the help throw.
+            let blockhashes = params.get(0);
+            let Some(hashes) = blockhashes.and_then(Value::as_array) else {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        field_type_message(blockhashes.unwrap_or(&Value::Null), "array"),
+                    )),
+                );
+            };
+            let scanobjects = params.get(1).cloned().unwrap_or(Value::Null);
+            let include_mempool = params.get(2).and_then(Value::as_bool).unwrap_or(true);
+            let hashes = hashes.clone();
+            chain_query(queries, move |cs, mgr| {
+                let params = cs.tree().params();
+                // Hashes resolve against the header tree first, then
+                // must sit on the active chain — Core's `Contains`
+                // check. Sorted by height for the scan order.
+                let mut indexes: Vec<(u32, BlockHash)> = Vec::with_capacity(hashes.len());
+                for el in &hashes {
+                    let hash: BlockHash = parse_hash_arg(el, "blockhash")?;
+                    let Some(node) = cs.tree().get(&hash) else {
+                        return Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into()));
+                    };
+                    if cs.chain().get(node.height as usize) != Some(&hash) {
+                        return Err((RPC_INVALID_PARAMETER, "Block is not in main chain".into()));
+                    }
+                    indexes.push((node.height, hash));
+                }
+                indexes.sort_by_key(|(height, _)| *height);
+                indexes.dedup_by_key(|(_, hash)| *hash);
+
+                // `scanobjects` is get_array'd only after the blockhash
+                // pass — Core's source order.
+                let Some(objects) = scanobjects.as_array() else {
+                    return Err((RPC_TYPE_ERROR, field_type_message(&scanobjects, "array")));
+                };
+                let mut watch: std::collections::HashSet<Vec<u8>> =
+                    std::collections::HashSet::new();
+                for scanobject in objects {
+                    let (scripts, _provider) = eval_scan_object(scanobject, params)?;
+                    watch.extend(scripts);
+                }
+
+                let mut activity: Vec<Value> = Vec::new();
+                let add_spend = |spk: &Script,
+                                 value: i64,
+                                 tx: &Transaction,
+                                 vin: usize,
+                                 txin: &TxIn,
+                                 index: Option<(u32, &BlockHash)>,
+                                 activity: &mut Vec<Value>| {
+                    let mut event = json!({
+                        "type": "spend",
+                        "amount": value_from_amount(value),
+                    });
+                    if let Some((height, hash)) = index {
+                        event["blockhash"] = json!(hash.to_string());
+                        event["height"] = json!(height);
+                    }
+                    event["spend_txid"] = json!(tx.txid().to_string());
+                    event["spend_vin"] = json!(vin);
+                    event["prevout_txid"] = json!(txin.previous_output.txid.to_string());
+                    event["prevout_vout"] = json!(txin.previous_output.vout);
+                    event["prevout_spk"] = script_to_univ(spk, params);
+                    activity.push(event);
+                };
+                let add_receive = |txout: &TxOut,
+                                   index: Option<(u32, &BlockHash)>,
+                                   vout: usize,
+                                   tx: &Transaction,
+                                   activity: &mut Vec<Value>| {
+                    let mut event = json!({
+                        "type": "receive",
+                        "amount": value_from_amount(txout.value),
+                    });
+                    if let Some((height, hash)) = index {
+                        event["blockhash"] = json!(hash.to_string());
+                        event["height"] = json!(height);
+                    }
+                    event["txid"] = json!(tx.txid().to_string());
+                    event["vout"] = json!(vout);
+                    event["output_spk"] = script_to_univ(&txout.script_pubkey, params);
+                    activity.push(event);
+                };
+
+                for (height, hash) in &indexes {
+                    let Some(block) = cs.body(hash) else {
+                        return Err((RPC_MISC_ERROR, "Block not found on disk".into()));
+                    };
+                    // `GetUndoChecked`: genesis has none (empty); any
+                    // other missing record is the -1 disk error.
+                    let undo = cs.undo(*height);
+                    if *height != 0 && undo.is_none() {
+                        return Err((RPC_MISC_ERROR, "Can't read undo data from disk".into()));
+                    }
+                    for (i, tx) in block.transactions.iter().enumerate() {
+                        if !tx.is_coinbase()
+                            && let Some(tx_undo) = undo.and_then(|u| u.txs.get(i))
+                        {
+                            for (vin_idx, (coin, txin)) in
+                                tx_undo.spent.iter().zip(tx.inputs.iter()).enumerate()
+                            {
+                                if watch.contains(coin.out.script_pubkey.as_bytes()) {
+                                    add_spend(
+                                        &coin.out.script_pubkey,
+                                        coin.out.value,
+                                        tx,
+                                        vin_idx,
+                                        txin,
+                                        Some((*height, hash)),
+                                        &mut activity,
+                                    );
+                                }
+                            }
+                        }
+                        for (vout_idx, txout) in tx.outputs.iter().enumerate() {
+                            if watch.contains(txout.script_pubkey.as_bytes()) {
+                                add_receive(
+                                    txout,
+                                    Some((*height, hash)),
+                                    vout_idx,
+                                    tx,
+                                    &mut activity,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if include_mempool {
+                    let pool = mgr.mempool_ref();
+                    for txid in pool.txids() {
+                        let Some(tx) = pool.get(&txid) else { continue };
+                        if !tx.is_coinbase() {
+                            for (vin_idx, txin) in tx.inputs.iter().enumerate() {
+                                // Chain first, mempool parent second —
+                                // Core's `coins_view.GetCoin` then
+                                // `mempool.get` fallback.
+                                let (spk, value) = match cs.utxo().get(&txin.previous_output) {
+                                    Some(coin) => (coin.out.script_pubkey.clone(), coin.out.value),
+                                    None => {
+                                        let parent = pool.get(&txin.previous_output.txid).ok_or(
+                                            (RPC_MISC_ERROR, "Invalid output index".to_string()),
+                                        )?;
+                                        let out = parent
+                                            .outputs
+                                            .get(txin.previous_output.vout as usize)
+                                            .ok_or((
+                                                RPC_MISC_ERROR,
+                                                "Invalid output index".to_string(),
+                                            ))?;
+                                        (out.script_pubkey.clone(), out.value)
+                                    }
+                                };
+                                if watch.contains(spk.as_bytes()) {
+                                    add_spend(&spk, value, tx, vin_idx, txin, None, &mut activity);
+                                }
+                            }
+                        }
+                        for (vout_idx, txout) in tx.outputs.iter().enumerate() {
+                            if watch.contains(txout.script_pubkey.as_bytes()) {
+                                add_receive(txout, None, vout_idx, tx, &mut activity);
+                            }
+                        }
+                    }
+                }
+                Ok(json!({ "activity": activity }))
+            })
+        }
         "scantxoutset" => {
             let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
             if arr.is_empty() || arr.len() > 2 {
@@ -6035,76 +6388,11 @@ fn dispatch(
                         let mut descriptors: std::collections::HashMap<Vec<u8>, String> =
                             std::collections::HashMap::new();
                         for scanobject in scanobjects.as_array().map(Vec::as_slice).unwrap_or(&[]) {
-                            let (desc_str, mut range) = match scanobject {
-                                Value::String(s) => (s.clone(), (0i64, 1000i64)),
-                                Value::Object(o) => {
-                                    let desc_v = o.get("desc");
-                                    if desc_v.is_none_or(Value::is_null) {
-                                        return Err((
-                                            RPC_INVALID_PARAMETER,
-                                            "Descriptor needs to be provided in scan object".into(),
-                                        ));
-                                    }
-                                    let desc_v = desc_v.unwrap_or(&Value::Null);
-                                    let Some(desc_str) = desc_v.as_str() else {
-                                        return Err((
-                                            RPC_TYPE_ERROR,
-                                            field_type_message(desc_v, "string"),
-                                        ));
-                                    };
-                                    let mut range = (0i64, 1000i64);
-                                    if let Some(range_v) = o.get("range").filter(|v| !v.is_null()) {
-                                        range = parse_descriptor_range(range_v)?;
-                                    }
-                                    (desc_str.to_string(), range)
-                                }
-                                _ => {
-                                    return Err((
-                                        RPC_INVALID_PARAMETER,
-                                        "Scan object needs to be either a string or an object"
-                                            .into(),
-                                    ));
-                                }
-                            };
-                            let (descs, provider, _checksum) =
-                                match parse_descriptors(&desc_str, params, false) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        return Err((RPC_INVALID_ADDRESS_OR_KEY, e));
-                                    }
-                                };
-                            if !descs.first().is_some_and(|d| d.is_range()) {
-                                range = (0, 0);
-                            }
-                            // `Expand` reads private material from the
-                            // provider while `MakeScripts` writes origins
-                            // into it — the fields are disjoint, so a
-                            // snapshot of the parse-time keys serves as
-                            // the read side (bounded to the descriptor).
-                            let signing = provider.clone();
-                            let mut out_provider = provider;
-                            for i in range.0..=range.1 {
-                                for desc in &descs {
-                                    let Some(scripts) = desc.expand_into(
-                                        i as u32,
-                                        &signing,
-                                        &mut out_provider,
-                                        params,
-                                    ) else {
-                                        return Err((
-                                            RPC_INVALID_ADDRESS_OR_KEY,
-                                            format!(
-                                                "Cannot derive script without private keys: '{desc_str}'"
-                                            ),
-                                        ));
-                                    };
-                                    for script in scripts {
-                                        if needles.insert(script.clone()) {
-                                            let inferred =
-                                                infer_descriptor(&script, &out_provider, params);
-                                            descriptors.insert(script, inferred);
-                                        }
-                                    }
+                            let (scripts, out_provider) = eval_scan_object(scanobject, params)?;
+                            for script in scripts {
+                                if needles.insert(script.clone()) {
+                                    let inferred = infer_descriptor(&script, &out_provider, params);
+                                    descriptors.insert(script, inferred);
                                 }
                             }
                         }
@@ -7657,7 +7945,10 @@ fn dispatch(
                      \x20   gettxoutsetinfo [hash_type] [hash_or_height] [use_index]\n\
                      \x20   scantxoutset <action> [scanobjects,...],\n\
                      \x20   dumptxoutset <path> [type] [options],\n\
-                     \x20   importmempool <path> [options], savemempool\n\
+                     \x20   importmempool <path> [options], savemempool,\n\
+                     \x20   getblockfilter <hash> [type],\n\
+                     \x20   scanblocks <action> [...],\n\
+                     \x20   getdescriptoractivity <hashes> <scanobjects>\n\
                      \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
                      \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
                      \x20   gettxspendingprevout <outputs>,\n\
@@ -9840,6 +10131,194 @@ mod tests {
                 "Unable to import mempool file, see debug.log for details.".to_string()
             )
         );
+    }
+
+    /// `getblockfilter`/`scanblocks` — no filter index exists, so both
+    /// take Core's no-index path after the hash/type/action checks.
+    #[test]
+    fn blockfilter_and_scanblocks_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let h = "00".repeat(32);
+
+        for (m, p, code) in [
+            ("getblockfilter", json!([]), RPC_MISC_ERROR),
+            ("getblockfilter", json!([null]), RPC_TYPE_ERROR),
+            ("getblockfilter", json!(["x"]), RPC_INVALID_PARAMETER),
+            ("getblockfilter", json!([h, true]), RPC_TYPE_ERROR),
+            (
+                "getblockfilter",
+                json!([h, "bogus"]),
+                RPC_INVALID_ADDRESS_OR_KEY,
+            ),
+            ("getblockfilter", json!([h]), RPC_MISC_ERROR),
+            ("getblockfilter", json!([h, "basic", 1]), RPC_MISC_ERROR),
+            ("scanblocks", json!([]), RPC_MISC_ERROR),
+            ("scanblocks", json!([null]), RPC_TYPE_ERROR),
+            ("scanblocks", json!(["bogus"]), RPC_INVALID_PARAMETER),
+            ("scanblocks", json!(["start", ["x"], "x"]), RPC_TYPE_ERROR),
+            ("scanblocks", json!(["status", "x"]), RPC_TYPE_ERROR),
+        ] {
+            let (_, e) = dispatch(m, &p, &snap, Some(&queries), None, None, None);
+            assert_eq!(e.unwrap().0, code, "{m} {p}");
+        }
+        // Index errors carry the exact Core wording.
+        let (_, e) = dispatch(
+            "getblockfilter",
+            &json!([h]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(e.unwrap().1, "Index is not enabled for filtertype basic");
+        let (_, e) = dispatch(
+            "scanblocks",
+            &json!(["bogus"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(e.unwrap().1, "Invalid action 'bogus'");
+
+        // Idle-scan verbs don't error.
+        let (r, e) = dispatch(
+            "scanblocks",
+            &json!(["status"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none() && r.is_null());
+        let (r, e) = dispatch(
+            "scanblocks",
+            &json!(["abort"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none() && r == json!(false));
+    }
+
+    /// `getdescriptoractivity` — the optional-declared args the body
+    /// requires (bare -3 on null/missing), hash/chain checks, and a
+    /// real block scan producing a `receive` event.
+    #[test]
+    fn getdescriptoractivity_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let g = |p: Value| {
+            dispatch(
+                "getdescriptoractivity",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+            )
+        };
+
+        // Both declared-optional args are body-required — null or
+        // missing is the bare get_array -3, and >3 args is the help
+        // throw.
+        for p in [json!([]), json!([null]), json!([null, null])] {
+            let (code, msg) = g(p.clone()).1.unwrap();
+            assert_eq!(
+                (code, msg.as_str()),
+                (
+                    RPC_TYPE_ERROR,
+                    "JSON value of type null is not of expected type array"
+                ),
+                "{p}"
+            );
+        }
+        let (code, msg) = g(json!([[], [], true, 1])).1.unwrap();
+        assert_eq!(code, RPC_MISC_ERROR);
+        assert!(msg.starts_with("getdescriptoractivity"), "{msg}");
+        // The declared-type pass collects arg-3 bool violations.
+        let (code, msg) = g(json!([[], [], "x"])).1.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert!(msg.contains("Position 3 (include_mempool)"), "{msg}");
+
+        // Hash element checks — ParseHashV's -3/-8 then the index
+        // lookups (-5 unknown, -8 not-main-chain is unreachable here).
+        let zero = "00".repeat(32);
+        let (_, e) = g(json!([[5], []]));
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_TYPE_ERROR,
+                "JSON value of type number is not of expected type string".to_string()
+            )
+        );
+        let (_, e) = g(json!([["x"], []]));
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        let (_, e) = g(json!([[zero], []]));
+        assert_eq!(
+            e.unwrap(),
+            (RPC_INVALID_ADDRESS_OR_KEY, "Block not found".to_string())
+        );
+
+        // Empty everything scans to no activity.
+        let genesis = {
+            let (r, e) = dispatch(
+                "getblockhash",
+                &json!([0]),
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+            );
+            assert!(e.is_none());
+            r.as_str().unwrap().to_owned()
+        };
+        assert_eq!(g(json!([[genesis], []])), (json!({ "activity": [] }), None));
+
+        // Mine a block paying `raw(51)` (OP_1 — nonstandard, no
+        // address), then scan for it: the coinbase vout is a receive.
+        let (r, e) = dispatch(
+            "generatetodescriptor",
+            &json!([1, "raw(51)"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        let mined = r[0].as_str().unwrap().to_owned();
+        let (r, e) = g(json!([[mined], ["raw(51)"]]));
+        assert!(e.is_none(), "{e:?}");
+        let events = r["activity"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{r}");
+        let ev = &events[0];
+        assert_eq!(ev["type"], json!("receive"));
+        assert_eq!(ev["amount"], value_from_amount(5_000_000_000));
+        assert_eq!(ev["blockhash"], json!(mined));
+        assert_eq!(ev["height"], json!(1));
+        assert_eq!(ev["vout"], json!(0));
+        let spk = &ev["output_spk"];
+        assert_eq!(spk["hex"], json!("51"));
+        assert_eq!(spk["type"], json!("nonstandard"));
+        assert!(
+            spk["desc"].as_str().unwrap().starts_with("raw(51)#"),
+            "{spk}"
+        );
+        assert!(spk.get("address").is_none());
+
+        // `include_mempool=false` on a hit keeps the confirmed events.
+        let (r2, e) = g(json!([[mined], ["raw(51)"], false]));
+        assert!(e.is_none());
+        assert_eq!(r2, r);
     }
 
     /// `getaddrmaninfo` — Core's fixed network keys each carrying

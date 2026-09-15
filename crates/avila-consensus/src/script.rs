@@ -201,6 +201,9 @@ pub enum ScriptType {
         /// The witness program bytes.
         program: Vec<u8>,
     },
+    /// The v28+ ephemeral-anchor script `OP_1 <0x4e73>` (`TX_ANCHOR`) —
+    /// technically a v1 witness program, but `Solver` names it `anchor`.
+    Anchor,
 }
 
 impl ScriptType {
@@ -220,6 +223,7 @@ impl ScriptType {
                 (1, 32) => "witness_v1_taproot",
                 _ => "witness_unknown",
             },
+            Self::Anchor => "anchor",
         }
     }
 }
@@ -640,6 +644,13 @@ impl Script {
         let bytes = self.as_bytes();
         if bytes.is_empty() {
             return ScriptType::Nonstandard;
+        }
+
+        // `IsPayToAnchor` precedes `IsWitnessProgram` in Solver — the
+        // fixed `OP_1 <0x4e73>` template parses as a v1 program but is
+        // reported as `anchor`.
+        if bytes == [0x51, 0x02, 0x4e, 0x73] {
+            return ScriptType::Anchor;
         }
 
         // Witness programs — `IsWitnessProgram` checked first in

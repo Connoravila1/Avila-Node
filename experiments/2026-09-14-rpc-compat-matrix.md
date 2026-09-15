@@ -625,6 +625,28 @@ surfaced:
   Core 29.4's output on the shared regtest chain. `importmempool`
   loads our own `mempool.dat` format (Core's file format differs)
   and maps any unreadable file to Core's opaque `-1` — result `{}`.
+- `getblockfilter`/`scanblocks` added on the no-index path: no
+  BIP157 filter index exists, so `getblockfilter <hash>` and
+  `scanblocks start` return Core's `-1 "Index is not enabled for
+  filtertype basic"` after the hash/filtertype/action validation;
+  `status` → null, `abort` → false. Verified live: all 31 matrix
+  rows byte-identical.
+- `getdescriptoractivity` added (Core 29.4, descriptor activity
+  scan — no filter index needed): resolves `blockhashes` against
+  the header tree (`-5` unknown, `-8` off-main-chain), expands each
+  scanobject through the same `EvalDescriptorStringOrObject` path
+  as `scantxoutset`, then reports `spend` events from the block's
+  undo data and `receive` events from its outputs — and repeats
+  both over the mempool when `include_mempool` (default true) —
+  mempool events omit `blockhash`/`height`. `prevout_spk`/
+  `output_spk` embed Core's `ScriptToUniv` shape (`asm`, dummy-
+  provider `desc`, `hex`, `address?`, `type` — pubkey scripts get
+  no address) and the script classifier now recognizes the v28+
+  ephemeral-anchor template (`51024e73` → `type:"anchor"`, checked
+  before the witness catch-all like Core's `IsPayToAnchor`).
+  Verified live: 24-row error/arity matrix byte-identical, plus
+  real spend+receive events on a shared regtest block and a
+  mempool receive — all byte-identical to Core 29.4.
 
 ### Known semantic differences
 
