@@ -385,7 +385,9 @@ fn scan_file(
 
 const STATE_FILE: &str = "state.dat";
 const STATE_TMP: &str = "state.dat.tmp";
-const STATE_VERSION: u32 = 1;
+// v2 adds `tx_meta` (per-node nTx/nChainTx) so `getchaintxstats`
+// survives restarts; a v1 snapshot is rejected and replay rebuilds.
+const STATE_VERSION: u32 = 2;
 
 /// The complete validation state needed to resume without re-validation.
 #[derive(Clone, PartialEq, Debug)]
@@ -410,6 +412,10 @@ pub struct StateData {
     pub utxo: Vec<(OutPoint, Coin)>,
     /// Failed-marked block hashes (`BLOCK_FAILED_*` bookkeeping).
     pub failed: Vec<BlockHash>,
+    /// `(hash, n_tx, n_chain_tx)` for nodes whose body was seen —
+    /// Core's per-index `nTx`/`nChainTx`, needed to keep
+    /// `getchaintxstats` honest across a snapshot resume.
+    pub tx_meta: Vec<(BlockHash, u32, u64)>,
 }
 
 fn invalid(msg: impl Into<String>) -> io::Error {
@@ -541,6 +547,12 @@ pub fn write_state(dir: &Path, magic: [u8; 4], data: &StateData) -> io::Result<(
     for hash in &data.failed {
         payload.extend_from_slice(hash.as_bytes());
     }
+    write_compact_size(&mut payload, data.tx_meta.len() as u64);
+    for (hash, n_tx, n_chain_tx) in &data.tx_meta {
+        payload.extend_from_slice(hash.as_bytes());
+        payload.extend_from_slice(&n_tx.to_le_bytes());
+        payload.extend_from_slice(&n_chain_tx.to_le_bytes());
+    }
 
     let mut file_bytes = Vec::with_capacity(payload.len() + 44);
     file_bytes.extend_from_slice(&magic);
@@ -640,6 +652,23 @@ pub fn read_state(dir: &Path, magic: [u8; 4]) -> io::Result<Option<StateData>> {
         utxo.push((op, coin));
     }
     let failed = read_hashes(&mut d, "failed")?;
+    let tx_meta_count = d
+        .read_compact_size()
+        .map_err(|e| invalid(format!("tx_meta count: {e}")))?;
+    let mut tx_meta = Vec::with_capacity(d.bounded_capacity(tx_meta_count, 44));
+    for _ in 0..tx_meta_count {
+        let hash = BlockHash::from_bytes(
+            d.read_array::<32>()
+                .map_err(|e| invalid(format!("tx_meta hash: {e}")))?,
+        );
+        let n_tx = d
+            .read_u32_le()
+            .map_err(|e| invalid(format!("tx_meta n_tx: {e}")))?;
+        let n_chain_tx = d
+            .read_u64_le()
+            .map_err(|e| invalid(format!("tx_meta n_chain_tx: {e}")))?;
+        tx_meta.push((hash, n_tx, n_chain_tx));
+    }
     d.finish().map_err(|e| invalid(format!("trailing: {e}")))?;
     if chain.is_empty()
         || chain.len() as u64 - 1 != undos.len() as u64
@@ -657,6 +686,7 @@ pub fn read_state(dir: &Path, magic: [u8; 4]) -> io::Result<Option<StateData>> {
         undos,
         utxo,
         failed,
+        tx_meta,
     }))
 }
 
@@ -858,6 +888,11 @@ mod tests {
         let blocks: Vec<Block> = (0..3).map(test_block).collect();
         let headers: Vec<BlockHeader> = blocks.iter().map(|b| b.header).collect();
         let chain: Vec<BlockHash> = blocks.iter().map(Block::block_hash).collect();
+        let tx_meta: Vec<(BlockHash, u32, u64)> = chain
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (*h, 1, i as u64 + 1))
+            .collect();
         StateData {
             tip: *chain.last().unwrap(),
             height: 2,
@@ -924,6 +959,7 @@ mod tests {
                 ),
             ],
             failed: vec![BlockHash::from_bytes([0xee; 32])],
+            tx_meta,
         }
     }
 

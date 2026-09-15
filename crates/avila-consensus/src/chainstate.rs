@@ -101,6 +101,45 @@ pub enum BlockRejection {
     Store(std::io::ErrorKind),
 }
 
+/// The result of [`Chainstate::chain_tx_stats`] — Core's
+/// `getchaintxstats` response, with `Option` fields marking the slots
+/// Core omits from the JSON object.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ChainTxStats {
+    /// The window-final block's timestamp (UNIX epoch).
+    pub time: u32,
+    /// Cumulative transaction count up to the final block — `None`
+    /// when that block was never connected (Core: `nChainTx` unknown,
+    /// as with assumeutxo).
+    pub tx_count: Option<u64>,
+    /// The window-final block's hash.
+    pub final_hash: BlockHash,
+    /// The window-final block's height.
+    pub final_height: u32,
+    /// Blocks between the window start and final block.
+    pub window_block_count: u32,
+    /// Seconds between the window start's and final block's timestamps
+    /// — `Some` only when `window_block_count > 0`.
+    pub window_interval: Option<i64>,
+    /// Transactions inside the window — `Some` only when both
+    /// endpoints' cumulative counts are known.
+    pub window_tx_count: Option<u64>,
+    /// `window_tx_count / window_interval` — `Some` only when the
+    /// interval is positive and the count is known.
+    pub tx_rate: Option<f64>,
+}
+
+/// Why [`Chainstate::chain_tx_stats`] failed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Error)]
+pub enum TxStatsError {
+    /// The named block is not in the block index (Core's `-5`).
+    #[error("block not in index")]
+    UnknownBlock,
+    /// `nblocks` is negative or exceeds `height - 1` (Core's `-8`).
+    #[error("window out of range")]
+    BadWindow,
+}
+
 impl BlockRejection {
     /// The reject reason `submitblock` reports for the equivalent failure.
     #[must_use]
@@ -459,6 +498,12 @@ impl Chainstate {
             }
             self.tree.mark_invalid(*hash);
         }
+        for (hash, n_tx, n_chain_tx) in &state.tx_meta {
+            if !self.tree.contains(hash) {
+                return Err(corrupt("tx_meta on unindexed header"));
+            }
+            self.tree.apply_tx_meta(hash, *n_tx, *n_chain_tx);
+        }
         if !self.tree.restore_tip(state.best_header) {
             return Err(corrupt("best header not a max-work tip"));
         }
@@ -541,6 +586,16 @@ impl Chainstate {
                 .map(|(outpoint, coin)| (*outpoint, coin.clone()))
                 .collect(),
             failed,
+            tx_meta: {
+                let mut meta: Vec<(BlockHash, u32, u64)> = self
+                    .tree
+                    .nodes()
+                    .filter(|(_, n)| n.n_tx > 0)
+                    .map(|(h, n)| (*h, n.n_tx, n.n_chain_tx))
+                    .collect();
+                meta.sort_unstable();
+                meta
+            },
         }
     }
 
@@ -636,6 +691,87 @@ impl Chainstate {
             return None;
         }
         self.undos.get(height as usize - 1)
+    }
+
+    /// Core's `GetChainTxStats` — transaction-count statistics for the
+    /// `nblocks`-sized window ending at `hash` (`None` = the connected
+    /// tip; `nblocks` `None` = one month of blocks at the network's
+    /// target spacing).
+    ///
+    /// `window_block_count` clamps the requested window to
+    /// `height - 1` — the walk never crosses the genesis (Core's bound:
+    /// `nblocks > height - 1` is a `-8`). Optional fields drop out
+    /// exactly where Core omits them: `tx_count` when the end block was
+    /// never connected (its `n_chain_tx` is unknown — assumeutxo or a
+    /// side-branch tip), `window_tx_count` when either endpoint's count
+    /// is unknown, `tx_rate` when the interval isn't positive.
+    ///
+    /// # Errors
+    ///
+    /// [`TxStatsError::UnknownBlock`] when `hash` isn't in the block
+    /// index; [`TxStatsError::BadWindow`] when `nblocks` is negative or
+    /// exceeds `height - 1` — on a genesis-only chain every `nblocks`
+    /// fails, matching Core.
+    pub fn chain_tx_stats(
+        &self,
+        hash: Option<&BlockHash>,
+        nblocks: Option<i64>,
+    ) -> Result<ChainTxStats, TxStatsError> {
+        let node = match hash {
+            Some(h) => self.tree.get(h).ok_or(TxStatsError::UnknownBlock)?,
+            None => self
+                .tree
+                .get(&self.connected)
+                .ok_or(TxStatsError::UnknownBlock)?,
+        };
+        let params = self.tree.params();
+        // Core's bound is `max(0, height - 1)` — at genesis a zero
+        // window is still legal. An absent `nblocks` clamps to the
+        // available history; an explicit one out of range errors.
+        let bound = i64::from(node.height).saturating_sub(1).max(0);
+        let wanted = match nblocks {
+            Some(n) => n,
+            None => ((30 * 24 * 60 * 60 / params.pow_target_spacing) as i64).min(bound),
+        };
+        if wanted < 0 || wanted > bound {
+            return Err(TxStatsError::BadWindow);
+        }
+        let count = wanted as u32;
+        let start = self
+            .tree
+            .get_ancestor(&node.hash(), node.height - count)
+            .ok_or(TxStatsError::UnknownBlock)?;
+        let have_counts = node.n_chain_tx > 0 && start.n_chain_tx > 0;
+        // Core's `window_interval` is `GetMedianTimePast(end) -
+        // GetMedianTimePast(start)` — median-of-11, not the header
+        // timestamps themselves.
+        let end_mtp = self
+            .tree
+            .median_time_past(&node.hash())
+            .unwrap_or(node.header.time);
+        let start_mtp = self
+            .tree
+            .median_time_past(&start.hash())
+            .unwrap_or(start.header.time);
+        let interval = i64::from(end_mtp) - i64::from(start_mtp);
+        let window_tx = if have_counts {
+            Some(node.n_chain_tx - start.n_chain_tx)
+        } else {
+            None
+        };
+        Ok(ChainTxStats {
+            time: node.header.time,
+            tx_count: (node.n_chain_tx > 0).then_some(node.n_chain_tx),
+            final_hash: node.hash(),
+            final_height: node.height,
+            window_block_count: count,
+            window_interval: (count > 0).then_some(interval),
+            window_tx_count: if count > 0 { window_tx } else { None },
+            tx_rate: match (count > 0 && interval > 0, window_tx) {
+                (true, Some(n)) => Some(n as f64 / interval as f64),
+                _ => None,
+            },
+        })
     }
 
     /// `CVerifyDB::VerifyDB` — re-validates the last `depth` connected
@@ -863,6 +999,7 @@ impl Chainstate {
         } else {
             self.blocks.insert(hash, block.clone());
         }
+        self.tree.note_body(&hash, block.transactions.len() as u32);
         if let Some(index) = &mut self.txindex {
             index.index_block(hash, block);
         }
@@ -878,6 +1015,7 @@ impl Chainstate {
                     self.chain.push(hash);
                     self.undos.push(undo);
                     self.connected = hash;
+                    self.tree.note_connected(&hash);
                     Ok(Acceptance::Connected {
                         height,
                         reorged: false,
@@ -928,6 +1066,12 @@ impl Chainstate {
         let Some(conn_node) = self.tree.get(&self.connected) else {
             return Err(ConnectError::Internal("connected tip not in tree"));
         };
+        // `ActivateBestChain` stops when the most-work candidate is
+        // already the tip — resubmitting a precious-marked tip must
+        // stay `AlreadyKnown`, not run an empty reorg.
+        if hash == self.connected {
+            return Ok(None);
+        }
         // Equal work only activates when the candidate tip is the
         // `preciousblock` — Core's nSequenceId tie-break where the
         // precious block counts as received earliest.
@@ -991,7 +1135,13 @@ impl Chainstate {
                 script_checks: self.script_checks(branch_hash, params),
             };
             match connect::connect_block(&block, &mut utxo, &ctx) {
-                Ok(undo) => new_undos.push(undo),
+                Ok(undo) => {
+                    // `ConnectTip` stamps nChainTx as each block lands —
+                    // kept even if a later branch block fails the whole
+                    // activation (those blocks genuinely connected).
+                    self.tree.note_connected(branch_hash);
+                    new_undos.push(undo);
+                }
                 Err(err) => {
                     // The branch wins on work but this block is invalid: mark
                     // it (and thereby every later descendant) and keep the old
@@ -1222,6 +1372,94 @@ mod tests {
             Ok(Acceptance::Parked { height: 1 })
         );
         assert_eq!(cs.tip_hash(), a.block_hash());
+    }
+
+    /// `getchaintxstats` — cumulative counts come from connect-time
+    /// nChainTx bookkeeping; a parked side tip reports the count as
+    /// unknown, and the window bound is `height - 1` like Core.
+    #[test]
+    fn chain_tx_stats_contract() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        // h1..h4 on the active chain, one coinbase each; block times
+        // step +1s so windows have nonzero intervals.
+        let mut parent = genesis_header();
+        for h in 1..=4u32 {
+            let b = block_on(&parent, vec![coinbase_tx(h, subsidy(h))], &params);
+            cs.accept_block(&b, NOW).unwrap();
+            parent = b.header;
+        }
+        let h3 = cs.chain()[3];
+        let tip = cs.chain()[4];
+
+        // Tip, default window → clamped to height-1 = 3 blocks back.
+        // The interval is median-time-past based, matching Core:
+        // MTP(h4) = t0+2, MTP(h1) = t0+1 → 1s for a 3-tx window.
+        let s = cs.chain_tx_stats(None, None).unwrap();
+        assert_eq!(s.final_height, 4);
+        assert_eq!(s.tx_count, Some(5)); // genesis + h1..h4
+        assert_eq!(s.window_block_count, 3);
+        assert_eq!(s.window_tx_count, Some(3));
+        assert_eq!(s.window_interval, Some(1));
+        assert_eq!(s.tx_rate, Some(3.0));
+
+        // Explicit window ending at h3, size 2: MTP(h3) = t0+2,
+        // MTP(h1) = t0+1 → interval 1, rate 2.
+        let s = cs.chain_tx_stats(Some(&h3), Some(2)).unwrap();
+        assert_eq!(s.final_height, 3);
+        assert_eq!(s.tx_count, Some(4));
+        assert_eq!(s.window_block_count, 2);
+        assert_eq!(s.window_tx_count, Some(2));
+        assert_eq!(s.tx_rate, Some(2.0));
+
+        // count=0: no interval/count/rate fields at all.
+        let s = cs.chain_tx_stats(Some(&tip), Some(0)).unwrap();
+        assert_eq!(s.window_block_count, 0);
+        assert_eq!(s.window_interval, None);
+        assert_eq!(s.window_tx_count, None);
+        assert_eq!(s.tx_rate, None);
+
+        // Bounds: `max(0, height - 1)` max, no negatives. At genesis
+        // the bound is 0 — a zero window still answers (Core's h0
+        // behavior) with count fields omitted.
+        assert_eq!(
+            cs.chain_tx_stats(Some(&tip), Some(4)),
+            Err(TxStatsError::BadWindow)
+        );
+        assert_eq!(
+            cs.chain_tx_stats(Some(&tip), Some(-1)),
+            Err(TxStatsError::BadWindow)
+        );
+        let s = cs.chain_tx_stats(Some(&cs.chain()[0]), Some(0)).unwrap();
+        assert_eq!(s.window_block_count, 0);
+        assert_eq!(s.tx_count, Some(1));
+        assert_eq!(s.window_interval, None);
+        assert_eq!(
+            cs.chain_tx_stats(Some(&cs.chain()[0]), Some(1)),
+            Err(TxStatsError::BadWindow)
+        );
+        assert_eq!(
+            cs.chain_tx_stats(Some(&BlockHash::from_bytes([7; 32])), None),
+            Err(TxStatsError::UnknownBlock)
+        );
+
+        // A parked equal-work sibling at h4 — never connected, so its
+        // cumulative count stays unknown and the count fields vanish.
+        let h3_header = cs.tree().get(&h3).unwrap().header;
+        let side = block_on(
+            &h3_header,
+            vec![tagged_coinbase(4, subsidy(4), script::OP_EQUAL)],
+            &params,
+        );
+        cs.accept_block(&side, NOW).unwrap();
+        let s = cs
+            .chain_tx_stats(Some(&side.block_hash()), Some(1))
+            .unwrap();
+        assert_eq!(s.tx_count, None);
+        assert_eq!(s.window_tx_count, None);
+        assert_eq!(s.tx_rate, None);
+        // MTP(side) and MTP(h3) are both t0+2 → a zero interval.
+        assert_eq!(s.window_interval, Some(0));
     }
 
     /// `preciousblock` flips an equal-work parked tip onto the active

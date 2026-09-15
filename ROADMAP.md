@@ -235,7 +235,14 @@ operation. Compare complete initial download and catch-up, not only local replay
       tie-break — an in-memory mark that wins `chainwork` ties in
       `maybe_reorg` and re-runs tip selection immediately, so a later
       call overrides the earlier one and nothing survives a restart,
-      like Core's nSequenceId). Outbound dialing is asynchronous —
+      like Core's nSequenceId), getchaintxstats (per-index `nTx`/
+      `nChainTx` bookkeeping stamped at body-store and connect time
+      and persisted in state.dat v2, the one-month default window
+      clamped to `max(0, height-1)`, median-time-past window
+      intervals, and Core's exact validation order — hash format and
+      index lookup before the integer count, every wrong-typed
+      argument collected into one `-3` list). Outbound dialing is
+      asynchronous —
       `maintain_outbounds` runs `connect_timeout` on slot-bounded
       worker threads and drains results on the tick, so a book of dead
       ends can't serialize RPC queries behind dial timeouts — verified

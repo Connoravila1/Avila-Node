@@ -72,13 +72,13 @@ python3 tools/compare_rpc.py \
 
 ## Results
 
-Latest run vs **Core 29.4** at h160: 63 MATCH, 2 EXPECTED-DIFF
+Latest run vs **Core 29.4** at h160: 83 MATCH, 2 EXPECTED-DIFF
 (`getpeerinfo` per-peer field shape — our extra observability fields
 vs Core's direction-specific `addrbind`/`addrlocal`/`last_block`;
 `getrawtransaction`'s `in_active_chain` — an upstream field added
 after 29.4, verified present in Core 31.1), 0 DIFFERS, 1 CORE-ERROR
 (`gettxoutproof prove_witness` — the witness-proof wire format is a
-Knots extension Core doesn't implement), 53 BOTH-ERROR (identical
+Knots extension Core doesn't implement), 86 BOTH-ERROR (identical
 error paths). First matrix vs Knots: 46 MATCH, 2 EXPECTED-DIFF,
 3 DIFFERS — `fullrbf` was a genuine policy divergence then; the
 mempool has since been aligned to Core 29.x (below).
@@ -355,6 +355,25 @@ surfaced:
   hash throws `-5` "Block not found", and marking the tip returns
   `null`. Verified live on Core 29.4 across every path; the tie-flip
   itself is covered by a unit test on a three-way equal-work fork.
+- `getchaintxstats` computes the window stats over per-index
+  `nTx`/`nChainTx` bookkeeping — stamped when a body is stored and
+  when a block connects (reorg connections included), persisted in
+  `state.dat` v2, and rebuilt by replay when an older snapshot
+  loads. The semantics match Core 29.4 on every probed path: the
+  absent-`nblocks` default clamps to `max(0, height-1)` (genesis
+  still answers a zero window), `window_interval` is
+  `GetMedianTimePast` difference — median-of-11, not header times —
+  `window_interval`/`window_tx_count`/`txrate` are omitted under
+  Core's exact conditions, a parked side tip reports `txcount`
+  unknown, and validation order is type list (`-3`, all positions
+  collected) → ParseHashV (`-8`) → index lookup (`-5`) → count parse
+  (`-1`) → window bound (`-8` "Invalid block count: should be
+  between 0 and the block's height - 1"). The `preciousblock` slice
+  also surfaced a latent tip-activation bug the comparison caught:
+  resubmitting a precious-marked active tip ran an empty reorg and
+  reported `Connected` where Core's `ActivateBestChain` early-exits —
+  `maybe_reorg` now stops on the connected tip, so `submitblock`
+  reports `"duplicate"` again.
 - SIGTERM/SIGINT now land on the same `cancel` flag as `stop` — the
   run loop exits through the normal shutdown block, so `peers.dat`,
   `mempool.dat`, and `banlist.json` persist across kills. Previously a

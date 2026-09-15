@@ -476,11 +476,24 @@ fn malloc_info_xml() -> Option<String> {
 /// `RPCTypeCheckArgument`'s message — the `Wrong type passed:` list
 /// keyed by position and argument name.
 fn wrong_type_message(position: usize, name: &str, v: &Value, expected: &str) -> String {
-    format!(
-        "Wrong type passed:\n{{\n    \"Position {position} ({name})\": \
-         \"JSON value of type {} is not of expected type {expected}\"\n}}",
-        json_type_name(v)
-    )
+    wrong_type_list(&[(position, name, v, expected)])
+}
+
+/// RPCHelpMan's collected type error — every bad argument reported at
+/// once, `"Position N (name)": "JSON value of type X is not of
+/// expected type Y"` per line.
+fn wrong_type_list(errors: &[(usize, &str, &Value, &str)]) -> String {
+    let body = errors
+        .iter()
+        .map(|(position, name, v, expected)| {
+            format!(
+                "    \"Position {position} ({name})\": \"{}\"",
+                field_type_message(v, expected)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!("Wrong type passed:\n{{\n{body}\n}}")
 }
 
 /// The bare field/element type error — `RPCTypeCheckObj`/`RPCTypeCheck`
@@ -611,6 +624,8 @@ const GETINDEXINFO_HELP: &str = "getindexinfo ( \"index_name\" )\n\nReturns the 
 
 /// Verbatim `help preciousblock` text (Bitcoin Core 29.4).
 const PRECIOUSBLOCK_HELP: &str = "preciousblock \"blockhash\"\n\nTreats a block as if it were received before others with the same work.\n\nA later preciousblock call can override the effect of an earlier one.\n\nThe effects of preciousblock are not retained across restarts.\n\nArguments:\n1. blockhash    (string, required) the hash of the block to mark as precious\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli preciousblock \"blockhash\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"preciousblock\", \"params\": [\"blockhash\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+const GETCHAINTXSTATS_HELP: &str = "getchaintxstats ( nblocks \"blockhash\" )\n\nCompute statistics about the total number and rate of transactions in the chain.\n\nArguments:\n1. nblocks      (numeric, optional, default=one month) Size of the window in number of blocks\n2. blockhash    (string, optional, default=chain tip) The hash of the block that ends the window.\n\nResult:\n{                                       (json object)\n  \"time\" : xxx,                         (numeric) The timestamp for the final block in the window, expressed in UNIX epoch time\n  \"txcount\" : n,                        (numeric, optional) The total number of transactions in the chain up to that point, if known. It may be unknown when using assumeutxo.\n  \"window_final_block_hash\" : \"hex\",    (string) The hash of the final block in the window\n  \"window_final_block_height\" : n,      (numeric) The height of the final block in the window.\n  \"window_block_count\" : n,             (numeric) Size of the window in number of blocks\n  \"window_interval\" : n,                (numeric, optional) The elapsed time in the window in seconds. Only returned if \"window_block_count\" is > 0\n  \"window_tx_count\" : n,                (numeric, optional) The number of transactions in the window. Only returned if \"window_block_count\" is > 0 and if txcount exists for the start and end of the window.\n  \"txrate\" : n                          (numeric, optional) The average rate of transactions per second in the window. Only returned if \"window_interval\" is > 0 and if window_tx_count exists.\n}\n\nExamples:\n> bitcoin-cli getchaintxstats \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getchaintxstats\", \"params\": [2016]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help verifychain` text (Bitcoin Core 29.4).
 const VERIFYCHAIN_HELP: &str = "verifychain ( checklevel nblocks )\n\nVerifies blockchain database.\n\nArguments:\n1. checklevel    (numeric, optional, default=3, range=0-4) How thorough the block verification is:\n                 - level 0 reads the blocks from disk\n                 - level 1 verifies block validity\n                 - level 2 verifies undo data\n                 - level 3 checks disconnection of tip blocks\n                 - level 4 tries to reconnect the blocks\n                 - each level includes the checks of the previous levels\n2. nblocks       (numeric, optional, default=6, 0=all) The number of blocks to check.\n\nResult:\ntrue|false    (boolean) Verification finished successfully. If false, check debug.log for reason.\n\nExamples:\n> bitcoin-cli verifychain \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"verifychain\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
@@ -3193,6 +3208,87 @@ fn dispatch(
                 Err(_) => Err((RPC_MISC_ERROR, "preciousblock revalidation failed".into())),
             })
         }
+        "getchaintxstats" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() > 2 {
+                return help_error(GETCHAINTXSTATS_HELP);
+            }
+            // RPCHelpMan type pass: nblocks numeric, blockhash a
+            // string; every bad argument is collected into one
+            // "Wrong type passed" list. Null means default.
+            let mut type_errors: Vec<(usize, &str, &Value, &str)> = Vec::new();
+            if let Some(v) = arr.first().filter(|v| !(v.is_number() || v.is_null())) {
+                type_errors.push((1, "nblocks", v, "number"));
+            }
+            if let Some(v) = arr.get(1).filter(|v| !(v.is_string() || v.is_null())) {
+                type_errors.push((2, "blockhash", v, "string"));
+            }
+            if !type_errors.is_empty() {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_list(&type_errors))),
+                );
+            }
+            // Core's body resolves the blockhash argument before
+            // reading nblocks — a bad hash wins over a bad count.
+            let hash = match arr.get(1) {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => match parse_hash_v(s, "blockhash") {
+                    Ok(h) => Some(h),
+                    Err(e) => return (Value::Null, Some(e)),
+                },
+                _ => unreachable!(),
+            };
+            let raw_nblocks = arr.first().cloned();
+            chain_query(queries, move |cs, _mgr| {
+                // Core resolves the block before reading nblocks —
+                // an unknown hash reports -5 ahead of a -1 int error.
+                if hash.is_some_and(|h| !cs.tree().contains(&h)) {
+                    return Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into()));
+                }
+                // getInt<int>: non-integral or out-of-range is -1.
+                let nblocks = match raw_nblocks {
+                    None | Some(Value::Null) => None,
+                    Some(v) => match v.as_i64().and_then(|n| i32::try_from(n).ok()) {
+                        Some(n) => Some(i64::from(n)),
+                        None => return Err((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                    },
+                };
+                match cs.chain_tx_stats(hash.as_ref(), nblocks) {
+                    Ok(s) => {
+                        let mut o = serde_json::Map::new();
+                        o.insert("time".into(), s.time.into());
+                        if let Some(n) = s.tx_count {
+                            o.insert("txcount".into(), n.into());
+                        }
+                        o.insert(
+                            "window_final_block_hash".into(),
+                            s.final_hash.to_string().into(),
+                        );
+                        o.insert("window_final_block_height".into(), s.final_height.into());
+                        o.insert("window_block_count".into(), s.window_block_count.into());
+                        if let Some(n) = s.window_interval {
+                            o.insert("window_interval".into(), n.into());
+                        }
+                        if let Some(n) = s.window_tx_count {
+                            o.insert("window_tx_count".into(), n.into());
+                        }
+                        if let Some(r) = s.tx_rate {
+                            o.insert("txrate".into(), r.into());
+                        }
+                        Ok(Value::Object(o))
+                    }
+                    Err(avila_consensus::chainstate::TxStatsError::UnknownBlock) => {
+                        Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into()))
+                    }
+                    Err(avila_consensus::chainstate::TxStatsError::BadWindow) => Err((
+                        RPC_INVALID_PARAMETER,
+                        "Invalid block count: should be between 0 and the block's height - 1"
+                            .into(),
+                    )),
+                }
+            })
+        }
         "generatetoaddress" => {
             let Some(nblocks) = param(params, 0, "nblocks").and_then(Value::as_u64) else {
                 return missing_params("nblocks address");
@@ -4478,7 +4574,8 @@ fn dispatch(
                  \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>,\n\
                  \x20   gettxoutproof <txids> [blockhash] [options],\n\
                  \x20   verifytxoutproof <proof> [options], validateaddress <address>,\n\
-                 \x20   verifychain [checklevel] [nblocks]\n\
+                 \x20   verifychain [checklevel] [nblocks],\n\
+                 \x20   getchaintxstats [nblocks] [blockhash]\n\
                  \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
                  \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
                  \x20   gettxspendingprevout <outputs>,\n\
@@ -6118,6 +6215,95 @@ mod tests {
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
+    }
+
+    /// `getchaintxstats` — on the genesis-only fixture every window
+    /// is out of range (Core's `height - 1` bound is -1 there), which
+    /// still exercises the full validation order.
+    #[test]
+    fn getchaintxstats_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+
+        // Arity → -1 + help.
+        let (_, e) = dispatch(
+            "getchaintxstats",
+            &json!([1, "00", 3]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_MISC_ERROR);
+        assert!(msg.starts_with("getchaintxstats"), "{msg}");
+
+        // Both positions wrong-typed → the collected two-line -3 list.
+        let (_, e) = dispatch(
+            "getchaintxstats",
+            &json!(["x", 1]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert!(msg.contains("Position 1 (nblocks)"), "{msg}");
+        assert!(msg.contains("Position 2 (blockhash)"), "{msg}");
+
+        // Hash format precedes the count parse: bad length → -8.
+        let (_, e) = dispatch(
+            "getchaintxstats",
+            &json!([1.5, "00"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+
+        // An unknown well-formed hash precedes the count parse too.
+        let unknown = "00".repeat(32);
+        let (_, e) = dispatch(
+            "getchaintxstats",
+            &json!([1.5, unknown]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (RPC_INVALID_ADDRESS_OR_KEY, "Block not found".to_string())
+        );
+
+        // Non-integral nblocks on a known block → -1.
+        let (_, e) = dispatch(
+            "getchaintxstats",
+            &json!([1.5]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (RPC_MISC_ERROR, "JSON integer out of range".to_string())
+        );
+
+        // Genesis allows only the zero window — it answers with just
+        // the final-block fields plus txcount, like Core at h0.
+        for p in [json!([]), json!([0]), json!([null, null])] {
+            let (r, e) = dispatch("getchaintxstats", &p, &snap, Some(&queries), None);
+            assert!(e.is_none(), "{p}: {e:?}");
+            assert_eq!(r["window_block_count"], json!(0), "{p}");
+            assert_eq!(r["txcount"], json!(1), "{p}");
+            assert!(r.get("window_interval").is_none(), "{p}");
+            assert!(r.get("txrate").is_none(), "{p}");
+        }
+        // A nonzero window on genesis and negative counts → -8.
+        for p in [json!([1]), json!([-1])] {
+            let (_, e) = dispatch("getchaintxstats", &p, &snap, Some(&queries), None);
+            let (code, msg) = e.unwrap();
+            assert_eq!(code, RPC_INVALID_PARAMETER, "{p}");
+            assert!(msg.contains("block's height - 1"), "{msg}");
+        }
     }
 
     /// `getrpcinfo`/`getmemoryinfo`/`logging` — the introspection

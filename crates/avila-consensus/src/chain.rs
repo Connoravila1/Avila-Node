@@ -44,6 +44,16 @@ pub struct HeaderNode {
     /// The total work of the chain ending at this header: the parent's `chainwork` plus
     /// [`Work::from_compact`] of this header's `bits`.
     pub chainwork: Work,
+    /// Core's `nTx` — the body's transaction count, `0` until the body
+    /// has been accepted and stored (a valid block always has ≥1 tx, so
+    /// zero unambiguously means "no body").
+    pub n_tx: u32,
+    /// Core's `nChainTx` — the cumulative transaction count up to and
+    /// including this block along its own ancestry, `0` = unknown. Set
+    /// when the block is connected (Core assigns it in `ConnectTip`);
+    /// never-connected side-branch tips keep it unknown, which is how
+    /// `getchaintxstats` decides `txcount` is "known".
+    pub n_chain_tx: u64,
 }
 
 impl HeaderNode {
@@ -185,6 +195,10 @@ impl HeaderTree {
             header: genesis,
             height: 0,
             chainwork: Work::from_compact(genesis.bits),
+            // The genesis is born connected; its coinbase counts toward
+            // the chain total (Core asserts genesis nChainTx == 1).
+            n_tx: 1,
+            n_chain_tx: 1,
         };
         let mut nodes = HashMap::new();
         nodes.insert(hash, node);
@@ -230,6 +244,38 @@ impl HeaderTree {
     #[must_use]
     pub fn contains(&self, hash: &BlockHash) -> bool {
         self.nodes.contains_key(hash)
+    }
+
+    /// `AcceptBlock`'s `pindex->nTx = block.vtx.size()` — records the
+    /// body's transaction count once the block is stored.
+    pub(crate) fn note_body(&mut self, hash: &BlockHash, n_tx: u32) {
+        if let Some(node) = self.nodes.get_mut(hash) {
+            node.n_tx = n_tx;
+        }
+    }
+
+    /// `ConnectTip`'s cumulative bookkeeping: this block's `n_chain_tx`
+    /// is the parent's `n_chain_tx` plus the body's `n_tx`. Called when
+    /// a block is connected; the caller guarantees the body is stored.
+    pub(crate) fn note_connected(&mut self, hash: &BlockHash) {
+        let Some(node) = self.nodes.get(hash) else {
+            return;
+        };
+        let prev = node.header.prev_block_hash;
+        let n_tx = u64::from(node.n_tx);
+        let prev_total = self.nodes.get(&prev).map(|p| p.n_chain_tx).unwrap_or(0);
+        if let Some(node) = self.nodes.get_mut(hash) {
+            node.n_chain_tx = prev_total + n_tx;
+        }
+    }
+
+    /// Snapshot-restore entry point: applies a persisted `(n_tx,
+    /// n_chain_tx)` pair to a reinserted node.
+    pub(crate) fn apply_tx_meta(&mut self, hash: &BlockHash, n_tx: u32, n_chain_tx: u64) {
+        if let Some(node) = self.nodes.get_mut(hash) {
+            node.n_tx = n_tx;
+            node.n_chain_tx = n_chain_tx;
+        }
     }
 
     /// The header hash of the current best (most-work) tip.
@@ -540,6 +586,8 @@ impl HeaderTree {
                 .checked_add(1)
                 .ok_or(ChainError::HeightOverflow)?,
             chainwork,
+            n_tx: 0,       // body not yet seen — Core's nTx starts unset
+            n_chain_tx: 0, // unknown until ConnectTip — Core's nChainTx
         };
         self.nodes.insert(hash, node);
         if chainwork > self.tip().chainwork {
