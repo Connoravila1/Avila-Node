@@ -195,6 +195,13 @@ pub fn run(
             dialed += 1;
         }
     }
+    // `-connect` peers are persistent operator intent (Core's
+    // CConnman::m_added_nodes) — not one-shot dials. Registering them
+    // keeps them redialed after drops, including across
+    // `setnetworkactive` off/on.
+    for addr in &cfg.connect {
+        mgr.add_node(addr.to_string(), false);
+    }
     if mgr.is_empty() && seeded == 0 {
         return Err(SyncError::NoPeers {
             seeded,
@@ -216,7 +223,13 @@ pub fn run(
     {
         // Nothing to talk to and nothing left to try — fail fast rather
         // than idling until the timeout (e.g. regtest with no seeds).
-        if mgr.is_empty() && mgr.addrbook().is_empty() {
+        // While `setnetworkactive false` holds, an empty peer set is
+        // the operator's intent, not exhaustion — keep ticking.
+        if mgr.is_empty()
+            && mgr.addrbook().is_empty()
+            && mgr.added_nodes().is_empty()
+            && mgr.network_active()
+        {
             return Err(SyncError::NoPeers {
                 seeded,
                 explicit: cfg.connect.len(),

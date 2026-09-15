@@ -318,6 +318,24 @@ pub fn socket_addr(addr: &NetAddr) -> SocketAddr {
     }
 }
 
+/// `NetAddr` → the operator-facing `"ip:port"` string (v6 bracketed) —
+/// Core's `CAddress::ToStringAddrPort()`, the value `disconnectnode`
+/// matches against.
+#[must_use]
+pub fn addr_string(addr: &NetAddr) -> String {
+    socket_addr(addr).to_string()
+}
+
+/// Core's `CSubNet::Match` — whether `ip` falls under the first `plen`
+/// bits of `net` (both in the 16-byte form, v4 mapped).
+#[must_use]
+pub fn net_match(ip: &[u8; 16], net: &[u8; 16], plen: u8) -> bool {
+    let plen = plen.min(128) as usize;
+    let (whole, rem) = (plen / 8, plen % 8);
+    ip[..whole] == net[..whole]
+        && (rem == 0 || (ip[whole] >> (8 - rem)) == (net[whole] >> (8 - rem)))
+}
+
 /// `SocketAddr` → `NetAddr` (v4 becomes v4-mapped on the wire).
 #[must_use]
 pub fn net_addr_of(sock: SocketAddr, services: u64) -> NetAddr {

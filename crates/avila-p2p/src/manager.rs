@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use avila_consensus::chainstate::Chainstate;
@@ -217,6 +217,21 @@ pub struct PeerManager<S> {
     /// disconnected peer's traffic must not vanish with its entry.
     closed_bytes_sent: u64,
     closed_bytes_recv: u64,
+    /// The operator's `addnode` list — Core's `connman.m_added_nodes`
+    /// (`node` string, `use_v2transport`). Entries are deduplicated by
+    /// the node string and dialed by [`PeerManager::tick_net`].
+    added_nodes: Vec<(String, bool)>,
+    /// `setnetworkactive` — when false every session is dropped and no
+    /// outbound dialing happens (`tick_net`/`maintain_outbounds`).
+    network_active: bool,
+    /// Last dial time per `added_nodes` entry — the addnode retry
+    /// backoff (Core's connman sleeps between addnode connection
+    /// rounds; without this every disconnect event would spin-dial
+    /// dead entries).
+    addnode_dial: HashMap<String, Instant>,
+    /// When `maintain_outbounds` last ran — paces the periodic
+    /// self-heal dial so a starved peer set doesn't spin.
+    last_maintained: Option<Instant>,
 }
 
 impl<S: Read + Write> PeerManager<S> {
@@ -233,6 +248,10 @@ impl<S: Read + Write> PeerManager<S> {
             mempool: avila_mempool::Mempool::new(),
             closed_bytes_sent: 0,
             closed_bytes_recv: 0,
+            added_nodes: Vec::new(),
+            network_active: true,
+            addnode_dial: HashMap::new(),
+            last_maintained: None,
         }
     }
 
@@ -938,6 +957,126 @@ impl<S: Read + Write> PeerManager<S> {
     pub fn disconnect(&mut self, id: u64) {
         self.drop_peer(id);
     }
+
+    /// `ping` — queues a `ping` on every established session, measuring
+    /// the send-queue backlog like Core's `Ping()` (each nonce is
+    /// tracked in `ping_outstanding` so `getpeerinfo` reports RTTs).
+    pub fn ping_all(&mut self) {
+        for peer in self.peers.values_mut() {
+            if !peer.session.established() {
+                continue;
+            }
+            let nonce = peer.last_rx.elapsed().subsec_nanos().into();
+            if peer.session.send(&Message::Ping(nonce)).is_ok() {
+                peer.last_ping = Instant::now();
+                peer.ping_outstanding = Some((nonce, Instant::now()));
+            }
+        }
+    }
+
+    /// `disconnectnode` by node id — `true` when a peer was dropped.
+    pub fn disconnect_by_id(&mut self, id: u64) -> bool {
+        if self.peers.contains_key(&id) {
+            self.drop_peer(id);
+            return true;
+        }
+        false
+    }
+
+    /// `disconnectnode` by `address` — Core matches the peer's
+    /// `m_addr_name` string (`"ip:port"` for our dials; a bare host
+    /// matches the address part). Returns whether anyone dropped.
+    pub fn disconnect_by_addr(&mut self, addr: &str) -> bool {
+        let hit: Vec<u64> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| {
+                p.remote.as_ref().is_some_and(|r| {
+                    let s = crate::addrman::addr_string(r);
+                    s == addr || s.split(':').next() == Some(addr)
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &hit {
+            self.drop_peer(*id);
+        }
+        !hit.is_empty()
+    }
+
+    /// `disconnectnode` by subnet — drops every peer whose remote ip
+    /// sits under `plen` bits of `net`.
+    pub fn disconnect_by_subnet(&mut self, net: &[u8; 16], plen: u8) -> bool {
+        let hit: Vec<u64> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| {
+                p.remote
+                    .as_ref()
+                    .is_some_and(|r| crate::addrman::net_match(&r.ip, net, plen))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &hit {
+            self.drop_peer(*id);
+        }
+        !hit.is_empty()
+    }
+
+    /// Is a live session already bound to `sock` — the addnode dial
+    /// loop's "don't double-dial" check (Core's `FindNode` equivalent).
+    fn connected_to(&self, sock: SocketAddr) -> bool {
+        self.peers.values().any(|p| {
+            p.remote
+                .as_ref()
+                .is_some_and(|r| crate::addrman::socket_addr(r) == sock)
+        })
+    }
+
+    /// `addnode ... "add"` — Core's `connman.AddNode`: dedupe on the
+    /// node string; `false` means it was already listed.
+    pub fn add_node(&mut self, node: String, use_v2: bool) -> bool {
+        if self.added_nodes.iter().any(|(n, _)| n == &node) {
+            return false;
+        }
+        self.added_nodes.push((node, use_v2));
+        true
+    }
+
+    /// `addnode ... "remove"` — `false` when the node wasn't listed.
+    pub fn remove_node(&mut self, node: &str) -> bool {
+        if let Some(i) = self.added_nodes.iter().position(|(n, _)| n == node) {
+            self.added_nodes.remove(i);
+            return true;
+        }
+        false
+    }
+
+    /// `setnetworkactive` — `false` drops every session (Core's
+    /// `SetNetworkActive` disconnects all peers and stops dialing);
+    /// `true` lets `tick_net` resume outbound maintenance.
+    pub fn set_network_active(&mut self, on: bool) {
+        self.network_active = on;
+        if !on {
+            let ids: Vec<u64> = self.peers.keys().copied().collect();
+            for id in ids {
+                self.drop_peer(id);
+            }
+            self.headers_leader = None;
+        }
+    }
+
+    /// `getnetworkinfo`'s `networkactive`.
+    #[must_use]
+    pub fn network_active(&self) -> bool {
+        self.network_active
+    }
+
+    /// The operator's `addnode` list (for `tick_net`'s dialing).
+    #[must_use]
+    pub fn added_nodes(&self) -> &[(String, bool)] {
+        &self.added_nodes
+    }
 }
 
 impl PeerManager<TcpStream> {
@@ -1008,20 +1147,70 @@ impl PeerManager<TcpStream> {
         start_height: i32,
     ) -> Vec<NetEvent> {
         let events = self.tick(cs, now);
+        // Maintain on any disconnect, plus periodically while the peer
+        // set isn't full — an empty set emits no events, so without the
+        // cadence a starved node (fresh start, or `setnetworkactive`
+        // re-enable) would never redial.
+        let due = self
+            .last_maintained
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
         if events
             .iter()
             .any(|e| matches!(e, NetEvent::Disconnected { .. }))
+            || (due && self.has_slot())
         {
+            self.last_maintained = Some(Instant::now());
             self.maintain_outbounds(magic, start_height);
         }
         events
     }
 
-    /// Dials address-book candidates until the peer set is full or the
-    /// book runs dry — the caller runs this between `tick`s to keep
-    /// outbound connectivity up. Returns the endpoints attempted.
+    /// Dials the operator's `addnode` entries plus address-book
+    /// candidates until the peer set is full — the caller runs this
+    /// between `tick`s to keep outbound connectivity up. No-op while
+    /// `setnetworkactive false` is in effect. Returns the endpoints
+    /// attempted.
     pub fn maintain_outbounds(&mut self, magic: [u8; 4], start_height: i32) -> Vec<SocketAddr> {
         let mut dialed = Vec::new();
+        if !self.network_active {
+            return dialed;
+        }
+        // addnode entries are operator intent — try them ahead of the
+        // book, each bounded by connect's 5s timeout like book dials.
+        // A 30s retry backoff keeps a dead entry from spin-dialing.
+        for (node, _) in self.added_nodes.clone() {
+            if !self.has_slot() {
+                break;
+            }
+            if self
+                .addnode_dial
+                .get(&node)
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(30))
+            {
+                continue;
+            }
+            if let Ok(addrs) = node.as_str().to_socket_addrs() {
+                let socks: Vec<SocketAddr> = addrs.collect();
+                // Already talking to this node — Core's AddNode thread
+                // skips connected entries rather than double-dialing.
+                // Don't stamp the backoff either, so a drop redials fast.
+                if socks.iter().any(|s| self.connected_to(*s)) {
+                    continue;
+                }
+                self.addnode_dial.insert(node.clone(), Instant::now());
+                for sock in socks {
+                    if !self.has_slot() {
+                        break;
+                    }
+                    dialed.push(sock);
+                    match self.connect(sock, magic, sock.port() as u64, start_height) {
+                        Ok(Some(_)) => break, // one session per node string
+                        Ok(None) => break,    // raced to full
+                        Err(_) => continue,   // try the next resolved addr
+                    }
+                }
+            }
+        }
         while self.has_slot()
             && let Some(candidate) = self.addrbook.select()
         {

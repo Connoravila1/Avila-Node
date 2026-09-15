@@ -178,6 +178,23 @@ def build_calls(height):
         ("addpeeraddress", ["1.2.3.4", "x"]),
         ("addpeeraddress", []),
         ("getconnectioncount", []),
+        # Network admin — deterministic error paths plus the no-arg
+        # shapes. `ping`/`disconnectnode`/`addnode` onetry live-compare
+        # statefully (peer sets differ); setnetworkactive returns the
+        # post-set bool on both.
+        ("ping", []),
+        ("ping", [1]),
+        ("disconnectnode", ["", 999]),
+        ("disconnectnode", ["1.2.3.4:5", 6]),
+        ("disconnectnode", ["notanip/33"]),
+        ("disconnectnode", [1]),
+        ("addnode", []),
+        ("addnode", ["x"]),
+        ("addnode", ["x", "bogus"]),
+        ("addnode", ["x", "add", "bogus_type"]),
+        ("addnode", ["x", "add", "feeler"]),
+        ("setnetworkactive", [5]),
+        ("setnetworkactive", []),
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),
         ("estimatesmartfee", [6]),

@@ -201,7 +201,16 @@ operation. Compare complete initial download and catch-up, not only local replay
       extraction, and malformation rules — plus Knots' witness
       extension: -1/-2 versioned wire form, coinbase always proven
       in the txid tree, wtxid tree with a null gentx leaf, and
-      witness-commitment recomputation on verify)) — verified
+      witness-commitment recomputation on verify),
+      ping/disconnectnode/addnode/setnetworkactive (network admin —
+      ping records RTT into getpeerinfo; disconnectnode matches by
+      address, id, or subnet with Core's -29/-32602/-8 errors;
+      addnode keeps Core's v2transport|connection_type_compat slot
+      semantics and `-8` type/duplicate errors; setnetworkactive
+      drops all sessions and halts outbound maintenance until
+      re-enabled, and `-connect` entries persist as added-nodes so
+      re-enable redials them — the no-peers fail-fast is suppressed
+      while networking is intentionally off)) — verified
       live over curl and the client.
       Genesis is served even though its body is never stored:
       `Params::genesis_block` reconstructs Core's per-network

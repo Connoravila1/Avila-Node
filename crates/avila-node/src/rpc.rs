@@ -23,7 +23,7 @@
 //! requests, and the wallet method surface.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
@@ -272,6 +272,9 @@ const RPC_VERIFY_REJECTED: i64 = -26;
 const RPC_METHOD_NOT_FOUND: i64 = -32601;
 const RPC_INVALID_PARAMS: i64 = -32602;
 const RPC_INTERNAL_ERROR: i64 = -32603;
+const RPC_CLIENT_NODE_ALREADY_ADDED: i64 = -23;
+const RPC_CLIENT_NODE_NOT_ADDED: i64 = -24;
+const RPC_CLIENT_NODE_NOT_CONNECTED: i64 = -29;
 
 /// Core's `DEFAULT_MAX_RAW_TX_FEE_RATE` — `sendrawtransaction` refuses
 /// txs paying more than this unless the caller raises it (BTC/kvB).
@@ -461,6 +464,41 @@ where
     })
 }
 
+/// `LookupSubNet` — parses `"a.b.c.d/n"` or `"v6::/n"` into the
+/// 16-byte network plus prefix length (v4 nets become v6-mapped with
+/// a +96 shift). `None` on anything unparseable.
+fn parse_subnet(s: &str) -> Option<([u8; 16], u8)> {
+    let (host, plen_s) = s.split_once('/')?;
+    let plen: u8 = plen_s.parse().ok()?;
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        if plen > 32 {
+            return None;
+        }
+        return Some((v4.to_ipv6_mapped().octets(), 96 + plen));
+    }
+    if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        if plen > 128 {
+            return None;
+        }
+        return Some((v6.octets(), plen));
+    }
+    None
+}
+
+/// Core's `ConnectionTypeFromValue` — the `addnode`/`addconnection`
+/// connection-type vocabulary.
+fn connection_type_from(s: &str) -> Option<&'static str> {
+    match s {
+        "inbound" => Some("inbound"),
+        "manual" => Some("manual"),
+        "feeler" => Some("feeler"),
+        "outbound-full-relay" => Some("outbound-full-relay"),
+        "block-relay-only" => Some("block-relay-only"),
+        "addr-fetch" => Some("addr-fetch"),
+        _ => None,
+    }
+}
+
 /// Core throws the method's full `RPCHelpMan` text as a -1 error when
 /// required args are absent or the arg count is out of range.
 fn help_error(text: &'static str) -> (Value, Option<(i64, String)>) {
@@ -483,6 +521,18 @@ const GETNETWORKHASHPS_HELP: &str = "getnetworkhashps ( nblocks height )\n\nRetu
 const GETNETTOTALS_HELP: &str = "getnettotals\n\nReturns information about network traffic, including bytes in, bytes out,\nand current system time.\n\nResult:\n{                                              (json object)\n  \"totalbytesrecv\" : n,                        (numeric) Total bytes received\n  \"totalbytessent\" : n,                        (numeric) Total bytes sent\n  \"timemillis\" : xxx,                          (numeric) Current system UNIX epoch time in milliseconds\n  \"uploadtarget\" : {                           (json object)\n    \"timeframe\" : n,                           (numeric) Length of the measuring timeframe in seconds\n    \"target\" : n,                              (numeric) Target in bytes\n    \"target_reached\" : true|false,             (boolean) True if target is reached\n    \"serve_historical_blocks\" : true|false,    (boolean) True if serving historical blocks\n    \"bytes_left_in_cycle\" : n,                 (numeric) Bytes left in current time cycle\n    \"time_left_in_cycle\" : n                   (numeric) Seconds left in current time cycle\n  }\n}\n\nExamples:\n> bitcoin-cli getnettotals \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getnettotals\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help getnodeaddresses` text (Bitcoin Core 29).
+/// Verbatim `help ping` text (Bitcoin Core 29).
+const PING_HELP: &str = "ping\n\nRequests that a ping be sent to all other nodes, to measure ping time.\nResults are provided in getpeerinfo.\nPing command is handled in queue with all other commands, so it measures processing backlog, not just network ping.\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli ping \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"ping\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help disconnectnode` text (Bitcoin Core 29).
+const DISCONNECTNODE_HELP: &str = "disconnectnode ( \"address\" nodeid )\n\nImmediately disconnects from the specified peer node.\n\nStrictly one out of 'address' and 'nodeid' can be provided to identify the node.\n\nTo disconnect by nodeid, either set 'address' to the empty string, or call using the named 'nodeid' argument only.\n\nArguments:\n1. address    (string, optional, default=fallback to nodeid) The IP address/port of the node or subnet\n2. nodeid     (numeric, optional, default=fallback to address) The node ID (see getpeerinfo for node IDs)\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli disconnectnode \"192.168.0.6:8333\"\n> bitcoin-cli disconnectnode \"\" 1\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"disconnectnode\", \"params\": [\"192.168.0.6:8333\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"disconnectnode\", \"params\": [\"\", 1]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help addnode` text (Knots 29.3).
+const ADDNODE_HELP: &str = "addnode \"node\" \"command\" ( v2transport \"connection_type\" )\n\nAttempts to add or remove a node from the addnode list.\nOr try a connection to a node once.\nAddnode connections are limited to 8 at a time and are counted separately from the -maxconnections limit.\n\nArguments:\n1. node               (string, required) The address of the peer to connect to\n2. command            (string, required) 'add' to add a node to the list, 'remove' to remove a node from the list, 'onetry' to try a connection to the node once\n3. v2transport        (boolean, optional, default=set by -v2transport) Attempt to connect using BIP324 v2 transport protocol (ignored for 'remove' command)\n4. connection_type    (string, optional, default=\"manual\") Type of connection: \n                      outbound-full-relay (default automatic connections),\n                      block-relay-only (does not relay transactions or addresses),\n                      inbound (initiated by the peer),\n                      manual (added via addnode RPC or -addnode/-connect configuration options; protected from DoS disconnection and not required to be full nodes as other outbound peers are),\n                      addr-fetch (short-lived automatic connection for soliciting addresses),\n                      feeler (short-lived automatic connection for testing addresses)\n                      Only supported for command \"onetry\" for now.\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli addnode \"192.168.0.6:8333\" \"onetry\" true\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"addnode\", \"params\": [\"192.168.0.6:8333\", \"onetry\" true]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help setnetworkactive` text (Bitcoin Core 29).
+const SETNETWORKACTIVE_HELP: &str = "setnetworkactive state\n\nDisable/enable all p2p network activity.\n\nArguments:\n1. state    (boolean, required) true to enable networking, false to disable\n\nResult:\ntrue|false    (boolean) The value that was passed in\n\nExamples:\n> bitcoin-cli setnetworkactive true\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"setnetworkactive\", \"params\": [true]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 const GETNODEADDRESSES_HELP: &str = "getnodeaddresses ( count \"network\" )\n\nReturn known addresses, after filtering for quality and recency.\nThese can potentially be used to find new peers in the network.\nThe total number of addresses known to the node may be higher.\n\nArguments:\n1. count      (numeric, optional, default=1) The maximum number of addresses to return. Specify 0 to return all known addresses.\n2. network    (string, optional, default=all networks) Return only addresses of the specified network. Can be one of: ipv4, ipv6, onion, i2p, cjdns.\n\nResult:\n[                         (json array)\n  {                       (json object)\n    \"time\" : xxx,         (numeric) The UNIX epoch time when the node was last seen\n    \"services\" : n,       (numeric) The services offered by the node\n    \"address\" : \"str\",    (string) The address of the node\n    \"port\" : n,           (numeric) The port number of the node\n    \"network\" : \"str\"     (string) The network (ipv4, ipv6, onion, i2p, cjdns) the node connected through\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli getnodeaddresses 8\n> bitcoin-cli getnodeaddresses 4 \"i2p\"\n> bitcoin-cli -named getnodeaddresses network=onion count=12\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getnodeaddresses\", \"params\": [8]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getnodeaddresses\", \"params\": [4, \"i2p\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help addpeeraddress` text (Bitcoin Core 29).
@@ -3409,6 +3459,232 @@ fn dispatch(
                 }))
             })
         }
+        "ping" => {
+            if params.as_array().is_some_and(|a| !a.is_empty()) {
+                return help_error(PING_HELP);
+            }
+            chain_query(queries, |_, mgr| {
+                mgr.ping_all();
+                Ok(Value::Null)
+            })
+        }
+        "disconnectnode" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.is_empty() || arr.len() > 2 {
+                return help_error(DISCONNECTNODE_HELP);
+            }
+            let address = &arr[0];
+            let nodeid = arr.get(1).unwrap_or(&Value::Null);
+            // Type checks precede the either/or check, like Core.
+            if !address.is_null() && !address.is_string() {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_message(1, "address", address, "string"),
+                    )),
+                );
+            }
+            if !nodeid.is_null() && !nodeid.is_i64() && !nodeid.is_u64() {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_message(2, "nodeid", nodeid, "number"),
+                    )),
+                );
+            }
+            let by_addr = !address.is_null() && nodeid.is_null();
+            let by_id = !nodeid.is_null()
+                && (address.is_null() || address.as_str().is_some_and(str::is_empty));
+            if !by_addr && !by_id {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_INVALID_PARAMS,
+                        "Only one of address and nodeid should be provided.".into(),
+                    )),
+                );
+            }
+            // Extract owned values — the query closure must be 'static.
+            let address_s = address.as_str().map(str::to_string);
+            let nodeid_v = nodeid.as_i64();
+            chain_query(queries, move |_, mgr| {
+                let success = if let Some(addr) = &address_s {
+                    if addr.contains('/') {
+                        match parse_subnet(addr) {
+                            Some((net, plen)) => mgr.disconnect_by_subnet(&net, plen),
+                            None => {
+                                return Err((RPC_INVALID_PARAMETER, "Invalid subnet".to_string()));
+                            }
+                        }
+                    } else {
+                        mgr.disconnect_by_addr(addr)
+                    }
+                } else {
+                    mgr.disconnect_by_id(nodeid_v.unwrap_or(-1) as u64)
+                };
+                if success {
+                    Ok(Value::Null)
+                } else {
+                    Err((
+                        RPC_CLIENT_NODE_NOT_CONNECTED,
+                        "Node not found in connected nodes".to_string(),
+                    ))
+                }
+            })
+        }
+        "addnode" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() != 2 && arr.len() != 3 && arr.len() != 4 {
+                return help_error(ADDNODE_HELP);
+            }
+            let node = match &arr[0] {
+                Value::String(s) => s.clone(),
+                v => {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, wrong_type_message(1, "node", v, "string"))),
+                    );
+                }
+            };
+            let command = match &arr[1] {
+                Value::String(s) => s.clone(),
+                v => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(2, "command", v, "string"),
+                        )),
+                    );
+                }
+            };
+            if command != "onetry" && command != "add" && command != "remove" {
+                return help_error(ADDNODE_HELP);
+            }
+            // v2transport|connection_type_compat: a *string* in slot 3
+            // is the pre-v26 connection_type position; otherwise it's
+            // the v2transport bool (we never run BIP324 → NODE_P2P_V2
+            // is unset → requesting it errors like Core).
+            let mut connection_type = "manual".to_string();
+            let read_conn_type = |v: &Value, pos: usize| -> Result<&'static str, (i64, String)> {
+                let Some(s) = v.as_str() else {
+                    return Err((
+                        RPC_TYPE_ERROR,
+                        wrong_type_message(pos, "connection_type", v, "string"),
+                    ));
+                };
+                connection_type_from(s).ok_or_else(|| {
+                    (
+                        RPC_INVALID_PARAMETER,
+                        format!("Unknown connection type {s}"),
+                    )
+                })
+            };
+            match arr.get(2) {
+                Some(Value::String(s)) => {
+                    if command == "remove" || arr.len() > 3 {
+                        return help_error(ADDNODE_HELP);
+                    }
+                    match read_conn_type(&Value::String(s.clone()), 3) {
+                        Ok(c) => connection_type = c.to_string(),
+                        Err(e) => return (Value::Null, Some(e)),
+                    }
+                }
+                Some(Value::Bool(true)) => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_INVALID_PARAMETER,
+                            "Error: v2transport requested but not enabled (see -v2transport)"
+                                .into(),
+                        )),
+                    );
+                }
+                Some(Value::Bool(false)) | Some(Value::Null) | None => {}
+                Some(v) => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(3, "v2transport|connection_type_compat", v, "bool"),
+                        )),
+                    );
+                }
+            }
+            if let Some(ct) = arr.get(3)
+                && !ct.is_null()
+            {
+                if command == "remove" {
+                    return help_error(ADDNODE_HELP);
+                }
+                match read_conn_type(ct, 4) {
+                    Ok(c) => connection_type = c.to_string(),
+                    Err(e) => return (Value::Null, Some(e)),
+                }
+            }
+            chain_query(queries, move |cs, mgr| {
+                if command == "onetry" {
+                    // OpenNetworkConnection resolves and dials async —
+                    // we queue the same bounded attempt.
+                    if let Ok(addrs) = node.as_str().to_socket_addrs()
+                        && let Some(sock) = addrs.into_iter().next()
+                    {
+                        let _ = mgr.connect(
+                            sock,
+                            cs.tree().params().message_start,
+                            sock.port() as u64,
+                            cs.chain().len() as i32 - 1,
+                        );
+                    }
+                    return Ok(Value::Null);
+                }
+                if command == "add" {
+                    if connection_type != "manual" {
+                        return Err((
+                            RPC_INVALID_PARAMETER,
+                            "connection_type != manual is only supported for \
+                             the \"onetry\" command for now"
+                                .into(),
+                        ));
+                    }
+                    if !mgr.add_node(node, false) {
+                        return Err((
+                            RPC_CLIENT_NODE_ALREADY_ADDED,
+                            "Error: Node already added".into(),
+                        ));
+                    }
+                } else if command == "remove" && !mgr.remove_node(&node) {
+                    return Err((
+                        RPC_CLIENT_NODE_NOT_ADDED,
+                        "Error: Node could not be removed. It has not \
+                         been added previously."
+                            .into(),
+                    ));
+                }
+                Ok(Value::Null)
+            })
+        }
+        "setnetworkactive" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() != 1 {
+                return help_error(SETNETWORKACTIVE_HELP);
+            }
+            let state = match &arr[0] {
+                Value::Bool(b) => *b,
+                v => {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, wrong_type_message(1, "state", v, "bool"))),
+                    );
+                }
+            };
+            chain_query(queries, move |_, mgr| {
+                mgr.set_network_active(state);
+                Ok(json!(state))
+            })
+        }
         "getnodeaddresses" => {
             // RPCHelpMan: 0–2 args.
             if params.as_array().is_some_and(|a| a.len() > 2) {
@@ -3609,7 +3885,7 @@ fn dispatch(
                 "localservicesnames": service_names(services),
                 "localrelay": true,
                 "timeoffset": 0,
-                "networkactive": true,
+                "networkactive": mgr.network_active(),
                 "networks": [
                     net("ipv4", true),
                     net("ipv6", true),
@@ -3749,7 +4025,9 @@ fn dispatch(
                  \x20   generateblock <output> [rawtx/txid,...]\n\
                  \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo,\n\
                  \x20   getnettotals, getnodeaddresses [count] [network],\n\
-                 \x20   addpeeraddress <address> <port> [tried]\n\
+                 \x20   addpeeraddress <address> <port> [tried], ping,\n\
+                 \x20   disconnectnode [address] [nodeid], addnode <node> <cmd>,\n\
+                 \x20   setnetworkactive <state>\n\
                  \x20 misc:  estimatesmartfee <target>, uptime, help, stop"
             ),
             None,
@@ -4970,6 +5248,142 @@ mod tests {
         assert_eq!(r["uploadtarget"]["timeframe"], json!(86400));
         assert_eq!(r["uploadtarget"]["serve_historical_blocks"], json!(true));
         let (_, e) = dispatch("getnettotals", &json!([1]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+    }
+
+    /// `ping`/`disconnectnode`/`addnode`/`setnetworkactive` — the
+    /// network-admin dispatch contract over a peer-less manager.
+    #[test]
+    fn network_admin_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+
+        // ping: no args → null; any arg → -1 + help.
+        let (r, e) = dispatch("ping", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, Value::Null);
+        let (_, e) = dispatch("ping", &json!([1]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+
+        // disconnectnode: no match → -29; both ids → -32602; bad
+        // subnet → -8; bad types → -3.
+        let (_, e) = dispatch(
+            "disconnectnode",
+            &json!(["", 999]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_NOT_CONNECTED);
+        let (_, e) = dispatch(
+            "disconnectnode",
+            &json!(["1.2.3.4:5", 6]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
+        let (_, e) = dispatch(
+            "disconnectnode",
+            &json!(["notanip/zz", ""]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
+        let (_, e) = dispatch(
+            "disconnectnode",
+            &json!(["notanip/33"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+
+        // addnode: add → null; duplicate → -23; remove → null;
+        // second remove → -24; bad command/type → -1/-8/-3.
+        let (r, e) = dispatch(
+            "addnode",
+            &json!(["1.2.3.4:8333", "add"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, Value::Null);
+        let (_, e) = dispatch(
+            "addnode",
+            &json!(["1.2.3.4:8333", "add"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_ALREADY_ADDED);
+        let (_, e) = dispatch(
+            "addnode",
+            &json!(["1.2.3.4:8333", "add", "feeler"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        let (r, e) = dispatch(
+            "addnode",
+            &json!(["1.2.3.4:8333", "remove"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, Value::Null);
+        let (_, e) = dispatch(
+            "addnode",
+            &json!(["1.2.3.4:8333", "remove"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_NOT_ADDED);
+        let (_, e) = dispatch(
+            "addnode",
+            &json!(["x", "add", "bogus_type"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        let (_, e) = dispatch(
+            "addnode",
+            &json!(["x", "add", true]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+
+        // setnetworkactive: returns the post-set state; toggling with
+        // no peers is a no-op; non-bool → -3; missing → -1.
+        let (r, e) = dispatch(
+            "setnetworkactive",
+            &json!([false]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, json!(false));
+        let (r, e) = dispatch(
+            "setnetworkactive",
+            &json!([true]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, json!(true));
+        let (_, e) = dispatch("setnetworkactive", &json!([5]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
+        let (_, e) = dispatch("setnetworkactive", &json!([]), &snap, Some(&queries), None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 
