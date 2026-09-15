@@ -4525,7 +4525,7 @@ mod tests {
             )
         );
         // A proof whose header doesn't resolve on the active chain.
-        let mut header = genesis.header.clone();
+        let mut header = genesis.header;
         header.nonce += 1;
         let mut bytes = header.encode().to_vec();
         avila_consensus::merkle::PartialMerkleTree::build(

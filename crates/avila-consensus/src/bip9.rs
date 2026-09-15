@@ -242,6 +242,7 @@ pub fn stats(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::arith::U256;
@@ -315,7 +316,7 @@ mod tests {
     fn state_progresses_through_windows() {
         let p = params();
         let dep = p.bip9_deployments[0]; // testdummy: bit 28, start 0, no timeout
-        let mut tree = HeaderTree::new(p.clone());
+        let mut tree = HeaderTree::new(p);
 
         // Window 0 not yet closed → DEFINED for the child of h142…
         let hs = grow(&mut tree, &p, 144, SIGNALLING, 600);
@@ -355,7 +356,7 @@ mod tests {
         // MTP(h287) is above it.
         p.bip9_deployments[0].timeout = i64::from(t0) + 200 * 600;
         let dep = p.bip9_deployments[0];
-        let mut tree = HeaderTree::new(p.clone());
+        let mut tree = HeaderTree::new(p);
         let hs = grow(&mut tree, &p, 288, QUIET, 600);
         // Window 0 closed in STARTED…
         assert_eq!(state(&tree, Some(&hs[143]), &dep, &p), Bip9State::Started);
@@ -371,7 +372,7 @@ mod tests {
         let mut p = params();
         p.bip9_deployments[0].min_activation_height = 500;
         let dep = p.bip9_deployments[0];
-        let mut tree = HeaderTree::new(p.clone());
+        let mut tree = HeaderTree::new(p);
         // Three signalling windows: STARTED@144, LOCKED_IN@288, and the
         // h431 boundary stays LOCKED_IN since 432 < 500.
         let hs = grow(&mut tree, &p, 432, SIGNALLING, 600);
@@ -388,7 +389,7 @@ mod tests {
         let p = params();
         let taproot = p.bip9_deployments[1]; // ALWAYS_ACTIVE
         assert_eq!(state(&tree_new(&p), None, &taproot, &p), Bip9State::Active);
-        let mut p2 = p.clone();
+        let mut p2 = p;
         p2.bip9_deployments[0].start_time = BIP9_NEVER_ACTIVE;
         let dep = p2.bip9_deployments[0];
         assert_eq!(state(&tree_new(&p2), None, &dep, &p2), Bip9State::Failed);
@@ -396,7 +397,7 @@ mod tests {
     }
 
     fn tree_new(p: &Params) -> HeaderTree {
-        HeaderTree::new(p.clone())
+        HeaderTree::new(*p)
     }
 
     /// Only `0x2000_0000` top bits with the deployment bit set count:
@@ -405,7 +406,7 @@ mod tests {
     fn signalling_requires_top_bits_and_bit() {
         let p = params();
         let dep = p.bip9_deployments[0];
-        let mut tree = HeaderTree::new(p.clone());
+        let mut tree = HeaderTree::new(p);
         // Two quiet windows → STARTED with no signallers anywhere.
         let hs = grow(&mut tree, &p, 288, QUIET, 600);
         // At window end h287 the full period was evaluated: count 0 of
