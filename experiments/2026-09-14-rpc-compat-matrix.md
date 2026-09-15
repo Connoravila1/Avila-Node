@@ -86,9 +86,18 @@ v0: raw hex), `getchaintips`, `getrawmempool`, `getconnectioncount`,
 
 ### Documented gaps (presence-only, never wrong values)
 
-- `getpeerinfo`: byte counters, ping times, `lastsend`/`lastrecv`,
-  per-height `inflight` list, `session_id` — per-peer telemetry we
-  don't track yet.
+- `getpeerinfo`: telemetry landed — `bytesrecv`/`bytessent`,
+  per-command `*_per_msg` histograms, `conntime`/`lastsend`/`lastrecv`,
+  `last_block`/`last_transaction`/`lastannounce` (emitted once the
+  events exist, matching Core's conditional), `session_id`, ping RTT
+  (`pingtime`/`minping`/`pingwait`), `synced_headers`/`synced_blocks`
+  heights, per-height `inflight`, `addr_processed`/`addr_rate_limited`,
+  `network`, `permissions`, `bip152_hb_*`, `minfeefilter`,
+  `addr_relay_enabled`, `transport_protocol_type`, `presynced_headers`.
+  Remaining C-ONLY fields are direction-asymmetric (`addrbind`,
+  `addrlocal` — each daemon sees the other as the opposite direction)
+  or Knots extensions (`cpu_load`, `forced_inbound`,
+  `last_block_announcement`).
 - `getnetworkinfo`: `localaddresses` — we don't track our own
   advertised addresses.
 - `getmempoolinfo`: `maxmempool` (our pool is entry-capped, not

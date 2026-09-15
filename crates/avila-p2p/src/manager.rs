@@ -107,6 +107,29 @@ struct PeerEntry<S> {
     last_rx: Instant,
     /// Outstanding handshake deadline check cadence.
     last_ping: Instant,
+    /// The ping we last sent and haven't seen a pong for.
+    ping_outstanding: Option<(u64, Instant)>,
+    /// Last measured round-trip (`getpeerinfo` `pingtime`).
+    ping_last: Option<Duration>,
+    /// Smallest round-trip ever seen (`minping`).
+    ping_min: Option<Duration>,
+    /// Wall-clock of the last block this peer delivered (`last_block_time`).
+    last_block_time: Option<std::time::SystemTime>,
+    /// Wall-clock of the last tx this peer delivered (`last_transaction`).
+    last_tx_time: Option<std::time::SystemTime>,
+    /// Wall-clock of the last inv/headers announcement (`lastannounce`).
+    last_announce: Option<std::time::SystemTime>,
+    /// Height of the last header this peer fed us that we indexed
+    /// (`synced_headers`); -1 when none.
+    synced_header_height: i64,
+    /// Height of the last block from this peer that connected
+    /// (`synced_blocks`); -1 when none.
+    synced_block_height: i64,
+    /// Address entries accepted from this peer (`addr_processed`).
+    addr_processed: u64,
+    /// Address entries dropped by the rate limiter
+    /// (`addr_rate_limited`) — zero until a limiter exists.
+    addr_rate_limited: u64,
 }
 
 /// A read-only view of one connected peer — the manager's state is
@@ -143,6 +166,31 @@ pub struct PeerSnapshot {
     pub connected_secs: u64,
     /// Seconds since this peer last gave us something useful.
     pub idle_secs: u64,
+    /// Wire counters and wall-clock times (`conntime`, `lastsend`,
+    /// `lastrecv`, byte and per-command totals, `session_id`).
+    pub telemetry: crate::session::SessionTelemetry,
+    /// Last ping round-trip in seconds (`pingtime`), if measured.
+    pub ping_last_secs: Option<f64>,
+    /// Smallest round-trip seen (`minping`).
+    pub ping_min_secs: Option<f64>,
+    /// Seconds an unanswered ping has been outstanding (`pingwait`).
+    pub ping_wait_secs: Option<f64>,
+    /// Last block this peer delivered, epoch seconds; -1 if none.
+    pub last_block_time: i64,
+    /// Last tx this peer delivered, epoch seconds; -1 if none.
+    pub last_tx_time: i64,
+    /// Last inv/headers announcement, epoch seconds; -1 if none.
+    pub last_announce: i64,
+    /// Height of the last header we indexed from this peer; -1 if none.
+    pub synced_header_height: i64,
+    /// Height of the last peer-delivered block that connected; -1 if none.
+    pub synced_block_height: i64,
+    /// Addresses accepted from this peer.
+    pub addr_processed: u64,
+    /// Addresses rate-limited from this peer.
+    pub addr_rate_limited: u64,
+    /// Outstanding `getdata` block hashes (for `inflight` heights).
+    pub in_flight_hashes: Vec<BlockHash>,
 }
 
 /// A bounded set of peers sharing one [`Chainstate`].
@@ -211,6 +259,32 @@ impl<S: Read + Write> PeerManager<S> {
                     in_flight: peer.sync.in_flight(),
                     connected_secs: peer.connected_at.elapsed().as_secs(),
                     idle_secs: peer.last_useful.elapsed().as_secs(),
+                    telemetry: peer.session.telemetry(),
+                    ping_last_secs: peer.ping_last.map(|d| d.as_secs_f64()),
+                    ping_min_secs: peer.ping_min.map(|d| d.as_secs_f64()),
+                    ping_wait_secs: peer
+                        .ping_outstanding
+                        .map(|(_, t)| t.elapsed().as_secs_f64()),
+                    last_block_time: peer
+                        .last_block_time
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(-1),
+                    last_tx_time: peer
+                        .last_tx_time
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(-1),
+                    last_announce: peer
+                        .last_announce
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(-1),
+                    synced_header_height: peer.synced_header_height,
+                    synced_block_height: peer.synced_block_height,
+                    addr_processed: peer.addr_processed,
+                    addr_rate_limited: peer.addr_rate_limited,
+                    in_flight_hashes: peer.sync.in_flight_hashes().collect(),
                 }
             })
             .collect();
@@ -320,6 +394,16 @@ impl<S: Read + Write> PeerManager<S> {
                 last_useful: now,
                 last_rx: now,
                 last_ping: now,
+                ping_outstanding: None,
+                ping_last: None,
+                ping_min: None,
+                last_block_time: None,
+                last_tx_time: None,
+                last_announce: None,
+                synced_header_height: -1,
+                synced_block_height: -1,
+                addr_processed: 0,
+                addr_rate_limited: 0,
             },
         );
         Some(id)
@@ -380,6 +464,7 @@ impl<S: Read + Write> PeerManager<S> {
                 let nonce = peer.last_rx.elapsed().subsec_nanos().into(); // arbitrary
                 if peer.session.send(&Message::Ping(nonce)).is_ok() {
                     peer.last_ping = Instant::now();
+                    peer.ping_outstanding = Some((nonce, Instant::now()));
                 }
             }
             // Stall eviction.
@@ -573,8 +658,17 @@ impl<S: Read + Write> PeerManager<S> {
                 let _ = peer.session.send(&req);
             }
             SessionEvent::Message(Message::Headers(headers)) => {
+                peer.last_announce = Some(std::time::SystemTime::now());
                 match peer.sync.on_headers(cs, &headers, now) {
                     Ok(outcome) => {
+                        // Height of the last header this page indexed —
+                        // Core's `synced_headers` (last common point this
+                        // peer fed us).
+                        if let Some(last) = headers.last()
+                            && let Some(node) = cs.tree().get(&last.hash())
+                        {
+                            peer.synced_header_height = i64::from(node.height);
+                        }
                         if let Some(next) = outcome.continuation {
                             // Only the headers leader keeps paging — Core
                             // pulls headers from one sync peer; other peers'
@@ -599,6 +693,7 @@ impl<S: Read + Write> PeerManager<S> {
                 }
             }
             SessionEvent::Message(Message::Inv(invs)) => {
+                peer.last_announce = Some(std::time::SystemTime::now());
                 let missing: Vec<BlockHash> = invs
                     .iter()
                     .filter(|i| {
@@ -623,6 +718,7 @@ impl<S: Read + Write> PeerManager<S> {
             }
             SessionEvent::Message(Message::Block(block)) => {
                 let old_tip = cs.tip_hash();
+                peer.last_block_time = Some(std::time::SystemTime::now());
                 match peer.sync.on_block(cs, &block, now) {
                     Ok(outcome) => {
                         peer.last_useful = Instant::now();
@@ -632,6 +728,7 @@ impl<S: Read + Write> PeerManager<S> {
                                 ..
                             } = outcome.acceptance
                             {
+                                peer.synced_block_height = i64::from(height);
                                 Some(height)
                             } else {
                                 None
@@ -672,6 +769,7 @@ impl<S: Read + Write> PeerManager<S> {
                 peer.wants_headers_announce = true;
             }
             SessionEvent::Message(Message::Tx(tx)) => {
+                peer.last_tx_time = Some(std::time::SystemTime::now());
                 let wtxid = tx.wtxid();
                 let txid_pre = tx.txid();
                 peer.sync.on_tx(&txid_pre);
@@ -732,15 +830,27 @@ impl<S: Read + Write> PeerManager<S> {
                 let _ = peer.session.send(&Message::AddrV2(entries));
             }
             SessionEvent::Message(Message::Addr(entries)) => {
+                peer.addr_processed += entries.len() as u64;
                 addrbook.add_many(entries.iter().map(|e| (e.addr, e.time)), now);
             }
             SessionEvent::Message(Message::AddrV2(entries)) => {
+                peer.addr_processed += entries.len() as u64;
                 addrbook.add_many(
                     entries
                         .iter()
                         .filter_map(|e| net_addr_of_v2(e).map(|a| (a, e.time))),
                     now,
                 );
+            }
+            SessionEvent::Message(Message::Pong(nonce)) => {
+                if let Some((expected, sent_at)) = peer.ping_outstanding
+                    && expected == nonce
+                {
+                    let rtt = sent_at.elapsed();
+                    peer.ping_last = Some(rtt);
+                    peer.ping_min = Some(peer.ping_min.map_or(rtt, |m| m.min(rtt)));
+                    peer.ping_outstanding = None;
+                }
             }
             SessionEvent::Message(_) => {}
         }

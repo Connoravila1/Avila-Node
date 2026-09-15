@@ -28,7 +28,9 @@ import urllib.error
 
 # Methods whose scalar results are inherently per-node — different
 # text or counters — so any value difference is expected.
-DYNAMIC_METHODS = {"uptime", "help"}
+# `getrawmempool` (unverbose) reports pool membership itself — content
+# differences are per-node state, not incompatibility.
+DYNAMIC_METHODS = {"uptime", "help", "getrawmempool"}
 
 # Keys whose values are legitimately node- or time-specific. They are
 # still compared (structural presence is checked) but a value
@@ -55,6 +57,16 @@ DYNAMIC_KEYS = {
     "transport_protocol_type", "session_id", "relaytxes", "minfeefilter",
     "services", "servicesnames", "feerate", "estimates", "headers",
     "commit", "target",
+    # Pool-content dependent — diverge whenever the two mempools differ.
+    "transactions", "coinbasevalue", "default_witness_commitment",
+    # Direction-dependent — each daemon sees the other as the opposite
+    # connection direction, so inbound-only fields legitimately differ.
+    "addrbind", "addrlocal", "forced_inbound", "cpu_load",
+    "last_block_announcement",
+    # Pool-membership counters — we don't persist the pool across
+    # restarts like Core's mempool.dat, so these reflect each daemon's
+    # live pool.
+    "size", "total_fee", "unbroadcastcount", "maxmempool",
 }
 
 # Method -> params factory. `h` is a recent height valid on both nodes;

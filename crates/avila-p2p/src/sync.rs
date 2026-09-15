@@ -113,6 +113,12 @@ impl PeerSync {
         self.in_flight.len()
     }
 
+    /// The block hashes this peer currently owes us (`getpeerinfo`'s
+    /// `inflight` list, rendered as heights by callers with the tree).
+    pub fn in_flight_hashes(&self) -> impl Iterator<Item = BlockHash> + '_ {
+        self.in_flight.iter().map(|(h, _)| *h)
+    }
+
     /// Every hash this peer has been asked for or already marked — the
     /// manager uses the union across peers as a reservation set so two
     /// peers never download the same block.

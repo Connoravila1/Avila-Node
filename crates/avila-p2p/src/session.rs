@@ -75,6 +75,51 @@ pub struct PeerInfo {
     pub addrv2: bool,
 }
 
+/// Wire telemetry for one session — what `getpeerinfo` reports. Bytes
+/// are counted where they actually move: outbound at `send` (queue
+/// time — a failed flush kills the session anyway), inbound at `poll`'s
+/// read; per-command histograms use whole-frame sizes.
+#[derive(Clone, Debug, Default)]
+pub struct SessionTelemetry {
+    /// Wire bytes sent to this peer.
+    pub bytes_sent: u64,
+    /// Wire bytes read from this peer.
+    pub bytes_recv: u64,
+    /// Outbound wire bytes by command name.
+    pub sent_by_msg: std::collections::HashMap<String, u64>,
+    /// Inbound wire bytes by command name (payload + 24-byte header).
+    pub recv_by_msg: std::collections::HashMap<String, u64>,
+    /// Wall-clock connection time (Core's `conntime`).
+    pub connected: i64,
+    /// Wall-clock of the last send (`lastsend`); 0 before any traffic.
+    pub last_send: i64,
+    /// Wall-clock of the last received frame (`lastrecv`); 0 likewise.
+    pub last_recv: i64,
+    /// Opaque per-session token (Core's `session_id`).
+    pub session_id: u64,
+}
+
+/// Monotonic session tokens — nanos-seeded so ids differ across
+/// process restarts, then a counter so same-instant sessions differ.
+fn next_session_id() -> u64 {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering::Relaxed;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 | (d.as_secs() & 0xffff_ffff) << 32)
+        .unwrap_or(0);
+    nanos.rotate_left(7) ^ seq.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Something the session wants the caller to know. Interpreting `Message`
 /// payloads (is this header valid? do we want these blocks?) is the sync
 /// layer's job — the session only reports wire facts.
@@ -125,6 +170,8 @@ pub struct PeerSession<S> {
     outbound: bool,
     peer: Option<PeerInfo>,
     connected_at: Instant,
+    /// Wire counters and wall-clock times for `getpeerinfo`.
+    telemetry: SessionTelemetry,
     /// Maximum bytes allowed outstanding in `send_buf`.
     send_budget: usize,
 }
@@ -171,6 +218,11 @@ impl<S: Read + Write> PeerSession<S> {
             outbound,
             peer: None,
             connected_at: Instant::now(),
+            telemetry: SessionTelemetry {
+                connected: now_epoch(),
+                session_id: next_session_id(),
+                ..SessionTelemetry::default()
+            },
             send_budget,
         }
     }
@@ -197,6 +249,12 @@ impl<S: Read + Write> PeerSession<S> {
     #[must_use]
     pub fn queued(&self) -> usize {
         self.send_buf.len()
+    }
+
+    /// Wire counters and timestamps — the `getpeerinfo` telemetry set.
+    #[must_use]
+    pub fn telemetry(&self) -> SessionTelemetry {
+        self.telemetry.clone()
     }
 
     /// Fails the session if the handshake has run past [`HANDSHAKE_TIMEOUT`].
@@ -228,6 +286,13 @@ impl<S: Read + Write> PeerSession<S> {
                 "per-peer send budget exhausted",
             )));
         }
+        *self
+            .telemetry
+            .sent_by_msg
+            .entry(command.name().to_string())
+            .or_insert(0) += frame.len() as u64;
+        self.telemetry.bytes_sent += frame.len() as u64;
+        self.telemetry.last_send = now_epoch();
         self.send_buf.extend(frame);
         Ok(())
     }
@@ -269,12 +334,22 @@ impl<S: Read + Write> PeerSession<S> {
         loop {
             match self.stream.read(&mut scratch) {
                 Ok(0) => return Err(SessionError::Eof),
-                Ok(n) => self.decoder.feed(&scratch[..n]),
+                Ok(n) => {
+                    self.telemetry.bytes_recv += n as u64;
+                    self.decoder.feed(&scratch[..n]);
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(SessionError::Io(e)),
             }
             while let Some((command, payload)) = self.decoder.next_frame()? {
+                // Whole wire frame: payload plus the 24-byte header.
+                *self
+                    .telemetry
+                    .recv_by_msg
+                    .entry(command.name().to_string())
+                    .or_insert(0) += payload.len() as u64 + 24;
+                self.telemetry.last_recv = now_epoch();
                 if let Some(event) = self.dispatch(command, &payload)? {
                     events.push(event);
                 }
@@ -494,6 +569,35 @@ mod tests {
 
         testpipe::inject(&mut peer_end, MAGIC, &Message::Verack);
         assert!(us.poll().unwrap().contains(&SessionEvent::Established));
+    }
+
+    #[test]
+    fn telemetry_counts_wire_bytes_by_command() {
+        let (us_end, mut peer_end) = testpipe::pair();
+        let mut us = PeerSession::accept(
+            us_end,
+            MAGIC,
+            build_version(6, 0, NetAddr::unspecified()),
+            BUDGET,
+        );
+        us.poll().unwrap();
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Version(version(1)));
+        us.poll().unwrap();
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Verack);
+        testpipe::inject(&mut peer_end, MAGIC, &Message::GetAddr);
+        us.poll().unwrap();
+
+        let t = us.telemetry();
+        let vframe = Message::Version(version(1)).encode().len() + 24;
+        // version + verack + getaddr frames, counted at the wire.
+        assert_eq!(t.bytes_recv as usize, vframe + 24 + 24);
+        assert!(t.bytes_sent > 0);
+        assert_eq!(t.recv_by_msg["version"] as usize, vframe);
+        assert_eq!(t.recv_by_msg["getaddr"], 24);
+        assert_eq!(t.sent_by_msg["verack"], 24);
+        assert!(t.sent_by_msg["version"] > 24);
+        assert!(t.connected > 0 && t.last_send > 0 && t.last_recv > 0);
+        assert_ne!(t.session_id, 0);
     }
 
     #[test]

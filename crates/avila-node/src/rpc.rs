@@ -993,21 +993,22 @@ fn dispatch(
                 }
             })
         }
-        "getpeerinfo" => chain_query(queries, |_, mgr| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+        "getpeerinfo" => chain_query(queries, |cs, mgr| {
             Ok(Value::Array(
                 mgr.peer_snapshots()
                     .iter()
                     .map(|p| {
                         // Core-named fields where we hold the data;
                         // ours are kept alongside so the claims-vs-
-                        // served framing stays visible.
-                        json!({
+                        // served framing stays visible. Per-command
+                        // histograms and timers come from the wire
+                        // layer's own counters.
+                        let mut peer = json!({
                             "id": p.id,
                             "addr": p.remote.map(|a| a.to_string()),
+                            "network": p.remote.map(|a| {
+                                if a.is_ipv4() { "ipv4" } else { "ipv6" }
+                            }),
                             "inbound": p.inbound,
                             "connection_type": if p.inbound {
                                 "inbound"
@@ -1016,6 +1017,7 @@ fn dispatch(
                             },
                             // v2 transport (BIP324) is not implemented.
                             "transport_protocol_type": "v1",
+                            "session_id": format!("{:016x}", p.telemetry.session_id),
                             "version": p.version,
                             // Core's field name is `subver` — there is
                             // no `subversion` in getpeerinfo.
@@ -1023,21 +1025,68 @@ fn dispatch(
                             "services": p.services.map(|s| format!("{s:016x}")),
                             "servicesnames": p.services.map(service_names),
                             "relaytxes": p.relay,
+                            "addr_relay_enabled": p.relay.unwrap_or(false),
                             "startingheight": p.start_height,
                             "claimed_height": p.start_height,
-                            "synced_headers": p.headers_received,
-                            "synced_blocks": p.blocks_received,
+                            // Heights of the last header/block this peer
+                            // gave us — Core's semantics, not counts.
+                            "synced_headers": p.synced_header_height,
+                            "synced_blocks": p.synced_block_height,
+                            "presynced_headers": false,
                             "handshake": p.established,
                             "headers_received": p.headers_received,
                             "blocks_received": p.blocks_received,
                             "in_flight": p.in_flight,
-                            "conntime": now.saturating_sub(p.connected_secs),
+                            "inflight": p
+                                .in_flight_hashes
+                                .iter()
+                                .filter_map(|h| {
+                                    cs.tree().get(h).map(|n| n.height)
+                                })
+                                .collect::<Vec<_>>(),
+                            "conntime": p.telemetry.connected,
                             "connected_secs": p.connected_secs,
+                            "bytessent": p.telemetry.bytes_sent,
+                            "bytesrecv": p.telemetry.bytes_recv,
+                            "bytessent_per_msg": p.telemetry.sent_by_msg,
+                            "bytesrecv_per_msg": p.telemetry.recv_by_msg,
+                            "lastsend": p.telemetry.last_send,
+                            "lastrecv": p.telemetry.last_recv,
                             "timeoffset": 0,
                             "misbehavior_score": 0,
                             "permissions": [],
+                            // We never send feefilter — the peer applies
+                            // its own default floor.
+                            "minfeefilter": 0,
+                            // Compact-block high-bandwidth mode was never
+                            // negotiated.
+                            "bip152_hb_to": false,
+                            "bip152_hb_from": false,
+                            "addr_processed": p.addr_processed,
+                            "addr_rate_limited": p.addr_rate_limited,
                             "idle_secs": p.idle_secs,
-                        })
+                        });
+                        // Core omits timing fields until the events
+                        // exist — no ping answer yet, no block, no tx.
+                        if p.last_announce > 0 {
+                            peer["lastannounce"] = json!(p.last_announce);
+                        }
+                        if p.last_block_time > 0 {
+                            peer["last_block"] = json!(p.last_block_time);
+                        }
+                        if p.last_tx_time > 0 {
+                            peer["last_transaction"] = json!(p.last_tx_time);
+                        }
+                        if let Some(t) = p.ping_last_secs {
+                            peer["pingtime"] = json!(t);
+                        }
+                        if let Some(t) = p.ping_min_secs {
+                            peer["minping"] = json!(t);
+                        }
+                        if let Some(t) = p.ping_wait_secs {
+                            peer["pingwait"] = json!(t);
+                        }
+                        peer
                     })
                     .collect(),
             ))
