@@ -58,6 +58,18 @@ pub struct MempoolEntry {
     /// The chain height when first pooled — the estimator's clock for
     /// "blocks to confirm" (Core's `nHeight` at acceptance).
     pub first_seen_height: u32,
+    /// `prioritisetransaction`'s accumulated adjustment (Core's
+    /// `nFeeDelta`) — `fee + fee_delta` is the modified fee template
+    /// ordering and `fees.modified` report.
+    pub fee_delta: i64,
+}
+
+impl MempoolEntry {
+    /// `fee + fee_delta` — Core's `GetModifiedFee`.
+    #[must_use]
+    pub fn modified_fee(&self) -> i64 {
+        self.fee.saturating_add(self.fee_delta)
+    }
 }
 
 /// Why a transaction was refused — the vocabulary Core's
@@ -243,6 +255,14 @@ pub struct Mempool {
     full_rbf: bool,
     /// Confirmation observations from connected blocks.
     estimator: FeeEstimator,
+    /// `prioritisetransaction` accumulations by txid — Core's
+    /// `mapDeltas`. Entries for not-yet-pooled txids apply at
+    /// admission; mined txids are cleared at block connect.
+    deltas: HashMap<Txid, i64>,
+    /// Locally submitted txids no peer has requested yet — Core's
+    /// `m_unbroadcast_txids`, cleared when a peer's getdata asks for
+    /// the tx or the entry leaves the pool.
+    unbroadcast: HashSet<Txid>,
 }
 
 impl Mempool {
@@ -260,6 +280,8 @@ impl Mempool {
             min_relay_fee: DEFAULT_MIN_RELAY_FEE,
             full_rbf: true,
             estimator: FeeEstimator::new(),
+            deltas: HashMap::new(),
+            unbroadcast: HashSet::new(),
         }
     }
 
@@ -367,6 +389,30 @@ impl Mempool {
         tx.inputs
             .iter()
             .any(|i| i.sequence < RBF_SEQUENCE_THRESHOLD)
+    }
+
+    /// Core's `IsRBFOptIn` for `getmempoolentry`'s `bip125-replaceable`:
+    /// the tx's own signal, or — with no signal of its own — every
+    /// direct in-pool parent signaling. A non-signaling tx with no
+    /// pooled parents is `FINAL` → false.
+    #[must_use]
+    pub fn bip125_replaceable(&self, txid: &Txid) -> bool {
+        let Some(e) = self.map.get(txid) else {
+            return false;
+        };
+        if Self::signals_rbf(&e.tx) {
+            return true;
+        }
+        let mut has_parent = false;
+        for input in &e.tx.inputs {
+            if let Some(parent) = self.map.get(&input.previous_output.txid) {
+                has_parent = true;
+                if !Self::signals_rbf(&parent.tx) {
+                    return false;
+                }
+            }
+        }
+        has_parent
     }
 
     /// Resolves an input's coin: the confirmed UTXO first, else a pooled
@@ -861,6 +907,10 @@ impl Mempool {
                 vsize,
                 time: now,
                 first_seen_height: cs.tree().tip().height,
+                // A prioritisetransaction delta recorded before the tx
+                // arrived applies now (Core reads mapDeltas at
+                // admission into the entry's nFeeDelta).
+                fee_delta: self.deltas.get(&txid).copied().unwrap_or(0),
             },
         );
         // Newly pooled outputs may un-orphan parked children — Core's
@@ -1040,6 +1090,14 @@ impl Mempool {
             f.write_all(&e.time.to_le_bytes())?;
             f.write_all(&e.first_seen_height.to_le_bytes())?;
         }
+        // Trailing prioritisetransaction deltas — Core persists
+        // `mapDeltas` in mempool.dat the same way; a file without the
+        // section just leaves `deltas` empty at load.
+        f.write_all(&(self.deltas.len() as u32).to_le_bytes())?;
+        for (txid, delta) in &self.deltas {
+            f.write_all(txid.as_bytes())?;
+            f.write_all(&delta.to_le_bytes())?;
+        }
         Ok(entries.len())
     }
 
@@ -1097,6 +1155,22 @@ impl Mempool {
             cursor += 8;
             if let Ok(tx) = Transaction::decode(raw) {
                 pending.push((tx, time, height));
+            }
+        }
+        // Optional trailing `mapDeltas` section — absent in files written
+        // before deltas were persisted; a short/corrupt tail is ignored.
+        if cursor + 4 <= buf.len() {
+            let dcount =
+                u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap_or_default()) as usize;
+            cursor += 4;
+            for _ in 0..dcount.min((buf.len() - cursor) / 40) {
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(&buf[cursor..cursor + 32]);
+                let delta = i64::from_le_bytes(
+                    buf[cursor + 32..cursor + 40].try_into().unwrap_or_default(),
+                );
+                self.deltas.insert(Txid::from_bytes(bytes), delta);
+                cursor += 40;
             }
         }
         let decoded = pending.len();
@@ -1157,6 +1231,7 @@ impl Mempool {
     /// Drops `txid` and unindexes its input spends.
     pub fn remove(&mut self, txid: &Txid) -> Option<MempoolEntry> {
         let entry = self.map.remove(txid)?;
+        self.unbroadcast.remove(txid);
         self.wtxids.remove(&entry.tx.wtxid());
         self.pool_bytes = self.pool_bytes.saturating_sub(entry.tx.encode().len());
         for input in &entry.tx.inputs {
@@ -1187,6 +1262,43 @@ impl Mempool {
         self.remove(txid);
     }
 
+    /// Marks `txid` as locally submitted but not yet requested by any
+    /// peer — Core's `AddToUnbroadcastTxSet`.
+    pub fn mark_unbroadcast(&mut self, txid: &Txid) {
+        self.unbroadcast.insert(*txid);
+    }
+
+    /// A peer's getdata asked for `txid` — Core's `RemoveUnbroadcastTx`.
+    pub fn clear_unbroadcast(&mut self, txid: &Txid) {
+        self.unbroadcast.remove(txid);
+    }
+
+    /// Whether `txid` is still waiting for its first peer request.
+    #[must_use]
+    pub fn is_unbroadcast(&self, txid: &Txid) -> bool {
+        self.unbroadcast.contains(txid)
+    }
+
+    /// `getmempoolinfo`'s `unbroadcastcount`.
+    #[must_use]
+    pub fn unbroadcast_count(&self) -> usize {
+        self.unbroadcast.len()
+    }
+
+    /// `prioritisetransaction` — accumulates `delta` onto the txid's
+    /// `mapDeltas` slot and stores the accumulated value on the entry
+    /// (Core's `UpdateFeeDelta` sets, doesn't add). Unknown txids are
+    /// remembered for admission; the RPC reports success either way.
+    /// Ancestor/descendant fee stats pick the delta up automatically —
+    /// they're summed from each entry's `modified_fee()` at query time.
+    pub fn prioritise(&mut self, txid: &Txid, delta: i64) {
+        let slot = self.deltas.entry(*txid).or_insert(0);
+        *slot = slot.saturating_add(delta);
+        if let Some(e) = self.map.get_mut(txid) {
+            e.fee_delta = *slot;
+        }
+    }
+
     /// Drops every tx that spends a block's *newly spent* outpoints or
     /// whose txid the block now confirms — Core's
     /// `removeForBlock`-lite: confirmed txs leave the pool, and so do
@@ -1195,6 +1307,9 @@ impl Mempool {
         let mut dead: Vec<Txid> = Vec::new();
         for tx in &block.transactions {
             let txid = tx.txid();
+            // Core's ClearPrioritisation — confirmation retires the
+            // txid's delta slot.
+            self.deltas.remove(&txid);
             if self.map.contains_key(&txid) {
                 dead.push(txid);
             }
@@ -1883,9 +1998,10 @@ mod tests {
         let (imported, skipped) = fresh.load(&path, &cs2, NOW + 300).unwrap();
         assert_eq!((imported, skipped), (0, 1), "spent input → skipped");
 
-        // A truncated file imports what decoded without erroring.
+        // A truncated file imports what decoded without erroring — cut
+        // through the 4-byte delta tail into the last entry's data.
         let raw = std::fs::read(&path).unwrap();
-        std::fs::write(&path, &raw[..raw.len() - 3]).unwrap();
+        std::fs::write(&path, &raw[..raw.len() - 7]).unwrap();
         let (imported, skipped) = fresh.load(&path, &cs2, NOW + 300).unwrap();
         assert_eq!((imported, skipped), (0, 0));
         std::fs::remove_file(&path).unwrap();
@@ -1907,5 +2023,85 @@ mod tests {
             est.observe(2_000, 1);
         }
         assert_eq!(est.estimate(1), Some(2_000));
+    }
+
+    #[test]
+    fn prioritise_unknown_txid_applies_at_admission() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let txid = tx.txid();
+        // Core: deltas land in mapDeltas before the tx is known and
+        // attach when it enters.
+        pool.prioritise(&txid, 5_000);
+        pool.prioritise(&txid, -2_000);
+        pool.accept_tx(tx, &cs, NOW).unwrap();
+        let e = pool.entry(&txid).unwrap();
+        assert_eq!(e.fee_delta, 3_000);
+        assert_eq!(e.modified_fee(), e.fee + 3_000);
+        // A further prioritise on the pooled entry accumulates.
+        pool.prioritise(&txid, 500);
+        assert_eq!(pool.entry(&txid).unwrap().fee_delta, 3_500);
+    }
+
+    #[test]
+    fn prioritise_pooled_tx_sets_accumulated_delta() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let txid = tx.txid();
+        pool.accept_tx(tx, &cs, NOW).unwrap();
+        pool.prioritise(&txid, 10_000);
+        pool.prioritise(&txid, -4_000);
+        let e = pool.entry(&txid).unwrap();
+        assert_eq!(e.fee_delta, 6_000);
+        assert_eq!(e.modified_fee(), e.fee + 6_000);
+        // Saturating accumulation — no overflow panic at the i64 edge.
+        pool.prioritise(&txid, i64::MAX);
+        assert_eq!(pool.entry(&txid).unwrap().fee_delta, i64::MAX);
+    }
+
+    #[test]
+    fn confirmation_clears_the_delta() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let txid = tx.txid();
+        pool.accept_tx(tx.clone(), &cs, NOW).unwrap();
+        pool.prioritise(&txid, 10_000);
+        let mut block = block_on(&blocks[100].header, 102, &Network::Regtest.params());
+        block.transactions.push(tx);
+        pool.on_block_connected(&block, 102);
+        assert!(pool.get(&txid).is_none());
+        // Core's ClearPrioritisation — the txid's slot is gone, so a
+        // re-prioritise starts from zero rather than accumulating.
+        assert!(!pool.deltas.contains_key(&txid));
+        pool.prioritise(&txid, 7);
+        assert_eq!(pool.deltas.get(&txid), Some(&7));
+    }
+
+    #[test]
+    fn deltas_persist_through_save_load() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let txid = tx.txid();
+        pool.prioritise(&txid, 42_000);
+        pool.accept_tx(tx, &cs, NOW).unwrap();
+        // A delta for a tx that never arrived persists too.
+        let ghost = Txid::from_bytes([9u8; 32]);
+        pool.prioritise(&ghost, 1_000);
+        let dir = std::env::temp_dir().join(format!("avila-mpd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mempool.dat");
+        pool.save(&path).unwrap();
+
+        let mut fresh = Mempool::new();
+        let (imported, skipped) = fresh.load(&path, &cs, NOW).unwrap();
+        assert_eq!((imported, skipped), (1, 0));
+        assert_eq!(fresh.entry(&txid).unwrap().fee_delta, 42_000);
+        assert_eq!(fresh.deltas.get(&ghost), Some(&1_000));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 }

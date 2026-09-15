@@ -630,6 +630,9 @@ const GETCHAINTXSTATS_HELP: &str = "getchaintxstats ( nblocks \"blockhash\" )\n\
 /// Verbatim `help gettxoutsetinfo` text (Bitcoin Core 29.4).
 const GETTXOUTSETINFO_HELP: &str = "gettxoutsetinfo ( \"hash_type\" hash_or_height use_index )\n\nReturns statistics about the unspent transaction output set.\nNote this call may take some time if you are not using coinstatsindex.\n\nArguments:\n1. hash_type         (string, optional, default=\"hash_serialized_3\") Which UTXO set hash should be calculated. Options: 'hash_serialized_3' (the legacy algorithm), 'muhash', 'none'.\n2. hash_or_height    (string or numeric, optional, default=the current best block) The block hash or height of the target height (only available with coinstatsindex).\n3. use_index         (boolean, optional, default=true) Use coinstatsindex, if available.\n\nResult:\n{                                     (json object)\n  \"height\" : n,                       (numeric) The block height (index) of the returned statistics\n  \"bestblock\" : \"hex\",                (string) The hash of the block at which these statistics are calculated\n  \"txouts\" : n,                       (numeric) The number of unspent transaction outputs\n  \"bogosize\" : n,                     (numeric) Database-independent, meaningless metric indicating the UTXO set size\n  \"hash_serialized_3\" : \"hex\",        (string, optional) The serialized hash (only present if 'hash_serialized_3' hash_type is chosen)\n  \"muhash\" : \"hex\",                   (string, optional) The serialized hash (only present if 'muhash' hash_type is chosen)\n  \"transactions\" : n,                 (numeric, optional) The number of transactions with unspent outputs (not available when coinstatsindex is used)\n  \"disk_size\" : n,                    (numeric, optional) The estimated size of the chainstate on disk (not available when coinstatsindex is used)\n  \"total_amount\" : n,                 (numeric) The total amount of coins in the UTXO set\n  \"total_unspendable_amount\" : n,     (numeric, optional) The total amount of coins permanently excluded from the UTXO set (only available if coinstatsindex is used)\n  \"block_info\" : {                    (json object, optional) Info on amounts in the block at this block height (only available if coinstatsindex is used)\n    \"prevout_spent\" : n,              (numeric) Total amount of all prevouts spent in this block\n    \"coinbase\" : n,                   (numeric) Coinbase subsidy amount of this block\n    \"new_outputs_ex_coinbase\" : n,    (numeric) Total amount of new outputs created by this block\n    \"unspendable\" : n,                (numeric) Total amount of unspendable outputs created in this block\n    \"unspendables\" : {                (json object) Detailed view of the unspendable categories\n      \"genesis_block\" : n,            (numeric) The unspendable amount of the Genesis block subsidy\n      \"bip30\" : n,                    (numeric) Transactions overridden by duplicates (no longer possible with BIP30)\n      \"scripts\" : n,                  (numeric) Amounts sent to scripts that are unspendable (for example OP_RETURN outputs)\n      \"unclaimed_rewards\" : n         (numeric) Fee rewards that miners did not claim in their coinbase transaction\n    }\n  }\n}\n\nExamples:\n> bitcoin-cli gettxoutsetinfo \n> bitcoin-cli gettxoutsetinfo \"none\"\n> bitcoin-cli gettxoutsetinfo \"none\" 1000\n> bitcoin-cli gettxoutsetinfo \"none\" '\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"'\n> bitcoin-cli -named gettxoutsetinfo hash_type='muhash' use_index='false'\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxoutsetinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxoutsetinfo\", \"params\": [\"none\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxoutsetinfo\", \"params\": [\"none\", 1000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxoutsetinfo\", \"params\": [\"none\", \"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+/// Verbatim `help prioritisetransaction` text (Bitcoin Core 29.4).
+const PRIORITISETRANSACTION_HELP: &str = "prioritisetransaction \"txid\" ( dummy ) fee_delta\n\nAccepts the transaction into mined blocks at a higher (or lower) priority\n\nArguments:\n1. txid         (string, required) The transaction id.\n2. dummy        (numeric, optional) API-Compatibility for previous API. Must be zero or null.\n                DEPRECATED. For forward compatibility use named arguments and omit this parameter.\n3. fee_delta    (numeric, required) The fee value (in satoshis) to add (or subtract, if negative).\n                Note, that this value is not a fee rate. It is a value to modify absolute fee of the TX.\n                The fee is not actually paid, only the algorithm for selecting transactions into a block\n                considers the transaction as it would have paid a higher (or lower) fee.\n\nResult:\ntrue|false    (boolean) Returns true\n\nExamples:\n> bitcoin-cli prioritisetransaction \"txid\" 0.0 10000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"prioritisetransaction\", \"params\": [\"txid\", 0.0, 10000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 /// Verbatim `help verifychain` text (Bitcoin Core 29.4).
 const VERIFYCHAIN_HELP: &str = "verifychain ( checklevel nblocks )\n\nVerifies blockchain database.\n\nArguments:\n1. checklevel    (numeric, optional, default=3, range=0-4) How thorough the block verification is:\n                 - level 0 reads the blocks from disk\n                 - level 1 verifies block validity\n                 - level 2 verifies undo data\n                 - level 3 checks disconnection of tip blocks\n                 - level 4 tries to reconnect the blocks\n                 - each level includes the checks of the previous levels\n2. nblocks       (numeric, optional, default=6, 0=all) The number of blocks to check.\n\nResult:\ntrue|false    (boolean) Verification finished successfully. If false, check debug.log for reason.\n\nExamples:\n> bitcoin-cli verifychain \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"verifychain\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -1328,34 +1331,67 @@ fn entry_json(
 ) -> Value {
     let ancestors = pool.ancestor_txids(&entry.tx);
     let descendants = pool.descendant_txids(txid);
+    // Core's entryToJSON: the ancestor/descendant fee totals (and the
+    // `ancestor`/`descendant` keys inside `fees`) sum *modified* fees —
+    // base plus prioritisetransaction deltas.
     let stat = |set: &std::collections::HashSet<Txid>| -> (usize, usize, i64) {
         let mut size = 0usize;
         let mut fees = 0i64;
         for id in set {
             if let Some(e) = pool.entry(id) {
                 size += e.vsize;
-                fees += e.fee;
+                fees += e.modified_fee();
             }
         }
         (set.len(), size, fees)
     };
-    let (acount, asize, afees) = stat(&ancestors);
-    let (dcount, dsize, dfees) = stat(&descendants);
+    let (_acount, asize, afees) = stat(&ancestors);
+    let (_dcount, dsize, dfees) = stat(&descendants);
+    let modified = entry.modified_fee();
+    // `depends`: direct parents present in the pool (Core dedups via a
+    // set; we sort for deterministic output). `spentby`: direct
+    // children — txids spending any of this tx's outputs.
+    let mut depends: Vec<String> = entry
+        .tx
+        .inputs
+        .iter()
+        .filter_map(|i| {
+            pool.entry(&i.previous_output.txid)
+                .map(|_| i.previous_output.txid.to_string())
+        })
+        .collect();
+    depends.sort_unstable();
+    depends.dedup();
+    let mut spentby: Vec<String> = (0..entry.tx.outputs.len())
+        .filter_map(|vout| {
+            pool.spent_by(&avila_consensus::transaction::OutPoint {
+                txid: *txid,
+                vout: vout as u32,
+            })
+            .map(|s| s.txid().to_string())
+        })
+        .collect();
+    spentby.sort_unstable();
     json!({
         "vsize": entry.vsize,
-        "weight": entry.vsize * 4,
+        "weight": entry.tx.weight(),
         "time": entry.time,
         "height": entry.first_seen_height,
         "wtxid": entry.tx.wtxid().to_string(),
         "fees": {
             "base": entry.fee as f64 / 100_000_000.0,
+            "modified": modified as f64 / 100_000_000.0,
+            "ancestor": (afees + modified) as f64 / 100_000_000.0,
+            "descendant": (dfees + modified) as f64 / 100_000_000.0,
         },
-        "ancestorcount": acount + 1,
+        "ancestorcount": ancestors.len() + 1,
         "ancestorsize": asize + entry.vsize,
-        "ancestorfees": afees + entry.fee,
-        "descendantcount": dcount + 1,
+        "descendantcount": descendants.len() + 1,
         "descendantsize": dsize + entry.vsize,
-        "descendantfees": dfees + entry.fee,
+        "depends": depends,
+        "spentby": spentby,
+        "bip125-replaceable": pool.bip125_replaceable(txid),
+        "unbroadcast": pool.is_unbroadcast(txid),
     })
 }
 
@@ -2827,7 +2863,7 @@ fn dispatch(
                 // Full-RBF matches deployed Core's -mempoolfullrbf=1:
                 // replacements no longer need BIP125 signaling.
                 "fullrbf": pool.full_rbf(),
-                "unbroadcastcount": 0,
+                "unbroadcastcount": pool.unbroadcast_count(),
             }))
         }),
         "getchaintips" => chain_query(queries, |cs, _| {
@@ -3088,11 +3124,17 @@ fn dispatch(
                 match mgr.mempool().accept_tx(tx, cs, now) {
                     Ok(_) => {
                         // Admitted — relay an inv to every tx-accepting
-                        // peer (Core's RelayTransaction path).
+                        // peer (Core's RelayTransaction path) and track
+                        // it as unbroadcast until a peer's getdata
+                        // acknowledges the announcement.
+                        mgr.mempool().mark_unbroadcast(&txid);
                         mgr.announce_tx(txid, wtxid);
                         Ok(json!(txid.to_string()))
                     }
-                    Err(avila_mempool::MempoolReject::AlreadyKnown) => Ok(json!(txid.to_string())),
+                    Err(avila_mempool::MempoolReject::AlreadyKnown) => {
+                        mgr.mempool().mark_unbroadcast(&txid);
+                        Ok(json!(txid.to_string()))
+                    }
                     // Consensus and input failures carry Core's
                     // state.Invalid reason strings via `reason()`;
                     // policy rejects already Display as Core strings.
@@ -3105,6 +3147,58 @@ fn dispatch(
                         },
                     )),
                 }
+            })
+        }
+        "prioritisetransaction" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() != 3 {
+                return help_error(PRIORITISETRANSACTION_HELP);
+            }
+            // RPCHelpMan type pass: txid a string, dummy numeric or
+            // null, fee_delta numeric — every bad argument collected.
+            let mut type_errors: Vec<(usize, &str, &Value, &str)> = Vec::new();
+            if !arr[0].is_string() {
+                type_errors.push((1, "txid", &arr[0], "string"));
+            }
+            if !(arr[1].is_number() || arr[1].is_null()) {
+                type_errors.push((2, "dummy", &arr[1], "number"));
+            }
+            if !arr[2].is_number() {
+                type_errors.push((3, "fee_delta", &arr[2], "number"));
+            }
+            if !type_errors.is_empty() {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, wrong_type_list(&type_errors))),
+                );
+            }
+            // Body order (Core's prioritisetransaction): ParseHashV the
+            // txid, then getInt<int64> on fee_delta, then the dummy
+            // compatibility check.
+            let txid: Txid = match parse_hash_v(arr[0].as_str().unwrap_or_default(), "txid") {
+                Ok(h) => h,
+                Err(e) => return (Value::Null, Some(e)),
+            };
+            let Some(fee_delta) = arr[2].as_i64() else {
+                return (
+                    Value::Null,
+                    Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                );
+            };
+            if arr[1].as_f64().is_some_and(|d| d != 0.0) {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_INVALID_PARAMETER,
+                        "Priority is no longer supported, dummy argument to \
+                         prioritisetransaction must be 0."
+                            .into(),
+                    )),
+                );
+            }
+            chain_query(queries, move |_cs, mgr| {
+                mgr.mempool().prioritise(&txid, fee_delta);
+                Ok(json!(true))
             })
         }
         "submitblock" => {
@@ -4674,7 +4768,7 @@ fn dispatch(
                  \x20   submitblock <hex>,\n\
                  \x20   submitheader <hex>, generatetoaddress <n> <address> [maxtries],\n\
                  \x20   generateblock <output> [rawtx/txid,...],\n\
-                 \x20   preciousblock <hash>\n\
+                 \x20   preciousblock <hash>, prioritisetransaction <txid> 0 <delta>\n\
                  \x20 net:   getpeerinfo, getconnectioncount, getnetworkinfo,\n\
                  \x20   getnettotals, getnodeaddresses [count] [network],\n\
                  \x20   getaddrmaninfo,\n\
@@ -6304,6 +6398,88 @@ mod tests {
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
+    }
+
+    /// `prioritisetransaction` — Core 29.4's validation order: exactly
+    /// three positional args, a collected -3 type list, ParseHashV on
+    /// the txid, getInt<int64> on fee_delta, then the zero-dummy
+    /// compatibility check. Unknown txids succeed — the delta waits in
+    /// the pool's map for admission.
+    #[test]
+    fn prioritisetransaction_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let txid = "00".repeat(32);
+
+        // Arity — fewer than 3 args or extra args → -1 + help.
+        for p in [
+            json!([]),
+            json!([txid]),
+            json!([txid, 0]),
+            json!([txid, 0, 0, 0]),
+        ] {
+            let (_, e) = dispatch("prioritisetransaction", &p, &snap, Some(&queries), None);
+            let (code, msg) = e.unwrap();
+            assert_eq!(code, RPC_MISC_ERROR, "{p}");
+            assert!(msg.starts_with("prioritisetransaction"), "{msg}");
+        }
+
+        // The type pass collects every bad position into one list.
+        let (_, e) = dispatch(
+            "prioritisetransaction",
+            &json!([7, "x", "y"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert!(msg.contains("Position 1 (txid)"), "{msg}");
+        assert!(msg.contains("Position 2 (dummy)"), "{msg}");
+        assert!(msg.contains("Position 3 (fee_delta)"), "{msg}");
+
+        // Body order: txid format → -8, then fee_delta getInt → -1,
+        // then a nonzero dummy → -8.
+        let (_, e) = dispatch(
+            "prioritisetransaction",
+            &json!(["00", 0, 100]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        let (_, e) = dispatch(
+            "prioritisetransaction",
+            &json!([txid, 0, 1.5]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (RPC_MISC_ERROR, "JSON integer out of range".to_string())
+        );
+        let (_, e) = dispatch(
+            "prioritisetransaction",
+            &json!([txid, 5, 100]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_INVALID_PARAMETER);
+        assert!(msg.contains("dummy argument"), "{msg}");
+
+        // Unknown txid, dummy 0 and dummy null → true.
+        for p in [
+            json!([txid, 0, 100]),
+            json!([txid, 0.0, -50]),
+            json!([txid, null, 100]),
+        ] {
+            let (r, e) = dispatch("prioritisetransaction", &p, &snap, Some(&queries), None);
+            assert!(e.is_none(), "{p}: {e:?}");
+            assert_eq!(r, json!(true), "{p}");
+        }
     }
 
     /// `getchaintxstats` — on the genesis-only fixture every window

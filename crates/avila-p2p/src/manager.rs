@@ -884,6 +884,25 @@ impl<S: Read + Write> PeerManager<S> {
                 let _ = peer.session.send(&reply);
             }
             SessionEvent::Message(Message::GetData(reqs)) => {
+                // A peer asking for a tx acknowledges its broadcast —
+                // Core's RemoveUnbroadcastTx on getdata.
+                for req in &reqs {
+                    let txid = match req.inv_type {
+                        crate::message::InvType::Tx | crate::message::InvType::WitnessTx => {
+                            Some(avila_consensus::hash::Txid::from_bytes(req.hash.to_bytes()))
+                        }
+                        // MSG_WTX requests name the wtxid — resolve it.
+                        crate::message::InvType::Wtx => mempool
+                            .get_wtxid(&avila_consensus::hash::Wtxid::from_bytes(
+                                req.hash.to_bytes(),
+                            ))
+                            .map(|tx| tx.txid()),
+                        _ => None,
+                    };
+                    if let Some(txid) = txid {
+                        mempool.clear_unbroadcast(&txid);
+                    }
+                }
                 for reply in PeerSync::serve_getdata(cs, Some(mempool), &reqs) {
                     if peer.session.send(&reply).is_err() {
                         break; // send budget exhausted — drop the rest

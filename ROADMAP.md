@@ -247,7 +247,14 @@ operation. Compare complete initial download and catch-up, not only local replay
       port matching Core's crypto test vectors and live digests,
       plus the coinstatsindex gate on hash_or_height; `disk_size`
       reports our serialized-size estimate where Core reports
-      LevelDB's). Outbound dialing is
+      LevelDB's), prioritisetransaction (Core's `mapDeltas` —
+      accumulating fee deltas that attach at admission, clear at
+      block connect, and persist in mempool.dat; modified fees flow
+      into getmempoolentry's four-key `fees` object, family fee
+      totals, and template ordering while template `"fee"` stays
+      base like Core — plus the unbroadcast set and the
+      depends/spentby/bip125-replaceable entry fields the RPC
+      exposes). Outbound dialing is
       asynchronous —
       `maintain_outbounds` runs `connect_timeout` on slot-bounded
       worker threads and drains results on the tick, so a book of dead

@@ -83,6 +83,9 @@ DYNAMIC_KEYS = {
     # restarts like Core's mempool.dat, so these reflect each daemon's
     # live pool.
     "size", "total_fee", "unbroadcastcount", "maxmempool",
+    # Per-node broadcast state — a tx is unbroadcast only for the node
+    # that submitted it until a peer's getdata acknowledges the inv.
+    "unbroadcast",
     # getnettotals — cumulative wire bytes and wall-clock millis are
     # per-node counters.
     "totalbytesrecv", "totalbytessent", "timemillis",
@@ -299,6 +302,22 @@ def build_calls(height):
         ("gettxoutsetinfo", [7, 5, "x"]),
         ("gettxoutsetinfo", [["none"]]),
         ("gettxoutsetinfo", ["a", "b", "c", "d"]),
+        # prioritisetransaction — exactly three positional args, the
+        # collected -3 type list, ParseHashV on the txid, getInt<int64>
+        # on fee_delta, then the zero-dummy check. Unknown txids
+        # succeed (the delta waits for admission).
+        ("prioritisetransaction", []),
+        ("prioritisetransaction", ["00" * 32]),
+        ("prioritisetransaction", ["00" * 32, 0]),
+        ("prioritisetransaction", ["00" * 32, 0, 0, 0]),
+        ("prioritisetransaction", [7, "x", "y"]),
+        ("prioritisetransaction", ["00" * 32, "x", 100]),
+        ("prioritisetransaction", ["00" * 32, 0, "x"]),
+        ("prioritisetransaction", ["00", 0, 100]),
+        ("prioritisetransaction", ["00" * 32, 0, 1.5]),
+        ("prioritisetransaction", ["00" * 32, 5, 100]),
+        ("prioritisetransaction", ["00" * 32, 0, 100]),
+        ("prioritisetransaction", ["00" * 32, 0, -50]),
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),
         ("estimatesmartfee", [6]),

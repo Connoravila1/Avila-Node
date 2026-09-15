@@ -90,9 +90,11 @@ impl Mempool {
         )
         .map_err(|e| TemplateError::Difficulty(e.to_string()))?;
 
-        // Greedy fill: fee-rate order, dependency-respecting.
+        // Greedy fill: modified-fee-rate order (base fee plus any
+        // prioritisetransaction delta — Core sorts templates by
+        // GetModifiedFee), dependency-respecting.
         let mut entries: Vec<_> = self.entries().collect();
-        entries.sort_by_key(|e| std::cmp::Reverse(e.fee * 1000 / e.vsize.max(1) as i64));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.modified_fee() * 1000 / e.vsize.max(1) as i64));
         let mut chosen: Vec<&crate::MempoolEntry> = Vec::new();
         let mut chosen_ids: HashSet<Txid> = HashSet::new();
         let mut weight = 0usize;

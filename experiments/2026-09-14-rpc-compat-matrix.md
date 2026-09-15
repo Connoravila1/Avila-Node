@@ -72,13 +72,13 @@ python3 tools/compare_rpc.py \
 
 ## Results
 
-Latest run vs **Core 29.4** at h160: 88 MATCH, 2 EXPECTED-DIFF
+Latest run vs **Core 29.4** at h161: 90 MATCH, 2 EXPECTED-DIFF
 (`getpeerinfo` per-peer field shape — our extra observability fields
 vs Core's direction-specific `addrbind`/`addrlocal`/`last_block`;
 `getrawtransaction`'s `in_active_chain` — an upstream field added
 after 29.4, verified present in Core 31.1), 0 DIFFERS, 1 CORE-ERROR
 (`gettxoutproof prove_witness` — the witness-proof wire format is a
-Knots extension Core doesn't implement), 93 BOTH-ERROR (identical
+Knots extension Core doesn't implement), 103 BOTH-ERROR (identical
 error paths). First matrix vs Knots: 46 MATCH, 2 EXPECTED-DIFF,
 3 DIFFERS — `fullrbf` was a genuine policy divergence then; the
 mempool has since been aligned to Core 29.x (below).
@@ -400,6 +400,29 @@ surfaced:
   signal killed the process outright and the address book never
   reached disk (verified live: seed → TERM → peers.dat written →
   restart → `getaddrmaninfo` shows the entry).
+- `prioritisetransaction` landed with Core's full contract: exactly
+  three positional args (`-1`+help otherwise), the collected `-3`
+  `Wrong type passed` list, then body order ParseHashV →
+  `getInt<int64>` on `fee_delta` → the zero-`dummy` compatibility
+  check (`-8`). Deltas live in `Mempool::deltas` (Core's `mapDeltas`):
+  unknown txids succeed and the pending delta attaches at admission,
+  calls accumulate with saturating add, and `on_block_connected`
+  clears the txid's slot like `ClearPrioritisation`. The deltas map
+  persists as a trailing `mempool.dat` section — verified live: a
+  `+70000`-delta entry's `fees.modified`/`ancestor`/`descendant`
+  survived a restart byte-identical to Core's. The pool gained a real
+  `m_unbroadcast_txids` equivalent for `getmempoolentry`'s
+  `unbroadcast` (marked on `sendrawtransaction`, cleared on a peer's
+  `getdata` — `MSG_WTX` resolved through the wtxid index) feeding
+  `getmempoolinfo`'s `unbroadcastcount`, and `entry_json` now matches
+  Core 29.4's field set exactly: `depends` (pooled direct parents),
+  `spentby` (direct children), `bip125-replaceable` (`IsRBFOptIn` —
+  own signal or all direct pooled parents signaling), true `weight`,
+  and the four-key `fees` object — all confirmed byte-identical on a
+  live parent+child pair, with the parent's delta propagating into
+  the child's `fees.ancestor`. Block-template ordering now sorts by
+  modified-fee rate (the reported per-tx `"fee"` stays the base fee,
+  matching Core's template output).
 - Outbound dials run on worker threads — `maintain_outbounds` queues
   `TcpStream::connect_timeout` calls (5s bound) instead of running
   them on the sync loop, and drains results back through a channel on
