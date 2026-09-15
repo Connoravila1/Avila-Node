@@ -29,13 +29,17 @@ pub fn base58check(version: u8, payload: &[u8]) -> String {
     data.extend_from_slice(payload);
     let checksum = sha256d(&data);
     data.extend_from_slice(&checksum[..4]);
+    base58_encode_raw(&data)
+}
 
+/// Raw base58 encoding of already-checksummed bytes.
+fn base58_encode_raw(data: &[u8]) -> String {
     // Count leading zero bytes — each becomes a '1'.
     let zeros = data.iter().take_while(|b| **b == 0).count();
 
     // Repeated division by 58 over the big-endian number.
     let mut digits: Vec<u8> = Vec::new();
-    let mut num = data;
+    let mut num = data.to_vec();
     while num.iter().any(|b| *b != 0) {
         let mut rem = 0u32;
         let mut next = Vec::with_capacity(num.len());
@@ -167,6 +171,53 @@ pub fn base58check_decode(s: &str) -> Option<(u8, Vec<u8>)> {
         return None;
     }
     Some((body[0], body[1..].to_vec()))
+}
+
+/// Base58Check over a caller-supplied body — same as [`base58check`]
+/// but for multi-byte version prefixes (BIP32 extended keys carry a
+/// four-byte version inside the body).
+#[must_use]
+pub fn base58check_body(body: &[u8]) -> String {
+    let mut data = body.to_vec();
+    data.extend_from_slice(&sha256d(body)[..4]);
+    base58_encode_raw(&data)
+}
+
+/// Base58Check decode returning the complete body — for payloads whose
+/// version is wider than one byte (extended keys).
+#[must_use]
+pub fn base58check_decode_body(s: &str) -> Option<Vec<u8>> {
+    let mut zeros = 0usize;
+    let mut num: Vec<u8> = Vec::new();
+    let mut seen_nonzero = false;
+    for c in s.bytes() {
+        let digit = BASE58_ALPHABET.iter().position(|&b| b == c)? as u32;
+        if !seen_nonzero && c == b'1' {
+            zeros += 1;
+            continue;
+        }
+        seen_nonzero = true;
+        let mut carry = digit;
+        for byte in num.iter_mut().rev() {
+            let acc = u32::from(*byte) * 58 + carry;
+            *byte = (acc & 0xff) as u8;
+            carry = acc >> 8;
+        }
+        while carry > 0 {
+            num.insert(0, (carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+    let mut data = vec![0u8; zeros];
+    data.extend_from_slice(&num);
+    if data.len() < 5 {
+        return None;
+    }
+    let (body, check) = data.split_at(data.len() - 4);
+    if sha256d(body)[..4] != *check {
+        return None;
+    }
+    Some(body.to_vec())
 }
 
 /// BIP173/BIP350 decode: returns `(hrp, version, program)` — the

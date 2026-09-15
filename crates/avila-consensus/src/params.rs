@@ -56,6 +56,8 @@ impl Network {
                 base58_pubkey_prefix: 0x00,
                 base58_script_prefix: 0x05,
                 base58_secret_prefix: 0x80,
+                base58_ext_pubkey_prefix: [0x04, 0x88, 0xb2, 0x1e],
+                base58_ext_secret_prefix: [0x04, 0x88, 0xad, 0xe4],
                 bech32_hrp: "bc",
                 dns_seeds: &[
                     "seed.bitcoin.sipa.be",
@@ -117,6 +119,8 @@ impl Network {
                 base58_pubkey_prefix: 0x6f,
                 base58_script_prefix: 0xc4,
                 base58_secret_prefix: 0xef,
+                base58_ext_pubkey_prefix: [0x04, 0x35, 0x87, 0xcf],
+                base58_ext_secret_prefix: [0x04, 0x35, 0x83, 0x94],
                 bech32_hrp: "tb",
                 dns_seeds: &[
                     "seed.testnet4.bitcoin.sprovoost.nl",
@@ -172,6 +176,8 @@ impl Network {
                 base58_pubkey_prefix: 0x6f,
                 base58_script_prefix: 0xc4,
                 base58_secret_prefix: 0xef,
+                base58_ext_pubkey_prefix: [0x04, 0x35, 0x87, 0xcf],
+                base58_ext_secret_prefix: [0x04, 0x35, 0x83, 0x94],
                 bech32_hrp: "tb",
                 dns_seeds: &[
                     "seed.signet.bitcoin.sprovoost.nl",
@@ -228,6 +234,8 @@ impl Network {
                 base58_pubkey_prefix: 0x6f,
                 base58_script_prefix: 0xc4,
                 base58_secret_prefix: 0xef,
+                base58_ext_pubkey_prefix: [0x04, 0x35, 0x87, 0xcf],
+                base58_ext_secret_prefix: [0x04, 0x35, 0x83, 0x94],
                 bech32_hrp: "bcrt",
                 dns_seeds: &[],
                 // Core's regtest defaults bury BIP34/65/66/CSV at height 1 and activate
@@ -369,6 +377,12 @@ pub struct Params {
     /// `base58Prefixes[SECRET_KEY]` — the version byte on WIF private
     /// keys (0x80 mainnet, 0xef elsewhere).
     pub base58_secret_prefix: u8,
+    /// `base58Prefixes[EXT_PUBLIC_KEY]` — the four version bytes on
+    /// BIP32 extended public keys (xpub / tpub).
+    pub base58_ext_pubkey_prefix: [u8; 4],
+    /// `base58Prefixes[EXT_SECRET_KEY]` — the four version bytes on
+    /// BIP32 extended private keys (xprv / tprv).
+    pub base58_ext_secret_prefix: [u8; 4],
     /// `bech32_hrp` — the human-readable part of segwit addresses
     /// (`bc`, `tb`, `tb`, `bcrt`).
     pub bech32_hrp: &'static str,

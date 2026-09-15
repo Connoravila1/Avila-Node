@@ -1081,6 +1081,10 @@ const WAITFORBLOCKHEIGHT_HELP: &str = "waitforblockheight height ( timeout )\n\n
 /// Verbatim `help waitfornewblock` text (Bitcoin Core 29.4).
 const WAITFORNEWBLOCK_HELP: &str = "waitfornewblock ( timeout )\n\nWaits for any new block and returns useful info about it.\n\nReturns the current block on timeout or exit.\n\nMake sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\n\nArguments:\n1. timeout    (numeric, optional, default=0) Time in milliseconds to wait for a response. 0 indicates no timeout.\n\nResult:\n{                    (json object)\n  \"hash\" : \"hex\",    (string) The blockhash\n  \"height\" : n       (numeric) Block height\n}\n\nExamples:\n> bitcoin-cli waitfornewblock 1000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"waitfornewblock\", \"params\": [1000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+const GETDESCRIPTORINFO_HELP: &str = "getdescriptorinfo \"descriptor\"\n\nAnalyses a descriptor.\n\nArguments:\n1. descriptor    (string, required) The descriptor.\n\nResult:\n{                                   (json object)\n  \"descriptor\" : \"str\",             (string) The descriptor in canonical form, without private keys. For a multipath descriptor, only the first will be returned.\n  \"multipath_expansion\" : [         (json array, optional) All descriptors produced by expanding multipath derivation elements. Only if the provided descriptor specifies multipath derivation elements.\n    \"str\",                          (string)\n    ...\n  ],\n  \"checksum\" : \"str\",               (string) The checksum for the input descriptor\n  \"isrange\" : true|false,           (boolean) Whether the descriptor is ranged\n  \"issolvable\" : true|false,        (boolean) Whether the descriptor is solvable\n  \"hasprivatekeys\" : true|false     (boolean) Whether the input descriptor contained at least one private key\n}\n\nExamples:\nAnalyse a descriptor\n> bitcoin-cli getdescriptorinfo \"wpkh([d34db33f/84h/0h/0h]0279be667ef9dcbbac55a06295Ce870b07029Bfcdb2dce28d959f2815b16f81798)\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getdescriptorinfo\", \"params\": [\"wpkh([d34db33f/84h/0h/0h]0279be667ef9dcbbac55a06295Ce870b07029Bfcdb2dce28d959f2815b16f81798)\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+const DERIVEADDRESSES_HELP: &str = "deriveaddresses \"descriptor\" ( range )\n\nDerives one or more addresses corresponding to an output descriptor.\nExamples of output descriptors are:\n    pkh(<pubkey>)                                     P2PKH outputs for the given pubkey\n    wpkh(<pubkey>)                                    Native segwit P2PKH outputs for the given pubkey\n    sh(multi(<n>,<pubkey>,<pubkey>,...))              P2SH-multisig outputs for the given threshold and pubkeys\n    raw(<hex script>)                                 Outputs whose output script equals the specified hex-encoded bytes\n    tr(<pubkey>,multi_a(<n>,<pubkey>,<pubkey>,...))   P2TR-multisig outputs for the given threshold and pubkeys\n\nIn the above, <pubkey> either refers to a fixed public key in hexadecimal notation, or to an xpub/xprv optionally followed by one\nor more path elements separated by \"/\", where \"h\" represents a hardened child key.\nFor more information on output descriptors, see the documentation in the doc/descriptors.md file.\n\nArguments:\n1. descriptor    (string, required) The descriptor.\n2. range         (numeric or array, optional) If a ranged descriptor is used, this specifies the end or the range (in [begin,end] notation) to derive.\n\nResult (for single derivation descriptors):\n[           (json array)\n  \"str\",    (string) the derived addresses\n  ...\n]\n\nResult (for multipath descriptors):\n[             (json array) The derived addresses for each of the multipath expansions of the descriptor, in multipath specifier order\n  [           (json array) The derived addresses for a multipath descriptor expansion\n    \"str\",    (string) the derived address\n    ...\n  ],\n  ...\n]\n\nExamples:\nFirst three native segwit receive addresses\n> bitcoin-cli deriveaddresses \"wpkh([d34db33f/84h/0h/0h]xpub6DJ2dNUysrn5Vt36jH2KLBT2i1auw1tTSSomg8PhqNiUtx8QX2SvC9nrHu81fT41fvDUnhMjEzQgXnQjKEu3oaqMSzhSrHMxyyoEAmUHQbY/0/*)#cjjspncu\" \"[0,2]\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"deriveaddresses\", \"params\": [\"wpkh([d34db33f/84h/0h/0h]xpub6DJ2dNUysrn5Vt36jH2KLBT2i1auw1tTSSomg8PhqNiUtx8QX2SvC9nrHu81fT41fvDUnhMjEzQgXnQjKEu3oaqMSzhSrHMxyyoEAmUHQbY/0/*)#cjjspncu\", \"[0,2]\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 /// Verbatim `help verifychain` text (Bitcoin Core 29.4).
 const VERIFYCHAIN_HELP: &str = "verifychain ( checklevel nblocks )\n\nVerifies blockchain database.\n\nArguments:\n1. checklevel    (numeric, optional, default=3, range=0-4) How thorough the block verification is:\n                 - level 0 reads the blocks from disk\n                 - level 1 verifies block validity\n                 - level 2 verifies undo data\n                 - level 3 checks disconnection of tip blocks\n                 - level 4 tries to reconnect the blocks\n                 - each level includes the checks of the previous levels\n2. nblocks       (numeric, optional, default=6, 0=all) The number of blocks to check.\n\nResult:\ntrue|false    (boolean) Verification finished successfully. If false, check debug.log for reason.\n\nExamples:\n> bitcoin-cli verifychain \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"verifychain\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -4296,6 +4300,187 @@ fn dispatch(
                 Ok(out)
             })
         }
+        // Core's getdescriptorinfo — parse, then report the canonical
+        // form, the input's own checksum, and the range/solvable/
+        // private-key flags. Multipath descriptors also list every
+        // expansion.
+        "getdescriptorinfo" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() != 1 {
+                return help_error(GETDESCRIPTORINFO_HELP);
+            }
+            if !arr[0].is_string() {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_list(&[(1, "descriptor", &arr[0], "string")]),
+                    )),
+                );
+            }
+            let desc_text = arr[0].as_str().unwrap_or_default().to_owned();
+            chain_query(queries, move |cs, _| {
+                let params = cs.tree().params();
+                let (descs, provider, _checksum) =
+                    match avila_consensus::descriptor::parse_descriptors(&desc_text, params, false)
+                    {
+                        Ok(v) => v,
+                        Err(e) => return Err((RPC_INVALID_ADDRESS_OR_KEY, e)),
+                    };
+                let mut result = serde_json::Map::new();
+                result.insert("descriptor".into(), json!(descs[0].to_descriptor_string()));
+                if descs.len() > 1 {
+                    result.insert(
+                        "multipath_expansion".into(),
+                        json!(
+                            descs
+                                .iter()
+                                .map(|d| d.to_descriptor_string())
+                                .collect::<Vec<_>>()
+                        ),
+                    );
+                }
+                result.insert(
+                    "checksum".into(),
+                    json!(
+                        avila_consensus::descriptor::get_descriptor_checksum(&desc_text)
+                            .unwrap_or_default()
+                    ),
+                );
+                result.insert("isrange".into(), json!(descs[0].is_range()));
+                result.insert("issolvable".into(), json!(descs[0].is_solvable()));
+                result.insert("hasprivatekeys".into(), json!(!provider.keys.is_empty()));
+                Ok(Value::Object(result))
+            })
+        }
+        // Core's deriveaddresses — the range argument is parsed before
+        // the descriptor (ParseDescriptorRange), the checksum is
+        // required, and bare-pubkey scripts inside multi-script
+        // descriptors are skipped rather than failing.
+        "deriveaddresses" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.is_empty() || arr.len() > 2 {
+                return help_error(DERIVEADDRESSES_HELP);
+            }
+            if !arr[0].is_string() {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_list(&[(1, "descriptor", &arr[0], "string")]),
+                    )),
+                );
+            }
+            let desc_text = arr[0].as_str().unwrap_or_default().to_owned();
+            let range_arg = arr.get(1).cloned();
+            chain_query(queries, move |cs, _| {
+                let params = cs.tree().params();
+                let range_err = |msg: &str| (RPC_INVALID_PARAMETER, msg.to_string());
+                let (mut lo, mut hi) = (0i64, 0i64);
+                if let Some(v) = &range_arg
+                    && !v.is_null()
+                {
+                    // ParseRange: a number means [0,n]; a two-element
+                    // numeric array means [begin,end].
+                    let pair = if v.is_number() {
+                        let Some(h) = v.as_i64() else {
+                            return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
+                        };
+                        Some((0i64, h))
+                    } else if let Some(a) = v.as_array()
+                        && a.len() == 2
+                        && a[0].is_number()
+                        && a[1].is_number()
+                    {
+                        let (Some(l), Some(h)) = (a[0].as_i64(), a[1].as_i64()) else {
+                            return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
+                        };
+                        if l > h {
+                            return Err(range_err(
+                                "Range specified as [begin,end] must not have begin after end",
+                            ));
+                        }
+                        Some((l, h))
+                    } else {
+                        None
+                    };
+                    let Some((l, h)) = pair else {
+                        return Err(range_err(
+                            "Range must be specified as end or as [begin,end]",
+                        ));
+                    };
+                    (lo, hi) = (l, h);
+                    if lo < 0 {
+                        return Err(range_err("Range should be greater or equal than 0"));
+                    }
+                    if hi >> 31 != 0 {
+                        return Err(range_err("End of range is too high"));
+                    }
+                    if hi >= lo + 1_000_000 {
+                        return Err(range_err("Range is too large"));
+                    }
+                }
+                let (descs, provider, _checksum) =
+                    match avila_consensus::descriptor::parse_descriptors(&desc_text, params, true) {
+                        Ok(v) => v,
+                        Err(e) => return Err((RPC_INVALID_ADDRESS_OR_KEY, e)),
+                    };
+                if !descs[0].is_range() && range_arg.is_some() {
+                    return Err(range_err(
+                        "Range should not be specified for an un-ranged descriptor",
+                    ));
+                }
+                if descs[0].is_range() && range_arg.is_none() {
+                    return Err(range_err("Range must be specified for a ranged descriptor"));
+                }
+                let derive = |desc: &avila_consensus::descriptor::Descriptor| {
+                    let mut addresses = Vec::new();
+                    for i in lo..=hi {
+                        let Some(scripts) = desc.expand(i as u32, &provider, params) else {
+                            return Err((
+                                RPC_INVALID_ADDRESS_OR_KEY,
+                                "Cannot derive script without private keys".to_string(),
+                            ));
+                        };
+                        for script in &scripts {
+                            let s = Script::new(script.clone());
+                            match script_address(&s, params) {
+                                Some(addr) => addresses.push(addr),
+                                None => {
+                                    // PubKey scripts have no address;
+                                    // combo() skips them, everything
+                                    // else fails.
+                                    let is_pubkey = matches!(
+                                        s.classify(),
+                                        avila_consensus::script::ScriptType::PubKey(_)
+                                    );
+                                    if !(scripts.len() > 1 && is_pubkey) {
+                                        return Err((
+                                            RPC_INVALID_ADDRESS_OR_KEY,
+                                            "Descriptor does not have a corresponding address"
+                                                .to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if addresses.is_empty() {
+                        return Err((RPC_MISC_ERROR, "Unexpected empty result".to_string()));
+                    }
+                    Ok(addresses)
+                };
+                let first = derive(&descs[0])?;
+                if descs.len() == 1 {
+                    return Ok(json!(first));
+                }
+                let mut ret = vec![json!(first)];
+                for desc in &descs[1..] {
+                    ret.push(json!(derive(desc)?));
+                }
+                Ok(json!(ret))
+            })
+        }
         "prioritisetransaction" => {
             let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
             if arr.len() != 3 {
@@ -5947,6 +6132,7 @@ fn dispatch(
                  \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>,\n\
                  \x20   createrawtransaction <inputs> <outputs> [locktime] [replaceable],\n\
                  \x20   createmultisig <nrequired> [keys] [address_type],\n\
+                 \x20   getdescriptorinfo <desc>, deriveaddresses <desc> [range],\n\
                  \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount], savemempool\n\
                  \x20 mining: getblocktemplate, getmininginfo, getnetworkhashps,\n\
                  \x20   submitblock <hex>,\n\
@@ -8583,6 +8769,148 @@ mod tests {
 
         // Empty key list hits the required-count checks, not a crash.
         assert_eq!(d(json!([1, []])).1.unwrap().0, RPC_INVALID_PARAMETER);
+    }
+
+    /// `getdescriptorinfo`/`deriveaddresses` — the descriptor parser
+    /// contract: canonical `ToString` plus `#checksum`, the collected
+    /// -3 type list, and `ParseDescriptorRange`'s error ordering.
+    /// Expected strings were read back from Core 29.4 on regtest.
+    #[test]
+    fn descriptor_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let info = |p: Value| dispatch("getdescriptorinfo", &p, &snap, Some(&queries), None, None);
+        let derive = |p: Value| dispatch("deriveaddresses", &p, &snap, Some(&queries), None, None);
+        let k = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+
+        // Arity — exactly one arg for getdescriptorinfo, 1–2 for
+        // deriveaddresses.
+        for p in [json!([]), json!(["raw(deadbeef)", "x"])] {
+            let (code, msg) = info(p.clone()).1.unwrap();
+            assert_eq!(code, RPC_MISC_ERROR, "{p}");
+            assert!(msg.starts_with("getdescriptorinfo"), "{msg}");
+        }
+        for p in [json!([]), json!(["raw(deadbeef)", 0, 0])] {
+            let (code, msg) = derive(p.clone()).1.unwrap();
+            assert_eq!(code, RPC_MISC_ERROR, "{p}");
+            assert!(msg.starts_with("deriveaddresses"), "{msg}");
+        }
+
+        // Collected -3 type list for a non-string descriptor.
+        let (code, msg) = info(json!([123])).1.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert!(msg.contains("Position 1 (descriptor)"), "{msg}");
+        let (code, msg) = derive(json!([123])).1.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert!(msg.contains("Position 1 (descriptor)"), "{msg}");
+
+        // Canonical form, checksum and flags.
+        let (r, e) = info(json!([format!("pkh({k})")]));
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(
+            r,
+            json!({
+                "descriptor": format!("pkh({k})#8fhd9pwu"),
+                "checksum": "8fhd9pwu",
+                "isrange": false,
+                "issolvable": true,
+                "hasprivatekeys": false,
+            })
+        );
+        // raw() is unsolvable; a supplied checksum is verified.
+        let (r, _) = info(json!(["raw(deadbeef)#89f8spxm"]));
+        assert_eq!(r["issolvable"], json!(false));
+        let (code, msg) = info(json!([format!("pkh({k})#xxxxxxxx")])).1.unwrap();
+        assert_eq!(
+            (code, msg.as_str()),
+            (
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "Provided checksum 'xxxxxxxx' does not match computed checksum '8fhd9pwu'"
+            )
+        );
+        let (code, msg) = info(json!([format!("bogus({k})")])).1.unwrap();
+        assert_eq!(code, RPC_INVALID_ADDRESS_OR_KEY);
+        assert!(msg.ends_with("is not a valid descriptor function"), "{msg}");
+
+        // deriveaddresses — range handling and expansion.
+        let (code, msg) = derive(json!(["raw(deadbeef)"])).1.unwrap();
+        assert_eq!(
+            (code, msg.as_str()),
+            (RPC_INVALID_ADDRESS_OR_KEY, "Missing checksum")
+        );
+        for (range, expect) in [
+            (
+                json!("bogus"),
+                "Range must be specified as end or as [begin,end]",
+            ),
+            (
+                json!([0]),
+                "Range must be specified as end or as [begin,end]",
+            ),
+            (
+                json!([0, 1, 2]),
+                "Range must be specified as end or as [begin,end]",
+            ),
+            (json!(-1), "End of range is too high"),
+            (
+                json!([2, 0]),
+                "Range specified as [begin,end] must not have begin after end",
+            ),
+            (json!(2147483648u64), "End of range is too high"),
+            (json!(1000000), "Range is too large"),
+        ] {
+            let (code, msg) = derive(json!(["raw(deadbeef)#89f8spxm", range])).1.unwrap();
+            assert_eq!(
+                (code, msg.as_str()),
+                (RPC_INVALID_PARAMETER, expect),
+                "{range:?}"
+            );
+        }
+        // Float range elements hit getInt's out-of-range throw.
+        let (code, msg) = derive(json!(["raw(deadbeef)#89f8spxm", 1.5])).1.unwrap();
+        assert_eq!(
+            (code, msg.as_str()),
+            (RPC_MISC_ERROR, "JSON integer out of range")
+        );
+        // An un-ranged descriptor refuses any supplied range — even
+        // null — while a ranged one requires it.
+        for range in [json!(0), json!([0, 2]), Value::Null] {
+            let (code, msg) = derive(json!([format!("pkh({k})#8fhd9pwu"), range]))
+                .1
+                .unwrap();
+            assert_eq!(
+                (code, msg.as_str()),
+                (
+                    RPC_INVALID_PARAMETER,
+                    "Range should not be specified for an un-ranged descriptor"
+                )
+            );
+        }
+        // A bare-pubkey script has no address; combo() skips it.
+        let (code, msg) = derive(json!([format!("pk({k})#3dt5nkzl")])).1.unwrap();
+        assert_eq!(
+            (code, msg.as_str()),
+            (
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "Descriptor does not have a corresponding address"
+            )
+        );
+        let (r, e) = derive(json!([format!("combo({k})#x7yr7hv3")]));
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(
+            r,
+            json!([
+                "mg8Jz5776UdyiYcBb9Z873NTozEiADRW5H",
+                "bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m",
+                "2N74VLxyT79VGHiBK2zEg3a9HJG7rEc5F3o"
+            ])
+        );
+        let (r, e) = derive(json!([format!("tr({k})#g74uw3rl")]));
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(
+            r,
+            json!(["bcrt1pet7ep3czdu9k4wvdlz2fp5p8x2yp7t6ttyqg2c6cmh0lgeuu9laspse7la"])
+        );
     }
 
     /// `verifymessage`/`signmessagewithprivkey` — Core's compact-sig

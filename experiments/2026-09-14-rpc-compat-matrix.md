@@ -523,6 +523,33 @@ surfaced:
   `signmessagewithprivkey` output matches Core byte-for-byte
   (compressed `I…` and uncompressed `H…` headers included). Verified
   live: 29 cases byte-identical.
+- `getdescriptorinfo`/`deriveaddresses` run on a from-scratch port
+  of Core 29.4's `script/descriptor.cpp` parser
+  (`ParseScript`/`ParsePubkey`/`ParseKeyPath`/`CheckChecksum`) plus a
+  BIP32 engine (`extended_key.rs`: Base58Check 78-byte decode,
+  CKDpriv/CKDpub, neuter, `from_seed`, HMAC-SHA512 written inline on
+  `sha2::Sha512`). Supported functions: `pk pkh wpkh combo multi
+  sortedmulti multi_a sortedmulti_a sh wsh tr addr raw rawtr`;
+  key expressions cover hex pubkeys, WIF secrets, xpub/xprv/tpub/
+  tprv (network-prefix-validated), `[fp/…]` origins, `'`-/`h`-hardened
+  steps, `*`/`*'` wildcards, and single-`<a;b>` multipath. Miniscript
+  inside `wsh()`/`tr()` trees is not yet parsed (only `pk`,
+  `multi_a`, `sortedmulti_a` leaves). `getdescriptorinfo` returns the
+  canonical neutered `descriptor`, any `multipath_expansion`, the
+  *input body's* `checksum` (not the canonical's), and Core's
+  `isrange`/`issolvable`/`hasprivatekeys` flags.
+  `deriveaddresses` ports `ParseDescriptorRange` verbatim — scalar
+  end or `[begin,end]` (`getInt<int64>` throws `-1` "JSON integer out
+  of range" on non-integral elements), `-8` for any other shape,
+  begin-after-end, the 2³¹ index cap, and the ≥1 000 000 range cap —
+  requires a `#checksum`, refuses a range on un-ranged descriptors
+  (`None`/null included), expands multipath into nested arrays, needs
+  private material for hardened wildcards, and maps bare-P2PK to
+  Core's "no corresponding address" `-5` except inside `combo()`,
+  where it is skipped. Verified live: 41 rows, all MATCH or
+  BOTH-ERROR including tpub derivation at positions 0/1, `tr()`
+  key-path and `{pk,pk}` script-tree addresses, and the
+  hardened-vs-xpub failure split.
 
 ### Known semantic differences
 

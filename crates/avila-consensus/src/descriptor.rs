@@ -1,20 +1,23 @@
-//! Output descriptors — display-layer emission plus the parse
-//! direction `generateblock`'s `output` argument needs.
+//! Output descriptors — the parser Core's `Parse` implements in
+//! `script/descriptor.cpp` plus the display-layer `InferDescriptor`
+//! direction `generateblock`/`script_desc` needs.
 //!
-//! `script_desc` mirrors what Core's `InferDescriptor` produces for a
-//! bare `scriptPubKey` (no key material available): `addr(...)` for
-//! addressable templates, `pk(...)`/`multi(...)` for bare-key scripts,
-//! `rawtr(...)` for taproot programs, `raw(...)` otherwise — each
-//! suffixed with the descriptor checksum from `doc/descriptors.md`.
-//! `output_to_script` parses the useful subset back to a
-//! `scriptPubKey`: bare addresses plus `addr`/`raw`/`pk`/`pkh`/`wpkh`/
-//! `tr` (key-path only) and `rawtr` descriptor forms. Full descriptor
-//! wallets (ranges, wildcards, nested trees) remain out of scope.
+//! The parse side is a faithful port of `ParseScript`/`ParsePubkey`/
+//! `ParseKeyPath`: all descriptor functions (`pk`, `pkh`, `wpkh`,
+//! `combo`, `multi`, `sortedmulti`, `multi_a`, `sortedmulti_a`, `sh`,
+//! `wsh`, `tr`, `addr`, `raw`, `rawtr`), key expressions (hex pubkeys,
+//! WIF secrets, xpub/xprv with `[fp/path]` origins and `path/*`
+//! ranges), and the single multipath `<a;b>` specifier whose values
+//! expand into the returned descriptor vector. Miniscript fragments
+//! inside `wsh`/`tr` are not yet parsed.
+
+use std::collections::HashMap;
 
 use crate::address::script_address;
+use crate::extended_key::ExtKey;
 use crate::hex;
 use crate::params::Params;
-use crate::script::ScriptType;
+use crate::script::{self, ScriptType};
 use crate::transaction::Script;
 
 /// The descriptor input charset — every character a descriptor body
@@ -214,6 +217,1328 @@ pub fn script_desc(script: &Script, params: &Params) -> String {
     format!("{body}#{}", descriptor_checksum(&body))
 }
 
+// ------------------------------------------------------------------
+// Descriptor parser — a faithful port of Core's `ParseScript` /
+// `ParsePubkey` / `ParseKeyPath` from `script/descriptor.cpp`.
+// ------------------------------------------------------------------
+
+/// `ParseScriptContext` — where in the tree a script expression sits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ctx {
+    Top,
+    P2sh,
+    P2wpkh,
+    P2wsh,
+    P2tr,
+}
+
+/// `DeriveType` — the wildcard form after a `/` path, if any.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Derive {
+    No,
+    Unhardened,
+    Hardened,
+}
+
+/// A parsed key expression — Core's `PubkeyProvider` hierarchy.
+#[derive(Clone, Debug)]
+pub enum Provider {
+    /// A literal pubkey (`ConstPubkeyProvider`); `xonly` strips the
+    /// leading `02`/`03` when serialized, used in taproot contexts.
+    Const { pubkey: Vec<u8>, xonly: bool },
+    /// An extended key plus its derivation path (`BIP32PubkeyProvider`).
+    Bip32 {
+        extpub: ExtKey,
+        path: Vec<u32>,
+        derive: Derive,
+        apostrophe: bool,
+    },
+    /// `[fingerprint/path]` origin metadata wrapping another provider.
+    Origin {
+        fingerprint: [u8; 4],
+        path: Vec<u32>,
+        apostrophe: bool,
+        inner: Box<Provider>,
+    },
+}
+
+/// `FlatSigningProvider` — the private material collected while
+/// parsing, used both for `hasprivatekeys` and for hardened-range
+/// derivation at `Expand` time.
+#[derive(Default, Debug)]
+pub struct FlatProvider {
+    /// `hash160(pubkey)` → secret, for WIF keys and xprv roots alike.
+    pub keys: HashMap<[u8; 20], secp256k1::SecretKey>,
+    /// `hash160(root pubkey)` → the decoded xprv (chain code needed
+    /// for private derivation beyond the root).
+    pub xprvs: HashMap<[u8; 20], ExtKey>,
+}
+
+/// A parsed descriptor — Core's `DescriptorImpl` hierarchy flattened
+/// into one enum.
+#[derive(Clone, Debug)]
+pub enum Descriptor {
+    Pk {
+        key: Provider,
+        xonly: bool,
+    },
+    Pkh {
+        key: Provider,
+    },
+    Wpkh {
+        key: Provider,
+    },
+    Combo {
+        key: Provider,
+    },
+    /// `multi`/`sortedmulti` (ECDSA) or `multi_a`/`sortedmulti_a`
+    /// (tapscript) — distinguished by `checksig_add`.
+    Multi {
+        threshold: u32,
+        keys: Vec<Provider>,
+        sorted: bool,
+        checksig_add: bool,
+    },
+    Sh(Box<Descriptor>),
+    Wsh(Box<Descriptor>),
+    Tr {
+        internal: Provider,
+        subs: Vec<Descriptor>,
+        depths: Vec<usize>,
+    },
+    RawTr {
+        key: Provider,
+    },
+    /// `addr(...)` — stores the canonical re-encoded destination.
+    Addr {
+        dest: String,
+        script: Script,
+    },
+    Raw {
+        script: Vec<u8>,
+    },
+}
+
+const HARDENED: u32 = 0x8000_0000;
+const MAX_PUBKEYS_PER_MULTISIG: usize = 20;
+const MAX_PUBKEYS_PER_MULTI_A: usize = 999;
+const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
+const TAPROOT_CONTROL_MAX_NODE_COUNT: usize = 128;
+const TAPROOT_LEAF_TAPSCRIPT: u8 = 0xc0;
+
+// ---- script/parsing.cpp primitives ------------------------------
+
+/// `script::Const` — consume `s` if it prefixes `sp`.
+fn parse_const(s: &str, sp: &mut &[u8]) -> bool {
+    if sp.len() >= s.len() && &sp[..s.len()] == s.as_bytes() {
+        *sp = &sp[s.len()..];
+        true
+    } else {
+        false
+    }
+}
+
+/// `script::Func` — `name(...)` wrapping all of `sp`; strips both
+/// the `name(` prefix and the trailing `)`.
+fn parse_func(name: &str, sp: &mut &[u8]) -> bool {
+    if sp.len() >= name.len() + 2
+        && sp[name.len()] == b'('
+        && sp[sp.len() - 1] == b')'
+        && &sp[..name.len()] == name.as_bytes()
+    {
+        *sp = &sp[name.len() + 1..sp.len() - 1];
+        true
+    } else {
+        false
+    }
+}
+
+/// `script::Expr` — consume a balanced `(`/`{` expression, stopping
+/// at a level-0 `)`, `}`, or `,`.
+fn parse_expr<'a>(sp: &mut &'a [u8]) -> &'a [u8] {
+    let mut level = 0i32;
+    let mut i = 0;
+    while i < sp.len() {
+        let c = sp[i];
+        if c == b'(' || c == b'{' {
+            level += 1;
+        } else if level > 0 && (c == b')' || c == b'}') {
+            level -= 1;
+        } else if level == 0 && (c == b')' || c == b'}' || c == b',') {
+            break;
+        }
+        i += 1;
+    }
+    let (expr, rest) = sp.split_at(i);
+    *sp = rest;
+    expr
+}
+
+fn to_str(sp: &[u8]) -> String {
+    String::from_utf8_lossy(sp).into_owned()
+}
+
+fn split(sp: &[u8], sep: u8) -> Vec<&[u8]> {
+    sp.split(|&b| b == sep).collect()
+}
+
+/// `IsHex` — nonempty, even-length hex digits.
+fn is_hex(text: &str) -> bool {
+    !text.is_empty() && text.len().is_multiple_of(2) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+// ---- key path parsing (ParseKeyPath / ParseKeyPathNum) ----------
+
+fn parse_key_path_num(elem: &[u8], apostrophe: &mut bool, error: &mut String) -> Option<u32> {
+    let mut elem = elem;
+    let mut hardened = false;
+    if let Some(&last) = elem.last()
+        && (last == b'\'' || last == b'h')
+    {
+        elem = &elem[..elem.len() - 1];
+        hardened = true;
+        *apostrophe = last == b'\'';
+    }
+    let text = to_str(elem);
+    let p: u32 = match text.parse() {
+        Ok(p) if !text.starts_with('-') && !text.starts_with('+') => p,
+        _ => {
+            *error = format!("Key path value '{text}' is not a valid uint32");
+            return None;
+        }
+    };
+    if p > 0x7FFF_FFFF {
+        *error = format!("Key path value {p} is out of range");
+        return None;
+    }
+    Some(p | (u32::from(hardened) << 31))
+}
+
+/// `ParseKeyPath` — `split` is the `/`-split elements where element 0
+/// is the key itself and is ignored. With `allow_multipath`, a single
+/// `<a;b;…>` segment expands into one path per value.
+fn parse_key_path(
+    split_elems: &[&[u8]],
+    out: &mut Vec<Vec<u32>>,
+    apostrophe: &mut bool,
+    error: &mut String,
+    allow_multipath: bool,
+) -> bool {
+    let mut path = Vec::new();
+    let mut multipath_index = None;
+    let mut multipath_values = Vec::new();
+    let mut seen_multipath = Vec::new();
+
+    for elem in &split_elems[1..] {
+        if elem.first() == Some(&b'<') && elem.last() == Some(&b'>') {
+            if !allow_multipath {
+                *error = format!(
+                    "Key path value '{}' specifies multipath in a section where multipath is not allowed",
+                    to_str(elem)
+                );
+                return false;
+            }
+            if multipath_index.is_some() {
+                *error = "Multiple multipath key path specifiers found".to_string();
+                return false;
+            }
+            let nums = split(&elem[1..elem.len() - 1], b';');
+            if nums.len() < 2 {
+                *error = "Multipath key path specifiers must have at least two items".to_string();
+                return false;
+            }
+            for num in nums {
+                let Some(op_num) = parse_key_path_num(num, apostrophe, error) else {
+                    return false;
+                };
+                if seen_multipath.contains(&op_num) {
+                    *error = format!("Duplicated key path value {op_num} in multipath specifier");
+                    return false;
+                }
+                seen_multipath.push(op_num);
+                multipath_values.push(op_num);
+            }
+            path.push(0u32);
+            multipath_index = Some(path.len() - 1);
+        } else {
+            let Some(op_num) = parse_key_path_num(elem, apostrophe, error) else {
+                return false;
+            };
+            path.push(op_num);
+        }
+    }
+
+    match multipath_index {
+        None => out.push(path),
+        Some(idx) => {
+            for value in multipath_values {
+                let mut branch = path.clone();
+                branch[idx] = value;
+                out.push(branch);
+            }
+        }
+    }
+    true
+}
+
+// ---- pubkey provider parsing (ParsePubkey / ParsePubkeyInner) ---
+
+/// `CPubKey::IsValid` structural check — 33-byte `02`/`03` or
+/// 65-byte `04`/`06`/`07`.
+fn pubkey_structural(bytes: &[u8]) -> bool {
+    matches!(
+        (bytes.len(), bytes.first()),
+        (33, Some(0x02 | 0x03)) | (65, Some(0x04 | 0x06 | 0x07))
+    )
+}
+
+fn key_id_of(pubkey: &[u8]) -> [u8; 20] {
+    crate::hash::hash160(pubkey)
+}
+
+fn parse_pubkey_inner(
+    sp: &[u8],
+    ctx: Ctx,
+    out: &mut FlatProvider,
+    apostrophe: &mut bool,
+    error: &mut String,
+    params: &Params,
+) -> Vec<Provider> {
+    let permit_uncompressed = ctx == Ctx::Top || ctx == Ctx::P2sh;
+    let elems = split(sp, b'/');
+    let key_text = to_str(elems[0]);
+    if key_text.is_empty() {
+        *error = "No key provided".to_string();
+        return Vec::new();
+    }
+    if elems.len() == 1 {
+        if is_hex(&key_text) {
+            let data = crate::hex::decode(&key_text).unwrap_or_default();
+            if pubkey_structural(&data) && data.len() == 65 && data[0] != 0x04 {
+                *error = "Hybrid public keys are not allowed".to_string();
+                return Vec::new();
+            }
+            if pubkey_is_valid(&data) {
+                if permit_uncompressed || data.len() == 33 {
+                    return vec![Provider::Const {
+                        pubkey: data,
+                        xonly: false,
+                    }];
+                }
+                *error = "Uncompressed keys are not allowed".to_string();
+                return Vec::new();
+            }
+            if data.len() == 32 && ctx == Ctx::P2tr {
+                let mut fullkey = Vec::with_capacity(33);
+                fullkey.push(0x02);
+                fullkey.extend_from_slice(&data);
+                if pubkey_is_valid(&fullkey) {
+                    return vec![Provider::Const {
+                        pubkey: fullkey,
+                        xonly: true,
+                    }];
+                }
+            }
+            *error = format!("Pubkey '{key_text}' is invalid");
+            return Vec::new();
+        }
+        if let Some((secret, compressed)) =
+            crate::message::decode_secret(&key_text, params.base58_secret_prefix)
+        {
+            if permit_uncompressed || compressed {
+                let secp = secp256k1::Secp256k1::new();
+                let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret);
+                let pubkey_bytes = if compressed {
+                    pubkey.serialize().to_vec()
+                } else {
+                    pubkey.serialize_uncompressed().to_vec()
+                };
+                out.keys.insert(key_id_of(&pubkey_bytes), secret);
+                return vec![Provider::Const {
+                    pubkey: pubkey_bytes,
+                    xonly: ctx == Ctx::P2tr,
+                }];
+            }
+            *error = "Uncompressed keys are not allowed".to_string();
+            return Vec::new();
+        }
+    }
+    let extkey = ExtKey::decode(
+        &key_text,
+        params.base58_ext_pubkey_prefix,
+        params.base58_ext_secret_prefix,
+    );
+    let Ok(extkey) = extkey else {
+        *error = format!("key '{key_text}' is not valid");
+        return Vec::new();
+    };
+    let mut elems = elems;
+    let mut derive = Derive::No;
+    if elems.last() == Some(&b"*".as_ref()) {
+        elems.pop();
+        derive = Derive::Unhardened;
+    } else if elems.last() == Some(&b"*'".as_ref()) || elems.last() == Some(&b"*h".as_ref()) {
+        *apostrophe = elems.last() == Some(&b"*'".as_ref());
+        elems.pop();
+        derive = Derive::Hardened;
+    }
+    let mut paths = Vec::new();
+    if !parse_key_path(&elems, &mut paths, apostrophe, error, true) {
+        return Vec::new();
+    }
+    let extpub = if extkey.is_private() {
+        match extkey.neuter(params.base58_ext_pubkey_prefix) {
+            Some(p) => p,
+            None => {
+                *error = format!("key '{key_text}' is not valid");
+                return Vec::new();
+            }
+        }
+    } else {
+        extkey.clone()
+    };
+    if extkey.is_private()
+        && let Some(secret) = secp256k1::SecretKey::from_slice(&extkey.key[1..]).ok()
+    {
+        let key_id = key_id_of(&extpub.key);
+        out.keys.insert(key_id, secret);
+        out.xprvs.insert(key_id, extkey);
+    }
+    paths
+        .into_iter()
+        .map(|path| Provider::Bip32 {
+            extpub: extpub.clone(),
+            path,
+            derive,
+            apostrophe: *apostrophe,
+        })
+        .collect()
+}
+
+/// `ParsePubkey` — the `[fp/path]` origin wrapper plus the inner key.
+fn parse_pubkey(
+    sp: &[u8],
+    ctx: Ctx,
+    out: &mut FlatProvider,
+    error: &mut String,
+    params: &Params,
+) -> Vec<Provider> {
+    let origin_split = split(sp, b']');
+    if origin_split.len() > 2 {
+        *error = "Multiple ']' characters found for a single pubkey".to_string();
+        return Vec::new();
+    }
+    let mut apostrophe = false;
+    if origin_split.len() == 1 {
+        return parse_pubkey_inner(origin_split[0], ctx, out, &mut apostrophe, error, params);
+    }
+    if origin_split[0].is_empty() || origin_split[0][0] != b'[' {
+        let got = if origin_split[0].is_empty() {
+            ']'
+        } else {
+            origin_split[0][0] as char
+        };
+        *error =
+            format!("Key origin start '[ character expected but not found, got '{got}' instead");
+        return Vec::new();
+    }
+    let slash_split = split(&origin_split[0][1..], b'/');
+    if slash_split[0].len() != 8 {
+        *error = format!(
+            "Fingerprint is not 4 bytes ({} characters instead of 8 characters)",
+            slash_split[0].len()
+        );
+        return Vec::new();
+    }
+    let fpr_hex = to_str(slash_split[0]);
+    if !is_hex(&fpr_hex) {
+        *error = format!("Fingerprint '{fpr_hex}' is not hex");
+        return Vec::new();
+    }
+    let fpr_bytes = crate::hex::decode(&fpr_hex).unwrap_or_default();
+    let mut fingerprint = [0u8; 4];
+    fingerprint.copy_from_slice(&fpr_bytes);
+    let mut path_out = Vec::new();
+    if !parse_key_path(&slash_split, &mut path_out, &mut apostrophe, error, false) {
+        return Vec::new();
+    }
+    let origin_path = path_out.swap_remove(0);
+    let providers = parse_pubkey_inner(origin_split[1], ctx, out, &mut apostrophe, error, params);
+    providers
+        .into_iter()
+        .map(|inner| Provider::Origin {
+            fingerprint,
+            path: origin_path.clone(),
+            apostrophe,
+            inner: Box::new(inner),
+        })
+        .collect()
+}
+
+// ---- ParseScript ------------------------------------------------
+
+fn parse_script(
+    sp: &mut &[u8],
+    ctx: Ctx,
+    out: &mut FlatProvider,
+    error: &mut String,
+    params: &Params,
+) -> Vec<Descriptor> {
+    let expr = parse_expr(sp);
+    let mut e = expr;
+
+    if parse_func("pk", &mut e) {
+        let keys = parse_pubkey(e, ctx, out, error, params);
+        if keys.is_empty() {
+            *error = format!("pk(): {error}");
+            return Vec::new();
+        }
+        return keys
+            .into_iter()
+            .map(|key| Descriptor::Pk {
+                key,
+                xonly: ctx == Ctx::P2tr,
+            })
+            .collect();
+    }
+    if matches!(ctx, Ctx::Top | Ctx::P2sh | Ctx::P2wsh) && parse_func("pkh", &mut e) {
+        let keys = parse_pubkey(e, ctx, out, error, params);
+        if keys.is_empty() {
+            *error = format!("pkh(): {error}");
+            return Vec::new();
+        }
+        return keys
+            .into_iter()
+            .map(|key| Descriptor::Pkh { key })
+            .collect();
+    }
+    if ctx == Ctx::Top && parse_func("combo", &mut e) {
+        let keys = parse_pubkey(e, ctx, out, error, params);
+        if keys.is_empty() {
+            *error = format!("combo(): {error}");
+            return Vec::new();
+        }
+        return keys
+            .into_iter()
+            .map(|key| Descriptor::Combo { key })
+            .collect();
+    } else if parse_func("combo", &mut e) {
+        *error = "Can only have combo() at top level".to_string();
+        return Vec::new();
+    }
+    let multi = parse_func("multi", &mut e);
+    let sortedmulti = !multi && parse_func("sortedmulti", &mut e);
+    let multi_a = !(multi || sortedmulti) && parse_func("multi_a", &mut e);
+    let sortedmulti_a = !(multi || sortedmulti || multi_a) && parse_func("sortedmulti_a", &mut e);
+    if (matches!(ctx, Ctx::Top | Ctx::P2sh | Ctx::P2wsh) && (multi || sortedmulti))
+        || (ctx == Ctx::P2tr && (multi_a || sortedmulti_a))
+    {
+        let threshold = parse_expr(&mut e);
+        let thres_text = to_str(threshold);
+        let Ok(thres) = thres_text.parse::<u32>() else {
+            *error = format!("Multi threshold '{thres_text}' is not valid");
+            return Vec::new();
+        };
+        let mut script_size = 0usize;
+        let mut max_len = 0usize;
+        let mut providers: Vec<Vec<Provider>> = Vec::new();
+        while !e.is_empty() {
+            if !parse_const(",", &mut e) {
+                *error = format!("Multi: expected ',', got '{}'", e[0] as char);
+                return Vec::new();
+            }
+            let arg = parse_expr(&mut e);
+            let pks = parse_pubkey(arg, ctx, out, error, params);
+            if pks.is_empty() {
+                *error = format!("Multi: {error}");
+                return Vec::new();
+            }
+            script_size += provider_size(&pks[0]) + 1;
+            max_len = max_len.max(pks.len());
+            providers.push(pks);
+        }
+        let checksig_add = multi_a || sortedmulti_a;
+        let (limit, name) = if checksig_add {
+            (MAX_PUBKEYS_PER_MULTI_A, "multi_a")
+        } else {
+            (MAX_PUBKEYS_PER_MULTISIG, "multisig")
+        };
+        if providers.is_empty() || providers.len() > limit {
+            *error = format!(
+                "Cannot have {} keys in {name}; must have between 1 and {limit} keys, inclusive",
+                providers.len()
+            );
+            return Vec::new();
+        }
+        if thres < 1 {
+            *error = format!("Multisig threshold cannot be {thres}, must be at least 1");
+            return Vec::new();
+        }
+        if thres as usize > providers.len() {
+            *error = format!(
+                "Multisig threshold cannot be larger than the number of keys; \
+                 threshold is {thres} but only {} keys specified",
+                providers.len()
+            );
+            return Vec::new();
+        }
+        if ctx == Ctx::Top && providers.len() > 3 {
+            *error = format!(
+                "Cannot have {} pubkeys in bare multisig; only at most 3 pubkeys",
+                providers.len()
+            );
+            return Vec::new();
+        }
+        if ctx == Ctx::P2sh && script_size + 3 > MAX_SCRIPT_ELEMENT_SIZE {
+            *error = format!(
+                "P2SH script is too large, {} bytes is larger than {MAX_SCRIPT_ELEMENT_SIZE} bytes",
+                script_size + 3
+            );
+            return Vec::new();
+        }
+        for vec in &mut providers {
+            if vec.len() == 1 {
+                let single = vec[0].clone();
+                for _ in 1..max_len {
+                    vec.push(single.clone());
+                }
+            } else if vec.len() != max_len {
+                *error = "multi(): Multipath derivation paths have mismatched lengths".to_string();
+                return Vec::new();
+            }
+        }
+        return (0..max_len)
+            .map(|i| Descriptor::Multi {
+                threshold: thres,
+                keys: providers.iter().map(|v| v[i].clone()).collect(),
+                sorted: sortedmulti || sortedmulti_a,
+                checksig_add,
+            })
+            .collect();
+    } else if multi || sortedmulti {
+        *error = "Can only have multi/sortedmulti at top level, in sh(), or in wsh()".to_string();
+        return Vec::new();
+    } else if multi_a || sortedmulti_a {
+        *error = "Can only have multi_a/sortedmulti_a inside tr()".to_string();
+        return Vec::new();
+    }
+    if matches!(ctx, Ctx::Top | Ctx::P2sh) && parse_func("wpkh", &mut e) {
+        let keys = parse_pubkey(e, Ctx::P2wpkh, out, error, params);
+        if keys.is_empty() {
+            *error = format!("wpkh(): {error}");
+            return Vec::new();
+        }
+        return keys
+            .into_iter()
+            .map(|key| Descriptor::Wpkh { key })
+            .collect();
+    } else if parse_func("wpkh", &mut e) {
+        *error = "Can only have wpkh() at top level or inside sh()".to_string();
+        return Vec::new();
+    }
+    if ctx == Ctx::Top && parse_func("sh", &mut e) {
+        let descs = parse_script(&mut e, Ctx::P2sh, out, error, params);
+        if descs.is_empty() || !e.is_empty() {
+            return Vec::new();
+        }
+        return descs
+            .into_iter()
+            .map(|d| Descriptor::Sh(Box::new(d)))
+            .collect();
+    } else if parse_func("sh", &mut e) {
+        *error = "Can only have sh() at top level".to_string();
+        return Vec::new();
+    }
+    if matches!(ctx, Ctx::Top | Ctx::P2sh) && parse_func("wsh", &mut e) {
+        let descs = parse_script(&mut e, Ctx::P2wsh, out, error, params);
+        if descs.is_empty() || !e.is_empty() {
+            return Vec::new();
+        }
+        return descs
+            .into_iter()
+            .map(|d| Descriptor::Wsh(Box::new(d)))
+            .collect();
+    } else if parse_func("wsh", &mut e) {
+        *error = "Can only have wsh() at top level or inside sh()".to_string();
+        return Vec::new();
+    }
+    if ctx == Ctx::Top && parse_func("addr", &mut e) {
+        let dest_text = to_str(e);
+        let Some(script) = crate::address::address_to_script(&dest_text, params) else {
+            *error = "Address is not valid".to_string();
+            return Vec::new();
+        };
+        let dest = script_address(&script, params).unwrap_or(dest_text);
+        return vec![Descriptor::Addr { dest, script }];
+    } else if parse_func("addr", &mut e) {
+        *error = "Can only have addr() at top level".to_string();
+        return Vec::new();
+    }
+    if ctx == Ctx::Top && parse_func("tr", &mut e) {
+        let arg = parse_expr(&mut e);
+        let internal = parse_pubkey(arg, Ctx::P2tr, out, error, params);
+        if internal.is_empty() {
+            *error = format!("tr(): {error}");
+            return Vec::new();
+        }
+        let mut max_len = internal.len();
+        let mut subscripts: Vec<Vec<Descriptor>> = Vec::new();
+        let mut depths: Vec<usize> = Vec::new();
+        if !e.is_empty() {
+            if !parse_const(",", &mut e) {
+                *error = format!("tr: expected ',', got '{}'", e[0] as char);
+                return Vec::new();
+            }
+            let mut branches: Vec<bool> = Vec::new();
+            loop {
+                while parse_const("{", &mut e) {
+                    branches.push(false);
+                    if branches.len() > TAPROOT_CONTROL_MAX_NODE_COUNT {
+                        *error = format!(
+                            "tr() supports at most {TAPROOT_CONTROL_MAX_NODE_COUNT} nesting levels"
+                        );
+                        return Vec::new();
+                    }
+                }
+                let sarg = parse_expr(&mut e);
+                let parsed = parse_script(&mut &sarg[..], Ctx::P2tr, out, error, params);
+                if parsed.is_empty() {
+                    return Vec::new();
+                }
+                max_len = max_len.max(parsed.len());
+                subscripts.push(parsed);
+                depths.push(branches.len());
+                while branches.last() == Some(&true) {
+                    if !parse_const("}", &mut e) {
+                        *error = "tr(): expected '}' after script expression".to_string();
+                        return Vec::new();
+                    }
+                    branches.pop();
+                }
+                if branches.last() == Some(&false) {
+                    if !parse_const(",", &mut e) {
+                        *error = "tr(): expected ',' after script expression".to_string();
+                        return Vec::new();
+                    }
+                    let last = branches.len() - 1;
+                    branches[last] = true;
+                }
+                if branches.is_empty() {
+                    break;
+                }
+            }
+            if !e.is_empty() {
+                *error = "tr(): expected ')' after script expression".to_string();
+                return Vec::new();
+            }
+        }
+        for vec in &mut subscripts {
+            if vec.len() == 1 {
+                let single = vec[0].clone();
+                for _ in 1..max_len {
+                    vec.push(single.clone());
+                }
+            } else if vec.len() != max_len {
+                *error = "tr(): Multipath subscripts have mismatched lengths".to_string();
+                return Vec::new();
+            }
+        }
+        let mut internal = internal;
+        if internal.len() > 1 && internal.len() != max_len {
+            *error =
+                "tr(): Multipath internal key mismatches multipath subscripts lengths".to_string();
+            return Vec::new();
+        }
+        while internal.len() < max_len {
+            internal.push(internal[0].clone());
+        }
+        return (0..max_len)
+            .map(|i| Descriptor::Tr {
+                internal: internal[i].clone(),
+                subs: subscripts.iter().map(|v| v[i].clone()).collect(),
+                depths: depths.clone(),
+            })
+            .collect();
+    } else if parse_func("tr", &mut e) {
+        *error = "Can only have tr at top level".to_string();
+        return Vec::new();
+    }
+    if ctx == Ctx::Top && parse_func("rawtr", &mut e) {
+        let arg = parse_expr(&mut e);
+        if !e.is_empty() {
+            *error = "rawtr(): only one key expected.".to_string();
+            return Vec::new();
+        }
+        let keys = parse_pubkey(arg, Ctx::P2tr, out, error, params);
+        if keys.is_empty() {
+            *error = format!("rawtr(): {error}");
+            return Vec::new();
+        }
+        return keys
+            .into_iter()
+            .map(|key| Descriptor::RawTr { key })
+            .collect();
+    } else if parse_func("rawtr", &mut e) {
+        *error = "Can only have rawtr at top level".to_string();
+        return Vec::new();
+    }
+    if ctx == Ctx::Top && parse_func("raw", &mut e) {
+        let text = to_str(e);
+        if !is_hex(&text) {
+            *error = "Raw script is not hex".to_string();
+            return Vec::new();
+        }
+        return vec![Descriptor::Raw {
+            script: crate::hex::decode(&text).unwrap_or_default(),
+        }];
+    } else if parse_func("raw", &mut e) {
+        *error = "Can only have raw() at top level".to_string();
+        return Vec::new();
+    }
+    if ctx == Ctx::P2sh {
+        *error = "A function is needed within P2SH".to_string();
+        return Vec::new();
+    }
+    if ctx == Ctx::P2wsh {
+        *error = "A function is needed within P2WSH".to_string();
+        return Vec::new();
+    }
+    *error = format!("'{}' is not a valid descriptor function", to_str(expr));
+    Vec::new()
+}
+
+/// The serialized pubkey size a provider produces — `GetSize`.
+fn provider_size(provider: &Provider) -> usize {
+    match provider {
+        Provider::Const { pubkey, .. } => pubkey.len(),
+        Provider::Bip32 { .. } => 33,
+        Provider::Origin { inner, .. } => provider_size(inner),
+    }
+}
+
+// ---- Parse / CheckChecksum --------------------------------------
+
+/// `CheckChecksum` — split off and verify the `#checksum` suffix.
+/// Returns `(body, computed_checksum)`.
+fn check_checksum<'a>(
+    text: &'a str,
+    require_checksum: bool,
+    error: &mut String,
+) -> Option<(&'a str, String)> {
+    let check_split: Vec<&str> = text.splitn(3, '#').collect();
+    let hash_count = text.matches('#').count();
+    if hash_count > 1 {
+        *error = "Multiple '#' symbols".to_string();
+        return None;
+    }
+    if check_split.len() == 1 && require_checksum {
+        *error = "Missing checksum".to_string();
+        return None;
+    }
+    if check_split.len() == 2 && check_split[1].len() != 8 {
+        *error = format!(
+            "Expected 8 character checksum, not {} characters",
+            check_split[1].len()
+        );
+        return None;
+    }
+    let body = check_split[0];
+    // `DescriptorChecksum` rejects characters outside INPUT_CHARSET.
+    if body.chars().any(|c| !INPUT_CHARSET.contains(c)) {
+        *error = "Invalid characters in payload".to_string();
+        return None;
+    }
+    let checksum = descriptor_checksum(body);
+    if check_split.len() == 2 && check_split[1] != checksum {
+        *error = format!(
+            "Provided checksum '{}' does not match computed checksum '{checksum}'",
+            check_split[1]
+        );
+        return None;
+    }
+    Some((body, checksum))
+}
+
+/// Core's `Parse` — a full descriptor string (optionally
+/// `#checksummed`) into one descriptor per multipath expansion plus
+/// the collected private material.
+pub fn parse_descriptors(
+    text: &str,
+    params: &Params,
+    require_checksum: bool,
+) -> Result<(Vec<Descriptor>, FlatProvider, String), String> {
+    let mut error = String::new();
+    let Some((body, checksum)) = check_checksum(text, require_checksum, &mut error) else {
+        return Err(error);
+    };
+    let mut out = FlatProvider::default();
+    let mut sp = body.as_bytes();
+    let descs = parse_script(&mut sp, Ctx::Top, &mut out, &mut error, params);
+    if sp.is_empty() && !descs.is_empty() {
+        Ok((descs, out, checksum))
+    } else {
+        Err(error)
+    }
+}
+
+/// `GetDescriptorChecksum` — the checksum of the descriptor body
+/// before any `#`, or `None` when the payload is malformed.
+#[must_use]
+pub fn get_descriptor_checksum(text: &str) -> Option<String> {
+    let mut error = String::new();
+    check_checksum(text, false, &mut error).map(|(_, c)| c)
+}
+
+// ---- canonical serialization (ToString / IsRange / IsSolvable) --
+
+fn fmt_key_path(path: &[u32], apostrophe: bool) -> String {
+    let mut out = String::new();
+    for &entry in path {
+        out.push('/');
+        out.push_str(&(entry & 0x7FFF_FFFF).to_string());
+        if entry & HARDENED != 0 {
+            out.push(if apostrophe { '\'' } else { 'h' });
+        }
+    }
+    out
+}
+
+fn provider_string(provider: &Provider) -> String {
+    match provider {
+        Provider::Const { pubkey, xonly } => {
+            let h = hex::encode(pubkey);
+            if *xonly { h[2..].to_string() } else { h }
+        }
+        Provider::Bip32 {
+            extpub,
+            path,
+            derive,
+            apostrophe,
+        } => {
+            let mut ret = extpub.encode() + &fmt_key_path(path, *apostrophe);
+            if *derive != Derive::No {
+                ret.push_str("/*");
+                if *derive == Derive::Hardened {
+                    ret.push(if *apostrophe { '\'' } else { 'h' });
+                }
+            }
+            ret
+        }
+        Provider::Origin {
+            fingerprint,
+            path,
+            apostrophe,
+            inner,
+        } => format!(
+            "[{}{}]{}",
+            hex::encode(fingerprint),
+            fmt_key_path(path, *apostrophe),
+            provider_string(inner)
+        ),
+    }
+}
+
+fn provider_is_range(provider: &Provider) -> bool {
+    match provider {
+        Provider::Const { .. } => false,
+        Provider::Bip32 { derive, .. } => *derive != Derive::No,
+        Provider::Origin { inner, .. } => provider_is_range(inner),
+    }
+}
+
+fn join_descriptors(name: &str, extra: &str, parts: &[String]) -> String {
+    let mut out = String::from(name);
+    out.push('(');
+    let mut pos = !extra.is_empty();
+    out.push_str(extra);
+    for part in parts {
+        if pos {
+            out.push(',');
+        }
+        pos = true;
+        out.push_str(part);
+    }
+    out.push(')');
+    out
+}
+
+impl Descriptor {
+    /// `Descriptor::ToString` — the canonical public form including
+    /// the `#checksum` suffix (never emits private key material).
+    #[must_use]
+    pub fn to_descriptor_string(&self) -> String {
+        let body = self.canonical_body();
+        format!("{body}#{}", descriptor_checksum(&body))
+    }
+
+    /// The canonical body without checksum — `ToStringHelper` with
+    /// `StringType::PUBLIC`.
+    #[must_use]
+    pub fn canonical_body(&self) -> String {
+        match self {
+            Descriptor::Pk { key, .. } => join_descriptors("pk", "", &[provider_string(key)]),
+            Descriptor::Pkh { key } => join_descriptors("pkh", "", &[provider_string(key)]),
+            Descriptor::Wpkh { key } => join_descriptors("wpkh", "", &[provider_string(key)]),
+            Descriptor::Combo { key } => join_descriptors("combo", "", &[provider_string(key)]),
+            Descriptor::Multi {
+                threshold,
+                keys,
+                sorted,
+                checksig_add,
+            } => {
+                let name = match (*sorted, *checksig_add) {
+                    (true, true) => "sortedmulti_a",
+                    (false, true) => "multi_a",
+                    (true, false) => "sortedmulti",
+                    (false, false) => "multi",
+                };
+                let parts: Vec<String> = keys.iter().map(provider_string).collect();
+                join_descriptors(name, &threshold.to_string(), &parts)
+            }
+            Descriptor::Sh(sub) => join_descriptors("sh", "", &[sub.canonical_body()]),
+            Descriptor::Wsh(sub) => join_descriptors("wsh", "", &[sub.canonical_body()]),
+            Descriptor::Tr {
+                internal,
+                subs,
+                depths,
+            } => {
+                let mut parts = vec![provider_string(internal)];
+                if !depths.is_empty() {
+                    let mut path: Vec<bool> = Vec::new();
+                    let mut tree = String::new();
+                    for (pos, (sub, &depth)) in subs.iter().zip(depths).enumerate() {
+                        if pos > 0 {
+                            tree.push(',');
+                        }
+                        while path.len() <= depth {
+                            if !path.is_empty() {
+                                tree.push('{');
+                            }
+                            path.push(false);
+                        }
+                        tree.push_str(&sub.canonical_body());
+                        while path.last() == Some(&true) {
+                            if path.len() > 1 {
+                                tree.push('}');
+                            }
+                            path.pop();
+                        }
+                        if let Some(last) = path.last_mut() {
+                            *last = true;
+                        }
+                    }
+                    parts.push(tree);
+                }
+                join_descriptors("tr", "", &parts)
+            }
+            Descriptor::RawTr { key } => join_descriptors("rawtr", "", &[provider_string(key)]),
+            Descriptor::Addr { dest, .. } => join_descriptors("addr", dest, &[]),
+            Descriptor::Raw { script } => join_descriptors("raw", &hex::encode(script), &[]),
+        }
+    }
+
+    /// `IsRange` — true when any contained key has a `/*` wildcard.
+    #[must_use]
+    pub fn is_range(&self) -> bool {
+        match self {
+            Descriptor::Pk { key, .. }
+            | Descriptor::Pkh { key }
+            | Descriptor::Wpkh { key }
+            | Descriptor::Combo { key }
+            | Descriptor::RawTr { key } => provider_is_range(key),
+            Descriptor::Multi { keys, .. } => keys.iter().any(provider_is_range),
+            Descriptor::Sh(sub) | Descriptor::Wsh(sub) => sub.is_range(),
+            Descriptor::Tr { internal, subs, .. } => {
+                provider_is_range(internal) || subs.iter().any(Self::is_range)
+            }
+            Descriptor::Addr { .. } | Descriptor::Raw { .. } => false,
+        }
+    }
+
+    /// `IsSolvable` — address/raw payloads carry no signing info.
+    #[must_use]
+    pub fn is_solvable(&self) -> bool {
+        match self {
+            Descriptor::Sh(sub) | Descriptor::Wsh(sub) => sub.is_solvable(),
+            Descriptor::Tr { subs, .. } => subs.iter().all(Self::is_solvable),
+            Descriptor::Addr { .. } | Descriptor::Raw { .. } => false,
+            _ => true,
+        }
+    }
+}
+
+// ---- Expand (script generation) ----------------------------------
+
+fn tagged_hash(tag: &str, msg: &[u8]) -> [u8; 32] {
+    let t = crate::hash::sha256(tag.as_bytes());
+    let mut data = Vec::with_capacity(64 + msg.len());
+    data.extend_from_slice(&t);
+    data.extend_from_slice(&t);
+    data.extend_from_slice(msg);
+    crate::hash::sha256(&data)
+}
+
+fn provider_pubkey(
+    provider: &Provider,
+    pos: u32,
+    signing: &FlatProvider,
+    params: &Params,
+) -> Option<Vec<u8>> {
+    match provider {
+        Provider::Const { pubkey, .. } => Some(pubkey.clone()),
+        Provider::Origin { inner, .. } => provider_pubkey(inner, pos, signing, params),
+        Provider::Bip32 {
+            extpub,
+            path,
+            derive,
+            ..
+        } => {
+            let hardened_any =
+                *derive == Derive::Hardened || path.iter().any(|step| step & HARDENED != 0);
+            let node = if hardened_any {
+                // Hardened steps require the root secret (Core's
+                // GetDerivedExtKey path).
+                let key_id = key_id_of(&extpub.key);
+                let mut xprv = signing.xprvs.get(&key_id)?.clone();
+                for &step in path {
+                    xprv = xprv.derive(step)?;
+                }
+                match derive {
+                    Derive::No => xprv.neuter(params.base58_ext_pubkey_prefix)?,
+                    Derive::Unhardened => {
+                        xprv.derive(pos)?.neuter(params.base58_ext_pubkey_prefix)?
+                    }
+                    Derive::Hardened => xprv
+                        .derive(pos | HARDENED)?
+                        .neuter(params.base58_ext_pubkey_prefix)?,
+                }
+            } else {
+                let mut node = extpub.clone();
+                for &step in path {
+                    node = node.derive(step)?;
+                }
+                if *derive == Derive::Unhardened {
+                    node = node.derive(pos)?;
+                }
+                node
+            };
+            Some(node.public_key()?.serialize().to_vec())
+        }
+    }
+}
+
+/// `ExpandHelper` — writes the descriptor's output scripts for
+/// position `pos` into `out`.
+fn expand_descriptor(
+    desc: &Descriptor,
+    pos: u32,
+    signing: &FlatProvider,
+    params: &Params,
+    out: &mut Vec<Vec<u8>>,
+) -> Option<()> {
+    let key = |p: &Provider| provider_pubkey(p, pos, signing, params);
+    match desc {
+        Descriptor::Pk { key: k, xonly } => {
+            let pubkey = key(k)?;
+            let mut script = if *xonly {
+                script::push_slice(&pubkey[1..])
+            } else {
+                script::push_slice(&pubkey)
+            };
+            script.push(script::OP_CHECKSIG);
+            out.push(script);
+        }
+        Descriptor::Pkh { key: k } => {
+            let h = crate::hash::hash160(&key(k)?);
+            out.push([&[0x76, 0xa9, 0x14], &h[..], &[0x88, 0xac]].concat());
+        }
+        Descriptor::Wpkh { key: k } => {
+            let h = crate::hash::hash160(&key(k)?);
+            out.push([&[script::OP_0, 0x14], &h[..]].concat());
+        }
+        Descriptor::Combo { key: k } => {
+            let pubkey = key(k)?;
+            let h = crate::hash::hash160(&pubkey);
+            out.push([script::push_slice(&pubkey), vec![script::OP_CHECKSIG]].concat());
+            out.push([&[0x76, 0xa9, 0x14], &h[..], &[0x88, 0xac]].concat());
+            if pubkey.len() == 33 {
+                let p2wpkh = [&[script::OP_0, 0x14], &h[..]].concat();
+                out.push(p2wpkh.clone());
+                let sh = crate::hash::hash160(&p2wpkh);
+                out.push([&[0xa9, 0x14], &sh[..], &[0x87]].concat());
+            }
+        }
+        Descriptor::Multi {
+            threshold,
+            keys,
+            sorted,
+            checksig_add,
+        } => {
+            let mut pubkeys: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+            for k in keys {
+                pubkeys.push(key(k)?);
+            }
+            let mut script = Vec::new();
+            if *checksig_add {
+                if *sorted {
+                    pubkeys.sort();
+                }
+                let first = &pubkeys[0];
+                let x0 = &first[first.len() - 32..];
+                script.extend_from_slice(&script::push_slice(x0));
+                script.push(script::OP_CHECKSIG);
+                for k in &pubkeys[1..] {
+                    script.extend_from_slice(&script::push_slice(&k[k.len() - 32..]));
+                    script.push(0xba); // OP_CHECKSIGADD
+                }
+                push_script_num(&mut script, *threshold);
+                script.push(0x9c); // OP_NUMEQUAL
+            } else {
+                if *sorted {
+                    pubkeys.sort();
+                }
+                push_script_num(&mut script, *threshold);
+                for k in &pubkeys {
+                    script.extend_from_slice(&script::push_slice(k));
+                }
+                push_script_num(&mut script, pubkeys.len() as u32);
+                script.push(script::OP_CHECKMULTISIG);
+            }
+            out.push(script);
+        }
+        Descriptor::Sh(sub) => {
+            let mut inner = Vec::new();
+            expand_descriptor(sub, pos, signing, params, &mut inner)?;
+            for s in inner {
+                let h = crate::hash::hash160(&s);
+                out.push([&[0xa9, 0x14], &h[..], &[0x87]].concat());
+            }
+        }
+        Descriptor::Wsh(sub) => {
+            let mut inner = Vec::new();
+            expand_descriptor(sub, pos, signing, params, &mut inner)?;
+            for s in inner {
+                let h = crate::hash::sha256(&s);
+                out.push([&[script::OP_0, 0x20], &h[..]].concat());
+            }
+        }
+        Descriptor::Tr {
+            internal,
+            subs,
+            depths,
+        } => {
+            let pubkey = key(internal)?;
+            let xonly = &pubkey[pubkey.len() - 32..];
+            let output = if subs.is_empty() {
+                taproot_output_key(xonly)?
+            } else {
+                let mut scripts = Vec::with_capacity(subs.len());
+                for sub in subs {
+                    let mut s = Vec::new();
+                    expand_descriptor(sub, pos, signing, params, &mut s)?;
+                    if s.len() != 1 {
+                        return None;
+                    }
+                    scripts.push(s.swap_remove(0));
+                }
+                let root = taproot_merkle_root(&scripts, depths)?;
+                let mut msg = Vec::with_capacity(64);
+                msg.extend_from_slice(xonly);
+                msg.extend_from_slice(&root);
+                let tweak_hash = tagged_hash("TapTweak", &msg);
+                let internal_key = secp256k1::XOnlyPublicKey::from_slice(xonly).ok()?;
+                let tweak = secp256k1::Scalar::from_be_bytes(tweak_hash).ok()?;
+                let secp = secp256k1::Secp256k1::verification_only();
+                let (output_key, _) = internal_key.add_tweak(&secp, &tweak).ok()?;
+                output_key.serialize()
+            };
+            let mut script = vec![script::OP_1];
+            script.extend_from_slice(&script::push_slice(&output));
+            out.push(script);
+        }
+        Descriptor::RawTr { key: k } => {
+            let pubkey = key(k)?;
+            let xonly = &pubkey[pubkey.len() - 32..];
+            let mut script = vec![script::OP_1];
+            script.extend_from_slice(&script::push_slice(xonly));
+            out.push(script);
+        }
+        Descriptor::Addr { script, .. } => {
+            out.push(script.as_bytes().to_vec());
+        }
+        Descriptor::Raw { script } => {
+            out.push(script.clone());
+        }
+    }
+    Some(())
+}
+
+/// CScript's `<< int64_t` — script-number encoding for small ints
+/// (thresholds stay under `OP_16`; larger values use minimal-push
+/// signed serialization).
+fn push_script_num(script: &mut Vec<u8>, n: u32) {
+    if n == 0 {
+        script.push(script::OP_0);
+    } else if n <= 16 {
+        script.push(script::OP_1 + (n as u8) - 1);
+    } else {
+        let mut value = n;
+        let mut bytes = Vec::new();
+        while value != 0 {
+            bytes.push((value & 0xff) as u8);
+            value >>= 8;
+        }
+        if bytes.last().is_some_and(|b| b & 0x80 != 0) {
+            bytes.push(0);
+        }
+        script.extend_from_slice(&script::push_slice(&bytes));
+    }
+}
+
+/// `TaprootBuilder::GetRoot` — combine the leaf TapLeaf hashes by
+/// depth into the single merkle root.
+fn taproot_merkle_root(scripts: &[Vec<u8>], depths: &[usize]) -> Option<[u8; 32]> {
+    let mut stack: Vec<(usize, [u8; 32])> = Vec::with_capacity(scripts.len());
+    for (script, &depth) in scripts.iter().zip(depths) {
+        let mut leaf = Vec::with_capacity(script.len() + 6);
+        leaf.push(TAPROOT_LEAF_TAPSCRIPT);
+        crate::encode::write_compact_size(&mut leaf, script.len() as u64);
+        leaf.extend_from_slice(script);
+        let mut node = (depth, tagged_hash("TapLeaf", &leaf));
+        while let Some(&(_, other)) = stack.last().filter(|&&(d, _)| d == node.0) {
+            stack.pop();
+            let mut branch = Vec::with_capacity(64);
+            let (a, b) = if other < node.1 {
+                (other, node.1)
+            } else {
+                (node.1, other)
+            };
+            branch.extend_from_slice(&a);
+            branch.extend_from_slice(&b);
+            node = (node.0 - 1, tagged_hash("TapBranch", &branch));
+        }
+        stack.push(node);
+    }
+    (stack.len() == 1 && stack[0].0 == 0).then_some(stack[0].1)
+}
+
+impl Descriptor {
+    /// `Expand` — the output scripts this descriptor produces for
+    /// derivation position `pos`. Fails when hardened derivation needs
+    /// private material that wasn't in the descriptor.
+    #[must_use]
+    pub fn expand(
+        &self,
+        pos: u32,
+        signing: &FlatProvider,
+        params: &Params,
+    ) -> Option<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        expand_descriptor(self, pos, signing, params, &mut out)?;
+        Some(out)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -267,5 +1592,235 @@ mod tests {
             let script = Script::new(hex::decode(script_hex).unwrap());
             assert_eq!(script_desc(&script, &params), *expected, "{script_hex}");
         }
+    }
+
+    // ---- parser tests: all vectors read back from Core 29.4's
+    // getdescriptorinfo/deriveaddresses on regtest ----
+
+    const K: &str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+    const TPUB: &str = "tpubDC7jtehYfSDGXbAgBuLKNyJBdHbyQoMX9V8oUMgfzgiL5pGrFCnv6cyoRt2dovvP3nMEaeFc2jW1aChYQpUZFdnbsaXVcc7t2WMA27AvJ4W";
+
+    fn regtest() -> Params {
+        Network::Regtest.params()
+    }
+
+    fn info(text: &str) -> Result<(String, bool, bool, bool), String> {
+        let (descs, provider, _) = parse_descriptors(text, &regtest(), false)?;
+        Ok((
+            descs[0].to_descriptor_string(),
+            descs[0].is_range(),
+            descs[0].is_solvable(),
+            !provider.keys.is_empty(),
+        ))
+    }
+
+    #[test]
+    fn canonical_forms_match_core() {
+        let cases: &[(&str, &str, bool, bool, bool)] = &[
+            // (input, canonical with checksum, isrange, issolvable, hasprivatekeys)
+            (
+                &format!("pkh({K})"),
+                &format!("pkh({K})#8fhd9pwu"),
+                false,
+                true,
+                false,
+            ),
+            (
+                &format!("pk({K})"),
+                &format!("pk({K})#3dt5nkzl"),
+                false,
+                true,
+                false,
+            ),
+            (
+                &format!("combo({K})"),
+                &format!("combo({K})#x7yr7hv3"),
+                false,
+                true,
+                false,
+            ),
+            (
+                &format!("sh(wpkh({K}))"),
+                &format!("sh(wpkh({K}))#la26f59y"),
+                false,
+                true,
+                false,
+            ),
+            (
+                "raw(deadbeef)",
+                "raw(deadbeef)#89f8spxm",
+                false,
+                false,
+                false,
+            ),
+            // Full 33-byte keys inside tr() keep their prefix byte;
+            // only the 32-byte form serializes x-only.
+            (
+                &format!("tr({K})"),
+                &format!("tr({K})#g74uw3rl"),
+                false,
+                true,
+                false,
+            ),
+            (
+                &format!("tr({K},pk({K}))"),
+                &format!("tr({K},pk({K}))#ffcw0aup"),
+                false,
+                true,
+                false,
+            ),
+            (
+                &format!("tr({K},{{pk({K}),pk({K})}})"),
+                &format!("tr({K},{{pk({K}),pk({K})}})#sm9gmmh5"),
+                false,
+                true,
+                false,
+            ),
+            (
+                &format!("sh(sortedmulti(1,{K},{K}))"),
+                &format!("sh(sortedmulti(1,{K},{K}))#75htpr3z"),
+                false,
+                true,
+                false,
+            ),
+            (
+                &format!("wsh(multi(1,{K},{K}))"),
+                &format!("wsh(multi(1,{K},{K}))#nmg09aec"),
+                false,
+                true,
+                false,
+            ),
+            (
+                &format!("wpkh({TPUB}/0/*)"),
+                &format!("wpkh({TPUB}/0/*)#f2s4pvjw"),
+                true,
+                true,
+                false,
+            ),
+            (
+                &format!("wpkh({TPUB}/0/*')"),
+                &format!("wpkh({TPUB}/0/*')#a4s4xzeg"),
+                true,
+                true,
+                false,
+            ),
+        ];
+        for (input, canonical, isrange, solvable, haspriv) in cases {
+            let (desc, r, s, h) = info(input).unwrap_or_else(|e| panic!("{input}: {e}"));
+            assert_eq!(
+                (desc.as_str(), r, s, h),
+                (*canonical, *isrange, *solvable, *haspriv),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_errors_match_core() {
+        let cases: &[(&str, &str)] = &[
+            (
+                &format!("pkh({K})#xxxxxxxx"),
+                "Provided checksum 'xxxxxxxx' does not match computed checksum '8fhd9pwu'",
+            ),
+            (
+                &format!("wpkh({K})#"),
+                "Expected 8 character checksum, not 0 characters",
+            ),
+            (
+                &format!("bogus({K})"),
+                "'bogus(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)' is not a valid descriptor function",
+            ),
+            (
+                &format!("pkh({K})extra"),
+                "'pkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)extra' is not a valid descriptor function",
+            ),
+            (
+                "addr(bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4)",
+                "Address is not valid",
+            ),
+            ("raw()", "Raw script is not hex"),
+            (
+                &format!("wpkh({})", &K[2..]),
+                "wpkh(): Pubkey 'c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5' is invalid",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = parse_descriptors(input, &regtest(), false).unwrap_err();
+            assert_eq!(err, *expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn multipath_expands() {
+        let (descs, provider, checksum) =
+            parse_descriptors(&format!("wpkh({TPUB}/<0;1>/*)"), &regtest(), false).unwrap();
+        assert_eq!(descs.len(), 2);
+        assert_eq!(
+            descs[0].to_descriptor_string(),
+            format!("wpkh({TPUB}/0/*)#f2s4pvjw")
+        );
+        assert_eq!(
+            descs[1].to_descriptor_string(),
+            format!("wpkh({TPUB}/1/*)#c745uezk")
+        );
+        // The reported checksum covers the original multipath body.
+        assert_eq!(checksum, "07eddr8t");
+        assert!(provider.keys.is_empty());
+    }
+
+    #[test]
+    fn expand_derives_core_addresses() {
+        // `deriveaddresses` equivalents — script → regtest address.
+        let to_addrs = |text: &str, lo: u32, hi: u32| -> Vec<String> {
+            let (descs, provider, _) = parse_descriptors(text, &regtest(), true).unwrap();
+            let mut out = Vec::new();
+            for i in lo..=hi {
+                for s in descs[0].expand(i, &provider, &regtest()).unwrap() {
+                    if let Some(a) = script_address(&Script::new(s), &regtest()) {
+                        out.push(a);
+                    }
+                }
+            }
+            out
+        };
+        assert_eq!(
+            to_addrs(&format!("wpkh({TPUB}/0/*)#f2s4pvjw"), 0, 1),
+            [
+                "bcrt1qk5zs82xrm4jn7dqljm00ch559h3j78l3zszwmz".to_string(),
+                "bcrt1qs3g67p7xmwv4ne28gwa35v96qq2qk487vw8y43".to_string(),
+            ]
+        );
+        assert_eq!(
+            to_addrs(&format!("tr({K})#g74uw3rl"), 0, 0),
+            ["bcrt1pet7ep3czdu9k4wvdlz2fp5p8x2yp7t6ttyqg2c6cmh0lgeuu9laspse7la".to_string()]
+        );
+        assert_eq!(
+            to_addrs(
+                &format!("tr({K},{{pk({K}),pk({})}})#tvkrlmva", &K[2..]),
+                0,
+                0
+            ),
+            ["bcrt1p9545a3sudgn65tgsjd5u2qpyfl8mxvmf3lu9s47gq49s077c7rcqwenme3".to_string()]
+        );
+        assert_eq!(
+            to_addrs(&format!("combo({K})#x7yr7hv3"), 0, 0),
+            [
+                "mg8Jz5776UdyiYcBb9Z873NTozEiADRW5H".to_string(),
+                "bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m".to_string(),
+                "2N74VLxyT79VGHiBK2zEg3a9HJG7rEc5F3o".to_string(),
+            ]
+        );
+        assert_eq!(
+            to_addrs(&format!("wsh(sortedmulti(1,{K},{K}))#6q3gsfav"), 0, 0),
+            ["bcrt1qhks8dknwck5c2jwme24akwysfw0z5c902wyzdqa53750aargwcds784rlk".to_string()]
+        );
+    }
+
+    #[test]
+    fn hardened_xpub_expand_needs_private_key() {
+        let (descs, provider, _) =
+            parse_descriptors(&format!("wpkh({TPUB}/0h/0/*)"), &regtest(), false).unwrap();
+        // `0h` in the path — public derivation alone can't do it.
+        assert!(descs[0].expand(0, &provider, &regtest()).is_none());
     }
 }

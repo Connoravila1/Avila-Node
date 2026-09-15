@@ -281,7 +281,18 @@ operation. Compare complete initial download and catch-up, not only local replay
       verifymessage/signmessagewithprivkey (compact-sig recovery on
       libsecp256k1's `recovery` feature — WIF decode, the `27+recid(+4)`
       header, strict `DecodeBase64`, and RFC6979 deterministic
-      signatures that match Core's output byte-for-byte). RPC
+      signatures that match Core's output byte-for-byte),
+      getdescriptorinfo/deriveaddresses (a from-scratch port of
+      `script/descriptor.cpp` — ParseScript/ParsePubkey/ParseKeyPath/
+      CheckChecksum — plus a BIP32 engine with inline HMAC-SHA512:
+      pk/pkh/wpkh/combo/multi/sortedmulti/multi_a/sortedmulti_a/sh/wsh/
+      tr/addr/raw/rawtr over hex keys, WIF, xpub/tpub with `[fp/…]`
+      origins, hardened `'`/`h` steps, `*`/`*'` wildcards and `<a;b>`
+      multipath; canonical neutered ToString, input-body checksums,
+      isrange/issolvable/hasprivatekeys, Core's ParseDescriptorRange
+      ordering, nested multipath output, taproot key-path and
+      script-tree expansion; miniscript inside wsh()/tr() is not yet
+      parsed). RPC
       doubles emit Core's `UniValue::setFloat` text (`%.16g` via `g16`)
       rather than ryu's shortest repr — the two parse to different
       f64s on values like 101/17, and `txrate` now matches

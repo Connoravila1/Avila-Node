@@ -70,6 +70,13 @@ SIG_C = ("IC93+OZbt0MJurMvm3NHxjW3mBdHGcrY6IlCuw2LiX9kerUXaMAMXxlM4vv6mBtD/"
 SIG_U = ("HC93+OZbt0MJurMvm3NHxjW3mBdHGcrY6IlCuw2LiX9kerUXaMAMXxlM4vv6mBtD/"
          "G81gwpyitAQp53tC0GMXx8=")
 
+# BIP32 extended-key fixtures (regtest tpub/tprv prefixes — Core
+# rejects xpub on regtest). Generated from a fixed seed.
+TPUB = ("tpubDC7jtehYfSDGXbAgBuLKNyJBdHbyQoMX9V8oUMgfzgiL5pGrFCnv6cyoRt2dovvP"
+        "3nMEaeFc2jW1aChYQpUZFdnbsaXVcc7t2WMA27AvJ4W")
+TPRV = ("tprv8ZgxMBicQKsPd2hD18Up58P5kRVCrCnpaRxRwEnq77nKVywfvGLZaaXgHwCyExc"
+        "BHJx49REoeVTUbVhZ9N54LbTB2HwnP41efBC9HKZB3UN")
+
 # Keys whose values are legitimately node- or time-specific. They are
 # still compared (structural presence is checked) but a value
 # difference is reported as expected rather than a failure.
@@ -458,6 +465,53 @@ def build_calls(height):
         ("verifymessage", [ADDR_U, SIG_C, "hi"]),
         ("verifymessage", [ADDR_C, SIG_C, "hi"]),
         ("verifymessage", [ADDR_U, SIG_U, "hi"]),
+        # getdescriptorinfo/deriveaddresses — the descriptor parser:
+        # canonical ToString + checksum, collected type errors, the
+        # ParseDescriptorRange ordering, ranged tpub derivation,
+        # multipath expansion, and the private-material gate on
+        # hardened wildcards.
+        ("getdescriptorinfo", []),
+        ("getdescriptorinfo", ["raw(deadbeef)", "x"]),
+        ("getdescriptorinfo", [123]),
+        ("getdescriptorinfo", [f"pkh({K1})"]),
+        ("getdescriptorinfo", [f"pkh({K1})#xxxxxxxx"]),
+        ("getdescriptorinfo", [f"wpkh({K1})#"]),
+        ("getdescriptorinfo", [f"bogus({K1})"]),
+        ("getdescriptorinfo", [f"combo({K1})"]),
+        ("getdescriptorinfo", [f"sh(wpkh({K1}))"]),
+        ("getdescriptorinfo", [f"sh(sortedmulti(1,{K1},{K2}))"]),
+        ("getdescriptorinfo", ["raw(deadbeef)"]),
+        ("getdescriptorinfo", ["addr(bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4)"]),
+        ("getdescriptorinfo", [f"tr({K1})"]),
+        ("getdescriptorinfo", [f"tr({K1},{{pk({K1}),pk({K1})}})"]),
+        ("getdescriptorinfo", [f"wpkh({TPUB}/0/*)"]),
+        ("getdescriptorinfo", [f"wpkh({TPUB}/<0;1>/*)"]),
+        ("getdescriptorinfo", [f"wpkh({TPUB}/0h/0/*)"]),
+        ("getdescriptorinfo", [f"wpkh({TPRV}/0h/0/*)"]),
+        ("deriveaddresses", []),
+        ("deriveaddresses", [123]),
+        ("deriveaddresses", ["raw(deadbeef)"]),
+        ("deriveaddresses", ["raw(deadbeef)#89f8spxm"]),
+        ("deriveaddresses", ["raw(deadbeef)#89f8spxm", 0]),
+        ("deriveaddresses", ["raw(deadbeef)#89f8spxm", "bogus"]),
+        ("deriveaddresses", ["raw(deadbeef)#89f8spxm", -1]),
+        ("deriveaddresses", ["raw(deadbeef)#89f8spxm", [2, 0]]),
+        ("deriveaddresses", ["raw(deadbeef)#89f8spxm", [0]]),
+        ("deriveaddresses", ["raw(deadbeef)#89f8spxm", 1.5]),
+        ("deriveaddresses", ["raw(deadbeef)#89f8spxm", 1000000]),
+        ("deriveaddresses", [f"pkh({K1})#yzlpqqfl", None]),
+        ("deriveaddresses", [f"pk({K1})#srmr50k3"]),
+        ("deriveaddresses", [f"combo({K1})#8s55ewcl"]),
+        ("deriveaddresses", [f"tr({K1})#fs9tfgh3"]),
+        ("deriveaddresses", [f"tr({K1},{{pk({K1}),pk({K1[2:]})}})#dwrj0khk"]),
+        ("deriveaddresses", [f"wsh(sortedmulti(1,{K1},{K1}))#lk5x4ape"]),
+        ("deriveaddresses", [f"wpkh({TPUB}/0/*)#f2s4pvjw", "[0,1]"]),
+        ("deriveaddresses", [f"wpkh({TPUB}/0/*)#f2s4pvjw", [0, 1]]),
+        ("deriveaddresses", [f"wpkh({TPUB}/0/*)#f2s4pvjw"]),
+        ("deriveaddresses", [f"wpkh({TPUB}/<0;1>/*)#07eddr8t", [0, 1]]),
+        ("deriveaddresses", [f"wpkh({TPUB}/0/*h)#jtytfwp7", 0]),
+        ("deriveaddresses", [f"wpkh({TPUB}/0h/0/*)#vuysp9q7", 0]),
+        ("deriveaddresses", [f"wpkh({TPRV}/0h/0/*)#dg96rhas", 0]),
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),
         ("estimatesmartfee", [6]),
