@@ -1069,6 +1069,24 @@ fn dispatch(
                 }
             })
         }
+        // Core's savemempool — writes mempool.dat under the chainstate
+        // dir and returns its path; without a store there is nowhere
+        // persistent to write, which is an honest -1 misc error.
+        "savemempool" => chain_query(queries, |_cs, mgr| {
+            let Some(store) = _cs.store() else {
+                return Err((RPC_MISC_ERROR, "no data directory configured".into()));
+            };
+            let path = store.dir().join("mempool.dat");
+            match mgr.mempool_ref().save(&path) {
+                // Core reports the absolute path of the written file.
+                Ok(_) => Ok(json!({
+                    "filename": std::fs::canonicalize(&path)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                })),
+                Err(e) => Err((RPC_MISC_ERROR, format!("save mempool: {e}"))),
+            }
+        }),
         "getpeerinfo" => chain_query(queries, |cs, mgr| {
             Ok(Value::Array(
                 mgr.peer_snapshots()
@@ -1968,7 +1986,7 @@ fn dispatch(
                  \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
                  \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
                  \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>,\n\
-                 \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount]\n\
+                 \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount], savemempool\n\
                  \x20 mining: getblocktemplate, getmininginfo, submitblock <hex>,\n\
                  \x20   submitheader <hex>, generatetoaddress <n> <address> [maxtries],\n\
                  \x20   generateblock <output> [rawtx/txid,...]\n\
@@ -2468,6 +2486,19 @@ mod tests {
 
         // Without the query channel the method reports honestly.
         let (_, e) = dispatch("sendrawtransaction", &json!(["00"]), &snap, None, None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+    }
+
+    /// `savemempool` — without a block store there is nowhere to write;
+    /// the method reports the misc error rather than fabricate a path.
+    #[test]
+    fn savemempool_reports_missing_store() {
+        let cs = Chainstate::new(&Network::Regtest.params());
+        let queries = query_server(cs);
+        let snap = snap();
+        let (_, e) = dispatch("savemempool", &Value::Null, &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+        let (_, e) = dispatch("savemempool", &Value::Null, &snap, None, None);
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 

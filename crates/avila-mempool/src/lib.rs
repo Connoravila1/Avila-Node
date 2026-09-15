@@ -948,6 +948,135 @@ impl Mempool {
             .retain(|_, e| now.saturating_sub(e.time) < ORPHAN_EXPIRE_SECS);
     }
 
+    /// `mempool.dat` file magic + version byte.
+    const MEMPOOL_FILE_MAGIC: &'static [u8; 8] = b"avmpool\x01";
+
+    /// The largest raw transaction `load` will read — consensus's
+    /// `MAX_BLOCK_WEIGHT` bounds any single tx's serialized length;
+    /// a bigger recorded length is file corruption, not a real entry.
+    const MAX_TX_BYTES: usize = 4_000_000;
+
+    /// Writes every pooled entry to `path` — Core's `DumpMempool` /
+    /// `mempool.dat`. Each record is `tx || time || first_seen_height`
+    /// (fees recompute at re-admission, so they needn't be stored).
+    /// Returns the number of entries written.
+    ///
+    /// # Errors
+    ///
+    /// `io::Error` on write failure — the file is replaced, not
+    /// merged, so a partial write leaves a truncated file `load`
+    /// reports as fewer entries, never a corrupt state.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        use std::io::Write;
+        let entries: Vec<&MempoolEntry> = self.map.values().collect();
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(Self::MEMPOOL_FILE_MAGIC)?;
+        f.write_all(&(entries.len() as u32).to_le_bytes())?;
+        for e in &entries {
+            let bytes = e.tx.encode();
+            f.write_all(&(bytes.len() as u32).to_le_bytes())?;
+            f.write_all(&bytes)?;
+            f.write_all(&e.time.to_le_bytes())?;
+            f.write_all(&e.first_seen_height.to_le_bytes())?;
+        }
+        Ok(entries.len())
+    }
+
+    /// Reads `path` and re-runs every entry through [`Self::accept_tx`]
+    /// — Core's `LoadMempool`: a tx that fails admission (inputs spent
+    /// by a newer tip, aged policy, decode failure) is skipped, not an
+    /// error. Entries re-enter in passes until one adds nothing, so a
+    /// file listing a child before its parent still resolves. Original
+    /// `time`/`first_seen_height` are restored onto accepted entries so
+    /// the fee estimator keeps its samples.
+    ///
+    /// Returns `(imported, skipped)`.
+    ///
+    /// # Errors
+    ///
+    /// `io::Error` on read failure or a malformed header — a missing
+    /// file is `Ok((0, 0))`, matching Core's first-run behavior.
+    pub fn load(
+        &mut self,
+        path: &std::path::Path,
+        cs: &avila_consensus::chainstate::Chainstate,
+        now: u32,
+    ) -> std::io::Result<(usize, usize)> {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        match std::fs::File::open(path).and_then(|mut f| f.read_to_end(&mut buf)) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+            Err(e) => return Err(e),
+        }
+        if buf.len() < Self::MEMPOOL_FILE_MAGIC.len() + 4 || buf[..8] != *Self::MEMPOOL_FILE_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mempool.dat: bad magic",
+            ));
+        }
+        let count = u32::from_le_bytes(buf[8..12].try_into().unwrap_or_default()) as usize;
+        let mut cursor = 12usize;
+        let mut pending: Vec<(Transaction, u32, u32)> = Vec::with_capacity(count.min(65_536));
+        for _ in 0..count {
+            if cursor + 4 > buf.len() {
+                break; // truncated tail — import what decoded
+            }
+            let tx_len =
+                u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap_or_default()) as usize;
+            cursor += 4;
+            if tx_len > Self::MAX_TX_BYTES || cursor + tx_len + 8 > buf.len() {
+                break;
+            }
+            let raw = &buf[cursor..cursor + tx_len];
+            cursor += tx_len;
+            let time = u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap_or_default());
+            let height =
+                u32::from_le_bytes(buf[cursor + 4..cursor + 8].try_into().unwrap_or_default());
+            cursor += 8;
+            if let Ok(tx) = Transaction::decode(raw) {
+                pending.push((tx, time, height));
+            }
+        }
+        let decoded = pending.len();
+        // Admission re-runs until a pass accepts nothing new. A child
+        // listed before its parent parks as an orphan on its first pass,
+        // then the parent's own accept_tx recursion un-parks it — so
+        // "imported" is everything that left the pending queue, whether
+        // this loop accepted it or the parent's orphan sweep did.
+        loop {
+            let mut progress = false;
+            pending.retain(|(tx, time, height)| {
+                match self.accept_tx(tx.clone(), cs, now) {
+                    Ok(txid) => {
+                        if let Some(e) = self.map.get_mut(&txid) {
+                            e.time = *time;
+                            e.first_seen_height = *height;
+                        }
+                        progress = true;
+                        false
+                    }
+                    // Already pooled — possibly just orphan-swept by a
+                    // parent's accept; restore its stored timestamps.
+                    Err(MempoolReject::AlreadyKnown) => {
+                        if let Some(e) = self.map.get_mut(&tx.txid()) {
+                            e.time = *time;
+                            e.first_seen_height = *height;
+                        }
+                        false
+                    }
+                    // Inputs may resolve once a later-file parent lands.
+                    Err(MempoolReject::InputsMissingOrSpent) => true,
+                    Err(_) => false,
+                }
+            });
+            if !progress {
+                break;
+            }
+        }
+        Ok((decoded - pending.len(), pending.len()))
+    }
+
     /// Every pooled entry — template.rs iterates these.
     pub(crate) fn entries(&self) -> impl Iterator<Item = &MempoolEntry> {
         self.map.values()
@@ -1542,6 +1671,102 @@ mod tests {
             .collect();
         assert_eq!(order.len(), 2);
         assert_eq!(order[0], pid, "parent must precede its child");
+    }
+
+    #[test]
+    fn mempool_persists_round_trip() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let pid = parent.txid();
+        let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 4_998_000_000, SEQ_FINAL);
+        pool.accept_tx(parent, &cs, NOW).unwrap();
+        pool.accept_tx(child, &cs, NOW).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("avila-mp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mempool.dat");
+        assert_eq!(pool.save(&path).unwrap(), 2);
+
+        let mut fresh = Mempool::new();
+        let (imported, skipped) = fresh.load(&path, &cs, NOW + 60).unwrap();
+        assert_eq!((imported, skipped), (2, 0));
+        assert!(fresh.has_entry(&pid));
+        // Original acceptance time is restored, not the load time.
+        assert_eq!(fresh.entry(&pid).unwrap().time, NOW);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn mempool_load_resolves_parent_after_child() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let pid = parent.txid();
+        let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 4_998_000_000, SEQ_FINAL);
+        pool.accept_tx(parent.clone(), &cs, NOW).unwrap();
+        pool.accept_tx(child.clone(), &cs, NOW).unwrap();
+
+        // Hand-write the file child-first so the parent's record trails.
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("avila-mpr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mempool.dat");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"avmpool\x01").unwrap();
+        f.write_all(&2u32.to_le_bytes()).unwrap();
+        for tx in [&child, &parent] {
+            let b = tx.encode();
+            f.write_all(&(b.len() as u32).to_le_bytes()).unwrap();
+            f.write_all(&b).unwrap();
+            f.write_all(&NOW.to_le_bytes()).unwrap();
+            f.write_all(&1u32.to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        let mut fresh = Mempool::new();
+        let (imported, skipped) = fresh.load(&path, &cs, NOW).unwrap();
+        assert_eq!((imported, skipped), (2, 0), "passes resolve ordering");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn mempool_load_skips_spent_and_truncated() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        pool.accept_tx(tx.clone(), &cs, NOW).unwrap();
+        let dir = std::env::temp_dir().join(format!("avila-mps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mempool.dat");
+        pool.save(&path).unwrap();
+
+        // The spend confirms — the persisted tx's input is now spent.
+        let mut block = block_on(&blocks[100].header, 102, &Network::Regtest.params());
+        block.transactions.push(tx);
+        let (root, _) = block.merkle_root();
+        block.header.merkle_root = root;
+        while pow::check_proof_of_work(&block.block_hash(), block.header.bits, cs.tree().params())
+            .is_err()
+        {
+            block.header.nonce += 1;
+        }
+        let mut cs2 = cs;
+        cs2.accept_block(&block, NOW + 200).unwrap();
+
+        let mut fresh = Mempool::new();
+        let (imported, skipped) = fresh.load(&path, &cs2, NOW + 300).unwrap();
+        assert_eq!((imported, skipped), (0, 1), "spent input → skipped");
+
+        // A truncated file imports what decoded without erroring.
+        let raw = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &raw[..raw.len() - 3]).unwrap();
+        let (imported, skipped) = fresh.load(&path, &cs2, NOW + 300).unwrap();
+        assert_eq!((imported, skipped), (0, 0));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

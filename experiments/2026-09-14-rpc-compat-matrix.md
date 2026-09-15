@@ -55,7 +55,10 @@ ships mempoolfullrbf semantics. One AVILA-ERROR (`estimatesmartfee` —
 honest "insufficient data" on a fresh chain with no confirmation
 samples; Knots returned its fallback). `sendrawtransaction` error
 paths match: `-22` decode failures, `-26`/`bad-cb-length` consensus
-rejects. One BOTH-ERROR (`getrawtransaction` — neither side indexes
+rejects. `savemempool` matches (`{"filename": <abs path>}`) and the
+pool survives restart: `mempool.dat` is written on shutdown, entries
+re-admit through full policy on start, spent-input entries are
+skipped. One BOTH-ERROR (`getrawtransaction` — neither side indexes
 arbitrary txids).
 
 `sendrawtransaction` was also verified live end-to-end (outside the

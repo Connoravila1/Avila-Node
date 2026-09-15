@@ -30,7 +30,9 @@ import urllib.error
 # text or counters — so any value difference is expected.
 # `getrawmempool` (unverbose) reports pool membership itself — content
 # differences are per-node state, not incompatibility.
-DYNAMIC_METHODS = {"uptime", "help", "getrawmempool"}
+# `savemempool` reports each daemon's own datadir path — presence is
+# checked, the path value itself is per-installation.
+DYNAMIC_METHODS = {"uptime", "help", "getrawmempool", "savemempool"}
 
 # Keys whose values are legitimately node- or time-specific. They are
 # still compared (structural presence is checked) but a value
@@ -109,6 +111,7 @@ def build_calls(height):
         ("uptime", []),
         ("getpeerinfo", []),
         ("getorphantxs", []),
+        ("savemempool", []),
         ("help", []),
         ("stop-token-check", None),  # placeholder, never called
     ]

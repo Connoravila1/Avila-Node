@@ -176,8 +176,12 @@ operation. Compare complete initial download and catch-up, not only local replay
       getblocktemplate built from live chainstate + pool,
       getmininginfo, getnetworkinfo, getconnectioncount, stop,
       sendrawtransaction, submitblock, submitheader,
-      generatetoaddress, generateblock) — verified live over curl and
-      the client. `run --txindex` maintains Core's txid→block index
+      generatetoaddress, generateblock, savemempool) — verified live
+      over curl and the client. The pool survives clean restarts like
+      Core's mempool.dat: saved on shutdown (and via savemempool),
+      re-admitted through full policy on start — entries whose inputs
+      a newer tip spent are skipped, not fatal. `run --txindex`
+      maintains Core's txid→block index
       (`txindex.dat` append log, resumable backfill, entries survive
       reorgs); `getrawtransaction` resolves bare txids through it and
       reports `in_active_chain`. Wallet functionality remains open.

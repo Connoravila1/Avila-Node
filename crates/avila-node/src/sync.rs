@@ -167,6 +167,16 @@ pub fn run(
     // costs us gossip history, so load errors are ignored by design.
     if let Some(dir) = &cfg.data_dir {
         let _ = mgr.addrbook().load(&dir.join("peers.dat"), unix_now());
+        // mempool.dat — Core's LoadMempool: entries re-run full
+        // admission against the resumed chainstate; what fails is
+        // skipped, not fatal.
+        if let Ok((imported, skipped)) =
+            mgr.mempool()
+                .load(&dir.join("mempool.dat"), &cs, unix_now())
+            && imported + skipped > 0
+        {
+            eprintln!("mempool.dat: imported {imported}, skipped {skipped}");
+        }
     }
     let seeded = mgr.seed_from_dns(params, unix_now());
     let mut dialed = 0usize;
@@ -278,6 +288,9 @@ pub fn run(
             cs.prune(keep).map_err(SyncError::Store)?;
         }
         mgr.addrbook().save(&dir.join("peers.dat"))?;
+        // mempool.dat — Core's DumpMempool at shutdown. A failed write
+        // must not fail the shutdown: the chainstate is already flushed.
+        let _ = mgr.mempool_ref().save(&dir.join("mempool.dat"));
     }
 
     Ok(SyncReport {
