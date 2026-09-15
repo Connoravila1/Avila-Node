@@ -61,6 +61,9 @@ DYNAMIC_KEYS = {
     "bip152_hb_to", "permissions", "addr_relay_enabled", "addrfee_enabled",
     "transport_protocol_type", "session_id", "relaytxes", "minfeefilter",
     "services", "servicesnames", "feerate", "estimates", "headers",
+    # estimatesmartfee's "blocks" — how much fee history the node's
+    # mempool has accumulated; pool-state-dependent.
+    "blocks",
     "commit", "target",
     # Pool-content dependent — diverge whenever the two mempools differ.
     "transactions", "coinbasevalue", "default_witness_commitment",
@@ -133,6 +136,25 @@ def build_calls(height):
         ("gettxspendingprevout", [[{"vout": 0}]]),
         ("gettxspendingprevout", [[]]),
         ("getindexinfo", []),
+        # gettxoutproof/verifytxoutproof: named-block proofs are
+        # byte-identical across implementations; PROOF/WITPROOF are the
+        # reference daemon's proofs for the shared-height block. The
+        # no-blockhash call resolves through each node's own UTXO set.
+        ("gettxoutproof", [["TXID"], "HASH"]),
+        ("gettxoutproof", [["TXID"], "HASH", {"prove_witness": True}]),
+        ("gettxoutproof", [["TXID"]]),
+        ("gettxoutproof", [[]]),
+        ("gettxoutproof", ["TXID"]),
+        ("gettxoutproof", [["TXID"], "0" * 64]),
+        ("gettxoutproof", [["TXID", "TXID"], "HASH"]),
+        ("gettxoutproof", [["TXID"], "HASH", {"prove_witness": 1}]),
+        ("verifytxoutproof", ["PROOF"]),
+        ("verifytxoutproof", ["WITPROOF", {"verify_witness": True}]),
+        ("verifytxoutproof", ["WITPROOF"]),
+        ("verifytxoutproof", ["PROOF", {"verify_witness": True}]),
+        ("verifytxoutproof", ["00"]),
+        ("verifytxoutproof", ["zz"]),
+        ("verifytxoutproof", [123]),
         # decodescript: one call per standard template family — the
         # values below are regtest scripts exercised against Knots.
         ("decodescript", ["76a914ba602196720c6f0c47c823e106405d9b0dc71dc088ac"]),
@@ -299,6 +321,15 @@ def main():
     s, rawtx = call(args.core, auth_c, "getrawtransaction",
                     [txid, 0, core_hash]) if txid else ("err", None)
     rawtx = rawtx if s == "ok" else None
+    # Classic + witness proofs of the shared-height coinbase, generated
+    # by the reference daemon; verifytxoutproof feeds them back to both.
+    s, proof = call(args.core, auth_c, "gettxoutproof",
+                    [[txid], core_hash]) if txid else ("err", None)
+    proof = proof if s == "ok" else None
+    s, wproof = call(args.core, auth_c, "gettxoutproof",
+                     [[txid], core_hash, {"prove_witness": True}]
+                     ) if txid else ("err", None)
+    wproof = wproof.get("proof") if s == "ok" and isinstance(wproof, dict) else None
 
     calls = build_calls(h)
     total = {"MATCH": 0, "EXPECTED-DIFF": 0, "DIFFERS": 0,
@@ -311,7 +342,8 @@ def main():
             continue
         placeholders = {"HASH": core_hash, "TXID": txid,
                         "BLOCKHEX": blockhex, "GHASH": ghash,
-                        "RAWTX": rawtx}
+                        "RAWTX": rawtx, "PROOF": proof,
+                        "WITPROOF": wproof}
 
         def resolve(v):
             if isinstance(v, str) and v in placeholders:

@@ -195,7 +195,13 @@ operation. Compare complete initial download and catch-up, not only local replay
       min_activation_height gating, StateSinceHeight, and the
       started/locked_in statistics+signalling block — plus
       getblocktemplate's vbavailable/version-bit advertisement
-      via ComputeBlockVersion)) — verified
+      via ComputeBlockVersion),
+      gettxoutproof/verifytxoutproof (BIP37 partial merkle proofs —
+      `PartialMerkleTree` ports CPartialMerkleTree's DFS build,
+      extraction, and malformation rules — plus Knots' witness
+      extension: -1/-2 versioned wire form, coinbase always proven
+      in the txid tree, wtxid tree with a null gentx leaf, and
+      witness-commitment recomputation on verify)) — verified
       live over curl and the client.
       Genesis is served even though its body is never stored:
       `Params::genesis_block` reconstructs Core's per-network

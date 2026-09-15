@@ -259,6 +259,23 @@ surfaced:
   The same machine drives `getblocktemplate`'s `vbavailable` and
   `ComputeBlockVersion` (template version `0x30000000` once testdummy
   is started, matching Knots).
+- `gettxoutproof`/`verifytxoutproof` implement BIP37 partial merkle
+  proofs (`PartialMerkleTree` in `merkle.rs`, a faithful port of
+  `CPartialMerkleTree`) plus Knots' witness-aware extension: the
+  `prove_witness` option emits the `version ‖ header ‖ txid-tree ‖
+  gentx ‖ tail` wire form where `version` is `-1` (no witness
+  commitment → `m_prove_gentx` bool tail) or `-2` (commitment → wtxid
+  partial tree with a null gentx leaf). Verification reproduces
+  Knots' full contract: gentx must be match 0 and a coinbase, the
+  witness commitment is recomputed as `sha256d(wtxid_root ‖
+  reserved)`, a null wtxid match at index 0 reports the gentx txid,
+  and proofs for headers off the active chain raise `-5` "Block not
+  found in chain". Live-verified byte-identical for classic and
+  witness proofs on 1-tx and 2-tx blocks (the 2-tx block exercises
+  the real `-2` wtxid tree), including the no-blockhash UTXO lookup,
+  every error path, mode mismatches, and tampered/truncated proofs.
+  Decoding caps allocation at what the input can contain — a
+  CompactSize count is never trusted for `with_capacity`.
 
 ### Known semantic differences
 

@@ -35,6 +35,7 @@ use avila_consensus::chain::HeaderNode;
 use avila_consensus::chainstate::Chainstate;
 use avila_consensus::check::RuleError;
 use avila_consensus::hash::{BlockHash, Txid};
+use avila_consensus::header::BlockHeader;
 use avila_consensus::hex;
 use avila_consensus::transaction::{OutPoint, Script, Transaction};
 use avila_p2p::manager::PeerManager;
@@ -270,6 +271,7 @@ const RPC_VERIFY_ERROR: i64 = -25;
 const RPC_VERIFY_REJECTED: i64 = -26;
 const RPC_METHOD_NOT_FOUND: i64 = -32601;
 const RPC_INVALID_PARAMS: i64 = -32602;
+const RPC_INTERNAL_ERROR: i64 = -32603;
 
 /// Core's `DEFAULT_MAX_RAW_TX_FEE_RATE` — `sendrawtransaction` refuses
 /// txs paying more than this unless the caller raises it (BTC/kvB).
@@ -431,6 +433,34 @@ fn wrong_type_message(position: usize, name: &str, v: &Value, expected: &str) ->
     )
 }
 
+/// The bare field/element type error — `RPCTypeCheckObj`/`RPCTypeCheck`
+/// wording without the `Position` wrapper Core adds at top level.
+fn field_type_message(v: &Value, expected: &str) -> String {
+    format!(
+        "JSON value of type {} is not of expected type {expected}",
+        json_type_name(v)
+    )
+}
+
+/// Core's `ParseHashV`: 64-char hex, else -8 with its exact wording.
+fn parse_hash_v<T>(s: &str, name: &str) -> Result<T, (i64, String)>
+where
+    T: std::str::FromStr,
+{
+    if s.len() != 64 {
+        return Err((
+            RPC_INVALID_PARAMETER,
+            format!("{name} must be of length 64 (not {}, for '{s}')", s.len()),
+        ));
+    }
+    s.parse::<T>().map_err(|_| {
+        (
+            RPC_INVALID_PARAMETER,
+            format!("{name} must be hexadecimal string (not '{s}')"),
+        )
+    })
+}
+
 /// Core throws the method's full `RPCHelpMan` text as a -1 error when
 /// required args are absent or the arg count is out of range.
 fn help_error(text: &'static str) -> (Value, Option<(i64, String)>) {
@@ -458,9 +488,16 @@ const GETNODEADDRESSES_HELP: &str = "getnodeaddresses ( count \"network\" )\n\nR
 /// Verbatim `help addpeeraddress` text (Bitcoin Core 29).
 const ADDPEERADDRESS_HELP: &str = "addpeeraddress \"address\" port ( tried )\n\nAdd the address of a potential peer to an address manager table. This RPC is for testing only.\n\nArguments:\n1. address    (string, required) The IP address of the peer\n2. port       (numeric, required) The port of the peer\n3. tried      (boolean, optional, default=false) If true, attempt to add the peer to the tried addresses table\n\nResult:\n{                            (json object)\n  \"success\" : true|false,    (boolean) whether the peer address was successfully added to the address manager table\n  \"error\" : \"str\"            (string, optional) error description, if the address could not be added\n}\n\nExamples:\n> bitcoin-cli addpeeraddress \"1.2.3.4\" 8333 true\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"addpeeraddress\", \"params\": [\"1.2.3.4\", 8333, true]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
-/// Verbatim `help getindexinfo` text (Bitcoin Core 29).
+/// Verbatim `help getdeploymentinfo` text (Knots 29.3).
 const GETDEPLOYMENTINFO_HELP: &str = "getdeploymentinfo ( \"blockhash\" )\n\nReturns an object containing various state info regarding deployments of consensus changes.\n\nArguments:\n1. blockhash    (string, optional, default=\"hash of current chain tip\") The block hash at which to query deployment state\n\nResult:\n{                                       (json object)\n  \"hash\" : \"str\",                       (string) requested block hash (or tip)\n  \"height\" : n,                         (numeric) requested block height (or tip)\n  \"deployments\" : {                     (json object)\n    \"xxxx\" : {                          (json object) name of the deployment\n      \"type\" : \"str\",                   (string) one of \"buried\", \"bip9\"\n      \"height\" : n,                     (numeric, optional) height of the first block which enforces the rules (only for \"buried\" type, or \"bip9\" type with \"active\" status)\n      \"height_end\" : n,                 (numeric, optional) height of the last block which enforces the rules (only for \"bip9\" type with \"active\" status and temporary deployments)\n      \"active\" : true|false,            (boolean) true if the rules are enforced for the mempool and the next block\n      \"bip9\" : {                        (json object, optional) status of bip9 softforks (only for \"bip9\" type)\n        \"bit\" : n,                      (numeric, optional) the bit (0-28) in the block version field used to signal this softfork (only for \"started\" and \"locked_in\" status)\n        \"start_time\" : xxx,             (numeric) the minimum median time past of a block at which the bit gains its meaning\n        \"timeout\" : xxx,                (numeric) the median time past of a block at which the deployment is considered failed if not yet locked in\n        \"min_activation_height\" : n,    (numeric) minimum height of blocks for which the rules may be enforced\n        \"max_activation_height\" : n,    (numeric, optional) height at which the deployment will unconditionally activate (absent for miner-vetoable deployments)\n        \"status\" : \"str\",               (string) status of deployment at specified block (one of \"defined\", \"started\", \"locked_in\", \"active\", \"failed\", \"expired\")\n        \"since\" : n,                    (numeric) height of the first block to which the status applies\n        \"status_next\" : \"str\",          (string) status of deployment at the next block\n        \"statistics\" : {                (json object, optional) numeric statistics about signalling for a softfork (only for \"started\" and \"locked_in\" status)\n          \"period\" : n,                 (numeric) the length in blocks of the signalling period\n          \"period_start\" : n,           (numeric) height of the first block of this signalling period\n          \"threshold\" : n,              (numeric, optional) the number of blocks with the version bit set required to activate the feature (only for \"started\" status)\n          \"elapsed\" : n,                (numeric) the number of blocks elapsed since the beginning of the current period\n          \"count\" : n,                  (numeric) the number of blocks with the version bit set in the current period\n          \"possible\" : true|false       (boolean, optional) returns false if there are not enough blocks left in this period to pass activation threshold (only for \"started\" status)\n        },\n        \"signalling\" : \"str\"            (string, optional) indicates blocks that signalled with a # and blocks that did not with a -\n      }\n    },\n    ...\n  }\n}\n\nExamples:\n> bitcoin-cli getdeploymentinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getdeploymentinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+/// Verbatim `help gettxoutproof` text (Knots 29.3 — witness-proof form).
+const GETTXOUTPROOF_HELP: &str = "gettxoutproof [\"txid\",...] ( \"blockhash\" {\"prove_witness\":bool,...} )\n\nReturns a hex-encoded proof that \"txid\" was included in a block.\n\nNOTE: By default this function only works sometimes. This is when there is an\nunspent output in the utxo for this transaction. To make it always work,\nyou need to maintain a transaction index, using the -txindex command line option or\nspecify the block in which the transaction is included manually (by blockhash).\n\nArguments:\n1. txids          (json array, required) The txids to filter\n     [\n       \"txid\",    (string) A transaction id\n       ...\n     ]\n2. blockhash      (string, optional) If specified, looks for txid in the block with this hash\n3. options        (json object, optional) Options object that can be used to pass named arguments, listed below.\n\nNamed Arguments:\nprove_witness    (boolean, optional, default=false) If true, proves the associated wtxid/hash of the specified transactions instead of txid\n\nResult (If prove_witness is false or unspecified):\n\"str\"    (string) A string that is a serialized, hex-encoded data for the proof.\n\nResult (If prove_witness is true):\n{                            (json object)\n  \"proof\" : \"str\",           (string) The produced txout proof, hex-encoded.\n  \"proven\" : {               (json object) Information about the proof.\n    \"blockhash\" : \"hex\",     (string) The block hash the proof links to\n    \"blockheight\" : n,       (numeric) The height of the block the proof links to\n    \"tx\" : [                 (json array) Information about transactions\n      {                      (json object) Information about a transaction\n        \"txid\" : \"hex\",      (string) Transaction id this is for (parameter; NOT proven by proof)\n        \"wtxid\" : \"hex\",     (string) Wtxid/hash of a transaction\n        \"blockindex\" : n     (numeric) Index of transaction in block\n      },\n      ...\n    ]\n  }\n}\n";
+
+/// Verbatim `help verifytxoutproof` text (Knots 29.3).
+const VERIFYTXOUTPROOF_HELP: &str = "verifytxoutproof \"proof\" ( {\"verify_witness\":bool,...} )\n\nVerifies that a proof points to a transaction in a block, returning the transaction it commits to\nand throwing an RPC error if the block is not in our best chain\n\nArguments:\n1. proof      (string, required) The hex-encoded proof generated by gettxoutproof\n2. options    (json object, optional) Options object that can be used to pass named arguments, listed below.\n\nNamed Arguments:\nverify_witness    (boolean, optional, default=false) If true, also verifies the associated wtxid/hash of the specified transactions (if included in proof)\n\nResult (If verify_witness is false or unspecified):\n[           (json array)\n  \"hex\",    (string) The txid(s) which the proof commits to, or empty array if the proof cannot be validated.\n  ...\n]\n\nResult (If verify_witness is true and the proof valid):\n{                                 (json object)\n  \"blockhash\" : \"hex\",            (string) The block hash this proof links to\n  \"blockheight\" : n,              (numeric) The height of the block this proof links to\n  \"confirmations\" : n,            (numeric, optional) Number of blocks (including the one with the transactions) confirming these transactions\n  \"confirmations_assumed\" : n,    (numeric, optional) The number of unverified blocks confirming these transactions (eg, in an assumed-valid UTXO set)\n  \"tx\" : [                        (json array) Information about transactions\n    {                             (json object) Information about a transaction\n      \"wtxid\" : \"hex\",            (string) Wtxid/hash of a transaction\n      \"blockindex\" : n            (numeric) Index of transaction in block\n    },\n    ...\n  ]\n}\n\nResult (If verify_witness is true and the proof invalid):\n{}    (empty JSON object)\n";
+
+/// Verbatim `help getindexinfo` text (Bitcoin Core 29).
 const GETINDEXINFO_HELP: &str = "getindexinfo ( \"index_name\" )\n\nReturns the status of one or all available indices currently running in the node.\n\nArguments:\n1. index_name    (string, optional) Filter results for an index with a specific name.\n\nResult:\n{                               (json object)\n  \"name\" : {                    (json object) The name of the index\n    \"synced\" : true|false,      (boolean) Whether the index is synced or not\n    \"best_block_height\" : n     (numeric) The block height to which the index is synced\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getindexinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> bitcoin-cli getindexinfo txindex\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": [txindex]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 fn missing_params(what: &str) -> (Value, Option<(i64, String)>) {
@@ -1858,6 +1895,470 @@ fn dispatch(
                 ))
             })
         }
+        "gettxoutproof" => {
+            // RPCHelpMan: 1–3 args; absent txids → -1 + help.
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.is_empty() || arr.len() > 3 {
+                return help_error(GETTXOUTPROOF_HELP);
+            }
+            let txids_v = match &arr[0] {
+                Value::Array(a) => a,
+                v => {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, wrong_type_message(1, "txids", v, "array"))),
+                    );
+                }
+            };
+            if txids_v.is_empty() {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_INVALID_PARAMETER,
+                        "Parameter 'txids' cannot be empty".into(),
+                    )),
+                );
+            }
+            let mut set: std::collections::BTreeSet<Txid> = Default::default();
+            for tv in txids_v {
+                let Some(s) = tv.as_str() else {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, field_type_message(tv, "string"))),
+                    );
+                };
+                let txid = match parse_hash_v::<Txid>(s, "txid") {
+                    Ok(t) => t,
+                    Err(e) => return (Value::Null, Some(e)),
+                };
+                if !set.insert(txid) {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_INVALID_PARAMETER,
+                            format!("Invalid parameter, duplicated txid: {s}"),
+                        )),
+                    );
+                }
+            }
+            let sel_hash = match arr.get(1) {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => match parse_hash_v::<BlockHash>(s, "blockhash") {
+                    Ok(h) => Some(h),
+                    Err(e) => return (Value::Null, Some(e)),
+                },
+                Some(v) => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(2, "blockhash", v, "string"),
+                        )),
+                    );
+                }
+            };
+            let prove_witness = match arr.get(2) {
+                None | Some(Value::Null) => false,
+                Some(Value::Object(o)) => match o.get("prove_witness") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(v) => {
+                        return (
+                            Value::Null,
+                            Some((RPC_TYPE_ERROR, field_type_message(v, "bool"))),
+                        );
+                    }
+                },
+                Some(v) => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(3, "options", v, "object"),
+                        )),
+                    );
+                }
+            };
+            chain_query(queries, move |cs, _| {
+                // Block selection — Core: explicit hash, else the first
+                // txid with an unspent vout 0 (AccessByTxid), else the
+                // txindex's containing block.
+                let node = if let Some(h) = sel_hash {
+                    *cs.tree()
+                        .get(&h)
+                        .ok_or((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".to_string()))?
+                } else {
+                    let mut found = None;
+                    for txid in &set {
+                        let op = OutPoint {
+                            txid: *txid,
+                            vout: 0,
+                        };
+                        if let Some(coin) = cs.utxo().get(&op)
+                            && let Some(bh) = cs.chain().get(coin.height as usize)
+                            && let Some(n) = cs.tree().get(bh)
+                        {
+                            found = Some(*n);
+                            break;
+                        }
+                    }
+                    if found.is_none()
+                        && let Some(first) = set.iter().next()
+                        && let Some(bh) = cs.find_transaction(first)
+                    {
+                        found = cs.tree().get(&bh).copied();
+                    }
+                    let Some(n) = found else {
+                        return Err((
+                            RPC_INVALID_ADDRESS_OR_KEY,
+                            "Transaction not yet in block".to_string(),
+                        ));
+                    };
+                    n
+                };
+                let hash = node.hash();
+                let Some(block) = cs.body(&hash) else {
+                    return Err((RPC_INTERNAL_ERROR, "Can't read block from disk".into()));
+                };
+                let mut found = Vec::new();
+                for (i, tx) in block.transactions.iter().enumerate() {
+                    if set.contains(&tx.txid()) {
+                        found.push((i, tx));
+                    }
+                }
+                if found.len() != set.len() {
+                    return Err((
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        "Not all transactions found in specified or retrieved block".into(),
+                    ));
+                }
+                let txids: Vec<[u8; 32]> = block
+                    .transactions
+                    .iter()
+                    .map(|tx| tx.txid().to_bytes())
+                    .collect();
+                let mut matches: Vec<bool> = block
+                    .transactions
+                    .iter()
+                    .map(|tx| set.contains(&tx.txid()))
+                    .collect();
+                let mut out = Vec::new();
+                if prove_witness {
+                    let gentx = &block.transactions[0];
+                    let has_commitment = block.witness_commitment_output().is_some();
+                    let mut wtxid_tree = None;
+                    let prove_gentx = matches[0];
+                    if has_commitment {
+                        // wtxid tree: null placeholder for gentx, then
+                        // each tx's witness hash.
+                        let mut wtxids = Vec::with_capacity(txids.len());
+                        wtxids.push([0u8; 32]);
+                        for tx in &block.transactions[1..] {
+                            wtxids.push(tx.wtxid().to_bytes());
+                        }
+                        wtxid_tree = Some(avila_consensus::merkle::PartialMerkleTree::build(
+                            &wtxids, &matches,
+                        ));
+                        for m in matches.iter_mut() {
+                            *m = false;
+                        }
+                    }
+                    // The gentx is always proven in the txid tree.
+                    matches[0] = true;
+                    let txn = avila_consensus::merkle::PartialMerkleTree::build(&txids, &matches);
+                    let version: i32 = if wtxid_tree.is_some() { -2 } else { -1 };
+                    out.extend_from_slice(&version.to_le_bytes());
+                    out.extend_from_slice(&block.header.encode());
+                    txn.encode(&mut out);
+                    out.extend_from_slice(&gentx.encode());
+                    if let Some(wt) = &wtxid_tree {
+                        wt.encode(&mut out);
+                    } else {
+                        out.push(u8::from(prove_gentx));
+                    }
+                    let txs: Vec<Value> = found
+                        .iter()
+                        .map(|(i, tx)| {
+                            json!({
+                                "txid": tx.txid().to_string(),
+                                "wtxid": tx.wtxid().to_string(),
+                                "blockindex": i,
+                            })
+                        })
+                        .collect();
+                    Ok(json!({
+                        "proof": hex::encode(&out),
+                        "proven": {
+                            "blockhash": hash.to_string(),
+                            "blockheight": node.height,
+                            "tx": txs,
+                        },
+                    }))
+                } else {
+                    let txn = avila_consensus::merkle::PartialMerkleTree::build(&txids, &matches);
+                    out.extend_from_slice(&block.header.encode());
+                    txn.encode(&mut out);
+                    Ok(json!(hex::encode(&out)))
+                }
+            })
+        }
+        "verifytxoutproof" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.is_empty() || arr.len() > 2 {
+                return help_error(VERIFYTXOUTPROOF_HELP);
+            }
+            let proof_hex = match &arr[0] {
+                Value::String(s) => s.clone(),
+                v => {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, wrong_type_message(1, "proof", v, "string"))),
+                    );
+                }
+            };
+            let verify_witness = match arr.get(1) {
+                None | Some(Value::Null) => false,
+                Some(Value::Object(o)) => match o.get("verify_witness") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(v) => {
+                        return (
+                            Value::Null,
+                            Some((RPC_TYPE_ERROR, field_type_message(v, "bool"))),
+                        );
+                    }
+                },
+                Some(v) => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(2, "options", v, "object"),
+                        )),
+                    );
+                }
+            };
+            let bytes = match hex::decode(&proof_hex) {
+                Ok(b) => b,
+                Err(_) => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_INVALID_PARAMETER,
+                            format!("proof must be hexadecimal string (not '{proof_hex}')"),
+                        )),
+                    );
+                }
+            };
+            chain_query(queries, move |cs, _| {
+                let mut d = avila_consensus::encode::Decoder::new(&bytes);
+                // Classic: header ‖ txn. Witness form: i32 version
+                // (-2/-1) ‖ header ‖ txn ‖ gentx ‖ (wtxid_tree | bool).
+                let mut version: Option<i32> = None;
+                let header = if verify_witness {
+                    match d.read_i32_le() {
+                        Ok(v) => version = Some(v),
+                        Err(_) => {
+                            return Err((
+                                RPC_MISC_ERROR,
+                                "DataStream::read(): end of data: iostream error".into(),
+                            ));
+                        }
+                    }
+                    match BlockHeader::read(&mut d) {
+                        Ok(h) => h,
+                        Err(_) => {
+                            return Err((
+                                RPC_MISC_ERROR,
+                                "DataStream::read(): end of data: iostream error".into(),
+                            ));
+                        }
+                    }
+                } else {
+                    match BlockHeader::read(&mut d) {
+                        Ok(h) => h,
+                        Err(_) => {
+                            return Err((
+                                RPC_MISC_ERROR,
+                                "DataStream::read(): end of data: iostream error".into(),
+                            ));
+                        }
+                    }
+                };
+                let mut txn = match avila_consensus::merkle::PartialMerkleTree::decode(&mut d) {
+                    Some(t) => t,
+                    None => {
+                        return Err((
+                            RPC_MISC_ERROR,
+                            "DataStream::read(): end of data: iostream error".into(),
+                        ));
+                    }
+                };
+                // Witness tail: gentx + (wtxid tree | prove_gentx flag).
+                let mut gentx: Option<Transaction> = None;
+                let mut prove_gentx = false;
+                let mut wtxid_tree = None;
+                if verify_witness {
+                    gentx = match Transaction::read(&mut d) {
+                        Ok(t) => Some(t),
+                        Err(_) => {
+                            return Err((
+                                RPC_MISC_ERROR,
+                                "DataStream::read(): end of data: iostream error".into(),
+                            ));
+                        }
+                    };
+                    match version {
+                        Some(-1) => match d.read_u8() {
+                            Ok(b) => prove_gentx = b != 0,
+                            Err(_) => {
+                                return Err((
+                                    RPC_MISC_ERROR,
+                                    "DataStream::read(): end of data: iostream error".into(),
+                                ));
+                            }
+                        },
+                        _ => {
+                            wtxid_tree = Some(
+                                match avila_consensus::merkle::PartialMerkleTree::decode(&mut d) {
+                                    Some(t) => t,
+                                    None => {
+                                        return Err((
+                                            RPC_MISC_ERROR,
+                                            "DataStream::read(): end of data: iostream error"
+                                                .into(),
+                                        ));
+                                    }
+                                },
+                            );
+                        }
+                    }
+                }
+                // ExtractMatches must reproduce the header's merkle root.
+                let Some((root, mut matches)) = txn.extract() else {
+                    return Ok(if verify_witness { json!({}) } else { json!([]) });
+                };
+                if root != header.merkle_root.to_bytes() || matches.is_empty() {
+                    return Ok(if verify_witness { json!({}) } else { json!([]) });
+                }
+                if verify_witness {
+                    // The gentx must be proven at index 0 and present.
+                    let Some(first) = matches.first().copied() else {
+                        return Ok(json!({}));
+                    };
+                    if first.1 != 0 {
+                        return Ok(json!({}));
+                    }
+                    let Some(gx) = &gentx else {
+                        return Ok(json!({}));
+                    };
+                    if gx.txid().to_bytes() != first.0 || !gx.is_coinbase() {
+                        return Ok(json!({}));
+                    }
+                    // If the gentx carries a witness commitment, verify
+                    // the wtxid tree against it.
+                    let commit_idx = gx.outputs.iter().rposition(|o| {
+                        let s = o.script_pubkey.as_bytes();
+                        s.len() >= 38 && s[..6] == [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]
+                    });
+                    match commit_idx {
+                        None => {
+                            // No commitment: gentx only proves itself
+                            // when prove_gentx asked for it.
+                            if !prove_gentx {
+                                matches.remove(0);
+                            }
+                        }
+                        Some(ci) => {
+                            let Some(wt) = wtxid_tree else {
+                                return Ok(json!({}));
+                            };
+                            let mut wt2 = wt;
+                            let Some((wroot, mut wmatch)) = wt2.extract() else {
+                                return Ok(json!({}));
+                            };
+                            if wmatch.is_empty() {
+                                return Ok(json!({}));
+                            }
+                            // wtxid_root ‖ reserved → sha256d must equal
+                            // the commitment's 32-byte payload.
+                            let witness = &gx.inputs[0].witness;
+                            let items = witness.items();
+                            if items.len() != 1 || items[0].len() != 32 {
+                                return Ok(json!({}));
+                            }
+                            let mut buf = Vec::with_capacity(64);
+                            buf.extend_from_slice(&wroot);
+                            buf.extend_from_slice(&items[0]);
+                            let commit = avila_consensus::hash::sha256d(&buf);
+                            let spk = gx.outputs[ci].script_pubkey.as_bytes();
+                            if commit != spk[6..38] {
+                                return Ok(json!({}));
+                            }
+                            // A gentx "match" at wtxid index 0 is the
+                            // null placeholder → report its txid.
+                            if wmatch[0].1 == 0 {
+                                if wmatch[0].0 != [0u8; 32] {
+                                    return Ok(json!({}));
+                                }
+                                wmatch[0].0 = gx.txid().to_bytes();
+                            }
+                            matches = wmatch;
+                        }
+                    }
+                }
+                // The block must be on the active chain with a known
+                // tx count matching the proof's claim.
+                let block_hash = header.hash();
+                let Some(bnode) = cs.tree().get(&block_hash) else {
+                    return Err((
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        "Block not found in chain".to_string(),
+                    ));
+                };
+                if cs.chain().get(bnode.height as usize) != Some(&block_hash) {
+                    return Err((
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        "Block not found in chain".to_string(),
+                    ));
+                }
+                // pindex->nTx==0 (no body) is part of Knots' "not in
+                // chain" predicate; a count mismatch is an empty result.
+                let n_tx = match cs.body(&block_hash) {
+                    Some(b) => b.transactions.len() as u32,
+                    None => {
+                        return Err((
+                            RPC_INVALID_ADDRESS_OR_KEY,
+                            "Block not found in chain".to_string(),
+                        ));
+                    }
+                };
+                if n_tx != txn.num_transactions {
+                    return Ok(if verify_witness { json!({}) } else { json!([]) });
+                }
+                if !verify_witness {
+                    return Ok(json!(
+                        matches
+                            .iter()
+                            .map(|(h, _)| Txid::from_bytes(*h).to_string())
+                            .collect::<Vec<_>>()
+                    ));
+                }
+                let tip_h = cs.chain().len() as u32 - 1;
+                Ok(json!({
+                    "blockheight": bnode.height,
+                    "confirmations": tip_h - bnode.height + 1,
+                    "blockhash": block_hash.to_string(),
+                    "tx": matches
+                        .iter()
+                        .map(|(h, i)| json!({
+                            "wtxid": Txid::from_bytes(*h).to_string(),
+                            "blockindex": i,
+                        }))
+                        .collect::<Vec<_>>(),
+                }))
+            })
+        }
         "getindexinfo" => {
             if params.as_array().is_some_and(|a| a.len() > 1) {
                 return help_error(GETINDEXINFO_HELP);
@@ -3235,7 +3736,8 @@ fn dispatch(
                  \x20   getrawtransaction <txid> [verbosity] [blockhash],\n\
                  \x20   decoderawtransaction <hex> [iswitness], getindexinfo [index_name],\n\
                  \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>,\n\
-                 \x20   validateaddress <address>\n\
+                 \x20   gettxoutproof <txids> [blockhash] [options],\n\
+                 \x20   verifytxoutproof <proof> [options], validateaddress <address>\n\
                  \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
                  \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
                  \x20   gettxspendingprevout <outputs>,\n\
@@ -3872,6 +4374,179 @@ mod tests {
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_MISC_ERROR);
         assert!(msg.starts_with("getdeploymentinfo ( \"blockhash\" )"));
+    }
+
+    /// `gettxoutproof`/`verifytxoutproof` — the genesis coinbase is the
+    /// only tx in the genesis block; the classic BIP37 proof and the
+    /// `-1`-format witness proof round-trip.
+    #[test]
+    fn txoutproof_round_trips_genesis() {
+        let params = Network::Regtest.params();
+        let queries = query_server(Chainstate::new(&params));
+        let snap = snap();
+        let genesis = params.genesis_block().unwrap();
+        let ghash = genesis.block_hash().to_string();
+        let gtxid = genesis.transactions[0].txid().to_string();
+
+        // Classic proof round-trips to the txid list.
+        let (r, e) = dispatch(
+            "gettxoutproof",
+            &json!([[&gtxid], &ghash]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        let proof = r.as_str().unwrap().to_string();
+        let (r, e) = dispatch(
+            "verifytxoutproof",
+            &json!([proof]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, json!([&gtxid]));
+
+        // Genesis has no witness commitment → version -1 witness proof.
+        let (r, e) = dispatch(
+            "gettxoutproof",
+            &json!([[&gtxid], &ghash, {"prove_witness": true}]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["proven"]["blockindex"], Value::Null);
+        assert_eq!(r["proven"]["blockheight"], json!(0));
+        assert_eq!(r["proven"]["tx"][0]["blockindex"], json!(0));
+        let wproof = r["proof"].as_str().unwrap().to_string();
+        assert!(wproof.starts_with("ffffffff"), "version -1 prefix");
+        let (r, e) = dispatch(
+            "verifytxoutproof",
+            &json!([wproof, {"verify_witness": true}]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["blockheight"], json!(0));
+        assert_eq!(r["confirmations"], json!(1));
+        assert_eq!(r["tx"][0]["blockindex"], json!(0));
+        // No witness data: the coinbase wtxid is its txid.
+        assert_eq!(r["tx"][0]["wtxid"], json!(&gtxid));
+
+        // A witness proof without the flag yields the empty list, and a
+        // classic proof under the flag fails to deserialize — both like
+        // Knots.
+        let (r, e) = dispatch(
+            "verifytxoutproof",
+            &json!([wproof]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none());
+        assert_eq!(r, json!([]));
+    }
+
+    /// `gettxoutproof` error contract — Knots' exact codes/wording.
+    #[test]
+    fn txoutproof_error_contract() {
+        let params = Network::Regtest.params();
+        let queries = query_server(Chainstate::new(&params));
+        let snap = snap();
+        let genesis = params.genesis_block().unwrap();
+        let ghash = genesis.block_hash().to_string();
+        let gtxid = genesis.transactions[0].txid().to_string();
+
+        let (_, e) = dispatch("gettxoutproof", &json!([]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+        let (_, e) = dispatch("gettxoutproof", &json!([[]]), &snap, Some(&queries), None);
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_INVALID_PARAMETER,
+                "Parameter 'txids' cannot be empty".into()
+            )
+        );
+        let (_, e) = dispatch(
+            "gettxoutproof",
+            &json!([[&gtxid, &gtxid]]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_INVALID_PARAMETER,
+                format!("Invalid parameter, duplicated txid: {gtxid}")
+            )
+        );
+        let (_, e) = dispatch(
+            "gettxoutproof",
+            &json!([[&gtxid], "ab".repeat(32)]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into())
+        );
+        let (_, e) = dispatch(
+            "gettxoutproof",
+            &json!([["ab".repeat(32)], &ghash]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "Not all transactions found in specified or retrieved block".into()
+            )
+        );
+        // Truncated proof → -1 deserialization error.
+        let (_, e) = dispatch(
+            "verifytxoutproof",
+            &json!(["00000030"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_MISC_ERROR,
+                "DataStream::read(): end of data: iostream error".into()
+            )
+        );
+        // A proof whose header doesn't resolve on the active chain.
+        let mut header = genesis.header.clone();
+        header.nonce += 1;
+        let mut bytes = header.encode().to_vec();
+        avila_consensus::merkle::PartialMerkleTree::build(
+            &[genesis.transactions[0].txid().to_bytes()],
+            &[true],
+        )
+        .encode(&mut bytes);
+        let (_, e) = dispatch(
+            "verifytxoutproof",
+            &json!([hex::encode(&bytes)]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "Block not found in chain".into()
+            )
+        );
     }
 
     /// `submitblock` — the mining loop end to end: a template-built
