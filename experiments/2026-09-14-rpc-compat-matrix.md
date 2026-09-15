@@ -674,6 +674,30 @@ surfaced:
   `effective-feerate` reports the member's own rate; Core's
   package-feerate chunking for a child whose own rate is lower
   than the package's is not yet reproduced.
+- `decodepsbt` added on a new BIP174 layer
+  (`avila-consensus/src/psbt.rs`): `psbt\xff` magic, CompactSize
+  key-value maps for the global/input/output scopes, every BIP174
+  key type through the taproot fields, and lossless roundtrip of
+  unknown/proprietary pairs. Decode failures carry Core's exact
+  `TX decode failed …: iostream error` strings (bad magic, missing
+  separators, missing unsigned tx, count mismatches, oversized
+  CompactSize, trailing bytes) — invalid base64 is the bare
+  `TX decode failed invalid base64`. The JSON renderers match
+  `DecodePSBT` field-for-field: `tx`/`non_witness_utxo` go through
+  `TxToUniv`, `witness_utxo` renders `{amount, scriptPubKey}`,
+  `bip32_derivs`/`global_xpubs` print the fingerprint in stored
+  byte order with `m/…/h` paths, `proprietary` identifiers are raw
+  hex (not UTF-8), `final_scriptwitness` reads its CompactSize
+  count prefix, and `fee` appears once every input's UTXO is known.
+  Two adjacent fixes fell out of the live diff: `scriptPubKey`
+  key order is `asm, desc, hex, address?, type` everywhere
+  (`script_pubkey_json` had `type` first), and `gettxout` now
+  resolves unconfirmed outputs through the mempool like
+  `CoinsViewMemPool` (`confirmations: 0`, `coinbase: false`).
+  Verified live against Core 29.4: a wallet-funded P2WPKH PSBT,
+  its `walletprocesspsbt`-signed form, funded+signed taproot
+  PSBTs, a hand-built unknown/proprietary fixture, and an 11-row
+  malformed-input matrix — all byte-identical.
 
 ### Known semantic differences
 

@@ -953,6 +953,411 @@ fn script_to_univ(
     out
 }
 
+/// Core's `SighashToStr` — the named table decodepsbt prints for a
+/// recognized sighash byte; anything else falls back to the number.
+fn sighash_json(v: &[u8]) -> Value {
+    let n = avila_consensus::encode::Decoder::new(v)
+        .read_u32_le()
+        .ok()
+        .filter(|_| v.len() == 4);
+    let Some(n) = n else {
+        return Value::Null;
+    };
+    let name = match n {
+        0x00 => "DEFAULT",
+        0x01 => "ALL",
+        0x02 => "NONE",
+        0x03 => "SINGLE",
+        0x81 => "ALL|ANYONECANPAY",
+        0x82 => "NONE|ANYONECANPAY",
+        0x83 => "SINGLE|ANYONECANPAY",
+        _ => return json!(n),
+    };
+    json!(name)
+}
+
+/// A `bip32_derivs` array element: `{pubkey, master_fingerprint,
+/// path}` in Core's order.
+fn bip32_deriv_json(pubkey: &[u8], value: &[u8]) -> Value {
+    let (fp, path) =
+        avila_consensus::psbt::bip32_derivation_value(value).unwrap_or((0, Vec::new()));
+    json!({
+        "pubkey": hex::encode(pubkey),
+        "master_fingerprint": hex::encode(&fp.to_le_bytes()),
+        "path": avila_consensus::psbt::format_derivation_path(&path),
+    })
+}
+
+/// A `taproot_bip32_derivs` element — pubkey plus its leaf-hash list.
+fn taproot_bip32_deriv_json(xonly: &[u8], value: &[u8]) -> Value {
+    let mut dec = avila_consensus::encode::Decoder::new(value);
+    let count = dec.read_compact_size().unwrap_or(0);
+    let mut leaf_hashes = Vec::new();
+    for _ in 0..count {
+        match dec.read_bytes(32) {
+            Ok(h) => leaf_hashes.push(hex::encode(h)),
+            Err(_) => break,
+        }
+    }
+    let (fp, path) = if dec.remaining() >= 4 {
+        let fp = dec.read_u32_le().unwrap_or(0);
+        let mut path = Vec::new();
+        while dec.remaining() >= 4 {
+            path.push(dec.read_u32_le().unwrap_or(0));
+        }
+        (fp, path)
+    } else {
+        (0, Vec::new())
+    };
+    json!({
+        "pubkey": hex::encode(xonly),
+        "master_fingerprint": hex::encode(&fp.to_le_bytes()),
+        "path": avila_consensus::psbt::format_derivation_path(&path),
+        "leaf_hashes": leaf_hashes,
+    })
+}
+
+/// `proprietary` array entries: the 0xfc keydata carries
+/// `compactsize id_len || identifier || subtype || subkeydata`.
+fn proprietary_json(map: &avila_consensus::psbt::KeyMap, type_byte: u8) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (key, value) in &map.pairs {
+        if key.first() != Some(&type_byte) {
+            continue;
+        }
+        let keydata = &key[1..];
+        let mut dec = avila_consensus::encode::Decoder::new(keydata);
+        let id_len = dec.read_compact_size().unwrap_or(0) as usize;
+        let identifier = dec.read_bytes(id_len).unwrap_or(&[]).to_vec();
+        let subtype = dec.read_u8().unwrap_or(0);
+        out.push(json!({
+            "identifier": hex::encode(&identifier),
+            "subtype": subtype,
+            "key": hex::encode(key),
+            "value": hex::encode(value),
+        }));
+    }
+    out
+}
+
+/// `unknown` map entries: everything not a declared type for the
+/// scope — `{full_key_hex: value_hex}`.
+fn unknown_json(map: &avila_consensus::psbt::KeyMap, known: impl Fn(u8) -> bool) -> Value {
+    let mut out = serde_json::Map::new();
+    for (key, value) in &map.pairs {
+        let t = key[0];
+        if !known(t) {
+            out.insert(hex::encode(key), json!(hex::encode(value)));
+        }
+    }
+    Value::Object(out)
+}
+
+/// `PSBTInputToJSON` — the per-input object in Core's field order.
+fn psbt_input_json(
+    map: &avila_consensus::psbt::KeyMap,
+    params: &avila_consensus::params::Params,
+) -> Value {
+    use avila_consensus::psbt::Psbt;
+    use avila_consensus::transaction::{Script, Transaction};
+    let mut out = serde_json::Map::new();
+    if let Some(v) = map.get(Psbt::IN_WITNESS_UTXO) {
+        let mut dec = avila_consensus::encode::Decoder::new(v);
+        let amount = dec.read_i64_le().unwrap_or(0);
+        let spk = dec.read_var_bytes().unwrap_or_default();
+        out.insert(
+            "witness_utxo".into(),
+            json!({
+                "amount": value_from_amount(amount),
+                "scriptPubKey": script_to_univ(&Script::new(spk), params),
+            }),
+        );
+    }
+    if let Some(v) = map.get(Psbt::IN_NON_WITNESS_UTXO)
+        && let Ok(tx) = Transaction::decode(v)
+    {
+        out.insert("non_witness_utxo".into(), tx_json(&tx, params, false));
+    }
+    {
+        let mut sigs = serde_json::Map::new();
+        for (pubkey, sig) in map.all(Psbt::IN_PARTIAL_SIG) {
+            sigs.insert(hex::encode(pubkey), json!(hex::encode(sig)));
+        }
+        if !sigs.is_empty() {
+            out.insert("partial_signatures".into(), Value::Object(sigs));
+        }
+    }
+    if let Some(v) = map.get(Psbt::IN_SIGHASH_TYPE) {
+        out.insert("sighash".into(), sighash_json(v));
+    }
+    if let Some(v) = map.get(Psbt::IN_REDEEM_SCRIPT) {
+        out.insert(
+            "redeem_script".into(),
+            script_to_univ(&Script::new(v.to_vec()), params),
+        );
+    }
+    if let Some(v) = map.get(Psbt::IN_WITNESS_SCRIPT) {
+        out.insert(
+            "witness_script".into(),
+            script_to_univ(&Script::new(v.to_vec()), params),
+        );
+    }
+    {
+        let derivs: Vec<Value> = map
+            .all(Psbt::IN_BIP32_DERIVATION)
+            .map(|(pubkey, v)| bip32_deriv_json(pubkey, v))
+            .collect();
+        if !derivs.is_empty() {
+            out.insert("bip32_derivs".into(), json!(derivs));
+        }
+    }
+    if let Some(v) = map.get(Psbt::IN_FINAL_SCRIPTSIG) {
+        let script = Script::new(v.to_vec());
+        out.insert(
+            "final_scriptsig".into(),
+            json!({"asm": script.asm(), "hex": hex::encode(script.as_bytes())}),
+        );
+    }
+    if let Some(v) = map.get(Psbt::IN_FINAL_SCRIPTWITNESS) {
+        // Serialized witness stack: CompactSize count, then var-bytes items.
+        let mut dec = avila_consensus::encode::Decoder::new(v);
+        let count = dec.read_compact_size().unwrap_or(0);
+        let mut items = Vec::new();
+        for _ in 0..count {
+            match dec.read_var_bytes() {
+                Ok(item) => items.push(json!(hex::encode(&item))),
+                Err(_) => break,
+            }
+        }
+        out.insert("final_scriptwitness".into(), json!(items));
+    }
+    for (key_type, name) in [
+        (Psbt::IN_RIPEMD160, "ripemd160s"),
+        (Psbt::IN_SHA256, "sha256s"),
+        (Psbt::IN_HASH160, "hash160s"),
+        (Psbt::IN_HASH256, "hash256s"),
+    ] {
+        let preimages: Vec<Value> = map
+            .all(key_type)
+            .map(|(_, v)| json!(hex::encode(v)))
+            .collect();
+        if !preimages.is_empty() {
+            out.insert(name.into(), json!(preimages));
+        }
+    }
+    if let Some(v) = map.get(Psbt::IN_TAP_KEY_SIG) {
+        out.insert("taproot_key_path_sig".into(), json!(hex::encode(v)));
+    }
+    {
+        let sigs: Vec<Value> = map
+            .all(Psbt::IN_TAP_SCRIPT_SIG)
+            .map(|(keydata, sig)| {
+                let (xonly, leaf) = keydata.split_at(keydata.len().min(32));
+                json!({
+                    "pubkey": hex::encode(xonly),
+                    "leaf_hash": hex::encode(leaf),
+                    "sig": hex::encode(sig),
+                })
+            })
+            .collect();
+        if !sigs.is_empty() {
+            out.insert("taproot_script_path_sigs".into(), json!(sigs));
+        }
+    }
+    {
+        let scripts: Vec<Value> = map
+            .all(Psbt::IN_TAP_LEAF_SCRIPT)
+            .map(|(control, v)| {
+                let (script_bytes, leaf_ver) = v.split_at(v.len().saturating_sub(1));
+                json!({
+                    "script": script_to_univ(&Script::new(script_bytes.to_vec()), params),
+                    "leaf_ver": format!("{:02x}", leaf_ver.first().copied().unwrap_or(0)),
+                    "control_block": hex::encode(control),
+                })
+            })
+            .collect();
+        if !scripts.is_empty() {
+            out.insert("taproot_scripts".into(), json!(scripts));
+        }
+    }
+    {
+        let derivs: Vec<Value> = map
+            .all(Psbt::IN_TAP_BIP32_DERIVATION)
+            .map(|(xonly, v)| taproot_bip32_deriv_json(xonly, v))
+            .collect();
+        if !derivs.is_empty() {
+            out.insert("taproot_bip32_derivs".into(), json!(derivs));
+        }
+    }
+    if let Some(v) = map.get(Psbt::IN_TAP_INTERNAL_KEY) {
+        out.insert("taproot_internal_key".into(), json!(hex::encode(v)));
+    }
+    if let Some(v) = map.get(Psbt::IN_TAP_MERKLE_ROOT) {
+        out.insert("taproot_merkle_root".into(), json!(hex::encode(v)));
+    }
+    let proprietary = proprietary_json(map, Psbt::IN_PROPRIETARY);
+    if !proprietary.is_empty() {
+        out.insert("proprietary".into(), json!(proprietary));
+    }
+    let unknown = unknown_json(map, |t| {
+        t <= Psbt::IN_TAP_MERKLE_ROOT || t == Psbt::IN_PROPRIETARY
+    });
+    if let Value::Object(ref o) = unknown
+        && !o.is_empty()
+    {
+        out.insert("unknown".into(), unknown);
+    }
+    Value::Object(out)
+}
+
+/// `PSBTOutputToJSON` — the per-output object in Core's field order.
+fn psbt_output_json(
+    map: &avila_consensus::psbt::KeyMap,
+    params: &avila_consensus::params::Params,
+) -> Value {
+    use avila_consensus::psbt::Psbt;
+    use avila_consensus::transaction::Script;
+    let mut out = serde_json::Map::new();
+    if let Some(v) = map.get(Psbt::OUT_REDEEM_SCRIPT) {
+        out.insert(
+            "redeem_script".into(),
+            script_to_univ(&Script::new(v.to_vec()), params),
+        );
+    }
+    if let Some(v) = map.get(Psbt::OUT_WITNESS_SCRIPT) {
+        out.insert(
+            "witness_script".into(),
+            script_to_univ(&Script::new(v.to_vec()), params),
+        );
+    }
+    {
+        let derivs: Vec<Value> = map
+            .all(Psbt::OUT_BIP32_DERIVATION)
+            .map(|(pubkey, v)| bip32_deriv_json(pubkey, v))
+            .collect();
+        if !derivs.is_empty() {
+            out.insert("bip32_derivs".into(), json!(derivs));
+        }
+    }
+    if let Some(v) = map.get(Psbt::OUT_TAP_INTERNAL_KEY) {
+        out.insert("taproot_internal_key".into(), json!(hex::encode(v)));
+    }
+    if let Some(v) = map.get(Psbt::OUT_TAP_TREE) {
+        // depth u8 || leaf_ver u8 || compactsize script — per tuple.
+        let mut dec = avila_consensus::encode::Decoder::new(v);
+        let mut tuples = Vec::new();
+        while dec.remaining() >= 2 {
+            let depth = dec.read_u8().unwrap_or(0);
+            let leaf_ver = dec.read_u8().unwrap_or(0);
+            let script = dec.read_var_bytes().unwrap_or_default();
+            tuples.push(json!({
+                "depth": depth,
+                "leaf_ver": leaf_ver,
+                "script": script_to_univ(&Script::new(script), params),
+            }));
+        }
+        out.insert("taproot_tree".into(), json!(tuples));
+    }
+    {
+        let derivs: Vec<Value> = map
+            .all(Psbt::OUT_TAP_BIP32_DERIVATION)
+            .map(|(xonly, v)| taproot_bip32_deriv_json(xonly, v))
+            .collect();
+        if !derivs.is_empty() {
+            out.insert("taproot_bip32_derivs".into(), json!(derivs));
+        }
+    }
+    let proprietary = proprietary_json(map, Psbt::OUT_PROPRIETARY);
+    if !proprietary.is_empty() {
+        out.insert("proprietary".into(), json!(proprietary));
+    }
+    let unknown = unknown_json(map, |t| {
+        t <= Psbt::OUT_TAP_BIP32_DERIVATION || t == Psbt::OUT_PROPRIETARY
+    });
+    if let Value::Object(ref o) = unknown
+        && !o.is_empty()
+    {
+        out.insert("unknown".into(), unknown);
+    }
+    Value::Object(out)
+}
+
+/// `decodepsbt`'s top-level object — Core's `PSBTAnalysisToUniv`-free
+/// shape: tx, globals, inputs, outputs, fee.
+fn psbt_json(
+    psbt: &avila_consensus::psbt::Psbt,
+    params: &avila_consensus::params::Params,
+) -> Value {
+    use avila_consensus::psbt::Psbt;
+    let mut out = serde_json::Map::new();
+    out.insert("tx".into(), tx_json(&psbt.tx, params, false));
+    // Global xpubs: `0x01 || 78-byte extpub` → base58check text.
+    let xpubs: Vec<Value> = psbt
+        .global
+        .all(Psbt::GLOBAL_XPUB)
+        .map(|(keydata, v)| {
+            let (fp, path) =
+                avila_consensus::psbt::bip32_derivation_value(v).unwrap_or((0, Vec::new()));
+            json!({
+                "xpub": avila_consensus::address::base58check_body(keydata),
+                "master_fingerprint": hex::encode(&fp.to_le_bytes()),
+                "path": avila_consensus::psbt::format_derivation_path(&path),
+            })
+        })
+        .collect();
+    out.insert("global_xpubs".into(), json!(xpubs));
+    out.insert("psbt_version".into(), json!(psbt.version()));
+    out.insert(
+        "proprietary".into(),
+        json!(proprietary_json(&psbt.global, Psbt::GLOBAL_PROPRIETARY)),
+    );
+    out.insert(
+        "unknown".into(),
+        unknown_json(&psbt.global, |t| {
+            matches!(
+                t,
+                Psbt::GLOBAL_TX
+                    | Psbt::GLOBAL_XPUB
+                    | Psbt::GLOBAL_TX_VERSION
+                    | Psbt::GLOBAL_FALLBACK_LOCKTIME
+                    | Psbt::GLOBAL_INPUT_COUNT
+                    | Psbt::GLOBAL_OUTPUT_COUNT
+                    | Psbt::GLOBAL_TX_MODIFIABLE
+                    | Psbt::GLOBAL_VERSION
+                    | Psbt::GLOBAL_PROPRIETARY
+            )
+        }),
+    );
+    out.insert(
+        "inputs".into(),
+        json!(
+            psbt.inputs
+                .iter()
+                .map(|m| psbt_input_json(m, params))
+                .collect::<Vec<_>>()
+        ),
+    );
+    out.insert(
+        "outputs".into(),
+        json!(
+            psbt.outputs
+                .iter()
+                .map(|m| psbt_output_json(m, params))
+                .collect::<Vec<_>>()
+        ),
+    );
+    // `fee` only when every input's utxo is known — Core computes it
+    // during analysis and emits it when the subtraction is safe.
+    let total_in: Option<i64> = (0..psbt.inputs.len())
+        .map(|i| psbt.input_utxo(i).map(|u| u.value))
+        .sum();
+    if let Some(total_in) = total_in {
+        let total_out: i64 = psbt.tx.outputs.iter().map(|o| o.value).sum();
+        out.insert("fee".into(), json!(value_from_amount(total_in - total_out)));
+    }
+    Value::Object(out)
+}
+
 /// The `{hash, height}` answer all three wait calls produce — the
 /// connected tip at the moment the wait ends, not the target.
 fn wait_tip_result(cs: &Chainstate) -> Value {
@@ -1459,6 +1864,216 @@ fn epoch_secs() -> i64 {
 }
 
 /// Verbatim `help decoderawtransaction` text (Bitcoin Core 29).
+const DECODEPSBT_HELP: &str = "decodepsbt \"psbt\"
+
+Return a JSON object representing the serialized, base64-encoded partially signed Bitcoin transaction.
+
+Arguments:
+1. psbt    (string, required) The PSBT base64 string
+
+Result:
+{                                          (json object)
+  \"tx\" : {                                 (json object) The decoded network-serialized unsigned transaction.
+    ...                                    The layout is the same as the output of decoderawtransaction.
+  },
+  \"global_xpubs\" : [                       (json array)
+    {                                      (json object)
+      \"xpub\" : \"str\",                      (string) The extended public key this path corresponds to
+      \"master_fingerprint\" : \"hex\",        (string) The fingerprint of the master key
+      \"path\" : \"str\"                       (string) The path
+    },
+    ...
+  ],
+  \"psbt_version\" : n,                      (numeric) The PSBT version number. Not to be confused with the unsigned transaction version
+  \"proprietary\" : [                        (json array) The global proprietary map
+    {                                      (json object)
+      \"identifier\" : \"hex\",                (string) The hex string for the proprietary identifier
+      \"subtype\" : n,                       (numeric) The number for the subtype
+      \"key\" : \"hex\",                       (string) The hex for the key
+      \"value\" : \"hex\"                      (string) The hex for the value
+    },
+    ...
+  ],
+  \"unknown\" : {                            (json object) The unknown global fields
+    \"key\" : \"hex\",                         (string) (key-value pair) An unknown key-value pair
+    ...
+  },
+  \"inputs\" : [                             (json array)
+    {                                      (json object)
+      \"non_witness_utxo\" : {               (json object, optional) Decoded network transaction for non-witness UTXOs
+        ...
+      },
+      \"witness_utxo\" : {                   (json object, optional) Transaction output for witness UTXOs
+        \"amount\" : n,                      (numeric) The value in BTC
+        \"scriptPubKey\" : {                 (json object)
+          \"asm\" : \"str\",                   (string) Disassembly of the output script
+          \"desc\" : \"str\",                  (string) Inferred descriptor for the output
+          \"hex\" : \"hex\",                   (string) The raw output script bytes, hex-encoded
+          \"type\" : \"str\",                  (string) The type, eg 'pubkeyhash'
+          \"address\" : \"str\"                (string, optional) The Bitcoin address (only if a well-defined address exists)
+        }
+      },
+      \"partial_signatures\" : {             (json object, optional)
+        \"pubkey\" : \"str\",                  (string) The public key and signature that corresponds to it.
+        ...
+      },
+      \"sighash\" : \"str\",                   (string, optional) The sighash type to be used
+      \"redeem_script\" : {                  (json object, optional)
+        \"asm\" : \"str\",                     (string) Disassembly of the redeem script
+        \"hex\" : \"hex\",                     (string) The raw redeem script bytes, hex-encoded
+        \"type\" : \"str\"                     (string) The type, eg 'pubkeyhash'
+      },
+      \"witness_script\" : {                 (json object, optional)
+        \"asm\" : \"str\",                     (string) Disassembly of the witness script
+        \"hex\" : \"hex\",                     (string) The raw witness script bytes, hex-encoded
+        \"type\" : \"str\"                     (string) The type, eg 'pubkeyhash'
+      },
+      \"bip32_derivs\" : [                   (json array, optional)
+        {                                  (json object)
+          \"pubkey\" : \"str\",                (string) The public key with the derivation path as the value.
+          \"master_fingerprint\" : \"str\",    (string) The fingerprint of the master key
+          \"path\" : \"str\"                   (string) The path
+        },
+        ...
+      ],
+      \"final_scriptSig\" : {                (json object, optional)
+        \"asm\" : \"str\",                     (string) Disassembly of the final signature script
+        \"hex\" : \"hex\"                      (string) The raw final signature script bytes, hex-encoded
+      },
+      \"final_scriptwitness\" : [            (json array, optional)
+        \"hex\",                             (string) hex-encoded witness data (if any)
+        ...
+      ],
+      \"ripemd160_preimages\" : {            (json object, optional)
+        \"hash\" : \"str\",                    (string) The hash and preimage that corresponds to it.
+        ...
+      },
+      \"sha256_preimages\" : {               (json object, optional)
+        \"hash\" : \"str\",                    (string) The hash and preimage that corresponds to it.
+        ...
+      },
+      \"hash160_preimages\" : {              (json object, optional)
+        \"hash\" : \"str\",                    (string) The hash and preimage that corresponds to it.
+        ...
+      },
+      \"hash256_preimages\" : {              (json object, optional)
+        \"hash\" : \"str\",                    (string) The hash and preimage that corresponds to it.
+        ...
+      },
+      \"taproot_key_path_sig\" : \"hex\",      (string, optional) hex-encoded signature for the Taproot key path spend
+      \"taproot_script_path_sigs\" : [       (json array, optional)
+        {                                  (json object, optional) The signature for the pubkey and leaf hash combination
+          \"pubkey\" : \"str\",                (string) The x-only pubkey for this signature
+          \"leaf_hash\" : \"str\",             (string) The leaf hash for this signature
+          \"sig\" : \"str\"                    (string) The signature itself
+        },
+        ...
+      ],
+      \"taproot_scripts\" : [                (json array, optional)
+        {                                  (json object)
+          \"script\" : \"hex\",                (string) A leaf script
+          \"leaf_ver\" : n,                  (numeric) The version number for the leaf script
+          \"control_blocks\" : [             (json array) The control blocks for this script
+            \"hex\",                         (string) A hex-encoded control block for this script
+            ...
+          ]
+        },
+        ...
+      ],
+      \"taproot_bip32_derivs\" : [           (json array, optional)
+        {                                  (json object)
+          \"pubkey\" : \"str\",                (string) The x-only public key this path corresponds to
+          \"master_fingerprint\" : \"str\",    (string) The fingerprint of the master key
+          \"path\" : \"str\",                  (string) The path
+          \"leaf_hashes\" : [                (json array) The hashes of the leaves this pubkey appears in
+            \"hex\",                         (string) The hash of a leaf this pubkey appears in
+            ...
+          ]
+        },
+        ...
+      ],
+      \"taproot_internal_key\" : \"hex\",      (string, optional) The hex-encoded Taproot x-only internal key
+      \"taproot_merkle_root\" : \"hex\",       (string, optional) The hex-encoded Taproot merkle root
+      \"unknown\" : {                        (json object, optional) The unknown input fields
+        \"key\" : \"hex\",                     (string) (key-value pair) An unknown key-value pair
+        ...
+      },
+      \"proprietary\" : [                    (json array, optional) The input proprietary map
+        {                                  (json object)
+          \"identifier\" : \"hex\",            (string) The hex string for the proprietary identifier
+          \"subtype\" : n,                   (numeric) The number for the subtype
+          \"key\" : \"hex\",                   (string) The hex for the key
+          \"value\" : \"hex\"                  (string) The hex for the value
+        },
+        ...
+      ]
+    },
+    ...
+  ],
+  \"outputs\" : [                            (json array)
+    {                                      (json object)
+      \"redeem_script\" : {                  (json object, optional)
+        \"asm\" : \"str\",                     (string) Disassembly of the redeem script
+        \"hex\" : \"hex\",                     (string) The raw redeem script bytes, hex-encoded
+        \"type\" : \"str\"                     (string) The type, eg 'pubkeyhash'
+      },
+      \"witness_script\" : {                 (json object, optional)
+        \"asm\" : \"str\",                     (string) Disassembly of the witness script
+        \"hex\" : \"hex\",                     (string) The raw witness script bytes, hex-encoded
+        \"type\" : \"str\"                     (string) The type, eg 'pubkeyhash'
+      },
+      \"bip32_derivs\" : [                   (json array, optional)
+        {                                  (json object)
+          \"pubkey\" : \"str\",                (string) The public key this path corresponds to
+          \"master_fingerprint\" : \"str\",    (string) The fingerprint of the master key
+          \"path\" : \"str\"                   (string) The path
+        },
+        ...
+      ],
+      \"taproot_internal_key\" : \"hex\",      (string, optional) The hex-encoded Taproot x-only internal key
+      \"taproot_tree\" : [                   (json array, optional) The tuples that make up the Taproot tree, in depth first search order
+        {                                  (json object, optional) A single leaf script in the taproot tree
+          \"depth\" : n,                     (numeric) The depth of this element in the tree
+          \"leaf_ver\" : n,                  (numeric) The version of this leaf
+          \"script\" : \"str\"                 (string) The hex-encoded script itself
+        },
+        ...
+      ],
+      \"taproot_bip32_derivs\" : [           (json array, optional)
+        {                                  (json object)
+          \"pubkey\" : \"str\",                (string) The x-only public key this path corresponds to
+          \"master_fingerprint\" : \"str\",    (string) The fingerprint of the master key
+          \"path\" : \"str\",                  (string) The path
+          \"leaf_hashes\" : [                (json array) The hashes of the leaves this pubkey appears in
+            \"hex\",                         (string) The hash of a leaf this pubkey appears in
+            ...
+          ]
+        },
+        ...
+      ],
+      \"unknown\" : {                        (json object, optional) The unknown output fields
+        \"key\" : \"hex\",                     (string) (key-value pair) An unknown key-value pair
+        ...
+      },
+      \"proprietary\" : [                    (json array, optional) The output proprietary map
+        {                                  (json object)
+          \"identifier\" : \"hex\",            (string) The hex string for the proprietary identifier
+          \"subtype\" : n,                   (numeric) The number for the subtype
+          \"key\" : \"hex\",                   (string) The hex for the key
+          \"value\" : \"hex\"                  (string) The hex for the value
+        },
+        ...
+      ]
+    },
+    ...
+  ],
+  \"fee\" : n                                (numeric, optional) The transaction fee paid if all UTXOs slots in the PSBT have been filled.
+}
+
+Examples:
+> bitcoin-cli decodepsbt \"psbt\"
+";
+
 const DECODERAWTRANSACTION_HELP: &str = "decoderawtransaction \"hexstring\" ( iswitness )\n\nReturn a JSON object representing the serialized, hex-encoded transaction.\n\nArguments:\n1. hexstring    (string, required) The transaction hex string\n2. iswitness    (boolean, optional, default=depends on heuristic tests) Whether the transaction hex is a serialized witness transaction.\n                If iswitness is not present, heuristic tests will be used in decoding.\n                If true, only witness deserialization will be tried.\n                If false, only non-witness deserialization will be tried.\n                This boolean should reflect whether the transaction has inputs\n                (e.g. fully valid, or on-chain transactions), if known by the caller.\n\nResult:\n{                             (json object)\n  \"txid\" : \"hex\",             (string) The transaction id\n  \"hash\" : \"hex\",             (string) The transaction hash (differs from txid for witness transactions)\n  \"size\" : n,                 (numeric) The serialized transaction size\n  \"vsize\" : n,                (numeric) The virtual transaction size (differs from size for witness transactions)\n  \"weight\" : n,               (numeric) The transaction's weight (between vsize*4-3 and vsize*4)\n  \"version\" : n,              (numeric) The version\n  \"locktime\" : xxx,           (numeric) The lock time\n  \"vin\" : [                   (json array)\n    {                         (json object)\n      \"coinbase\" : \"hex\",     (string, optional) The coinbase value (only if coinbase transaction)\n      \"txid\" : \"hex\",         (string, optional) The transaction id (if not coinbase transaction)\n      \"vout\" : n,             (numeric, optional) The output number (if not coinbase transaction)\n      \"scriptSig\" : {         (json object, optional) The script (if not coinbase transaction)\n        \"asm\" : \"str\",        (string) Disassembly of the signature script\n        \"hex\" : \"hex\"         (string) The raw signature script bytes, hex-encoded\n      },\n      \"txinwitness\" : [       (json array, optional)\n        \"hex\",                (string) hex-encoded witness data (if any)\n        ...\n      ],\n      \"sequence\" : n          (numeric) The script sequence number\n    },\n    ...\n  ],\n  \"vout\" : [                  (json array)\n    {                         (json object)\n      \"value\" : n,            (numeric) The value in BTC\n      \"n\" : n,                (numeric) index\n      \"scriptPubKey\" : {      (json object)\n        \"asm\" : \"str\",        (string) Disassembly of the output script\n        \"desc\" : \"str\",       (string) Inferred descriptor for the output\n        \"hex\" : \"hex\",        (string) The raw output script bytes, hex-encoded\n        \"address\" : \"str\",    (string, optional) The Bitcoin address (only if a well-defined address exists)\n        \"type\" : \"str\"        (string) The type (one of: nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n      }\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli decoderawtransaction \"hexstring\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"decoderawtransaction\", \"params\": [\"hexstring\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help createrawtransaction` text (Bitcoin Core 29).
@@ -2189,11 +2804,12 @@ fn script_pubkey_json(
         "asm": script.asm(),
         "desc": avila_consensus::descriptor::script_desc(script, params),
         "hex": hex::encode(script.as_bytes()),
-        "type": script.classify().name(),
     });
+    // ScriptToUniv emits the address between `hex` and `type`.
     if let Some(addr) = avila_consensus::address::script_address(script, params) {
         out["address"] = json!(addr);
     }
+    out["type"] = json!(script.classify().name());
     out
 }
 
@@ -2530,6 +3146,11 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
             ("replaceable", Some("bool"), false),
         ],
         CREATERAWTRANSACTION_HELP,
+    ),
+    (
+        "decodepsbt",
+        &[("psbt", Some("string"), true)],
+        DECODEPSBT_HELP,
     ),
     (
         "decoderawtransaction",
@@ -3454,6 +4075,47 @@ fn dispatch(
                 Ok(tx_json(&tx, cs.tree().params(), false))
             })
         }
+        "decodepsbt" => {
+            // The gate guarantees a string; `DecodeBase64PSBT`'s
+            // failure text rides inside "TX decode failed <reason>".
+            let raw = match params[0].as_str() {
+                Some(s) => s,
+                None => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(1, "psbt", &params[0], "string"),
+                        )),
+                    );
+                }
+            };
+            let Some(bytes) = base64_decode_strict(raw) else {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_DESERIALIZATION_ERROR,
+                        "TX decode failed invalid base64".into(),
+                    )),
+                );
+            };
+            let psbt = match avila_consensus::psbt::Psbt::decode(&bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_DESERIALIZATION_ERROR,
+                            format!("TX decode failed {}", e.core_message()),
+                        )),
+                    );
+                }
+            };
+            chain_query(queries, move |cs, _| {
+                let params_ref = cs.tree().params();
+                Ok(psbt_json(&psbt, params_ref))
+            })
+        }
         "getblockhash" => {
             let Some(height) = param(params, 0, "height").and_then(Value::as_u64) else {
                 return missing_params("height");
@@ -3666,7 +4328,6 @@ fn dispatch(
                     return Ok(Value::Null);
                 }
                 match cs.utxo().get(&outpoint) {
-                    None => Ok(Value::Null),
                     Some(coin) => {
                         let tip = cs.chain().len() as u32 - 1;
                         Ok(json!({
@@ -3680,6 +4341,26 @@ fn dispatch(
                             "coinbase": coin.coinbase,
                         }))
                     }
+                    // `CoinsViewMemPool`: outputs created by pooled
+                    // transactions resolve with zero confirmations.
+                    None => match mgr
+                        .mempool_ref()
+                        .entry(&txid)
+                        .and_then(|e| e.tx.outputs.get(vout as usize))
+                        .filter(|_| include_mempool)
+                    {
+                        Some(out) => Ok(json!({
+                            "bestblock": cs.tip_hash().to_string(),
+                            "confirmations": 0,
+                            "value": value_from_amount(out.value),
+                            "scriptPubKey": script_pubkey_json(
+                                &out.script_pubkey,
+                                cs.tree().params(),
+                            ),
+                            "coinbase": false,
+                        })),
+                        None => Ok(Value::Null),
+                    },
                 }
             })
         }
@@ -5013,8 +5694,7 @@ fn dispatch(
                         Some("conflict-in-package")
                     } else {
                         let mut seen = std::collections::HashSet::new();
-                        txns
-                            .iter()
+                        txns.iter()
                             .any(|tx| !seen.insert(tx.txid()))
                             .then_some("package-contains-duplicates")
                     }
@@ -8277,7 +8957,7 @@ fn dispatch(
                      \x20   getdeploymentinfo [blockhash],\n\
                      \x20   getrawtransaction <txid> [verbosity] [blockhash],\n\
                      \x20   decoderawtransaction <hex> [iswitness], getindexinfo [index_name],\n\
-                     \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>,\n\
+                     \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>, decodepsbt <psbt>,\n\
                      \x20   gettxoutproof <txids> [blockhash] [options],\n\
                      \x20   verifytxoutproof <proof> [options], validateaddress <address>,\n\
                      \x20   verifymessage <address> <sig> <msg>,\n\
@@ -9079,6 +9759,91 @@ mod tests {
             json!({"txid": txid.to_string(), "error": "bad-cb-length"})
         );
         assert_eq!(r["replaced-transactions"], json!([]));
+    }
+
+    /// `decodepsbt` — base64/structure error contract plus the JSON
+    /// shape of a minimal `from_unsigned_tx` PSBT.
+    #[test]
+    fn decodepsbt_dispatch() {
+        use avila_consensus::psbt::Psbt;
+        use avila_consensus::transaction::{OutPoint, Script, Transaction, TxIn, TxOut, Witness};
+
+        let cs = Chainstate::new(&Network::Regtest.params());
+        let queries = query_server(cs);
+        let snap = snap();
+
+        // Invalid base64 and structurally bad payloads are -22.
+        let (_, e) = dispatch(
+            "decodepsbt",
+            &json!(["!!!not-base64!!!"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_DESERIALIZATION_ERROR,
+                "TX decode failed invalid base64".into()
+            )
+        );
+        let bad_magic = base64_encode(b"not-a-psbt");
+        let (_, e) = dispatch(
+            "decodepsbt",
+            &json!([bad_magic]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_DESERIALIZATION_ERROR,
+                "TX decode failed Invalid PSBT magic bytes: iostream error".into()
+            )
+        );
+
+        // A valid PSBT renders the unsigned tx and one map per input/output.
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_bytes([0x42; 32]),
+                    vout: 0,
+                },
+                script_sig: Script::new(Vec::new()),
+                sequence: 0xffff_fffd,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: Script::new(hex::decode("0014").unwrap_or_default()),
+            }],
+            lock_time: 0,
+        };
+        let psbt = Psbt::from_unsigned_tx(tx);
+        let b64 = base64_encode(&psbt.encode());
+        let (r, e) = dispatch(
+            "decodepsbt",
+            &json!([b64]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["psbt_version"], json!(0));
+        assert_eq!(r["inputs"].as_array().unwrap().len(), 1);
+        assert_eq!(r["outputs"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            r["tx"]["vin"][0]["txid"],
+            json!(Txid::from_bytes([0x42; 32]).to_string())
+        );
     }
 
     /// `savemempool` — without a block store there is nowhere to write;

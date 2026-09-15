@@ -347,9 +347,17 @@ operation. Compare complete initial download and catch-up, not only local replay
       ({txid, vsize, fees{base, effective-feerate,
       effective-includes}} on accept, {txid, error} on reject,
       pooled-member and different-witness shapes) plus
-      replaced-transactions. Verified byte-identical against
-      Core 29.4 including a live spend+receive and a real
-      parent+child package. Outbound
+      replaced-transactions, and decodepsbt sits on a BIP174
+      key-map layer (lossless unknown/proprietary roundtrip,
+      Core's `TX decode failed …` strings) rendering Core's full
+      field shape — tx/non_witness_utxo/witness_utxo,
+      partial_sigs, sighash, scripts, taproot fields, bip32/taproot
+      derivations, global xpubs, preimages, proprietary/unknown
+      echoes, and fee once every UTXO slot is filled. Verified
+      byte-identical against
+      Core 29.4 including a live spend+receive, a real
+      parent+child package, and funded/signed P2WPKH + taproot
+      PSBTs. Outbound
       dialing is
       asynchronous —
       `maintain_outbounds` runs `connect_timeout` on slot-bounded

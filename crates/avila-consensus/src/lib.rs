@@ -24,6 +24,7 @@ pub mod message;
 pub mod muhash;
 pub mod params;
 pub mod pow;
+pub mod psbt;
 pub mod rules;
 pub mod script;
 pub mod sigchecker;
