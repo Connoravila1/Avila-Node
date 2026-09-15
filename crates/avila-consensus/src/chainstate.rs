@@ -325,6 +325,13 @@ impl Chainstate {
         self.txindex.as_ref()?.map.get(txid).copied()
     }
 
+    /// Whether `-txindex` is active — `getindexinfo` reports `txindex`
+    /// only then, like Core's index list.
+    #[must_use]
+    pub fn txindex_enabled(&self) -> bool {
+        self.txindex.is_some()
+    }
+
     /// Whether `hash` is on the connected chain — Core's
     /// `in_active_chain` check for indexed lookups.
     #[must_use]

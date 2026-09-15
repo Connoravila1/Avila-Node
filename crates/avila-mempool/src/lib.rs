@@ -270,6 +270,13 @@ impl Mempool {
         self.wtxids.get(wtxid).and_then(|id| self.get(id))
     }
 
+    /// The pooled tx spending `outpoint`, if any — Core's
+    /// `gettxspendingprevout` lookup (`mempool.NextTransactionsIter`).
+    #[must_use]
+    pub fn spent_by(&self, outpoint: &OutPoint) -> Option<&Transaction> {
+        self.spends.get(outpoint).and_then(|id| self.get(id))
+    }
+
     /// Does the pool hold a tx under either hash form? Used to dedup
     /// `inv` announcements before issuing `getdata`.
     #[must_use]

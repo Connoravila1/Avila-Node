@@ -29,9 +29,10 @@ drift: any `DIFFERS` verdict on a shared field is a compatibility bug.
 
 ## Workload and method
 
-`tools/compare_rpc.py` calls 26 methods with identical parameters on
-both endpoints (block hash, coinbase txid, and raw block hex resolved
-live at the shared height), flattens each response to field paths, and reports
+`tools/compare_rpc.py` calls 30 methods with identical parameters on
+both endpoints (block hash, coinbase txid, raw block hex, and raw tx
+hex resolved live at the shared height), flattens each response to
+field paths, and reports
 matched / expected-dynamic / differing / one-side-only fields.
 `DYNAMIC_KEYS`/`DYNAMIC_METHODS` mark legitimately node- or
 time-specific values (time, curtime, peers, uptime, help text).
@@ -39,7 +40,7 @@ time-specific values (time, curtime, peers, uptime, help text).
 Reproduce:
 
 ```
-avila-node run --connect <core-p2p> --rpc 127.0.0.1:18443
+avila-node run --connect <core-p2p> --rpc 127.0.0.1:18443 --txindex
 python3 tools/compare_rpc.py \
     --avila-cookie data/regtest/.cookie \
     --core-cookie <core-datadir>/regtest/.cookie --height 100
@@ -47,21 +48,27 @@ python3 tools/compare_rpc.py \
 
 ## Results
 
-39 MATCH (every shared field byte-identical), 1 EXPECTED-DIFF
+43 MATCH (every shared field byte-identical), 2 EXPECTED-DIFF
 (presence gaps only), 3 DIFFERS — one is a genuine policy divergence
 (`fullrbf`: our pool enforces BIP125 opt-in signaling; Knots 29 ships
 mempoolfullrbf semantics) and two are environmental (`getpeerinfo`,
-`getconnectioncount` — the daemons hold different peer sets). One AVILA-ERROR (`estimatesmartfee` —
-honest "insufficient data" on a fresh chain with no confirmation
-samples; Knots returned its fallback). One CORE-ERROR
+`getconnectioncount` — the daemons hold different peer sets).
+`estimatesmartfee` now returns Core's no-data result object
+(`{"errors": ["Insufficient data or no feerate found"], "blocks": 0}`)
+and its full argument-validation table (`-3` type, `-8` range,
+case-insensitive `estimate_mode`). One CORE-ERROR
 (`getrawtransaction` on a buried coinbase — a flag asymmetry: Knots
 runs without `-txindex`, we run with it, so the bare-txid lookup
-resolves only on our side). `sendrawtransaction` error
+resolves only on our side; `getindexinfo` likewise reports `txindex`
+only on the node that has it). `sendrawtransaction` error
 paths match: `-22` decode failures, `-26`/`bad-cb-length` consensus
 rejects. `savemempool` matches (`{"filename": <abs path>}`) and the
 pool survives restart: `mempool.dat` is written on shutdown, entries
 re-admit through full policy on start, spent-input entries are
-skipped.
+skipped. `decoderawtransaction`, `gettxspendingprevout`, and
+`getindexinfo` are byte-identical across their success paths and
+every error class — including the `-1` help-text throws Core raises
+for missing or excess arguments.
 
 `sendrawtransaction` was also verified live end-to-end (outside the
 static matrix since pool state is per-daemon): a wallet-signed tx
@@ -174,12 +181,48 @@ Serving genesis surfaced two deeper compat fixes:
   byte-capped) and Knots-specific knobs (`rbf_policy`, `truc_policy`,
   `dustdynamic`, `dustrelayfee*`).
 
+`decoderawtransaction`, `gettxspendingprevout`, and `getindexinfo`
+landed, along with three display/validation fixes the comparison
+surfaced:
+
+- `decoderawtransaction` shares `TxToUniv` but omits the `hex` echo
+  (Core only attaches it for `getrawtransaction`/getblock-v2) and
+  honors `iswitness`: absent tries no-witness then witness, `false`
+  pins `Transaction::decode_no_witness`, `true` pins the witness
+  decode. Bad hex or undecodable bytes are `-22 "TX decode failed"`.
+  Missing or excess args are Core's `-1` help throw — the method's
+  verbatim `RPCHelpMan` text is embedded and returned.
+- `gettxspendingprevout` validates with Core's full error taxonomy:
+  `-1`+help for missing/excess args, `-3` `Wrong type passed` /
+  field-type / `Missing txid|vout`, `-8` for `outputs are missing`,
+  `vout cannot be negative`, and the txid-length/hex gates, `-1`
+  `JSON integer out of range` for non-integer or >i32 vouts. Lookups
+  use `Mempool::spent_by`'s outpoint index — no pool scan.
+- `getindexinfo` reports `txindex` (synced + `best_block_height`)
+  only when `-txindex` is on, supports the `index_name` filter, and
+  returns `{}` otherwise — matching Core's behavior per config.
+- `TxToUniv`'s `scriptSig.asm` now runs `ScriptToAsmStr` with
+  `fAttemptSighashDecode`: strict-DER pushes ending in a defined
+  hashtype render as `…[ALL]`/`[NONE]`/`[SINGLE]`/`[…|ANYONECANPAY]`
+  (undefined-last-byte sigs stay plain hex). `Script::asm_sighash`
+  does this; `scriptPubKey.asm` keeps the plain mode.
+- `txinwitness` is emitted for coinbase inputs too (witness
+  coinbases carry the reserved value) and now precedes `sequence`,
+  matching `TxToUniv` field order.
+- `estimatesmartfee` was fixed end-to-end: no-data returns Core's
+  result object `{"errors": ["Insufficient data or no feerate
+  found"], "blocks": 0}` instead of an RPC error, `conf_target` is
+  range-checked 1–1008 (`-8`), non-numeric targets are `-3`, and
+  `estimate_mode` accepts unset/economical/conservative
+  case-insensitively (`FeeModeFromString`).
+
 ### Known semantic differences
 
 - `fullrbf`: `false` — we implement BIP125 opt-in signaling; Knots
   29 enables full RBF. Real policy divergence to decide on.
-- `estimatesmartfee` errors when the sample set is empty rather than
-  returning a floor — the estimator only reports rates it observed.
+- `getindexinfo`/`getrawtransaction` differences against Knots are
+  flag-driven: our test node runs `--txindex`, the Knots instance
+  does not. Both sides answer correctly for their configuration.
 - `getrawtransaction` without a named block now goes through the
   `-txindex` index when enabled (`run --txindex`); without it the
   error is Core's exact `-5` ("No such mempool transaction. Use

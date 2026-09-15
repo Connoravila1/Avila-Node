@@ -20,8 +20,7 @@
 //!
 //! Not implemented (by design, this slice): HTTP keep-alive, chunked
 //! encoding, TLS, authentication beyond localhost binding, batch
-//! requests, txindex-backed `getrawtransaction`, and the wallet
-//! method surface.
+//! requests, and the wallet method surface.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -263,6 +262,7 @@ pub fn call(addr: SocketAddr, auth: Option<&str>, request: &Value) -> Result<Val
 
 /// JSON-RPC error codes Core uses.
 const RPC_MISC_ERROR: i64 = -1;
+const RPC_TYPE_ERROR: i64 = -3;
 const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
 const RPC_INVALID_PARAMETER: i64 = -8;
 const RPC_DESERIALIZATION_ERROR: i64 = -22;
@@ -405,9 +405,49 @@ fn chain_query(
     }
 }
 
+/// The `UniValue` type name Core's `Wrong type passed` errors use.
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 fn param<'a>(params: &'a Value, index: usize, name: &str) -> Option<&'a Value> {
     params.get(index).or_else(|| params.get(name))
 }
+
+/// `RPCTypeCheckArgument`'s message — the `Wrong type passed:` list
+/// keyed by position and argument name.
+fn wrong_type_message(position: usize, name: &str, v: &Value, expected: &str) -> String {
+    format!(
+        "Wrong type passed:\n{{\n    \"Position {position} ({name})\": \
+         \"JSON value of type {} is not of expected type {expected}\"\n}}",
+        json_type_name(v)
+    )
+}
+
+/// Core throws the method's full `RPCHelpMan` text as a -1 error when
+/// required args are absent or the arg count is out of range.
+fn help_error(text: &'static str) -> (Value, Option<(i64, String)>) {
+    (Value::Null, Some((RPC_MISC_ERROR, text.to_string())))
+}
+
+/// Verbatim `help decoderawtransaction` text (Bitcoin Core 29).
+const DECODERAWTRANSACTION_HELP: &str = "decoderawtransaction \"hexstring\" ( iswitness )\n\nReturn a JSON object representing the serialized, hex-encoded transaction.\n\nArguments:\n1. hexstring    (string, required) The transaction hex string\n2. iswitness    (boolean, optional, default=depends on heuristic tests) Whether the transaction hex is a serialized witness transaction.\n                If iswitness is not present, heuristic tests will be used in decoding.\n                If true, only witness deserialization will be tried.\n                If false, only non-witness deserialization will be tried.\n                This boolean should reflect whether the transaction has inputs\n                (e.g. fully valid, or on-chain transactions), if known by the caller.\n\nResult:\n{                             (json object)\n  \"txid\" : \"hex\",             (string) The transaction id\n  \"hash\" : \"hex\",             (string) The transaction hash (differs from txid for witness transactions)\n  \"size\" : n,                 (numeric) The serialized transaction size\n  \"vsize\" : n,                (numeric) The virtual transaction size (differs from size for witness transactions)\n  \"weight\" : n,               (numeric) The transaction's weight (between vsize*4-3 and vsize*4)\n  \"version\" : n,              (numeric) The version\n  \"locktime\" : xxx,           (numeric) The lock time\n  \"vin\" : [                   (json array)\n    {                         (json object)\n      \"coinbase\" : \"hex\",     (string, optional) The coinbase value (only if coinbase transaction)\n      \"txid\" : \"hex\",         (string, optional) The transaction id (if not coinbase transaction)\n      \"vout\" : n,             (numeric, optional) The output number (if not coinbase transaction)\n      \"scriptSig\" : {         (json object, optional) The script (if not coinbase transaction)\n        \"asm\" : \"str\",        (string) Disassembly of the signature script\n        \"hex\" : \"hex\"         (string) The raw signature script bytes, hex-encoded\n      },\n      \"txinwitness\" : [       (json array, optional)\n        \"hex\",                (string) hex-encoded witness data (if any)\n        ...\n      ],\n      \"sequence\" : n          (numeric) The script sequence number\n    },\n    ...\n  ],\n  \"vout\" : [                  (json array)\n    {                         (json object)\n      \"value\" : n,            (numeric) The value in BTC\n      \"n\" : n,                (numeric) index\n      \"scriptPubKey\" : {      (json object)\n        \"asm\" : \"str\",        (string) Disassembly of the output script\n        \"desc\" : \"str\",       (string) Inferred descriptor for the output\n        \"hex\" : \"hex\",        (string) The raw output script bytes, hex-encoded\n        \"address\" : \"str\",    (string, optional) The Bitcoin address (only if a well-defined address exists)\n        \"type\" : \"str\"        (string) The type (one of: nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n      }\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli decoderawtransaction \"hexstring\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"decoderawtransaction\", \"params\": [\"hexstring\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help gettxspendingprevout` text (Bitcoin Core 29).
+const GETTXSPENDINGPREVOUT_HELP: &str = "gettxspendingprevout [{\"txid\":\"hex\",\"vout\":n},...]\n\nScans the mempool to find transactions spending any of the given outputs\n\nArguments:\n1. outputs                 (json array, required) The transaction outputs that we want to check, and within each, the txid (string) vout (numeric).\n     [\n       {                   (json object)\n         \"txid\": \"hex\",    (string, required) The transaction id\n         \"vout\": n,        (numeric, required) The output number\n       },\n       ...\n     ]\n\nResult:\n[                              (json array)\n  {                            (json object)\n    \"txid\" : \"hex\",            (string) the transaction id of the checked output\n    \"vout\" : n,                (numeric) the vout value of the checked output\n    \"spendingtxid\" : \"hex\"     (string, optional) the transaction id of the mempool transaction spending this output (omitted if unspent)\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli gettxspendingprevout \"[{\\\"txid\\\":\\\"a08e6907dbbd3d809776dbfc5d82e371b764ed838b5655e72f463568df1aadf0\\\",\\\"vout\\\":3}]\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"gettxspendingprevout\", \"params\": [[{\"txid\":\"a08e6907dbbd3d809776dbfc5d82e371b764ed838b5655e72f463568df1aadf0\",\"vout\":3}]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help estimatesmartfee` text (Bitcoin Core 29).
+const ESTIMATESMARTFEE_HELP: &str = "estimatesmartfee conf_target ( \"estimate_mode\" )\n\nEstimates the approximate fee per kilobyte needed for a transaction to begin\nconfirmation within conf_target blocks if possible and return the number of blocks\nfor which the estimate is valid. Uses virtual transaction size as defined\nin BIP 141 (witness data is discounted).\n\nArguments:\n1. conf_target      (numeric, required) Confirmation target in blocks (1 - 1008)\n2. estimate_mode    (string, optional, default=\"economical\") The fee estimate mode.\n                    unset, economical, conservative \n                    unset means no mode set (default mode will be used). \n                    economical estimates use a shorter time horizon, making them more\n                    responsive to short-term drops in the prevailing fee market. This mode\n                    potentially returns a lower fee rate estimate.\n                    conservative estimates use a longer time horizon, making them\n                    less responsive to short-term drops in the prevailing fee market. This mode\n                    potentially returns a higher fee rate estimate.\n                    \n\nResult:\n{                   (json object)\n  \"feerate\" : n,    (numeric, optional) estimate fee rate in BTC/kvB (only present if no errors were encountered)\n  \"errors\" : [      (json array, optional) Errors encountered during processing (if there are any)\n    \"str\",          (string) error\n    ...\n  ],\n  \"blocks\" : n      (numeric) block number where estimate was found\n                    The request target will be clamped between 2 and the highest target\n                    fee estimation is able to return based on how long it has been running.\n                    An error is returned if not enough transactions and blocks\n                    have been observed to make an estimate for any number of blocks.\n}\n\nExamples:\n> bitcoin-cli estimatesmartfee 6\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"estimatesmartfee\", \"params\": [6]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help getindexinfo` text (Bitcoin Core 29).
+const GETINDEXINFO_HELP: &str = "getindexinfo ( \"index_name\" )\n\nReturns the status of one or all available indices currently running in the node.\n\nArguments:\n1. index_name    (string, optional) Filter results for an index with a specific name.\n\nResult:\n{                               (json object)\n  \"name\" : {                    (json object) The name of the index\n    \"synced\" : true|false,      (boolean) Whether the index is synced or not\n    \"best_block_height\" : n     (numeric) The block height to which the index is synced\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getindexinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> bitcoin-cli getindexinfo txindex\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getindexinfo\", \"params\": [txindex]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 fn missing_params(what: &str) -> (Value, Option<(i64, String)>) {
     (
@@ -800,10 +840,11 @@ fn script_pubkey_json(
 }
 
 /// `scriptSig` decode — asm + hex only; input scripts never carry an
-/// address.
+/// address. Core's `TxToUniv` passes `fAttemptSighashDecode` here, so
+/// DER-sig pushes carry their `[HASHTYPE]` suffix.
 fn script_json(script: &avila_consensus::transaction::Script) -> Value {
     json!({
-        "asm": script.asm(),
+        "asm": script.asm_sighash(),
         "hex": hex::encode(script.as_bytes()),
     })
 }
@@ -889,42 +930,41 @@ fn decodescript_json(
 
 /// A decoded transaction in Core's `getrawtransaction`/`getblock`
 /// verbosity-2 shape (`vout` spends omitted).
-fn tx_json(tx: &Transaction, params: &avila_consensus::params::Params) -> Value {
+fn tx_json(tx: &Transaction, params: &avila_consensus::params::Params, include_hex: bool) -> Value {
     let weight = tx.weight();
-    json!({
+    let mut out = json!({
         "txid": tx.txid().to_string(),
         "hash": tx.wtxid().to_string(),
-        "hex": hex::encode(&tx.encode()),
         "version": tx.version,
         "size": tx.size_with_witness(),
         "vsize": weight.div_ceil(4),
         "weight": weight,
         "locktime": tx.lock_time,
         "vin": tx.inputs.iter().map(|input| {
-            if input.previous_output.is_null() {
-                json!({
-                    "coinbase": hex::encode(input.script_sig.as_bytes()),
-                    "sequence": input.sequence,
-                })
+            let mut vin = if input.previous_output.is_null() {
+                json!({"coinbase": hex::encode(input.script_sig.as_bytes())})
             } else {
-                let mut vin = json!({
+                json!({
                     "txid": input.previous_output.txid.to_string(),
                     "vout": input.previous_output.vout,
                     "scriptSig": script_json(&input.script_sig),
-                    "sequence": input.sequence,
-                });
-                if !input.witness.is_empty() {
-                    vin["txinwitness"] = json!(
-                        input
-                            .witness
-                            .items()
-                            .iter()
-                            .map(|i| hex::encode(i))
-                            .collect::<Vec<_>>()
-                    );
-                }
-                vin
+                })
+            };
+            // `txinwitness` precedes `sequence` and applies to
+            // coinbase inputs too (witness coinbases carry the
+            // 32-byte reserved value).
+            if !input.witness.is_empty() {
+                vin["txinwitness"] = json!(
+                    input
+                        .witness
+                        .items()
+                        .iter()
+                        .map(|i| hex::encode(i))
+                        .collect::<Vec<_>>()
+                );
             }
+            vin["sequence"] = json!(input.sequence);
+            vin
         }).collect::<Vec<_>>(),
         "vout": tx.outputs.iter().enumerate().map(|(n, out)| {
             json!({
@@ -933,7 +973,11 @@ fn tx_json(tx: &Transaction, params: &avila_consensus::params::Params) -> Value 
                 "scriptPubKey": script_pubkey_json(&out.script_pubkey, params),
             })
         }).collect::<Vec<_>>(),
-    })
+    });
+    if include_hex {
+        out["hex"] = json!(hex::encode(&tx.encode()));
+    }
+    out
 }
 
 /// A pooled entry in Core's `getmempoolentry` shape — the admission
@@ -1180,6 +1224,69 @@ fn dispatch(
                 Ok(decodescript_json(&script, cs.tree().params()))
             })
         }
+        "decoderawtransaction" => {
+            // RPCHelpMan: 1–2 args; anything else is the -1 help throw.
+            if params
+                .as_array()
+                .is_some_and(|a| a.len() > 2 || a.is_empty())
+            {
+                return help_error(DECODERAWTRANSACTION_HELP);
+            }
+            let hexstr_val = param(params, 0, "hexstring");
+            match hexstr_val {
+                None => return help_error(DECODERAWTRANSACTION_HELP),
+                Some(v) if !v.is_string() => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(1, "hexstring", v, "string"),
+                        )),
+                    );
+                }
+                _ => {}
+            }
+            let hexstr = hexstr_val.and_then(Value::as_str).unwrap_or_default();
+            // Core's `iswitness`: unset tries no-witness then witness,
+            // false pins the no-witness parse, true pins witness. A
+            // non-bool is Core's -3 type error.
+            let iswitness_val = param(params, 1, "iswitness");
+            if let Some(v) = iswitness_val
+                && !v.is_null()
+                && !v.is_boolean()
+            {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_message(2, "iswitness", v, "bool"),
+                    )),
+                );
+            }
+            let iswitness = iswitness_val.and_then(Value::as_bool);
+            let Ok(bytes) = hex::decode(hexstr) else {
+                return (
+                    Value::Null,
+                    Some((RPC_DESERIALIZATION_ERROR, "TX decode failed".into())),
+                );
+            };
+            let decoded = match iswitness {
+                Some(true) => Transaction::decode(&bytes).ok(),
+                Some(false) => Transaction::decode_no_witness(&bytes).ok(),
+                None => Transaction::decode_no_witness(&bytes)
+                    .or_else(|_| Transaction::decode(&bytes))
+                    .ok(),
+            };
+            let Some(tx) = decoded else {
+                return (
+                    Value::Null,
+                    Some((RPC_DESERIALIZATION_ERROR, "TX decode failed".into())),
+                );
+            };
+            chain_query(queries, move |cs, _| {
+                Ok(tx_json(&tx, cs.tree().params(), false))
+            })
+        }
         "getblockhash" => {
             let Some(height) = param(params, 0, "height").and_then(Value::as_u64) else {
                 return missing_params("height");
@@ -1255,7 +1362,7 @@ fn dispatch(
                                 block
                                     .transactions
                                     .iter()
-                                    .map(|tx| tx_json(tx, cs.tree().params()))
+                                    .map(|tx| tx_json(tx, cs.tree().params(), true))
                                     .collect::<Vec<_>>()
                             )
                         };
@@ -1391,15 +1498,8 @@ fn dispatch(
                 };
                 // With include_mempool (Core's default), an output spent
                 // by a pooled transaction reports as spent.
-                if include_mempool {
-                    let spent = mgr.mempool_ref().txids().iter().any(|id| {
-                        mgr.mempool_ref().get(id).is_some_and(|tx| {
-                            tx.inputs.iter().any(|i| i.previous_output == outpoint)
-                        })
-                    });
-                    if spent {
-                        return Ok(Value::Null);
-                    }
+                if include_mempool && mgr.mempool_ref().spent_by(&outpoint).is_some() {
+                    return Ok(Value::Null);
                 }
                 match cs.utxo().get(&outpoint) {
                     None => Ok(Value::Null),
@@ -1417,6 +1517,170 @@ fn dispatch(
                         }))
                     }
                 }
+            })
+        }
+        "gettxspendingprevout" => {
+            // Core's shape: `[{"txid":h,"vout":n},...]` → same list with
+            // `spendingtxid` added when the mempool spends the output.
+            if params.as_array().is_some_and(|a| a.len() > 1) {
+                return help_error(GETTXSPENDINGPREVOUT_HELP);
+            }
+            let Some(outputs_val) = param(params, 0, "outputs") else {
+                return help_error(GETTXSPENDINGPREVOUT_HELP);
+            };
+            let Some(outputs) = outputs_val.as_array() else {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_message(1, "outputs", outputs_val, "array"),
+                    )),
+                );
+            };
+            if outputs.is_empty() {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_INVALID_PARAMETER,
+                        "Invalid parameter, outputs are missing".into(),
+                    )),
+                );
+            }
+            let mut outpoints = Vec::with_capacity(outputs.len());
+            for item in outputs {
+                let Some(obj) = item.as_object() else {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            format!(
+                                "JSON value of type {} is not of expected type object",
+                                json_type_name(item)
+                            ),
+                        )),
+                    );
+                };
+                let txid = match obj.get("txid") {
+                    Some(v) if !v.is_string() => {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_TYPE_ERROR,
+                                format!(
+                                    "JSON value of type {} for field txid is not of \
+                                     expected type string",
+                                    json_type_name(v)
+                                ),
+                            )),
+                        );
+                    }
+                    Some(v) => match v.as_str().unwrap_or_default().parse::<Txid>() {
+                        Ok(t) => t,
+                        Err(_) => {
+                            let s = v.as_str().unwrap_or_default();
+                            let msg = if s.len() != 64 {
+                                format!("txid must be of length 64 (not {}, for '{s}')", s.len())
+                            } else {
+                                format!("txid must be hexadecimal string (not '{s}')")
+                            };
+                            return (Value::Null, Some((RPC_INVALID_PARAMETER, msg)));
+                        }
+                    },
+                    None => {
+                        return (Value::Null, Some((RPC_TYPE_ERROR, "Missing txid".into())));
+                    }
+                };
+                let vout = match obj.get("vout") {
+                    Some(v) if !v.is_number() => {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_TYPE_ERROR,
+                                format!(
+                                    "JSON value of type {} for field vout is not of \
+                                     expected type number",
+                                    json_type_name(v)
+                                ),
+                            )),
+                        );
+                    }
+                    // Core reads `vout` via `getInt<int>`: non-integer
+                    // and out-of-i32-range values are UniValue's
+                    // "JSON integer out of range" (-1), then negatives
+                    // are the -8 gate.
+                    Some(v) => match v.as_i64() {
+                        Some(n) if n < 0 => {
+                            return (
+                                Value::Null,
+                                Some((
+                                    RPC_INVALID_PARAMETER,
+                                    "Invalid parameter, vout cannot be negative".into(),
+                                )),
+                            );
+                        }
+                        Some(n) if n > i64::from(i32::MAX) || v.is_f64() => {
+                            return (
+                                Value::Null,
+                                Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                            );
+                        }
+                        Some(n) => n as u32,
+                        None => {
+                            return (
+                                Value::Null,
+                                Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                            );
+                        }
+                    },
+                    None => {
+                        return (Value::Null, Some((RPC_TYPE_ERROR, "Missing vout".into())));
+                    }
+                };
+                outpoints.push((OutPoint { txid, vout }, txid.to_string(), u64::from(vout)));
+            }
+            chain_query(queries, move |cs, mgr| {
+                let _ = cs;
+                Ok(json!(
+                    outpoints
+                        .iter()
+                        .map(|(op, txid_s, vout)| {
+                            let mut entry = json!({"txid": txid_s, "vout": vout});
+                            if let Some(tx) = mgr.mempool_ref().spent_by(op) {
+                                entry["spendingtxid"] = json!(tx.txid().to_string());
+                            }
+                            entry
+                        })
+                        .collect::<Vec<_>>()
+                ))
+            })
+        }
+        "getindexinfo" => {
+            if params.as_array().is_some_and(|a| a.len() > 1) {
+                return help_error(GETINDEXINFO_HELP);
+            }
+            let filter = match param(params, 0, "index_name") {
+                Some(v) if !v.is_null() && !v.is_string() => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(1, "index_name", v, "string"),
+                        )),
+                    );
+                }
+                Some(v) if !v.is_null() => Some(v.as_str().unwrap_or_default().to_string()),
+                _ => None,
+            };
+            chain_query(queries, move |cs, _| {
+                if !cs.txindex_enabled() || filter.as_deref().is_some_and(|f| f != "txindex") {
+                    return Ok(json!({}));
+                }
+                Ok(json!({
+                    "txindex": {
+                        "synced": true,
+                        "best_block_height": cs.chain().len() as u32 - 1,
+                    }
+                }))
             })
         }
         "getrawtransaction" => {
@@ -1492,7 +1756,7 @@ fn dispatch(
                 match verbosity {
                     0 => Ok(json!(hex::encode(&tx.encode()))),
                     1 | 2 => {
-                        let mut out = tx_json(&tx, cs.tree().params());
+                        let mut out = tx_json(&tx, cs.tree().params(), true);
                         if let Some(bh) = in_block
                             && let Some(node) = cs.tree().get(&bh)
                         {
@@ -2409,11 +2673,75 @@ fn dispatch(
             ),
         },
         "estimatesmartfee" => {
-            let target = params
-                .get(0)
-                .or_else(|| params.get("conf_target"))
-                .and_then(Value::as_u64)
-                .unwrap_or(6) as u32;
+            // RPCHelpMan: 1–2 args.
+            if params
+                .as_array()
+                .is_some_and(|a| a.len() > 2 || a.is_empty())
+            {
+                return help_error(ESTIMATESMARTFEE_HELP);
+            }
+            let target_val = param(params, 0, "conf_target");
+            let target = match target_val {
+                None => return help_error(ESTIMATESMARTFEE_HELP),
+                Some(v) if !v.is_number() => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(1, "conf_target", v, "number"),
+                        )),
+                    );
+                }
+                // Core reads it via `getInt<unsigned int>` — a float
+                // or out-of-u32 value is UniValue's -1 error before
+                // the range check.
+                Some(v) if v.is_f64() || v.as_u64().is_none() => {
+                    return (
+                        Value::Null,
+                        Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                    );
+                }
+                Some(v) => match v.as_u64() {
+                    Some(n) if (1..=1008).contains(&n) => n as u32,
+                    _ => {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_INVALID_PARAMETER,
+                                "Invalid conf_target, must be between 1 and 1008".into(),
+                            )),
+                        );
+                    }
+                },
+            };
+            if let Some(v) = param(params, 1, "estimate_mode") {
+                if !v.is_null() && !v.is_string() {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(2, "estimate_mode", v, "string"),
+                        )),
+                    );
+                }
+                // `FeeModeFromString` uppercases before matching.
+                if let Some(mode) = v.as_str()
+                    && !matches!(
+                        mode.to_ascii_lowercase().as_str(),
+                        "unset" | "economical" | "conservative"
+                    )
+                {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_INVALID_PARAMETER,
+                            "Invalid estimate_mode parameter, must be one of: \
+                             \"unset\", \"economical\", \"conservative\""
+                                .into(),
+                        )),
+                    );
+                }
+            }
             chain_query(queries, move |_, mgr| {
                 match mgr.mempool_ref().estimate_fee(target) {
                     // Core reports feerate in BTC/kvB; our estimator
@@ -2422,10 +2750,13 @@ fn dispatch(
                         "feerate": rate as f64 / 100_000_000.0,
                         "blocks": target,
                     })),
-                    None => Err((
-                        RPC_INVALID_PARAMS,
-                        "insufficient data — no confirming samples seen for this target".into(),
-                    )),
+                    // Core's estimator returns a result object with an
+                    // `errors` list when it has no data — not an RPC
+                    // error.
+                    None => Ok(json!({
+                        "errors": ["Insufficient data or no feerate found"],
+                        "blocks": 0,
+                    })),
                 }
             })
         }
@@ -2437,10 +2768,12 @@ fn dispatch(
                  \x20   getblockhash <height>, getblockheader <hash> [verbose],\n\
                  \x20   getblock <hash> [verbosity 0-2], getblockstats <hash|height> [stats],\n\
                  \x20   getrawtransaction <txid> [verbosity] [blockhash],\n\
+                 \x20   decoderawtransaction <hex> [iswitness], getindexinfo [index_name],\n\
                  \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>,\n\
                  \x20   validateaddress <address>\n\
                  \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
                  \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
+                 \x20   gettxspendingprevout <outputs>,\n\
                  \x20   getorphantxs, testmempoolaccept <rawtx | [rawtx,...]>,\n\
                  \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount], savemempool\n\
                  \x20 mining: getblocktemplate, getmininginfo, submitblock <hex>,\n\
@@ -2757,10 +3090,14 @@ mod tests {
         assert_eq!(r["next"]["height"], 1);
         assert!(r["next"]["target"].is_string());
 
-        // An empty pool has no confirmation samples — the estimate
-        // says so rather than inventing a rate.
-        let (_, e) = dispatch("estimatesmartfee", &json!([6]), &snap, Some(&queries), None);
-        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
+        // An empty pool has no confirmation samples — Core returns a
+        // result object with `errors`, not an RPC error.
+        let (r, e) = dispatch("estimatesmartfee", &json!([6]), &snap, Some(&queries), None);
+        assert!(e.is_none());
+        assert_eq!(
+            r,
+            json!({"errors": ["Insufficient data or no feerate found"], "blocks": 0})
+        );
 
         // getnetworkinfo splits in/out connections.
         let (r, e) = dispatch("getnetworkinfo", &Value::Null, &snap, Some(&queries), None);
@@ -3195,5 +3532,179 @@ mod tests {
             None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
+    }
+
+    /// `decoderawtransaction` — the regtest genesis coinbase decodes
+    /// in Core's TxToUniv shape (no `hex` echo), each `iswitness`
+    /// spelling works, and every error path carries Core's code.
+    #[test]
+    fn decoderawtransaction_matches_core_shape() {
+        let params = Network::Regtest.params();
+        let queries = query_server(Chainstate::new(&params));
+        let snap = snap();
+        let cb_hex = hex::encode(&params.genesis_block().unwrap().transactions[0].encode());
+        let cb_txid = params.genesis_block().unwrap().transactions[0]
+            .txid()
+            .to_string();
+
+        for p in [
+            json!([cb_hex]),
+            json!([cb_hex, true]),
+            json!([cb_hex, false]),
+        ] {
+            let (r, e) = dispatch("decoderawtransaction", &p, &snap, Some(&queries), None);
+            assert!(e.is_none(), "{e:?}");
+            assert_eq!(r["txid"], json!(cb_txid));
+            assert!(r.get("hex").is_none(), "decoderawtransaction omits hex");
+            assert!(r.get("blockhash").is_none());
+            assert_eq!(r["vin"][0]["coinbase"].as_str().unwrap().len() % 2, 0);
+        }
+
+        // Bad hex / undecodable bytes / wrong-type iswitness / missing
+        // or excess args all carry Core's codes.
+        let (_, e) = dispatch(
+            "decoderawtransaction",
+            &json!(["zz"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
+        let (_, e) = dispatch(
+            "decoderawtransaction",
+            &json!(["00"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
+        let (_, e) = dispatch(
+            "decoderawtransaction",
+            &json!([cb_hex, 2]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_TYPE_ERROR);
+        assert!(msg.contains("Position 2 (iswitness)"), "{msg}");
+        let (_, e) = dispatch(
+            "decoderawtransaction",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+        let (_, e) = dispatch(
+            "decoderawtransaction",
+            &json!([cb_hex, true, 1]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+    }
+
+    /// `getindexinfo` — `{}` without `-txindex`, the Core status object
+    /// with it, and the name filter gates the output.
+    #[test]
+    fn getindexinfo_reflects_txindex_state() {
+        let snap = snap();
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let (r, e) = dispatch("getindexinfo", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none());
+        assert_eq!(r, json!({}));
+
+        let mut cs = Chainstate::new(&Network::Regtest.params());
+        cs.enable_txindex(None).unwrap();
+        let queries = query_server(cs);
+        let (r, e) = dispatch("getindexinfo", &json!([]), &snap, Some(&queries), None);
+        assert!(e.is_none());
+        assert_eq!(r["txindex"]["synced"], json!(true));
+        assert_eq!(r["txindex"]["best_block_height"], json!(0));
+
+        // The name filter: "txindex" keeps it, anything else empties.
+        let (r, _) = dispatch(
+            "getindexinfo",
+            &json!(["txindex"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(r.get("txindex").is_some());
+        let (r, _) = dispatch(
+            "getindexinfo",
+            &json!(["coinstatsindex"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(r, json!({}));
+        // Non-string name → Core's -3; extra args → the -1 help throw.
+        let (_, e) = dispatch("getindexinfo", &json!([5]), &snap, Some(&queries), None);
+        assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
+        let (_, e) = dispatch(
+            "getindexinfo",
+            &json!(["a", "b"]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+    }
+
+    /// `gettxspendingprevout` — well-formed queries echo the inputs and
+    /// every malformed input carries Core's exact error code.
+    #[test]
+    fn gettxspendingprevout_validates_core_style() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let txid = "04".repeat(32);
+
+        // Nothing in the pool spends it → the entry echoes without
+        // `spendingtxid`.
+        let (r, e) = dispatch(
+            "gettxspendingprevout",
+            &json!([[{"txid": txid, "vout": 0}]]),
+            &snap,
+            Some(&queries),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(
+            r,
+            json!([{"txid": txid, "vout": 0}]),
+            "unspent output must omit spendingtxid"
+        );
+
+        // Core's error taxonomy: -1 help for absent/oversized args,
+        // -3 for type errors and missing fields, -8 for the
+        // outputs-empty / negative-vout / bad-txid gates, -1 for
+        // integer range.
+        for (p, code) in [
+            (json!([]), RPC_MISC_ERROR),
+            (
+                json!([[{"txid": txid, "vout": 0}], [{"txid": txid, "vout": 1}]]),
+                RPC_MISC_ERROR,
+            ),
+            (json!(["notarray"]), RPC_TYPE_ERROR),
+            (json!([[5]]), RPC_TYPE_ERROR),
+            (json!([[{"vout": 0}]]), RPC_TYPE_ERROR),
+            (json!([[{"txid": 5, "vout": 0}]]), RPC_TYPE_ERROR),
+            (json!([[{"txid": txid}]]), RPC_TYPE_ERROR),
+            (json!([[{"txid": txid, "vout": "0"}]]), RPC_TYPE_ERROR),
+            (json!([[]]), RPC_INVALID_PARAMETER),
+            (json!([[{"txid": "zz", "vout": 0}]]), RPC_INVALID_PARAMETER),
+            (json!([[{"txid": txid, "vout": -1}]]), RPC_INVALID_PARAMETER),
+            (json!([[{"txid": txid, "vout": 1.5}]]), RPC_MISC_ERROR),
+            (
+                json!([[{"txid": txid, "vout": 4_000_000_000i64}]]),
+                RPC_MISC_ERROR,
+            ),
+        ] {
+            let (_, e) = dispatch("gettxspendingprevout", &p, &snap, Some(&queries), None);
+            assert_eq!(e.unwrap().0, code, "params {p}");
+        }
     }
 }

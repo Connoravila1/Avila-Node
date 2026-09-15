@@ -348,6 +348,31 @@ impl Transaction {
         Ok(tx)
     }
 
+    /// Decodes a transaction with witness serialization disabled — Core's
+    /// `UnserializeTransaction` with `allow_witness = false`, used by
+    /// `decoderawtransaction`'s `iswitness=false` mode. Reads `vin || vout ||
+    /// lock_time` straight; a BIP144 serialization's `00 01` marker/flags pair
+    /// misdirects this parse into garbage, exactly like Core's no-witness
+    /// attempt.
+    ///
+    /// # Errors
+    ///
+    /// As [`Transaction::decode`].
+    pub fn decode_no_witness(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut decoder = Decoder::new(bytes);
+        let version = decoder.read_u32_le()?;
+        let inputs = Self::read_vin(&mut decoder)?;
+        let outputs = Self::read_vout(&mut decoder)?;
+        let lock_time = decoder.read_u32_le()?;
+        decoder.finish()?;
+        Ok(Transaction {
+            version,
+            inputs,
+            outputs,
+            lock_time,
+        })
+    }
+
     /// Appends one input's legacy fields (outpoint, `scriptSig`, sequence; no witness) to `out`.
     fn write_txin_no_witness(out: &mut Vec<u8>, input: &TxIn) {
         out.extend_from_slice(input.previous_output.txid.as_bytes());

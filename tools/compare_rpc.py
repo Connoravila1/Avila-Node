@@ -98,6 +98,22 @@ def build_calls(height):
         ("getblockstats", ["deadbeef"]),
         ("getrawtransaction", ["TXID", 1]),
         ("gettxout", ["TXID", 0]),
+        # decoderawtransaction: the shared-height coinbase hex plus
+        # each error class — bad hex, bad tx, wrong-type iswitness.
+        ("decoderawtransaction", ["RAWTX"]),
+        ("decoderawtransaction", ["RAWTX", True]),
+        ("decoderawtransaction", ["RAWTX", False]),
+        ("decoderawtransaction", ["RAWTX", 2]),
+        ("decoderawtransaction", ["zz"]),
+        # gettxspendingprevout: an unspent outpoint (the coinbase's
+        # vout 0 is unspent in both mempools' spend index — the
+        # mempool only tracks *spends*, not UTXO membership) plus the
+        # deterministic error paths.
+        ("gettxspendingprevout", [[{"txid": "TXID", "vout": 0}]]),
+        ("gettxspendingprevout", [[{"txid": "zz", "vout": 0}]]),
+        ("gettxspendingprevout", [[{"vout": 0}]]),
+        ("gettxspendingprevout", [[]]),
+        ("getindexinfo", []),
         # decodescript: one call per standard template family — the
         # values below are regtest scripts exercised against Knots.
         ("decodescript", ["76a914ba602196720c6f0c47c823e106405d9b0dc71dc088ac"]),
@@ -112,6 +128,9 @@ def build_calls(height):
         ("getmininginfo", []),
         ("getblocktemplate", [{"rules": ["segwit"]}]),
         ("estimatesmartfee", [6]),
+        ("estimatesmartfee", [0]),
+        ("estimatesmartfee", ["x"]),
+        ("estimatesmartfee", [6, "bogus"]),
         # sendrawtransaction: deterministic error paths only — a valid
         # tx can't be in the static matrix since pool state differs per
         # daemon (verified live separately).
@@ -237,6 +256,11 @@ def main():
     blockhex = core_block_hex if s == "ok" else None
     s, ghash = call(args.core, auth_c, "getblockhash", [0])
     ghash = ghash if s == "ok" else None
+    # The coinbase's raw hex — named-block lookup works without a
+    # txindex on the Core side.
+    s, rawtx = call(args.core, auth_c, "getrawtransaction",
+                    [txid, 0, core_hash]) if txid else ("err", None)
+    rawtx = rawtx if s == "ok" else None
 
     calls = build_calls(h)
     total = {"MATCH": 0, "EXPECTED-DIFF": 0, "DIFFERS": 0,
@@ -247,11 +271,31 @@ def main():
     for method, params in calls:
         if method == "stop-token-check":
             continue
-        resolved = [core_hash if v == "HASH" else v for v in params]
-        resolved = [txid if v == "TXID" else v for v in resolved]
-        resolved = [blockhex if v == "BLOCKHEX" else v for v in resolved]
-        resolved = [ghash if v == "GHASH" else v for v in resolved]
-        if any(v is None for v in resolved):
+        placeholders = {"HASH": core_hash, "TXID": txid,
+                        "BLOCKHEX": blockhex, "GHASH": ghash,
+                        "RAWTX": rawtx}
+
+        def resolve(v):
+            if isinstance(v, str) and v in placeholders:
+                return placeholders[v]
+            if isinstance(v, list):
+                return [resolve(x) for x in v]
+            if isinstance(v, dict):
+                return {k: resolve(x) for k, x in v.items()}
+            return v
+
+        resolved = resolve(params)
+
+        def has_none(v):
+            if v is None:
+                return True
+            if isinstance(v, list):
+                return any(has_none(x) for x in v)
+            if isinstance(v, dict):
+                return any(has_none(x) for x in v.values())
+            return False
+
+        if has_none(resolved):
             total["SKIPPED"] += 1
             continue
         sa, ra = call(args.avila, auth_a, method, resolved)

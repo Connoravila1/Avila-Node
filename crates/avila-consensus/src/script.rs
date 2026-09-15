@@ -238,6 +238,39 @@ fn is_valid_pubkey(key: &[u8]) -> bool {
 /// `CScriptNum` decode for `asm` rendering — little-endian
 /// sign-magnitude, no minimal-encoding or size enforcement (only
 /// pushes of at most four bytes reach it, so the value fits `i64`).
+///
+/// `ScriptToAsmStr`'s sighash decode: if `data` passes strict-DER
+/// signature encoding (`CheckSignatureEncoding` under
+/// `SCRIPT_VERIFY_STRICTENC`) and its last byte is a *defined*
+/// hashtype — base type ALL/NONE/SINGLE, no unsupported flag bits —
+/// return Core's `"[HASHTYPE]"` suffix. The caller strips the byte.
+fn sighash_suffix(data: &[u8]) -> Option<&'static str> {
+    if !crate::interpreter::is_valid_signature_encoding(data) {
+        return None;
+    }
+    let t = *data.last()?;
+    // `IsDefinedHashtypeSignature`: the base type must be a defined
+    // enum member and no bits outside ALL|NONE|SINGLE|ANYONECANPAY.
+    if t & !0x83 != 0 {
+        return None;
+    }
+    let base = match t & 0x1f {
+        1 => "ALL",
+        2 => "NONE",
+        3 => "SINGLE",
+        _ => return None,
+    };
+    Some(match t & 0x80 {
+        0x80 if base == "ALL" => "[ALL|ANYONECANPAY]",
+        0x80 if base == "NONE" => "[NONE|ANYONECANPAY]",
+        0x80 if base == "SINGLE" => "[SINGLE|ANYONECANPAY]",
+        0x80 => return None,
+        _ if base == "ALL" => "[ALL]",
+        _ if base == "NONE" => "[NONE]",
+        _ => "[SINGLE]",
+    })
+}
+
 fn script_num(data: &[u8]) -> i64 {
     let mut value = 0i64;
     for (i, &b) in data.iter().enumerate() {
@@ -544,6 +577,22 @@ impl Script {
     /// `GetOp` failure).
     #[must_use]
     pub fn asm(&self) -> String {
+        self.asm_impl(false)
+    }
+
+    /// `ScriptToAsmStr` with `fAttemptSighashDecode` — the mode Core's
+    /// `TxToUniv` applies to `scriptSig` (and only there): a push
+    /// longer than four bytes that passes strict-DER signature
+    /// encoding and ends in a defined hashtype renders as the DER hex
+    /// with `[ALL]`/`[NONE]`/`[SINGLE]`/`[ALL|ANYONECANPAY]`/…
+    /// appended. Skipped when the whole script is unspendable.
+    #[must_use]
+    pub fn asm_sighash(&self) -> String {
+        self.asm_impl(true)
+    }
+
+    fn asm_impl(&self, attempt_sighash_decode: bool) -> String {
+        let attempt = attempt_sighash_decode && !self.is_unspendable();
         let mut out = String::new();
         for instruction in self.instructions() {
             match instruction {
@@ -554,9 +603,14 @@ impl Script {
                     if data.len() <= 4 {
                         out.push_str(&script_num(data).to_string());
                     } else {
-                        for byte in data {
+                        let (body, suffix) = match sighash_suffix(data).filter(|_| attempt) {
+                            Some(name) => (&data[..data.len() - 1], name),
+                            None => (data, ""),
+                        };
+                        for byte in body {
                             out.push_str(&format!("{byte:02x}"));
                         }
+                        out.push_str(suffix);
                     }
                 }
                 Ok(Instruction::Op(opcode)) => {
@@ -1143,5 +1197,46 @@ mod tests {
         assert_eq!(push_int(16), vec![OP_16]);
         assert_eq!(push_int(17), vec![0x01, 0x11]);
         assert_eq!(push_int(-2), vec![0x01, 0x82]);
+    }
+
+    /// `asm_sighash` — `ScriptToAsmStr`'s `fAttemptSighashDecode`: a
+    /// strict-DER push whose last byte is a defined hashtype renders
+    /// without that byte plus a `[HASHTYPE]` suffix; anything else
+    /// stays plain hex. The suffix never fires on `asm()`.
+    #[test]
+    fn asm_sighash_annotates_der_pushes() {
+        // A real DER signature ending in SIGHASH_ALL (0x01).
+        let mut sig = vec![
+            0x30, 0x44, 0x02, 0x20, // DER: seq len 68, int len 32
+        ];
+        sig.extend_from_slice(&[0x11; 32]); // R
+        sig.extend_from_slice(&[0x02, 0x20]);
+        sig.extend_from_slice(&[0x22; 32]); // S
+        sig.push(0x01); // SIGHASH_ALL
+        let mut bytes = push_slice(&sig);
+        bytes.extend_from_slice(&push_slice(&[0x33; 33])); // pubkey push
+        let s = script(&bytes);
+
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(
+            s.asm_sighash(),
+            format!("{}[ALL] {}", hex(&sig[..sig.len() - 1]), hex(&[0x33; 33]))
+        );
+        // Plain asm() never decodes the hashtype.
+        assert_eq!(s.asm(), format!("{} {}", hex(&sig), hex(&[0x33; 33])));
+
+        // A signature whose last byte is NOT a defined hashtype
+        // (0x00) stays plain hex even in sighash mode.
+        let mut bad = sig.clone();
+        *bad.last_mut().unwrap() = 0x00;
+        let s = script(&push_slice(&bad));
+        assert_eq!(s.asm_sighash(), hex(&bad));
+        // Same for SIGHASH_SINGLE|ANYONECANPAY (0x83).
+        *bad.last_mut().unwrap() = 0x83;
+        let s = script(&push_slice(&bad));
+        assert_eq!(
+            s.asm_sighash(),
+            format!("{}[SINGLE|ANYONECANPAY]", hex(&bad[..bad.len() - 1]))
+        );
     }
 }

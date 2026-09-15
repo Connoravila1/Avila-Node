@@ -179,7 +179,12 @@ operation. Compare complete initial download and catch-up, not only local replay
       generatetoaddress, generateblock, savemempool,
       validateaddress, getblockstats (undo-backed fee/UTXO
       aggregates, Core's selector errors and stats filter),
-      getdifficulty) — verified live over curl and the client.
+      getdifficulty, decoderawtransaction (witness/`iswitness`
+      semantics, TxToUniv without the hex echo),
+      gettxspendingprevout (outpoint-indexed mempool spends,
+      Core's full argument error taxonomy), getindexinfo
+      (txindex state + name filter)) — verified live over curl
+      and the client.
       Genesis is served even though its body is never stored:
       `Params::genesis_block` reconstructs Core's per-network
       `CreateGenesisBlock` coinbase and `Chainstate::body` falls back
