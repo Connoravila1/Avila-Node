@@ -879,6 +879,23 @@ surfaced:
   multi-input mixed scripts, wrong-WIF, and every
   ParsePrevouts/getInt/sighash-string error path — all
   byte-identical.
+- `combinerawtransaction` ports Core's merge arm: each hex
+  variant decodes first (`TX decode failed for tx N. Make
+  sure the tx has at least one input.`), an empty array is
+  `Missing transactions`, and inputs resolve through the
+  chainstate+mempool view with mempool-spent reads as
+  `Coin::IsSpent` (-25 "Input not found or already spent").
+  Per input, `DataFromTransaction` extracts each variant's
+  partial spend, `MergeSignatureData` folds them
+  (complete-wins, else signature union + unset-script fill),
+  and `ProduceSignature` over the empty provider assembles
+  final scripts — a signed variant's witness/scriptSig
+  survives untouched through sigdata's own copies. Core's
+  quirk is preserved: variants are merged by input position
+  with no same-txid check. Verified live across 16 cases —
+  unsigned/signed/order permutations, 2-of-2 WSH multisig
+  two-part combine to complete, and every decode/element/
+  spent-input error path — all byte-identical.
 
 ### Known semantic differences
 

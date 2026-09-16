@@ -507,6 +507,26 @@ impl SignatureData {
             );
         }
     }
+
+    /// `SignatureData::MergeSignatureData` — a complete other side
+    /// wins wholesale; otherwise redeem/witness scripts fill only
+    /// when unset and `signatures` unions in.
+    pub fn merge_signature_data(&mut self, sigdata: SignatureData) {
+        if self.complete {
+            return;
+        }
+        if sigdata.complete {
+            *self = sigdata;
+            return;
+        }
+        if self.redeem_script.is_none() && sigdata.redeem_script.is_some() {
+            self.redeem_script = sigdata.redeem_script;
+        }
+        if self.witness_script.is_none() && sigdata.witness_script.is_some() {
+            self.witness_script = sigdata.witness_script;
+        }
+        self.signatures.extend(sigdata.signatures);
+    }
 }
 
 /// The final-script-witness value: a CompactSize item count followed
@@ -1878,7 +1898,7 @@ pub fn data_from_transaction(tx: &Transaction, n_in: usize, txout: &TxOut) -> Si
 }
 
 /// `UpdateInput` — write the produced scriptSig/witness onto the input.
-fn update_input(input: &mut TxIn, data: &SignatureData) {
+pub fn update_input(input: &mut TxIn, data: &SignatureData) {
     input.script_sig = Script::new(data.script_sig.clone());
     input.witness = data
         .script_witness
@@ -2978,5 +2998,41 @@ mod tests {
         ));
         assert!(tx.inputs[0].witness.len() == 2);
         assert!(errors.contains_key(&1));
+    }
+
+    /// `MergeSignatureData` — a complete other side replaces, partial
+    /// data unions signatures and fills unset scripts, and a complete
+    /// self is never degraded.
+    #[test]
+    fn merge_signature_data_core_semantics() {
+        let mut dst = SignatureData::default();
+        let mut src = SignatureData::default();
+        src.signatures
+            .insert([0x11; 20], (vec![0x02; 33], vec![0x30; 70]));
+        dst.redeem_script = Some(vec![0xaa]);
+        src.redeem_script = Some(vec![0xbb]);
+        src.witness_script = Some(vec![0xcc]);
+        dst.merge_signature_data(src);
+        // redeem kept (already set), witness filled, sigs unioned.
+        assert_eq!(dst.redeem_script.as_deref(), Some(&[0xaa][..]));
+        assert_eq!(dst.witness_script.as_deref(), Some(&[0xcc][..]));
+        assert_eq!(dst.signatures.len(), 1);
+
+        // A complete source wins wholesale.
+        let done = SignatureData {
+            complete: true,
+            script_sig: vec![0x51],
+            ..SignatureData::default()
+        };
+        dst.merge_signature_data(done);
+        assert!(dst.complete && dst.script_sig == vec![0x51]);
+        assert!(dst.signatures.is_empty()); // wholesale replace
+
+        // A complete self ignores the merge.
+        let mut src2 = SignatureData::default();
+        src2.signatures
+            .insert([0x22; 20], (vec![0x03; 33], vec![0x30; 70]));
+        dst.merge_signature_data(src2);
+        assert!(dst.signatures.is_empty());
     }
 }

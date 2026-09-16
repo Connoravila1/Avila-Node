@@ -2773,6 +2773,7 @@ Result:
 Examples:
 > curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"submitpackage\", \"params\": [[\"raw-parent-tx-1\", \"raw-parent-tx-2\", \"raw-child-tx\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/
 > bitcoin-cli submitpackage '[\"raw-tx-without-unconfirmed-parents\"]'\n";
+const COMBINERAWTRANSACTION_HELP: &str = "combinerawtransaction [\"hexstring\",...]\n\nCombine multiple partially signed transactions into one transaction.\nThe combined transaction may be another partially signed transaction or a \nfully signed transaction.\n\nArguments:\n1. txs                 (json array, required) The hex strings of partially signed transactions\n     [\n       \"hexstring\",    (string) A hex-encoded raw transaction\n       ...\n     ]\n\nResult:\n\"str\"    (string) The hex-encoded raw transaction with signature(s)\n\nExamples:\n> bitcoin-cli combinerawtransaction '[\"myhex1\", \"myhex2\", \"myhex3\"]'\n";
 const SENDRAWTRANSACTION_HELP: &str = "sendrawtransaction \"hexstring\" ( maxfeerate maxburnamount )\n\nSubmit a raw transaction (serialized, hex-encoded) to local node and network.\n\nThe transaction will be sent unconditionally to all peers, so using sendrawtransaction\nfor manual rebroadcast may degrade privacy by leaking the transaction's origin, as\nnodes will normally not rebroadcast non-wallet transactions already in their mempool.\n\nA specific exception, RPC_TRANSACTION_ALREADY_IN_UTXO_SET, may throw if the transaction cannot be added to the mempool.\n\nRelated RPCs: createrawtransaction, signrawtransactionwithkey\n\nArguments:\n1. hexstring        (string, required) The hex string of the raw transaction\n2. maxfeerate       (numeric or string, optional, default=\"0.10\") Reject transactions whose fee rate is higher than the specified value, expressed in BTC/kvB.\n                    Fee rates larger than 1BTC/kvB are rejected.\n                    Set to 0 to accept any fee rate.\n3. maxburnamount    (numeric or string, optional, default=\"0.00\") Reject transactions with provably unspendable outputs (e.g. 'datacarrier' outputs that use the OP_RETURN opcode) greater than the specified value, expressed in BTC.\n                    If burning funds through unspendable outputs is desired, increase this value.\n                    This check is based on heuristics and does not guarantee spendability of outputs.\n                    \n\nResult:\n\"hex\"    (string) The transaction hash in hex\n\nExamples:\n\nCreate a transaction\n> bitcoin-cli createrawtransaction \"[{\\\"txid\\\" : \\\"mytxid\\\",\\\"vout\\\":0}]\" \"{\\\"myaddress\\\":0.01}\"\nSign the transaction, and get back the hex\n> bitcoin-cli signrawtransactionwithwallet \"myhex\"\n\nSend the transaction (signed hex)\n> bitcoin-cli sendrawtransaction \"signedhex\"\n\nAs a JSON-RPC call\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"sendrawtransaction\", \"params\": [\"signedhex\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const SIGNRAWTRANSACTIONWITHKEY_HELP: &str = "signrawtransactionwithkey \"hexstring\" [\"privatekey\",...] ( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\",\"redeemScript\":\"hex\",\"witnessScript\":\"hex\",\"amount\":amount},...] \"sighashtype\" )\n\nSign inputs for raw transaction (serialized, hex-encoded).\nThe second argument is an array of base58-encoded private\nkeys that will be the only keys used to sign the transaction.\nThe third optional argument (may be null) is an array of previous transaction outputs that\nthis transaction depends on but may not yet be in the block chain.\n\nArguments:\n1. hexstring                        (string, required) The transaction hex string\n2. privkeys                         (json array, required) The base58-encoded private keys for signing\n     [\n       \"privatekey\",                (string) private key in base58-encoding\n       ...\n     ]\n3. prevtxs                          (json array, optional) The previous dependent transaction outputs\n     [\n       {                            (json object)\n         \"txid\": \"hex\",             (string, required) The transaction id\n         \"vout\": n,                 (numeric, required) The output number\n         \"scriptPubKey\": \"hex\",     (string, required) output script\n         \"redeemScript\": \"hex\",     (string, optional) (required for P2SH) redeem script\n         \"witnessScript\": \"hex\",    (string, optional) (required for P2WSH or P2SH-P2WSH) witness script\n         \"amount\": amount,          (numeric or string, optional) (required for Segwit inputs) the amount spent\n       },\n       ...\n     ]\n4. sighashtype                      (string, optional, default=\"DEFAULT for Taproot, ALL otherwise\") The signature hash type. Must be one of:\n                                    \"DEFAULT\"\n                                    \"ALL\"\n                                    \"NONE\"\n                                    \"SINGLE\"\n                                    \"ALL|ANYONECANPAY\"\n                                    \"NONE|ANYONECANPAY\"\n                                    \"SINGLE|ANYONECANPAY\"\n                                    \n\nResult:\n{                             (json object)\n  \"hex\" : \"hex\",              (string) The hex-encoded raw transaction with signature(s)\n  \"complete\" : true|false,    (boolean) If the transaction has a complete set of signatures\n  \"errors\" : [                (json array, optional) Script verification errors (if there are any)\n    {                         (json object)\n      \"txid\" : \"hex\",         (string) The hash of the referenced, previous transaction\n      \"vout\" : n,             (numeric) The index of the output to spent and used as input\n      \"witness\" : [           (json array)\n        \"hex\",                (string)\n        ...\n      ],\n      \"scriptSig\" : \"hex\",    (string) The hex-encoded signature script\n      \"sequence\" : n,         (numeric) Script sequence number\n      \"error\" : \"str\"         (string) Verification or signing error related to the input\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli signrawtransactionwithkey \"myhex\" \"[\\\"key1\\\",\\\"key2\\\"]\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"signrawtransactionwithkey\", \"params\": [\"myhex\", \"[\\\"key1\\\",\\\"key2\\\"]\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const SUBMITBLOCK_HELP: &str = "submitblock \"hexdata\" ( \"dummy\" )\n\nAttempts to submit new block to network.\nSee https://en.bitcoin.it/wiki/BIP_0022 for full specification.\n\nArguments:\n1. hexdata    (string, required) the hex-encoded block data to submit\n2. dummy      (string, optional, default=ignored) dummy value, for compatibility with BIP22. This value is ignored.\n\nResult (If the block was accepted):\nnull    (json null)\n\nResult (Otherwise):\n\"str\"    (string) According to BIP22\n\nExamples:\n> bitcoin-cli submitblock \"mydata\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"submitblock\", \"params\": [\"mydata\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
@@ -3668,6 +3669,11 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
             ("replaceable", Some("bool"), false),
         ],
         CREATERAWTRANSACTION_HELP,
+    ),
+    (
+        "combinerawtransaction",
+        &[("txs", Some("array"), true)],
+        COMBINERAWTRANSACTION_HELP,
     ),
     (
         "combinepsbt",
@@ -7623,6 +7629,91 @@ fn dispatch(
                 Ok(Value::Object(result))
             })
         }
+        // `combinerawtransaction` — decode every variant, merge each
+        // input's `DataFromTransaction` across all of them, then
+        // `ProduceSignature` over the empty provider (never signs —
+        // only assembles final scripts from the merged sigs).
+        // Core's rawtransaction.cpp arm; the merge takes whichever
+        // variant's input `i` exists, regardless of differing txids.
+        "combinerawtransaction" => {
+            let arr = params[0].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let mut variants = Vec::with_capacity(arr.len());
+            for (idx, t) in arr.iter().enumerate() {
+                let Some(hexs) = t.as_str() else {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, field_type_message(t, "string"))),
+                    );
+                };
+                match hex::decode(hexs)
+                    .ok()
+                    .and_then(|b| Transaction::decode(&b).ok())
+                {
+                    Some(txv) => variants.push(txv),
+                    None => {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_DESERIALIZATION_ERROR,
+                                format!(
+                                    "TX decode failed for tx {idx}. Make sure the tx has at least one input."
+                                ),
+                            )),
+                        );
+                    }
+                }
+            }
+            if variants.is_empty() {
+                return (
+                    Value::Null,
+                    Some((RPC_DESERIALIZATION_ERROR, "Missing transactions".into())),
+                );
+            }
+            let mut merged = variants[0].clone();
+            chain_query(queries, move |cs, mgr| {
+                let pool = mgr.mempool_ref();
+                for i in 0..merged.inputs.len() {
+                    let op = merged.inputs[i].previous_output;
+                    let coin = if pool.spent_by(&op).is_some() {
+                        None
+                    } else {
+                        pool.resolve(cs, &op).map(|c| c.out)
+                    };
+                    let Some(coin_out) = coin else {
+                        return Err((RPC_VERIFY_ERROR, "Input not found or already spent".into()));
+                    };
+                    let mut sigdata = avila_consensus::sign::SignatureData::default();
+                    for txv in &variants {
+                        if txv.inputs.len() > i {
+                            sigdata.merge_signature_data(
+                                avila_consensus::sign::data_from_transaction(txv, i, &coin_out),
+                            );
+                        }
+                    }
+                    // `MutableTransactionSignatureChecker(mergedTx, i,
+                    // amount, SIGHASH_ALL)` — no txdata, so the final
+                    // verify only succeeds for legacy-verifiable
+                    // spends; the witness survives through sigdata's
+                    // own copy either way. `Creator::Dummy` because
+                    // the empty provider can never reach CreateSig.
+                    let checker = avila_consensus::sigchecker::TransactionSignatureChecker {
+                        tx: &merged,
+                        n_in: i,
+                        amount: coin_out.value,
+                        txdata: None,
+                    };
+                    avila_consensus::sign::produce_signature(
+                        &avila_consensus::descriptor::FlatProvider::default(),
+                        &coin_out.script_pubkey,
+                        &mut sigdata,
+                        avila_consensus::sign::Creator::Dummy,
+                        &checker,
+                    );
+                    avila_consensus::sign::update_input(&mut merged.inputs[i], &sigdata);
+                }
+                Ok(json!(hex::encode(&merged.encode())))
+            })
+        }
         // Core's createmultisig (rpc/output_script.cpp) — n-of-m
         // multisig construction: keys parse first (HexToPubKey), then
         // the address type, then AddAndGetMultisigDestination's checks
@@ -10383,6 +10474,7 @@ fn dispatch(
                      \x20   getdescriptorinfo <desc>, deriveaddresses <desc> [range],\n\
                      \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount], savemempool,\n\
                      \x20   signrawtransactionwithkey <hex> <privkeys> [prevtxs] [sighashtype],\n\
+                     \x20   combinerawtransaction <[hex,...]>,\n\
                      \x20   submitpackage <[rawtx,...]> [maxfeerate] [maxburnamount]\n\
                      \x20 mining: getblocktemplate, getmininginfo, getnetworkhashps,\n\
                      \x20   submitblock <hex>,\n\

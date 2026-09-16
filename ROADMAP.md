@@ -395,7 +395,12 @@ operation. Compare complete initial download and catch-up, not only local replay
       {hex, complete, errors[]} with per-input
       txid/vout/witness/scriptSig/sequence/error entries —
       the MAX_MONEY sentinel throws Core's "Missing amount
-      for CTxOut(...)".
+      for CTxOut(...)". combinerawtransaction merges
+      partially-signed variants per input position through
+      DataFromTransaction + MergeSignatureData +
+      ProduceSignature over the empty provider — signatures
+      union, final scripts assemble, and no same-txid check
+      applies (Core's quirk).
       Verified
       byte-identical against
       Core 29.4 including a live spend+receive, a real
@@ -408,7 +413,9 @@ operation. Compare complete initial download and catch-up, not only local replay
       prevtxs-only coins, all seven sighash modes, taproot
       key-path, uncompressed-WIF pkh, multisig
       partial/complete, multi-input, and every
-      ParsePrevouts/getInt error path
+      ParsePrevouts/getInt error path, and
+      combinerawtransaction across unsigned/signed/order
+      permutations and a 2-of-2 WSH two-part combine
       (joinpsbts compared semantically — Core's join
       ordering is salted-unordered-map random). Outbound
       dialing is
