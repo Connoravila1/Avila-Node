@@ -1221,8 +1221,32 @@ fn psbt_input_json(
     if !proprietary.is_empty() {
         out.insert("proprietary".into(), json!(proprietary));
     }
+    // BIP370 types (0x09 por-commitment, 0x0e–0x12) are not parsed by
+    // Core and stay in `unknown`.
     let unknown = unknown_json(map, |t| {
-        t <= Psbt::IN_TAP_MERKLE_ROOT || t == Psbt::IN_PROPRIETARY
+        matches!(
+            t,
+            Psbt::IN_NON_WITNESS_UTXO
+                | Psbt::IN_WITNESS_UTXO
+                | Psbt::IN_PARTIAL_SIG
+                | Psbt::IN_SIGHASH_TYPE
+                | Psbt::IN_REDEEM_SCRIPT
+                | Psbt::IN_WITNESS_SCRIPT
+                | Psbt::IN_BIP32_DERIVATION
+                | Psbt::IN_FINAL_SCRIPTSIG
+                | Psbt::IN_FINAL_SCRIPTWITNESS
+                | Psbt::IN_RIPEMD160
+                | Psbt::IN_SHA256
+                | Psbt::IN_HASH160
+                | Psbt::IN_HASH256
+                | Psbt::IN_TAP_KEY_SIG
+                | Psbt::IN_TAP_SCRIPT_SIG
+                | Psbt::IN_TAP_LEAF_SCRIPT
+                | Psbt::IN_TAP_BIP32_DERIVATION
+                | Psbt::IN_TAP_INTERNAL_KEY
+                | Psbt::IN_TAP_MERKLE_ROOT
+                | Psbt::IN_PROPRIETARY
+        )
     });
     if let Value::Object(ref o) = unknown
         && !o.is_empty()
@@ -1258,14 +1282,50 @@ fn psbt_output_json(map: &avila_consensus::psbt::KeyMap) -> Value {
             out.insert("bip32_derivs".into(), json!(derivs));
         }
     }
+    if let Some(v) = map.get(Psbt::OUT_TAP_INTERNAL_KEY) {
+        out.insert("taproot_internal_key".into(), json!(hex::encode(v)));
+    }
+    if let Some(v) = map.get(Psbt::OUT_TAP_TREE) {
+        // `depth || leaf_ver || CompactSize script` triples, DFS order.
+        let mut dec = avila_consensus::encode::Decoder::new(v);
+        let mut tree = Vec::new();
+        while !dec.is_finished() {
+            let (Ok(d), Ok(lv), Ok(s)) = (dec.read_u8(), dec.read_u8(), dec.read_var_bytes())
+            else {
+                break;
+            };
+            tree.push(json!({
+                "depth": d,
+                "leaf_ver": lv,
+                "script": hex::encode(&s),
+            }));
+        }
+        out.insert("taproot_tree".into(), json!(tree));
+    }
+    {
+        let derivs: Vec<Value> = map
+            .all(Psbt::OUT_TAP_BIP32_DERIVATION)
+            .map(|(xonly, v)| taproot_bip32_deriv_json(xonly, v))
+            .collect();
+        if !derivs.is_empty() {
+            out.insert("taproot_bip32_derivs".into(), json!(derivs));
+        }
+    }
     let proprietary = proprietary_json(map, Psbt::OUT_PROPRIETARY);
     if !proprietary.is_empty() {
         out.insert("proprietary".into(), json!(proprietary));
     }
-    // Core 29.4's output map knows only types 00/01/02 + proprietary —
-    // everything else (including the BIP371 taproot fields) is unknown.
     let unknown = unknown_json(map, |t| {
-        t <= Psbt::OUT_BIP32_DERIVATION || t == Psbt::OUT_PROPRIETARY
+        matches!(
+            t,
+            Psbt::OUT_REDEEM_SCRIPT
+                | Psbt::OUT_WITNESS_SCRIPT
+                | Psbt::OUT_BIP32_DERIVATION
+                | Psbt::OUT_TAP_INTERNAL_KEY
+                | Psbt::OUT_TAP_TREE
+                | Psbt::OUT_TAP_BIP32_DERIVATION
+                | Psbt::OUT_PROPRIETARY
+        )
     });
     if let Value::Object(ref o) = unknown
         && !o.is_empty()
@@ -1307,15 +1367,11 @@ fn psbt_json(
     out.insert(
         "unknown".into(),
         unknown_json(&psbt.global, |t| {
+            // BIP370 global types (0x02–0x06) are unknown to Core.
             matches!(
                 t,
                 Psbt::GLOBAL_TX
                     | Psbt::GLOBAL_XPUB
-                    | Psbt::GLOBAL_TX_VERSION
-                    | Psbt::GLOBAL_FALLBACK_LOCKTIME
-                    | Psbt::GLOBAL_INPUT_COUNT
-                    | Psbt::GLOBAL_OUTPUT_COUNT
-                    | Psbt::GLOBAL_TX_MODIFIABLE
                     | Psbt::GLOBAL_VERSION
                     | Psbt::GLOBAL_PROPRIETARY
             )
@@ -6586,8 +6642,10 @@ fn dispatch(
         // joinpsbts — Core collects inputs/outputs through salted
         // unordered maps, so its output order is randomized per call;
         // we emit arg order, which is the same set either way.
-        // Signature-bearing input fields are dropped, the rest carry
-        // over, and global maps merge insert-absent.
+        // The merged tx takes max(version,1) and min(locktime);
+        // AddInput drops only partial_sigs/final_scriptsig/
+        // final_scriptwitness, and globals merge xpubs + unknown
+        // only — version and proprietary fields are dropped.
         "joinpsbts" => {
             let txs = match params[0].as_array() {
                 Some(a) => a,
@@ -6640,10 +6698,12 @@ fn dispatch(
                     }
                 }
             }
+            // Core's AddInput dedups on whole-CTxIn equality (prevout,
+            // scriptSig, sequence — witnesses are always empty here).
             let mut seen = std::collections::HashSet::new();
             for psbt in &psbts {
                 for input in &psbt.tx.inputs {
-                    if !seen.insert(input.previous_output) {
+                    if !seen.insert(input) {
                         return (
                             Value::Null,
                             Some((
@@ -6661,14 +6721,18 @@ fn dispatch(
                 avila_consensus::psbt::Psbt::IN_PARTIAL_SIG,
                 avila_consensus::psbt::Psbt::IN_FINAL_SCRIPTSIG,
                 avila_consensus::psbt::Psbt::IN_FINAL_SCRIPTWITNESS,
-                avila_consensus::psbt::Psbt::IN_TAP_KEY_SIG,
-                avila_consensus::psbt::Psbt::IN_TAP_SCRIPT_SIG,
             ];
+            let mut best_version: u32 = 1;
+            let mut best_locktime: u32 = u32::MAX;
+            for psbt in &psbts {
+                best_version = best_version.max(psbt.tx.version);
+                best_locktime = best_locktime.min(psbt.tx.lock_time);
+            }
             let mut merged_tx = Transaction {
-                version: 2,
+                version: best_version,
                 inputs: Vec::new(),
                 outputs: Vec::new(),
-                lock_time: 0,
+                lock_time: best_locktime,
             };
             let mut global = avila_consensus::psbt::KeyMap::default();
             let mut in_maps = Vec::new();
@@ -6677,8 +6741,23 @@ fn dispatch(
                 merged_tx.inputs.append(&mut psbt.tx.inputs);
                 merged_tx.outputs.append(&mut psbt.tx.outputs);
                 for (key, value) in &psbt.global.pairs {
-                    if key.first() != Some(&avila_consensus::psbt::Psbt::GLOBAL_TX) {
-                        global.insert_absent(key, value);
+                    // Core's join rebuilds the PSBT through AddInput/
+                    // AddOutput into a fresh map, then copies only
+                    // `unknown` into the shuffled result — xpubs,
+                    // version, and proprietary globals are all dropped.
+                    match key.first() {
+                        Some(&t)
+                            if !matches!(
+                                t,
+                                avila_consensus::psbt::Psbt::GLOBAL_TX
+                                    | avila_consensus::psbt::Psbt::GLOBAL_XPUB
+                                    | avila_consensus::psbt::Psbt::GLOBAL_VERSION
+                                    | avila_consensus::psbt::Psbt::GLOBAL_PROPRIETARY
+                            ) =>
+                        {
+                            global.insert_absent(key, value);
+                        }
+                        _ => {}
                     }
                 }
                 for mut map in psbt.inputs {

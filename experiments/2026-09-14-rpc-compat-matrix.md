@@ -706,23 +706,38 @@ surfaced:
   non-witness serialization. `combinepsbt` requires identical
   unsigned txs and merges global/input/output maps
   first-contributor-wins on exact key collisions; `joinpsbts`
-  requires ≥2 PSBTs, rejects duplicate input outpoints with
-  Core's `-8` "exists in multiple PSBTs", rebuilds the tx at
-  version 2/locktime 0, and strips signature/finalization fields
-  (partial sigs, final scriptSig/witness, taproot key-path and
-  script-path sigs) while keeping UTXOs, scripts, derivations,
-  and unknown/proprietary pairs. Renderer parity notes:
-  `redeem_script`/`witness_script` use Core's reduced
-  `{asm, hex, type}` shape (no `desc`/`address`),
-  `taproot_scripts` groups control blocks under
-  `{script, leaf_ver, control_blocks[]}`, and Core 29.4 reports
-  output-map key types ≥0x03 (taproot output fields) as
-  `unknown`. Verified live: `createpsbt`/`converttopsbt` 27-row
-  matrix byte-identical; `combinepsbt` byte-identical;
-  `joinpsbts` verified semantically — Core iterates its join
-  sets through salted unordered maps, so input/output ordering
-  is nondeterministic per call and the comparison canonicalizes
-  vin/vout/map content before diffing.
+  requires ≥2 PSBTs, rejects duplicate whole-`CTxIn` inputs with
+  Core's `-8` "exists in multiple PSBTs" (same outpoint with a
+  different sequence is *not* a duplicate), rebuilds the tx at
+  `version = max(1, versions)` and `locktime = min(locktimes)`,
+  and strips only `partial_sigs`/`final_script_sig`/
+  `final_script_witness` per `AddInput` — UTXOs, scripts,
+  derivations, taproot sigs, and unknown pairs survive. Core's
+  shuffle pass copies only `unknown` globals into the result, so
+  joined global xpubs, `psbt_version`, and proprietary pairs are
+  silently dropped. Verified live: `createpsbt`/`converttopsbt`
+  27-row matrix byte-identical; `combinepsbt` byte-identical;
+  `joinpsbts` verified semantically — Core shuffles input/output
+  order per call, so the comparison canonicalizes vin/vout/map
+  content before diffing.
+- The PSBT decoder now reproduces Core's per-type key/value
+  checks with exact error strings: scope-aware keydata shape
+  rules (33/65-byte partial-sig keys must be valid pubkeys,
+  20/32-byte preimage keys, 33-byte tap-script-sig keys, taproot
+  leaf control-block alignment, 78-byte xpub keydata with a
+  valid inner pubkey), per-type duplicate-key messages, value
+  length checks (`"Size of value was not the stated size"`,
+  per-field "invalid length"/"end of data" where Core reads
+  past a stated length into the outer stream),
+  `m_version > 0` → "Unsupported version number", tap-tree
+  completeness via a faithful `TaprootBuilder::Insert`
+  simulation, and `non_witness_utxo` hash/index validation
+  against the unsigned tx. `decodepsbt` renders the taproot
+  output fields (`taproot_internal_key`, `taproot_tree` as
+  `{depth, leaf_ver, script}` objects, `taproot_bip32_derivs`)
+  and treats BIP370 types (global 0x02–0x06, input 0x09 and
+  0x0e–0x12) as `unknown`, matching Core 29.4. Verified live:
+  51-row malformed/semantic decode matrix byte-identical.
 - `analyzepsbt` runs `node::AnalyzePSBT` on a new
   `avila-consensus/src/sign.rs` port of Core's
   `SignPSBTInput`/`ProduceSignature` over the empty

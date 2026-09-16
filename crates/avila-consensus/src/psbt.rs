@@ -40,24 +40,21 @@ pub enum PsbtError {
     /// Fewer output maps than the unsigned tx has outputs.
     #[error("Outputs provided does not match the number of outputs in transaction.")]
     OutputCountMismatch,
-    /// A key arrived with keydata where the type forbids it, or
-    /// missing keydata where the type requires it — the `name` is
-    /// Core's per-type label ("Global unsigned tx", "Input
-    /// redeemScript", …).
-    #[error("{0} key is more than one byte type")]
-    KeyDataWrong(&'static str),
-    /// A key appeared twice in the same map.
-    #[error("Duplicate key not allowed in {0} map")]
-    DuplicateKey(&'static str),
     /// The global map terminated without an unsigned-tx pair.
     #[error("No unsigned transaction was provided")]
     MissingUnsignedTx,
-    /// More than one unsigned-tx pair in the global map.
-    #[error("Multiple unsigned transactions provided")]
-    DuplicateUnsignedTx,
     /// The unsigned tx carried non-empty scriptSigs or witnesses.
-    #[error("Unsigned tx has non-empty scriptSigs")]
+    #[error("Unsigned tx does not have empty scriptSigs and scriptWitnesses.")]
     NonEmptyScriptSig,
+    /// `PSBT_GLOBAL_VERSION` above `PSBT_HIGHEST_VERSION` (0 — v2
+    /// PSBTs are rejected outright).
+    #[error("Unsupported version number")]
+    UnsupportedVersion,
+    /// A Core `std::ios_base::failure` message carried verbatim —
+    /// the per-type key-shape, duplicate, and value checks each
+    /// carry their own string.
+    #[error("{0}")]
+    Core(&'static str),
     /// Bytes remained after the last map.
     #[error("extra data after PSBT")]
     TrailingBytes,
@@ -81,120 +78,536 @@ impl PsbtError {
     }
 }
 
-/// Whether a BIP174 key type takes mandatory keydata (`Keydata`),
-/// forbids it (`NoKeydata`), or is unknown (`Any`).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum KeydataRule {
-    /// Keydata must be empty.
-    NoKeydata,
-    /// Keydata must be present (minimum length given).
-    Keydata(usize),
-    /// Type unrecognized — any keydata accepted.
-    Any,
+/// The map a key belongs to — selects Core's per-case check tables.
+#[derive(Clone, Copy)]
+enum Scope {
+    Global,
+    Input,
+    Output,
 }
 
-/// Core's `CheckKeyTypeAndKeyData` tables, one per map scope.
-fn global_key_rule(key_type: u8) -> KeydataRule {
-    match key_type {
-        Psbt::GLOBAL_TX => KeydataRule::NoKeydata,
-        Psbt::GLOBAL_XPUB => KeydataRule::Keydata(78),
-        Psbt::GLOBAL_TX_VERSION
-        | Psbt::GLOBAL_FALLBACK_LOCKTIME
-        | Psbt::GLOBAL_INPUT_COUNT
-        | Psbt::GLOBAL_OUTPUT_COUNT
-        | Psbt::GLOBAL_TX_MODIFIABLE
-        | Psbt::GLOBAL_VERSION => KeydataRule::NoKeydata,
-        Psbt::GLOBAL_PROPRIETARY => KeydataRule::Keydata(1),
-        _ => KeydataRule::Any,
+/// A proprietary key's keydata is `<compactsize id-len><id><compactsize
+/// subtype><rest>` — Core parses `identifier` then `subtype` off the
+/// key stream, so malformed keydata fails as a stream read.
+fn proprietary_keydata_ok(keydata: &[u8]) -> bool {
+    let mut dec = Decoder::new(keydata);
+    let Ok(id_len) = dec.read_compact_size() else {
+        return false;
+    };
+    if dec.read_bytes(id_len as usize).is_err() {
+        return false;
+    }
+    dec.read_compact_size().is_ok()
+}
+
+/// Core's per-case key checks (`psbt.h` `Unserialize` switches): the
+/// type byte selects a keydata shape and each failure carries that
+/// case's exact `std::ios_base::failure` text.
+fn check_key(scope: Scope, key: &[u8]) -> Result<(), PsbtError> {
+    let key_type = key[0];
+    let kd = &key[1..];
+    match (scope, key_type) {
+        (Scope::Global, Psbt::GLOBAL_TX) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Global unsigned tx key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Global, Psbt::GLOBAL_XPUB) => {
+            if kd.len() != 78 {
+                return Err(PsbtError::Core(
+                    "Size of key was not the expected size for the type global xpub",
+                ));
+            }
+            // `CExtPubKey::DecodeWithVersion` + `pubkey.IsFullyValid` —
+            // the trailing 33 bytes are the compressed pubkey.
+            if !crate::descriptor::pubkey_is_valid(&kd[45..]) {
+                return Err(PsbtError::Core("Invalid pubkey"));
+            }
+        }
+        (Scope::Global, Psbt::GLOBAL_VERSION) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Global version key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_NON_WITNESS_UTXO) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Non-witness utxo key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_WITNESS_UTXO) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Witness utxo key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_PARTIAL_SIG) => {
+            if kd.len() != 33 && kd.len() != 65 {
+                return Err(PsbtError::Core(
+                    "Size of key was not the expected size for the type partial signature pubkey",
+                ));
+            }
+            if !crate::descriptor::pubkey_is_valid(kd) {
+                return Err(PsbtError::Core("Invalid pubkey"));
+            }
+        }
+        (Scope::Input, Psbt::IN_SIGHASH_TYPE) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Sighash type key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_REDEEM_SCRIPT) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Input redeemScript key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_WITNESS_SCRIPT) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Input witnessScript key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_BIP32_DERIVATION) | (Scope::Output, Psbt::OUT_BIP32_DERIVATION) => {
+            if kd.len() != 33 && kd.len() != 65 {
+                return Err(PsbtError::Core(
+                    "Size of key was not the expected size for the type BIP32 keypath",
+                ));
+            }
+            if !crate::descriptor::pubkey_is_valid(kd) {
+                return Err(PsbtError::Core("Invalid pubkey"));
+            }
+        }
+        (Scope::Input, Psbt::IN_FINAL_SCRIPTSIG) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Final scriptSig key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_FINAL_SCRIPTWITNESS) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Final scriptWitness key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_RIPEMD160) => {
+            if kd.len() != 20 {
+                return Err(PsbtError::Core(
+                    "Size of key was not the expected size for the type ripemd160 preimage",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_SHA256) => {
+            if kd.len() != 32 {
+                return Err(PsbtError::Core(
+                    "Size of key was not the expected size for the type sha256 preimage",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_HASH160) => {
+            if kd.len() != 20 {
+                return Err(PsbtError::Core(
+                    "Size of key was not the expected size for the type hash160 preimage",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_HASH256) => {
+            if kd.len() != 32 {
+                return Err(PsbtError::Core(
+                    "Size of key was not the expected size for the type hash256 preimage",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_TAP_KEY_SIG) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Input Taproot key signature key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_TAP_SCRIPT_SIG) => {
+            if kd.len() != 64 {
+                return Err(PsbtError::Core(
+                    "Input Taproot script signature key is not 65 bytes",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_TAP_LEAF_SCRIPT) => {
+            if kd.len() < 33 {
+                return Err(PsbtError::Core(
+                    "Taproot leaf script key is not at least 34 bytes",
+                ));
+            }
+            if !(kd.len() - 1).is_multiple_of(32) {
+                return Err(PsbtError::Core(
+                    "Input Taproot leaf script key's control block size is not valid",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_TAP_BIP32_DERIVATION) => {
+            if kd.len() != 32 {
+                return Err(PsbtError::Core(
+                    "Input Taproot BIP32 keypath key is not at 33 bytes",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_TAP_INTERNAL_KEY) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Input Taproot internal key key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_TAP_MERKLE_ROOT) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Input Taproot merkle root key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Output, Psbt::OUT_REDEEM_SCRIPT) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Output redeemScript key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Output, Psbt::OUT_WITNESS_SCRIPT) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Output witnessScript key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Output, Psbt::OUT_TAP_INTERNAL_KEY) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Output Taproot internal key key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Output, Psbt::OUT_TAP_TREE) => {
+            if !kd.is_empty() {
+                return Err(PsbtError::Core(
+                    "Output Taproot tree key is more than one byte type",
+                ));
+            }
+        }
+        (Scope::Output, Psbt::OUT_TAP_BIP32_DERIVATION) => {
+            if kd.len() != 32 {
+                return Err(PsbtError::Core(
+                    "Output Taproot BIP32 keypath key is not at 33 bytes",
+                ));
+            }
+        }
+        (Scope::Global | Scope::Input | Scope::Output, Psbt::GLOBAL_PROPRIETARY)
+            if !proprietary_keydata_ok(kd) =>
+        {
+            return Err(PsbtError::UnexpectedEnd);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The `Duplicate Key, …` string Core throws when a pair's key is
+/// already present — each map case names its own field.
+fn dup_message(scope: Scope, key_type: u8) -> &'static str {
+    match (scope, key_type) {
+        (Scope::Global, Psbt::GLOBAL_TX) => "Duplicate Key, unsigned tx already provided",
+        (Scope::Global, Psbt::GLOBAL_XPUB) => "Duplicate key, global xpub already provided",
+        (Scope::Global, Psbt::GLOBAL_VERSION) => "Duplicate Key, version already provided",
+        (_, Psbt::GLOBAL_PROPRIETARY) => "Duplicate Key, proprietary key already found",
+        (Scope::Input, Psbt::IN_NON_WITNESS_UTXO) => {
+            "Duplicate Key, input non-witness utxo already provided"
+        }
+        (Scope::Input, Psbt::IN_WITNESS_UTXO) => {
+            "Duplicate Key, input witness utxo already provided"
+        }
+        (Scope::Input, Psbt::IN_PARTIAL_SIG) => {
+            "Duplicate Key, input partial signature for pubkey already provided"
+        }
+        (Scope::Input, Psbt::IN_SIGHASH_TYPE) => {
+            "Duplicate Key, input sighash type already provided"
+        }
+        (Scope::Input, Psbt::IN_REDEEM_SCRIPT) => {
+            "Duplicate Key, input redeemScript already provided"
+        }
+        (Scope::Input, Psbt::IN_WITNESS_SCRIPT) => {
+            "Duplicate Key, input witnessScript already provided"
+        }
+        (Scope::Input, Psbt::IN_BIP32_DERIVATION) | (Scope::Output, Psbt::OUT_BIP32_DERIVATION) => {
+            "Duplicate Key, pubkey derivation path already provided"
+        }
+        (Scope::Input, Psbt::IN_FINAL_SCRIPTSIG) => {
+            "Duplicate Key, input final scriptSig already provided"
+        }
+        (Scope::Input, Psbt::IN_FINAL_SCRIPTWITNESS) => {
+            "Duplicate Key, input final scriptWitness already provided"
+        }
+        (Scope::Input, Psbt::IN_RIPEMD160) => {
+            "Duplicate Key, input ripemd160 preimage already provided"
+        }
+        (Scope::Input, Psbt::IN_SHA256) => "Duplicate Key, input sha256 preimage already provided",
+        (Scope::Input, Psbt::IN_HASH160) => {
+            "Duplicate Key, input hash160 preimage already provided"
+        }
+        (Scope::Input, Psbt::IN_HASH256) => {
+            "Duplicate Key, input hash256 preimage already provided"
+        }
+        (Scope::Input, Psbt::IN_TAP_KEY_SIG) => {
+            "Duplicate Key, input Taproot key signature already provided"
+        }
+        (Scope::Input, Psbt::IN_TAP_SCRIPT_SIG) => {
+            "Duplicate Key, input Taproot script signature already provided"
+        }
+        (Scope::Input, Psbt::IN_TAP_LEAF_SCRIPT) => {
+            "Duplicate Key, input Taproot leaf script already provided"
+        }
+        (Scope::Input, Psbt::IN_TAP_BIP32_DERIVATION) => {
+            "Duplicate Key, input Taproot BIP32 keypath already provided"
+        }
+        (Scope::Input, Psbt::IN_TAP_INTERNAL_KEY) => {
+            "Duplicate Key, input Taproot internal key already provided"
+        }
+        (Scope::Input, Psbt::IN_TAP_MERKLE_ROOT) => {
+            "Duplicate Key, input Taproot merkle root already provided"
+        }
+        (Scope::Output, Psbt::OUT_REDEEM_SCRIPT) => {
+            "Duplicate Key, output redeemScript already provided"
+        }
+        (Scope::Output, Psbt::OUT_WITNESS_SCRIPT) => {
+            "Duplicate Key, output witnessScript already provided"
+        }
+        (Scope::Output, Psbt::OUT_TAP_INTERNAL_KEY) => {
+            "Duplicate Key, output Taproot internal key already provided"
+        }
+        (Scope::Output, Psbt::OUT_TAP_TREE) => {
+            "Duplicate Key, output Taproot tree already provided"
+        }
+        (Scope::Output, Psbt::OUT_TAP_BIP32_DERIVATION) => {
+            "Duplicate Key, output Taproot BIP32 keypath already provided"
+        }
+        _ => "Duplicate Key, key for unknown value already provided",
     }
 }
 
-fn input_key_rule(key_type: u8) -> KeydataRule {
-    match key_type {
-        Psbt::IN_PARTIAL_SIG | Psbt::IN_BIP32_DERIVATION => KeydataRule::Keydata(1),
-        Psbt::IN_RIPEMD160 => KeydataRule::Keydata(20),
-        Psbt::IN_SHA256 | Psbt::IN_HASH256 => KeydataRule::Keydata(32),
-        Psbt::IN_HASH160 => KeydataRule::Keydata(20),
-        Psbt::IN_TAP_SCRIPT_SIG => KeydataRule::Keydata(64),
-        Psbt::IN_TAP_LEAF_SCRIPT => KeydataRule::Keydata(32),
-        Psbt::IN_TAP_BIP32_DERIVATION => KeydataRule::Keydata(32),
-        Psbt::IN_PROPRIETARY => KeydataRule::Keydata(1),
-        _ if key_type <= 0x18 => KeydataRule::NoKeydata,
-        _ => KeydataRule::Any,
+/// `UnserializeFromVector` — the value must decode as `needed` bytes
+/// exactly; `remaining` is what the outer stream still holds so an
+/// under-sized value reports end-of-data only when Core would hit EOF.
+fn exact_value(value: &[u8], needed: usize, remaining: usize) -> Result<(), PsbtError> {
+    if value.len() == needed {
+        Ok(())
+    } else if value.len() < needed && remaining < needed - value.len() {
+        Err(PsbtError::UnexpectedEnd)
+    } else {
+        Err(PsbtError::Core("Size of value was not the stated size"))
     }
 }
 
-fn output_key_rule(key_type: u8) -> KeydataRule {
-    match key_type {
-        Psbt::OUT_BIP32_DERIVATION => KeydataRule::Keydata(1),
-        Psbt::OUT_TAP_BIP32_DERIVATION => KeydataRule::Keydata(32),
-        Psbt::OUT_PROPRIETARY => KeydataRule::Keydata(1),
-        _ if key_type <= 0x07 => KeydataRule::NoKeydata,
-        _ => KeydataRule::Any,
+/// `DeserializeKeyOrigin` — the value is `fingerprint(4) || path*4`;
+/// zero or non-multiple-of-four lengths are rejected.
+fn check_hd_keypath(value: &[u8]) -> Result<(), PsbtError> {
+    if value.is_empty() || !value.len().is_multiple_of(4) {
+        return Err(PsbtError::Core("Invalid length for HD key path"));
     }
+    Ok(())
 }
 
-/// The scope/name labels Core embeds in key-data errors.
-fn global_key_name(key_type: u8) -> &'static str {
-    match key_type {
-        Psbt::GLOBAL_TX => "Global unsigned tx",
-        Psbt::GLOBAL_XPUB => "Global xpub",
-        Psbt::GLOBAL_TX_VERSION => "Global transaction version",
-        Psbt::GLOBAL_FALLBACK_LOCKTIME => "Global fallback locktime",
-        Psbt::GLOBAL_INPUT_COUNT => "Global inputs count",
-        Psbt::GLOBAL_OUTPUT_COUNT => "Global outputs count",
-        Psbt::GLOBAL_TX_MODIFIABLE => "Global tx modifiable",
-        Psbt::GLOBAL_VERSION => "Global version",
-        Psbt::GLOBAL_PROPRIETARY => "Global proprietary",
-        _ => "Global unknown",
+/// The `(hashes || origin)` value of a taproot BIP32 derivation:
+/// `CompactSize count` + `count` 32-byte leaf hashes, then the
+/// remaining bytes must be a valid `KeyOriginInfo` length.
+fn check_tap_keypath(value: &[u8], input: bool, remaining: usize) -> Result<(), PsbtError> {
+    let mut dec = Decoder::new(value);
+    let n = dec.read_compact_size().map_err(map_decode_err)?;
+    let used = dec.position() + (n as usize).saturating_mul(32);
+    if used > value.len() {
+        // Core reads the leaf hashes straight off the outer stream;
+        // running past the stated value errors with "end of data",
+        // while a read that fits reports the invalid length.
+        if used - value.len() > remaining {
+            return Err(PsbtError::UnexpectedEnd);
+        }
+        return Err(PsbtError::Core(if input {
+            "Input Taproot BIP32 keypath has an invalid length"
+        } else {
+            "Output Taproot BIP32 keypath has an invalid length"
+        }));
     }
+    check_hd_keypath(&value[used..])
 }
 
-fn input_key_name(key_type: u8) -> &'static str {
-    match key_type {
-        Psbt::IN_NON_WITNESS_UTXO => "Input non-witness utxo",
-        Psbt::IN_WITNESS_UTXO => "Input witness utxo",
-        Psbt::IN_PARTIAL_SIG => "Input partial sig",
-        Psbt::IN_SIGHASH_TYPE => "Input sighash type",
-        Psbt::IN_REDEEM_SCRIPT => "Input redeemScript",
-        Psbt::IN_WITNESS_SCRIPT => "Input witnessScript",
-        Psbt::IN_BIP32_DERIVATION => "Input keypath",
-        Psbt::IN_FINAL_SCRIPTSIG => "Input final scriptSig",
-        Psbt::IN_FINAL_SCRIPTWITNESS => "Input final scriptWitness",
-        Psbt::IN_POR_COMMITMENT => "Input por commitment",
-        Psbt::IN_RIPEMD160 => "Input ripemd160 hash",
-        Psbt::IN_SHA256 => "Input sha256 hash",
-        Psbt::IN_HASH160 => "Input hash160",
-        Psbt::IN_HASH256 => "Input hash256",
-        Psbt::IN_PREVIOUS_TXID => "Input previous txid",
-        Psbt::IN_OUTPUT_INDEX => "Input output index",
-        Psbt::IN_SEQUENCE => "Input sequence",
-        Psbt::IN_REQUIRED_TIME_LOCKTIME => "Input required time-based locktime",
-        Psbt::IN_REQUIRED_HEIGHT_LOCKTIME => "Input required height-based locktime",
-        Psbt::IN_TAP_KEY_SIG => "Input taproot key path signature",
-        Psbt::IN_TAP_SCRIPT_SIG => "Input taproot script path signature",
-        Psbt::IN_TAP_LEAF_SCRIPT => "Input taproot leaf script",
-        Psbt::IN_TAP_BIP32_DERIVATION => "Input taproot BIP32 derivation",
-        Psbt::IN_TAP_INTERNAL_KEY => "Input taproot internal key",
-        Psbt::IN_TAP_MERKLE_ROOT => "Input taproot merkle root",
-        Psbt::IN_PROPRIETARY => "Input proprietary",
-        _ => "Input unknown",
+/// `TaprootBuilder` completeness over the output `tap_tree` value:
+/// `(depth, leaf_ver, CompactSize script)` triples in DFS order.
+/// `branch[d]` tracks a merged node awaiting its sibling at depth `d`,
+/// mirroring `TaprootBuilder::Insert` — a leaf may not sit below an
+/// open branch, same-depth nodes combine and propagate up, and a
+/// complete tree ends as a single root at depth 0.
+fn check_tap_tree(value: &[u8]) -> Result<(), PsbtError> {
+    if value.is_empty() {
+        return Err(PsbtError::Core("Output Taproot tree must not be empty"));
     }
+    let mut dec = Decoder::new(value);
+    let mut branch: Vec<bool> = Vec::new();
+    let mut valid = true;
+    while !dec.is_finished() {
+        let depth = dec.read_u8().map_err(map_decode_err)? as usize;
+        let leaf_ver = dec.read_u8().map_err(map_decode_err)?;
+        dec.read_var_bytes().map_err(map_decode_err)?;
+        if depth > 128 {
+            return Err(PsbtError::Core(
+                "Output Taproot tree has as leaf greater than Taproot maximum depth",
+            ));
+        }
+        if leaf_ver & !0xfe != 0 {
+            return Err(PsbtError::Core(
+                "Output Taproot tree has a leaf with an invalid leaf version",
+            ));
+        }
+        if valid {
+            if depth + 1 < branch.len() {
+                valid = false;
+            }
+            let mut d = depth;
+            while valid && branch.len() > d && branch[d] {
+                branch.pop();
+                if d == 0 {
+                    valid = false;
+                    break;
+                }
+                d -= 1;
+            }
+            if valid {
+                if branch.len() <= d {
+                    branch.resize(d + 1, false);
+                }
+                branch[d] = true;
+            }
+        }
+    }
+    if !valid || !(branch.is_empty() || (branch.len() == 1 && branch[0])) {
+        return Err(PsbtError::Core("Output Taproot tree is malformed"));
+    }
+    Ok(())
 }
 
-fn output_key_name(key_type: u8) -> &'static str {
-    match key_type {
-        Psbt::OUT_REDEEM_SCRIPT => "Output redeemScript",
-        Psbt::OUT_WITNESS_SCRIPT => "Output witnessScript",
-        Psbt::OUT_BIP32_DERIVATION => "Output keypath",
-        Psbt::OUT_AMOUNT => "Output amount",
-        Psbt::OUT_SCRIPT => "Output script",
-        Psbt::OUT_TAP_INTERNAL_KEY => "Output taproot internal key",
-        Psbt::OUT_TAP_TREE => "Output taproot tree",
-        Psbt::OUT_TAP_BIP32_DERIVATION => "Output taproot BIP32 derivation",
-        Psbt::OUT_PROPRIETARY => "Output proprietary",
-        _ => "Output unknown",
+/// Value-side checks Core runs inside each map case — embedded
+/// transactions, `TxOut`s, u32s, fixed-width hashes, signature
+/// lengths, and the structured taproot values.
+fn check_value(scope: Scope, key: &[u8], value: &[u8], remaining: usize) -> Result<(), PsbtError> {
+    match (scope, key[0]) {
+        (Scope::Global, Psbt::GLOBAL_TX) => {
+            let tx = Transaction::decode_no_witness(value).map_err(|e| match e {
+                DecodeError::TrailingBytes(_) => {
+                    PsbtError::Core("Size of value was not the stated size")
+                }
+                other => map_decode_err(other),
+            })?;
+            if tx.inputs.iter().any(|i| !i.script_sig.is_empty()) {
+                return Err(PsbtError::NonEmptyScriptSig);
+            }
+        }
+        (Scope::Global, Psbt::GLOBAL_XPUB) => check_hd_keypath(value)?,
+        (Scope::Global, Psbt::GLOBAL_VERSION) => {
+            exact_value(value, 4, remaining)?;
+            let ver = Decoder::new(value).read_u32_le().map_err(map_decode_err)?;
+            if ver > 0 {
+                return Err(PsbtError::UnsupportedVersion);
+            }
+        }
+        (Scope::Input, Psbt::IN_NON_WITNESS_UTXO) => {
+            Transaction::decode(value).map_err(|e| match e {
+                DecodeError::TrailingBytes(_) => {
+                    PsbtError::Core("Size of value was not the stated size")
+                }
+                other => map_decode_err(other),
+            })?;
+        }
+        (Scope::Input, Psbt::IN_WITNESS_UTXO) => {
+            // `UnserializeFromVector(s, CTxOut)` — i64 value then a
+            // var-bytes script, consuming the stated length exactly.
+            let mut dec = Decoder::new(value);
+            let short = |e: DecodeError| -> PsbtError {
+                if remaining + value.len() < 9 {
+                    PsbtError::UnexpectedEnd
+                } else {
+                    map_decode_err(e)
+                }
+            };
+            dec.read_u64_le().map_err(short)?;
+            dec.read_var_bytes().map_err(short)?;
+            if !dec.is_finished() {
+                return Err(PsbtError::Core("Size of value was not the stated size"));
+            }
+        }
+        (Scope::Input, Psbt::IN_SIGHASH_TYPE) => exact_value(value, 4, remaining)?,
+        (Scope::Input, Psbt::IN_BIP32_DERIVATION) | (Scope::Output, Psbt::OUT_BIP32_DERIVATION) => {
+            check_hd_keypath(value)?
+        }
+        (Scope::Input, Psbt::IN_FINAL_SCRIPTWITNESS) => {
+            let mut dec = Decoder::new(value);
+            let count = dec.read_compact_size().map_err(map_decode_err)?;
+            for _ in 0..count {
+                dec.read_var_bytes().map_err(map_decode_err)?;
+            }
+            if !dec.is_finished() {
+                return Err(PsbtError::Core("Size of value was not the stated size"));
+            }
+        }
+        (Scope::Input, Psbt::IN_TAP_KEY_SIG) => {
+            if value.len() < 64 {
+                return Err(PsbtError::Core(
+                    "Input Taproot key path signature is shorter than 64 bytes",
+                ));
+            }
+            if value.len() > 65 {
+                return Err(PsbtError::Core(
+                    "Input Taproot key path signature is longer than 65 bytes",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_TAP_SCRIPT_SIG) => {
+            if value.len() < 64 {
+                return Err(PsbtError::Core(
+                    "Input Taproot script path signature is shorter than 64 bytes",
+                ));
+            }
+            if value.len() > 65 {
+                return Err(PsbtError::Core(
+                    "Input Taproot script path signature is longer than 65 bytes",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_TAP_LEAF_SCRIPT) => {
+            if value.is_empty() {
+                return Err(PsbtError::Core(
+                    "Input Taproot leaf script must be at least 1 byte",
+                ));
+            }
+        }
+        (Scope::Input, Psbt::IN_TAP_BIP32_DERIVATION) => check_tap_keypath(value, true, remaining)?,
+        (Scope::Input, Psbt::IN_TAP_INTERNAL_KEY)
+        | (Scope::Input, Psbt::IN_TAP_MERKLE_ROOT)
+        | (Scope::Output, Psbt::OUT_TAP_INTERNAL_KEY) => exact_value(value, 32, remaining)?,
+        (Scope::Output, Psbt::OUT_TAP_TREE) => check_tap_tree(value)?,
+        (Scope::Output, Psbt::OUT_TAP_BIP32_DERIVATION) => {
+            check_tap_keypath(value, false, remaining)?
+        }
+        _ => {}
     }
+    Ok(())
 }
 
 /// A BIP174 key-value map — pairs preserved in wire order so unknown
@@ -311,34 +724,22 @@ fn map_decode_err(e: DecodeError) -> PsbtError {
     }
 }
 
-/// Reads a key-value map terminated by `0x00`, validating keydata
-/// rules and duplicates against `rule`/`name` for `scope`.
-fn read_map(
-    dec: &mut Decoder<'_>,
-    scope: &'static str,
-    rule: fn(u8) -> KeydataRule,
-    name: fn(u8) -> &'static str,
-) -> Result<KeyMap, PsbtError> {
+/// Reads a key-value map terminated by `0x00`, running Core's
+/// per-case key and value checks for `scope` and its per-type
+/// duplicate messages.
+fn read_map(dec: &mut Decoder<'_>, scope: Scope) -> Result<KeyMap, PsbtError> {
     let mut map = KeyMap::default();
     let mut seen = std::collections::HashSet::new();
     loop {
         match read_key(dec)? {
             None => break,
             Some(key) => {
-                let key_type = key[0];
-                match rule(key_type) {
-                    KeydataRule::NoKeydata if key.len() != 1 => {
-                        return Err(PsbtError::KeyDataWrong(name(key_type)));
-                    }
-                    KeydataRule::Keydata(min) if key.len() - 1 < min => {
-                        return Err(PsbtError::KeyDataWrong(name(key_type)));
-                    }
-                    _ => {}
-                }
+                check_key(scope, &key)?;
                 if !seen.insert(key.clone()) {
-                    return Err(PsbtError::DuplicateKey(scope));
+                    return Err(PsbtError::Core(dup_message(scope, key[0])));
                 }
                 let value = read_value(dec)?;
+                check_value(scope, &key, &value, dec.remaining())?;
                 map.pairs.push((key, value));
             }
         }
@@ -462,20 +863,12 @@ impl Psbt {
                 match read_key(&mut dec)? {
                     None => break,
                     Some(key) => {
-                        let key_type = key[0];
-                        match global_key_rule(key_type) {
-                            KeydataRule::NoKeydata if key.len() != 1 => {
-                                return Err(PsbtError::KeyDataWrong(global_key_name(key_type)));
-                            }
-                            KeydataRule::Keydata(min) if key.len() - 1 < min => {
-                                return Err(PsbtError::KeyDataWrong(global_key_name(key_type)));
-                            }
-                            _ => {}
-                        }
+                        check_key(Scope::Global, &key)?;
                         if !seen.insert(key.clone()) {
-                            return Err(PsbtError::DuplicateKey("global"));
+                            return Err(PsbtError::Core(dup_message(Scope::Global, key[0])));
                         }
                         let value = read_value(&mut dec)?;
+                        check_value(Scope::Global, &key, &value, dec.remaining())?;
                         map.pairs.push((key, value));
                     }
                 }
@@ -485,13 +878,7 @@ impl Psbt {
         let tx_bytes = global
             .get(Self::GLOBAL_TX)
             .ok_or(PsbtError::MissingUnsignedTx)?;
-        if global.all(Self::GLOBAL_TX).count() > 1 {
-            return Err(PsbtError::DuplicateUnsignedTx);
-        }
         let tx = Transaction::decode_no_witness(tx_bytes).map_err(map_decode_err)?;
-        if tx.inputs.iter().any(|i| !i.script_sig.is_empty()) {
-            return Err(PsbtError::NonEmptyScriptSig);
-        }
         // Per-input maps: an exhausted stream means a missing map —
         // Core reports the count mismatch, not a separator error.
         let mut inputs = Vec::with_capacity(tx.inputs.len());
@@ -499,7 +886,24 @@ impl Psbt {
             if dec.is_finished() {
                 break;
             }
-            inputs.push(read_map(&mut dec, "input", input_key_rule, input_key_name)?);
+            let map = read_map(&mut dec, Scope::Input)?;
+            // `Unserialize` checks a carried non-witness utxo against
+            // the outpoint right after each input map.
+            if let Some(v) = map.get(Self::IN_NON_WITNESS_UTXO) {
+                let prev_tx = Transaction::decode(v).map_err(map_decode_err)?;
+                let prevout = &tx.inputs[inputs.len()].previous_output;
+                if prev_tx.txid() != prevout.txid {
+                    return Err(PsbtError::Core(
+                        "Non-witness UTXO does not match outpoint hash",
+                    ));
+                }
+                if prevout.vout as usize >= prev_tx.outputs.len() {
+                    return Err(PsbtError::Core(
+                        "Input specifies output index that does not exist",
+                    ));
+                }
+            }
+            inputs.push(map);
         }
         if inputs.len() != tx.inputs.len() {
             return Err(PsbtError::InputCountMismatch);
@@ -509,12 +913,7 @@ impl Psbt {
             if dec.is_finished() {
                 break;
             }
-            outputs.push(read_map(
-                &mut dec,
-                "output",
-                output_key_rule,
-                output_key_name,
-            )?);
+            outputs.push(read_map(&mut dec, Scope::Output)?);
         }
         if outputs.len() != tx.outputs.len() {
             return Err(PsbtError::OutputCountMismatch);
@@ -757,8 +1156,9 @@ mod tests {
         );
     }
 
-    /// `joinpsbts` strips only signature/finalization input fields —
-    /// utxos, scripts, derivations, and unknown keys survive.
+    /// `joinpsbts` strips only partial sigs and the two finalization
+    /// fields (`AddInput` clears exactly those) — utxos, scripts,
+    /// derivations, taproot sigs, and unknown keys survive.
     #[test]
     fn keymap_remove_signature_types() {
         let mut m = KeyMap::default();
@@ -774,13 +1174,17 @@ mod tests {
             Psbt::IN_PARTIAL_SIG,
             Psbt::IN_FINAL_SCRIPTSIG,
             Psbt::IN_FINAL_SCRIPTWITNESS,
-            Psbt::IN_TAP_KEY_SIG,
-            Psbt::IN_TAP_SCRIPT_SIG,
         ]);
         let types: Vec<u8> = m.pairs.iter().map(|(k, _)| k[0]).collect();
         assert_eq!(
             types,
-            vec![Psbt::IN_WITNESS_UTXO, Psbt::IN_BIP32_DERIVATION, 0x60]
+            vec![
+                Psbt::IN_TAP_KEY_SIG,
+                Psbt::IN_TAP_SCRIPT_SIG,
+                Psbt::IN_WITNESS_UTXO,
+                Psbt::IN_BIP32_DERIVATION,
+                0x60
+            ]
         );
     }
 }
