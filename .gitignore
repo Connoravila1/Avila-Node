@@ -13,6 +13,7 @@ target/
 /.claude/worktrees/
 # Ad-hoc session scratch (daemon datadirs, generated corpora).
 /.scratch/
+/.test-tmp/
 # Live regtest datadirs for the reference-comparison setup.
 /data-core/
 /data-core-ref/

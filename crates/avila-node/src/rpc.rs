@@ -2260,13 +2260,10 @@ fn help_error(text: &'static str) -> (Value, Option<(i64, String)>) {
     (Value::Null, Some((RPC_MISC_ERROR, text.to_string())))
 }
 
-/// Wall-clock UNIX seconds — the ban list's timestamps live on wall
-/// time (`ban_created`/`banned_until` are epoch values).
+/// UNIX seconds on the node's (possibly mocked) clock — the ban
+/// list's `ban_created`/`banned_until` read `GetTime`, like Core.
 fn epoch_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::time::time()
 }
 
 /// Verbatim `help decoderawtransaction` text (Bitcoin Core 29).
@@ -2624,6 +2621,8 @@ const ADDNODE_HELP: &str = "addnode \"node\" \"command\" ( v2transport )\n\nAtte
 
 /// Verbatim `help setnetworkactive` text (Bitcoin Core 29).
 const SETNETWORKACTIVE_HELP: &str = "setnetworkactive state\n\nDisable/enable all p2p network activity.\n\nArguments:\n1. state    (boolean, required) true to enable networking, false to disable\n\nResult:\ntrue|false    (boolean) The value that was passed in\n";
+/// Verbatim `help setmocktime` text (Bitcoin Core 29.4).
+const SETMOCKTIME_HELP: &str = "setmocktime timestamp\n\nSet the local time to given timestamp (-regtest only)\n\nArguments:\n1. timestamp    (numeric, required) UNIX epoch time\n                Pass 0 to go back to using the system time.\n\nResult:\nnull    (json null)\n";
 
 /// Verbatim `help getaddrmaninfo` text (Bitcoin Core 29.4).
 const GETADDRMANINFO_HELP: &str = "getaddrmaninfo\n\nProvides information about the node's address manager by returning the number of addresses in the `new` and `tried` tables and their sum for all networks.\n\nResult:\n{                   (json object) json object with network type as keys\n  \"network\" : {     (json object) the network (ipv4, ipv6, onion, i2p, cjdns, all_networks)\n    \"new\" : n,      (numeric) number of addresses in the new table, which represent potential peers the node has discovered but hasn't yet successfully connected to.\n    \"tried\" : n,    (numeric) number of addresses in the tried table, which represent peers the node has successfully connected to in the past.\n    \"total\" : n     (numeric) total number of addresses in both new/tried tables\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getaddrmaninfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getaddrmaninfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
@@ -4040,6 +4039,11 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
             ("absolute", Some("bool"), false),
         ],
         SETBAN_HELP,
+    ),
+    (
+        "setmocktime",
+        &[("timestamp", Some("number"), true)],
+        SETMOCKTIME_HELP,
     ),
     (
         "setnetworkactive",
@@ -5910,10 +5914,7 @@ fn dispatch(
                         "Unable to import mempool file, see debug.log for details.".into(),
                     ));
                 }
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32)
-                    .unwrap_or(0);
+                let now = crate::time::time() as u32;
                 match mgr.mempool().load(&path, cs, now) {
                     Ok(_) => Ok(json!({})),
                     Err(_) => Err((
@@ -6299,10 +6300,7 @@ fn dispatch(
                             .into(),
                     ));
                 }
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32)
-                    .unwrap_or(0);
+                let now = crate::time::time() as u32;
                 match mgr.mempool().accept_tx(tx, cs, now) {
                     Ok(_) => {
                         // Admitted — relay an inv to every tx-accepting
@@ -6482,10 +6480,7 @@ fn dispatch(
                 let mut replaced: std::collections::BTreeSet<String> =
                     std::collections::BTreeSet::new();
                 let mut all_ok = true;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32)
-                    .unwrap_or(0);
+                let now = crate::time::time() as u32;
                 for tx in &txns {
                     let txid = tx.txid();
                     let wtxid = tx.wtxid();
@@ -8187,10 +8182,7 @@ fn dispatch(
                         return Err((RPC_DESERIALIZATION_ERROR, "Block decode failed".into()));
                     }
                 };
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32)
-                    .unwrap_or(0);
+                let now = crate::time::time() as u32;
                 // Core's submitblock reports a status STRING in result —
                 // errors are only for decode/parameter failures.
                 match cs.accept_block(&block, now) {
@@ -8235,10 +8227,7 @@ fn dispatch(
                         "Block header decode failed".into(),
                     ));
                 };
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32)
-                    .unwrap_or(0);
+                let now = crate::time::time() as u32;
                 match cs.accept_header(&header, now) {
                     Ok(_) => Ok(Value::Null),
                     Err(avila_consensus::chainstate::BlockRejection::Header(
@@ -9015,10 +9004,7 @@ fn dispatch(
                         "Error: Invalid address".to_string(),
                     ));
                 };
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32)
-                    .unwrap_or(0);
+                let now = crate::time::time() as u32;
                 let mut hashes = Vec::with_capacity(nblocks as usize);
                 for _ in 0..nblocks {
                     let template = mgr
@@ -9119,10 +9105,7 @@ fn dispatch(
                     _ => scripts[1].clone(),
                 };
                 let script = Script::new(script);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32)
-                    .unwrap_or(0);
+                let now = crate::time::time() as u32;
                 let mut hashes = Vec::new();
                 for _ in 0..nblocks.max(0) {
                     let template = mgr
@@ -9159,10 +9142,7 @@ fn dispatch(
                             "Error: Invalid address or descriptor".to_string(),
                         )
                     })?;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32)
-                    .unwrap_or(0);
+                let now = crate::time::time() as u32;
                 // Core resolves each entry as a mempool txid first (the
                 // string parses as a 64-hex hash) and falls back to a
                 // raw transaction, which is admitted to the pool before
@@ -9209,10 +9189,7 @@ fn dispatch(
             })
         }
         "getblocktemplate" => chain_query(queries, |cs, mgr| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as u32)
-                .unwrap_or(0);
+            let now = crate::time::time() as u32;
             // No wallet exists — the coinbase pays Core's default
             // `OP_TRUE` anyone-can-spend script (what Core's
             // BlockAssembler uses when no payout script is supplied).
@@ -9411,10 +9388,7 @@ fn dispatch(
             let Some(node) = cs.tree().get(&tip) else {
                 return Err((RPC_MISC_ERROR, "tip not indexed".into()));
             };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as u32)
-                .unwrap_or(0);
+            let now = crate::time::time() as u32;
             // `next` is what the next block's header would carry —
             // the same `required_bits` the template builder used.
             let next = avila_consensus::pow::required_bits(
@@ -9540,10 +9514,7 @@ fn dispatch(
             }
             chain_query(queries, |_, mgr| {
                 let (sent, recv) = mgr.net_totals();
-                let timemillis = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                let timemillis = crate::time::time_millis() as u64;
                 // `uploadtarget` mirrors `-maxuploadtarget=0`
                 // (unlimited): no cycle budget is tracked.
                 Ok(json!({
@@ -9782,6 +9753,36 @@ fn dispatch(
                     return Ok(json!([added_node_json(entry)]));
                 }
                 Ok(json!(all.iter().map(added_node_json).collect::<Vec<_>>()))
+            })
+        }
+        // Core's setmocktime (rpc/node.cpp): the regtest-only
+        // `SetMockTime`. The non-mockable-chain guard throws a bare
+        // `std::runtime_error` (RPC_MISC_ERROR), then
+        // `getInt<int64_t>` ("JSON integer out of range") and the
+        // [0, max_time] range check (RPC_INVALID_PARAMETER).
+        "setmocktime" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let Some(v) = arr.first().cloned() else {
+                return help_error(SETMOCKTIME_HELP);
+            };
+            chain_query(queries, move |cs, _mgr| {
+                if cs.tree().params().network != avila_consensus::params::Network::Regtest {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "setmocktime is for regression testing (-regtest mode) only".into(),
+                    ));
+                }
+                let Some(t) = v.as_i64() else {
+                    return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
+                };
+                if !(0..=9_223_372_036).contains(&t) {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        format!("Mocktime must be in the range [0, 9223372036], not {t}."),
+                    ));
+                }
+                crate::time::set_mock_time(t);
+                Ok(Value::Null)
             })
         }
         "setnetworkactive" => {
@@ -10264,10 +10265,7 @@ fn dispatch(
                             std::net::SocketAddr::new(ip, port),
                             NODE_NETWORK | NODE_WITNESS,
                         );
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as u32)
-                            .unwrap_or(0);
+                        let now = crate::time::time() as u32;
                         if mgr.addrbook().add(addr, now, now) {
                             if tried {
                                 mgr.addrbook().mark_tried(&addr);
@@ -10497,7 +10495,7 @@ fn dispatch(
                      \x20   listbanned, clearbanned\n\
                      \x20 misc:  estimatesmartfee <target>, getrpcinfo,\n\
                      \x20   getmemoryinfo [mode], logging [include] [exclude],\n\
-                     \x20   uptime, help, stop"
+                     \x20   setmocktime <ts>, uptime, help, stop"
                 ),
                 None,
             ),
@@ -11724,10 +11722,7 @@ mod tests {
         // built here connects identically on the query server's copy.
         let mine_cs = Chainstate::new(&params);
         let pool = avila_mempool::Mempool::new();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0);
+        let now = crate::time::time() as u32;
         let mut block = pool
             .build_template(
                 &mine_cs,
@@ -11807,10 +11802,7 @@ mod tests {
         // A valid-PoW header with an unknown parent: regtest's target
         // is near-maximal so a few nonces suffice.
         let unknown = BlockHash::from_bytes([0x42; 32]);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0);
+        let now = crate::time::time() as u32;
         let bits = params.genesis_header.bits;
         let mut header = avila_consensus::header::BlockHeader {
             version: 0x2000_0000,

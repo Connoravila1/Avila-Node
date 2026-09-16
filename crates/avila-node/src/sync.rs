@@ -6,7 +6,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use avila_consensus::chainstate::Chainstate;
 use avila_consensus::params::Params;
@@ -140,10 +140,9 @@ pub enum SyncError {
 }
 
 fn unix_now() -> u32 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0)
+    // `GetTime`: honors `setmocktime` so acceptance and scheduler
+    // timestamps stay on the mocked clock, like Core.
+    crate::time::time() as u32
 }
 
 /// Runs headers-first sync until `cfg.target_height` connects or
