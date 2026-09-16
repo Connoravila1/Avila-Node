@@ -792,6 +792,18 @@ surfaced:
   merges, bad descriptor strings, non-string elements, range
   bounds, missing/short/base64-broken PSBT args — all
   byte-identical.
+- `finalizepsbt` is `FinalizeAndExtractPSBT`: every input runs
+  `SignPSBTInput` over the empty provider with `finalize=true` and
+  the real transaction checker — existing partial sigs satisfy the
+  solve, the produced final scripts must verify, and `complete`
+  AND-folds across inputs without short-circuiting (partial
+  finalization still applies). The result is `{hex, complete}` —
+  the extracted witness-serialized transaction — when complete and
+  `extract` (default true), else `{psbt, complete}` with the
+  re-encoded PSBT. Verified live against Core 29.4: signed P2WPKH,
+  taproot, and 2-of-2 P2WSH multisig PSBTs across extract
+  true/false/null, already-final idempotency, a corrupted tail
+  byte, and the decode/arity error paths — all byte-identical.
 
 ### Known semantic differences
 

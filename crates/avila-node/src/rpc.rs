@@ -38,7 +38,7 @@ use avila_consensus::descriptor::{infer_descriptor, parse_descriptors};
 use avila_consensus::hash::{BlockHash, Txid, Wtxid};
 use avila_consensus::header::BlockHeader;
 use avila_consensus::hex;
-use avila_consensus::transaction::{OutPoint, Script, Transaction, TxIn, TxOut};
+use avila_consensus::transaction::{OutPoint, Script, Transaction, TxIn, TxOut, Witness};
 use avila_p2p::manager::PeerManager;
 use serde_json::{Value, json};
 
@@ -2149,6 +2149,8 @@ const ANALYZEPSBT_HELP: &str = "analyzepsbt \"psbt\"\n\nAnalyzes and provides in
 
 const UTXOUPDATEPSBT_HELP: &str = "utxoupdatepsbt \"psbt\" ( [\"\",{\"desc\":\"str\",\"range\":n or [n,n]},...] )\n\nUpdates all segwit inputs and outputs in a PSBT with data from output descriptors, the UTXO set, txindex, or the mempool.\n\nArguments:\n1. psbt                          (string, required) A base64 string of a PSBT\n2. descriptors                   (json array, optional) An array of either strings or objects\n     [\n       \"\",                       (string) An output descriptor\n       {                         (json object) An object with an output descriptor and extra information\n         \"desc\": \"str\",          (string, required) An output descriptor\n         \"range\": n or [n,n],    (numeric or array, optional, default=1000) Up to what index HD chains should be explored (either end or [begin,end])\n       },\n       ...\n     ]\n\nResult:\n\"str\"    (string) The base64-encoded partially signed transaction with inputs updated\n\nExamples:\n> bitcoin-cli utxoupdatepsbt \"psbt\"\n";
 
+const FINALIZEPSBT_HELP: &str = "finalizepsbt \"psbt\" ( extract )\n\nFinalize the inputs of a PSBT. If the transaction is fully signed, it will produce a\nnetwork serialized transaction which can be broadcast with sendrawtransaction. Otherwise a PSBT will be\ncreated which has the final_scriptSig and final_scriptwitness fields filled for inputs that are complete.\nImplements the Finalizer and Extractor roles.\n\nArguments:\n1. psbt       (string, required) A base64 string of a PSBT\n2. extract    (boolean, optional, default=true) If true and the transaction is complete,\n              extract and return the complete transaction in normal network serialization instead of the PSBT.\n\nResult:\n{                             (json object)\n  \"psbt\" : \"str\",             (string, optional) The base64-encoded partially signed transaction if not extracted\n  \"hex\" : \"hex\",              (string, optional) The hex-encoded network transaction if extracted\n  \"complete\" : true|false     (boolean) If the transaction has a complete set of signatures\n}\n\nExamples:\n> bitcoin-cli finalizepsbt \"psbt\"\n";
+
 const JOINPSBTS_HELP: &str = "joinpsbts [\"psbt\",...]
 
 Joins multiple distinct PSBTs with different inputs and outputs into one PSBT with inputs and outputs from all of the PSBTs
@@ -3341,6 +3343,14 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         "decodepsbt",
         &[("psbt", Some("string"), true)],
         DECODEPSBT_HELP,
+    ),
+    (
+        "finalizepsbt",
+        &[
+            ("psbt", Some("string"), true),
+            ("extract", Some("bool"), false),
+        ],
+        FINALIZEPSBT_HELP,
     ),
     (
         "utxoupdatepsbt",
@@ -7013,6 +7023,83 @@ fn dispatch(
                 remove_unnecessary_transactions(&mut psbt, 1);
                 Ok(json!(base64_encode(&psbt.encode())))
             })
+        }
+        // `finalizepsbt` — FinalizeAndExtractPSBT: every input runs
+        // SignPSBTInput over the empty provider (finalize=true, the
+        // real transaction checker so existing partial sigs verify),
+        // then final scriptSigs/witnesses move into the transaction
+        // for the extracted hex form.
+        "finalizepsbt" => {
+            let raw = match params[0].as_str() {
+                Some(s) => s,
+                None => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(1, "psbt", &params[0], "string"),
+                        )),
+                    );
+                }
+            };
+            let Some(bytes) = base64_decode_strict(raw) else {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_DESERIALIZATION_ERROR,
+                        "TX decode failed invalid base64".into(),
+                    )),
+                );
+            };
+            let mut psbt = match avila_consensus::psbt::Psbt::decode(&bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_DESERIALIZATION_ERROR,
+                            format!("TX decode failed {}", e.core_message()),
+                        )),
+                    );
+                }
+            };
+            let extract = params
+                .get(1)
+                .map(|v| v.is_null() || v.as_bool().unwrap_or(false))
+                .unwrap_or(true);
+            let txdata = avila_consensus::sign::precompute_psbt_data(&psbt);
+            let provider = avila_consensus::descriptor::FlatProvider::default();
+            let mut complete = true;
+            for i in 0..psbt.tx.inputs.len() {
+                complete &= avila_consensus::sign::sign_psbt_input(
+                    &provider,
+                    &mut psbt,
+                    i,
+                    Some(&txdata),
+                    avila_consensus::sign::Creator::Real,
+                    None,
+                    true,
+                );
+            }
+            let mut result = serde_json::Map::new();
+            if complete && extract {
+                let mut tx = psbt.tx.clone();
+                for (i, input) in tx.inputs.iter_mut().enumerate() {
+                    input.script_sig = psbt.inputs[i]
+                        .get(avila_consensus::psbt::Psbt::IN_FINAL_SCRIPTSIG)
+                        .map_or_else(|| Script::new(Vec::new()), |v| Script::new(v.to_vec()));
+                    input.witness = psbt.inputs[i]
+                        .get(avila_consensus::psbt::Psbt::IN_FINAL_SCRIPTWITNESS)
+                        .and_then(avila_consensus::sign::decode_witness_stack)
+                        .map(Witness::new)
+                        .unwrap_or_default();
+                }
+                result.insert("hex".into(), json!(hex::encode(&tx.encode())));
+            } else {
+                result.insert("psbt".into(), json!(base64_encode(&psbt.encode())));
+            }
+            result.insert("complete".into(), json!(complete));
+            (Value::Object(result), None)
         }
         // Core's createmultisig (rpc/output_script.cpp) — n-of-m
         // multisig construction: keys parse first (HexToPubKey), then

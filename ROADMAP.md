@@ -374,7 +374,9 @@ operation. Compare complete initial download and catch-up, not only local replay
       and provider-derived scripts/derivations/taproot spend data
       fill input and output metadata. PSBT maps serialize in
       Core's canonical per-scope order (typed fields, proprietary,
-      unknown).
+      unknown). finalizepsbt runs FinalizeAndExtractPSBT — partial
+      sigs assemble into verified final scripts, {hex, complete}
+      when extracted.
       Verified
       byte-identical against
       Core 29.4 including a live spend+receive, a real
