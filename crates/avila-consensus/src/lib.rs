@@ -28,6 +28,7 @@ pub mod psbt;
 pub mod rules;
 pub mod script;
 pub mod sigchecker;
+pub mod sign;
 pub mod signet;
 pub mod store;
 pub mod transaction;

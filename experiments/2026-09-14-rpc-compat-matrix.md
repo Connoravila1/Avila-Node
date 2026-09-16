@@ -723,6 +723,25 @@ surfaced:
   sets through salted unordered maps, so input/output ordering
   is nondeterministic per call and the comparison canonicalizes
   vin/vout/map content before diffing.
+- `analyzepsbt` runs `node::AnalyzePSBT` on a new
+  `avila-consensus/src/sign.rs` port of Core's
+  `SignPSBTInput`/`ProduceSignature` over the empty
+  `DUMMY_SIGNING_PROVIDER`: `FillSignatureData` collects partial
+  sigs/scripts/derivations/taproot fields, `SignStep` solves
+  P2PK/P2PKH/multisig/P2SH/P2WPKH/P2WSH/taproot script shapes,
+  and `PSBTInputSignedAndVerified` decides `is_final`. Per-input
+  `missing` reports follow Core exactly — including the
+  `require_witness_sig` early-return that suppresses `missing`
+  when a non-witness UTXO is supplied via `witness_utxo`. When
+  every input's UTXO is known the fee is computed and a second
+  `DUMMY_SIGNATURE_CREATOR` pass (DER-valid 71-byte sigs with
+  `0x01` leading R and S) dummy-finalizes inputs for
+  `estimated_vsize`/`estimated_feerate`. Verified live against
+  Core 29.4: 19-row type matrix (funded P2WPKH, taproot
+  key-path, P2SH/P2WSH multisig with and without scripts,
+  non-witness-UTXO paths, unspendable, zero-value, output
+  overflow, non-string arg) plus a 4-row malformed-input matrix
+  — all byte-identical.
 
 ### Known semantic differences
 

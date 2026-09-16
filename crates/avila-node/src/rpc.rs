@@ -2089,6 +2089,8 @@ Examples:
 > bitcoin-cli combinepsbt '[\"mybase64_1\", \"mybase64_2\", \"mybase64_3\"]'
 ";
 
+const ANALYZEPSBT_HELP: &str = "analyzepsbt \"psbt\"\n\nAnalyzes and provides information about the current status of a PSBT and its inputs\n\nArguments:\n1. psbt    (string, required) A base64 string of a PSBT\n\nResult:\n{                                   (json object)\n  \"inputs\" : [                      (json array, optional)\n    {                               (json object)\n      \"has_utxo\" : true|false,      (boolean) Whether a UTXO is provided\n      \"is_final\" : true|false,      (boolean) Whether the input is finalized\n      \"missing\" : {                 (json object, optional) Things that are missing that are required to complete this input\n        \"pubkeys\" : [               (json array, optional)\n          \"hex\",                    (string) Public key ID, hash160 of the public key, of a public key whose BIP 32 derivation path is missing\n          ...\n        ],\n        \"signatures\" : [            (json array, optional)\n          \"hex\",                    (string) Public key ID, hash160 of the public key, of a public key whose signature is missing\n          ...\n        ],\n        \"redeemscript\" : \"hex\",     (string, optional) Hash160 of the redeem script that is missing\n        \"witnessscript\" : \"hex\"     (string, optional) SHA256 of the witness script that is missing\n      },\n      \"next\" : \"str\"                (string, optional) Role of the next person that this input needs to go to\n    },\n    ...\n  ],\n  \"estimated_vsize\" : n,            (numeric, optional) Estimated vsize of the final signed transaction\n  \"estimated_feerate\" : n,          (numeric, optional) Estimated feerate of the final signed transaction in BTC/kvB. Shown only if all UTXO slots in the PSBT have been filled\n  \"fee\" : n,                        (numeric, optional) The transaction fee paid. Shown only if all UTXO slots in the PSBT have been filled\n  \"next\" : \"str\",                   (string) Role of the next person that this psbt needs to go to\n  \"error\" : \"str\"                   (string, optional) Error message (if there is one)\n}\n\nExamples:\n> bitcoin-cli analyzepsbt \"psbt\"\n";
+
 const JOINPSBTS_HELP: &str = "joinpsbts [\"psbt\",...]
 
 Joins multiple distinct PSBTs with different inputs and outputs into one PSBT with inputs and outputs from all of the PSBTs
@@ -3253,6 +3255,11 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         COMBINEPSBT_HELP,
     ),
     ("joinpsbts", &[("txs", Some("array"), true)], JOINPSBTS_HELP),
+    (
+        "analyzepsbt",
+        &[("psbt", Some("string"), true)],
+        ANALYZEPSBT_HELP,
+    ),
     (
         "converttopsbt",
         &[
@@ -6693,6 +6700,107 @@ fn dispatch(
             merged.outputs = out_maps;
             (json!(base64_encode(&merged.encode())), None)
         }
+        // analyzepsbt — node::AnalyzePSBT: per-input has_utxo/is_final/
+        // next + missing data from a SignPSBTInput pass with the real
+        // (empty-provider) creator; fee + dummy-finalized vsize when
+        // every input's UTXO is known.
+        "analyzepsbt" => {
+            let raw = match params[0].as_str() {
+                Some(s) => s,
+                None => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(1, "psbt", &params[0], "string"),
+                        )),
+                    );
+                }
+            };
+            let Some(bytes) = base64_decode_strict(raw) else {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_DESERIALIZATION_ERROR,
+                        "TX decode failed invalid base64".into(),
+                    )),
+                );
+            };
+            let psbt = match avila_consensus::psbt::Psbt::decode(&bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_DESERIALIZATION_ERROR,
+                            format!("TX decode failed {}", e.core_message()),
+                        )),
+                    );
+                }
+            };
+            let analysis = avila_consensus::sign::analyze_psbt(&psbt);
+            let mut result = serde_json::Map::new();
+            if !analysis.inputs.is_empty() {
+                let inputs: Vec<Value> = analysis
+                    .inputs
+                    .iter()
+                    .map(|i| {
+                        let mut iv = serde_json::Map::new();
+                        iv.insert("has_utxo".into(), json!(i.has_utxo));
+                        iv.insert("is_final".into(), json!(i.is_final));
+                        iv.insert("next".into(), json!(i.next.name()));
+                        let mut missing = serde_json::Map::new();
+                        if !i.missing_pubkeys.is_empty() {
+                            missing.insert(
+                                "pubkeys".into(),
+                                json!(
+                                    i.missing_pubkeys
+                                        .iter()
+                                        .map(|k| hex::encode(k))
+                                        .collect::<Vec<_>>()
+                                ),
+                            );
+                        }
+                        if let Some(h) = i.missing_redeem_script {
+                            missing.insert("redeemscript".into(), json!(hex::encode(&h)));
+                        }
+                        if let Some(h) = i.missing_witness_script {
+                            missing.insert("witnessscript".into(), json!(hex::encode(&h)));
+                        }
+                        if !i.missing_sigs.is_empty() {
+                            missing.insert(
+                                "signatures".into(),
+                                json!(
+                                    i.missing_sigs
+                                        .iter()
+                                        .map(|k| hex::encode(k))
+                                        .collect::<Vec<_>>()
+                                ),
+                            );
+                        }
+                        if !missing.is_empty() {
+                            iv.insert("missing".into(), Value::Object(missing));
+                        }
+                        Value::Object(iv)
+                    })
+                    .collect();
+                result.insert("inputs".into(), json!(inputs));
+            }
+            if let Some(vsize) = analysis.estimated_vsize {
+                result.insert("estimated_vsize".into(), json!(vsize));
+            }
+            if let Some(fee_k) = analysis.estimated_feerate_k {
+                result.insert("estimated_feerate".into(), value_from_amount(fee_k));
+            }
+            if let Some(fee) = analysis.fee {
+                result.insert("fee".into(), value_from_amount(fee));
+            }
+            result.insert("next".into(), json!(analysis.next.name()));
+            if let Some(err) = analysis.error {
+                result.insert("error".into(), json!(err));
+            }
+            (Value::Object(result), None)
+        }
         // Core's createmultisig (rpc/output_script.cpp) — n-of-m
         // multisig construction: keys parse first (HexToPubKey), then
         // the address type, then AddAndGetMultisigDestination's checks
@@ -9426,7 +9534,7 @@ fn dispatch(
                      \x20   decoderawtransaction <hex> [iswitness], getindexinfo [index_name],\n\
                      \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>, decodepsbt <psbt>,\n\
                      \x20   createpsbt <in> <out> [lt] [rbf], converttopsbt <hex> [ok] [wit],\n\
-                     \x20   combinepsbt <psbts>, joinpsbts <psbts>,\n\
+                     \x20   combinepsbt <psbts>, joinpsbts <psbts>, analyzepsbt <psbt>,\n\
                      \x20   gettxoutproof <txids> [blockhash] [options],\n\
                      \x20   verifytxoutproof <proof> [options], validateaddress <address>,\n\
                      \x20   verifymessage <address> <sig> <msg>,\n\
