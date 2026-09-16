@@ -21,12 +21,16 @@
 
 use std::collections::BTreeMap;
 
-use crate::hash::hash160;
-use crate::interpreter::{SigVersion, SignatureChecker, compute_tapleaf_hash, verify_script};
+use crate::descriptor::FlatProvider;
+use crate::hash::{hash160, sha256};
+use crate::interpreter::{
+    SigVersion, SignatureChecker, compute_tapbranch_hash, compute_tapleaf_hash, verify_script,
+};
 use crate::psbt::{KeyMap, Psbt};
 use crate::script::ScriptType;
 use crate::sigchecker::{PrecomputedTransactionData, TransactionSignatureChecker};
 use crate::transaction::{Script, Transaction, TxOut, Witness};
+use sha2::{Digest, Sha256};
 
 /// `SIGHASH_ALL`.
 pub const SIGHASH_ALL: u32 = 1;
@@ -126,6 +130,10 @@ pub struct SignatureData {
     /// each block list kept shortest-first like Core's
     /// `ShortestVectorFirstComparator`.
     pub tr_scripts: BTreeMap<(Vec<u8>, u8), Vec<Vec<u8>>>,
+    /// `tr_builder` leaves as `(depth, leaf_ver, script)` tuples —
+    /// set from the provider's taproot tree; written back to an
+    /// output's `OUT_TAP_TREE` when scripts are present.
+    pub tr_tree: Option<Vec<(u8, u8, Vec<u8>)>>,
     /// `taproot_misc_pubkeys` — `xonly → (leaf hashes, origin value)`.
     pub tap_misc: BTreeMap<[u8; 32], TapMiscEntry>,
     /// Hash-preimage maps (`ripemd160`/`sha256`/`hash160`/`hash256`).
@@ -204,23 +212,16 @@ impl SignatureData {
             blocks.insert(pos.unwrap_or(blocks.len()), control.to_vec());
         }
         for (xonly, v) in map.all(Psbt::IN_TAP_BIP32_DERIVATION) {
-            if xonly.len() != 32 || v.len() < 4 {
+            let Some((leaves, origin)) = parse_tap_bip32_value(v) else {
+                continue;
+            };
+            if xonly.len() != 32 {
                 continue;
             }
             let mut xk = [0u8; 32];
             xk.copy_from_slice(xonly);
-            let leaf_count = u32::from_le_bytes([v[0], v[1], v[2], v[3]]) as usize;
-            let leaf_end = 4 + 32 * leaf_count;
-            let mut leaves = Vec::new();
-            if v.len() >= leaf_end {
-                for i in 0..leaf_count {
-                    let mut h = [0u8; 32];
-                    h.copy_from_slice(&v[4 + 32 * i..4 + 32 * i + 32]);
-                    leaves.push(h);
-                }
-                self.tap_misc.insert(xk, (leaves, v[leaf_end..].to_vec()));
-                self.tap_pubkeys.insert(hash160(&xk), xk);
-            }
+            self.tap_misc.insert(xk, (leaves, origin));
+            self.tap_pubkeys.insert(hash160(&xk), xk);
         }
         const PREIMAGE_TYPES: [u8; 4] = [
             Psbt::IN_RIPEMD160,
@@ -315,7 +316,8 @@ impl SignatureData {
         for (xonly, (leaves, origin)) in &self.tap_misc {
             let mut key = vec![Psbt::IN_TAP_BIP32_DERIVATION];
             key.extend_from_slice(xonly);
-            let mut value = (leaves.len() as u32).to_le_bytes().to_vec();
+            let mut value = Vec::new();
+            crate::encode::write_compact_size(&mut value, leaves.len() as u64);
             for h in leaves {
                 value.extend_from_slice(h);
             }
@@ -323,6 +325,165 @@ impl SignatureData {
             if !map.contains(&key) {
                 map.set(key, value);
             }
+        }
+    }
+
+    /// `PSBTOutput::FillSignatureData` — output maps carry scripts,
+    /// derivations, and the taproot tree (which rebuilds spend data
+    /// when an internal key is present).
+    pub fn fill_from_output(&mut self, map: &KeyMap) {
+        if let Some(v) = map.get(Psbt::OUT_REDEEM_SCRIPT) {
+            self.redeem_script = Some(v.to_vec());
+        }
+        if let Some(v) = map.get(Psbt::OUT_WITNESS_SCRIPT) {
+            self.witness_script = Some(v.to_vec());
+        }
+        for (pubkey, origin) in map.all(Psbt::OUT_BIP32_DERIVATION) {
+            self.misc_pubkeys
+                .insert(hash160(pubkey), (pubkey.to_vec(), origin.to_vec()));
+        }
+        if let (Some(tree), Some(internal)) = (
+            map.get(Psbt::OUT_TAP_TREE),
+            map.get(Psbt::OUT_TAP_INTERNAL_KEY).and_then(|v| {
+                (v.len() == 32).then(|| {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(v);
+                    k
+                })
+            }),
+        ) {
+            let mut builder = TaprootTreeBuilder::new();
+            let mut dec = crate::encode::Decoder::new(tree);
+            while !dec.is_finished() {
+                let (Ok(d), Ok(ver), Ok(script)) = (
+                    dec.read_u8(),
+                    dec.read_u8(),
+                    dec.read_var_bytes().map(|s| s.to_vec()),
+                ) else {
+                    break;
+                };
+                builder.add(d, &script, ver);
+            }
+            if builder.is_complete()
+                && let Some(spend) = builder.spend_data(internal)
+            {
+                self.tr_internal_key = Some(internal);
+                self.merge_spend_scripts(spend.0);
+                if self.tr_merkle_root.is_none() {
+                    self.tr_merkle_root = spend.1;
+                }
+            }
+        }
+        for (xonly, v) in map.all(Psbt::OUT_TAP_BIP32_DERIVATION) {
+            let Some((leaves, origin)) = parse_tap_bip32_value(v) else {
+                continue;
+            };
+            if xonly.len() != 32 {
+                continue;
+            }
+            let mut xk = [0u8; 32];
+            xk.copy_from_slice(xonly);
+            self.tap_misc.insert(xk, (leaves, origin));
+            self.tap_pubkeys.insert(hash160(&xk), xk);
+        }
+    }
+
+    /// `PSBTOutput::FromSignatureData` — merge-only writes: existing
+    /// fields are never overwritten.
+    pub fn store_into_output(&self, map: &mut KeyMap) {
+        if let Some(script) = &self.redeem_script
+            && map.get(Psbt::OUT_REDEEM_SCRIPT).is_none()
+        {
+            map.set(vec![Psbt::OUT_REDEEM_SCRIPT], script.clone());
+        }
+        if let Some(script) = &self.witness_script
+            && map.get(Psbt::OUT_WITNESS_SCRIPT).is_none()
+        {
+            map.set(vec![Psbt::OUT_WITNESS_SCRIPT], script.clone());
+        }
+        for (pubkey, origin) in self.misc_pubkeys.values() {
+            let mut key = vec![Psbt::OUT_BIP32_DERIVATION];
+            key.extend_from_slice(pubkey);
+            if !map.contains(&key) {
+                map.set(key, origin.clone());
+            }
+        }
+        if let Some(k) = self.tr_internal_key
+            && map.get(Psbt::OUT_TAP_INTERNAL_KEY).is_none()
+        {
+            map.set(vec![Psbt::OUT_TAP_INTERNAL_KEY], k.to_vec());
+        }
+        if let Some(tree) = &self.tr_tree
+            && !tree.is_empty()
+            && map.get(Psbt::OUT_TAP_TREE).is_none()
+        {
+            let mut v = Vec::new();
+            for (depth, ver, script) in tree {
+                v.push(*depth);
+                v.push(*ver);
+                crate::encode::write_var_bytes(&mut v, script);
+            }
+            map.set(vec![Psbt::OUT_TAP_TREE], v);
+        }
+        for (xonly, (leaves, origin)) in &self.tap_misc {
+            let mut key = vec![Psbt::OUT_TAP_BIP32_DERIVATION];
+            key.extend_from_slice(xonly);
+            let mut value = Vec::new();
+            crate::encode::write_compact_size(&mut value, leaves.len() as u64);
+            for h in leaves {
+                value.extend_from_slice(h);
+            }
+            value.extend_from_slice(origin);
+            if !map.contains(&key) {
+                map.set(key, value);
+            }
+        }
+    }
+
+    /// `TaprootSpendData::Merge` — keep the existing internal key and
+    /// merkle root, union the script→control-blocks map.
+    fn merge_spend_scripts(&mut self, scripts: BTreeMap<(Vec<u8>, u8), Vec<Vec<u8>>>) {
+        for ((script, ver), blocks) in scripts {
+            let dst = self.tr_scripts.entry((script, ver)).or_default();
+            for block in blocks {
+                if !dst.contains(&block) {
+                    let pos = dst
+                        .iter()
+                        .position(|b| (b.len(), b.as_slice()) > (block.len(), block.as_slice()));
+                    dst.insert(pos.unwrap_or(dst.len()), block);
+                }
+            }
+        }
+    }
+
+    /// `provider.GetTaprootSpendData`/`GetTaprootBuilder` merge —
+    /// internal key and merkle root attach, leaves become control
+    /// blocks, and the tree tuples are kept for `OUT_TAP_TREE`.
+    fn merge_tr_spend(&mut self, spend: &crate::descriptor::TaprootSpendData) {
+        // `IsNull()` — an all-zero key/root counts as unset in Core.
+        if self.tr_internal_key.is_none_or(|k| k == [0; 32]) {
+            self.tr_internal_key = Some(spend.internal_key);
+        }
+        if self.tr_merkle_root.is_none_or(|r| r == [0; 32]) {
+            self.tr_merkle_root = spend.merkle_root;
+        }
+        let mut builder = TaprootTreeBuilder::new();
+        for (depth, script, ver) in &spend.leaves {
+            builder.add(*depth as u8, script, *ver);
+        }
+        if let Some((scripts, _)) = builder
+            .is_complete()
+            .then(|| builder.spend_data(spend.internal_key))
+            .flatten()
+        {
+            self.merge_spend_scripts(scripts);
+            self.tr_tree = Some(
+                spend
+                    .leaves
+                    .iter()
+                    .map(|(d, s, v)| (*d as u8, *v, s.clone()))
+                    .collect(),
+            );
         }
     }
 }
@@ -430,9 +591,164 @@ pub fn psbt_input_signed_and_verified(
     .is_ok()
 }
 
-/// `GetCScript` against an empty provider — only the PSBT-carried
-/// redeem/witness scripts can satisfy the hash.
-fn get_cscript(sigdata: &SignatureData, scriptid: &[u8; 20]) -> Option<Vec<u8>> {
+/// `TaprootBuilder` — tracks each leaf's merkle branch while merging
+/// DFS-ordered `(depth, script, leaf_version)` leaves up to the root,
+/// then `spend_data` produces the control blocks Core's
+/// `GetSpendData` emits.
+#[derive(Default)]
+pub struct TaprootTreeBuilder {
+    /// `m_valid` — cleared when a leaf breaks DFS order or a depth-0
+    /// combine would exceed the root. Core inits `true`; `Default`
+    /// is overridden below.
+    valid: bool,
+    /// `branch[d]` = merged node awaiting its sibling at depth `d`.
+    branch: Vec<Option<TapNode>>,
+    parity: bool,
+}
+
+impl TaprootTreeBuilder {
+    pub fn new() -> Self {
+        TaprootTreeBuilder {
+            valid: true,
+            branch: Vec::new(),
+            parity: false,
+        }
+    }
+}
+
+struct TapLeaf {
+    script: Vec<u8>,
+    leaf_ver: u8,
+    /// Sibling hashes on the path from this leaf to the node.
+    branch: Vec<[u8; 32]>,
+}
+
+struct TapNode {
+    hash: [u8; 32],
+    leaves: Vec<TapLeaf>,
+}
+
+impl TaprootTreeBuilder {
+    /// `Add` — hash the leaf, `Insert` at `depth`.
+    pub fn add(&mut self, depth: u8, script: &[u8], leaf_ver: u8) {
+        if !self.valid {
+            return;
+        }
+        let node = TapNode {
+            hash: compute_tapleaf_hash(leaf_ver, script),
+            leaves: vec![TapLeaf {
+                script: script.to_vec(),
+                leaf_ver,
+                branch: Vec::new(),
+            }],
+        };
+        self.insert(node, depth as usize);
+    }
+
+    /// `Insert` — see `psbt::check_tap_tree` for the depth rules.
+    fn insert(&mut self, mut node: TapNode, mut depth: usize) {
+        if depth + 1 < self.branch.len() {
+            self.valid = false;
+            return;
+        }
+        while self.valid && self.branch.len() > depth && self.branch[depth].is_some() {
+            let other = self.branch.pop().flatten().expect("checked");
+            node = combine_nodes(node, other);
+            if depth == 0 {
+                self.valid = false;
+                break;
+            }
+            depth -= 1;
+        }
+        if self.valid {
+            while self.branch.len() <= depth {
+                self.branch.push(None);
+            }
+            self.branch[depth] = Some(node);
+        }
+    }
+
+    /// `IsComplete` — single root at depth 0 (or an untouched builder).
+    pub fn is_complete(&self) -> bool {
+        self.valid
+            && (self.branch.is_empty() || (self.branch.len() == 1 && self.branch[0].is_some()))
+    }
+
+    /// `Finalize` + `GetSpendData` — tweak the internal key against the
+    /// root and emit `(script, leaf_ver) → control blocks` plus the
+    /// merkle root. `None` when the tree is incomplete or the tweak
+    /// fails.
+    pub fn spend_data(
+        &mut self,
+        internal_key: [u8; 32],
+    ) -> Option<(BTreeMap<(Vec<u8>, u8), Vec<Vec<u8>>>, Option<[u8; 32]>)> {
+        if !self.is_complete() {
+            return None;
+        }
+        let root = self.branch.first().and_then(|n| n.as_ref());
+        // `CreateTapTweak` — `TapTweak(internal || merkle_root)`, the
+        // root omitted entirely for a key-path-only builder.
+        let tag = sha256(b"TapTweak");
+        let mut h = Sha256::new();
+        h.update(&tag);
+        h.update(&tag);
+        h.update(&internal_key);
+        if let Some(n) = root {
+            h.update(&n.hash);
+        }
+        let tweak: [u8; 32] = h.finalize().into();
+        let internal = secp256k1::XOnlyPublicKey::from_slice(&internal_key).ok()?;
+        let tweak = secp256k1::Scalar::from_be_bytes(tweak).ok()?;
+        let (_out, parity) = internal
+            .add_tweak(&secp256k1::Secp256k1::verification_only(), &tweak)
+            .ok()?;
+        self.parity = parity == secp256k1::Parity::Odd;
+        let mut scripts: BTreeMap<(Vec<u8>, u8), Vec<Vec<u8>>> = BTreeMap::new();
+        if let Some(n) = root {
+            for leaf in &n.leaves {
+                let mut control = Vec::with_capacity(33 + 32 * leaf.branch.len());
+                control.push(leaf.leaf_ver | u8::from(self.parity));
+                control.extend_from_slice(&internal_key);
+                for node in &leaf.branch {
+                    control.extend_from_slice(node);
+                }
+                let entry = scripts
+                    .entry((leaf.script.clone(), leaf.leaf_ver))
+                    .or_default();
+                if !entry.contains(&control) {
+                    entry.push(control);
+                }
+            }
+        }
+        Some((scripts, root.map(|n| n.hash)))
+    }
+}
+
+/// `TaprootBuilder::Combine` — `a`'s leaves gain `b`'s hash and vice
+/// versa; the node hash is the sorted branch hash.
+fn combine_nodes(a: TapNode, b: TapNode) -> TapNode {
+    let mut leaves = Vec::with_capacity(a.leaves.len() + b.leaves.len());
+    for mut leaf in a.leaves {
+        leaf.branch.push(b.hash);
+        leaves.push(leaf);
+    }
+    for mut leaf in b.leaves {
+        leaf.branch.push(a.hash);
+        leaves.push(leaf);
+    }
+    TapNode {
+        hash: compute_tapbranch_hash(&a.hash, &b.hash),
+        leaves,
+    }
+}
+
+/// `GetCScript` — the PSBT-carried redeem/witness scripts first, then
+/// the provider's script map.
+fn get_cscript(
+    sigdata: &SignatureData,
+    scriptid: &[u8; 20],
+    provider: &FlatProvider,
+) -> Option<Vec<u8>> {
     if let Some(script) = &sigdata.redeem_script
         && hash160(script) == *scriptid
     {
@@ -443,12 +759,16 @@ fn get_cscript(sigdata: &SignatureData, scriptid: &[u8; 20]) -> Option<Vec<u8>> 
     {
         return Some(script.clone());
     }
-    None
+    provider.scripts.get(scriptid).cloned()
 }
 
-/// `GetPubKey` against an empty provider — partial-sig keydata,
-/// BIP32-derivation keydata, then taproot pubkeys (even-Y form).
-fn get_pubkey(sigdata: &SignatureData, keyid: &[u8; 20]) -> Option<Vec<u8>> {
+/// `GetPubKey` — partial-sig keydata, BIP32-derivation keydata,
+/// taproot pubkeys (even-Y form), then the provider's pubkey map.
+fn get_pubkey(
+    sigdata: &SignatureData,
+    keyid: &[u8; 20],
+    provider: &FlatProvider,
+) -> Option<Vec<u8>> {
     if let Some((pubkey, _)) = sigdata.signatures.get(keyid) {
         return Some(pubkey.clone());
     }
@@ -462,7 +782,47 @@ fn get_pubkey(sigdata: &SignatureData, keyid: &[u8; 20]) -> Option<Vec<u8>> {
         cpk.extend_from_slice(xonly);
         return Some(cpk);
     }
-    None
+    provider.pubkeys.get(keyid).cloned()
+}
+
+/// The tap-bip32 value body: `CompactSize(leafcount) || leafhashes
+/// || fingerprint || path elements` — Core's `SerializeToVector` with
+/// a `std::set<uint256>` then `SerializeHDKeypath`.
+fn parse_tap_bip32_value(v: &[u8]) -> Option<(Vec<[u8; 32]>, Vec<u8>)> {
+    let mut dec = crate::encode::Decoder::new(v);
+    let leaf_count = dec.read_compact_size().ok()? as usize;
+    let mut leaves = Vec::with_capacity(leaf_count.min(64));
+    for _ in 0..leaf_count {
+        let mut h = [0u8; 32];
+        h.copy_from_slice(dec.read_bytes(32).ok()?);
+        leaves.push(h);
+    }
+    Some((leaves, v[dec.position()..].to_vec()))
+}
+
+/// `GetKeyOrigin` — the provider's `keyid → (pubkey, origin)` map;
+/// the returned origin is encoded as a PSBT derivation value.
+fn get_key_origin(provider: &FlatProvider, keyid: &[u8; 20]) -> Option<Vec<u8>> {
+    let (_, (fp, path)) = provider.origins.get(keyid)?;
+    Some(key_origin_value(fp, path))
+}
+
+/// `GetKeyOriginByXOnly` — scan origins for the key whose x-coordinate
+/// matches (compressed and uncompressed keys share `key[1..33]`).
+fn get_key_origin_by_xonly(provider: &FlatProvider, xonly: &[u8; 32]) -> Option<Vec<u8>> {
+    provider.origins.values().find_map(|(pk, (fp, path))| {
+        (pk.len() >= 33 && pk[1..33] == xonly[..]).then(|| key_origin_value(fp, path))
+    })
+}
+
+/// `SerializeHDKeypath` — `fingerprint || path elements` little-endian.
+fn key_origin_value(fp: &[u8; 4], path: &[u32]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + 4 * path.len());
+    v.extend_from_slice(fp);
+    for p in path {
+        v.extend_from_slice(&p.to_le_bytes());
+    }
+    v
 }
 
 /// `DummySignatureCreator`'s ECDSA output: a DER-valid 71-byte sig —
@@ -482,12 +842,23 @@ fn dummy_ecdsa_sig() -> Vec<u8> {
     sig
 }
 
-/// `CreateSig` — reuse an existing partial sig, else create through
-/// the pass's creator. `Real` failures record `missing_sigs`.
-fn create_sig(sigdata: &mut SignatureData, pubkey: &[u8], mode: Creator) -> Option<Vec<u8>> {
+/// `CreateSig` — reuse an existing partial sig, else attach the
+/// provider's key origin and create through the pass's creator.
+/// `Real` failures record `missing_sigs`.
+fn create_sig(
+    sigdata: &mut SignatureData,
+    pubkey: &[u8],
+    mode: Creator,
+    provider: &FlatProvider,
+) -> Option<Vec<u8>> {
     let keyid = hash160(pubkey);
     if let Some((_, sig)) = sigdata.signatures.get(&keyid) {
         return Some(sig.clone());
+    }
+    if let Some(origin) = get_key_origin(provider, &keyid) {
+        sigdata
+            .misc_pubkeys
+            .insert(keyid, (pubkey.to_vec(), origin));
     }
     match mode {
         Creator::Dummy => {
@@ -504,14 +875,31 @@ fn create_sig(sigdata: &mut SignatureData, pubkey: &[u8], mode: Creator) -> Opti
     }
 }
 
-/// `CreateTaprootScriptSig` — a `(xonly, leaf_hash)`-keyed schnorr sig.
+/// `CreateTaprootScriptSig` — a `(xonly, leaf_hash)`-keyed schnorr sig;
+/// the provider's x-only key origin is attached to
+/// `taproot_misc_pubkeys` before the sig lookup.
 /// Real-mode failures are silent (taproot has no `missing_sigs` entry).
 fn create_taproot_script_sig(
     sigdata: &mut SignatureData,
     xonly: &[u8; 32],
     leaf_hash: &[u8; 32],
     mode: Creator,
+    provider: &FlatProvider,
 ) -> Option<Vec<u8>> {
+    // Core emplaces the entry before the sig lookup — with no origin
+    // the value serializes as `leafcount || leaves || 00000000`.
+    let entry = sigdata
+        .tap_misc
+        .entry(*xonly)
+        .or_insert_with(|| (Vec::new(), vec![0; 4]));
+    if let Some(origin) = get_key_origin_by_xonly(provider, xonly) {
+        entry.1 = origin;
+    }
+    if !entry.0.contains(leaf_hash) {
+        // std::set<uint256> — ordered by the stored bytes.
+        entry.0.push(*leaf_hash);
+        entry.0.sort();
+    }
     if let Some(sig) = sigdata.taproot_script_sigs.get(&(*xonly, *leaf_hash)) {
         return Some(sig.clone());
     }
@@ -562,24 +950,40 @@ fn satisfy_pk_leaf(
     leaf_hash: Option<&[u8; 32]>,
     sigdata: &mut SignatureData,
     mode: Creator,
+    provider: &FlatProvider,
 ) -> Option<Vec<Vec<u8>>> {
     if script.len() == 34 && script[0] == 0x20 && script[33] == 0xac {
         let mut xonly = [0u8; 32];
         xonly.copy_from_slice(&script[1..33]);
-        let sig = create_taproot_script_sig(sigdata, &xonly, leaf_hash?, mode)?;
+        let sig = create_taproot_script_sig(sigdata, &xonly, leaf_hash?, mode, provider)?;
         return Some(vec![sig]);
     }
     None
 }
 
-/// `SignTaproot` — key path first, then the smallest satisfying
-/// script-path leaf (provider lookups dropped: the provider is empty).
+/// `SignTaproot` — merge the provider's taproot spend data and builder
+/// for this output key, sign the key path first, then the smallest
+/// satisfying script-path leaf.
 fn sign_taproot(
     output_key: &[u8; 32],
     sigdata: &mut SignatureData,
     mode: Creator,
+    provider: &FlatProvider,
 ) -> Option<Vec<Vec<u8>>> {
-    // Key path: internal key first (may be null), then the output key.
+    // GetTaprootSpendData + GetTaprootBuilder.
+    if let Some(spend) = provider.tr_trees.get(output_key) {
+        sigdata.merge_tr_spend(spend);
+    }
+    // Key path: the internal key's origin attaches, then internal key
+    // first (may be null), then the output key.
+    if let Some(internal) = sigdata.tr_internal_key
+        && let Some(origin) = get_key_origin_by_xonly(provider, &internal)
+    {
+        sigdata
+            .tap_misc
+            .entry(internal)
+            .or_insert((Vec::new(), origin));
+    }
     if sigdata.taproot_key_path_sig.is_empty()
         && sigdata.tr_internal_key.is_some()
         && let Some(sig) = create_schnorr_keypath(mode)
@@ -591,7 +995,6 @@ fn sign_taproot(
     {
         sigdata.taproot_key_path_sig = sig;
     }
-    let _ = output_key;
     if !sigdata.taproot_key_path_sig.is_empty() {
         return Some(vec![sigdata.taproot_key_path_sig.clone()]);
     }
@@ -602,7 +1005,8 @@ fn sign_taproot(
             continue;
         }
         let leaf_hash = compute_tapleaf_hash(*leaf_ver, script);
-        if let Some(mut stack) = satisfy_pk_leaf(script, Some(&leaf_hash), sigdata, mode) {
+        if let Some(mut stack) = satisfy_pk_leaf(script, Some(&leaf_hash), sigdata, mode, provider)
+        {
             stack.push(script.clone());
             stack.push(control_blocks[0].clone());
             let better = smallest
@@ -623,6 +1027,7 @@ fn serialized_len(stack: &[Vec<u8>]) -> usize {
 /// `SignStep` — solve one script level. Returns `(solved, result)`;
 /// for SCRIPTHASH `result` carries the redeem script to recurse into.
 fn sign_step(
+    provider: &FlatProvider,
     script: &[u8],
     sigdata: &mut SignatureData,
     mode: Creator,
@@ -634,21 +1039,21 @@ fn sign_step(
         {
             (false, Vec::new(), StepKind::Other)
         }
-        ScriptType::PubKey(pubkey) => match create_sig(sigdata, &pubkey, mode) {
+        ScriptType::PubKey(pubkey) => match create_sig(sigdata, &pubkey, mode, provider) {
             Some(sig) => (true, vec![sig], StepKind::Other),
             None => (false, Vec::new(), StepKind::Other),
         },
         ScriptType::PubKeyHash(h160) => {
-            let Some(pubkey) = get_pubkey(sigdata, &h160) else {
+            let Some(pubkey) = get_pubkey(sigdata, &h160, provider) else {
                 sigdata.missing_pubkeys.push(h160);
                 return (false, Vec::new(), StepKind::Other);
             };
-            match create_sig(sigdata, &pubkey, mode) {
+            match create_sig(sigdata, &pubkey, mode, provider) {
                 Some(sig) => (true, vec![sig, pubkey], StepKind::Other),
                 None => (false, Vec::new(), StepKind::Other),
             }
         }
-        ScriptType::ScriptHash(h160) => match get_cscript(sigdata, &h160) {
+        ScriptType::ScriptHash(h160) => match get_cscript(sigdata, &h160, provider) {
             Some(script) => (true, vec![script], StepKind::ScriptHash),
             None => {
                 sigdata.missing_redeem_script = Some(h160);
@@ -658,7 +1063,7 @@ fn sign_step(
         ScriptType::Multisig { required, keys } => {
             let mut ret = vec![Vec::new()];
             for pubkey in &keys {
-                if let Some(sig) = create_sig(sigdata, pubkey, mode)
+                if let Some(sig) = create_sig(sigdata, pubkey, mode, provider)
                     && ret.len() < required as usize + 1
                 {
                     ret.push(sig);
@@ -684,7 +1089,7 @@ fn sign_step(
                 h.copy_from_slice(&hash160_of_program(&program));
                 h
             };
-            match get_cscript(sigdata, &scriptid) {
+            match get_cscript(sigdata, &scriptid, provider) {
                 Some(script) => (true, vec![script], StepKind::W0ScriptHash),
                 None => {
                     let mut w = [0u8; 32];
@@ -700,7 +1105,7 @@ fn sign_step(
         } if program.len() == 32 => {
             let mut key = [0u8; 32];
             key.copy_from_slice(&program);
-            match sign_taproot(&key, sigdata, mode) {
+            match sign_taproot(&key, sigdata, mode, provider) {
                 Some(stack) => (true, stack, StepKind::Taproot),
                 None => (false, Vec::new(), StepKind::Taproot),
             }
@@ -739,6 +1144,7 @@ fn hash160_of_program(program: &[u8]) -> [u8; 20] {
 /// the real transaction checker for the missing-analysis pass,
 /// `DummyChecker` for estimation.
 pub fn produce_signature(
+    provider: &FlatProvider,
     script_pubkey: &Script,
     sigdata: &mut SignatureData,
     mode: Creator,
@@ -747,61 +1153,63 @@ pub fn produce_signature(
     if sigdata.complete {
         return true;
     }
-    let (mut solved, mut result, kind) = sign_step(script_pubkey.as_bytes(), sigdata, mode);
+    let (mut solved, mut result, mut kind) =
+        sign_step(provider, script_pubkey.as_bytes(), sigdata, mode);
     let mut p2sh = false;
     let mut subscript = Vec::new();
 
+    // `whichType` is an out-param in Core — each SignStep call
+    // rewrites it, and the witness arms check the *current* type.
     if solved && matches!(kind, StepKind::ScriptHash) {
         subscript = result[0].clone();
         sigdata.redeem_script = Some(subscript.clone());
-        let (s2, r2, k2) = sign_step(&subscript, sigdata, mode);
+        let (s2, r2, k2) = sign_step(provider, &subscript, sigdata, mode);
         solved = s2 && !matches!(k2, StepKind::ScriptHash);
         result = r2;
+        kind = k2;
         p2sh = true;
     }
 
-    match kind {
-        _ if !solved => {}
-        StepKind::W0KeyHash => {
-            // OP_DUP OP_HASH160 <program> OP_EQUALVERIFY OP_CHECKSIG
-            let mut wsh = Vec::with_capacity(25);
-            wsh.extend_from_slice(&[0x76, 0xa9, 0x14]);
-            wsh.extend_from_slice(&result[0]);
-            wsh.extend_from_slice(&[0x88, 0xac]);
-            let (s2, r2, _k2) = sign_step(&wsh, sigdata, mode);
-            solved = s2;
-            sigdata.script_witness = Some(r2);
-            sigdata.witness = true;
-            result.clear();
-        }
-        StepKind::W0ScriptHash => {
-            let witnessscript = result[0].clone();
-            sigdata.witness_script = Some(witnessscript.clone());
-            let (s2, mut r2, k2) = sign_step(&witnessscript, sigdata, mode);
-            solved = s2
-                && !matches!(k2, StepKind::ScriptHash)
-                && !matches!(k2, StepKind::W0ScriptHash)
-                && !matches!(k2, StepKind::W0KeyHash);
-            if !solved && r2.is_empty() {
-                // Miniscript fallback: only the `pk` leaf subset.
-                if let Some(stack) = satisfy_wsh_miniscript(&witnessscript, sigdata, mode) {
-                    solved = true;
-                    r2 = stack;
-                }
+    if solved && matches!(kind, StepKind::W0KeyHash) {
+        // OP_DUP OP_HASH160 <program> OP_EQUALVERIFY OP_CHECKSIG
+        let mut wsh = Vec::with_capacity(25);
+        wsh.extend_from_slice(&[0x76, 0xa9, 0x14]);
+        wsh.extend_from_slice(&result[0]);
+        wsh.extend_from_slice(&[0x88, 0xac]);
+        let (s2, r2, _k2) = sign_step(provider, &wsh, sigdata, mode);
+        solved = s2;
+        sigdata.script_witness = Some(r2);
+        sigdata.witness = true;
+        result.clear();
+    }
+
+    if solved && matches!(kind, StepKind::W0ScriptHash) {
+        let witnessscript = result[0].clone();
+        sigdata.witness_script = Some(witnessscript.clone());
+        let (s2, mut r2, k2) = sign_step(provider, &witnessscript, sigdata, mode);
+        solved = s2
+            && !matches!(k2, StepKind::ScriptHash)
+            && !matches!(k2, StepKind::W0ScriptHash)
+            && !matches!(k2, StepKind::W0KeyHash);
+        if !solved && r2.is_empty() {
+            // Miniscript fallback: only the `pk` leaf subset.
+            if let Some(stack) = satisfy_wsh_miniscript(&witnessscript, sigdata, mode, provider) {
+                solved = true;
+                r2 = stack;
             }
-            r2.push(witnessscript);
-            sigdata.script_witness = Some(r2);
-            sigdata.witness = true;
-            result.clear();
         }
-        StepKind::Taproot if !p2sh => {
-            sigdata.witness = true;
-            if solved {
-                sigdata.script_witness = Some(result.clone());
-            }
-            result.clear();
+        r2.push(witnessscript);
+        sigdata.script_witness = Some(r2);
+        sigdata.witness = true;
+        result.clear();
+    }
+
+    if matches!(kind, StepKind::Taproot) && !p2sh {
+        sigdata.witness = true;
+        if solved {
+            sigdata.script_witness = Some(result.clone());
         }
-        _ => {}
+        result.clear();
     }
     // Core's `solved && WITNESS_UNKNOWN` arm is unreachable (SignStep
     // never solves it) — an unknown program just leaves `witness`
@@ -832,10 +1240,11 @@ fn satisfy_wsh_miniscript(
     script: &[u8],
     sigdata: &mut SignatureData,
     mode: Creator,
+    provider: &FlatProvider,
 ) -> Option<Vec<Vec<u8>>> {
     // `<33B compressed pubkey> OP_CHECKSIG` — `pk(key)` in P2WSH.
     if script.len() == 35 && script[0] == 0x21 && script[34] == 0xac {
-        let sig = create_sig(sigdata, &script[1..34], mode)?;
+        let sig = create_sig(sigdata, &script[1..34], mode, provider)?;
         return Some(vec![sig]);
     }
     None
@@ -884,6 +1293,7 @@ impl SignatureChecker for DummyChecker {
 /// `Real` collects `missing_*` into `out`, `Dummy` produces final
 /// scripts on the input (for `finalize`/`estimated_vsize`).
 pub fn sign_psbt_input(
+    provider: &FlatProvider,
     psbt: &mut Psbt,
     index: usize,
     txdata: Option<&PrecomputedTransactionData>,
@@ -936,9 +1346,15 @@ pub fn sign_psbt_input(
     let sig_complete = match txdata {
         Some(td) => {
             let checker = TransactionSignatureChecker::new(&psbt.tx, index, utxo.value, td);
-            produce_signature(&utxo.script_pubkey, &mut sigdata, mode, &checker)
+            produce_signature(provider, &utxo.script_pubkey, &mut sigdata, mode, &checker)
         }
-        None => produce_signature(&utxo.script_pubkey, &mut sigdata, mode, &DummyChecker),
+        None => produce_signature(
+            provider,
+            &utxo.script_pubkey,
+            &mut sigdata,
+            mode,
+            &DummyChecker,
+        ),
     };
     if require_witness_sig && !sigdata.witness {
         return false;
@@ -963,6 +1379,90 @@ pub fn sign_psbt_input(
         out.missing_witness_script = sigdata.missing_witness_script;
     }
     sig_complete
+}
+
+/// `PSBTInputSigned` — a final scriptSig or a non-null final witness
+/// marks the input signed (Core checks presence, not validity).
+pub fn psbt_input_signed(input: &KeyMap) -> bool {
+    if input
+        .get(Psbt::IN_FINAL_SCRIPTSIG)
+        .is_some_and(|v| !v.is_empty())
+    {
+        return true;
+    }
+    input
+        .get(Psbt::IN_FINAL_SCRIPTWITNESS)
+        .and_then(decode_witness_stack)
+        .is_some_and(|stack| !stack.is_empty())
+}
+
+/// `IsSegWitOutput` — a bare witness program, or P2SH whose provider
+/// subscript is a witness program.
+pub fn is_segwit_output(provider: &FlatProvider, script: &Script) -> bool {
+    match script.classify() {
+        ScriptType::Witness { .. } => true,
+        ScriptType::ScriptHash(h160) => provider.scripts.get(&h160).is_some_and(|s| {
+            matches!(
+                Script::new(s.clone()).classify(),
+                ScriptType::Witness { .. }
+            )
+        }),
+        _ => false,
+    }
+}
+
+/// `RemoveUnnecessaryTransactions` — when every input's witness_utxo
+/// is a segwit v1+ program, the redundant non_witness_utxos can drop
+/// (skipped entirely for SIGHASH_ANYONECANPAY).
+pub fn remove_unnecessary_transactions(psbt: &mut Psbt, sighash_type: u32) {
+    if sighash_type & 0x80 == 0x80 {
+        return;
+    }
+    let mut to_drop = Vec::new();
+    for (i, input) in psbt.inputs.iter().enumerate() {
+        let segwit_v1_plus = input
+            .get(Psbt::IN_WITNESS_UTXO)
+            .and_then(|raw| {
+                let mut dec = crate::encode::Decoder::new(raw);
+                dec.read_i64_le().ok()?;
+                dec.read_var_bytes().ok()
+            })
+            .is_some_and(|spk| {
+                matches!(
+                    Script::new(spk.to_vec()).classify(),
+                    ScriptType::Witness { version, .. } if version != 0
+                )
+            });
+        if !segwit_v1_plus {
+            to_drop.clear();
+            break;
+        }
+        if input.get(Psbt::IN_NON_WITNESS_UTXO).is_some() {
+            to_drop.push(i);
+        }
+    }
+    for i in to_drop {
+        psbt.inputs[i].remove_types(&[Psbt::IN_NON_WITNESS_UTXO]);
+    }
+}
+
+/// `UpdatePSBTOutput` — fill a `SignatureData` from the output map,
+/// run `ProduceSignature` on the output's scriptPubKey as a would-be
+/// spend (provider lookups fill scripts/derivations/taproot data;
+/// `Real` mode with a hiding provider never produces sigs), then
+/// write back merge-only.
+pub fn update_psbt_output(provider: &FlatProvider, psbt: &mut Psbt, index: usize) {
+    let out = psbt.tx.outputs[index].clone();
+    let mut sigdata = SignatureData::default();
+    sigdata.fill_from_output(&psbt.outputs[index]);
+    produce_signature(
+        provider,
+        &out.script_pubkey,
+        &mut sigdata,
+        Creator::Real,
+        &DummyChecker,
+    );
+    sigdata.store_into_output(&mut psbt.outputs[index]);
 }
 
 /// `PSBTRole` ordering — `min()` picks the earliest-needed role.
@@ -1154,6 +1654,7 @@ pub fn analyze_psbt(psbt: &Psbt) -> Analysis {
             let mut outdata = SignatureData::default();
             let mut owned = psbt.clone();
             let complete = sign_psbt_input(
+                &FlatProvider::default(),
                 &mut owned,
                 i,
                 Some(&txdata),
@@ -1215,7 +1716,15 @@ pub fn analyze_psbt(psbt: &Psbt) -> Analysis {
         let mut spent = Vec::with_capacity(mtx.inputs.len());
         let mut success = true;
         for i in 0..mtx.inputs.len() {
-            if !sign_psbt_input(&mut owned, i, None, Creator::Dummy, None, true) {
+            if !sign_psbt_input(
+                &FlatProvider::default(),
+                &mut owned,
+                i,
+                None,
+                Creator::Dummy,
+                None,
+                true,
+            ) {
                 success = false;
                 break;
             }
@@ -1260,6 +1769,8 @@ fn virtual_size(tx: &Transaction, spent: &[TxOut]) -> u64 {
 mod tests {
     use super::*;
     use crate::hex;
+    use crate::psbt::bip32_derivation_value;
+    use crate::transaction::OutPoint;
 
     fn funded() -> Psbt {
         let bytes = hex::decode(include_str!("../tests/data/funded.psbt.hex").trim()).unwrap();
@@ -1276,5 +1787,126 @@ mod tests {
         assert_eq!(analysis.fee, Some(141));
         assert_eq!(analysis.estimated_vsize, Some(141));
         assert_eq!(analysis.estimated_feerate_k, Some(1000));
+    }
+
+    /// The tap-bip32 derivation value: `CompactSize count || leaves ||
+    /// fingerprint || path` — not a fixed-width count.
+    #[test]
+    fn tap_bip32_value_compact_size() {
+        let mut v = vec![0x02];
+        v.extend_from_slice(&[0xaa; 32]);
+        v.extend_from_slice(&[0xbb; 32]);
+        v.extend_from_slice(&[0x78, 0x56, 0x34, 0x12]);
+        v.extend_from_slice(&(84u32 | 0x8000_0000).to_le_bytes());
+        let (leaves, origin) = parse_tap_bip32_value(&v).unwrap();
+        assert_eq!(leaves, vec![[0xaa; 32], [0xbb; 32]]);
+        assert_eq!(bip32_derivation_value(&origin).unwrap().0, 0x1234_5678);
+        // A count that overruns the value is rejected.
+        assert!(parse_tap_bip32_value(&[0x03, 0xaa]).is_none());
+    }
+
+    /// `ProduceSignature` on `sh(wpkh(key))`: the P2SH recursion must
+    /// hand the inner witness type back to the wrapping logic so the
+    /// pkh template runs — filling `redeem_script`, `witness`, and the
+    /// inner key's BIP32 derivation even without private keys.
+    #[test]
+    fn produce_signature_sh_wpkh_metadata() {
+        let secp = secp256k1::Secp256k1::new();
+        let secret = secp256k1::SecretKey::from_slice(&[0x11; 32]).unwrap();
+        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret)
+            .serialize()
+            .to_vec();
+        let keyid = hash160(&pubkey);
+        // redeem = OP_0 <keyid>; spk = OP_HASH160 <h160(redeem)> OP_EQUAL.
+        let mut redeem = vec![0x00, 0x14];
+        redeem.extend_from_slice(&keyid);
+        let mut spk = vec![0xa9, 0x14];
+        spk.extend_from_slice(&hash160(&redeem));
+        spk.push(0x87);
+
+        let mut provider = FlatProvider::default();
+        provider.scripts.insert(hash160(&redeem), redeem.clone());
+        provider.pubkeys.insert(keyid, pubkey.clone());
+        provider.origins.insert(
+            keyid,
+            (
+                pubkey.clone(),
+                ([0xde, 0xad, 0xbe, 0xef], vec![84 | 0x8000_0000]),
+            ),
+        );
+
+        let mut sigdata = SignatureData::default();
+        produce_signature(
+            &provider,
+            &Script::new(spk),
+            &mut sigdata,
+            Creator::Real,
+            &DummyChecker,
+        );
+        assert_eq!(sigdata.redeem_script.as_deref(), Some(&redeem[..]));
+        assert!(sigdata.witness);
+        assert_eq!(
+            sigdata.misc_pubkeys.get(&keyid).map(|(p, _)| p),
+            Some(&pubkey)
+        );
+        // No private key in the provider — the sig is missing but the
+        // pubkey was found, so `missing_pubkeys` stays empty.
+        assert!(sigdata.missing_pubkeys.is_empty());
+        assert_eq!(sigdata.missing_sigs, vec![keyid]);
+    }
+
+    /// `UpdatePSBTOutput` on a `sh(wpkh)` output writes both the
+    /// redeem script and the inner key's derivation record.
+    #[test]
+    fn update_psbt_output_sh_wpkh() {
+        let secp = secp256k1::Secp256k1::new();
+        let secret = secp256k1::SecretKey::from_slice(&[0x22; 32]).unwrap();
+        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret)
+            .serialize()
+            .to_vec();
+        let keyid = hash160(&pubkey);
+        let mut redeem = vec![0x00, 0x14];
+        redeem.extend_from_slice(&keyid);
+        let mut spk = vec![0xa9, 0x14];
+        spk.extend_from_slice(&hash160(&redeem));
+        spk.push(0x87);
+
+        let mut provider = FlatProvider::default();
+        provider.scripts.insert(hash160(&redeem), redeem.clone());
+        provider.pubkeys.insert(keyid, pubkey.clone());
+        provider.origins.insert(
+            keyid,
+            (pubkey.clone(), ([0x11, 0x22, 0x33, 0x44], Vec::new())),
+        );
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![crate::transaction::TxIn {
+                previous_output: OutPoint {
+                    txid: crate::hash::Txid::from_bytes([0x01; 32]),
+                    vout: 0,
+                },
+                script_sig: Script::new(Vec::new()),
+                sequence: 0xffff_fffd,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: Script::new(spk),
+            }],
+            lock_time: 0,
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx);
+        update_psbt_output(&provider, &mut psbt, 0);
+        assert_eq!(
+            psbt.outputs[0].get(Psbt::OUT_REDEEM_SCRIPT),
+            Some(&redeem[..])
+        );
+        let deriv = psbt.outputs[0]
+            .all(Psbt::OUT_BIP32_DERIVATION)
+            .collect::<Vec<_>>();
+        assert_eq!(deriv.len(), 1);
+        assert_eq!(deriv[0].0[..], pubkey[..]);
+        assert_eq!(deriv[0].1[..4], [0x11, 0x22, 0x33, 0x44]);
     }
 }

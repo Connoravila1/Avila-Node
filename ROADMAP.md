@@ -358,14 +358,23 @@ operation. Compare complete initial download and catch-up, not only local replay
       tx-building body and decoderawtransaction's iswitness
       semantics; combinepsbt merges maps first-contributor-wins
       over identical unsigned txs; joinpsbts rebuilds a
-      version-2/locktime-0 tx from ≥2 PSBTs, rejects duplicate
-      outpoints, and strips signature/finalization fields;
+      max-version/min-locktime tx from ≥2 PSBTs, rejects duplicate
+      whole-input spends, and strips signature/finalization fields;
       analyzepsbt runs Core's AnalyzePSBT role machine on a
       SignPSBTInput/ProduceSignature port over the empty signing
       provider (has_utxo/is_final/next + missing
       pubkeys/signatures/redeemscript/witnessscript per input,
       fee and dummy-finalizer estimated_vsize/estimated_feerate
-      once every UTXO slot is filled).
+      once every UTXO slot is filled); utxoupdatepsbt runs
+      ProcessPSBT's update pass — descriptor strings and
+      {desc,range} scan objects expand through the descriptor
+      provider, inputs resolve non_witness_utxo via
+      txindex→mempool then witness_utxo from the UTXO set for
+      segwit prevouts, unnecessary non-witness txs are dropped,
+      and provider-derived scripts/derivations/taproot spend data
+      fill input and output metadata. PSBT maps serialize in
+      Core's canonical per-scope order (typed fields, proprietary,
+      unknown).
       Verified
       byte-identical against
       Core 29.4 including a live spend+receive, a real

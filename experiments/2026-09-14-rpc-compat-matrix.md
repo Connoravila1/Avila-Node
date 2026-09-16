@@ -757,6 +757,41 @@ surfaced:
   non-witness-UTXO paths, unspendable, zero-value, output
   overflow, non-string arg) plus a 4-row malformed-input matrix
   — all byte-identical.
+- `utxoupdatepsbt` runs Core's `ProcessPSBT` update pass: the
+  optional descriptors array accepts strings and
+  `{desc, range:[lo,hi]}` objects (each range endpoint in
+  `[0, 2^31)` through the descriptor's own `Expand` bounds), parses
+  through the `descriptor.rs` provider (ranged `*` paths expand per
+  index, hardened suffixes `'`/`h`, multipath `<a;b>`), and merges
+  every expanded `FlatProvider`. Each input resolves
+  `non_witness_utxo` through txindex → mempool, then `witness_utxo`
+  from the UTXO set when the prevout is segwit (Core's
+  `IsSegWitOutput` fallback); a segwit input with only
+  `witness_utxo` keeps it, and `RemoveUnnecessaryTransactions`
+  drops `non_witness_utxo` whenever a `witness_utxo` coexists.
+  `non_witness_utxo` values serialize the prevout tx *without*
+  witness data per BIP174. Signing metadata comes from the
+  provider-threaded `SignPSBTInput`/`UpdatePSBTOutput` pass:
+  `ProduceSignature` re-checks the rewritten output type after the
+  P2SH recursion (Core's `whichType` out-param — a
+  `sh(wpkh(…))` output fills `redeem_script` *and* the inner key's
+  `bip32_derivs`), `UpdatePSBTOutput` fills output
+  redeem/witness scripts and derivations, and `SignTaproot` merges
+  provider `TaprootSpendData` into `taproot_internal_key`,
+  `taproot_merkle_root`, `taproot_scripts` (control blocks built by
+  a `TaprootBuilder` port — depth-validated DFS merge, sorted
+  branch hashes, tweak parity in the control byte), and
+  `taproot_bip32_derivation` (`CompactSize` leaf-hash count +
+  sorted `std::set` leaf hashes + origin, key-path-only entries
+  emitting an empty leaf list). PSBT map serialization is
+  canonical per Core's `SerializeToStream` — each scope emits typed
+  fields in fixed order, then proprietary, then unknown — so
+  re-encoded PSBTs match Core byte-for-byte. Verified live against
+  Core 29.4: 19-row matrix covering wpkh/sh(wpkh)/tr outputs and
+  inputs, ranged and bare-string descriptors, multi-descriptor
+  merges, bad descriptor strings, non-string elements, range
+  bounds, missing/short/base64-broken PSBT args — all
+  byte-identical.
 
 ### Known semantic differences
 

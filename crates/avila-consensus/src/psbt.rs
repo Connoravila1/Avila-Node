@@ -670,13 +670,72 @@ impl KeyMap {
         self.pairs.iter().any(|(k, _)| k == key)
     }
 
-    fn encode(&self, out: &mut Vec<u8>) {
-        for (key, value) in &self.pairs {
+    /// Serialization order is canonical: Core emits typed members in
+    /// a fixed order, then proprietary keys, then unknowns — an
+    /// insertion-ordered map would produce a different wire form than
+    /// `PartiallySignedTransaction`'s `SerializeToStream`.
+    fn encode_scoped(&self, out: &mut Vec<u8>, scope: MapScope) {
+        let mut sorted: Vec<(&Vec<u8>, &Vec<u8>)> =
+            self.pairs.iter().map(|(k, v)| (k, v)).collect();
+        sorted.sort_by(|a, b| {
+            let ra = scope.rank(a.0.first().copied().unwrap_or(0));
+            let rb = scope.rank(b.0.first().copied().unwrap_or(0));
+            (ra, a.0).cmp(&(rb, b.0))
+        });
+        for (key, value) in sorted {
             encode::write_compact_size(out, key.len() as u64);
             out.extend_from_slice(key);
             encode::write_var_bytes(out, value);
         }
         out.push(0x00);
+    }
+}
+
+/// Which map a `KeyMap` belongs to — Core's `SerializeToStream` order
+/// differs per scope (`PSBTInput`/`PSBTOutput`/`PartiallySignedTransaction`).
+#[derive(Clone, Copy)]
+enum MapScope {
+    Global,
+    Input,
+    Output,
+}
+
+impl MapScope {
+    /// The sort rank of a key type within its map — matching Core's
+    /// field order in `SerializeToStream`. Types not in the table are
+    /// `unknown` and sort last; `0xfc` (proprietary) sits between the
+    /// typed fields and unknowns (for outputs, between `0x02` and
+    /// `0x05`).
+    fn rank(self, key_type: u8) -> u8 {
+        match self {
+            // tx, xpubs, version(0xfb), proprietary, unknown.
+            // BIP370 globals 0x02-0x06 are unknown to Core 29.x.
+            Self::Global => match key_type {
+                0x00 => 0,
+                0x01 => 1,
+                0xfb => 2,
+                0xfc => 3,
+                _ => 4,
+            },
+            // 00,01,02,03,04,05,06,0a,0b,0c,0d,13..18,07,08,
+            // proprietary, unknown.
+            Self::Input => match key_type {
+                0x00..=0x06 => key_type,
+                0x0a..=0x0d => key_type - 3,
+                0x13..=0x18 => key_type - 8,
+                0x07 => 17,
+                0x08 => 18,
+                0xfc => 19,
+                _ => 20,
+            },
+            // 00,01,02, proprietary, 05,06,07, unknown.
+            Self::Output => match key_type {
+                0x00..=0x02 => key_type,
+                0xfc => 3,
+                0x05..=0x07 => key_type - 1,
+                _ => 8,
+            },
+        }
     }
 }
 
@@ -929,16 +988,18 @@ impl Psbt {
         })
     }
 
-    /// Serializes back to the exact wire form.
+    /// Serializes back to the exact wire form — Core's
+    /// `SerializeToStream` order per map (typed fields, proprietary,
+    /// unknowns), so re-encoding a decoded PSBT is identity.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(PSBT_MAGIC);
-        self.global.encode(&mut out);
+        self.global.encode_scoped(&mut out, MapScope::Global);
         for map in &self.inputs {
-            map.encode(&mut out);
+            map.encode_scoped(&mut out, MapScope::Input);
         }
         for map in &self.outputs {
-            map.encode(&mut out);
+            map.encode_scoped(&mut out, MapScope::Output);
         }
         out
     }
@@ -1095,6 +1156,43 @@ mod tests {
         assert_eq!(fp, 0x1234_5678);
         assert_eq!(format_derivation_path(&path), "m/84/1h");
         assert!(bip32_derivation_value(&[1, 2]).is_none());
+    }
+
+    /// `encode` emits Core's canonical map order — typed fields,
+    /// then proprietary, then unknown — regardless of pair insertion
+    /// order (and of plain byte-sort, which would place 0xfc last).
+    #[test]
+    fn encode_canonicalizes_map_order() {
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![crate::transaction::TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_bytes([0x07; 32]),
+                    vout: 1,
+                },
+                script_sig: crate::transaction::Script::new(Vec::new()),
+                sequence: 0xffff_fffd,
+                witness: crate::transaction::Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 500,
+                script_pubkey: crate::transaction::Script::new(vec![0x51]),
+            }],
+            lock_time: 0,
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx);
+        // Insert output pairs scrambled: unknown 0xfa, proprietary
+        // 0xfc, typed 0x01 before 0x00.
+        psbt.outputs[0].pairs.push((vec![0xfa, 0x01], vec![0xaa]));
+        psbt.outputs[0]
+            .pairs
+            .push((vec![0xfc, 0x01, 0x77, 0x00], vec![0xbb]));
+        psbt.outputs[0].pairs.push((vec![0x01], vec![0xcc]));
+        psbt.outputs[0].pairs.push((vec![0x00], vec![0xdd]));
+        let bytes = psbt.encode();
+        let back = Psbt::decode(&bytes).unwrap();
+        let types: Vec<u8> = back.outputs[0].pairs.iter().map(|(k, _)| k[0]).collect();
+        assert_eq!(types, vec![0x00, 0x01, 0xfc, 0xfa]);
     }
 
     /// A skeleton built from an unsigned tx encodes with empty maps.

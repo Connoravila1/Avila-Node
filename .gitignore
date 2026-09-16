@@ -21,3 +21,6 @@ target/
 # Python bytecode caches
 __pycache__/
 *.pyc
+
+# local scratch (test daemons, comparison fixtures)
+/tmp/

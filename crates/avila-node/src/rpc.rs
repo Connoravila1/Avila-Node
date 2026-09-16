@@ -2147,6 +2147,8 @@ Examples:
 
 const ANALYZEPSBT_HELP: &str = "analyzepsbt \"psbt\"\n\nAnalyzes and provides information about the current status of a PSBT and its inputs\n\nArguments:\n1. psbt    (string, required) A base64 string of a PSBT\n\nResult:\n{                                   (json object)\n  \"inputs\" : [                      (json array, optional)\n    {                               (json object)\n      \"has_utxo\" : true|false,      (boolean) Whether a UTXO is provided\n      \"is_final\" : true|false,      (boolean) Whether the input is finalized\n      \"missing\" : {                 (json object, optional) Things that are missing that are required to complete this input\n        \"pubkeys\" : [               (json array, optional)\n          \"hex\",                    (string) Public key ID, hash160 of the public key, of a public key whose BIP 32 derivation path is missing\n          ...\n        ],\n        \"signatures\" : [            (json array, optional)\n          \"hex\",                    (string) Public key ID, hash160 of the public key, of a public key whose signature is missing\n          ...\n        ],\n        \"redeemscript\" : \"hex\",     (string, optional) Hash160 of the redeem script that is missing\n        \"witnessscript\" : \"hex\"     (string, optional) SHA256 of the witness script that is missing\n      },\n      \"next\" : \"str\"                (string, optional) Role of the next person that this input needs to go to\n    },\n    ...\n  ],\n  \"estimated_vsize\" : n,            (numeric, optional) Estimated vsize of the final signed transaction\n  \"estimated_feerate\" : n,          (numeric, optional) Estimated feerate of the final signed transaction in BTC/kvB. Shown only if all UTXO slots in the PSBT have been filled\n  \"fee\" : n,                        (numeric, optional) The transaction fee paid. Shown only if all UTXO slots in the PSBT have been filled\n  \"next\" : \"str\",                   (string) Role of the next person that this psbt needs to go to\n  \"error\" : \"str\"                   (string, optional) Error message (if there is one)\n}\n\nExamples:\n> bitcoin-cli analyzepsbt \"psbt\"\n";
 
+const UTXOUPDATEPSBT_HELP: &str = "utxoupdatepsbt \"psbt\" ( [\"\",{\"desc\":\"str\",\"range\":n or [n,n]},...] )\n\nUpdates all segwit inputs and outputs in a PSBT with data from output descriptors, the UTXO set, txindex, or the mempool.\n\nArguments:\n1. psbt                          (string, required) A base64 string of a PSBT\n2. descriptors                   (json array, optional) An array of either strings or objects\n     [\n       \"\",                       (string) An output descriptor\n       {                         (json object) An object with an output descriptor and extra information\n         \"desc\": \"str\",          (string, required) An output descriptor\n         \"range\": n or [n,n],    (numeric or array, optional, default=1000) Up to what index HD chains should be explored (either end or [begin,end])\n       },\n       ...\n     ]\n\nResult:\n\"str\"    (string) The base64-encoded partially signed transaction with inputs updated\n\nExamples:\n> bitcoin-cli utxoupdatepsbt \"psbt\"\n";
+
 const JOINPSBTS_HELP: &str = "joinpsbts [\"psbt\",...]
 
 Joins multiple distinct PSBTs with different inputs and outputs into one PSBT with inputs and outputs from all of the PSBTs
@@ -3339,6 +3341,11 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         "decodepsbt",
         &[("psbt", Some("string"), true)],
         DECODEPSBT_HELP,
+    ),
+    (
+        "utxoupdatepsbt",
+        &[("psbt", Some("string"), true), ("descriptors", None, false)],
+        UTXOUPDATEPSBT_HELP,
     ),
     (
         "decoderawtransaction",
@@ -6880,6 +6887,133 @@ fn dispatch(
             }
             (Value::Object(result), None)
         }
+        // `utxoupdatepsbt` — Core's ProcessPSBT with a HidingSigningProvider
+        // over the descriptor-derived provider (hide_secret, show origins):
+        // non_witness_utxo from txindex/mempool, witness_utxo from the
+        // UTXO set for segwit outputs, then provider data fills scripts,
+        // derivations, and taproot trees on every unsigned input and
+        // every output.
+        "utxoupdatepsbt" => {
+            let raw = match params[0].as_str() {
+                Some(s) => s,
+                None => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(1, "psbt", &params[0], "string"),
+                        )),
+                    );
+                }
+            };
+            let Some(bytes) = base64_decode_strict(raw) else {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_DESERIALIZATION_ERROR,
+                        "TX decode failed invalid base64".into(),
+                    )),
+                );
+            };
+            let mut psbt = match avila_consensus::psbt::Psbt::decode(&bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_DESERIALIZATION_ERROR,
+                            format!("TX decode failed {}", e.core_message()),
+                        )),
+                    );
+                }
+            };
+            let descs_arg = param(params, 1, "descriptors")
+                .cloned()
+                .unwrap_or(Value::Null);
+            chain_query(queries, move |cs, mgr| {
+                use avila_consensus::psbt::Psbt;
+                use avila_consensus::sign::{
+                    Creator, is_segwit_output, precompute_psbt_data, psbt_input_signed,
+                    remove_unnecessary_transactions, sign_psbt_input, update_psbt_output,
+                };
+                let mut provider = avila_consensus::descriptor::FlatProvider::default();
+                if !descs_arg.is_null() {
+                    let Some(arr) = descs_arg.as_array() else {
+                        return Err((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(2, "descriptors", &descs_arg, "array"),
+                        ));
+                    };
+                    for d in arr {
+                        let (_, p) = eval_scan_object(d, cs.tree().params())?;
+                        provider.keys.extend(p.keys);
+                        provider.xprvs.extend(p.xprvs);
+                        provider.pubkeys.extend(p.pubkeys);
+                        provider.origins.extend(p.origins);
+                        provider.scripts.extend(p.scripts);
+                        provider.tr_trees.extend(p.tr_trees);
+                    }
+                }
+                // Fetch prev txs — txindex first, then the mempool.
+                for i in 0..psbt.tx.inputs.len() {
+                    if psbt.inputs[i].get(Psbt::IN_NON_WITNESS_UTXO).is_some() {
+                        continue;
+                    }
+                    let txid = psbt.tx.inputs[i].previous_output.txid;
+                    let tx = cs
+                        .find_transaction(&txid)
+                        .and_then(|bh| cs.body(&bh))
+                        .and_then(|b| b.transactions.iter().find(|t| t.txid() == txid).cloned())
+                        .or_else(|| mgr.mempool_ref().get(&txid).cloned());
+                    if let Some(tx) = tx {
+                        // BIP174: non_witness_utxo serializes without
+                        // witness data (`SER_NETWORK` legacy form).
+                        let mut raw = Vec::new();
+                        tx.write_without_witness(&mut raw);
+                        psbt.inputs[i].set(vec![Psbt::IN_NON_WITNESS_UTXO], raw);
+                    }
+                }
+                // Missing prev txs fall back to the UTXO set — only
+                // segwit outputs become witness_utxo (Core's
+                // IsSegWitOutput consults the provider for P2SH wraps).
+                for i in 0..psbt.tx.inputs.len() {
+                    if psbt.inputs[i].get(Psbt::IN_NON_WITNESS_UTXO).is_some() {
+                        continue;
+                    }
+                    let prevout = psbt.tx.inputs[i].previous_output;
+                    if let Some(coin) = cs.utxo().get(&prevout)
+                        && is_segwit_output(&provider, &coin.out.script_pubkey)
+                    {
+                        let mut v = coin.out.value.to_le_bytes().to_vec();
+                        avila_consensus::encode::write_var_bytes(
+                            &mut v,
+                            coin.out.script_pubkey.as_bytes(),
+                        );
+                        psbt.inputs[i].set(vec![Psbt::IN_WITNESS_UTXO], v);
+                    }
+                }
+                let txdata = precompute_psbt_data(&psbt);
+                for i in 0..psbt.tx.inputs.len() {
+                    if psbt_input_signed(&psbt.inputs[i]) {
+                        continue;
+                    }
+                    sign_psbt_input(
+                        &provider,
+                        &mut psbt,
+                        i,
+                        Some(&txdata),
+                        Creator::Real,
+                        None,
+                        false,
+                    );
+                }
+                for i in 0..psbt.tx.outputs.len() {
+                    update_psbt_output(&provider, &mut psbt, i);
+                }
+                remove_unnecessary_transactions(&mut psbt, 1);
+                Ok(json!(base64_encode(&psbt.encode())))
+            })
+        }
         // Core's createmultisig (rpc/output_script.cpp) — n-of-m
         // multisig construction: keys parse first (HexToPubKey), then
         // the address type, then AddAndGetMultisigDestination's checks
@@ -9614,6 +9748,7 @@ fn dispatch(
                      \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>, decodepsbt <psbt>,\n\
                      \x20   createpsbt <in> <out> [lt] [rbf], converttopsbt <hex> [ok] [wit],\n\
                      \x20   combinepsbt <psbts>, joinpsbts <psbts>, analyzepsbt <psbt>,\n\
+                     \x20   utxoupdatepsbt <psbt> [descs],\n\
                      \x20   gettxoutproof <txids> [blockhash] [options],\n\
                      \x20   verifytxoutproof <proof> [options], validateaddress <address>,\n\
                      \x20   verifymessage <address> <sig> <msg>,\n\
