@@ -50,6 +50,20 @@ pub fn decode_secret(wif: &str, secret_prefix: u8) -> Option<(secp256k1::SecretK
     Some((key, compressed))
 }
 
+/// `CKey::GetPubKey` — the secp256k1 public key for `secret` in the
+/// encoding `compressed` selects (33-byte compressed or 65-byte
+/// uncompressed). WIF's trailing `0x01` flag feeds `compressed`.
+#[must_use]
+pub fn pubkey_from_secret(secret: &secp256k1::SecretKey, compressed: bool) -> Vec<u8> {
+    let secp = secp256k1::Secp256k1::new();
+    let pubkey = secp256k1::PublicKey::from_secret_key(&secp, secret);
+    if compressed {
+        pubkey.serialize().to_vec()
+    } else {
+        pubkey.serialize_uncompressed().to_vec()
+    }
+}
+
 /// `CKey::SignCompact` — RFC6979 deterministic signature, header byte
 /// `27 + recid (+4 when the key is compressed)`. `None` only when the
 /// secret is invalid — `MessageSign`'s `Sign failed` path.

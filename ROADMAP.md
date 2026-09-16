@@ -384,6 +384,18 @@ operation. Compare complete initial download and catch-up, not only local replay
       sighashes with TapTweak key-path and leaf script-path
       spends; sighashtype, bip32derivs (hide_origin), and
       finalize flags match Core's argument handling.
+      signrawtransactionwithkey ports Core's SignTransaction:
+      WIF keys fill a FlatSigningProvider (keys + pubkeys),
+      FindCoins resolves prevouts through the
+      chainstate+mempool overlay (mempool-spent reads as
+      Coin::IsSpent), ParsePrevouts overlays caller coins with
+      scriptPubKey-mismatch, redeemScript/witnessScript, and
+      amount rules, DataFromTransaction recovers partial
+      spends, ProduceSignature signs, and the result is
+      {hex, complete, errors[]} with per-input
+      txid/vout/witness/scriptSig/sequence/error entries —
+      the MAX_MONEY sentinel throws Core's "Missing amount
+      for CTxOut(...)".
       Verified
       byte-identical against
       Core 29.4 including a live spend+receive, a real
@@ -391,7 +403,12 @@ operation. Compare complete initial download and catch-up, not only local replay
       PSBTs, and live descriptorprocesspsbt signing across
       pkh, wpkh, sh(wpkh), wsh(sortedmulti 2-of-2), tr key-path
       and script-path, every sighash mode, finalize=false,
-      bip32derivs=false, and missing-key/error cases
+      bip32derivs=false, and missing-key/error cases, plus
+      signrawtransactionwithkey across funded-chain and
+      prevtxs-only coins, all seven sighash modes, taproot
+      key-path, uncompressed-WIF pkh, multisig
+      partial/complete, multi-input, and every
+      ParsePrevouts/getInt error path
       (joinpsbts compared semantically — Core's join
       ordering is salted-unordered-map random). Outbound
       dialing is

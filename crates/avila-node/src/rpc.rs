@@ -935,14 +935,14 @@ fn eval_scan_object(
 /// `ParseSighashString` — null → `SIGHASH_DEFAULT`; otherwise the
 /// named table, erroring `'<s>' is not a valid sighash parameter.`
 /// (`RPC_INVALID_PARAMETER`, like Core's `ErrorString(result)`).
-fn parse_sighash_string(v: &Value) -> Result<i32, (i64, String)> {
+fn parse_sighash_string(v: &Value, position: usize) -> Result<i32, (i64, String)> {
     if v.is_null() {
         return Ok(0);
     }
     let Some(s) = v.as_str() else {
         return Err((
             RPC_TYPE_ERROR,
-            wrong_type_message(3, "sighashtype", v, "string"),
+            wrong_type_message(position, "sighashtype", v, "string"),
         ));
     };
     match s {
@@ -1064,6 +1064,220 @@ fn process_psbt(
     // `RemoveUnnecessaryTransactions(psbtx, 1)` — Core hardcodes the
     // sighash to SIGHASH_ALL here, not the caller's value.
     remove_unnecessary_transactions(psbt, 1);
+    Ok(())
+}
+
+/// `ParseHexV` — the named-field hex parse `ParsePrevouts` uses:
+/// non-empty, even-length, all-hexdigit, else
+/// `'<name>' must be hexadecimal string (not '<s>')` at -8.
+fn parse_hex_v(s: &str, name: &str) -> Result<Vec<u8>, (i64, String)> {
+    if s.is_empty() || !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err((
+            RPC_INVALID_PARAMETER,
+            format!("{name} must be hexadecimal string (not '{s}')"),
+        ));
+    }
+    Ok(hex::decode(s).unwrap_or_default())
+}
+
+/// `RPCTypeCheckObj` for the `prevtxs` members — Core iterates a
+/// `std::map`, so `scriptPubKey` < `txid` < `vout` is the check order.
+/// A missing key is `Missing <name>` (-3); a present-but-mistyped one
+/// is `JSON value of type <t> for field <name> is not of expected
+/// type <expected>` (-3). `allow_null` members only get the second.
+fn prevout_type_check(
+    obj: &serde_json::Map<String, Value>,
+    fields: &[(&str, &str)],
+    allow_null: bool,
+) -> Result<(), (i64, String)> {
+    for (key, ty) in fields {
+        let v = obj.get(*key).unwrap_or(&Value::Null);
+        if v.is_null() {
+            if allow_null {
+                continue;
+            }
+            return Err((RPC_TYPE_ERROR, format!("Missing {key}")));
+        }
+        let ok = match *ty {
+            "string" => v.is_string(),
+            "number" => v.is_number(),
+            _ => false,
+        };
+        if !ok {
+            return Err((
+                RPC_TYPE_ERROR,
+                format!(
+                    "JSON value of type {} for field {key} is not of expected type {ty}",
+                    json_type_name(v)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `ParsePrevouts` — overlay the caller-supplied `prevtxs` onto the
+/// coin map (`coins[out] = newcoin` unconditionally overrides what
+/// `FindCoins` resolved) and add redeem/witness scripts to the
+/// provider. `coins` maps an outpoint to `Some(TxOut)` (unspent) or
+/// `None` (`Coin::IsSpent` — absent, pruned, or mempool-spent).
+fn parse_prevouts(
+    prevtxs: &Value,
+    provider: &mut avila_consensus::descriptor::FlatProvider,
+    coins: &mut std::collections::HashMap<OutPoint, Option<TxOut>>,
+) -> Result<(), (i64, String)> {
+    if prevtxs.is_null() {
+        return Ok(());
+    }
+    let Some(arr) = prevtxs.as_array() else {
+        return Err((RPC_TYPE_ERROR, field_type_message(prevtxs, "array")));
+    };
+    for p in arr {
+        let Some(obj) = p.as_object() else {
+            return Err((
+                RPC_DESERIALIZATION_ERROR,
+                "expected object with {\"txid'\",\"vout\",\"scriptPubKey\"}".to_string(),
+            ));
+        };
+        prevout_type_check(
+            obj,
+            &[
+                ("scriptPubKey", "string"),
+                ("txid", "string"),
+                ("vout", "number"),
+            ],
+            false,
+        )?;
+        let txid = parse_hash_v::<Txid>(obj["txid"].as_str().unwrap_or_default(), "txid")?;
+        // `prevOut.find_value("vout").getInt<int>()` — univalue's
+        // integer parse collapses non-integral and out-of-range into
+        // the same -1 "JSON integer out of range" (verified live).
+        let n_out = match obj["vout"].as_i64() {
+            Some(n) if n < i64::from(i32::MIN) || n > i64::from(i32::MAX) => {
+                return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
+            }
+            Some(n) => n,
+            None => {
+                return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
+            }
+        };
+        if n_out < 0 {
+            return Err((
+                RPC_DESERIALIZATION_ERROR,
+                "vout cannot be negative".to_string(),
+            ));
+        }
+        let out = OutPoint {
+            txid,
+            vout: n_out as u32,
+        };
+        let spk_bytes = parse_hex_v(
+            obj["scriptPubKey"].as_str().unwrap_or_default(),
+            "scriptPubKey",
+        )?;
+        let script_pubkey = Script::new(spk_bytes);
+        if let Some(Some(existing)) = coins.get(&out)
+            && existing.script_pubkey != script_pubkey
+        {
+            return Err((
+                RPC_DESERIALIZATION_ERROR,
+                format!(
+                    "Previous output scriptPubKey mismatch:\n{}\nvs:\n{}",
+                    existing.script_pubkey.asm(),
+                    script_pubkey.asm()
+                ),
+            ));
+        }
+        let value = if let Some(amt) = obj.get("amount").filter(|v| !v.is_null()) {
+            amount_from_value(amt)?
+        } else {
+            avila_consensus::check::MAX_MONEY
+        };
+        coins.insert(
+            out,
+            Some(TxOut {
+                value,
+                script_pubkey: script_pubkey.clone(),
+            }),
+        );
+
+        // The redeem/witness-script block only runs when the declared
+        // scriptPubKey is P2SH or P2WSH — for anything else the fields
+        // are ignored entirely (even when mistyped).
+        let is_p2sh = matches!(
+            script_pubkey.classify(),
+            avila_consensus::script::ScriptType::ScriptHash(_)
+        );
+        let is_p2wsh = matches!(
+            script_pubkey.classify(),
+            avila_consensus::script::ScriptType::Witness { version: 0, ref program }
+                if program.len() == 32
+        );
+        if !is_p2sh && !is_p2wsh {
+            continue;
+        }
+        prevout_type_check(
+            obj,
+            &[("redeemScript", "string"), ("witnessScript", "string")],
+            true,
+        )?;
+        let rs = obj.get("redeemScript").filter(|v| !v.is_null());
+        let ws = obj.get("witnessScript").filter(|v| !v.is_null());
+        if rs.is_none() && ws.is_none() {
+            return Err((
+                RPC_INVALID_PARAMETER,
+                "Missing redeemScript/witnessScript".into(),
+            ));
+        }
+        // Work from witnessScript when possible.
+        let script = match ws {
+            Some(v) => parse_hex_v(v.as_str().unwrap_or_default(), "witnessScript")?,
+            None => parse_hex_v(
+                rs.map(|v| v.as_str().unwrap_or_default())
+                    .unwrap_or_default(),
+                "redeemScript",
+            )?,
+        };
+        provider
+            .scripts
+            .insert(avila_consensus::hash::hash160(&script), script.clone());
+        // Also register the P2WSH wrap of the script (P2SH-P2WSH
+        // compatibility — `witness_output_script` in Core).
+        let mut wsh_spk = vec![0x00u8, 0x20];
+        wsh_spk.extend_from_slice(&avila_consensus::hash::sha256(&script));
+        provider
+            .scripts
+            .insert(avila_consensus::hash::hash160(&wsh_spk), wsh_spk.clone());
+        if let (Some(ws_v), Some(rs_v)) = (ws, rs)
+            && ws_v.as_str() != rs_v.as_str()
+        {
+            let redeem = parse_hex_v(rs_v.as_str().unwrap_or_default(), "redeemScript")?;
+            if redeem != wsh_spk {
+                return Err((
+                    RPC_INVALID_PARAMETER,
+                    "redeemScript does not correspond to witnessScript".into(),
+                ));
+            }
+        }
+        let matches_spk = if is_p2sh {
+            let mut p2sh = vec![0xa9u8, 0x14];
+            p2sh.extend_from_slice(&avila_consensus::hash::hash160(&script));
+            p2sh.push(0x87);
+            let mut p2sh_p2wsh = vec![0xa9u8, 0x14];
+            p2sh_p2wsh.extend_from_slice(&avila_consensus::hash::hash160(&wsh_spk));
+            p2sh_p2wsh.push(0x87);
+            script_pubkey.as_bytes() == p2sh.as_slice()
+                || script_pubkey.as_bytes() == p2sh_p2wsh.as_slice()
+        } else {
+            script_pubkey.as_bytes() == wsh_spk.as_slice()
+        };
+        if !matches_spk {
+            return Err((
+                RPC_INVALID_PARAMETER,
+                "redeemScript/witnessScript does not match scriptPubKey".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -2560,6 +2774,7 @@ Examples:
 > curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"submitpackage\", \"params\": [[\"raw-parent-tx-1\", \"raw-parent-tx-2\", \"raw-child-tx\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/
 > bitcoin-cli submitpackage '[\"raw-tx-without-unconfirmed-parents\"]'\n";
 const SENDRAWTRANSACTION_HELP: &str = "sendrawtransaction \"hexstring\" ( maxfeerate maxburnamount )\n\nSubmit a raw transaction (serialized, hex-encoded) to local node and network.\n\nThe transaction will be sent unconditionally to all peers, so using sendrawtransaction\nfor manual rebroadcast may degrade privacy by leaking the transaction's origin, as\nnodes will normally not rebroadcast non-wallet transactions already in their mempool.\n\nA specific exception, RPC_TRANSACTION_ALREADY_IN_UTXO_SET, may throw if the transaction cannot be added to the mempool.\n\nRelated RPCs: createrawtransaction, signrawtransactionwithkey\n\nArguments:\n1. hexstring        (string, required) The hex string of the raw transaction\n2. maxfeerate       (numeric or string, optional, default=\"0.10\") Reject transactions whose fee rate is higher than the specified value, expressed in BTC/kvB.\n                    Fee rates larger than 1BTC/kvB are rejected.\n                    Set to 0 to accept any fee rate.\n3. maxburnamount    (numeric or string, optional, default=\"0.00\") Reject transactions with provably unspendable outputs (e.g. 'datacarrier' outputs that use the OP_RETURN opcode) greater than the specified value, expressed in BTC.\n                    If burning funds through unspendable outputs is desired, increase this value.\n                    This check is based on heuristics and does not guarantee spendability of outputs.\n                    \n\nResult:\n\"hex\"    (string) The transaction hash in hex\n\nExamples:\n\nCreate a transaction\n> bitcoin-cli createrawtransaction \"[{\\\"txid\\\" : \\\"mytxid\\\",\\\"vout\\\":0}]\" \"{\\\"myaddress\\\":0.01}\"\nSign the transaction, and get back the hex\n> bitcoin-cli signrawtransactionwithwallet \"myhex\"\n\nSend the transaction (signed hex)\n> bitcoin-cli sendrawtransaction \"signedhex\"\n\nAs a JSON-RPC call\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"sendrawtransaction\", \"params\": [\"signedhex\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const SIGNRAWTRANSACTIONWITHKEY_HELP: &str = "signrawtransactionwithkey \"hexstring\" [\"privatekey\",...] ( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\",\"redeemScript\":\"hex\",\"witnessScript\":\"hex\",\"amount\":amount},...] \"sighashtype\" )\n\nSign inputs for raw transaction (serialized, hex-encoded).\nThe second argument is an array of base58-encoded private\nkeys that will be the only keys used to sign the transaction.\nThe third optional argument (may be null) is an array of previous transaction outputs that\nthis transaction depends on but may not yet be in the block chain.\n\nArguments:\n1. hexstring                        (string, required) The transaction hex string\n2. privkeys                         (json array, required) The base58-encoded private keys for signing\n     [\n       \"privatekey\",                (string) private key in base58-encoding\n       ...\n     ]\n3. prevtxs                          (json array, optional) The previous dependent transaction outputs\n     [\n       {                            (json object)\n         \"txid\": \"hex\",             (string, required) The transaction id\n         \"vout\": n,                 (numeric, required) The output number\n         \"scriptPubKey\": \"hex\",     (string, required) output script\n         \"redeemScript\": \"hex\",     (string, optional) (required for P2SH) redeem script\n         \"witnessScript\": \"hex\",    (string, optional) (required for P2WSH or P2SH-P2WSH) witness script\n         \"amount\": amount,          (numeric or string, optional) (required for Segwit inputs) the amount spent\n       },\n       ...\n     ]\n4. sighashtype                      (string, optional, default=\"DEFAULT for Taproot, ALL otherwise\") The signature hash type. Must be one of:\n                                    \"DEFAULT\"\n                                    \"ALL\"\n                                    \"NONE\"\n                                    \"SINGLE\"\n                                    \"ALL|ANYONECANPAY\"\n                                    \"NONE|ANYONECANPAY\"\n                                    \"SINGLE|ANYONECANPAY\"\n                                    \n\nResult:\n{                             (json object)\n  \"hex\" : \"hex\",              (string) The hex-encoded raw transaction with signature(s)\n  \"complete\" : true|false,    (boolean) If the transaction has a complete set of signatures\n  \"errors\" : [                (json array, optional) Script verification errors (if there are any)\n    {                         (json object)\n      \"txid\" : \"hex\",         (string) The hash of the referenced, previous transaction\n      \"vout\" : n,             (numeric) The index of the output to spent and used as input\n      \"witness\" : [           (json array)\n        \"hex\",                (string)\n        ...\n      ],\n      \"scriptSig\" : \"hex\",    (string) The hex-encoded signature script\n      \"sequence\" : n,         (numeric) Script sequence number\n      \"error\" : \"str\"         (string) Verification or signing error related to the input\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli signrawtransactionwithkey \"myhex\" \"[\\\"key1\\\",\\\"key2\\\"]\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"signrawtransactionwithkey\", \"params\": [\"myhex\", \"[\\\"key1\\\",\\\"key2\\\"]\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const SUBMITBLOCK_HELP: &str = "submitblock \"hexdata\" ( \"dummy\" )\n\nAttempts to submit new block to network.\nSee https://en.bitcoin.it/wiki/BIP_0022 for full specification.\n\nArguments:\n1. hexdata    (string, required) the hex-encoded block data to submit\n2. dummy      (string, optional, default=ignored) dummy value, for compatibility with BIP22. This value is ignored.\n\nResult (If the block was accepted):\nnull    (json null)\n\nResult (Otherwise):\n\"str\"    (string) According to BIP22\n\nExamples:\n> bitcoin-cli submitblock \"mydata\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"submitblock\", \"params\": [\"mydata\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const SUBMITHEADER_HELP: &str = "submitheader \"hexdata\"\n\nDecode the given hexdata as a header and submit it as a candidate chain tip if valid.\nThrows when the header is invalid.\n\nArguments:\n1. hexdata    (string, required) the hex-encoded block header data\n\nResult:\nnull    (json null) None\n\nExamples:\n> bitcoin-cli submitheader \"aabbcc\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"submitheader\", \"params\": [\"aabbcc\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const GENERATETOADDRESS_HELP: &str = "generatetoaddress nblocks \"address\" ( maxtries )\n\nMine to a specified address and return the block hashes.\n\nArguments:\n1. nblocks     (numeric, required) How many blocks are generated.\n2. address     (string, required) The address to send the newly generated bitcoin to.\n3. maxtries    (numeric, optional, default=1000000) How many iterations to try.\n\nResult:\n[           (json array) hashes of blocks generated\n  \"hex\",    (string) blockhash\n  ...\n]\n\nExamples:\n\nGenerate 11 blocks to myaddress\n> bitcoin-cli generatetoaddress 11 \"myaddress\"\nIf you are using the Bitcoin Core wallet, you can get a new address to send the newly generated bitcoin to with:\n> bitcoin-cli getnewaddress \n";
@@ -3799,6 +4014,16 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
             ("maxburnamount", None, false),
         ],
         SENDRAWTRANSACTION_HELP,
+    ),
+    (
+        "signrawtransactionwithkey",
+        &[
+            ("hexstring", Some("string"), true),
+            ("privkeys", Some("array"), true),
+            ("prevtxs", Some("array"), false),
+            ("sighashtype", Some("string"), false),
+        ],
+        SIGNRAWTRANSACTIONWITHKEY_HELP,
     ),
     (
         "setban",
@@ -7224,12 +7449,13 @@ fn dispatch(
             let descs_arg = param(params, 1, "descriptors")
                 .cloned()
                 .unwrap_or(Value::Null);
-            let sighash =
-                match parse_sighash_string(param(params, 2, "sighashtype").unwrap_or(&Value::Null))
-                {
-                    Ok(s) => s,
-                    Err(e) => return (Value::Null, Some(e)),
-                };
+            let sighash = match parse_sighash_string(
+                param(params, 2, "sighashtype").unwrap_or(&Value::Null),
+                3,
+            ) {
+                Ok(s) => s,
+                Err(e) => return (Value::Null, Some(e)),
+            };
             let bip32derivs = param(params, 3, "bip32derivs")
                 .map(|v| v.is_null() || v.as_bool().unwrap_or(false))
                 .unwrap_or(true);
@@ -7260,6 +7486,139 @@ fn dispatch(
                     if let Some(tx) = avila_consensus::sign::finalize_and_extract_psbt(&mut copy) {
                         result.insert("hex".into(), json!(hex::encode(&tx.encode())));
                     }
+                }
+                Ok(Value::Object(result))
+            })
+        }
+        // `signrawtransactionwithkey` — DecodeHexTx, load the WIF
+        // keys into a `FlatSigningProvider` (pubkeys AND keys), then
+        // `FindCoins` (chainstate+mempool overlay; a mempool-spent
+        // outpoint resolves to `Coin::IsSpent`), `ParsePrevouts`, and
+        // `SignTransaction` — Core's rawtransaction.cpp arm.
+        "signrawtransactionwithkey" => {
+            let raw = match params[0].as_str() {
+                Some(s) => s,
+                None => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(1, "hexstring", &params[0], "string"),
+                        )),
+                    );
+                }
+            };
+            let mut tx = match hex::decode(raw)
+                .ok()
+                .and_then(|b| Transaction::decode(&b).ok())
+            {
+                Some(t) => t,
+                None => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_DESERIALIZATION_ERROR,
+                            "TX decode failed. Make sure the tx has at least one input."
+                                .to_string(),
+                        )),
+                    );
+                }
+            };
+            let privkeys = param(params, 1, "privkeys").cloned().unwrap_or(Value::Null);
+            let prevtxs = param(params, 2, "prevtxs").cloned().unwrap_or(Value::Null);
+            let sighash_arg = param(params, 3, "sighashtype")
+                .cloned()
+                .unwrap_or(Value::Null);
+            chain_query(queries, move |cs, mgr| {
+                let prefix = cs.tree().params().base58_secret_prefix;
+                let mut provider = avila_consensus::descriptor::FlatProvider::default();
+                for k in privkeys.as_array().map(Vec::as_slice).unwrap_or(&[]) {
+                    let Some(wif) = k.as_str() else {
+                        return Err((RPC_TYPE_ERROR, field_type_message(k, "string")));
+                    };
+                    let Some((secret, compressed)) =
+                        avila_consensus::message::decode_secret(wif, prefix)
+                    else {
+                        return Err((RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key".into()));
+                    };
+                    let pubkey = avila_consensus::message::pubkey_from_secret(&secret, compressed);
+                    let keyid = avila_consensus::hash::hash160(&pubkey);
+                    provider.pubkeys.insert(keyid, pubkey);
+                    provider.keys.insert(keyid, secret);
+                }
+                // `FindCoins` — empty entry per input, filled from
+                // the UTXO set or a mempool parent, then cleared when
+                // a pooled tx already spends it (`CCoinsViewMemPool`).
+                let pool = mgr.mempool_ref();
+                let mut coins = std::collections::HashMap::new();
+                for input in &tx.inputs {
+                    let op = input.previous_output;
+                    let coin = if pool.spent_by(&op).is_some() {
+                        None
+                    } else {
+                        pool.resolve(cs, &op).map(|c| c.out)
+                    };
+                    coins.insert(op, coin);
+                }
+                parse_prevouts(&prevtxs, &mut provider, &mut coins)?;
+                // `ParseSighashString` runs inside `SignTransaction`,
+                // after ParsePrevouts.
+                let sighash = parse_sighash_string(&sighash_arg, 4)?;
+                let mut input_errors = std::collections::BTreeMap::new();
+                let complete = avila_consensus::sign::sign_transaction(
+                    &mut tx,
+                    &provider,
+                    &coins,
+                    sighash,
+                    &mut input_errors,
+                );
+                // `SignTransactionResultToJSON` — errors build first
+                // (the "Missing amount" sentinel throws), then
+                // hex/complete.
+                let mut verrors = Vec::new();
+                for (i, e) in &input_errors {
+                    if e == "Missing amount" {
+                        let coin = coins
+                            .get(&tx.inputs[*i].previous_output)
+                            .and_then(|c| c.as_ref());
+                        let value = coin.map_or(avila_consensus::check::MAX_MONEY, |c| c.value);
+                        // `CTxOut::ToString` prints
+                        // `HexStr(scriptPubKey).substr(0, 30)`.
+                        let spk = coin.map_or_else(String::new, |c| {
+                            hex::encode(c.script_pubkey.as_bytes())
+                                .chars()
+                                .take(30)
+                                .collect()
+                        });
+                        return Err((
+                            RPC_TYPE_ERROR,
+                            format!(
+                                "Missing amount for CTxOut(nValue={}.{:08}, scriptPubKey={spk})",
+                                value / 100_000_000,
+                                value % 100_000_000
+                            ),
+                        ));
+                    }
+                    let txin = &tx.inputs[*i];
+                    verrors.push(json!({
+                        "txid": txin.previous_output.txid.to_string(),
+                        "vout": txin.previous_output.vout,
+                        "witness": txin
+                            .witness
+                            .items()
+                            .iter()
+                            .map(|w| hex::encode(w))
+                            .collect::<Vec<_>>(),
+                        "scriptSig": hex::encode(txin.script_sig.as_bytes()),
+                        "sequence": txin.sequence,
+                        "error": e,
+                    }));
+                }
+                let mut result = serde_json::Map::new();
+                result.insert("hex".into(), json!(hex::encode(&tx.encode())));
+                result.insert("complete".into(), json!(complete));
+                if !verrors.is_empty() {
+                    result.insert("errors".into(), json!(verrors));
                 }
                 Ok(Value::Object(result))
             })
@@ -10023,6 +10382,7 @@ fn dispatch(
                      \x20   createmultisig <nrequired> [keys] [address_type],\n\
                      \x20   getdescriptorinfo <desc>, deriveaddresses <desc> [range],\n\
                      \x20   sendrawtransaction <hex> [maxfeerate] [maxburnamount], savemempool,\n\
+                     \x20   signrawtransactionwithkey <hex> <privkeys> [prevtxs] [sighashtype],\n\
                      \x20   submitpackage <[rawtx,...]> [maxfeerate] [maxburnamount]\n\
                      \x20 mining: getblocktemplate, getmininginfo, getnetworkhashps,\n\
                      \x20   submitblock <hex>,\n\

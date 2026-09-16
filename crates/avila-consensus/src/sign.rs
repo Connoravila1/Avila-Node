@@ -19,21 +19,25 @@
 //! subset `pk(<key>)` (`<key> OP_CHECKSIG`) and treat other
 //! miniscript-only scripts as unsatisfiable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::descriptor::FlatProvider;
 use crate::hash::{hash160, sha256};
 use crate::interpreter::{
-    SigVersion, SignatureChecker, compute_tapbranch_hash, compute_tapleaf_hash, verify_script,
+    ExecutionData, ScriptError, SigVersion, SignatureChecker, compute_tapbranch_hash,
+    compute_tapleaf_hash, eval_script, verify_script,
 };
 use crate::psbt::{KeyMap, Psbt};
-use crate::script::ScriptType;
+use crate::script::{ScriptFlags, ScriptType};
 use crate::sigchecker::{PrecomputedTransactionData, TransactionSignatureChecker};
-use crate::transaction::{Script, Transaction, TxOut, Witness};
+use crate::transaction::{OutPoint, Script, Transaction, TxIn, TxOut, Witness};
 use sha2::{Digest, Sha256};
 
 /// `SIGHASH_ALL`.
 pub const SIGHASH_ALL: u32 = 1;
+
+/// `CKeyID → (pubkey, sig)` — the `SignatureData::signatures` map type.
+pub type SignatureMap = BTreeMap<[u8; 20], (Vec<u8>, Vec<u8>)>;
 /// `WITNESS_SCALE_FACTOR`.
 const WITNESS_SCALE_FACTOR: u64 = 4;
 /// `nBytesPerSigOp` — standard policy's sigop-to-weight ratio.
@@ -122,7 +126,7 @@ pub struct SignatureData {
     pub witness_script: Option<Vec<u8>>,
     /// `signatures` — `CKeyID → (pubkey, sig)` (PSBT partial sigs are
     /// stored by pubkey keydata; internally keyed by hash160).
-    pub signatures: BTreeMap<[u8; 20], (Vec<u8>, Vec<u8>)>,
+    pub signatures: SignatureMap,
     /// `misc_pubkeys` — `CKeyID → (pubkey, origin-info value bytes)`.
     pub misc_pubkeys: BTreeMap<[u8; 20], (Vec<u8>, Vec<u8>)>,
     /// `tap_pubkeys` — `CKeyID → x-only pubkey`.
@@ -1707,6 +1711,287 @@ pub fn update_psbt_output(provider: &FlatProvider, psbt: &mut Psbt, index: usize
     sigdata.store_into_output(&mut psbt.outputs[index]);
 }
 
+/// `SignatureExtractorChecker` — every check delegates to the wrapped
+/// checker; a passing ECDSA check also records `keyid → (pubkey, sig)`
+/// (`DataFromTransaction` recovers signatures already sitting in a
+/// scriptSig this way). Schnorr signatures are not extracted — Core's
+/// extractor predates taproot and only wraps `CheckECDSASignature`.
+struct SignatureExtractorChecker<'a> {
+    inner: &'a dyn SignatureChecker,
+    signatures: std::cell::RefCell<SignatureMap>,
+}
+
+impl SignatureChecker for SignatureExtractorChecker<'_> {
+    fn check_ecdsa_signature(
+        &self,
+        sig: &[u8],
+        pubkey: &[u8],
+        script_code: &[u8],
+        sigversion: SigVersion,
+    ) -> bool {
+        if self
+            .inner
+            .check_ecdsa_signature(sig, pubkey, script_code, sigversion)
+        {
+            self.signatures
+                .borrow_mut()
+                .insert(hash160(pubkey), (pubkey.to_vec(), sig.to_vec()));
+            return true;
+        }
+        false
+    }
+    fn check_schnorr_signature(
+        &self,
+        sig: &[u8],
+        pubkey: &[u8],
+        sigversion: SigVersion,
+        execdata: &mut ExecutionData,
+    ) -> Result<(), ScriptError> {
+        self.inner
+            .check_schnorr_signature(sig, pubkey, sigversion, execdata)
+    }
+    fn check_locktime(&self, locktime: i64) -> bool {
+        self.inner.check_locktime(locktime)
+    }
+    fn check_sequence(&self, sequence: i64) -> bool {
+        self.inner.check_sequence(sequence)
+    }
+    fn verify_taproot_commitment(
+        &self,
+        control: &[u8],
+        program: &[u8],
+        tapleaf_hash: &[u8; 32],
+    ) -> bool {
+        self.inner
+            .verify_taproot_commitment(control, program, tapleaf_hash)
+    }
+}
+
+/// `DataFromTransaction` — pull the signatures and scripts an existing
+/// (possibly partial) spend carries into a `SignatureData`: a spend
+/// that already verifies is `complete`; otherwise P2SH and P2WSH
+/// wrappers are recovered from the stack tails and multisig signatures
+/// are matched against the script's pubkeys. Extracts signatures and
+/// scripts from incomplete scriptSigs — please do not extend this
+/// (Core's comment), use PSBT instead.
+#[must_use]
+pub fn data_from_transaction(tx: &Transaction, n_in: usize, txout: &TxOut) -> SignatureData {
+    let mut data = SignatureData {
+        script_sig: tx.inputs[n_in].script_sig.as_bytes().to_vec(),
+        ..SignatureData::default()
+    };
+    if !tx.inputs[n_in].witness.is_empty() {
+        data.script_witness = Some(tx.inputs[n_in].witness.items().to_vec());
+    }
+
+    // `MutableTransactionSignatureChecker(&tx, nIn, amount, FAIL)` —
+    // no txdata, so segwit checks fail inside the extractor and only
+    // legacy-verifiable signatures are recovered.
+    let checker = TransactionSignatureChecker {
+        tx,
+        n_in,
+        amount: txout.value,
+        txdata: None,
+    };
+    let extractor = SignatureExtractorChecker {
+        inner: &checker,
+        signatures: std::cell::RefCell::new(SignatureMap::new()),
+    };
+
+    if verify_script(
+        &tx.inputs[n_in].script_sig,
+        &txout.script_pubkey,
+        Some(&tx.inputs[n_in].witness),
+        standard_flags(),
+        &extractor,
+    )
+    .is_ok()
+    {
+        data.signatures = extractor.signatures.into_inner();
+        data.complete = true;
+        return data;
+    }
+
+    // `Stacks` — the scriptSig's pushes under STRICTENC (the eval's
+    // result is ignored) plus the witness items.
+    let mut script_stack: Vec<Vec<u8>> = Vec::new();
+    let _ = eval_script(
+        &mut script_stack,
+        &tx.inputs[n_in].script_sig,
+        ScriptFlags::STRICTENC,
+        &DummyChecker,
+        SigVersion::Base,
+        &mut ExecutionData::default(),
+    );
+    let mut witness_stack: Vec<Vec<u8>> = tx.inputs[n_in].witness.items().to_vec();
+
+    let mut script_type = txout.script_pubkey.classify();
+    let mut next_script = txout.script_pubkey.clone();
+    let mut sigversion = SigVersion::Base;
+
+    if let ScriptType::ScriptHash(_) = script_type
+        && script_stack.last().is_some_and(|s| !s.is_empty())
+    {
+        let redeem = script_stack.pop().unwrap_or_default();
+        data.redeem_script = Some(redeem.clone());
+        next_script = Script::new(redeem);
+        script_type = next_script.classify();
+    }
+    if let ScriptType::Witness {
+        version: 0,
+        ref program,
+    } = script_type
+        && program.len() == 32
+        && witness_stack.last().is_some_and(|s| !s.is_empty())
+    {
+        let wscript = witness_stack.pop().unwrap_or_default();
+        data.witness_script = Some(wscript.clone());
+        next_script = Script::new(wscript);
+        script_stack = std::mem::take(&mut witness_stack);
+        script_type = next_script.classify();
+        sigversion = SigVersion::WitnessV0;
+    }
+    if let ScriptType::Multisig { keys, .. } = &script_type
+        && !script_stack.is_empty()
+    {
+        // Match each stack signature to a script pubkey — the same
+        // order CHECKMULTISIG evaluates in.
+        let mut last_success_key = 0usize;
+        for sig in &script_stack {
+            for (i, pubkey) in keys.iter().enumerate().skip(last_success_key) {
+                if extractor.signatures.borrow().contains_key(&hash160(pubkey))
+                    || extractor.check_ecdsa_signature(
+                        sig,
+                        pubkey,
+                        next_script.as_bytes(),
+                        sigversion,
+                    )
+                {
+                    last_success_key = i + 1;
+                    break;
+                }
+            }
+        }
+    }
+    data.signatures = extractor.signatures.into_inner();
+    data
+}
+
+/// `UpdateInput` — write the produced scriptSig/witness onto the input.
+fn update_input(input: &mut TxIn, data: &SignatureData) {
+    input.script_sig = Script::new(data.script_sig.clone());
+    input.witness = data
+        .script_witness
+        .clone()
+        .map(Witness::new)
+        .unwrap_or_default();
+}
+
+/// `SignTransaction` — produce signatures for every input the
+/// keystore's keys can satisfy. `coins` maps each spent outpoint to
+/// its `TxOut` (`None`/absent = `Coin::IsSpent`); a single missing
+/// coin disables real precomputed sighash data for the whole pass
+/// (`txdata.Init(tx, {}, force)`). `input_errors` collects per-input
+/// failures keyed by index; the return is `input_errors.is_empty()`.
+pub fn sign_transaction(
+    tx: &mut Transaction,
+    provider: &FlatProvider,
+    coins: &HashMap<OutPoint, Option<TxOut>>,
+    sighash: i32,
+    input_errors: &mut BTreeMap<usize, String>,
+) -> bool {
+    let f_hash_single = (sighash & !0x80) == 3;
+    let tx_const = tx.clone();
+
+    let txdata = {
+        let mut outs = Vec::with_capacity(tx_const.inputs.len());
+        let mut all = true;
+        for input in &tx_const.inputs {
+            match coins.get(&input.previous_output).and_then(|c| c.as_ref()) {
+                Some(o) => outs.push(o.clone()),
+                None => {
+                    all = false;
+                    break;
+                }
+            }
+        }
+        if all {
+            PrecomputedTransactionData::new(&tx_const, Some(outs), true)
+        } else {
+            PrecomputedTransactionData::new(&tx_const, None, true)
+        }
+    };
+
+    for i in 0..tx_const.inputs.len() {
+        let txin = &tx_const.inputs[i];
+        let Some(coin_out) = coins.get(&txin.previous_output).and_then(|c| c.as_ref()) else {
+            input_errors.insert(i, "Input not found or already spent".into());
+            continue;
+        };
+        let prev_pubkey = coin_out.script_pubkey.clone();
+        let amount = coin_out.value;
+
+        let mut sigdata = data_from_transaction(&tx_const, i, coin_out);
+        // Only sign SIGHASH_SINGLE if there's a corresponding output.
+        if !f_hash_single || i < tx_const.outputs.len() {
+            let env = SignerEnv {
+                tx: &tx_const,
+                n_in: i,
+                amount,
+                txdata: &txdata,
+                sighash,
+            };
+            let checker = TransactionSignatureChecker::new(&tx_const, i, amount, &txdata);
+            produce_signature(
+                provider,
+                &prev_pubkey,
+                &mut sigdata,
+                Creator::Real(&env),
+                &checker,
+            );
+        }
+        update_input(&mut tx.inputs[i], &sigdata);
+
+        // amount must be specified for valid segwit signature.
+        if amount == crate::check::MAX_MONEY && !tx.inputs[i].witness.is_empty() {
+            input_errors.insert(i, "Missing amount".into());
+            continue;
+        }
+
+        let verification = if sigdata.complete {
+            Ok(())
+        } else {
+            verify_script(
+                &tx.inputs[i].script_sig,
+                &prev_pubkey,
+                Some(&tx.inputs[i].witness),
+                standard_flags(),
+                &TransactionSignatureChecker::new(&tx_const, i, amount, &txdata),
+            )
+        };
+        match verification {
+            Ok(()) => {
+                input_errors.remove(&i);
+            }
+            Err(e) => {
+                let msg = match e {
+                    // Unable to sign input and verification failed
+                    // (possible attempt to partially sign).
+                    ScriptError::InvalidStackOperation => {
+                        "Unable to sign input, invalid stack size (possibly missing key)".to_string()
+                    }
+                    // Verification failed (possibly due to insufficient
+                    // signatures).
+                    ScriptError::SigNullFail => "CHECK(MULTI)SIG failing with non-zero signature (possibly need more signatures)".to_string(),
+                    other => other.to_string(),
+                };
+                input_errors.insert(i, msg);
+            }
+        }
+    }
+    input_errors.is_empty()
+}
+
 /// `PSBTRole` ordering — `min()` picks the earliest-needed role.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PsbtRole {
@@ -2505,5 +2790,193 @@ mod tests {
         ));
         assert!(!psbt_input_signed(&psbt.inputs[0]));
         assert_eq!(psbt.inputs[0].all(Psbt::IN_PARTIAL_SIG).count(), 1);
+    }
+
+    /// `signrawtransactionwithkey`'s signer: a bare tx spending a
+    /// `spk` outpoint. `psbt_spending`'s tx minus the PSBT wrap.
+    fn raw_tx() -> Transaction {
+        psbt_spending(&[0x51]).tx
+    }
+
+    fn wpkh_spk(keyid: &[u8; 20]) -> Vec<u8> {
+        let mut spk = vec![0x00, 0x14];
+        spk.extend_from_slice(keyid);
+        spk
+    }
+
+    fn wif_provider(secret: &secp256k1::SecretKey) -> (FlatProvider, [u8; 20]) {
+        let secp = secp256k1::Secp256k1::new();
+        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, secret)
+            .serialize()
+            .to_vec();
+        let keyid = hash160(&pubkey);
+        let mut provider = FlatProvider::default();
+        provider.keys.insert(keyid, *secret);
+        provider.pubkeys.insert(keyid, pubkey);
+        (provider, keyid)
+    }
+
+    /// A WIF provider signs a P2WPKH input to completion; the witness
+    /// lands on the input and `DataFromTransaction` re-reads it as
+    /// complete.
+    #[test]
+    fn sign_transaction_wpkh() {
+        let secret = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let (provider, keyid) = wif_provider(&secret);
+        let mut tx = raw_tx();
+        let mut coins = HashMap::new();
+        coins.insert(
+            tx.inputs[0].previous_output,
+            Some(TxOut {
+                value: 50_000,
+                script_pubkey: Script::new(wpkh_spk(&keyid)),
+            }),
+        );
+        let mut errors = BTreeMap::new();
+        assert!(sign_transaction(&mut tx, &provider, &coins, 1, &mut errors));
+        assert!(errors.is_empty());
+        assert_eq!(tx.inputs[0].witness.len(), 2);
+        assert!(tx.inputs[0].script_sig.is_empty());
+        // `DataFromTransaction` — a verifying input reports complete
+        // with the extracted signature.
+        let coin_out = coins[&tx.inputs[0].previous_output].clone().unwrap();
+        let data = data_from_transaction(&tx, 0, &coin_out);
+        assert!(data.complete);
+        assert_eq!(data.signatures.len(), 1);
+    }
+
+    /// A P2PKH legacy input signs into `script_sig` (no witness).
+    #[test]
+    fn sign_transaction_pkh() {
+        let secret = secp256k1::SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let (provider, keyid) = wif_provider(&secret);
+        let mut spk = vec![0x76, 0xa9, 0x14];
+        spk.extend_from_slice(&keyid);
+        spk.extend_from_slice(&[0x88, 0xac]);
+        let mut tx = raw_tx();
+        let mut coins = HashMap::new();
+        coins.insert(
+            tx.inputs[0].previous_output,
+            Some(TxOut {
+                value: 50_000,
+                script_pubkey: Script::new(spk),
+            }),
+        );
+        let mut errors = BTreeMap::new();
+        assert!(sign_transaction(&mut tx, &provider, &coins, 1, &mut errors));
+        assert!(!tx.inputs[0].script_sig.is_empty());
+        assert!(tx.inputs[0].witness.is_empty());
+    }
+
+    /// An unresolvable outpoint is `Coin::IsSpent` — the input error
+    /// "Input not found or already spent" makes the tx incomplete.
+    #[test]
+    fn sign_transaction_input_not_found() {
+        let secret = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let (provider, _) = wif_provider(&secret);
+        let mut tx = raw_tx();
+        let mut coins = HashMap::new();
+        coins.insert(tx.inputs[0].previous_output, None);
+        let mut errors = BTreeMap::new();
+        assert!(!sign_transaction(
+            &mut tx,
+            &provider,
+            &coins,
+            1,
+            &mut errors
+        ));
+        assert_eq!(errors[&0], "Input not found or already spent");
+    }
+
+    /// A segwit coin at the `MAX_MONEY` sentinel — signed witness but
+    /// the amount was never provided — reports `Missing amount`
+    /// (surfaced as the `-3` exception by the RPC layer).
+    #[test]
+    fn sign_transaction_missing_amount() {
+        let secret = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let (provider, keyid) = wif_provider(&secret);
+        let mut tx = raw_tx();
+        let mut coins = HashMap::new();
+        coins.insert(
+            tx.inputs[0].previous_output,
+            Some(TxOut {
+                value: crate::check::MAX_MONEY,
+                script_pubkey: Script::new(wpkh_spk(&keyid)),
+            }),
+        );
+        let mut errors = BTreeMap::new();
+        assert!(!sign_transaction(
+            &mut tx,
+            &provider,
+            &coins,
+            1,
+            &mut errors
+        ));
+        assert_eq!(errors[&0], "Missing amount");
+    }
+
+    /// A key that doesn't own the output leaves the input unsigned and
+    /// the verification failure becomes the input error.
+    #[test]
+    fn sign_transaction_wrong_key() {
+        let secret = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let (provider, _) = wif_provider(&secret);
+        let mut tx = raw_tx();
+        let mut coins = HashMap::new();
+        coins.insert(
+            tx.inputs[0].previous_output,
+            Some(TxOut {
+                value: 50_000,
+                script_pubkey: Script::new(wpkh_spk(&[0xee; 20])),
+            }),
+        );
+        let mut errors = BTreeMap::new();
+        assert!(!sign_transaction(
+            &mut tx,
+            &provider,
+            &coins,
+            1,
+            &mut errors
+        ));
+        assert!(errors.contains_key(&0));
+    }
+
+    /// `SIGHASH_SINGLE` without a matching output skips signing — the
+    /// input error reflects the untouched, failing spend.
+    #[test]
+    fn sign_transaction_single_no_output() {
+        let secret = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let (provider, keyid) = wif_provider(&secret);
+        let mut tx = raw_tx();
+        tx.inputs.push(crate::transaction::TxIn {
+            previous_output: OutPoint {
+                txid: crate::hash::Txid::from_bytes([0x33; 32]),
+                vout: 7,
+            },
+            script_sig: Script::new(Vec::new()),
+            sequence: 0xffff_ffff,
+            witness: Witness::default(),
+        });
+        let mut coins = HashMap::new();
+        for i in 0..2 {
+            coins.insert(
+                tx.inputs[i].previous_output,
+                Some(TxOut {
+                    value: 50_000,
+                    script_pubkey: Script::new(wpkh_spk(&keyid)),
+                }),
+            );
+        }
+        let mut errors = BTreeMap::new();
+        // Input 1 has no corresponding output — Core skips signing it.
+        assert!(!sign_transaction(
+            &mut tx,
+            &provider,
+            &coins,
+            3,
+            &mut errors
+        ));
+        assert!(tx.inputs[0].witness.len() == 2);
+        assert!(errors.contains_key(&1));
     }
 }

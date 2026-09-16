@@ -832,6 +832,53 @@ surfaced:
   reprocessing, and the bad-psbt/bad-descriptor/bad-sighash/
   hardened-tpub error paths — all byte-identical, including
   `complete`/`hex` result shape.
+- `signrawtransactionwithkey` ports `SignTransaction` over a
+  WIF-keyed `FlatSigningProvider`: each privkey decodes via
+  `decode_secret` (per-element type check runs *after* the
+  raw-tx decode — Core's arg order), `pubkey_from_secret`
+  fills `provider.pubkeys` honoring the compression flag, and
+  `FindCoins` resolves prevouts through the
+  chainstate+mempool overlay — a mempool-confirmed coin that
+  an in-pool spend consumed reads as `Coin::IsSpent` (via the
+  pool's spent-tracker) and errors "Input not found or already
+  spent". `ParsePrevouts` overlays caller coins: fields are
+  read in Core's `exists` order, `txid`/`vout`/`scriptPubKey`
+  are mandatory, `vout` fails `-22 "vout cannot be negative"`
+  or `-1 "JSON integer out of range"` (Core's `getInt`
+  wording, so floats print `jErr`'s raw type string), a
+  non-hex/odd-length scriptPubKey is `-8 "scriptPubKey must
+  be hexadecimal string (not '…')"` (empty hex accepted,
+  dropped from the coin view), a chain coin must match the
+  declared scriptPubKey, `redeemScript`/`witnessScript` enter
+  `provider.scripts` under their script-id/sha256 keys, and
+  `amount` is optional unless the coin is segwit — a missing
+  one throws Core's `-3 "Missing amount for
+  CTxOut(nValue=…, scriptPubKey=<30-char prefix>)"` (the
+  MAX_MONEY sentinel path, after signing, matching
+  `SighashFromSignature`'s amount validation). The signer
+  runs `data_from_transaction` (Core's
+  `SignatureExtractorChecker`: scriptSig pushes split into
+  signature+pubkey pairs, existing sigs registered per
+  hash160, redeem/witness scripts recovered into
+  `SignatureData`) before `produce_signature` merges new
+  sigs, and each input's finality check verifies the full
+  script — failure strings come from the interpreter's own
+  error table ("Signature must be zero for failed
+  CHECK(MULTI)SIG operation" etc.). Result is
+  `{hex, complete, errors[]}` with each error carrying
+  Core's `txid/vout/witness/scriptSig/sequence/error` shape
+  (`witness` is the *stack*, `scriptSig` is the raw script
+  bytes — pushes included, no CompactSize — and `sequence` is
+  the numeric nSequence).
+  Verified live against Core 29.4 across 47 cases —
+  funded-chain pkh/wpkh/sh(wpkh)/wsh(2-of-3 multi)/tr
+  key-path spends, `prevtxs`-only coins (no chain lookup),
+  all seven sighash modes including `SINGLE` on a
+  no-matching-output input (errors `-22` with the sighash
+  string), uncompressed-WIF pkh, already-signed inputs,
+  multi-input mixed scripts, wrong-WIF, and every
+  ParsePrevouts/getInt/sighash-string error path — all
+  byte-identical.
 
 ### Known semantic differences
 
