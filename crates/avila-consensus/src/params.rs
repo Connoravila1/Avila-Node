@@ -29,6 +29,30 @@ pub enum Network {
 }
 
 impl Network {
+    /// Core's `ChainTypeToString` — the `chain`/`network` string every
+    /// RPC reports: `"main"`, `"testnet4"`, `"signet"`, `"regtest"`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Network::Mainnet => "main",
+            Network::Testnet4 => "testnet4",
+            Network::Signet => "signet",
+            Network::Regtest => "regtest",
+        }
+    }
+
+    /// Every built-in network — `GetNetworkForMagic`'s domain for
+    /// snapshot-metadata network checks.
+    #[must_use]
+    pub fn all() -> [Network; 4] {
+        [
+            Network::Mainnet,
+            Network::Testnet4,
+            Network::Signet,
+            Network::Regtest,
+        ]
+    }
+
     /// Returns this network's consensus parameters (Core's `CreateChainParams` /
     /// `ChainParamsFromNetwork`).
     #[must_use]
@@ -97,7 +121,20 @@ impl Network {
                         min_activation_height: 709_632,
                     },
                 ],
-                assumeutxo_snapshot_heights: &[840_000, 880_000],
+                assumeutxo_data: &[
+                    AssumeutxoData {
+                        height: 840_000,
+                        hash_serialized: "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96",
+                        n_chain_tx: 991_032_194,
+                        blockhash: "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
+                    },
+                    AssumeutxoData {
+                        height: 880_000,
+                        hash_serialized: "dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9",
+                        n_chain_tx: 1_145_604_538,
+                        blockhash: "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880",
+                    },
+                ],
                 genesis_header: MAINNET_GENESIS,
             },
             Network::Testnet4 => Params {
@@ -154,7 +191,9 @@ impl Network {
                         min_activation_height: 0,
                     },
                 ],
-                assumeutxo_snapshot_heights: &[2_500_000],
+                // Core's `CTestNet4Params` ships an empty table — no
+                // snapshot point exists for this network.
+                assumeutxo_data: &[],
                 genesis_header: TESTNET4_GENESIS,
             },
             Network::Signet => Params {
@@ -211,7 +250,12 @@ impl Network {
                         min_activation_height: 0,
                     },
                 ],
-                assumeutxo_snapshot_heights: &[160_000],
+                assumeutxo_data: &[AssumeutxoData {
+                    height: 160_000,
+                    hash_serialized: "fe0a44309b74d6b5883d246cb419c6221bcccf0b308c9b59b7d70783dbdf928a",
+                    n_chain_tx: 2_289_496,
+                    blockhash: "0000003ca3c99aff040f2563c2ad8f8ec88bd0fd6b8f0895cfaf1ef90353a62c",
+                }],
                 genesis_header: SIGNET_GENESIS,
             },
             Network::Regtest => Params {
@@ -269,11 +313,49 @@ impl Network {
                         min_activation_height: 0,
                     },
                 ],
-                assumeutxo_snapshot_heights: &[110, 200, 299],
+                assumeutxo_data: &[
+                    // For use by unit tests.
+                    AssumeutxoData {
+                        height: 110,
+                        hash_serialized: "6657b736d4fe4db0cbc796789e812d5dba7f5c143764b1b6905612f1830609d1",
+                        n_chain_tx: 111,
+                        blockhash: "696e92821f65549c7ee134edceeeeaaa4105647a3c4fd9f298c0aec0ab50425c",
+                    },
+                    // For use by fuzz target src/test/fuzz/utxo_snapshot.cpp.
+                    AssumeutxoData {
+                        height: 200,
+                        hash_serialized: "4f34d431c3e482f6b0d67b64609ece3964dc8d7976d02ac68dd7c9c1421738f2",
+                        n_chain_tx: 201,
+                        blockhash: "5e93653318f294fb5aa339d00bbf8cf1c3515488ad99412c37608b139ea63b27",
+                    },
+                    // For use by test/functional/feature_assumeutxo.py.
+                    AssumeutxoData {
+                        height: 299,
+                        hash_serialized: "a4bf3407ccb2cc0145c49ebba8fa91199f8a3903daf0883875941497d2493c27",
+                        n_chain_tx: 334,
+                        blockhash: "3bb7ce5eba0be48939b7a521ac1ba9316afee2c7bada3a0cca24188e6d7d96c0",
+                    },
+                ],
                 genesis_header: REGTEST_GENESIS,
             },
         }
     }
+}
+
+/// One `m_assumeutxo_data` entry — a `loadtxoutset`-acceptable snapshot
+/// point: the base block, its expected `hash_serialized_3` UTXO-set
+/// digest, and the `nChainTx` Core stamps on the base index entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AssumeutxoData {
+    /// `AssumeutxoData::height` — the snapshot base block's height.
+    pub height: u32,
+    /// `hash_serialized` — display-order hex of the expected
+    /// `hash_serialized_3` digest over the snapshot's coins.
+    pub hash_serialized: &'static str,
+    /// `m_chain_tx_count` — `nChainTx` for the base block.
+    pub n_chain_tx: u64,
+    /// `blockhash` — display-order hex of the base block's hash.
+    pub blockhash: &'static str,
 }
 
 /// One `consensus.vDeployments` entry — a BIP9 versionbits deployment
@@ -452,11 +534,11 @@ pub struct Params {
     /// `consensus.vDeployments` — the BIP9 positions Core ships, in
     /// `DeploymentInfo` order: `testdummy` then `taproot`.
     pub bip9_deployments: [Bip9Deployment; 2],
-    /// `m_assumeutxo_data` heights — the snapshot heights `loadtxoutset`
-    /// accepts and `dumptxoutset rollback` (without an explicit target)
-    /// rolls back to. Heights only: the serialized hashes belong to
-    /// Core's own chain history and can't be reproduced here.
-    pub assumeutxo_snapshot_heights: &'static [u32],
+    /// `m_assumeutxo_data` — the snapshot points `loadtxoutset` accepts
+    /// and `dumptxoutset rollback` (without an explicit target) rolls
+    /// back to. Hashes are display-hex strings parsed at the call site
+    /// (Core stores them as `uint256` constants).
+    pub assumeutxo_data: &'static [AssumeutxoData],
     /// The network's genesis block header: the anchor every [`crate::chain::HeaderTree`]
     /// is seeded with.
     pub genesis_header: BlockHeader,

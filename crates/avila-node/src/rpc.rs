@@ -2791,6 +2791,8 @@ const HELP_HELP: &str = "help ( \"command\" )\n\nList all commands, or get help 
 const GETMEMORYINFO_HELP: &str = "getmemoryinfo ( \"mode\" )\n\nReturns an object containing information about memory usage.\n\nArguments:\n1. mode    (string, optional, default=\"stats\") determines what kind of information is returned.\n           - \"stats\" returns general statistics about memory usage in the daemon.\n           - \"mallocinfo\" returns an XML string describing low-level heap state (only available if compiled with glibc).\n\nResult (mode \"stats\"):\n{                         (json object)\n  \"locked\" : {            (json object) Information about locked memory manager\n    \"used\" : n,           (numeric) Number of bytes used\n    \"free\" : n,           (numeric) Number of bytes available in current arenas\n    \"total\" : n,          (numeric) Total number of bytes managed\n    \"locked\" : n,         (numeric) Amount of bytes that succeeded locking. If this number is smaller than total, locking pages failed at some point and key data could be swapped to disk.\n    \"chunks_used\" : n,    (numeric) Number allocated chunks\n    \"chunks_free\" : n     (numeric) Number unused chunks\n  }\n}\n\nResult (mode \"mallocinfo\"):\n\"str\"    (string) \"<malloc version=\"1\">...\"\n\nExamples:\n> bitcoin-cli getmemoryinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getmemoryinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 const DUMPTXOUTSET_HELP: &str = "dumptxoutset \"path\" ( \"type\" {\"rollback\":n,...} )\n\nWrite the serialized UTXO set to a file. This can be used in loadtxoutset afterwards if this snapshot height is supported in the chainparams as well.\n\nUnless the \"latest\" type is requested, the node will roll back to the requested height and network activity will be suspended during this process. Because of this it is discouraged to interact with the node in any other way during the execution of this call to avoid inconsistent results and race conditions, particularly RPCs that interact with blockstorage.\n\nThis call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\n\nArguments:\n1. path       (string, required) Path to the output file. If relative, will be prefixed by datadir.\n2. type       (string, optional, default=\"\") The type of snapshot to create. Can be \"latest\" to create a snapshot of the current UTXO set or \"rollback\" to temporarily roll back the state of the node to a historical block before creating the snapshot of a historical UTXO set. This parameter can be omitted if a separate \"rollback\" named parameter is specified indicating the height or hash of a specific historical block. If \"rollback\" is specified and separate \"rollback\" named parameter is not specified, this will roll back to the latest valid snapshot block that can currently be loaded with loadtxoutset.\n3. options    (json object, optional) Options object that can be used to pass named arguments, listed below.\n\nNamed Arguments:\nrollback    (string or numeric, optional) Height or hash of the block to roll back to before creating the snapshot. Note: The further this number is from the tip, the longer this process will take. Consider setting a higher -rpcclienttimeout value in this case.\n\nResult:\n{                             (json object)\n  \"coins_written\" : n,        (numeric) the number of coins written in the snapshot\n  \"base_hash\" : \"hex\",        (string) the hash of the base of the snapshot\n  \"base_height\" : n,          (numeric) the height of the base of the snapshot\n  \"path\" : \"str\",             (string) the absolute path that the snapshot was written to\n  \"txoutset_hash\" : \"hex\",    (string) the hash of the UTXO set contents\n  \"nchaintx\" : n              (numeric) the number of transactions in the chain up to and including the base block\n}\n\nExamples:\n> bitcoin-cli -rpcclienttimeout=0 dumptxoutset utxo.dat latest\n> bitcoin-cli -rpcclienttimeout=0 dumptxoutset utxo.dat rollback\n> bitcoin-cli -rpcclienttimeout=0 -named dumptxoutset utxo.dat rollback=853456\n";
+const LOADTXOUTSET_HELP: &str = "loadtxoutset \"path\"\n\nLoad the serialized UTXO set from a file.\nOnce this snapshot is loaded, its contents will be deserialized into the active chainstate, which is then used to sync to the network's tip. The snapshot's base block must already be in the headers chain and must be one of the heights supported by the chainparams assumeutxo table.\n\nThis call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\n\nArguments:\n1. path    (string, required) Path to the snapshot file. If relative, will be prefixed by datadir.\n\nResult:\n{                             (json object)\n  \"coins_loaded\" : n,         (numeric) the number of coins loaded from the snapshot\n  \"tip_hash\" : \"hex\",        (string) the hash of the base of the snapshot\n  \"base_height\" : n,         (numeric) the height of the base of the snapshot\n  \"path\" : \"str\",             (string) the absolute path that the snapshot was loaded from\n}\n\nExamples:\n> bitcoin-cli -rpcclienttimeout=0 loadtxoutset utxo.dat\n";
+
 const IMPORTMEMPOOL_HELP: &str = "importmempool \"filepath\" ( options )\n\nImport a mempool.dat file and attempt to add its contents to the mempool.\nWarning: Importing untrusted files is dangerous, especially if metadata from the file is taken over.\n\nArguments:\n1. filepath    (string, required) The mempool file\n2. options     (json object, optional) Options object that can be used to pass named arguments, listed below.\n\nNamed Arguments:\nuse_current_time            (boolean, optional, default=true) Whether to use the current system time or use the entry time metadata from the mempool file.\n                            Warning: Importing untrusted metadata may lead to unexpected issues and undesirable behavior.\napply_fee_delta_priority    (boolean, optional, default=false) Whether to apply the fee delta metadata from the mempool file.\n                            It will be added to any existing fee deltas.\n                            The fee delta can be set by the prioritisetransaction RPC.\n                            Warning: Importing untrusted metadata may lead to unexpected issues and undesirable behavior.\n                            Only set this bool if you understand what it does.\napply_unbroadcast_set       (boolean, optional, default=false) Whether to apply the unbroadcast set metadata from the mempool file.\n                            Warning: Importing untrusted metadata may lead to unexpected issues and undesirable behavior.\n\nResult:\n{}    (empty JSON object)\n\nExamples:\n> bitcoin-cli importmempool /path/to/mempool.dat\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"importmempool\", \"params\": [/path/to/mempool.dat]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 const GETBLOCKFILTER_HELP: &str = "getblockfilter \"blockhash\" ( \"filtertype\" )\n\nRetrieve a BIP 157 content filter for a particular block.\n\nArguments:\n1. blockhash     (string, required) The hash of the block\n2. filtertype    (string, optional, default=\"basic\") The type name of the filter\n\nResult:\n{                      (json object)\n  \"filter\" : \"hex\",    (string) the hex-encoded filter data\n  \"header\" : \"hex\"     (string) the hex-encoded filter header\n}\n\nExamples:\n> bitcoin-cli getblockfilter \"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\" \"basic\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockfilter\", \"params\": [\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\", \"basic\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
@@ -4151,6 +4153,11 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         DUMPTXOUTSET_HELP,
     ),
     (
+        "loadtxoutset",
+        &[("path", Some("string"), true)],
+        LOADTXOUTSET_HELP,
+    ),
+    (
         "importmempool",
         &[
             ("filepath", Some("string"), true),
@@ -4541,7 +4548,7 @@ fn dispatch(
                 })
                 .unwrap_or(0);
             Ok(json!({
-                "chain": format!("{:?}", cs.tree().params().network).to_lowercase(),
+                "chain": cs.tree().params().network.name(),
                 "blocks": connected,
                 "headers": best_header.height,
                 "bestblockhash": tip.to_string(),
@@ -4566,8 +4573,9 @@ fn dispatch(
             }))
         }),
         "getchainstates" => chain_query(queries, |cs, _| {
-            // One chainstate — we never snapshot-load (assumeutxo),
-            // so the list is Core's single-entry case.
+            // One chainstate — a `loadtxoutset` snapshot reports
+            // `validated: false` until the assumed prefix is
+            // re-validated (Core's snapshot chainstate flag).
             let tip = cs.tip_hash();
             let connected = cs.chain().len().saturating_sub(1) as u32;
             let best_header = cs.tree().tip();
@@ -4591,7 +4599,7 @@ fn dispatch(
                     // state itself, held without a byte budget.
                     "coins_db_cache_bytes": 0,
                     "coins_tip_cache_bytes": 0,
-                    "validated": true,
+                    "validated": cs.snapshot_base().is_none(),
                 }],
             }))
         }),
@@ -8476,13 +8484,14 @@ fn dispatch(
                 } else if snap_type == "rollback" {
                     // No explicit target: Core rolls back to the
                     // largest chainparams assumeutxo height.
-                    let max_h = *cs
+                    let max_h = cs
                         .tree()
                         .params()
-                        .assumeutxo_snapshot_heights
+                        .assumeutxo_data
                         .iter()
+                        .map(|d| d.height)
                         .max()
-                        .unwrap_or(&0);
+                        .unwrap_or(0);
                     parse_hash_or_height(&json!(max_h), cs)?
                 } else if snap_type == "latest" {
                     cs.tree()
@@ -8517,6 +8526,15 @@ fn dispatch(
                 // to the target height. Core does a TemporaryRollback
                 // of the live chain; the clone gets the same UTXO set
                 // without suspending the node's own state.
+                // A snapshot-based chainstate has no undo below the
+                // assumeutxo base — a rollback crossing it can't be
+                // simulated.
+                if cs.snapshot_base().is_some_and(|b| target.height < b) {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "Could not roll back to requested height.".to_string(),
+                    ));
+                }
                 let mut utxo = cs.utxo().clone();
                 let tip_h = cs.chain().len() - 1;
                 for h in ((target.height + 1)..=tip_h as u32).rev() {
@@ -8571,6 +8589,60 @@ fn dispatch(
                     "path": path.to_string_lossy(),
                     "txoutset_hash": stats.hash_serialized.map(|h| h.to_string()),
                     "nchaintx": target.n_chain_tx,
+                }))
+            })
+        }
+        // Core's `loadtxoutset` — `ActivateSnapshot` +
+        // `PopulateAndValidateSnapshot` on the single chainstate. The
+        // three-stage error surface matches Core's: open (-8),
+        // metadata parse (-22), activation (-1 wrapper).
+        "loadtxoutset" => {
+            let path_arg = params
+                .get(0)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            chain_query(queries, move |cs, mgr| {
+                let Some(store) = cs.store() else {
+                    return Err((RPC_MISC_ERROR, "no data directory configured".into()));
+                };
+                // `AbsPathForConfigVal`: relative paths resolve under
+                // the datadir, then absolutize so errors and the
+                // result report Core's canonicalized path.
+                let path = if std::path::Path::new(&path_arg).is_absolute() {
+                    std::path::PathBuf::from(&path_arg)
+                } else {
+                    store.dir().join(&path_arg)
+                };
+                let path = std::path::absolute(&path).unwrap_or(path);
+                let file = std::fs::File::open(&path).map_err(|_| {
+                    (
+                        RPC_INVALID_PARAMETER,
+                        format!("Couldn't open file {} for reading.", path.display()),
+                    )
+                })?;
+                let mut reader = std::io::BufReader::new(file);
+                let magic = cs.tree().params().message_start;
+                let meta = avila_consensus::utxo_snapshot::read_metadata(&mut reader, magic)
+                    .map_err(|e| {
+                        (
+                            RPC_DESERIALIZATION_ERROR,
+                            format!("Unable to parse metadata: {e}"),
+                        )
+                    })?;
+                let base_height = cs
+                    .activate_snapshot(&mut reader, &meta, !mgr.mempool_ref().is_empty())
+                    .map_err(|e| {
+                        (
+                            RPC_INTERNAL_ERROR,
+                            format!("Unable to load UTXO snapshot: {e}. ({})", path.display()),
+                        )
+                    })?;
+                Ok(json!({
+                    "coins_loaded": meta.coins_count,
+                    "tip_hash": meta.base_blockhash.to_string(),
+                    "base_height": base_height,
+                    "path": path.to_string_lossy(),
                 }))
             })
         }
@@ -9555,7 +9627,7 @@ fn dispatch(
                 "target": node.header.bits.expand().value.to_hex(),
                 "networkhashps": core_num(networkhashps),
                 "pooledtx": mgr.mempool_ref().len(),
-                "chain": format!("{:?}", cs.tree().params().network).to_lowercase(),
+                "chain": cs.tree().params().network.name(),
             });
             if let Some(bits) = next {
                 out["next"] = json!({
@@ -10594,7 +10666,7 @@ fn dispatch(
                      \x20   getchainstates, pruneblockchain <height>,\n\
                      \x20   gettxoutsetinfo [hash_type] [hash_or_height] [use_index]\n\
                      \x20   scantxoutset <action> [scanobjects,...],\n\
-                     \x20   dumptxoutset <path> [type] [options],\n\
+                     \x20   dumptxoutset <path> [type] [options], loadtxoutset <path>,\n\
                      \x20   importmempool <path> [options], savemempool,\n\
                      \x20   getblockfilter <hash> [type],\n\
                      \x20   scanblocks <action> [...],\n\
@@ -12931,6 +13003,9 @@ mod tests {
             ("dumptxoutset", json!([null]), RPC_TYPE_ERROR),
             ("dumptxoutset", json!([["x"]]), RPC_TYPE_ERROR),
             ("dumptxoutset", json!(["x", "latest", "x"]), RPC_TYPE_ERROR),
+            ("loadtxoutset", json!([]), RPC_MISC_ERROR),
+            ("loadtxoutset", json!([null]), RPC_TYPE_ERROR),
+            ("loadtxoutset", json!([["x"]]), RPC_TYPE_ERROR),
             ("importmempool", json!([]), RPC_MISC_ERROR),
             ("importmempool", json!([null]), RPC_TYPE_ERROR),
             ("importmempool", json!([[]]), RPC_TYPE_ERROR),

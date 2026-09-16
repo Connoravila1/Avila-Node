@@ -201,6 +201,11 @@ pub struct Chainstate {
     /// nothing persists it across restarts — hence a plain in-memory
     /// slot here.
     precious: Option<BlockHash>,
+    /// `m_from_snapshot_blockhash` — the `loadtxoutset` base height,
+    /// when this chainstate was built from a snapshot. Heights at or
+    /// below it are assume-valid: their `undos` slots are empty
+    /// placeholders and no reorg may fork below it.
+    snapshot_base: Option<u32>,
 }
 
 /// The transaction index behind `-txindex`: every retained block's
@@ -452,6 +457,18 @@ impl FilterIndex {
         }
         self.by_hash.get(hash).map(|(f, h)| (f.as_slice(), h))
     }
+
+    /// `loadtxoutset` rewinds: every active-chain entry below the
+    /// snapshot base belongs to the abandoned prefix (those heights
+    /// have no bodies to filter), so the height index empties into the
+    /// hash index and the header chain restarts — Core's snapshot
+    /// chainstate begins with an empty index the same way.
+    fn reset_to_snapshot(&mut self) {
+        for (_, (hash, filter, header)) in std::mem::take(&mut self.by_height) {
+            self.by_hash.insert(hash, (filter, header));
+        }
+        self.last_header = [0; 32];
+    }
 }
 
 impl Chainstate {
@@ -473,6 +490,7 @@ impl Chainstate {
             txindex: None,
             filterindex: None,
             precious: None,
+            snapshot_base: None,
         }
     }
 
@@ -593,6 +611,186 @@ impl Chainstate {
                     .map(|(hash, f, hdr)| (*hash, f.clone(), *hdr))
             })
             .collect()
+    }
+
+    /// The assumeutxo base height when this chainstate was built from a
+    /// `loadtxoutset` snapshot — Core's `m_from_snapshot_blockhash`.
+    /// Heights at or below it are assume-valid: their undo slots are
+    /// empty placeholders, their bodies were never required, and no
+    /// reorg may fork below it.
+    #[must_use]
+    pub fn snapshot_base(&self) -> Option<u32> {
+        self.snapshot_base
+    }
+
+    /// `ChainstateManager::ActivateSnapshot` + `PopulateAndValidateSnapshot`
+    /// folded onto this single chainstate: the snapshot becomes the
+    /// connected state (assume-valid through the base), and later
+    /// blocks connect on top of it. Core additionally keeps a
+    /// background-validation chainstate that re-validates up to the
+    /// base; this port loads the set directly — the chainparams hash
+    /// check is what makes that safe, and `snapshot_base` records the
+    /// unvalidated prefix so reorgs never fork below it.
+    ///
+    /// Gate order and error strings are `ActivateSnapshot`'s, then
+    /// `PopulateAndValidateSnapshot`'s.
+    ///
+    /// # Errors
+    ///
+    /// `SnapshotError` with Core's exact messages.
+    pub fn activate_snapshot<R: std::io::Read>(
+        &mut self,
+        r: &mut R,
+        meta: &crate::utxo_snapshot::SnapshotMetadata,
+        mempool_nonempty: bool,
+    ) -> Result<u32, crate::utxo_snapshot::SnapshotError> {
+        use crate::utxo_snapshot::SnapshotError;
+        let params = *self.tree.params();
+        let base = meta.base_blockhash;
+        let base_display = base.to_string();
+
+        // ActivateSnapshot's checks, in order.
+        if self.snapshot_base.is_some() {
+            return Err(SnapshotError(
+                "Can't activate a snapshot-based chainstate more than once".to_string(),
+            ));
+        }
+        let Some(au_data) = params.assumeutxo_data.iter().find(|d| {
+            std::str::FromStr::from_str(d.blockhash)
+                .ok()
+                .as_ref()
+                .map(|h: &BlockHash| h.as_bytes() == base.as_bytes())
+                .unwrap_or(false)
+        }) else {
+            let heights = params
+                .assumeutxo_data
+                .iter()
+                .map(|d| d.height.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(SnapshotError(format!(
+                "assumeutxo block hash in snapshot metadata not recognized (hash: {base_display}). The following snapshot heights are available: {heights}"
+            )));
+        };
+        let Some(start) = self.tree.get(&base) else {
+            return Err(SnapshotError(format!(
+                "The base block header ({base_display}) must appear in the headers chain. Make sure all headers are syncing, and call loadtxoutset again"
+            )));
+        };
+        if self.tree.is_failed(&base) {
+            return Err(SnapshotError(format!(
+                "The base block header ({base_display}) is part of an invalid chain"
+            )));
+        }
+        let base_height = start.height;
+        let best_header = self.tree.tip_hash();
+        if self
+            .tree
+            .get_ancestor(&best_header, base_height)
+            .map(|n| n.hash())
+            != Some(base)
+        {
+            return Err(SnapshotError(
+                "A forked headers-chain with more work than the chain with the snapshot base block header exists. Please proceed to sync without AssumeUtxo."
+                    .to_string(),
+            ));
+        }
+        if mempool_nonempty {
+            return Err(SnapshotError(
+                "Can't activate a snapshot when mempool not empty".to_string(),
+            ));
+        }
+
+        // PopulateAndValidateSnapshot: the height-keyed table lookup is
+        // a duplicate of the blockhash one here (the table is keyed on
+        // both consistently), then the work comparison Core repeats.
+        let Some(au_by_height) = params
+            .assumeutxo_data
+            .iter()
+            .find(|d| d.height == base_height)
+        else {
+            return Err(SnapshotError(format!(
+                "Assumeutxo height in snapshot metadata not recognized ({base_height}) - refusing to load snapshot"
+            )));
+        };
+        let tip_work = self
+            .tree
+            .get(&self.connected)
+            .map(|n| n.chainwork)
+            .unwrap_or_default();
+        if start.chainwork <= tip_work {
+            return Err(SnapshotError(
+                "Work does not exceed active chainstate".to_string(),
+            ));
+        }
+
+        let mut loaded = UtxoSet::new();
+        crate::utxo_snapshot::read_coins(r, meta.coins_count, base_height, |outpoint, coin| {
+            loaded.insert_synthetic(outpoint, coin)
+        })?;
+
+        // `AssumeutxoHash` — hash_serialized_3 of the loaded set must
+        // match the chainparams value.
+        let stats = crate::coinstats::compute(
+            &loaded,
+            i64::from(base_height),
+            base,
+            crate::coinstats::CoinStatsHashType::HashSerialized,
+        );
+        let got = stats
+            .hash_serialized
+            .map(|h| crate::hash::format_display_hex(h.as_bytes()))
+            .unwrap_or_default();
+        if got != au_by_height.hash_serialized {
+            return Err(SnapshotError(format!(
+                "Bad snapshot content hash: expected {}, got {got}",
+                au_by_height.hash_serialized
+            )));
+        }
+
+        // Commit: the connected chain becomes the header chain through
+        // the base. Undo slots below it are empty placeholders — those
+        // blocks were never connected here, and the reorg guard keeps
+        // them from ever being "disconnected".
+        let mut chain = Vec::with_capacity(base_height as usize + 1);
+        let mut cursor = base;
+        loop {
+            chain.push(cursor);
+            if cursor == params.genesis_header.hash() {
+                break;
+            }
+            cursor = self
+                .tree
+                .get(&cursor)
+                .map(|n| n.header.prev_block_hash)
+                .ok_or_else(|| {
+                    SnapshotError("snapshot base header chain is incomplete".to_string())
+                })?;
+        }
+        chain.reverse();
+        self.utxo = loaded;
+        self.chain = chain;
+        self.undos = vec![BlockUndo::default(); base_height as usize];
+        self.connected = base;
+        self.snapshot_base = Some(base_height);
+        self.precious = None;
+        self.tree.apply_tx_meta(&base, 0, au_data.n_chain_tx);
+        // The filter index belongs to the connected chain — every
+        // pre-base height entry is now stale, and the first post-base
+        // append chains its header off nothing (Core's snapshot
+        // chainstate starts with an empty index).
+        if let Some(index) = &mut self.filterindex {
+            index.reset_to_snapshot();
+        }
+        // The assumed state must be durable before the call returns —
+        // a crash otherwise resumes the pre-snapshot `state.dat` while
+        // blk files may already hold post-base bodies (Core flushes
+        // the snapshot chainstate on activation).
+        if self.store.is_some() {
+            self.flush()
+                .map_err(|e| SnapshotError(format!("snapshot flush: {e}")))?;
+        }
+        Ok(base_height)
     }
 
     /// The block a transaction was retained in, when the index is on —
@@ -741,19 +939,24 @@ impl Chainstate {
             return Err(corrupt("best header not a max-work tip"));
         }
         let store = self.store.as_ref().ok_or_else(|| corrupt("no store"))?;
+        let snapshot_base = (state.snapshot_base > 0).then_some(state.snapshot_base);
         for (index, hash) in state.chain.iter().enumerate() {
             if !self.tree.contains(hash) {
                 return Err(corrupt("connected block unindexed"));
             }
-            // The genesis (index 0) is never accepted through `accept_block`,
-            // so its body is legitimately absent from the store.
-            if index > 0 && store.position(hash).is_none() {
+            // The genesis (index 0) is never accepted through
+            // `accept_block`, and heights at or below an assumeutxo
+            // base were never connected — both legitimately absent
+            // from the store.
+            let assumed = snapshot_base.is_some_and(|b| index <= b as usize);
+            if index > 0 && !assumed && store.position(hash).is_none() {
                 return Err(corrupt("connected block body not stored"));
             }
         }
         self.connected = state.tip;
         self.chain = state.chain;
         self.undos = state.undos;
+        self.snapshot_base = snapshot_base;
         self.utxo = UtxoSet::new();
         for (outpoint, coin) in state.utxo {
             self.utxo.insert_synthetic(outpoint, coin);
@@ -823,12 +1026,15 @@ impl Chainstate {
                 let mut meta: Vec<(BlockHash, u32, u64)> = self
                     .tree
                     .nodes()
-                    .filter(|(_, n)| n.n_tx > 0)
+                    // `n_chain_tx` alone is meaningful — the assumeutxo
+                    // base carries the table's count with `n_tx` = 0.
+                    .filter(|(_, n)| n.n_tx > 0 || n.n_chain_tx > 0)
                     .map(|(h, n)| (*h, n.n_tx, n.n_chain_tx))
                     .collect();
                 meta.sort_unstable();
                 meta
             },
+            snapshot_base: self.snapshot_base.unwrap_or(0),
         }
     }
 
@@ -1351,6 +1557,14 @@ impl Chainstate {
         let fork = cursor;
         let fork_height = self.tree.get(&fork).map(|n| n.height).unwrap_or(0);
         branch_hashes.reverse();
+
+        // `assumeutxo` floors the chain: a branch forking below the
+        // snapshot base can never activate — there is no state or undo
+        // below it to disconnect into (Core's snapshot chainstate
+        // simply has no view of the pre-base chain).
+        if self.snapshot_base.is_some_and(|b| fork_height < b) {
+            return Ok(None);
+        }
 
         // A candidate whose branch lacks a stored body can never activate
         // (Core: `!HaveTxsDownloaded` keeps it out of `setBlockIndexCandidates`)
@@ -2481,5 +2695,213 @@ mod tests {
         assert!(cs.block_filter(2, &blocks[1].block_hash()).is_some());
         assert!(cs.block_filter(3, &blocks[2].block_hash()).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// `loadtxoutset` end to end on regtest: a snapshot written by
+    /// `write_snapshot` loads into a headers-only chainstate, becomes
+    /// the tip, accepts the next block, and refuses a reorg below the
+    /// base. The assumeutxo table is injected like Core's test-only
+    /// params do (its built-in regtest entries describe Core's own
+    /// deterministic chain, not this one).
+    #[test]
+    fn assumeutxo_load_round_trip() {
+        use crate::params::AssumeutxoData;
+        use crate::utxo_snapshot::{read_metadata, sorted_coins, write_snapshot};
+
+        let mut p = params();
+        // The source node validates h1..h3 honestly.
+        let mut src = Chainstate::new(&p);
+        let mut blocks = Vec::new();
+        let mut parent = genesis_header();
+        for h in 1..=3u32 {
+            let b = block_on(&parent, vec![coinbase_tx(h, subsidy(h))], &p);
+            src.accept_block(&b, NOW).unwrap();
+            parent = b.header;
+            blocks.push(b);
+        }
+        // Snapshot at h2 — roll back on a clone like dumptxoutset does.
+        let base_hash = blocks[1].block_hash();
+        let mut utxo = src.utxo().clone();
+        let undo3 = src.undo(3).unwrap();
+        connect::disconnect_block(&blocks[2], &mut utxo, undo3).unwrap();
+        let stats = crate::coinstats::compute(
+            &utxo,
+            2,
+            base_hash,
+            crate::coinstats::CoinStatsHashType::HashSerialized,
+        );
+        let coins = sorted_coins(&utxo);
+        let mut snap = Vec::new();
+        write_snapshot(
+            &mut snap,
+            p.message_start,
+            &base_hash,
+            coins.len() as u64,
+            &coins,
+        )
+        .unwrap();
+
+        // The loading node gets a params copy whose assumeutxo table
+        // describes this chain's h2.
+        p.assumeutxo_data = Box::leak(Box::new([AssumeutxoData {
+            height: 2,
+            hash_serialized: Box::leak(stats.hash_serialized.unwrap().to_string().into_boxed_str()),
+            n_chain_tx: 3,
+            blockhash: Box::leak(base_hash.to_string().into_boxed_str()),
+        }]));
+        let dir = store_dir("assumeutxo");
+        let mut cs = Chainstate::with_store(&dir, &p, NOW).unwrap();
+        // Headers through h3 arrive (the base must be in the headers
+        // chain and under the best header) — no bodies connected.
+        for b in &blocks {
+            cs.tree.insert(&b.header, NOW).unwrap();
+        }
+
+        let mut cursor = std::io::Cursor::new(&snap);
+        let meta = read_metadata(&mut cursor, p.message_start).unwrap();
+        assert_eq!(meta.base_blockhash, base_hash);
+        assert_eq!(meta.coins_count, coins.len() as u64);
+        let base_height = cs.activate_snapshot(&mut cursor, &meta, false).unwrap();
+        assert_eq!(base_height, 2);
+        assert_eq!(cs.tip_hash(), base_hash);
+        assert_eq!(cs.snapshot_base(), Some(2));
+        assert_eq!(cs.chain().len(), 3);
+        // The loaded view equals the source's h2 view, coin for coin.
+        assert_eq!(cs.utxo().len(), utxo.len());
+        for (op, coin) in &coins {
+            let got = cs
+                .utxo()
+                .iter()
+                .find(|(o, _)| *o == op)
+                .map(|(_, c)| c)
+                .unwrap();
+            assert_eq!(got, coin);
+        }
+
+        // A second load is refused exactly like Core's double activate.
+        let mut cursor = std::io::Cursor::new(&snap);
+        let meta = read_metadata(&mut cursor, p.message_start).unwrap();
+        let err = cs.activate_snapshot(&mut cursor, &meta, false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Can't activate a snapshot-based chainstate more than once"
+        );
+
+        // h3's body now connects on top of the assumed state.
+        match cs.accept_block(&blocks[2], NOW) {
+            Ok(Acceptance::Connected { height, .. }) => assert_eq!(height, 3),
+            other => panic!("expected connect, got {other:?}"),
+        }
+        assert_eq!(cs.tip_hash(), blocks[2].block_hash());
+
+        // A heavier branch forking below the base can never activate:
+        // h2' h3' h4' on h1 outwork h3 but fork at 1 < base 2.
+        let h1 = &blocks[0];
+        let mut fork_parent = h1.header;
+        let mut last = h1.block_hash();
+        for h in 2..=4u32 {
+            let b = block_on(&fork_parent, vec![tagged_coinbase(h, subsidy(h), 0xaa)], &p);
+            last = b.block_hash();
+            fork_parent = b.header;
+            let accepted = cs.accept_block(&b, NOW).unwrap();
+            assert!(matches!(accepted, Acceptance::Parked { .. }));
+        }
+        assert_eq!(cs.tip_hash(), blocks[2].block_hash());
+        assert_ne!(cs.tip_hash(), last);
+
+        // Restart: activation flushed state.dat at the base and h3's
+        // body is on disk, so the resumed chainstate is tip h3 with
+        // the snapshot floor intact — no sub-base bodies required.
+        drop(cs);
+        let cs = Chainstate::with_store(&dir, &p, NOW).unwrap();
+        assert_eq!(cs.tip_hash(), blocks[2].block_hash());
+        assert_eq!(cs.snapshot_base(), Some(2));
+        assert_eq!(sorted_utxo(&cs).len(), utxo.len() + 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The metadata + activation gate error strings, verbatim.
+    #[test]
+    fn assumeutxo_gate_errors() {
+        use crate::utxo_snapshot::{read_metadata, write_snapshot};
+        let p = params();
+        let genesis = genesis_header().hash();
+        let mut snap = Vec::new();
+        write_snapshot(&mut snap, p.message_start, &genesis, 0, &[]).unwrap();
+
+        // Wrong network magic → -22 surface text.
+        let mut bad_magic = snap.clone();
+        bad_magic[7] ^= 0xff; // network magic byte
+        let mut c = std::io::Cursor::new(&bad_magic);
+        let err = read_metadata(&mut c, p.message_start).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "This snapshot has been created for an unrecognized network. This could be a custom signet, a new testnet or possibly caused by data corruption.: iostream error"
+        );
+
+        // Known-but-different network names it.
+        let mut signet_magic = snap.clone();
+        signet_magic[7..11].copy_from_slice(&Network::Signet.params().message_start);
+        let mut c = std::io::Cursor::new(&signet_magic);
+        let err = read_metadata(&mut c, p.message_start).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "The network of the snapshot (signet) does not match the network of this node (regtest).: iostream error"
+        );
+
+        // Bad magic prefix.
+        let mut wrong = snap.clone();
+        wrong[0] = b'x';
+        let mut c = std::io::Cursor::new(&wrong);
+        assert_eq!(
+            read_metadata(&mut c, p.message_start)
+                .unwrap_err()
+                .to_string(),
+            "Invalid UTXO set snapshot magic bytes. Please check if this is indeed a snapshot file or if you are using an outdated snapshot format.: iostream error"
+        );
+
+        // Unsupported version.
+        let mut v = snap.clone();
+        v[5] = 1;
+        v[6] = 0;
+        let mut c = std::io::Cursor::new(&v);
+        assert_eq!(
+            read_metadata(&mut c, p.message_start)
+                .unwrap_err()
+                .to_string(),
+            "Version of snapshot 1 does not match any of the supported versions.: iostream error"
+        );
+
+        // A hash the table doesn't know → "not recognized" + heights.
+        let mut cs = Chainstate::new(&p);
+        let mut cursor = std::io::Cursor::new(&snap);
+        let meta = read_metadata(&mut cursor, p.message_start).unwrap();
+        let err = cs.activate_snapshot(&mut cursor, &meta, false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "assumeutxo block hash in snapshot metadata not recognized (hash: {genesis}). The following snapshot heights are available: 110, 200, 299"
+            )
+        );
+
+        // A non-empty mempool is refused before any loading.
+        let mut p2 = params();
+        p2.assumeutxo_data = Box::leak(Box::new([crate::params::AssumeutxoData {
+            height: 0,
+            hash_serialized: "",
+            n_chain_tx: 0,
+            blockhash: Box::leak(genesis.to_string().into_boxed_str()),
+        }]));
+        let mut cs2 = Chainstate::new(&p2);
+        let mut cursor = std::io::Cursor::new(&snap);
+        let meta = read_metadata(&mut cursor, p2.message_start).unwrap();
+        // genesis is in the headers chain and under the best header;
+        // its chainwork does not exceed the connected tip (also
+        // genesis) — so the mempool gate must come first to be
+        // observable; run it with a non-empty mempool.
+        let err = cs2.activate_snapshot(&mut cursor, &meta, true).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Can't activate a snapshot when mempool not empty"
+        );
     }
 }

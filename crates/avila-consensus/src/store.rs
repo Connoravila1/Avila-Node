@@ -387,7 +387,10 @@ const STATE_FILE: &str = "state.dat";
 const STATE_TMP: &str = "state.dat.tmp";
 // v2 adds `tx_meta` (per-node nTx/nChainTx) so `getchaintxstats`
 // survives restarts; a v1 snapshot is rejected and replay rebuilds.
-const STATE_VERSION: u32 = 2;
+// v3 adds `snapshot_base` — the assumeutxo base height (`0` = none) —
+// so a `loadtxoutset` chainstate resumes without demanding stored
+// bodies below the base.
+const STATE_VERSION: u32 = 3;
 
 /// The complete validation state needed to resume without re-validation.
 #[derive(Clone, PartialEq, Debug)]
@@ -416,6 +419,11 @@ pub struct StateData {
     /// Core's per-index `nTx`/`nChainTx`, needed to keep
     /// `getchaintxstats` honest across a snapshot resume.
     pub tx_meta: Vec<(BlockHash, u32, u64)>,
+    /// The assumeutxo base height when this state came from
+    /// `loadtxoutset`; `0` for an organically validated chain.
+    /// Heights `1..=snapshot_base` have no stored bodies and carry
+    /// empty undo placeholders.
+    pub snapshot_base: u32,
 }
 
 fn invalid(msg: impl Into<String>) -> io::Error {
@@ -553,6 +561,7 @@ pub fn write_state(dir: &Path, magic: [u8; 4], data: &StateData) -> io::Result<(
         payload.extend_from_slice(&n_tx.to_le_bytes());
         payload.extend_from_slice(&n_chain_tx.to_le_bytes());
     }
+    payload.extend_from_slice(&data.snapshot_base.to_le_bytes());
 
     let mut file_bytes = Vec::with_capacity(payload.len() + 44);
     file_bytes.extend_from_slice(&magic);
@@ -669,6 +678,9 @@ pub fn read_state(dir: &Path, magic: [u8; 4]) -> io::Result<Option<StateData>> {
             .map_err(|e| invalid(format!("tx_meta n_chain_tx: {e}")))?;
         tx_meta.push((hash, n_tx, n_chain_tx));
     }
+    let snapshot_base = d
+        .read_u32_le()
+        .map_err(|e| invalid(format!("snapshot_base: {e}")))?;
     d.finish().map_err(|e| invalid(format!("trailing: {e}")))?;
     if chain.is_empty()
         || chain.len() as u64 - 1 != undos.len() as u64
@@ -687,6 +699,7 @@ pub fn read_state(dir: &Path, magic: [u8; 4]) -> io::Result<Option<StateData>> {
         utxo,
         failed,
         tx_meta,
+        snapshot_base,
     }))
 }
 
@@ -960,6 +973,7 @@ mod tests {
             ],
             failed: vec![BlockHash::from_bytes([0xee; 32])],
             tx_meta,
+            snapshot_base: 0,
         }
     }
 
