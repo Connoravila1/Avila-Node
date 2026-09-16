@@ -39,6 +39,10 @@ pub struct SyncConfig {
     /// under `data_dir`) so `getrawtransaction` can find transactions
     /// without a named block.
     pub txindex: bool,
+    /// Core's `-blockfilterindex`: maintain the BIP 158 basic filter
+    /// index (`cfilters.dat` under `data_dir`) so `getblockfilter` and
+    /// `scanblocks` serve real data.
+    pub blockfilterindex: bool,
     /// When set, publish each tick's progress into this snapshot so a
     /// query surface (RPC, GUI) can read it without blocking sync.
     pub status: Option<crate::rpc::SharedStatus>,
@@ -67,6 +71,7 @@ impl Default for SyncConfig {
             cancel: None,
             prune_bytes: None,
             txindex: false,
+            blockfilterindex: false,
             status: None,
             queries: None,
             waiters: None,
@@ -162,6 +167,10 @@ pub fn run(
     };
     if cfg.txindex {
         cs.enable_txindex(cfg.data_dir.as_deref())
+            .map_err(SyncError::Store)?;
+    }
+    if cfg.blockfilterindex {
+        cs.enable_blockfilterindex(cfg.data_dir.as_deref())
             .map_err(SyncError::Store)?;
     }
     let resumed_height = cs.chain().len() as u32 - 1;

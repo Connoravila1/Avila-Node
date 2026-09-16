@@ -49,6 +49,10 @@ enum Command {
         /// finds transactions without a named block.
         #[arg(long)]
         txindex: bool,
+        /// Maintain the BIP 158 basic block filter index (Core's
+        /// -blockfilterindex) so getblockfilter/scanblocks serve.
+        #[arg(long)]
+        blockfilterindex: bool,
     },
     /// Sync headers and blocks from live peers (headers-first, full
     /// consensus validation). Bounded by target height and timeout.
@@ -79,6 +83,10 @@ enum Command {
         /// Maintain a txid index (Core's -txindex) for txid lookups.
         #[arg(long)]
         txindex: bool,
+        /// Maintain the BIP 158 basic block filter index (Core's
+        /// -blockfilterindex) so getblockfilter/scanblocks serve.
+        #[arg(long)]
+        blockfilterindex: bool,
     },
     /// Call a JSON-RPC method on a running daemon — the bitcoin-cli
     /// analog. Positional params are parsed as raw JSON values, falling
@@ -125,6 +133,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             proxy,
             rpc,
             txindex,
+            blockfilterindex,
         } => {
             // A real daemon: unbounded headers-first sync — sync to the
             // tip, then keep serving, relaying, and announcing until
@@ -199,6 +208,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 cancel: Some(cancel),
                 prune_bytes: None,
                 txindex,
+                blockfilterindex,
                 status: Some(status),
                 queries: Some(std::sync::Arc::new(std::sync::Mutex::new(query_rx))),
                 waiters: Some(waiters),
@@ -233,6 +243,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             store,
             prune_mb,
             txindex,
+            blockfilterindex,
         } => {
             use avila_consensus::params::Network as ConsensusNet;
             let network = config.get().network;
@@ -253,6 +264,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 cancel: None,
                 prune_bytes: prune_mb.map(|m| m * 1024 * 1024),
                 txindex,
+                blockfilterindex,
                 status: None,
                 queries: None,
                 waiters: None,

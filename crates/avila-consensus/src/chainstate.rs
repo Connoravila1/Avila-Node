@@ -28,7 +28,7 @@
 //! Neither changes any verdict.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use thiserror::Error;
@@ -191,6 +191,10 @@ pub struct Chainstate {
     /// [`Chainstate::enable_txindex`] ran; when present every body
     /// retained by `accept_block` records its transactions here.
     txindex: Option<TxIndex>,
+    /// BIP 158 basic filter index, Core's `-blockfilterindex`. `None`
+    /// unless [`Chainstate::enable_blockfilterindex`] ran; indexed at
+    /// connect time so spent-prevout scripts come from the undo data.
+    filterindex: Option<FilterIndex>,
     /// `preciousblock` — the block that wins equal-work tie-breaks.
     /// Core implements it as the lowest `nSequenceId` (reception order
     /// settles work ties); a later call overrides the earlier one, and
@@ -307,6 +311,149 @@ impl TxIndex {
     }
 }
 
+/// The BIP 158 `basic` block-filter index behind `-blockfilterindex`.
+/// Active-chain entries are keyed by height; a reorg moves the evicted
+/// block's filter to the hash index, matching Core's
+/// `CopyHeightIndexToHashIndex` rewind — so a filter stays retrievable
+/// for a stale-branch block. `last_header` chains filter headers in the
+/// index's append order (Core's `m_last_header`).
+pub struct FilterIndex {
+    /// height → (block hash, encoded filter, filter header).
+    by_height: BTreeMap<u32, (BlockHash, Vec<u8>, [u8; 32])>,
+    /// Reorged-out blocks: block hash → (encoded filter, header).
+    by_hash: HashMap<BlockHash, (Vec<u8>, [u8; 32])>,
+    /// Filter-header chain tip — the indexed block that connected last.
+    last_header: [u8; 32],
+    /// The open append handle for `cfilters.dat`, when persistence is on.
+    log: Option<std::fs::File>,
+}
+
+impl FilterIndex {
+    const MAGIC: &'static [u8; 8] = b"cflt\x01\x00\x00\x00";
+
+    fn empty() -> Self {
+        Self {
+            by_height: BTreeMap::new(),
+            by_hash: HashMap::new(),
+            last_header: [0; 32],
+            log: None,
+        }
+    }
+
+    /// Loads `dir/cfilters.dat` and opens it for append. Records are
+    /// `height || block_hash || filter_len || filter || header`; replay
+    /// demotes an overwritten height to the hash index, so a reorg's
+    /// disconnect records never need logging. A partial tail is cut back
+    /// like the blk store's.
+    fn open(dir: &Path) -> std::io::Result<Self> {
+        use std::io::{Read, Write};
+        let path = dir.join("cfilters.dat");
+        let mut idx = Self::empty();
+        let mut committed = Self::MAGIC.len() as u64;
+        let mut ok = false;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf)?;
+            if buf.len() >= 8 && buf[..8] == *Self::MAGIC {
+                let mut cursor = Self::MAGIC.len();
+                while cursor + 72 <= buf.len() {
+                    let height =
+                        u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap_or_default());
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&buf[cursor + 4..cursor + 36]);
+                    let flen = u32::from_le_bytes(
+                        buf[cursor + 36..cursor + 40].try_into().unwrap_or_default(),
+                    ) as usize;
+                    let rec_len = 72 + flen;
+                    if cursor + rec_len > buf.len() {
+                        break; // partial tail — truncate below
+                    }
+                    let filter = buf[cursor + 40..cursor + 40 + flen].to_vec();
+                    let mut header = [0u8; 32];
+                    header.copy_from_slice(&buf[cursor + 40 + flen..cursor + rec_len]);
+                    idx.insert(height, BlockHash::from_bytes(hash), filter, header);
+                    cursor += rec_len;
+                }
+                committed = cursor as u64;
+                ok = true;
+            }
+            f.set_len(if ok { committed } else { 0 })?;
+        }
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        if !ok {
+            log.write_all(Self::MAGIC)?;
+        }
+        idx.log = Some(log);
+        Ok(idx)
+    }
+
+    /// Indexes `filter` for the block at `height` — the `Write` half of
+    /// Core's `CustomAppend`. The header chains off `last_header`, then
+    /// becomes it. A same-height replacement demotes the old entry to
+    /// the hash index.
+    fn insert(&mut self, height: u32, hash: BlockHash, filter: Vec<u8>, header: [u8; 32]) {
+        if let Some((old_hash, old_filter, old_header)) = self.by_height.remove(&height) {
+            self.by_hash.insert(old_hash, (old_filter, old_header));
+        }
+        self.by_height.insert(height, (hash, filter, header));
+        self.last_header = header;
+    }
+
+    /// Builds and indexes `block`'s basic filter — Core's
+    /// `CustomAppend`: `filter` from block + undo, header chained off
+    /// `last_header`. `undo` is empty for the genesis block.
+    fn append(&mut self, height: u32, block: &Block, undo: &BlockUndo) {
+        let hash = block.block_hash();
+        let filter = crate::gcs::build_basic(block, undo);
+        let header =
+            crate::gcs::compute_header(&crate::gcs::filter_hash(&filter), &self.last_header);
+        self.insert(height, hash, filter.clone(), header);
+        if let Some(log) = &mut self.log {
+            use std::io::Write;
+            let mut rec = Vec::with_capacity(72 + filter.len());
+            rec.extend_from_slice(&height.to_le_bytes());
+            rec.extend_from_slice(hash.as_bytes());
+            rec.extend_from_slice(&(filter.len() as u32).to_le_bytes());
+            rec.extend_from_slice(&filter);
+            rec.extend_from_slice(&header);
+            let _ = log.write_all(&rec);
+        }
+    }
+
+    /// The rewind half of a reorg — moves the active-chain entry at
+    /// `height` to the hash index and rewinds `last_header` to the
+    /// parent's (`CustomRewind` + `ReadFilterHeader(new_tip)`).
+    fn disconnect(&mut self, height: u32) {
+        if let Some((hash, filter, header)) = self.by_height.remove(&height) {
+            self.by_hash.insert(hash, (filter, header));
+        }
+        self.last_header = height
+            .checked_sub(1)
+            .and_then(|h| self.by_height.get(&h))
+            .map(|(_, _, h)| *h)
+            .unwrap_or([0; 32]);
+    }
+
+    /// Core's `LookupOne`: the height-index entry serves the block only
+    /// when its hash matches; a reorged-out block falls to the hash
+    /// index.
+    fn lookup(&self, height: u32, hash: &BlockHash) -> Option<(&[u8], &[u8; 32])> {
+        if let Some((h, filter, header)) = self.by_height.get(&height)
+            && h == hash
+        {
+            return Some((filter, header));
+        }
+        self.by_hash.get(hash).map(|(f, h)| (f.as_slice(), h))
+    }
+}
+
 impl Chainstate {
     /// A chainstate at genesis on `params`' network — the state Core reaches at
     /// startup with an empty datadir (the genesis is in the block index and is
@@ -324,6 +471,7 @@ impl Chainstate {
             undos: Vec::new(),
             store: None,
             txindex: None,
+            filterindex: None,
             precious: None,
         }
     }
@@ -361,6 +509,90 @@ impl Chainstate {
         }
         self.txindex = Some(index);
         Ok(())
+    }
+
+    /// Turns on the basic block-filter index — Core's `-blockfilterindex`.
+    /// With `dir` the index persists as `cfilters.dat` (append log; a
+    /// restart resumes from it and backfills only blocks never logged).
+    ///
+    /// Backfill walks the connected chain: the genesis filter is
+    /// outputs-only (Core appends it with an empty `CBlockUndo`), and
+    /// every later height uses its stored undo records for the
+    /// spent-script half of the element set.
+    ///
+    /// # Errors
+    ///
+    /// `io::Error` when `dir` is given but `cfilters.dat` cannot be
+    /// read or opened for append.
+    pub fn enable_blockfilterindex(&mut self, dir: Option<&Path>) -> std::io::Result<()> {
+        let mut index = match dir {
+            Some(dir) => FilterIndex::open(dir)?,
+            None => FilterIndex::empty(),
+        };
+        // Backfill connected heights the log never covered — side
+        // branches are never indexed, matching Core's active-chain index.
+        for h in 0..self.chain.len() as u32 {
+            let hash = self.chain[h as usize];
+            if index
+                .by_height
+                .get(&h)
+                .is_some_and(|(bh, _, _)| *bh == hash)
+            {
+                continue;
+            }
+            let Some(block) = self.body(&hash) else {
+                continue; // retained-map gap — unreachable on a stored chain
+            };
+            let empty = BlockUndo::default();
+            let undo = self.undo(h).unwrap_or(&empty);
+            index.append(h, &block, undo);
+        }
+        self.filterindex = Some(index);
+        Ok(())
+    }
+
+    /// Whether `-blockfilterindex` is active — `getindexinfo` reports
+    /// `basic block filter index` under it.
+    #[must_use]
+    pub fn blockfilterindex_enabled(&self) -> bool {
+        self.filterindex.is_some()
+    }
+
+    /// The basic filter and its header for a block — Core's
+    /// `LookupFilter` + `LookupFilterHeader`. `height`/`hash` name the
+    /// block index entry; a stale-branch hash resolves through the
+    /// reorg hash index.
+    #[must_use]
+    pub fn block_filter(&self, height: u32, hash: &BlockHash) -> Option<(Vec<u8>, [u8; 32])> {
+        self.filterindex
+            .as_ref()?
+            .lookup(height, hash)
+            .map(|(f, h)| (f.to_vec(), *h))
+    }
+
+    /// All active-chain filters in `start..=stop` — Core's
+    /// `LookupFilterRange` for `scanblocks`. Heights the index never
+    /// covered (shouldn't happen on a stored chain) skip silently —
+    /// Core treats the same gap as an index error, but the maps here
+    /// can't distinguish corruption from lag, so skipping is the safe
+    /// degradation.
+    #[must_use]
+    pub fn block_filters_range(
+        &self,
+        start: u32,
+        stop: u32,
+    ) -> Vec<(BlockHash, Vec<u8>, [u8; 32])> {
+        let Some(index) = &self.filterindex else {
+            return Vec::new();
+        };
+        (start..=stop)
+            .filter_map(|h| {
+                index
+                    .by_height
+                    .get(&h)
+                    .map(|(hash, f, hdr)| (*hash, f.clone(), *hdr))
+            })
+            .collect()
     }
 
     /// The block a transaction was retained in, when the index is on —
@@ -1026,6 +1258,9 @@ impl Chainstate {
             };
             match connect::connect_block(block, &mut self.utxo, &ctx) {
                 Ok(undo) => {
+                    if let Some(index) = &mut self.filterindex {
+                        index.append(height, block, &undo);
+                    }
                     self.chain.push(hash);
                     self.undos.push(undo);
                     self.connected = hash;
@@ -1171,9 +1406,26 @@ impl Chainstate {
         // resubmission landing here is `ActivateBestChain` connecting it, not
         // a reorg).
         let disconnected = (fork_height as usize) < self.chain.len() - 1;
+        let old_tip_height = self.chain.len() as u32 - 1;
         self.utxo = utxo;
+        // The filter index follows the chain's own rewind/append: evicted
+        // heights move to the hash index, then each reconnected block
+        // chains its header off the fork point's.
+        if let Some(index) = &mut self.filterindex {
+            for h in (fork_height + 1..=old_tip_height).rev() {
+                index.disconnect(h);
+            }
+        }
         self.chain.truncate(fork_height as usize + 1);
         self.undos.truncate(fork_height as usize);
+        let bodies: Vec<Option<Block>> = branch_hashes.iter().map(|bh| self.body(bh)).collect();
+        if let Some(index) = &mut self.filterindex {
+            for (i, (b, u)) in bodies.iter().zip(new_undos.iter()).enumerate() {
+                if let Some(b) = b {
+                    index.append(fork_height + 1 + i as u32, b, u);
+                }
+            }
+        }
         self.chain.extend(branch_hashes);
         self.undos.extend(new_undos);
         self.connected = hash;
@@ -2109,6 +2361,125 @@ mod tests {
         let cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
         assert_eq!(cs.tip_hash(), blocks[9].block_hash());
         drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The filter index follows the active chain: reorged-out heights
+    /// keep serving their filter by block hash (Core retains stale
+    /// filters), the new branch chains its headers off the fork, and
+    /// the regtest genesis filter matches Core's `014756c0` / header
+    /// `485e301e…`.
+    #[test]
+    fn filterindex_indexes_connects_and_survives_reorgs() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        cs.enable_blockfilterindex(None).unwrap();
+        assert!(cs.blockfilterindex_enabled());
+
+        // Genesis: outputs-only filter (Core appends it with an empty undo).
+        let genesis = cs.chain()[0];
+        let (gf, gh) = cs.block_filter(0, &genesis).unwrap();
+        assert_eq!(crate::hex::encode(&gf), "014756c0");
+        assert_eq!(
+            crate::hash::format_display_hex(&gh),
+            "485e301e4509d7f0d954bf5b529f3ecef68c5191fd0e635f775c1d0266dc5a2b"
+        );
+
+        let a1 = block_on(&genesis_header(), vec![coinbase_tx(1, subsidy(1))], &params);
+        let a2 = block_on(&a1.header, vec![coinbase_tx(2, subsidy(2))], &params);
+        cs.accept_block(&a1, NOW).unwrap();
+        cs.accept_block(&a2, NOW).unwrap();
+        let (a1f, a1h) = cs.block_filter(1, &a1.block_hash()).unwrap();
+        assert_eq!(
+            a1h,
+            crate::gcs::compute_header(&crate::gcs::filter_hash(&a1f), &gh)
+        );
+
+        // Heavier side branch on genesis disconnects a1+a2.
+        let b1 = block_on(
+            &genesis_header(),
+            vec![tagged_coinbase(1, subsidy(1), script::OP_EQUAL)],
+            &params,
+        );
+        let b2 = block_on(
+            &b1.header,
+            vec![tagged_coinbase(2, subsidy(2), script::OP_EQUAL)],
+            &params,
+        );
+        let b3 = block_on(
+            &b2.header,
+            vec![tagged_coinbase(3, subsidy(3), script::OP_EQUAL)],
+            &params,
+        );
+        cs.accept_block(&b1, NOW).unwrap();
+        cs.accept_block(&b2, NOW).unwrap();
+        assert_eq!(
+            cs.accept_block(&b3, NOW),
+            Ok(Acceptance::Connected {
+                height: 3,
+                reorged: true
+            })
+        );
+
+        // New branch owns heights 1..=3 and its headers chain off the
+        // genesis header; the evicted filters still answer by hash.
+        let (b1f, b1h) = cs.block_filter(1, &b1.block_hash()).unwrap();
+        assert_eq!(
+            b1h,
+            crate::gcs::compute_header(&crate::gcs::filter_hash(&b1f), &gh)
+        );
+        assert_eq!(
+            cs.block_filter(1, &a1.block_hash()).unwrap().0,
+            a1f,
+            "reorged-out a1 filter still resolvable by hash"
+        );
+        // Height keys point at the new branch — a stale hash at the
+        // wrong height isn't confused for the active entry.
+        assert_eq!(cs.block_filter(1, &b1.block_hash()).unwrap().0, b1f);
+        assert_eq!(cs.chain()[1], b1.block_hash());
+    }
+
+    /// `cfilters.dat` reloads across restarts and tolerates a torn tail:
+    /// records end mid-append after a crash and the log replays to the
+    /// last complete record.
+    #[test]
+    fn filterindex_persists_and_recovers_partial_tail() {
+        let params = params();
+        let dir = store_dir("filterindex-restart");
+        let blocks = probe_chain(3, &[], &params);
+
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        cs.enable_blockfilterindex(Some(&dir)).unwrap();
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        let expected_h1 = cs.block_filter(1, &blocks[0].block_hash()).unwrap().0;
+        drop(cs);
+        let logged = std::fs::read(dir.join("cfilters.dat")).unwrap();
+
+        // A fresh enable over the same dir answers h1 from the log —
+        // an in-memory chainstate has no bodies to backfill from.
+        let mut cs2 = Chainstate::new(&params);
+        cs2.enable_blockfilterindex(Some(&dir)).unwrap();
+        assert_eq!(
+            cs2.block_filter(1, &blocks[0].block_hash()).unwrap().0,
+            expected_h1
+        );
+        drop(cs2);
+
+        // Torn tail: truncate the last record mid-write and the reload
+        // still yields a consistent index through the previous record.
+        let mut torn = logged.clone();
+        torn.truncate(torn.len() - 5);
+        std::fs::write(dir.join("cfilters.dat"), &torn).unwrap();
+        let cs = Chainstate::new(&params);
+        let mut cs = cs;
+        cs.enable_blockfilterindex(Some(&dir)).unwrap();
+        // Heights 0..=2 read back; the torn h3 record is dropped.
+        assert!(cs.block_filter(0, &cs.chain()[0]).is_some());
+        assert!(cs.block_filter(1, &blocks[0].block_hash()).is_some());
+        assert!(cs.block_filter(2, &blocks[1].block_hash()).is_some());
+        assert!(cs.block_filter(3, &blocks[2].block_hash()).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

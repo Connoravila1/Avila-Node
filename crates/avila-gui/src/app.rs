@@ -795,6 +795,7 @@ impl AvilaApp {
             queries: None,
             waiters: None,
             txindex: false,
+            blockfilterindex: false,
             prune_bytes: self
                 .sync
                 .prune_input

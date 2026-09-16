@@ -114,7 +114,7 @@ fn parse_display_hex(s: &str) -> Result<[u8; 32], HashParseError> {
 }
 
 /// Formats raw (internal-order) bytes as a reversed-byte-order hex string.
-fn format_display_hex(raw: &[u8; 32]) -> String {
+pub fn format_display_hex(raw: &[u8; 32]) -> String {
     let mut reversed = *raw;
     reversed.reverse();
     hex::encode(&reversed)

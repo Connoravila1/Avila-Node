@@ -5755,15 +5755,25 @@ fn dispatch(
                 _ => None,
             };
             chain_query(queries, move |cs, _| {
-                if !cs.txindex_enabled() || filter.as_deref().is_some_and(|f| f != "txindex") {
-                    return Ok(json!({}));
+                let mut out = serde_json::Map::new();
+                let best = cs.chain().len() as u32 - 1;
+                if cs.txindex_enabled() && filter.as_deref().is_none_or(|f| f == "txindex") {
+                    out.insert(
+                        "txindex".into(),
+                        json!({"synced": true, "best_block_height": best}),
+                    );
                 }
-                Ok(json!({
-                    "txindex": {
-                        "synced": true,
-                        "best_block_height": cs.chain().len() as u32 - 1,
-                    }
-                }))
+                if cs.blockfilterindex_enabled()
+                    && filter
+                        .as_deref()
+                        .is_none_or(|f| f == "basic block filter index")
+                {
+                    out.insert(
+                        "basic block filter index".into(),
+                        json!({"synced": true, "best_block_height": best}),
+                    );
+                }
+                Ok(Value::Object(out))
             })
         }
         "getrawtransaction" => {
@@ -8569,9 +8579,10 @@ fn dispatch(
         "getblockfilter" => {
             // Core's order: ParseHashV → filtertype name → index.
             let hash_s = params.get(0).and_then(Value::as_str).unwrap_or_default();
-            if let Err(e) = parse_hash_v::<BlockHash>(hash_s, "blockhash") {
-                return (Value::Null, Some(e));
-            }
+            let hash = match parse_hash_v::<BlockHash>(hash_s, "blockhash") {
+                Ok(h) => h,
+                Err(e) => return (Value::Null, Some(e)),
+            };
             let ft = params.get(1).and_then(Value::as_str).unwrap_or("basic");
             if ft != "basic" {
                 return (
@@ -8579,22 +8590,55 @@ fn dispatch(
                     Some((RPC_INVALID_ADDRESS_OR_KEY, "Unknown filtertype".into())),
                 );
             }
-            (
-                Value::Null,
-                Some((
-                    RPC_MISC_ERROR,
-                    "Index is not enabled for filtertype basic".into(),
-                )),
-            )
+            chain_query(queries, move |cs, _| {
+                if !cs.blockfilterindex_enabled() {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "Index is not enabled for filtertype basic".into(),
+                    ));
+                }
+                let Some(node) = cs.tree().get(&hash) else {
+                    return Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into()));
+                };
+                match cs.block_filter(node.height, &hash) {
+                    Some((filter, header)) => Ok(json!({
+                        "filter": avila_consensus::hex::encode(&filter),
+                        "header": avila_consensus::hash::format_display_hex(&header),
+                    })),
+                    None => {
+                        // Core's three-way miss: never-connected blocks
+                        // (header-only, parked side branches) are a client
+                        // error; an active-chain gap would be corruption.
+                        if cs.chain().contains(&hash) {
+                            Err((
+                                RPC_INTERNAL_ERROR,
+                                "Filter not found. This error is unexpected \
+                                 and indicates index corruption."
+                                    .into(),
+                            ))
+                        } else {
+                            Err((
+                                RPC_INVALID_ADDRESS_OR_KEY,
+                                "Filter not found. Block was not connected \
+                                 to active chain."
+                                    .into(),
+                            ))
+                        }
+                    }
+                }
+            })
         }
         "scanblocks" => {
             let action = params.get(0).and_then(Value::as_str).unwrap_or_default();
             match action {
-                // No scan ever runs — Core's idle "status" is null,
-                // "abort" reports nothing was cancelled.
+                // Scans run synchronously inside the RPC, so between
+                // calls there is never one in progress — Core's idle
+                // "status" is null and "abort" reports nothing cancelled.
                 "status" => (Value::Null, None),
                 "abort" => (json!(false), None),
                 "start" => {
+                    // Core's order: filtertype → options → index →
+                    // heights → scanobjects.
                     let ft = params.get(4).and_then(Value::as_str).unwrap_or("basic");
                     if ft != "basic" {
                         return (
@@ -8602,13 +8646,105 @@ fn dispatch(
                             Some((RPC_INVALID_ADDRESS_OR_KEY, "Unknown filtertype".into())),
                         );
                     }
-                    (
-                        Value::Null,
-                        Some((
-                            RPC_MISC_ERROR,
-                            "Index is not enabled for filtertype basic".into(),
-                        )),
-                    )
+                    let options = params.get(5).cloned().unwrap_or(Value::Null);
+                    if !options.is_null() && !options.is_object() {
+                        return (
+                            Value::Null,
+                            Some((RPC_TYPE_ERROR, field_type_message(&options, "object"))),
+                        );
+                    }
+                    let filter_false_positives = options
+                        .get("filter_false_positives")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let scanobjects = params.get(1).cloned().unwrap_or(Value::Null);
+                    let start_v = params.get(2).cloned().unwrap_or(Value::Null);
+                    let stop_v = params.get(3).cloned().unwrap_or(Value::Null);
+                    chain_query(queries, move |cs, _| {
+                        if !cs.blockfilterindex_enabled() {
+                            return Err((
+                                RPC_MISC_ERROR,
+                                "Index is not enabled for filtertype basic".into(),
+                            ));
+                        }
+                        let tip = cs.chain().len() as i64 - 1;
+                        let start = match &start_v {
+                            Value::Null => 0,
+                            v => v
+                                .as_i64()
+                                .ok_or_else(|| (RPC_TYPE_ERROR, field_type_message(v, "number")))?,
+                        };
+                        let stop = match &stop_v {
+                            Value::Null => tip,
+                            v => v
+                                .as_i64()
+                                .ok_or_else(|| (RPC_TYPE_ERROR, field_type_message(v, "number")))?,
+                        };
+                        if start < 0 || start > tip {
+                            return Err((RPC_MISC_ERROR, "Invalid start_height".into()));
+                        }
+                        if stop < start || stop > tip {
+                            return Err((RPC_MISC_ERROR, "Invalid stop_height".into()));
+                        }
+                        // `get_array` is unconditional — absent or
+                        // non-array scanobjects are Core's type error.
+                        let objects = scanobjects.as_array().ok_or_else(|| {
+                            (RPC_TYPE_ERROR, field_type_message(&scanobjects, "array"))
+                        })?;
+                        let mut needles: Vec<Vec<u8>> = Vec::new();
+                        for obj in objects {
+                            let (scripts, _) = eval_scan_object(obj, cs.tree().params(), false)?;
+                            needles.extend(scripts);
+                        }
+                        needles.sort();
+                        needles.dedup();
+                        // Chunked like Core's 10000-block rounds — here
+                        // just a walk over the height-keyed index.
+                        let mut relevant: Vec<String> = Vec::new();
+                        for (hash, filter, _header) in
+                            cs.block_filters_range(start as u32, stop as u32)
+                        {
+                            if avila_consensus::gcs::filter_match_any(&filter, &hash, &needles)
+                                != Some(true)
+                            {
+                                continue;
+                            }
+                            if filter_false_positives {
+                                // Core's CheckBlockFilterMatches — exact
+                                // script membership over outputs and
+                                // undo prevouts, no hashing.
+                                let member = |s: &[u8]| needles.iter().any(|n| n.as_slice() == s);
+                                let hit = cs.body(&hash).is_some_and(|block| {
+                                    block
+                                        .transactions
+                                        .iter()
+                                        .flat_map(|tx| tx.outputs.iter())
+                                        .any(|o| member(o.script_pubkey.as_bytes()))
+                                        || cs
+                                            .undo(
+                                                cs.tree().get(&hash).map(|n| n.height).unwrap_or(0),
+                                            )
+                                            .is_some_and(|undo| {
+                                                undo.txs.iter().any(|tu| {
+                                                    tu.spent.iter().any(|coin| {
+                                                        member(coin.out.script_pubkey.as_bytes())
+                                                    })
+                                                })
+                                            })
+                                });
+                                if !hit {
+                                    continue;
+                                }
+                            }
+                            relevant.push(hash.to_string());
+                        }
+                        Ok(json!({
+                            "from_height": start,
+                            "to_height": stop,
+                            "relevant_blocks": relevant,
+                            "completed": true,
+                        }))
+                    })
                 }
                 _ => (
                     Value::Null,
