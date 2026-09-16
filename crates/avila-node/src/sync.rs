@@ -167,6 +167,9 @@ pub fn run(
     let resumed_height = cs.chain().len() as u32 - 1;
     let mut mgr = PeerManager::new(cfg.max_peers);
     let started = Instant::now();
+    // Core's `GetStartupTime` — wall-clock boot epoch. `uptime` reads
+    // `GetTime() - GetStartupTime()`, so a pinned mock shifts it too.
+    let started_epoch = crate::time::system_time();
 
     // peers.dat — restart keeps learned candidates; a corrupt file just
     // costs us gossip history, so load errors are ignored by design.
@@ -290,7 +293,7 @@ pub fn run(
                 mgr.mempool().orphan_count(),
                 mgr.mempool().estimate_fee(6),
             ),
-            elapsed_secs: started.elapsed().as_secs(),
+            elapsed_secs: (crate::time::time() - started_epoch).max(0) as u64,
         };
         if let Some(status) = &cfg.status
             && let Ok(mut w) = status.write()
