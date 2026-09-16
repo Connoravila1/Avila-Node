@@ -698,6 +698,31 @@ surfaced:
   its `walletprocesspsbt`-signed form, funded+signed taproot
   PSBTs, a hand-built unknown/proprietary fixture, and an 11-row
   malformed-input matrix — all byte-identical.
+- `createpsbt` shares `createrawtransaction`'s `CreateTransaction`
+  body (extracted verbatim into `build_raw_tx`) and wraps the
+  unsigned tx in an empty-map PSBT; `converttopsbt` decodes with
+  `decoderawtransaction`'s `iswitness` semantics, drops
+  scriptSig/witness unless `permitsigdata`, and forces a
+  non-witness serialization. `combinepsbt` requires identical
+  unsigned txs and merges global/input/output maps
+  first-contributor-wins on exact key collisions; `joinpsbts`
+  requires ≥2 PSBTs, rejects duplicate input outpoints with
+  Core's `-8` "exists in multiple PSBTs", rebuilds the tx at
+  version 2/locktime 0, and strips signature/finalization fields
+  (partial sigs, final scriptSig/witness, taproot key-path and
+  script-path sigs) while keeping UTXOs, scripts, derivations,
+  and unknown/proprietary pairs. Renderer parity notes:
+  `redeem_script`/`witness_script` use Core's reduced
+  `{asm, hex, type}` shape (no `desc`/`address`),
+  `taproot_scripts` groups control blocks under
+  `{script, leaf_ver, control_blocks[]}`, and Core 29.4 reports
+  output-map key types ≥0x03 (taproot output fields) as
+  `unknown`. Verified live: `createpsbt`/`converttopsbt` 27-row
+  matrix byte-identical; `combinepsbt` byte-identical;
+  `joinpsbts` verified semantically — Core iterates its join
+  sets through salted unordered maps, so input/output ordering
+  is nondeterministic per call and the comparison canonicalizes
+  vin/vout/map content before diffing.
 
 ### Known semantic differences
 

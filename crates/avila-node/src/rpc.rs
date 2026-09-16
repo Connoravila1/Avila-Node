@@ -1053,6 +1053,16 @@ fn unknown_json(map: &avila_consensus::psbt::KeyMap, known: impl Fn(u8) -> bool)
     Value::Object(out)
 }
 
+/// PSBT `redeem_script`/`witness_script` fields — Core renders these
+/// smaller than `ScriptToUniv`: just `{asm, hex, type}`.
+fn psbt_script_json(script: &avila_consensus::transaction::Script) -> Value {
+    json!({
+        "asm": script.asm(),
+        "hex": hex::encode(script.as_bytes()),
+        "type": script.classify().name(),
+    })
+}
+
 /// `PSBTInputToJSON` — the per-input object in Core's field order.
 fn psbt_input_json(
     map: &avila_consensus::psbt::KeyMap,
@@ -1093,13 +1103,13 @@ fn psbt_input_json(
     if let Some(v) = map.get(Psbt::IN_REDEEM_SCRIPT) {
         out.insert(
             "redeem_script".into(),
-            script_to_univ(&Script::new(v.to_vec()), params),
+            psbt_script_json(&Script::new(v.to_vec())),
         );
     }
     if let Some(v) = map.get(Psbt::IN_WITNESS_SCRIPT) {
         out.insert(
             "witness_script".into(),
-            script_to_univ(&Script::new(v.to_vec()), params),
+            psbt_script_json(&Script::new(v.to_vec())),
         );
     }
     {
@@ -1165,17 +1175,29 @@ fn psbt_input_json(
         }
     }
     {
-        let scripts: Vec<Value> = map
-            .all(Psbt::IN_TAP_LEAF_SCRIPT)
-            .map(|(control, v)| {
-                let (script_bytes, leaf_ver) = v.split_at(v.len().saturating_sub(1));
-                json!({
-                    "script": script_to_univ(&Script::new(script_bytes.to_vec()), params),
-                    "leaf_ver": format!("{:02x}", leaf_ver.first().copied().unwrap_or(0)),
-                    "control_block": hex::encode(control),
-                })
-            })
-            .collect();
+        // Grouped by (script, leaf_ver): every control block mapping
+        // to a leaf lands in its `control_blocks` array.
+        let mut scripts: Vec<Value> = Vec::new();
+        for (control, v) in map.all(Psbt::IN_TAP_LEAF_SCRIPT) {
+            let (script_bytes, leaf_ver) = v.split_at(v.len().saturating_sub(1));
+            let leaf_ver = leaf_ver.first().copied().unwrap_or(0) as u64;
+            let script_hex = hex::encode(script_bytes);
+            let entry = scripts
+                .iter_mut()
+                .find(|e| e["script"] == json!(script_hex) && e["leaf_ver"] == json!(leaf_ver));
+            match entry {
+                Some(e) => {
+                    if let Some(blocks) = e["control_blocks"].as_array_mut() {
+                        blocks.push(json!(hex::encode(control)));
+                    }
+                }
+                None => scripts.push(json!({
+                    "script": script_hex,
+                    "leaf_ver": leaf_ver,
+                    "control_blocks": [hex::encode(control)],
+                })),
+            }
+        }
         if !scripts.is_empty() {
             out.insert("taproot_scripts".into(), json!(scripts));
         }
@@ -1211,23 +1233,20 @@ fn psbt_input_json(
 }
 
 /// `PSBTOutputToJSON` — the per-output object in Core's field order.
-fn psbt_output_json(
-    map: &avila_consensus::psbt::KeyMap,
-    params: &avila_consensus::params::Params,
-) -> Value {
+fn psbt_output_json(map: &avila_consensus::psbt::KeyMap) -> Value {
     use avila_consensus::psbt::Psbt;
     use avila_consensus::transaction::Script;
     let mut out = serde_json::Map::new();
     if let Some(v) = map.get(Psbt::OUT_REDEEM_SCRIPT) {
         out.insert(
             "redeem_script".into(),
-            script_to_univ(&Script::new(v.to_vec()), params),
+            psbt_script_json(&Script::new(v.to_vec())),
         );
     }
     if let Some(v) = map.get(Psbt::OUT_WITNESS_SCRIPT) {
         out.insert(
             "witness_script".into(),
-            script_to_univ(&Script::new(v.to_vec()), params),
+            psbt_script_json(&Script::new(v.to_vec())),
         );
     }
     {
@@ -1239,40 +1258,14 @@ fn psbt_output_json(
             out.insert("bip32_derivs".into(), json!(derivs));
         }
     }
-    if let Some(v) = map.get(Psbt::OUT_TAP_INTERNAL_KEY) {
-        out.insert("taproot_internal_key".into(), json!(hex::encode(v)));
-    }
-    if let Some(v) = map.get(Psbt::OUT_TAP_TREE) {
-        // depth u8 || leaf_ver u8 || compactsize script — per tuple.
-        let mut dec = avila_consensus::encode::Decoder::new(v);
-        let mut tuples = Vec::new();
-        while dec.remaining() >= 2 {
-            let depth = dec.read_u8().unwrap_or(0);
-            let leaf_ver = dec.read_u8().unwrap_or(0);
-            let script = dec.read_var_bytes().unwrap_or_default();
-            tuples.push(json!({
-                "depth": depth,
-                "leaf_ver": leaf_ver,
-                "script": script_to_univ(&Script::new(script), params),
-            }));
-        }
-        out.insert("taproot_tree".into(), json!(tuples));
-    }
-    {
-        let derivs: Vec<Value> = map
-            .all(Psbt::OUT_TAP_BIP32_DERIVATION)
-            .map(|(xonly, v)| taproot_bip32_deriv_json(xonly, v))
-            .collect();
-        if !derivs.is_empty() {
-            out.insert("taproot_bip32_derivs".into(), json!(derivs));
-        }
-    }
     let proprietary = proprietary_json(map, Psbt::OUT_PROPRIETARY);
     if !proprietary.is_empty() {
         out.insert("proprietary".into(), json!(proprietary));
     }
+    // Core 29.4's output map knows only types 00/01/02 + proprietary —
+    // everything else (including the BIP371 taproot fields) is unknown.
     let unknown = unknown_json(map, |t| {
-        t <= Psbt::OUT_TAP_BIP32_DERIVATION || t == Psbt::OUT_PROPRIETARY
+        t <= Psbt::OUT_BIP32_DERIVATION || t == Psbt::OUT_PROPRIETARY
     });
     if let Value::Object(ref o) = unknown
         && !o.is_empty()
@@ -1342,7 +1335,7 @@ fn psbt_json(
         json!(
             psbt.outputs
                 .iter()
-                .map(|m| psbt_output_json(m, params))
+                .map(psbt_output_json)
                 .collect::<Vec<_>>()
         ),
     );
@@ -2077,6 +2070,44 @@ Examples:
 const DECODERAWTRANSACTION_HELP: &str = "decoderawtransaction \"hexstring\" ( iswitness )\n\nReturn a JSON object representing the serialized, hex-encoded transaction.\n\nArguments:\n1. hexstring    (string, required) The transaction hex string\n2. iswitness    (boolean, optional, default=depends on heuristic tests) Whether the transaction hex is a serialized witness transaction.\n                If iswitness is not present, heuristic tests will be used in decoding.\n                If true, only witness deserialization will be tried.\n                If false, only non-witness deserialization will be tried.\n                This boolean should reflect whether the transaction has inputs\n                (e.g. fully valid, or on-chain transactions), if known by the caller.\n\nResult:\n{                             (json object)\n  \"txid\" : \"hex\",             (string) The transaction id\n  \"hash\" : \"hex\",             (string) The transaction hash (differs from txid for witness transactions)\n  \"size\" : n,                 (numeric) The serialized transaction size\n  \"vsize\" : n,                (numeric) The virtual transaction size (differs from size for witness transactions)\n  \"weight\" : n,               (numeric) The transaction's weight (between vsize*4-3 and vsize*4)\n  \"version\" : n,              (numeric) The version\n  \"locktime\" : xxx,           (numeric) The lock time\n  \"vin\" : [                   (json array)\n    {                         (json object)\n      \"coinbase\" : \"hex\",     (string, optional) The coinbase value (only if coinbase transaction)\n      \"txid\" : \"hex\",         (string, optional) The transaction id (if not coinbase transaction)\n      \"vout\" : n,             (numeric, optional) The output number (if not coinbase transaction)\n      \"scriptSig\" : {         (json object, optional) The script (if not coinbase transaction)\n        \"asm\" : \"str\",        (string) Disassembly of the signature script\n        \"hex\" : \"hex\"         (string) The raw signature script bytes, hex-encoded\n      },\n      \"txinwitness\" : [       (json array, optional)\n        \"hex\",                (string) hex-encoded witness data (if any)\n        ...\n      ],\n      \"sequence\" : n          (numeric) The script sequence number\n    },\n    ...\n  ],\n  \"vout\" : [                  (json array)\n    {                         (json object)\n      \"value\" : n,            (numeric) The value in BTC\n      \"n\" : n,                (numeric) index\n      \"scriptPubKey\" : {      (json object)\n        \"asm\" : \"str\",        (string) Disassembly of the output script\n        \"desc\" : \"str\",       (string) Inferred descriptor for the output\n        \"hex\" : \"hex\",        (string) The raw output script bytes, hex-encoded\n        \"address\" : \"str\",    (string, optional) The Bitcoin address (only if a well-defined address exists)\n        \"type\" : \"str\"        (string) The type (one of: nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n      }\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli decoderawtransaction \"hexstring\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"decoderawtransaction\", \"params\": [\"hexstring\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help createrawtransaction` text (Bitcoin Core 29).
+const COMBINEPSBT_HELP: &str = "combinepsbt [\"psbt\",...]
+
+Combine multiple partially signed Bitcoin transactions into one transaction.
+Implements the Combiner role.
+
+Arguments:
+1. txs            (json array, required) The base64 strings of partially signed transactions
+     [
+       \"psbt\",    (string) A base64 string of a PSBT
+       ...
+     ]
+
+Result:
+\"str\"    (string) The base64-encoded partially signed transaction
+
+Examples:
+> bitcoin-cli combinepsbt '[\"mybase64_1\", \"mybase64_2\", \"mybase64_3\"]'
+";
+
+const JOINPSBTS_HELP: &str = "joinpsbts [\"psbt\",...]
+
+Joins multiple distinct PSBTs with different inputs and outputs into one PSBT with inputs and outputs from all of the PSBTs
+No input in any of the PSBTs can be in more than one of the PSBTs.
+
+Arguments:
+1. txs            (json array, required) The base64 strings of partially signed transactions
+     [
+       \"psbt\",    (string, required) A base64 string of a PSBT
+       ...
+     ]
+
+Result:
+\"str\"    (string) The base64-encoded partially signed transaction
+
+Examples:
+> bitcoin-cli joinpsbts \"psbt\"
+";
+
 const CONVERTTOPSBT_HELP: &str = "converttopsbt \"hexstring\" ( permitsigdata iswitness )
 
 Converts a network serialized transaction to a PSBT. This should be used only with createrawtransaction and fundrawtransaction
@@ -3216,6 +3247,12 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         ],
         CREATERAWTRANSACTION_HELP,
     ),
+    (
+        "combinepsbt",
+        &[("txs", Some("array"), true)],
+        COMBINEPSBT_HELP,
+    ),
+    ("joinpsbts", &[("txs", Some("array"), true)], JOINPSBTS_HELP),
     (
         "converttopsbt",
         &[
@@ -6442,6 +6479,220 @@ fn dispatch(
                 None,
             )
         }
+        // combinepsbt — same unsigned tx required across all members;
+        // key-maps merge insert-absent (first contributor wins a key
+        // collision), then keys serialize in Core's sorted order.
+        "combinepsbt" => {
+            let txs = match params[0].as_array() {
+                Some(a) => a,
+                None => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(1, "txs", &params[0], "array"),
+                        )),
+                    );
+                }
+            };
+            if txs.is_empty() {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_INVALID_PARAMETER,
+                        "Parameter 'txs' cannot be empty".into(),
+                    )),
+                );
+            }
+            let mut merged = None;
+            for elem in txs {
+                let Some(s) = elem.as_str() else {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, field_type_message(elem, "string"))),
+                    );
+                };
+                let Some(bytes) = base64_decode_strict(s) else {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_DESERIALIZATION_ERROR,
+                            "TX decode failed invalid base64".into(),
+                        )),
+                    );
+                };
+                let psbt = match avila_consensus::psbt::Psbt::decode(&bytes) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_DESERIALIZATION_ERROR,
+                                format!("TX decode failed {}", e.core_message()),
+                            )),
+                        );
+                    }
+                };
+                match &mut merged {
+                    None => merged = Some(psbt),
+                    Some(m) => {
+                        if m.tx.encode() != psbt.tx.encode() {
+                            return (
+                                Value::Null,
+                                Some((
+                                    RPC_INVALID_PARAMETER,
+                                    "PSBTs not compatible (different transactions)".into(),
+                                )),
+                            );
+                        }
+                        for (key, value) in &psbt.global.pairs {
+                            if key.first() != Some(&avila_consensus::psbt::Psbt::GLOBAL_TX) {
+                                m.global.insert_absent(key, value);
+                            }
+                        }
+                        for (dst, src) in m.inputs.iter_mut().zip(psbt.inputs.iter()) {
+                            for (key, value) in &src.pairs {
+                                dst.insert_absent(key, value);
+                            }
+                        }
+                        for (dst, src) in m.outputs.iter_mut().zip(psbt.outputs.iter()) {
+                            for (key, value) in &src.pairs {
+                                dst.insert_absent(key, value);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut m = merged.unwrap_or_else(|| {
+                avila_consensus::psbt::Psbt::from_unsigned_tx(Transaction {
+                    version: 2,
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    lock_time: 0,
+                })
+            });
+            m.global.sort_keys();
+            m.inputs.iter_mut().for_each(|i| i.sort_keys());
+            m.outputs.iter_mut().for_each(|o| o.sort_keys());
+            (json!(base64_encode(&m.encode())), None)
+        }
+        // joinpsbts — Core collects inputs/outputs through salted
+        // unordered maps, so its output order is randomized per call;
+        // we emit arg order, which is the same set either way.
+        // Signature-bearing input fields are dropped, the rest carry
+        // over, and global maps merge insert-absent.
+        "joinpsbts" => {
+            let txs = match params[0].as_array() {
+                Some(a) => a,
+                None => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(1, "txs", &params[0], "array"),
+                        )),
+                    );
+                }
+            };
+            if txs.len() < 2 {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_INVALID_PARAMETER,
+                        "At least two PSBTs are required to join PSBTs.".into(),
+                    )),
+                );
+            }
+            let mut psbts = Vec::with_capacity(txs.len());
+            for elem in txs {
+                let Some(s) = elem.as_str() else {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, field_type_message(elem, "string"))),
+                    );
+                };
+                let Some(bytes) = base64_decode_strict(s) else {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_DESERIALIZATION_ERROR,
+                            "TX decode failed invalid base64".into(),
+                        )),
+                    );
+                };
+                match avila_consensus::psbt::Psbt::decode(&bytes) {
+                    Ok(p) => psbts.push(p),
+                    Err(e) => {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_DESERIALIZATION_ERROR,
+                                format!("TX decode failed {}", e.core_message()),
+                            )),
+                        );
+                    }
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            for psbt in &psbts {
+                for input in &psbt.tx.inputs {
+                    if !seen.insert(input.previous_output) {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_INVALID_PARAMETER,
+                                format!(
+                                    "Input {}:{} exists in multiple PSBTs",
+                                    input.previous_output.txid, input.previous_output.vout
+                                ),
+                            )),
+                        );
+                    }
+                }
+            }
+            const SIG_TYPES: &[u8] = &[
+                avila_consensus::psbt::Psbt::IN_PARTIAL_SIG,
+                avila_consensus::psbt::Psbt::IN_FINAL_SCRIPTSIG,
+                avila_consensus::psbt::Psbt::IN_FINAL_SCRIPTWITNESS,
+                avila_consensus::psbt::Psbt::IN_TAP_KEY_SIG,
+                avila_consensus::psbt::Psbt::IN_TAP_SCRIPT_SIG,
+            ];
+            let mut merged_tx = Transaction {
+                version: 2,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                lock_time: 0,
+            };
+            let mut global = avila_consensus::psbt::KeyMap::default();
+            let mut in_maps = Vec::new();
+            let mut out_maps = Vec::new();
+            for mut psbt in psbts {
+                merged_tx.inputs.append(&mut psbt.tx.inputs);
+                merged_tx.outputs.append(&mut psbt.tx.outputs);
+                for (key, value) in &psbt.global.pairs {
+                    if key.first() != Some(&avila_consensus::psbt::Psbt::GLOBAL_TX) {
+                        global.insert_absent(key, value);
+                    }
+                }
+                for mut map in psbt.inputs {
+                    map.remove_types(SIG_TYPES);
+                    map.sort_keys();
+                    in_maps.push(map);
+                }
+                for mut map in psbt.outputs {
+                    map.sort_keys();
+                    out_maps.push(map);
+                }
+            }
+            let mut merged = avila_consensus::psbt::Psbt::from_unsigned_tx(merged_tx);
+            for (key, value) in global.pairs {
+                merged.global.insert_absent(&key, &value);
+            }
+            merged.global.sort_keys();
+            merged.inputs = in_maps;
+            merged.outputs = out_maps;
+            (json!(base64_encode(&merged.encode())), None)
+        }
         // Core's createmultisig (rpc/output_script.cpp) — n-of-m
         // multisig construction: keys parse first (HexToPubKey), then
         // the address type, then AddAndGetMultisigDestination's checks
@@ -9175,6 +9426,7 @@ fn dispatch(
                      \x20   decoderawtransaction <hex> [iswitness], getindexinfo [index_name],\n\
                      \x20   gettxout <txid> <n> [include_mempool], decodescript <hex>, decodepsbt <psbt>,\n\
                      \x20   createpsbt <in> <out> [lt] [rbf], converttopsbt <hex> [ok] [wit],\n\
+                     \x20   combinepsbt <psbts>, joinpsbts <psbts>,\n\
                      \x20   gettxoutproof <txids> [blockhash] [options],\n\
                      \x20   verifytxoutproof <proof> [options], validateaddress <address>,\n\
                      \x20   verifymessage <address> <sig> <msg>,\n\

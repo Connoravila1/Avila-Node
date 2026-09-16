@@ -347,17 +347,25 @@ operation. Compare complete initial download and catch-up, not only local replay
       ({txid, vsize, fees{base, effective-feerate,
       effective-includes}} on accept, {txid, error} on reject,
       pooled-member and different-witness shapes) plus
-      replaced-transactions, and decodepsbt sits on a BIP174
+      replaced-transactions, and the PSBT family sits on a BIP174
       key-map layer (lossless unknown/proprietary roundtrip,
-      Core's `TX decode failed …` strings) rendering Core's full
-      field shape — tx/non_witness_utxo/witness_utxo,
+      Core's `TX decode failed …` strings): decodepsbt renders
+      Core's full field shape — tx/non_witness_utxo/witness_utxo,
       partial_sigs, sighash, scripts, taproot fields, bip32/taproot
       derivations, global xpubs, preimages, proprietary/unknown
-      echoes, and fee once every UTXO slot is filled. Verified
+      echoes, and fee once every UTXO slot is filled;
+      createpsbt/converttopsbt share createrawtransaction's
+      tx-building body and decoderawtransaction's iswitness
+      semantics; combinepsbt merges maps first-contributor-wins
+      over identical unsigned txs; joinpsbts rebuilds a
+      version-2/locktime-0 tx from ≥2 PSBTs, rejects duplicate
+      outpoints, and strips signature/finalization fields.
+      Verified
       byte-identical against
       Core 29.4 including a live spend+receive, a real
       parent+child package, and funded/signed P2WPKH + taproot
-      PSBTs. Outbound
+      PSBTs (joinpsbts compared semantically — Core's join
+      ordering is salted-unordered-map random). Outbound
       dialing is
       asynchronous —
       `maintain_outbounds` runs `connect_timeout` on slot-bounded

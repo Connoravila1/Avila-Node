@@ -232,6 +232,26 @@ impl KeyMap {
         }
     }
 
+    /// `combinepsbt` merge: insert the pair only when absent — the
+    /// first contributor's value wins on a key collision.
+    pub fn insert_absent(&mut self, key: &[u8], value: &[u8]) {
+        if !self.contains(key) {
+            self.pairs.push((key.to_vec(), value.to_vec()));
+        }
+    }
+
+    /// Removes every pair whose type byte is in `types`
+    /// (`joinpsbts`' signature-data drop).
+    pub fn remove_types(&mut self, types: &[u8]) {
+        self.pairs
+            .retain(|(k, _)| !types.contains(k.first().unwrap_or(&0)));
+    }
+
+    /// Sorts pairs by full key — the order Core's `std::map` emits.
+    pub fn sort_keys(&mut self) {
+        self.pairs.sort();
+    }
+
     /// Whether a pair exists for the exact key.
     pub fn contains(&self, key: &[u8]) -> bool {
         self.pairs.iter().any(|(k, _)| k == key)
@@ -715,5 +735,52 @@ mod tests {
         assert!(psbt.tx.inputs[0].script_sig.is_empty());
         let round = Psbt::decode(&psbt.encode()).unwrap();
         assert_eq!(round.tx.txid(), psbt.tx.txid());
+    }
+
+    /// `combinepsbt` merge: an exact-key collision keeps the first
+    /// contributor's value; distinct keydatas under one type all
+    /// survive; sorting is by full key bytes like Core's `std::map`.
+    #[test]
+    fn keymap_merge_semantics() {
+        let mut m = KeyMap::default();
+        m.set(vec![0x02, 0xaa], vec![0x01]);
+        m.insert_absent(&[0x02, 0xaa], &[0x09]);
+        assert_eq!(m.get(0x02), Some(&[0x01][..]));
+        m.insert_absent(&[0x02, 0xbb], &[0x07]);
+        assert_eq!(m.all(0x02).count(), 2);
+        m.insert_absent(&[0x60, 0x01], &[0xcc]);
+        m.sort_keys();
+        let keys: Vec<&Vec<u8>> = m.pairs.iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            keys,
+            vec![&vec![0x02, 0xaa], &vec![0x02, 0xbb], &vec![0x60, 0x01]]
+        );
+    }
+
+    /// `joinpsbts` strips only signature/finalization input fields —
+    /// utxos, scripts, derivations, and unknown keys survive.
+    #[test]
+    fn keymap_remove_signature_types() {
+        let mut m = KeyMap::default();
+        m.set(vec![Psbt::IN_PARTIAL_SIG, 0xaa], vec![0x01]);
+        m.set(vec![Psbt::IN_FINAL_SCRIPTSIG], vec![0x02]);
+        m.set(vec![Psbt::IN_FINAL_SCRIPTWITNESS], vec![0x03]);
+        m.set(vec![Psbt::IN_TAP_KEY_SIG], vec![0x04]);
+        m.set(vec![Psbt::IN_TAP_SCRIPT_SIG, 0xbb], vec![0x05]);
+        m.set(vec![Psbt::IN_WITNESS_UTXO], vec![0x06]);
+        m.set(vec![Psbt::IN_BIP32_DERIVATION, 0xcc], vec![0x07]);
+        m.set(vec![0x60, 0xdd], vec![0x08]);
+        m.remove_types(&[
+            Psbt::IN_PARTIAL_SIG,
+            Psbt::IN_FINAL_SCRIPTSIG,
+            Psbt::IN_FINAL_SCRIPTWITNESS,
+            Psbt::IN_TAP_KEY_SIG,
+            Psbt::IN_TAP_SCRIPT_SIG,
+        ]);
+        let types: Vec<u8> = m.pairs.iter().map(|(k, _)| k[0]).collect();
+        assert_eq!(
+            types,
+            vec![Psbt::IN_WITNESS_UTXO, Psbt::IN_BIP32_DERIVATION, 0x60]
+        );
     }
 }
