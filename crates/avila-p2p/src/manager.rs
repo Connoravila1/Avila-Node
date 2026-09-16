@@ -21,7 +21,9 @@ use avila_consensus::hash::BlockHash;
 
 use crate::addrman::{self, AddrBook};
 use crate::message::{AddrV2Entry, Message, NetAddr};
-use crate::session::{PeerInfo, PeerSession, SessionError, SessionEvent, build_version};
+use crate::session::{
+    PeerInfo, PeerSession, SessionError, SessionEvent, build_version, wall_epoch,
+};
 use crate::sync::{MAX_BLOCKS_IN_TRANSIT_PER_PEER, PeerSync};
 
 /// Maximum simultaneous peers — small by design; more arrive when
@@ -32,15 +34,6 @@ pub const DEFAULT_MAX_PEERS: usize = 8;
 /// set — independent of peer count, so aggregate download memory stays
 /// predictable (Core bounds this through `BLOCK_DOWNLOAD_WINDOW`).
 pub const MAX_BLOCKS_IN_TRANSIT_TOTAL: usize = 1024;
-
-/// Wall-clock epoch seconds — the ban list lives on wall time
-/// (`banned_until` is a UNIX timestamp), not the `Instant` domain.
-fn epoch_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
 
 /// Peers that delivered useful headers or blocks within this window are
 /// protected from inbound eviction (Core protects for ~30 min; our
@@ -122,12 +115,15 @@ struct PeerEntry<S> {
     ping_last: Option<Duration>,
     /// Smallest round-trip ever seen (`minping`).
     ping_min: Option<Duration>,
-    /// Wall-clock of the last block this peer delivered (`last_block_time`).
-    last_block_time: Option<std::time::SystemTime>,
-    /// Wall-clock of the last tx this peer delivered (`last_transaction`).
-    last_tx_time: Option<std::time::SystemTime>,
-    /// Wall-clock of the last inv/headers announcement (`lastannounce`).
-    last_announce: Option<std::time::SystemTime>,
+    /// Node-clock epoch of the last block this peer delivered
+    /// (`last_block_time`).
+    last_block_time: Option<i64>,
+    /// Node-clock epoch of the last tx this peer delivered
+    /// (`last_transaction`).
+    last_tx_time: Option<i64>,
+    /// Node-clock epoch of the last inv/headers announcement
+    /// (`lastannounce`).
+    last_announce: Option<i64>,
     /// Height of the last header this peer fed us that we indexed
     /// (`synced_headers`); -1 when none.
     synced_header_height: i64,
@@ -259,6 +255,11 @@ pub struct PeerManager<S> {
     /// network can't queue unbounded workers, and deduplicated so the
     /// same address is never dialed twice at once.
     pending_dials: std::collections::HashSet<SocketAddr>,
+    /// The epoch-seconds clock every time-domain decision reads —
+    /// ban checks, version `timestamp`s, session telemetry and the
+    /// `last_*` fields. Core's `GetTime`: [`wall_epoch`] until the
+    /// node substitutes its mockable clock via [`Self::set_clock`].
+    clock: fn() -> i64,
 }
 
 impl<S: Read + Write> PeerManager<S> {
@@ -285,7 +286,17 @@ impl<S: Read + Write> PeerManager<S> {
             dial_tx: dial_channel.0,
             dial_rx: dial_channel.1,
             pending_dials: std::collections::HashSet::new(),
+            clock: wall_epoch,
         }
+    }
+
+    /// Substitutes the manager's epoch clock — the node passes its
+    /// mockable `GetTime` so ban expiry, `version` timestamps and peer
+    /// telemetry all honor `setmocktime`. Sessions adopt the current
+    /// clock at registration; since the node's clock reads a shared
+    /// atomic, a later `setmocktime` still shifts every session.
+    pub fn set_clock(&mut self, clock: fn() -> i64) {
+        self.clock = clock;
     }
 
     /// Removes a peer, folding its wire counters into the cumulative
@@ -351,21 +362,9 @@ impl<S: Read + Write> PeerManager<S> {
                     ping_wait_secs: peer
                         .ping_outstanding
                         .map(|(_, t)| t.elapsed().as_secs_f64()),
-                    last_block_time: peer
-                        .last_block_time
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(-1),
-                    last_tx_time: peer
-                        .last_tx_time
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(-1),
-                    last_announce: peer
-                        .last_announce
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(-1),
+                    last_block_time: peer.last_block_time.unwrap_or(-1),
+                    last_tx_time: peer.last_tx_time.unwrap_or(-1),
+                    last_announce: peer.last_announce.unwrap_or(-1),
                     synced_header_height: peer.synced_header_height,
                     synced_block_height: peer.synced_block_height,
                     addr_processed: peer.addr_processed,
@@ -458,7 +457,7 @@ impl<S: Read + Write> PeerManager<S> {
 
     fn add(
         &mut self,
-        session: PeerSession<S>,
+        mut session: PeerSession<S>,
         remote: Option<NetAddr>,
         inbound: bool,
     ) -> Option<u64> {
@@ -467,6 +466,7 @@ impl<S: Read + Write> PeerManager<S> {
         }
         let id = self.next_id;
         self.next_id += 1;
+        session.set_clock(self.clock);
         let now = Instant::now();
         self.peers.insert(
             id,
@@ -758,7 +758,7 @@ impl<S: Read + Write> PeerManager<S> {
                 let _ = peer.session.send(&req);
             }
             SessionEvent::Message(Message::Headers(headers)) => {
-                peer.last_announce = Some(std::time::SystemTime::now());
+                peer.last_announce = Some(i64::from(now));
                 match peer.sync.on_headers(cs, &headers, now) {
                     Ok(outcome) => {
                         // Height of the last header this page indexed —
@@ -793,7 +793,7 @@ impl<S: Read + Write> PeerManager<S> {
                 }
             }
             SessionEvent::Message(Message::Inv(invs)) => {
-                peer.last_announce = Some(std::time::SystemTime::now());
+                peer.last_announce = Some(i64::from(now));
                 let missing: Vec<BlockHash> = invs
                     .iter()
                     .filter(|i| {
@@ -818,7 +818,7 @@ impl<S: Read + Write> PeerManager<S> {
             }
             SessionEvent::Message(Message::Block(block)) => {
                 let old_tip = cs.tip_hash();
-                peer.last_block_time = Some(std::time::SystemTime::now());
+                peer.last_block_time = Some(i64::from(now));
                 match peer.sync.on_block(cs, &block, now) {
                     Ok(outcome) => {
                         peer.last_useful = Instant::now();
@@ -869,7 +869,7 @@ impl<S: Read + Write> PeerManager<S> {
                 peer.wants_headers_announce = true;
             }
             SessionEvent::Message(Message::Tx(tx)) => {
-                peer.last_tx_time = Some(std::time::SystemTime::now());
+                peer.last_tx_time = Some(i64::from(now));
                 let wtxid = tx.wtxid();
                 let txid_pre = tx.txid();
                 peer.sync.on_tx(&txid_pre);
@@ -1258,13 +1258,13 @@ impl PeerManager<TcpStream> {
         let remote = crate::addrman::net_addr_of(addr, 0);
         // `BanMan::IsBanned` gates dialing — Core never opens a
         // connection to a banned address.
-        if self.bans.is_banned(&remote.ip, epoch_now()) {
+        if self.bans.is_banned(&remote.ip, (self.clock)()) {
             return Ok(None);
         }
         let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
-        let version = build_version(our_version, start_height, remote);
+        let version = build_version(our_version, start_height, remote, (self.clock)());
         let session = PeerSession::initiate(stream, magic, version, SEND_BUDGET_PER_PEER)?;
         Ok(self.add(session, Some(remote), false))
     }
@@ -1285,13 +1285,13 @@ impl PeerManager<TcpStream> {
             // A domain target has no numeric address to gossip.
             crate::proxy::SocksTarget::Domain(..) => NetAddr::unspecified(),
         };
-        if self.bans.is_banned(&remote.ip, epoch_now()) {
+        if self.bans.is_banned(&remote.ip, (self.clock)()) {
             return Ok(None);
         }
         let stream = crate::proxy::socks5_connect(proxy, target, Duration::from_secs(10))?;
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
-        let version = build_version(our_version, start_height, remote);
+        let version = build_version(our_version, start_height, remote, (self.clock)());
         let session = PeerSession::initiate(stream, magic, version, SEND_BUDGET_PER_PEER)?;
         Ok(self.add(session, Some(remote), false))
     }
@@ -1355,14 +1355,14 @@ impl PeerManager<TcpStream> {
             let remote = addrman::net_addr_of(addr, 0);
             let admissible = self.network_active
                 && self.has_slot()
-                && !self.bans.is_banned(&remote.ip, epoch_now())
+                && !self.bans.is_banned(&remote.ip, (self.clock)())
                 && stream.set_nonblocking(true).is_ok()
                 && stream.set_nodelay(true).is_ok();
             if admissible
                 && let Ok(session) = PeerSession::initiate(
                     stream,
                     magic,
-                    build_version(addr.port() as u64, start_height, remote),
+                    build_version(addr.port() as u64, start_height, remote, (self.clock)()),
                     SEND_BUDGET_PER_PEER,
                 )
             {
@@ -1398,7 +1398,7 @@ impl PeerManager<TcpStream> {
                     continue;
                 }
                 self.addnode_dial.insert(node.clone(), Instant::now());
-                let now = epoch_now();
+                let now = (self.clock)();
                 for sock in socks {
                     if !self.outbound_open() {
                         break;
@@ -1412,7 +1412,7 @@ impl PeerManager<TcpStream> {
                 }
             }
         }
-        let now = epoch_now();
+        let now = (self.clock)();
         // `select` is deterministic, so each probe marks its candidate —
         // the round is bounded by the book size and a banned candidate
         // can't starve or spin the loop.
@@ -1527,7 +1527,7 @@ mod tests {
         let session = PeerSession::initiate(
             us_end,
             MAGIC,
-            build_version(1, 0, NetAddr::unspecified()),
+            build_version(1, 0, NetAddr::unspecified(), i64::from(NOW)),
             BUDGET,
         )
         .expect("session");
@@ -1567,7 +1567,7 @@ mod tests {
             PeerSession::initiate(
                 us1,
                 MAGIC,
-                build_version(1, 0, NetAddr::unspecified()),
+                build_version(1, 0, NetAddr::unspecified(), i64::from(NOW)),
                 BUDGET,
             )
             .unwrap(),
@@ -1578,7 +1578,7 @@ mod tests {
                 PeerSession::initiate(
                     us2,
                     MAGIC,
-                    build_version(2, 0, NetAddr::unspecified()),
+                    build_version(2, 0, NetAddr::unspecified(), i64::from(NOW)),
                     BUDGET
                 )
                 .unwrap()
@@ -1755,7 +1755,7 @@ mod tests {
         let session = PeerSession::initiate(
             us_end,
             MAGIC,
-            build_version(9, 0, NetAddr::unspecified()),
+            build_version(9, 0, NetAddr::unspecified(), i64::from(NOW)),
             BUDGET,
         )
         .expect("session");
@@ -1926,7 +1926,7 @@ mod tests {
         let session = PeerSession::initiate(
             us_end,
             MAGIC,
-            build_version(9, 0, NetAddr::unspecified()),
+            build_version(9, 0, NetAddr::unspecified(), i64::from(NOW)),
             BUDGET,
         )
         .expect("session");
@@ -1963,7 +1963,7 @@ mod tests {
         let session = PeerSession::initiate(
             _us_end,
             MAGIC,
-            build_version(9, 0, NetAddr::unspecified()),
+            build_version(9, 0, NetAddr::unspecified(), i64::from(NOW)),
             BUDGET,
         )
         .expect("session");

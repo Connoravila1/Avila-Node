@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use avila_consensus::chainstate::Chainstate;
 use avila_consensus::params::Network;
 use avila_p2p::message::{Message, NetAddr};
-use avila_p2p::session::{PeerSession, SessionEvent, build_version};
+use avila_p2p::session::{PeerSession, SessionEvent, build_version, wall_epoch};
 use avila_p2p::sync::PeerSync;
 
 fn net_addr(sock: SocketAddr) -> NetAddr {
@@ -113,7 +113,7 @@ fn main() {
         let mut session = PeerSession::initiate(
             stream,
             params.message_start,
-            build_version(0xabba_abba, 0, net_addr(sock)),
+            build_version(0xabba_abba, 0, net_addr(sock), wall_epoch()),
             8 << 20,
         )
         .expect("initiate");
@@ -171,6 +171,7 @@ fn main() {
             0xbeef_beef,
             cs.chain().len() as i32 - 1,
             net_addr(peer_addr),
+            wall_epoch(),
         ),
         8 << 20,
     );

@@ -113,7 +113,12 @@ fn next_session_id() -> u64 {
     nanos.rotate_left(7) ^ seq.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
-fn now_epoch() -> i64 {
+/// Wall-clock UNIX seconds — the default session clock. Callers that
+/// keep a mockable clock (Core's `GetTime`) substitute it via
+/// [`PeerSession::set_clock`]; [`build_version`] takes the epoch as an
+/// argument for the same reason.
+#[must_use]
+pub fn wall_epoch() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -174,6 +179,9 @@ pub struct PeerSession<S> {
     telemetry: SessionTelemetry,
     /// Maximum bytes allowed outstanding in `send_buf`.
     send_budget: usize,
+    /// The clock `conntime`/`lastsend`/`lastrecv` read — [`wall_epoch`]
+    /// until the owning manager substitutes its own.
+    clock: fn() -> i64,
 }
 
 impl<S: Read + Write> PeerSession<S> {
@@ -219,11 +227,29 @@ impl<S: Read + Write> PeerSession<S> {
             peer: None,
             connected_at: Instant::now(),
             telemetry: SessionTelemetry {
-                connected: now_epoch(),
+                connected: wall_epoch(),
                 session_id: next_session_id(),
                 ..SessionTelemetry::default()
             },
             send_budget,
+            clock: wall_epoch,
+        }
+    }
+
+    /// Swaps the telemetry clock — the manager calls this at
+    /// registration so `conntime`/`lastsend`/`lastrecv` live on the
+    /// node's (possibly mocked) clock, like Core's `GetTime` reads.
+    /// `connected` re-stamps to registration time; any pre-registration
+    /// traffic stamps re-anchor to the same domain.
+    pub fn set_clock(&mut self, clock: fn() -> i64) {
+        self.clock = clock;
+        let now = clock();
+        self.telemetry.connected = now;
+        if self.telemetry.last_send > 0 {
+            self.telemetry.last_send = now;
+        }
+        if self.telemetry.last_recv > 0 {
+            self.telemetry.last_recv = now;
         }
     }
 
@@ -292,7 +318,7 @@ impl<S: Read + Write> PeerSession<S> {
             .entry(command.name().to_string())
             .or_insert(0) += frame.len() as u64;
         self.telemetry.bytes_sent += frame.len() as u64;
-        self.telemetry.last_send = now_epoch();
+        self.telemetry.last_send = (self.clock)();
         self.send_buf.extend(frame);
         Ok(())
     }
@@ -349,7 +375,7 @@ impl<S: Read + Write> PeerSession<S> {
                     .recv_by_msg
                     .entry(command.name().to_string())
                     .or_insert(0) += payload.len() as u64 + 24;
-                self.telemetry.last_recv = now_epoch();
+                self.telemetry.last_recv = (self.clock)();
                 if let Some(event) = self.dispatch(command, &payload)? {
                     events.push(event);
                 }
@@ -427,16 +453,15 @@ impl<S: Read + Write> PeerSession<S> {
 
 /// Builds the `version` message a fresh session sends. `nonce` should be a
 /// random per-instance value (loopback detection); `start_height` is our
-/// best height; `addr_recv` is the peer's address as observed.
+/// best height; `addr_recv` is the peer's address as observed. `now` is
+/// the version's `timestamp` — Core's `GetTime`, so callers carrying a
+/// mockable clock pass it; others pass [`wall_epoch()`].
 #[must_use]
-pub fn build_version(nonce: u64, start_height: i32, addr_recv: NetAddr) -> Version {
+pub fn build_version(nonce: u64, start_height: i32, addr_recv: NetAddr, now: i64) -> Version {
     Version {
         version: PROTOCOL_VERSION,
         services: OUR_SERVICES,
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
+        timestamp: now,
         addr_recv,
         addr_from: NetAddr::unspecified(),
         nonce,
@@ -498,7 +523,7 @@ mod tests {
         let mut us = PeerSession::initiate(
             us_end,
             MAGIC,
-            build_version(1, 500, NetAddr::unspecified()),
+            build_version(1, 500, NetAddr::unspecified(), wall_epoch()),
             BUDGET,
         )
         .unwrap();
@@ -520,7 +545,7 @@ mod tests {
         let mut us = PeerSession::initiate(
             us_end,
             MAGIC,
-            build_version(1, 500, NetAddr::unspecified()),
+            build_version(1, 500, NetAddr::unspecified(), wall_epoch()),
             BUDGET,
         )
         .unwrap();
@@ -551,7 +576,7 @@ mod tests {
         let mut us = PeerSession::accept(
             us_end,
             MAGIC,
-            build_version(2, 500, NetAddr::unspecified()),
+            build_version(2, 500, NetAddr::unspecified(), wall_epoch()),
             BUDGET,
         );
         us.poll().unwrap();
@@ -577,7 +602,7 @@ mod tests {
         let mut us = PeerSession::accept(
             us_end,
             MAGIC,
-            build_version(6, 0, NetAddr::unspecified()),
+            build_version(6, 0, NetAddr::unspecified(), wall_epoch()),
             BUDGET,
         );
         us.poll().unwrap();
@@ -606,7 +631,7 @@ mod tests {
         let mut us = PeerSession::accept(
             us_end,
             MAGIC,
-            build_version(3, 0, NetAddr::unspecified()),
+            build_version(3, 0, NetAddr::unspecified(), wall_epoch()),
             BUDGET,
         );
         testpipe::inject(&mut peer_end, MAGIC, &Message::GetAddr);
@@ -623,7 +648,7 @@ mod tests {
         let mut us = PeerSession::accept(
             us_end,
             MAGIC,
-            build_version(4, 0, NetAddr::unspecified()),
+            build_version(4, 0, NetAddr::unspecified(), wall_epoch()),
             BUDGET,
         );
         testpipe::inject(&mut peer_end, MAGIC, &Message::Version(version(1)));
@@ -641,7 +666,7 @@ mod tests {
         let mut us = PeerSession::accept(
             us_end,
             MAGIC,
-            build_version(5, 0, NetAddr::unspecified()),
+            build_version(5, 0, NetAddr::unspecified(), wall_epoch()),
             BUDGET,
         );
         testpipe::inject(&mut peer_end, MAGIC, &Message::Version(version(1)));
@@ -661,7 +686,7 @@ mod tests {
         let mut us = PeerSession::accept(
             us_end,
             MAGIC,
-            build_version(6, 0, NetAddr::unspecified()),
+            build_version(6, 0, NetAddr::unspecified(), wall_epoch()),
             BUDGET,
         );
         testpipe::inject(&mut peer_end, MAGIC, &Message::Version(version(1)));
@@ -685,7 +710,7 @@ mod tests {
             PeerSession::initiate(
                 us_end,
                 MAGIC,
-                build_version(7, 0, NetAddr::unspecified()),
+                build_version(7, 0, NetAddr::unspecified(), wall_epoch()),
                 64,
             )
             .is_err()
@@ -698,7 +723,7 @@ mod tests {
         let mut us = PeerSession::initiate(
             us_end,
             MAGIC,
-            build_version(8, 0, NetAddr::unspecified()),
+            build_version(8, 0, NetAddr::unspecified(), wall_epoch()),
             BUDGET,
         )
         .unwrap();
@@ -720,7 +745,7 @@ mod tests {
         let mut us = PeerSession::accept(
             us_end,
             MAGIC,
-            build_version(9, 0, NetAddr::unspecified()),
+            build_version(9, 0, NetAddr::unspecified(), wall_epoch()),
             BUDGET,
         );
         drop(peer_end);

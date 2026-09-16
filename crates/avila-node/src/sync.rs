@@ -166,6 +166,10 @@ pub fn run(
     }
     let resumed_height = cs.chain().len() as u32 - 1;
     let mut mgr = PeerManager::new(cfg.max_peers);
+    // The whole p2p time domain — dial-path ban checks, version
+    // `timestamp`s, conntime/lastsend/lastrecv and the last_* peer
+    // fields — reads the node clock, so `setmocktime` shifts them too.
+    mgr.set_clock(crate::time::time);
     let started = Instant::now();
     // Core's `GetStartupTime` — wall-clock boot epoch. `uptime` reads
     // `GetTime() - GetStartupTime()`, so a pinned mock shifts it too.

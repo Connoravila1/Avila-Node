@@ -16,7 +16,7 @@ use avila_consensus::chainstate::Chainstate;
 use avila_consensus::hash::BlockHash;
 use avila_consensus::params::Network;
 use avila_p2p::message::{Message, NetAddr};
-use avila_p2p::session::{PeerSession, SessionEvent, build_version};
+use avila_p2p::session::{PeerSession, SessionEvent, build_version, wall_epoch};
 use avila_p2p::sync::PeerSync;
 
 #[allow(clippy::expect_used)] // a probe binary may fail loudly
@@ -49,6 +49,7 @@ fn main() {
             },
             port: sock.port(),
         },
+        wall_epoch(),
     );
     let mut session =
         PeerSession::initiate(stream, params.message_start, version, 8 << 20).expect("initiate");
