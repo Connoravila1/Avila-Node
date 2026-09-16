@@ -1289,6 +1289,36 @@ fn tagged_hash(tag: &str, msg: &[u8]) -> [u8; 32] {
     crate::hash::sha256(&data)
 }
 
+/// `DescriptorCache` — the `ExtKey` at a `Provider::Bip32`
+/// derivation path is constant across range positions; memoizing it
+/// turns each position's work into a single child derivation. The
+/// cached node is the xprv when `signing` has it (hardened steps and
+/// secrets need private material), otherwise the extpub.
+pub type DeriveCache = HashMap<(Vec<u8>, Vec<u32>), ExtKey>;
+
+fn bip32_base_key(
+    extpub: &ExtKey,
+    path: &[u32],
+    signing: &FlatProvider,
+    cache: &mut DeriveCache,
+) -> Option<ExtKey> {
+    let key = (extpub.key.to_vec(), path.to_vec());
+    if let Some(node) = cache.get(&key) {
+        return Some(node.clone());
+    }
+    let key_id = key_id_of(&extpub.key);
+    let mut node = signing
+        .xprvs
+        .get(&key_id)
+        .cloned()
+        .unwrap_or_else(|| extpub.clone());
+    for &step in path {
+        node = node.derive(step)?;
+    }
+    cache.insert(key, node.clone());
+    Some(node)
+}
+
 /// `GetPubKey` — the expanded pubkey plus its `KeyOriginInfo`
 /// `(fingerprint, path)`: a const key reports its own
 /// `hash160[..4]` with an empty path, a BIP32 key reports the root's
@@ -1300,7 +1330,7 @@ fn provider_pubkey(
     provider: &Provider,
     pos: u32,
     signing: &FlatProvider,
-    params: &Params,
+    cache: &mut DeriveCache,
 ) -> Option<(Vec<u8>, KeyOrigin)> {
     match provider {
         Provider::Const { pubkey, .. } => {
@@ -1314,7 +1344,7 @@ fn provider_pubkey(
             inner,
             ..
         } => {
-            let (pubkey, (_, inner_path)) = provider_pubkey(inner, pos, signing, params)?;
+            let (pubkey, (_, inner_path)) = provider_pubkey(inner, pos, signing, cache)?;
             let mut full = path.clone();
             full.extend_from_slice(&inner_path);
             Some((pubkey, (*fingerprint, full)))
@@ -1325,34 +1355,14 @@ fn provider_pubkey(
             derive,
             ..
         } => {
-            let hardened_any =
-                *derive == Derive::Hardened || path.iter().any(|step| step & HARDENED != 0);
-            let node = if hardened_any {
-                // Hardened steps require the root secret (Core's
-                // GetDerivedExtKey path).
-                let key_id = key_id_of(&extpub.key);
-                let mut xprv = signing.xprvs.get(&key_id)?.clone();
-                for &step in path {
-                    xprv = xprv.derive(step)?;
-                }
-                match derive {
-                    Derive::No => xprv.neuter(params.base58_ext_pubkey_prefix)?,
-                    Derive::Unhardened => {
-                        xprv.derive(pos)?.neuter(params.base58_ext_pubkey_prefix)?
-                    }
-                    Derive::Hardened => xprv
-                        .derive(pos | HARDENED)?
-                        .neuter(params.base58_ext_pubkey_prefix)?,
-                }
-            } else {
-                let mut node = extpub.clone();
-                for &step in path {
-                    node = node.derive(step)?;
-                }
-                if *derive == Derive::Unhardened {
-                    node = node.derive(pos)?;
-                }
-                node
+            // Hardened steps require the root secret — `bip32_base_key`
+            // uses the xprv when present, and a hardened `derive` on
+            // an extpub fails (Core's GetDerivedExtKey path).
+            let base = bip32_base_key(extpub, path, signing, cache)?;
+            let node = match derive {
+                Derive::No => base,
+                Derive::Unhardened => base.derive(pos)?,
+                Derive::Hardened => base.derive(pos | HARDENED)?,
             };
             let mut fp = [0u8; 4];
             fp.copy_from_slice(&key_id_of(&extpub.key)[..4]);
@@ -1367,24 +1377,65 @@ fn provider_pubkey(
     }
 }
 
+/// `GetPrivKey` — the derived private key for `pos` when `signing`
+/// holds the material: a const key reads it back from `signing.keys`
+/// (WIF secrets land there at parse time), a BIP32 key derives
+/// through `signing.xprvs` — needed for hardened steps anyway — and
+/// an origin wrapper recurses into the inner provider.
+fn provider_privkey(
+    provider: &Provider,
+    pos: u32,
+    signing: &FlatProvider,
+    cache: &mut DeriveCache,
+) -> Option<secp256k1::SecretKey> {
+    match provider {
+        Provider::Const { pubkey, .. } => signing.keys.get(&key_id_of(pubkey)).copied(),
+        Provider::Origin { inner, .. } => provider_privkey(inner, pos, signing, cache),
+        Provider::Bip32 {
+            extpub,
+            path,
+            derive,
+            ..
+        } => {
+            let base = bip32_base_key(extpub, path, signing, cache)?;
+            if !base.is_private() {
+                return None;
+            }
+            let node = match derive {
+                Derive::No => base,
+                Derive::Unhardened => base.derive(pos)?,
+                Derive::Hardened => base.derive(pos | HARDENED)?,
+            };
+            secp256k1::SecretKey::from_slice(&node.key[1..]).ok()
+        }
+    }
+}
+
 /// `ExpandHelper` — writes the descriptor's output scripts for
 /// position `pos` into `out` and the signing data Core's
 /// `MakeScripts`/`GetPubKey` record into `out_provider` (origins for
 /// every key, pubkeys for hash-locked types, subscripts for the
 /// wrappers, and taproot spend data for `tr`).
+#[allow(clippy::too_many_arguments)]
 fn expand_descriptor(
     desc: &Descriptor,
     pos: u32,
     signing: &FlatProvider,
-    params: &Params,
     out: &mut Vec<Vec<u8>>,
     out_provider: &mut FlatProvider,
+    expand_priv: bool,
+    cache: &mut DeriveCache,
 ) -> Option<()> {
-    let key = |p: &Provider, out_provider: &mut FlatProvider| {
-        let (pubkey, info) = provider_pubkey(p, pos, signing, params)?;
+    let mut key = |p: &Provider, out_provider: &mut FlatProvider| {
+        let (pubkey, info) = provider_pubkey(p, pos, signing, cache)?;
         out_provider
             .origins
             .insert(key_id_of(&pubkey), (pubkey.clone(), info));
+        // `ExpandPrivate` — the derived secret lands in the output
+        // provider keyed by the expanded pubkey's id.
+        if expand_priv && let Some(secret) = provider_privkey(p, pos, signing, cache) {
+            out_provider.keys.insert(key_id_of(&pubkey), secret);
+        }
         Some(pubkey)
     };
     match desc {
@@ -1466,7 +1517,15 @@ fn expand_descriptor(
         }
         Descriptor::Sh(sub) => {
             let mut inner = Vec::new();
-            expand_descriptor(sub, pos, signing, params, &mut inner, out_provider)?;
+            expand_descriptor(
+                sub,
+                pos,
+                signing,
+                &mut inner,
+                out_provider,
+                expand_priv,
+                cache,
+            )?;
             for s in inner {
                 let h = crate::hash::hash160(&s);
                 out_provider.scripts.insert(h, s);
@@ -1475,7 +1534,15 @@ fn expand_descriptor(
         }
         Descriptor::Wsh(sub) => {
             let mut inner = Vec::new();
-            expand_descriptor(sub, pos, signing, params, &mut inner, out_provider)?;
+            expand_descriptor(
+                sub,
+                pos,
+                signing,
+                &mut inner,
+                out_provider,
+                expand_priv,
+                cache,
+            )?;
             for s in inner {
                 let h = crate::hash::sha256(&s);
                 out_provider.scripts.insert(crate::hash::hash160(&s), s);
@@ -1506,7 +1573,7 @@ fn expand_descriptor(
                 let mut scripts = Vec::with_capacity(subs.len());
                 for sub in subs {
                     let mut s = Vec::new();
-                    expand_descriptor(sub, pos, signing, params, &mut s, out_provider)?;
+                    expand_descriptor(sub, pos, signing, &mut s, out_provider, expand_priv, cache)?;
                     if s.len() != 1 {
                         return None;
                     }
@@ -1946,30 +2013,46 @@ impl Descriptor {
     /// derivation position `pos`. Fails when hardened derivation needs
     /// private material that wasn't in the descriptor.
     #[must_use]
-    pub fn expand(
-        &self,
-        pos: u32,
-        signing: &FlatProvider,
-        params: &Params,
-    ) -> Option<Vec<Vec<u8>>> {
+    pub fn expand(&self, pos: u32, signing: &FlatProvider) -> Option<Vec<Vec<u8>>> {
         let mut out = Vec::new();
         let mut provider = FlatProvider::default();
-        expand_descriptor(self, pos, signing, params, &mut out, &mut provider)?;
+        let mut cache = DeriveCache::new();
+        expand_descriptor(
+            self,
+            pos,
+            signing,
+            &mut out,
+            &mut provider,
+            false,
+            &mut cache,
+        )?;
         Some(out)
     }
 
     /// `Expand` with Core's `out` provider — returns the scripts plus
     /// the accumulated pubkeys/origins/subscripts/spend data that
-    /// `scantxoutset` needs for `InferDescriptor`.
+    /// `scantxoutset` needs for `InferDescriptor`. `expand_priv`
+    /// additionally records derived secrets (`ExpandPrivate`).
+    /// `cache` is Core's `DescriptorCache`: the per-provider base key
+    /// is memoized across range positions.
     pub fn expand_into(
         &self,
         pos: u32,
         signing: &FlatProvider,
         out_provider: &mut FlatProvider,
-        params: &Params,
+        expand_priv: bool,
+        cache: &mut DeriveCache,
     ) -> Option<Vec<Vec<u8>>> {
         let mut out = Vec::new();
-        expand_descriptor(self, pos, signing, params, &mut out, out_provider)?;
+        expand_descriptor(
+            self,
+            pos,
+            signing,
+            &mut out,
+            out_provider,
+            expand_priv,
+            cache,
+        )?;
         Some(out)
     }
 }
@@ -2210,7 +2293,7 @@ mod tests {
             let (descs, provider, _) = parse_descriptors(text, &regtest(), true).unwrap();
             let mut out = Vec::new();
             for i in lo..=hi {
-                for s in descs[0].expand(i, &provider, &regtest()).unwrap() {
+                for s in descs[0].expand(i, &provider).unwrap() {
                     if let Some(a) = script_address(&Script::new(s), &regtest()) {
                         out.push(a);
                     }
@@ -2256,6 +2339,6 @@ mod tests {
         let (descs, provider, _) =
             parse_descriptors(&format!("wpkh({TPUB}/0h/0/*)"), &regtest(), false).unwrap();
         // `0h` in the path — public derivation alone can't do it.
-        assert!(descs[0].expand(0, &provider, &regtest()).is_none());
+        assert!(descs[0].expand(0, &provider).is_none());
     }
 }

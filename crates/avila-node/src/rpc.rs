@@ -868,6 +868,7 @@ type ScanObjectScripts = (Vec<Vec<u8>>, avila_consensus::descriptor::FlatProvide
 fn eval_scan_object(
     scanobject: &Value,
     params: &avila_consensus::params::Params,
+    expand_priv: bool,
 ) -> Result<ScanObjectScripts, (i64, String)> {
     let (desc_str, mut range) = match scanobject {
         Value::String(s) => (s.clone(), (0i64, 1000i64)),
@@ -909,10 +910,17 @@ fn eval_scan_object(
     // (bounded to the descriptor).
     let signing = provider.clone();
     let mut out_provider = provider;
+    let mut cache = avila_consensus::descriptor::DeriveCache::new();
     let mut scripts = Vec::new();
     for i in range.0..=range.1 {
         for desc in &descs {
-            let Some(s) = desc.expand_into(i as u32, &signing, &mut out_provider, params) else {
+            let Some(s) = desc.expand_into(
+                i as u32,
+                &signing,
+                &mut out_provider,
+                expand_priv,
+                &mut cache,
+            ) else {
                 return Err((
                     RPC_INVALID_ADDRESS_OR_KEY,
                     format!("Cannot derive script without private keys: '{desc_str}'"),
@@ -922,6 +930,141 @@ fn eval_scan_object(
         }
     }
     Ok((scripts, out_provider))
+}
+
+/// `ParseSighashString` — null → `SIGHASH_DEFAULT`; otherwise the
+/// named table, erroring `'<s>' is not a valid sighash parameter.`
+/// (`RPC_INVALID_PARAMETER`, like Core's `ErrorString(result)`).
+fn parse_sighash_string(v: &Value) -> Result<i32, (i64, String)> {
+    if v.is_null() {
+        return Ok(0);
+    }
+    let Some(s) = v.as_str() else {
+        return Err((
+            RPC_TYPE_ERROR,
+            wrong_type_message(3, "sighashtype", v, "string"),
+        ));
+    };
+    match s {
+        "DEFAULT" => Ok(0x00),
+        "ALL" => Ok(0x01),
+        "NONE" => Ok(0x02),
+        "SINGLE" => Ok(0x03),
+        "ALL|ANYONECANPAY" => Ok(0x81),
+        "NONE|ANYONECANPAY" => Ok(0x82),
+        "SINGLE|ANYONECANPAY" => Ok(0x83),
+        _ => Err((
+            RPC_INVALID_PARAMETER,
+            format!("'{s}' is not a valid sighash parameter."),
+        )),
+    }
+}
+
+/// `ProcessPSBT` — the shared descriptor-PSBT pipeline behind
+/// `utxoupdatepsbt` (`hide_secret`, `finalize=false`, `SIGHASH_ALL`)
+/// and `descriptorprocesspsbt` (real signing, `hide_origin =
+/// !bip32derivs`, the `sighashtype` argument). Provider fields the
+/// `HidingSigningProvider` would conceal are cleared up front.
+#[allow(clippy::too_many_arguments)]
+fn process_psbt(
+    psbt: &mut avila_consensus::psbt::Psbt,
+    descs_arg: &Value,
+    sighash: i32,
+    finalize: bool,
+    hide_secret: bool,
+    hide_origin: bool,
+    expand_priv: bool,
+    cs: &mut Chainstate,
+    mgr: &mut PeerManager<TcpStream>,
+) -> Result<(), (i64, String)> {
+    use avila_consensus::psbt::Psbt;
+    use avila_consensus::sign::{
+        is_segwit_output, precompute_psbt_data, psbt_input_signed, remove_unnecessary_transactions,
+        sign_psbt_input, update_psbt_output,
+    };
+    let mut provider = avila_consensus::descriptor::FlatProvider::default();
+    if !descs_arg.is_null() {
+        let Some(arr) = descs_arg.as_array() else {
+            return Err((
+                RPC_TYPE_ERROR,
+                wrong_type_message(2, "descriptors", descs_arg, "array"),
+            ));
+        };
+        for d in arr {
+            let (_, p) = eval_scan_object(d, cs.tree().params(), expand_priv)?;
+            provider.keys.extend(p.keys);
+            provider.xprvs.extend(p.xprvs);
+            provider.pubkeys.extend(p.pubkeys);
+            provider.origins.extend(p.origins);
+            provider.scripts.extend(p.scripts);
+            provider.tr_trees.extend(p.tr_trees);
+        }
+    }
+    // `HidingSigningProvider(&provider, hide_secret, hide_origin)`.
+    if hide_secret {
+        provider.keys.clear();
+    }
+    if hide_origin {
+        provider.origins.clear();
+    }
+    // Fetch prev txs — txindex first, then the mempool.
+    for i in 0..psbt.tx.inputs.len() {
+        if psbt.inputs[i].get(Psbt::IN_NON_WITNESS_UTXO).is_some() {
+            continue;
+        }
+        let txid = psbt.tx.inputs[i].previous_output.txid;
+        let tx = cs
+            .find_transaction(&txid)
+            .and_then(|bh| cs.body(&bh))
+            .and_then(|b| b.transactions.iter().find(|t| t.txid() == txid).cloned())
+            .or_else(|| mgr.mempool_ref().get(&txid).cloned());
+        if let Some(tx) = tx {
+            // BIP174: non_witness_utxo serializes without witness
+            // data (`SER_NETWORK` legacy form).
+            let mut raw = Vec::new();
+            tx.write_without_witness(&mut raw);
+            psbt.inputs[i].set(vec![Psbt::IN_NON_WITNESS_UTXO], raw);
+        }
+    }
+    // Missing prev txs fall back to the UTXO set — only segwit
+    // outputs become witness_utxo (Core's IsSegWitOutput consults the
+    // provider for P2SH wraps).
+    for i in 0..psbt.tx.inputs.len() {
+        if psbt.inputs[i].get(Psbt::IN_NON_WITNESS_UTXO).is_some() {
+            continue;
+        }
+        let prevout = psbt.tx.inputs[i].previous_output;
+        if let Some(coin) = cs.utxo().get(&prevout)
+            && is_segwit_output(&provider, &coin.out.script_pubkey)
+        {
+            let mut v = coin.out.value.to_le_bytes().to_vec();
+            avila_consensus::encode::write_var_bytes(&mut v, coin.out.script_pubkey.as_bytes());
+            psbt.inputs[i].set(vec![Psbt::IN_WITNESS_UTXO], v);
+        }
+    }
+    let txdata = precompute_psbt_data(psbt);
+    for i in 0..psbt.tx.inputs.len() {
+        if psbt_input_signed(&psbt.inputs[i]) {
+            continue;
+        }
+        sign_psbt_input(
+            &provider,
+            psbt,
+            i,
+            Some(&txdata),
+            sighash,
+            false,
+            None,
+            finalize,
+        );
+    }
+    for i in 0..psbt.tx.outputs.len() {
+        update_psbt_output(&provider, psbt, i);
+    }
+    // `RemoveUnnecessaryTransactions(psbtx, 1)` — Core hardcodes the
+    // sighash to SIGHASH_ALL here, not the caller's value.
+    remove_unnecessary_transactions(psbt, 1);
+    Ok(())
 }
 
 /// Core's `ScriptToUniv` with `include_hex`/`include_address` — the
@@ -2149,6 +2292,8 @@ const ANALYZEPSBT_HELP: &str = "analyzepsbt \"psbt\"\n\nAnalyzes and provides in
 
 const UTXOUPDATEPSBT_HELP: &str = "utxoupdatepsbt \"psbt\" ( [\"\",{\"desc\":\"str\",\"range\":n or [n,n]},...] )\n\nUpdates all segwit inputs and outputs in a PSBT with data from output descriptors, the UTXO set, txindex, or the mempool.\n\nArguments:\n1. psbt                          (string, required) A base64 string of a PSBT\n2. descriptors                   (json array, optional) An array of either strings or objects\n     [\n       \"\",                       (string) An output descriptor\n       {                         (json object) An object with an output descriptor and extra information\n         \"desc\": \"str\",          (string, required) An output descriptor\n         \"range\": n or [n,n],    (numeric or array, optional, default=1000) Up to what index HD chains should be explored (either end or [begin,end])\n       },\n       ...\n     ]\n\nResult:\n\"str\"    (string) The base64-encoded partially signed transaction with inputs updated\n\nExamples:\n> bitcoin-cli utxoupdatepsbt \"psbt\"\n";
 
+const DESCRIPTORPROCESSPSBT_HELP: &str = "descriptorprocesspsbt \"psbt\" [\"\",{\"desc\":\"str\",\"range\":n or [n,n]},...] ( \"sighashtype\" bip32derivs finalize )\n\nUpdate all segwit inputs in a PSBT with information from output descriptors, the UTXO set or the mempool. \nThen, sign the inputs we are able to with information from the output descriptors. \n\nArguments:\n1. psbt                          (string, required) The transaction base64 string\n2. descriptors                   (json array, required) An array of either strings or objects\n     [\n       \"\",                       (string) An output descriptor\n       {                         (json object) An object with an output descriptor and extra information\n         \"desc\": \"str\",          (string, required) An output descriptor\n         \"range\": n or [n,n],    (numeric or array, optional, default=1000) Up to what index HD chains should be explored (either end or [begin,end])\n       },\n       ...\n     ]\n3. sighashtype                   (string, optional, default=\"DEFAULT for Taproot, ALL otherwise\") The signature hash type to sign with if not specified by the PSBT. Must be one of\n                                 \"DEFAULT\"\n                                 \"ALL\"\n                                 \"NONE\"\n                                 \"SINGLE\"\n                                 \"ALL|ANYONECANPAY\"\n                                 \"NONE|ANYONECANPAY\"\n                                 \"SINGLE|ANYONECANPAY\"\n4. bip32derivs                   (boolean, optional, default=true) Include BIP 32 derivation paths for public keys if we know them\n5. finalize                      (boolean, optional, default=true) Also finalize inputs if possible\n\nResult:\n{                             (json object)\n  \"psbt\" : \"str\",             (string) The base64-encoded partially signed transaction\n  \"complete\" : true|false,    (boolean) If the transaction has a complete set of signatures\n  \"hex\" : \"hex\"               (string, optional) The hex-encoded network transaction if complete\n}\n\nExamples:\n> bitcoin-cli descriptorprocesspsbt \"psbt\" \"[\\\"descriptor1\\\", \\\"descriptor2\\\"]\"\n> bitcoin-cli descriptorprocesspsbt \"psbt\" \"[{\\\"desc\\\":\\\"mydescriptor\\\", \\\"range\\\":21}]\"\n";
+
 const FINALIZEPSBT_HELP: &str = "finalizepsbt \"psbt\" ( extract )\n\nFinalize the inputs of a PSBT. If the transaction is fully signed, it will produce a\nnetwork serialized transaction which can be broadcast with sendrawtransaction. Otherwise a PSBT will be\ncreated which has the final_scriptSig and final_scriptwitness fields filled for inputs that are complete.\nImplements the Finalizer and Extractor roles.\n\nArguments:\n1. psbt       (string, required) A base64 string of a PSBT\n2. extract    (boolean, optional, default=true) If true and the transaction is complete,\n              extract and return the complete transaction in normal network serialization instead of the PSBT.\n\nResult:\n{                             (json object)\n  \"psbt\" : \"str\",             (string, optional) The base64-encoded partially signed transaction if not extracted\n  \"hex\" : \"hex\",              (string, optional) The hex-encoded network transaction if extracted\n  \"complete\" : true|false     (boolean) If the transaction has a complete set of signatures\n}\n\nExamples:\n> bitcoin-cli finalizepsbt \"psbt\"\n";
 
 const JOINPSBTS_HELP: &str = "joinpsbts [\"psbt\",...]
@@ -3343,6 +3488,17 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         "decodepsbt",
         &[("psbt", Some("string"), true)],
         DECODEPSBT_HELP,
+    ),
+    (
+        "descriptorprocesspsbt",
+        &[
+            ("psbt", Some("string"), true),
+            ("descriptors", None, true),
+            ("sighashtype", Some("string"), false),
+            ("bip32derivs", Some("bool"), false),
+            ("finalize", Some("bool"), false),
+        ],
+        DESCRIPTORPROCESSPSBT_HELP,
     ),
     (
         "finalizepsbt",
@@ -6941,86 +7097,10 @@ fn dispatch(
                 .cloned()
                 .unwrap_or(Value::Null);
             chain_query(queries, move |cs, mgr| {
-                use avila_consensus::psbt::Psbt;
-                use avila_consensus::sign::{
-                    Creator, is_segwit_output, precompute_psbt_data, psbt_input_signed,
-                    remove_unnecessary_transactions, sign_psbt_input, update_psbt_output,
-                };
-                let mut provider = avila_consensus::descriptor::FlatProvider::default();
-                if !descs_arg.is_null() {
-                    let Some(arr) = descs_arg.as_array() else {
-                        return Err((
-                            RPC_TYPE_ERROR,
-                            wrong_type_message(2, "descriptors", &descs_arg, "array"),
-                        ));
-                    };
-                    for d in arr {
-                        let (_, p) = eval_scan_object(d, cs.tree().params())?;
-                        provider.keys.extend(p.keys);
-                        provider.xprvs.extend(p.xprvs);
-                        provider.pubkeys.extend(p.pubkeys);
-                        provider.origins.extend(p.origins);
-                        provider.scripts.extend(p.scripts);
-                        provider.tr_trees.extend(p.tr_trees);
-                    }
-                }
-                // Fetch prev txs — txindex first, then the mempool.
-                for i in 0..psbt.tx.inputs.len() {
-                    if psbt.inputs[i].get(Psbt::IN_NON_WITNESS_UTXO).is_some() {
-                        continue;
-                    }
-                    let txid = psbt.tx.inputs[i].previous_output.txid;
-                    let tx = cs
-                        .find_transaction(&txid)
-                        .and_then(|bh| cs.body(&bh))
-                        .and_then(|b| b.transactions.iter().find(|t| t.txid() == txid).cloned())
-                        .or_else(|| mgr.mempool_ref().get(&txid).cloned());
-                    if let Some(tx) = tx {
-                        // BIP174: non_witness_utxo serializes without
-                        // witness data (`SER_NETWORK` legacy form).
-                        let mut raw = Vec::new();
-                        tx.write_without_witness(&mut raw);
-                        psbt.inputs[i].set(vec![Psbt::IN_NON_WITNESS_UTXO], raw);
-                    }
-                }
-                // Missing prev txs fall back to the UTXO set — only
-                // segwit outputs become witness_utxo (Core's
-                // IsSegWitOutput consults the provider for P2SH wraps).
-                for i in 0..psbt.tx.inputs.len() {
-                    if psbt.inputs[i].get(Psbt::IN_NON_WITNESS_UTXO).is_some() {
-                        continue;
-                    }
-                    let prevout = psbt.tx.inputs[i].previous_output;
-                    if let Some(coin) = cs.utxo().get(&prevout)
-                        && is_segwit_output(&provider, &coin.out.script_pubkey)
-                    {
-                        let mut v = coin.out.value.to_le_bytes().to_vec();
-                        avila_consensus::encode::write_var_bytes(
-                            &mut v,
-                            coin.out.script_pubkey.as_bytes(),
-                        );
-                        psbt.inputs[i].set(vec![Psbt::IN_WITNESS_UTXO], v);
-                    }
-                }
-                let txdata = precompute_psbt_data(&psbt);
-                for i in 0..psbt.tx.inputs.len() {
-                    if psbt_input_signed(&psbt.inputs[i]) {
-                        continue;
-                    }
-                    sign_psbt_input(
-                        &provider,
-                        &mut psbt,
-                        i,
-                        Some(&txdata),
-                        Creator::Real,
-                        None,
-                        false,
-                    );
-                }
-                for i in 0..psbt.tx.outputs.len() {
-                    update_psbt_output(&provider, &mut psbt, i);
-                }
-                remove_unnecessary_transactions(&mut psbt, 1);
+                // `HidingSigningProvider(provider, hide_secret=true,
+                // hide_origin=false)`, `sighash_type=SIGHASH_ALL`,
+                // `finalize=false`.
+                process_psbt(&mut psbt, &descs_arg, 1, false, true, false, false, cs, mgr)?;
                 Ok(json!(base64_encode(&psbt.encode())))
             })
         }
@@ -7076,7 +7156,8 @@ fn dispatch(
                     &mut psbt,
                     i,
                     Some(&txdata),
-                    avila_consensus::sign::Creator::Real,
+                    1, // SIGHASH_ALL
+                    false,
                     None,
                     true,
                 );
@@ -7100,6 +7181,88 @@ fn dispatch(
             }
             result.insert("complete".into(), json!(complete));
             (Value::Object(result), None)
+        }
+        // `descriptorprocesspsbt` — ProcessPSBT over the private-
+        // capable provider the descriptors build (`hide_secret=false`,
+        // `hide_origin=!bip32derivs`), then `PSBTInputSigned` on every
+        // input; a complete PSBT also returns the extracted hex via
+        // `FinalizeAndExtractPSBT` on a copy.
+        "descriptorprocesspsbt" => {
+            let raw = match params[0].as_str() {
+                Some(s) => s,
+                None => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            wrong_type_message(1, "psbt", &params[0], "string"),
+                        )),
+                    );
+                }
+            };
+            let Some(bytes) = base64_decode_strict(raw) else {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_DESERIALIZATION_ERROR,
+                        "TX decode failed invalid base64".into(),
+                    )),
+                );
+            };
+            let mut psbt = match avila_consensus::psbt::Psbt::decode(&bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_DESERIALIZATION_ERROR,
+                            format!("TX decode failed {}", e.core_message()),
+                        )),
+                    );
+                }
+            };
+            let descs_arg = param(params, 1, "descriptors")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let sighash =
+                match parse_sighash_string(param(params, 2, "sighashtype").unwrap_or(&Value::Null))
+                {
+                    Ok(s) => s,
+                    Err(e) => return (Value::Null, Some(e)),
+                };
+            let bip32derivs = param(params, 3, "bip32derivs")
+                .map(|v| v.is_null() || v.as_bool().unwrap_or(false))
+                .unwrap_or(true);
+            let finalize = param(params, 4, "finalize")
+                .map(|v| v.is_null() || v.as_bool().unwrap_or(false))
+                .unwrap_or(true);
+            chain_query(queries, move |cs, mgr| {
+                process_psbt(
+                    &mut psbt,
+                    &descs_arg,
+                    sighash,
+                    finalize,
+                    false,
+                    !bip32derivs,
+                    true,
+                    cs,
+                    mgr,
+                )?;
+                let complete = psbt
+                    .inputs
+                    .iter()
+                    .all(avila_consensus::sign::psbt_input_signed);
+                let mut result = serde_json::Map::new();
+                result.insert("psbt".into(), json!(base64_encode(&psbt.encode())));
+                result.insert("complete".into(), json!(complete));
+                if complete {
+                    let mut copy = psbt.clone();
+                    if let Some(tx) = avila_consensus::sign::finalize_and_extract_psbt(&mut copy) {
+                        result.insert("hex".into(), json!(hex::encode(&tx.encode())));
+                    }
+                }
+                Ok(Value::Object(result))
+            })
         }
         // Core's createmultisig (rpc/output_script.cpp) — n-of-m
         // multisig construction: keys parse first (HexToPubKey), then
@@ -7427,7 +7590,7 @@ fn dispatch(
                 let derive = |desc: &avila_consensus::descriptor::Descriptor| {
                     let mut addresses = Vec::new();
                     for i in lo..=hi {
-                        let Some(scripts) = desc.expand(i as u32, &provider, params) else {
+                        let Some(scripts) = desc.expand(i as u32, &provider) else {
                             return Err((
                                 RPC_INVALID_ADDRESS_OR_KEY,
                                 "Cannot derive script without private keys".to_string(),
@@ -8058,7 +8221,7 @@ fn dispatch(
                 let mut watch: std::collections::HashSet<Vec<u8>> =
                     std::collections::HashSet::new();
                 for scanobject in objects {
-                    let (scripts, _provider) = eval_scan_object(scanobject, params)?;
+                    let (scripts, _provider) = eval_scan_object(scanobject, params, false)?;
                     watch.extend(scripts);
                 }
 
@@ -8285,7 +8448,8 @@ fn dispatch(
                         let mut descriptors: std::collections::HashMap<Vec<u8>, String> =
                             std::collections::HashMap::new();
                         for scanobject in scanobjects.as_array().map(Vec::as_slice).unwrap_or(&[]) {
-                            let (scripts, out_provider) = eval_scan_object(scanobject, params)?;
+                            let (scripts, out_provider) =
+                                eval_scan_object(scanobject, params, false)?;
                             for script in scripts {
                                 if needles.insert(script.clone()) {
                                     let inferred = infer_descriptor(&script, &out_provider, params);
@@ -8487,7 +8651,7 @@ fn dispatch(
                             .into(),
                     ));
                 }
-                let Some(scripts) = desc.expand(0, &provider, &params) else {
+                let Some(scripts) = desc.expand(0, &provider) else {
                     return Err((
                         RPC_INVALID_ADDRESS_OR_KEY,
                         "Cannot derive script without private keys".into(),
@@ -9836,6 +10000,8 @@ fn dispatch(
                      \x20   createpsbt <in> <out> [lt] [rbf], converttopsbt <hex> [ok] [wit],\n\
                      \x20   combinepsbt <psbts>, joinpsbts <psbts>, analyzepsbt <psbt>,\n\
                      \x20   utxoupdatepsbt <psbt> [descs],\n\
+                     \x20   descriptorprocesspsbt <psbt> <descs> [sighashtype] [bip32derivs] [finalize],\n\
+                     \x20   finalizepsbt <psbt> [extract],\n\
                      \x20   gettxoutproof <txids> [blockhash] [options],\n\
                      \x20   verifytxoutproof <proof> [options], validateaddress <address>,\n\
                      \x20   verifymessage <address> <sig> <msg>,\n\

@@ -376,12 +376,23 @@ operation. Compare complete initial download and catch-up, not only local replay
       Core's canonical per-scope order (typed fields, proprietary,
       unknown). finalizepsbt runs FinalizeAndExtractPSBT — partial
       sigs assemble into verified final scripts, {hex, complete}
-      when extracted.
+      when extracted. descriptorprocesspsbt runs the same
+      ProcessPSBT pipeline with real signing: descriptors expand
+      with private material (ExpandPrivate), ECDSA signs through
+      secp256k1's low-R grinding (byte-identical to Core's RFC6979
+      + extra-entropy loop) and Schnorr through BIP341/342
+      sighashes with TapTweak key-path and leaf script-path
+      spends; sighashtype, bip32derivs (hide_origin), and
+      finalize flags match Core's argument handling.
       Verified
       byte-identical against
       Core 29.4 including a live spend+receive, a real
-      parent+child package, and funded/signed P2WPKH + taproot
-      PSBTs (joinpsbts compared semantically — Core's join
+      parent+child package, funded/signed P2WPKH + taproot
+      PSBTs, and live descriptorprocesspsbt signing across
+      pkh, wpkh, sh(wpkh), wsh(sortedmulti 2-of-2), tr key-path
+      and script-path, every sighash mode, finalize=false,
+      bip32derivs=false, and missing-key/error cases
+      (joinpsbts compared semantically — Core's join
       ordering is salted-unordered-map random). Outbound
       dialing is
       asynchronous —

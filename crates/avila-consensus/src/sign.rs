@@ -67,14 +67,31 @@ fn standard_flags() -> crate::script::ScriptFlags {
         .union(F::DISCOURAGE_UPGRADABLE_PUBKEYTYPE)
 }
 
-/// Which `BaseSignatureCreator` a pass runs — the provider is always
-/// empty, so the only difference is what happens when no signature is
-/// already available for a key.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Creator {
-    /// `MutableTransactionSignatureCreator` + empty provider: creating
-    /// a signature always fails and records `missing_sigs`.
-    Real,
+/// `MutableTransactionSignatureCreator`'s context — the transaction,
+/// input position, spent amount, precomputed sighash data, and
+/// `nHashType` the pass signs with.
+pub struct SignerEnv<'a> {
+    /// `m_txto`.
+    pub tx: &'a Transaction,
+    /// `nIn`.
+    pub n_in: usize,
+    /// `amount` — the spent output's value.
+    pub amount: i64,
+    /// `m_txdata`.
+    pub txdata: &'a PrecomputedTransactionData,
+    /// `nHashType` — `SIGHASH_DEFAULT` (0) reaches Schnorr signing
+    /// as-is and normalizes to `SIGHASH_ALL` for ECDSA.
+    pub sighash: i32,
+}
+
+/// Which `BaseSignatureCreator` a pass runs. `Real` signs through the
+/// provider's private keys (an empty provider — `DUMMY_SIGNING_PROVIDER`
+/// — always fails, recording `missing_sigs`); `Dummy` produces
+/// placeholder signatures for size estimation.
+#[derive(Clone, Copy)]
+pub enum Creator<'a> {
+    /// `MutableTransactionSignatureCreator`.
+    Real(&'a SignerEnv<'a>),
     /// `DUMMY_SIGNATURE_CREATOR`: 71-byte ECDSA / 64-byte Schnorr
     /// placeholders, no key needed.
     Dummy,
@@ -628,6 +645,10 @@ struct TapNode {
     leaves: Vec<TapLeaf>,
 }
 
+/// `spend_data`'s result — `(script, leaf_ver) → control blocks` for
+/// every leaf, plus the merkle root (`GetSpendData`).
+pub type TaprootSpendResult = (BTreeMap<(Vec<u8>, u8), Vec<Vec<u8>>>, Option<[u8; 32]>);
+
 impl TaprootTreeBuilder {
     /// `Add` — hash the leaf, `Insert` at `depth`.
     pub fn add(&mut self, depth: u8, script: &[u8], leaf_ver: u8) {
@@ -652,7 +673,9 @@ impl TaprootTreeBuilder {
             return;
         }
         while self.valid && self.branch.len() > depth && self.branch[depth].is_some() {
-            let other = self.branch.pop().flatten().expect("checked");
+            let Some(other) = self.branch.pop().flatten() else {
+                break;
+            };
             node = combine_nodes(node, other);
             if depth == 0 {
                 self.valid = false;
@@ -678,10 +701,7 @@ impl TaprootTreeBuilder {
     /// root and emit `(script, leaf_ver) → control blocks` plus the
     /// merkle root. `None` when the tree is incomplete or the tweak
     /// fails.
-    pub fn spend_data(
-        &mut self,
-        internal_key: [u8; 32],
-    ) -> Option<(BTreeMap<(Vec<u8>, u8), Vec<Vec<u8>>>, Option<[u8; 32]>)> {
+    pub fn spend_data(&mut self, internal_key: [u8; 32]) -> Option<TaprootSpendResult> {
         if !self.is_complete() {
             return None;
         }
@@ -690,11 +710,11 @@ impl TaprootTreeBuilder {
         // root omitted entirely for a key-path-only builder.
         let tag = sha256(b"TapTweak");
         let mut h = Sha256::new();
-        h.update(&tag);
-        h.update(&tag);
-        h.update(&internal_key);
+        h.update(tag);
+        h.update(tag);
+        h.update(internal_key);
         if let Some(n) = root {
-            h.update(&n.hash);
+            h.update(n.hash);
         }
         let tweak: [u8; 32] = h.finalize().into();
         let internal = secp256k1::XOnlyPublicKey::from_slice(&internal_key).ok()?;
@@ -810,9 +830,17 @@ fn get_key_origin(provider: &FlatProvider, keyid: &[u8; 20]) -> Option<Vec<u8>> 
 /// `GetKeyOriginByXOnly` — scan origins for the key whose x-coordinate
 /// matches (compressed and uncompressed keys share `key[1..33]`).
 fn get_key_origin_by_xonly(provider: &FlatProvider, xonly: &[u8; 32]) -> Option<Vec<u8>> {
-    provider.origins.values().find_map(|(pk, (fp, path))| {
-        (pk.len() >= 33 && pk[1..33] == xonly[..]).then(|| key_origin_value(fp, path))
-    })
+    // `GetKeyOriginByXOnly` — `GetKeyIDsByXOnly` yields the even-then-
+    // odd compressed-pubkey keyids; the first origin found wins.
+    for prefix in [0x02u8, 0x03] {
+        let mut pk = [0u8; 33];
+        pk[0] = prefix;
+        pk[1..].copy_from_slice(xonly);
+        if let Some((_, (fp, path))) = provider.origins.get(&hash160(&pk)) {
+            return Some(key_origin_value(fp, path));
+        }
+    }
+    None
 }
 
 /// `SerializeHDKeypath` — `fingerprint || path elements` little-endian.
@@ -844,12 +872,15 @@ fn dummy_ecdsa_sig() -> Vec<u8> {
 
 /// `CreateSig` — reuse an existing partial sig, else attach the
 /// provider's key origin and create through the pass's creator.
-/// `Real` failures record `missing_sigs`.
+/// `Real` failures record `missing_sigs` (Core's wrapper pushes the
+/// keyid on any `creator.CreateSig` failure).
 fn create_sig(
     sigdata: &mut SignatureData,
     pubkey: &[u8],
     mode: Creator,
     provider: &FlatProvider,
+    script_code: &[u8],
+    sigversion: SigVersion,
 ) -> Option<Vec<u8>> {
     let keyid = hash160(pubkey);
     if let Some((_, sig)) = sigdata.signatures.get(&keyid) {
@@ -860,19 +891,53 @@ fn create_sig(
             .misc_pubkeys
             .insert(keyid, (pubkey.to_vec(), origin));
     }
-    match mode {
-        Creator::Dummy => {
-            let sig = dummy_ecdsa_sig();
-            sigdata
-                .signatures
-                .insert(keyid, (pubkey.to_vec(), sig.clone()));
-            Some(sig)
+    let sig = match mode {
+        Creator::Dummy => dummy_ecdsa_sig(),
+        // `MutableTransactionSignatureCreator::CreateSig`.
+        Creator::Real(env) => {
+            let Some(secret) = provider.keys.get(&keyid) else {
+                sigdata.missing_sigs.push(keyid);
+                return None;
+            };
+            // Uncompressed keys cannot sign witness scripts; the
+            // pubkey that produced `keyid` carries the compression.
+            if sigversion == SigVersion::WitnessV0 && pubkey.len() != 33 {
+                sigdata.missing_sigs.push(keyid);
+                return None;
+            }
+            if sigversion == SigVersion::WitnessV0 && !(0..=MAX_MONEY).contains(&env.amount) {
+                sigdata.missing_sigs.push(keyid);
+                return None;
+            }
+            // BASE/WITNESS_V0 don't support explicit SIGHASH_DEFAULT.
+            let hashtype = if env.sighash == 0 {
+                SIGHASH_ALL as i32
+            } else {
+                env.sighash
+            };
+            let hash = crate::sigchecker::signature_hash(
+                &Script::new(script_code.to_vec()),
+                env.tx,
+                env.n_in,
+                hashtype,
+                env.amount,
+                sigversion,
+                Some(env.txdata),
+            );
+            let secp = secp256k1::Secp256k1::new();
+            let msg = secp256k1::Message::from_digest(hash);
+            // `CKey::Sign(hash, vch, grind=true)` — RFC6979 with
+            // LE32-counter extra-entropy retries until low-R.
+            let sig = secp.sign_ecdsa_low_r(&msg, secret);
+            let mut vch = sig.serialize_der().to_vec();
+            vch.push(hashtype as u8);
+            vch
         }
-        Creator::Real => {
-            sigdata.missing_sigs.push(keyid);
-            None
-        }
-    }
+    };
+    sigdata
+        .signatures
+        .insert(keyid, (pubkey.to_vec(), sig.clone()));
+    Some(sig)
 }
 
 /// `CreateTaprootScriptSig` — a `(xonly, leaf_hash)`-keyed schnorr sig;
@@ -903,24 +968,111 @@ fn create_taproot_script_sig(
     if let Some(sig) = sigdata.taproot_script_sigs.get(&(*xonly, *leaf_hash)) {
         return Some(sig.clone());
     }
-    match mode {
-        Creator::Dummy => {
-            let sig = vec![0u8; 64];
-            sigdata
-                .taproot_script_sigs
-                .insert((*xonly, *leaf_hash), sig.clone());
-            Some(sig)
-        }
-        Creator::Real => None,
-    }
+    let sig = match mode {
+        Creator::Dummy => vec![0u8; 64],
+        // `CreateSchnorrSig(provider, sig, xonly, &leaf_hash, nullptr,
+        // TAPSCRIPT)` — untweaked script-path signature.
+        Creator::Real(_) => create_schnorr_sig(
+            provider,
+            xonly,
+            Some(leaf_hash),
+            None,
+            SigVersion::Tapscript,
+            mode,
+        )?,
+    };
+    sigdata
+        .taproot_script_sigs
+        .insert((*xonly, *leaf_hash), sig.clone());
+    Some(sig)
 }
 
-/// `creator.CreateSchnorrSig` for the key path — a 64-byte sig, no
-/// missing recording (real mode: the empty provider has no key).
-fn create_schnorr_keypath(mode: Creator) -> Option<Vec<u8>> {
+/// `provider.GetKeyByXOnly` — both compressed-pubkey keyids derived
+/// from the x-only key, even-then-odd like `GetKeyIDsByXOnly`.
+fn get_key_by_xonly<'a>(
+    provider: &'a FlatProvider,
+    xonly: &[u8; 32],
+) -> Option<&'a secp256k1::SecretKey> {
+    for prefix in [0x02u8, 0x03] {
+        let mut pk = [0u8; 33];
+        pk[0] = prefix;
+        pk[1..].copy_from_slice(xonly);
+        if let Some(k) = provider.keys.get(&hash160(&pk)) {
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// `MutableTransactionSignatureCreator::CreateSchnorrSig` —
+/// `GetKeyByXOnly`, BIP341/342 precomputed-data requirements, and
+/// `CKey::SignSchnorr`'s `ComputeKeyPair(merkle_root)` tweak: a
+/// non-`None` `merkle_root` always tweaks (`TapTweak(internal ||
+/// root)` with a null root hashing the key alone); `None` signs with
+/// the raw keypair.
+fn create_schnorr_sig(
+    provider: &FlatProvider,
+    pubkey: &[u8; 32],
+    leaf_hash: Option<&[u8; 32]>,
+    merkle_root: Option<&[u8; 32]>,
+    sigversion: SigVersion,
+    mode: Creator,
+) -> Option<Vec<u8>> {
     match mode {
         Creator::Dummy => Some(vec![0u8; 64]),
-        Creator::Real => None,
+        Creator::Real(env) => {
+            let secret = get_key_by_xonly(provider, pubkey)?;
+            if !env.txdata.bip341_taproot_ready || !env.txdata.spent_outputs_ready {
+                return None;
+            }
+            let mut execdata = crate::interpreter::ExecutionData {
+                annex_init: true,
+                annex_present: false,
+                ..crate::interpreter::ExecutionData::default()
+            };
+            if sigversion == SigVersion::Tapscript {
+                execdata.codeseparator_pos_init = true;
+                execdata.codeseparator_pos = 0xFFFF_FFFF;
+                execdata.tapleaf_hash_init = true;
+                execdata.tapleaf_hash = Some(*leaf_hash?);
+            }
+            let sighash = env.sighash as u8;
+            let hash = crate::sigchecker::signature_hash_schnorr(
+                env.tx,
+                env.n_in,
+                sighash,
+                sigversion,
+                env.txdata,
+                &mut execdata,
+            )?;
+            let secp = secp256k1::Secp256k1::new();
+            let keypair = secp256k1::Keypair::from_secret_key(&secp, secret);
+            let keypair = match merkle_root {
+                Some(root) => {
+                    // `merkle_root->IsNull() ? nullptr : merkle_root`.
+                    let root = (*root != [0; 32]).then_some(*root);
+                    let mut h = Sha256::new();
+                    let tag = sha256(b"TapTweak");
+                    h.update(tag);
+                    h.update(tag);
+                    h.update(pubkey);
+                    if let Some(r) = root {
+                        h.update(r);
+                    }
+                    let tweak: [u8; 32] = h.finalize().into();
+                    let scalar = secp256k1::Scalar::from_be_bytes(tweak).ok()?;
+                    keypair.add_xonly_tweak(&secp, &scalar).ok()?
+                }
+                None => keypair,
+            };
+            let msg = secp256k1::Message::from_digest(hash);
+            let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+            let mut out = sig.serialize().to_vec();
+            if sighash != 0 {
+                out.push(sighash);
+            }
+            Some(out)
+        }
     }
 }
 
@@ -985,13 +1137,26 @@ fn sign_taproot(
             .or_insert((Vec::new(), origin));
     }
     if sigdata.taproot_key_path_sig.is_empty()
-        && sigdata.tr_internal_key.is_some()
-        && let Some(sig) = create_schnorr_keypath(mode)
+        && let Some(internal) = sigdata.tr_internal_key
     {
-        sigdata.taproot_key_path_sig = sig;
+        // `CreateSchnorrSig(provider, sig, internal_key, nullptr,
+        // &tr_spenddata.merkle_root, TAPROOT)` — the pointer is
+        // non-null even when the root is null (tweak without root).
+        let root = sigdata.tr_merkle_root.unwrap_or_default();
+        if let Some(sig) = create_schnorr_sig(
+            provider,
+            &internal,
+            None,
+            Some(&root),
+            SigVersion::Taproot,
+            mode,
+        ) {
+            sigdata.taproot_key_path_sig = sig;
+        }
     }
     if sigdata.taproot_key_path_sig.is_empty()
-        && let Some(sig) = create_schnorr_keypath(mode)
+        && let Some(sig) =
+            create_schnorr_sig(provider, output_key, None, None, SigVersion::Taproot, mode)
     {
         sigdata.taproot_key_path_sig = sig;
     }
@@ -1031,6 +1196,7 @@ fn sign_step(
     script: &[u8],
     sigdata: &mut SignatureData,
     mode: Creator,
+    sigversion: SigVersion,
 ) -> (bool, Vec<Vec<u8>>, StepKind) {
     match Script::new(script.to_vec()).classify() {
         ScriptType::Nonstandard | ScriptType::NullData => (false, Vec::new(), StepKind::Other),
@@ -1039,16 +1205,18 @@ fn sign_step(
         {
             (false, Vec::new(), StepKind::Other)
         }
-        ScriptType::PubKey(pubkey) => match create_sig(sigdata, &pubkey, mode, provider) {
-            Some(sig) => (true, vec![sig], StepKind::Other),
-            None => (false, Vec::new(), StepKind::Other),
-        },
+        ScriptType::PubKey(pubkey) => {
+            match create_sig(sigdata, &pubkey, mode, provider, script, sigversion) {
+                Some(sig) => (true, vec![sig], StepKind::Other),
+                None => (false, Vec::new(), StepKind::Other),
+            }
+        }
         ScriptType::PubKeyHash(h160) => {
             let Some(pubkey) = get_pubkey(sigdata, &h160, provider) else {
                 sigdata.missing_pubkeys.push(h160);
                 return (false, Vec::new(), StepKind::Other);
             };
-            match create_sig(sigdata, &pubkey, mode, provider) {
+            match create_sig(sigdata, &pubkey, mode, provider, script, sigversion) {
                 Some(sig) => (true, vec![sig, pubkey], StepKind::Other),
                 None => (false, Vec::new(), StepKind::Other),
             }
@@ -1063,7 +1231,7 @@ fn sign_step(
         ScriptType::Multisig { required, keys } => {
             let mut ret = vec![Vec::new()];
             for pubkey in &keys {
-                if let Some(sig) = create_sig(sigdata, pubkey, mode, provider)
+                if let Some(sig) = create_sig(sigdata, pubkey, mode, provider, script, sigversion)
                     && ret.len() < required as usize + 1
                 {
                     ret.push(sig);
@@ -1153,8 +1321,13 @@ pub fn produce_signature(
     if sigdata.complete {
         return true;
     }
-    let (mut solved, mut result, mut kind) =
-        sign_step(provider, script_pubkey.as_bytes(), sigdata, mode);
+    let (mut solved, mut result, mut kind) = sign_step(
+        provider,
+        script_pubkey.as_bytes(),
+        sigdata,
+        mode,
+        SigVersion::Base,
+    );
     let mut p2sh = false;
     let mut subscript = Vec::new();
 
@@ -1163,7 +1336,7 @@ pub fn produce_signature(
     if solved && matches!(kind, StepKind::ScriptHash) {
         subscript = result[0].clone();
         sigdata.redeem_script = Some(subscript.clone());
-        let (s2, r2, k2) = sign_step(provider, &subscript, sigdata, mode);
+        let (s2, r2, k2) = sign_step(provider, &subscript, sigdata, mode, SigVersion::Base);
         solved = s2 && !matches!(k2, StepKind::ScriptHash);
         result = r2;
         kind = k2;
@@ -1176,7 +1349,7 @@ pub fn produce_signature(
         wsh.extend_from_slice(&[0x76, 0xa9, 0x14]);
         wsh.extend_from_slice(&result[0]);
         wsh.extend_from_slice(&[0x88, 0xac]);
-        let (s2, r2, _k2) = sign_step(provider, &wsh, sigdata, mode);
+        let (s2, r2, _k2) = sign_step(provider, &wsh, sigdata, mode, SigVersion::WitnessV0);
         solved = s2;
         sigdata.script_witness = Some(r2);
         sigdata.witness = true;
@@ -1186,7 +1359,13 @@ pub fn produce_signature(
     if solved && matches!(kind, StepKind::W0ScriptHash) {
         let witnessscript = result[0].clone();
         sigdata.witness_script = Some(witnessscript.clone());
-        let (s2, mut r2, k2) = sign_step(provider, &witnessscript, sigdata, mode);
+        let (s2, mut r2, k2) = sign_step(
+            provider,
+            &witnessscript,
+            sigdata,
+            mode,
+            SigVersion::WitnessV0,
+        );
         solved = s2
             && !matches!(k2, StepKind::ScriptHash)
             && !matches!(k2, StepKind::W0ScriptHash)
@@ -1244,7 +1423,14 @@ fn satisfy_wsh_miniscript(
 ) -> Option<Vec<Vec<u8>>> {
     // `<33B compressed pubkey> OP_CHECKSIG` — `pk(key)` in P2WSH.
     if script.len() == 35 && script[0] == 0x21 && script[34] == 0xac {
-        let sig = create_sig(sigdata, &script[1..34], mode, provider)?;
+        let sig = create_sig(
+            sigdata,
+            &script[1..34],
+            mode,
+            provider,
+            script,
+            SigVersion::WitnessV0,
+        )?;
         return Some(vec![sig]);
     }
     None
@@ -1289,15 +1475,20 @@ impl SignatureChecker for DummyChecker {
     }
 }
 
-/// `SignPSBTInput` — run one pass over input `index`: `mode`
-/// `Real` collects `missing_*` into `out`, `Dummy` produces final
-/// scripts on the input (for `finalize`/`estimated_vsize`).
+/// `SignPSBTInput` — run one pass over input `index` with `sighash`.
+/// `dummy_creator` picks `DUMMY_SIGNATURE_CREATOR` (size estimation);
+/// otherwise a `MutableTransactionSignatureCreator` signs with the
+/// provider's keys — and, per Core, a missing `txdata` still forces
+/// the dummy creator. `Real` failures collect `missing_*` into `out`;
+/// `finalize` keeps `sigdata.complete` so final scripts are written.
+#[allow(clippy::too_many_arguments)]
 pub fn sign_psbt_input(
     provider: &FlatProvider,
     psbt: &mut Psbt,
     index: usize,
     txdata: Option<&PrecomputedTransactionData>,
-    mode: Creator,
+    sighash: i32,
+    dummy_creator: bool,
     out: Option<&mut SignatureData>,
     finalize: bool,
 ) -> bool {
@@ -1343,16 +1534,37 @@ pub fn sign_psbt_input(
     }
 
     sigdata.witness = false;
+    // `MutableTransactionSignatureCreator` when the pass signs for
+    // real and `txdata` exists; `txdata == nullptr` or an explicit
+    // dummy request runs `DUMMY_SIGNATURE_CREATOR`.
+    let env = if dummy_creator {
+        None
+    } else {
+        txdata.map(|td| SignerEnv {
+            tx: &psbt.tx,
+            n_in: index,
+            amount: utxo.value,
+            txdata: td,
+            sighash,
+        })
+    };
+    let creator = env.as_ref().map_or(Creator::Dummy, Creator::Real);
     let sig_complete = match txdata {
         Some(td) => {
             let checker = TransactionSignatureChecker::new(&psbt.tx, index, utxo.value, td);
-            produce_signature(provider, &utxo.script_pubkey, &mut sigdata, mode, &checker)
+            produce_signature(
+                provider,
+                &utxo.script_pubkey,
+                &mut sigdata,
+                creator,
+                &checker,
+            )
         }
         None => produce_signature(
             provider,
             &utxo.script_pubkey,
             &mut sigdata,
-            mode,
+            creator,
             &DummyChecker,
         ),
     };
@@ -1379,6 +1591,36 @@ pub fn sign_psbt_input(
         out.missing_witness_script = sigdata.missing_witness_script;
     }
     sig_complete
+}
+
+/// `FinalizeAndExtractPSBT` — finalize every input (empty provider,
+/// real checker), then move final scriptSigs/witnesses into the
+/// transaction. `None` when any input stays incomplete.
+#[must_use]
+pub fn finalize_and_extract_psbt(psbt: &mut Psbt) -> Option<Transaction> {
+    let txdata = precompute_psbt_data(psbt);
+    let provider = FlatProvider::default();
+    let mut complete = true;
+    for i in 0..psbt.tx.inputs.len() {
+        complete &= sign_psbt_input(&provider, psbt, i, Some(&txdata), 1, false, None, true);
+    }
+    if !complete {
+        return None;
+    }
+    let mut tx = psbt.tx.clone();
+    for (i, input) in tx.inputs.iter_mut().enumerate() {
+        input.script_sig = Script::new(
+            psbt.inputs[i]
+                .get(Psbt::IN_FINAL_SCRIPTSIG)
+                .map_or_else(Vec::new, |v| v.to_vec()),
+        );
+        input.witness = psbt.inputs[i]
+            .get(Psbt::IN_FINAL_SCRIPTWITNESS)
+            .and_then(decode_witness_stack)
+            .map(Witness::new)
+            .unwrap_or_default();
+    }
+    Some(tx)
 }
 
 /// `PSBTInputSigned` — a final scriptSig or a non-null final witness
@@ -1459,7 +1701,7 @@ pub fn update_psbt_output(provider: &FlatProvider, psbt: &mut Psbt, index: usize
         provider,
         &out.script_pubkey,
         &mut sigdata,
-        Creator::Real,
+        Creator::Dummy,
         &DummyChecker,
     );
     sigdata.store_into_output(&mut psbt.outputs[index]);
@@ -1658,7 +1900,8 @@ pub fn analyze_psbt(psbt: &Psbt) -> Analysis {
                 &mut owned,
                 i,
                 Some(&txdata),
-                Creator::Real,
+                SIGHASH_ALL as i32,
+                false,
                 Some(&mut outdata),
                 false,
             );
@@ -1721,7 +1964,8 @@ pub fn analyze_psbt(psbt: &Psbt) -> Analysis {
                 &mut owned,
                 i,
                 None,
-                Creator::Dummy,
+                SIGHASH_ALL as i32,
+                true,
                 None,
                 true,
             ) {
@@ -1836,11 +2080,25 @@ mod tests {
         );
 
         let mut sigdata = SignatureData::default();
+        let tx = Transaction {
+            version: 2,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            lock_time: 0,
+        };
+        let txdata = PrecomputedTransactionData::default();
+        let env = SignerEnv {
+            tx: &tx,
+            n_in: 0,
+            amount: 0,
+            txdata: &txdata,
+            sighash: 1,
+        };
         produce_signature(
             &provider,
             &Script::new(spk),
             &mut sigdata,
-            Creator::Real,
+            Creator::Real(&env),
             &DummyChecker,
         );
         assert_eq!(sigdata.redeem_script.as_deref(), Some(&redeem[..]));
@@ -1908,5 +2166,344 @@ mod tests {
         assert_eq!(deriv.len(), 1);
         assert_eq!(deriv[0].0[..], pubkey[..]);
         assert_eq!(deriv[0].1[..4], [0x11, 0x22, 0x33, 0x44]);
+    }
+
+    /// A one-input PSBT spending `spk` via `witness_utxo` (50k sats
+    /// in, half out to an OP_1 output).
+    fn psbt_spending(spk: &[u8]) -> Psbt {
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![crate::transaction::TxIn {
+                previous_output: OutPoint {
+                    txid: crate::hash::Txid::from_bytes([0x22; 32]),
+                    vout: 0,
+                },
+                script_sig: Script::new(Vec::new()),
+                sequence: 0xffff_ffff,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 25_000,
+                script_pubkey: Script::new(vec![0x51]),
+            }],
+            lock_time: 0,
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx);
+        let mut v = 50_000i64.to_le_bytes().to_vec();
+        crate::encode::write_var_bytes(&mut v, spk);
+        psbt.inputs[0].set(vec![Psbt::IN_WITNESS_UTXO], v);
+        psbt
+    }
+
+    fn compressed_keyid(xonly: &[u8; 32], prefix: u8) -> [u8; 20] {
+        let mut pk = vec![prefix];
+        pk.extend_from_slice(xonly);
+        hash160(&pk)
+    }
+
+    /// `TapTweak(pubkey || root?)` — descriptor.rs's tagged hash.
+    fn tap_tweak(xonly: &[u8; 32], root: Option<&[u8; 32]>) -> [u8; 32] {
+        let tag = sha256(b"TapTweak");
+        let mut h = Sha256::new();
+        h.update(tag);
+        h.update(tag);
+        h.update(xonly);
+        if let Some(r) = root {
+            h.update(r);
+        }
+        h.finalize().into()
+    }
+
+    /// `descriptorprocesspsbt`'s signer path — a P2WPKH input signs,
+    /// finalizes, verifies, and extracts.
+    #[test]
+    fn sign_psbt_input_p2wpkh_signs() {
+        let secp = secp256k1::Secp256k1::new();
+        let secret = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret)
+            .serialize()
+            .to_vec();
+        let keyid = hash160(&pubkey);
+        let mut spk = vec![0x00, 0x14];
+        spk.extend_from_slice(&keyid);
+        let mut psbt = psbt_spending(&spk);
+        let mut provider = FlatProvider::default();
+        provider.keys.insert(keyid, secret);
+        provider.pubkeys.insert(keyid, pubkey.clone());
+        let txdata = precompute_psbt_data(&psbt);
+        assert!(sign_psbt_input(
+            &provider,
+            &mut psbt,
+            0,
+            Some(&txdata),
+            1,
+            false,
+            None,
+            true,
+        ));
+        assert!(psbt_input_signed(&psbt.inputs[0]));
+        let wit = decode_witness_stack(psbt.inputs[0].get(Psbt::IN_FINAL_SCRIPTWITNESS).unwrap())
+            .unwrap();
+        assert_eq!(wit.len(), 2);
+        assert_eq!(wit[0].last(), Some(&1)); // SIGHASH_ALL byte
+        assert_eq!(wit[1], pubkey);
+        assert!(finalize_and_extract_psbt(&mut psbt).is_some());
+    }
+
+    /// A pubkey-only provider reports `missing_pubkeys`; adding the
+    /// pubkey without the secret reports `missing_sigs` instead.
+    #[test]
+    fn sign_psbt_input_p2wpkh_missing() {
+        let secp = secp256k1::Secp256k1::new();
+        let secret = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret)
+            .serialize()
+            .to_vec();
+        let keyid = hash160(&pubkey);
+        let mut spk = vec![0x00, 0x14];
+        spk.extend_from_slice(&keyid);
+        let mut psbt = psbt_spending(&spk);
+        let txdata = precompute_psbt_data(&psbt);
+        let mut out = SignatureData::default();
+        assert!(!sign_psbt_input(
+            &FlatProvider::default(),
+            &mut psbt,
+            0,
+            Some(&txdata),
+            1,
+            false,
+            Some(&mut out),
+            true,
+        ));
+        assert_eq!(out.missing_pubkeys, vec![keyid]);
+        assert!(out.missing_sigs.is_empty());
+        // Pubkey known but no secret → missing_sigs.
+        let mut provider = FlatProvider::default();
+        provider.pubkeys.insert(keyid, pubkey);
+        let mut out = SignatureData::default();
+        assert!(!sign_psbt_input(
+            &provider,
+            &mut psbt,
+            0,
+            Some(&txdata),
+            1,
+            false,
+            Some(&mut out),
+            true,
+        ));
+        assert!(out.missing_pubkeys.is_empty());
+        assert_eq!(out.missing_sigs, vec![keyid]);
+    }
+
+    /// Taproot key-path: the internal key + merkle-root tweak signs
+    /// `SIGHASH_DEFAULT` (64-byte sig, no appended sighash byte).
+    #[test]
+    fn sign_psbt_input_taproot_keypath() {
+        let secp = secp256k1::Secp256k1::new();
+        let secret = secp256k1::SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let keypair = secp256k1::Keypair::from_secret_key(&secp, &secret);
+        let (internal, _parity) = keypair.x_only_public_key();
+        let scalar =
+            secp256k1::Scalar::from_be_bytes(tap_tweak(&internal.serialize(), None)).unwrap();
+        let tweaked = keypair.add_xonly_tweak(&secp, &scalar).unwrap();
+        let (outkey, _) = tweaked.x_only_public_key();
+        let mut spk = vec![0x51, 0x20];
+        spk.extend_from_slice(&outkey.serialize());
+        let mut psbt = psbt_spending(&spk);
+        let mut provider = FlatProvider::default();
+        provider
+            .keys
+            .insert(compressed_keyid(&internal.serialize(), 0x02), secret);
+        provider.tr_trees.insert(
+            outkey.serialize(),
+            crate::descriptor::TaprootSpendData {
+                merkle_root: None,
+                internal_key: internal.serialize(),
+                leaves: Vec::new(),
+            },
+        );
+        let txdata = precompute_psbt_data(&psbt);
+        assert!(sign_psbt_input(
+            &provider,
+            &mut psbt,
+            0,
+            Some(&txdata),
+            0, // SIGHASH_DEFAULT
+            false,
+            None,
+            true,
+        ));
+        let wit = decode_witness_stack(psbt.inputs[0].get(Psbt::IN_FINAL_SCRIPTWITNESS).unwrap())
+            .unwrap();
+        assert_eq!(wit.len(), 1);
+        assert_eq!(wit[0].len(), 64);
+    }
+
+    /// Taproot script path: a `pk()` leaf signs with the leaf key
+    /// when the internal key is unknown.
+    #[test]
+    fn sign_psbt_input_taproot_script_path() {
+        let secp = secp256k1::Secp256k1::new();
+        let internal_secret = secp256k1::SecretKey::from_slice(&[0x21u8; 32]).unwrap();
+        let internal_pair = secp256k1::Keypair::from_secret_key(&secp, &internal_secret);
+        let (internal, _parity) = internal_pair.x_only_public_key();
+        let leaf_secret = secp256k1::SecretKey::from_slice(&[0x33u8; 32]).unwrap();
+        let leaf_pair = secp256k1::Keypair::from_secret_key(&secp, &leaf_secret);
+        let (leaf_x, _lp) = leaf_pair.x_only_public_key();
+        // `<32B xonly> OP_CHECKSIG` — the pk() leaf.
+        let mut leaf_script = vec![0x20];
+        leaf_script.extend_from_slice(&leaf_x.serialize());
+        leaf_script.push(0xac);
+        let root = compute_tapleaf_hash(0xc0, &leaf_script);
+        let scalar =
+            secp256k1::Scalar::from_be_bytes(tap_tweak(&internal.serialize(), Some(&root)))
+                .unwrap();
+        let out_pair = internal_pair.add_xonly_tweak(&secp, &scalar).unwrap();
+        let (outkey, _) = out_pair.x_only_public_key();
+        let mut spk = vec![0x51, 0x20];
+        spk.extend_from_slice(&outkey.serialize());
+        let mut psbt = psbt_spending(&spk);
+        let mut provider = FlatProvider::default();
+        provider
+            .keys
+            .insert(compressed_keyid(&leaf_x.serialize(), 0x02), leaf_secret);
+        provider.tr_trees.insert(
+            outkey.serialize(),
+            crate::descriptor::TaprootSpendData {
+                merkle_root: Some(root),
+                internal_key: internal.serialize(),
+                leaves: vec![(0, leaf_script.clone(), 0xc0)],
+            },
+        );
+        let txdata = precompute_psbt_data(&psbt);
+        assert!(sign_psbt_input(
+            &provider,
+            &mut psbt,
+            0,
+            Some(&txdata),
+            0,
+            false,
+            None,
+            true,
+        ));
+        let wit = decode_witness_stack(psbt.inputs[0].get(Psbt::IN_FINAL_SCRIPTWITNESS).unwrap())
+            .unwrap();
+        // [sig, leaf script, control block]
+        assert_eq!(wit.len(), 3);
+        assert_eq!(wit[0].len(), 64);
+        assert_eq!(wit[1], leaf_script);
+        assert_eq!(wit[2].len(), 33);
+    }
+
+    /// P2WSH 2-of-2: one key leaves a `partial_sigs` entry, the second
+    /// reuses it and finalizes.
+    #[test]
+    fn sign_psbt_input_wsh_multisig_partial() {
+        let secp = secp256k1::Secp256k1::new();
+        let s1 = secp256k1::SecretKey::from_slice(&[0x41u8; 32]).unwrap();
+        let s2 = secp256k1::SecretKey::from_slice(&[0x42u8; 32]).unwrap();
+        let pk1 = secp256k1::PublicKey::from_secret_key(&secp, &s1)
+            .serialize()
+            .to_vec();
+        let pk2 = secp256k1::PublicKey::from_secret_key(&secp, &s2)
+            .serialize()
+            .to_vec();
+        let mut wscript = vec![0x52, 0x21];
+        wscript.extend_from_slice(&pk1);
+        wscript.push(0x21);
+        wscript.extend_from_slice(&pk2);
+        wscript.extend_from_slice(&[0x52, 0xae]);
+        let mut spk = vec![0x00, 0x20];
+        spk.extend_from_slice(&sha256(&wscript));
+        let mut psbt = psbt_spending(&spk);
+        let mut provider = FlatProvider::default();
+        provider.keys.insert(hash160(&pk1), s1);
+        provider.pubkeys.insert(hash160(&pk1), pk1.clone());
+        provider.pubkeys.insert(hash160(&pk2), pk2.clone());
+        provider.scripts.insert(hash160(&wscript), wscript.clone());
+        let txdata = precompute_psbt_data(&psbt);
+        // Only s1 → partial sig recorded, input not final.
+        assert!(!sign_psbt_input(
+            &provider,
+            &mut psbt,
+            0,
+            Some(&txdata),
+            1,
+            false,
+            None,
+            true,
+        ));
+        assert!(!psbt_input_signed(&psbt.inputs[0]));
+        let partials: Vec<_> = psbt.inputs[0].all(Psbt::IN_PARTIAL_SIG).collect();
+        assert_eq!(partials.len(), 1);
+        assert_eq!(partials[0].0[..], pk1[..]);
+        // Adding s2 reuses the stored sig for pk1 and finalizes.
+        provider.keys.insert(hash160(&pk2), s2);
+        assert!(sign_psbt_input(
+            &provider,
+            &mut psbt,
+            0,
+            Some(&txdata),
+            1,
+            false,
+            None,
+            true,
+        ));
+        let wit = decode_witness_stack(psbt.inputs[0].get(Psbt::IN_FINAL_SCRIPTWITNESS).unwrap())
+            .unwrap();
+        // [CHECKMULTISIG dummy, sig1, sig2, witness script]
+        assert_eq!(wit.len(), 4);
+        assert!(wit[0].is_empty());
+        assert_eq!(wit[3], wscript);
+        assert!(psbt_input_signed(&psbt.inputs[0]));
+    }
+
+    /// `sighashtype` flows through to the appended sighash byte;
+    /// `finalize=false` leaves `partial_sigs` instead.
+    #[test]
+    fn sign_psbt_input_sighash_and_no_finalize() {
+        let secp = secp256k1::Secp256k1::new();
+        let secret = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret)
+            .serialize()
+            .to_vec();
+        let keyid = hash160(&pubkey);
+        let mut spk = vec![0x00, 0x14];
+        spk.extend_from_slice(&keyid);
+        let mut provider = FlatProvider::default();
+        provider.keys.insert(keyid, secret);
+        provider.pubkeys.insert(keyid, pubkey);
+        // SIGHASH_NONE|ANYONECANPAY signs and verifies as such.
+        let mut psbt = psbt_spending(&spk);
+        let txdata = precompute_psbt_data(&psbt);
+        assert!(sign_psbt_input(
+            &provider,
+            &mut psbt,
+            0,
+            Some(&txdata),
+            0x82,
+            false,
+            None,
+            true,
+        ));
+        let wit = decode_witness_stack(psbt.inputs[0].get(Psbt::IN_FINAL_SCRIPTWITNESS).unwrap())
+            .unwrap();
+        assert_eq!(wit[0].last(), Some(&0x82));
+        // finalize=false → solved (returns true) but the sig lands in
+        // partial_sigs only — no final fields, not PSBTInputSigned.
+        let mut psbt = psbt_spending(&spk);
+        let txdata = precompute_psbt_data(&psbt);
+        assert!(sign_psbt_input(
+            &provider,
+            &mut psbt,
+            0,
+            Some(&txdata),
+            1,
+            false,
+            None,
+            false,
+        ));
+        assert!(!psbt_input_signed(&psbt.inputs[0]));
+        assert_eq!(psbt.inputs[0].all(Psbt::IN_PARTIAL_SIG).count(), 1);
     }
 }

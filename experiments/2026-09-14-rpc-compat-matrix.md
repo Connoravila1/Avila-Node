@@ -804,6 +804,34 @@ surfaced:
   taproot, and 2-of-2 P2WSH multisig PSBTs across extract
   true/false/null, already-final idempotency, a corrupted tail
   byte, and the decode/arity error paths — all byte-identical.
+- `descriptorprocesspsbt` runs `ProcessPSBT` with real signing:
+  descriptors expand through `eval_scan_object` with
+  `expand_priv=true` (Core's `ExpandPrivate` — derived secrets
+  land in the provider keyed by each expanded pubkey's id), the
+  `bip32derivs` flag maps to `hide_origin` (clearing
+  `provider.origins` before metadata writes), and `finalize`
+  defaults true. `Creator::Real` carries the transaction,
+  input index, amount, precomputed sighash data, and the
+  `sighashtype` argument: ECDSA signs via
+  `sign_ecdsa_low_r` (RFC6979 + extra-entropy counter grinding —
+  byte-identical to Core's `CKey::Sign`), Schnorr signs via
+  BIP341/342 sighashes with the `TapTweak(internal||merkle_root)`
+  key-path tweak (a null merkle root is treated as absent) and
+  raw-leaf script-path spends; `xonly` private-key lookup probes
+  the even then odd compressed keys (Core's `GetKeyByXOnly`).
+  Derived-key memoization in `DeriveCache` (Core's
+  `DescriptorCache`) keeps a 0..1000 range expansion under the
+  query timeout — the per-provider base key is derived once, so
+  each position costs a single child derivation. Verified live
+  against Core 29.4: pkh (legacy sighash), wpkh, sh(wpkh),
+  wsh(sortedmulti 2-of-2), tr() key-path and forced script-path
+  (internal key passed as xonly hex without its secret), every
+  sighash mode (DEFAULT/ALL/NONE/SINGLE/…|ANYONECANPAY),
+  finalize=false, bip32derivs=false, {desc,range} objects,
+  WIF const keys, multi-input partial signing, signed-PSBT
+  reprocessing, and the bad-psbt/bad-descriptor/bad-sighash/
+  hardened-tpub error paths — all byte-identical, including
+  `complete`/`hex` result shape.
 
 ### Known semantic differences
 
