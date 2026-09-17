@@ -1217,7 +1217,8 @@ impl Mempool {
         self.map.values()
     }
 
-    /// `txid` is pooled — template.rs's dependency test.
+    /// `txid` is pooled.
+    #[cfg(test)]
     pub(crate) fn has_entry(&self, txid: &Txid) -> bool {
         self.map.contains_key(txid)
     }
@@ -1916,6 +1917,75 @@ mod tests {
             .collect();
         assert_eq!(order.len(), 2);
         assert_eq!(order[0], pid, "parent must precede its child");
+    }
+
+    #[test]
+    fn template_mines_by_ancestor_feerate() {
+        // Core's addPackageTxs: a low-fee parent rides its high-fee
+        // child's package rate — the whole package lands ahead of a
+        // standalone tx whose own rate sits between the two.
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        // parent: 1 sat/vB-ish (tiny fee); child: enormous fee.
+        let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_900_000, SEQ_FINAL);
+        let pid = parent.txid();
+        let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 1_000_000_000, SEQ_FINAL);
+        let cid = child.txid();
+        // standalone: mid-range fee — higher than parent alone, far
+        // below the (parent+child) package rate.
+        let solo = spend_tx(mature_outpoint(&blocks, 2), 4_000_000_000, SEQ_FINAL);
+        let sid = solo.txid();
+        pool.accept_tx(parent, &cs, NOW).unwrap();
+        pool.accept_tx(child, &cs, NOW).unwrap();
+        pool.accept_tx(solo, &cs, NOW).unwrap();
+
+        let template = pool
+            .build_template(&cs, Script::new(vec![script::OP_1]), NOW + 120)
+            .unwrap();
+        let order: Vec<Txid> = template
+            .block
+            .transactions
+            .iter()
+            .skip(1)
+            .map(|t| t.txid())
+            .collect();
+        assert_eq!(
+            order,
+            vec![pid, cid, sid],
+            "package rate (~2B/220vB) beats the standalone's own rate"
+        );
+    }
+
+    #[test]
+    fn template_prioritise_lifts_the_whole_package() {
+        // `prioritisetransaction`'s delta lands in the *modified* fee,
+        // which the ancestor-feerate score uses — a prioritized child
+        // pulls its parent forward too.
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_990_000, SEQ_FINAL);
+        let pid = parent.txid();
+        let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 4_999_000_000, SEQ_FINAL);
+        let cid = child.txid();
+        let solo = spend_tx(mature_outpoint(&blocks, 2), 4_000_000_000, SEQ_FINAL);
+        let sid = solo.txid();
+        pool.accept_tx(parent, &cs, NOW).unwrap();
+        pool.accept_tx(child, &cs, NOW).unwrap();
+        pool.accept_tx(solo, &cs, NOW).unwrap();
+        // Solo outranks both alone; lift the package via the child.
+        pool.prioritise(&cid, 5_000_000_000);
+
+        let template = pool
+            .build_template(&cs, Script::new(vec![script::OP_1]), NOW + 120)
+            .unwrap();
+        let order: Vec<Txid> = template
+            .block
+            .transactions
+            .iter()
+            .skip(1)
+            .map(|t| t.txid())
+            .collect();
+        assert_eq!(order, vec![pid, cid, sid]);
     }
 
     #[test]

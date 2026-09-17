@@ -1,16 +1,18 @@
 //! Block-template construction — the engine behind Core's
-//! `getblocktemplate` RPC: greedily fill a block with the pool's
-//! highest-fee-rate transactions, respecting in-pool parent order, the
-//! weight cap, the subsidy, and the BIP141 witness commitment.
+//! `getblocktemplate` RPC: `BlockAssembler::addPackageTxs` — ancestor-
+//! feerate package selection. Every pool entry scores by the minimum
+//! of its own modified feerate and its whole in-pool ancestor
+//! package's feerate; when a package is selected its descendants'
+//! scores are rewritten (`UpdatePackagesForAdded`) so the next picks
+//! see the not-yet-mined remainder.
 //!
-//! Scope honesty: selection is greedy by *individual* fee rate. Core
-//! mines by ancestor-feerate packages — a low-fee parent never blocks
-//! its high-fee child here because inclusion is dependency-ordered,
-//! but a low-fee child riding a high-fee parent is not pulled up the
-//! way `UpdatePackages` would pull it. Package-feerate mining remains
-//! open work.
+//! Beyond ordering, the checks mirror Core's: `TestPackage` (weight
+//! in vsize terms, sigop cost), `TestPackageTransactions` (nLockTime
+//! finality vs the tip's median time past), `SortForBlock` (ancestor-
+//! count order with txid tie-break), and the 1000-consecutive-failure
+//! early exit when the block is nearly full.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use avila_consensus::arith::CompactTarget;
 use avila_consensus::block::{Block, MAX_BLOCK_WEIGHT};
@@ -90,45 +92,15 @@ impl Mempool {
         )
         .map_err(|e| TemplateError::Difficulty(e.to_string()))?;
 
-        // Greedy fill: modified-fee-rate order (base fee plus any
-        // prioritisetransaction delta — Core sorts templates by
-        // GetModifiedFee), dependency-respecting.
-        let mut entries: Vec<_> = self.entries().collect();
-        entries.sort_by_key(|e| std::cmp::Reverse(e.modified_fee() * 1000 / e.vsize.max(1) as i64));
-        let mut chosen: Vec<&crate::MempoolEntry> = Vec::new();
-        let mut chosen_ids: HashSet<Txid> = HashSet::new();
-        let mut weight = 0usize;
-        let mut fees = 0i64;
-        // Multiple passes: a tx skipped for a not-yet-included parent may
-        // become includable once the parent lands.
-        loop {
-            let mut progress = false;
-            for entry in &entries {
-                let txid = entry.tx.txid();
-                if chosen_ids.contains(&txid) {
-                    continue;
-                }
-                if weight + entry.tx.weight() > MAX_BLOCK_WEIGHT - COINBASE_RESERVE_WEIGHT {
-                    continue;
-                }
-                // Every pooled parent must already be in the block.
-                let deps_met = entry.tx.inputs.iter().all(|i| {
-                    !self.has_entry(&i.previous_output.txid)
-                        || chosen_ids.contains(&i.previous_output.txid)
-                });
-                if !deps_met {
-                    continue;
-                }
-                chosen_ids.insert(txid);
-                weight += entry.tx.weight();
-                fees += entry.fee;
-                chosen.push(entry);
-                progress = true;
-            }
-            if !progress {
-                break;
-            }
-        }
+        // Core's `BlockAssembler::addPackageTxs`: ancestor-feerate
+        // package selection. Each entry's `ancestor_score` uses
+        // `GetModFeeAndSize` — the smaller of the tx's own modified
+        // feerate and its in-pool ancestor package's feerate.
+        let flags = avila_consensus::script::block_script_flags(cs.tree().params(), height, &tip);
+        let package = self.select_package_txs(cs, height, mtp, flags);
+        let chosen: Vec<&crate::MempoolEntry> =
+            package.iter().filter_map(|id| self.entry(id)).collect();
+        let fees: i64 = chosen.iter().map(|e| e.fee).sum();
 
         // Coinbase: BIP34 height prefix, subsidy + fees to the miner.
         let subsidy = block_subsidy(height, cs.tree().params());
@@ -152,6 +124,383 @@ impl Mempool {
             fees,
             tx_count: chosen.len(),
         })
+    }
+
+    /// Core's `BlockAssembler::addPackageTxs` — pick transactions by
+    /// ancestor-feerate packages. Returns the included txids in block
+    /// order (parents before children).
+    ///
+    /// Selection sorts every entry by the *minimum* of its own
+    /// modified feerate and the feerate of itself plus all its
+    /// in-pool ancestors (`GetModFeeAndSize`), so a low-fee parent is
+    /// evaluated at the price its children would pay. As packages land
+    /// in the block, `UpdatePackagesForAdded` subtracts the included
+    /// ancestors' stats from each descendant's score — the descendant
+    /// is then re-ranked on what remains unmined.
+    fn select_package_txs(
+        &self,
+        cs: &avila_consensus::chainstate::Chainstate,
+        height: u32,
+        mtp: u32,
+        flags: avila_consensus::script::ScriptFlags,
+    ) -> Vec<Txid> {
+        use avila_consensus::block::WITNESS_SCALE_FACTOR;
+        use avila_consensus::check::{MAX_BLOCK_SIGOPS_COST, is_final_tx};
+
+        /// `policy::nBytesPerSigOp` — legacy sigop cost granularity.
+        const BYTES_PER_SIGOP: u64 = 20;
+        /// Core's `-blockmintxfee` default (0 sat/kvB): no floor.
+        const BLOCK_MIN_FEE_SAT_PER_KVB: i64 = 0;
+        /// Core's `MAX_CONSECUTIVE_FAILURES` — give up once the block
+        /// is nearly full and nothing fits.
+        const MAX_CONSECUTIVE_FAILURES: i64 = 1000;
+        let cap = MAX_BLOCK_WEIGHT - COINBASE_RESERVE_WEIGHT;
+
+        // Per-entry cached facts: the sigop-adjusted vsize Core calls
+        // `GetTxSize`, real weight for block accounting, sigop cost,
+        // modified fee, and the in-pool ancestor package totals.
+        struct Facts {
+            /// `GetTxSize` — `max(weight, sigops*20)` rounded up to
+            /// vbytes; the feerate/TestPackage size unit.
+            tx_size: u64,
+            /// Real weight for `nBlockWeight`.
+            weight: u64,
+            /// `GetSigOpCost` — legacy×4 + p2sh + witness.
+            sigops: u64,
+            /// `GetModifiedFee` — fee + prioritisetransaction delta.
+            mod_fee: i64,
+            /// In-pool ancestors (the `CalculateMemPoolAncestors` set).
+            ancestors: HashSet<Txid>,
+            /// `nCountWithAncestors` — self + ancestors.
+            count_wa: usize,
+            /// `nSizeWithAncestors`.
+            size_wa: u64,
+            /// `nModFeesWithAncestors`.
+            fees_wa: i64,
+            /// `nSigOpCostWithAncestors`.
+            sigops_wa: u64,
+        }
+
+        /// `GetModFeeAndSize`: the (fee, size) pair the ancestor_score
+        /// comparator uses — the tx's own rate when it isn't dragged
+        /// below its package rate, else the package rate.
+        fn score_fee_size(f: &Facts) -> (i128, i128) {
+            if f.mod_fee as i128 * f.size_wa as i128 > f.fees_wa as i128 * f.tx_size as i128 {
+                (f.fees_wa as i128, f.size_wa as i128)
+            } else {
+                (f.mod_fee as i128, f.tx_size as i128)
+            }
+        }
+        /// `CompareTxMemPoolEntryByAncestorFee`: higher score first,
+        /// txid (Core's numeric uint256 order — display-order bytes)
+        /// breaks exact feerate ties.
+        fn better(facts: &HashMap<Txid, Facts>, a: &Txid, b: &Txid) -> bool {
+            let (fa, sa) = score_fee_size(&facts[a]);
+            let (fb, sb) = score_fee_size(&facts[b]);
+            let f1 = fa * sb;
+            let f2 = sa * fb;
+            if f1 == f2 {
+                // Core compares uint256 numerically — internal bytes
+                // are little-endian, so compare them reversed.
+                let mut x = a.to_bytes();
+                x.reverse();
+                let mut y = b.to_bytes();
+                y.reverse();
+                return x < y;
+            }
+            f1 > f2
+        }
+        /// Same comparator over a modified entry's rewritten package
+        /// stats vs a still-pristine pool entry.
+        fn better_mod(
+            facts: &HashMap<Txid, Facts>,
+            mods: &HashMap<Txid, ModEntry>,
+            a: &Txid,
+            b: &Txid,
+        ) -> bool {
+            let (fa, sa) = mod_score_fee_size(&facts[a], &mods[a]);
+            let (fb, sb) = score_fee_size(&facts[b]);
+            let f1 = fa * sb;
+            let f2 = sa * fb;
+            if f1 == f2 {
+                let mut x = a.to_bytes();
+                x.reverse();
+                let mut y = b.to_bytes();
+                y.reverse();
+                return x < y;
+            }
+            f1 > f2
+        }
+        fn mod_score_fee_size(f: &Facts, m: &ModEntry) -> (i128, i128) {
+            if f.mod_fee as i128 * m.size_wa as i128 > m.fees_wa as i128 * f.tx_size as i128 {
+                (m.fees_wa as i128, m.size_wa as i128)
+            } else {
+                (f.mod_fee as i128, f.tx_size as i128)
+            }
+        }
+
+        /// `CTxMemPoolModifiedEntry` — a descendant's package stats
+        /// with already-mined ancestors subtracted.
+        #[derive(Clone)]
+        struct ModEntry {
+            size_wa: u64,
+            fees_wa: i64,
+            sigops_wa: u64,
+        }
+
+        // Snapshot every entry's facts once — the pool is frozen for
+        // the duration of selection.
+        let mut facts: HashMap<Txid, Facts> = HashMap::with_capacity(self.entries().count());
+        for e in self.entries() {
+            let txid = e.tx.txid();
+            let mut sigops =
+                e.tx.inputs
+                    .iter()
+                    .map(|i| i.script_sig.sig_ops(false))
+                    .sum::<u64>()
+                    + e.tx
+                        .outputs
+                        .iter()
+                        .map(|o| o.script_pubkey.sig_ops(false))
+                        .sum::<u64>();
+            sigops *= WITNESS_SCALE_FACTOR as u64;
+            for input in &e.tx.inputs {
+                if let Some(coin) = self.resolve(cs, &input.previous_output) {
+                    let spk = &coin.out.script_pubkey;
+                    if spk.is_p2sh() {
+                        sigops += spk.p2sh_sig_ops(&input.script_sig) * WITNESS_SCALE_FACTOR as u64;
+                    }
+                    sigops += avila_consensus::script::count_witness_sig_ops(
+                        &input.script_sig,
+                        spk,
+                        &input.witness,
+                        flags,
+                    );
+                }
+            }
+            let weight = e.tx.weight() as u64;
+            let tx_size = weight
+                .max(sigops * BYTES_PER_SIGOP)
+                .div_ceil(WITNESS_SCALE_FACTOR as u64);
+            facts.insert(
+                txid,
+                Facts {
+                    tx_size,
+                    weight,
+                    sigops,
+                    mod_fee: e.modified_fee(),
+                    ancestors: HashSet::new(),
+                    count_wa: 0,
+                    size_wa: 0,
+                    fees_wa: 0,
+                    sigops_wa: 0,
+                },
+            );
+        }
+        // Ancestor package totals per entry (self + in-pool ancestors)
+        // — `CalculateMemPoolAncestors` walked once at snapshot time.
+        let txids: Vec<Txid> = facts.keys().copied().collect();
+        for txid in &txids {
+            let mut ancestors: HashSet<Txid> = HashSet::new();
+            let mut pending: Vec<Txid> = self
+                .entry(txid)
+                .map(|e| {
+                    e.tx.inputs
+                        .iter()
+                        .map(|i| i.previous_output.txid)
+                        .filter(|p| facts.contains_key(p))
+                        .collect()
+                })
+                .unwrap_or_default();
+            while let Some(id) = pending.pop() {
+                if !ancestors.insert(id) {
+                    continue;
+                }
+                if let Some(e) = self.entry(&id) {
+                    pending.extend(
+                        e.tx.inputs
+                            .iter()
+                            .map(|i| i.previous_output.txid)
+                            .filter(|p| facts.contains_key(p)),
+                    );
+                }
+            }
+            let (mut sz, mut fe, mut so) = (0u64, 0i64, 0u64);
+            if let Some(f) = facts.get(txid) {
+                sz += f.tx_size;
+                fe += f.mod_fee;
+                so += f.sigops;
+            }
+            for a in &ancestors {
+                let af = &facts[a];
+                sz += af.tx_size;
+                fe += af.mod_fee;
+                so += af.sigops;
+            }
+            if let Some(f) = facts.get_mut(txid) {
+                f.count_wa = ancestors.len() + 1;
+                f.size_wa = sz;
+                f.fees_wa = fe;
+                f.sigops_wa = so;
+                f.ancestors = ancestors;
+            }
+        }
+
+        // The mapTx order — entries sorted by ancestor_score once.
+        let mut order: Vec<Txid> = txids;
+        order.sort_by(|a, b| {
+            if better(&facts, a, b) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        });
+
+        let mut in_block: HashSet<Txid> = HashSet::new();
+        let mut failed_tx: HashSet<Txid> = HashSet::new();
+        let mut map_modified: HashMap<Txid, ModEntry> = HashMap::new();
+        let mut block_weight: u64 = 0;
+        let mut block_sigops: u64 = 0;
+        let mut chosen: Vec<Txid> = Vec::new();
+        let mut consecutive_failed: i64 = 0;
+        let mut mi = 0usize;
+
+        while mi < order.len() || !map_modified.is_empty() {
+            // Skip stale/failed/in-block mapTx entries.
+            if mi < order.len() {
+                let cand = order[mi];
+                if map_modified.contains_key(&cand)
+                    || in_block.contains(&cand)
+                    || failed_tx.contains(&cand)
+                {
+                    mi += 1;
+                    continue;
+                }
+            }
+            // Which to evaluate: the next mapTx entry or the best
+            // modified one?
+            let mut using_modified = false;
+            let best_mod = map_modified.keys().copied().reduce(|a, b| {
+                if better_mod(&facts, &map_modified, &a, &b) {
+                    a
+                } else {
+                    b
+                }
+            });
+            let iter = if mi >= order.len() {
+                using_modified = true;
+                best_mod
+            } else if let Some(m) = best_mod {
+                if better_mod(&facts, &map_modified, &m, &order[mi]) {
+                    using_modified = true;
+                    Some(m)
+                } else {
+                    mi += 1;
+                    Some(order[mi - 1])
+                }
+            } else {
+                mi += 1;
+                Some(order[mi - 1])
+            };
+            let Some(iter) = iter else { break };
+
+            let (package_size, package_fees, package_sigops) = if using_modified {
+                let m = &map_modified[&iter];
+                (m.size_wa, m.fees_wa, m.sigops_wa)
+            } else {
+                let f = &facts[&iter];
+                (f.size_wa, f.fees_wa, f.sigops_wa)
+            };
+
+            // `-blockmintxfee` floor — everything else sorts lower.
+            if package_fees < BLOCK_MIN_FEE_SAT_PER_KVB * package_size as i64 / 1000 {
+                return chosen;
+            }
+
+            // TestPackage: weight (vsize terms) + sigops.
+            if block_weight + WITNESS_SCALE_FACTOR as u64 * package_size >= cap as u64
+                || block_sigops + package_sigops >= MAX_BLOCK_SIGOPS_COST
+            {
+                if using_modified {
+                    map_modified.remove(&iter);
+                    failed_tx.insert(iter);
+                }
+                consecutive_failed += 1;
+                if consecutive_failed > MAX_CONSECUTIVE_FAILURES
+                    && block_weight + COINBASE_RESERVE_WEIGHT as u64 > cap as u64
+                {
+                    break;
+                }
+                continue;
+            }
+
+            // The actual package: in-pool ancestors not yet mined, + self.
+            let mut package: HashSet<Txid> = facts[&iter]
+                .ancestors
+                .iter()
+                .copied()
+                .filter(|a| !in_block.contains(a))
+                .collect();
+            package.insert(iter);
+
+            // TestPackageTransactions: nLockTime finality at height/MTP.
+            if !package.iter().all(|id| {
+                self.entry(id)
+                    .is_some_and(|e| is_final_tx(&e.tx, height, mtp))
+            }) {
+                if using_modified {
+                    map_modified.remove(&iter);
+                    failed_tx.insert(iter);
+                }
+                continue;
+            }
+            consecutive_failed = 0;
+
+            // SortForBlock: ancestor-count order, txid ties.
+            let mut sorted: Vec<Txid> = package.into_iter().collect();
+            sorted.sort_by(|a, b| {
+                facts[a].count_wa.cmp(&facts[b].count_wa).then_with(|| {
+                    let mut x = a.to_bytes();
+                    x.reverse();
+                    let mut y = b.to_bytes();
+                    y.reverse();
+                    x.cmp(&y)
+                })
+            });
+
+            for id in &sorted {
+                let f = &facts[id];
+                block_weight += f.weight;
+                block_sigops += f.sigops;
+                in_block.insert(*id);
+                map_modified.remove(id);
+                chosen.push(*id);
+            }
+
+            // UpdatePackagesForAdded: subtract each included tx's stats
+            // from its not-yet-mined descendants' package scores.
+            for id in &sorted {
+                let pf = &facts[id];
+                let (p_size, p_fee, p_sig) = (pf.tx_size, pf.mod_fee, pf.sigops);
+                for desc in self.descendant_txids(id) {
+                    if in_block.contains(&desc) {
+                        continue;
+                    }
+                    let m = map_modified.entry(desc).or_insert_with(|| {
+                        let f = &facts[&desc];
+                        ModEntry {
+                            size_wa: f.size_wa,
+                            fees_wa: f.fees_wa,
+                            sigops_wa: f.sigops_wa,
+                        }
+                    });
+                    m.size_wa -= p_size;
+                    m.fees_wa -= p_fee;
+                    m.sigops_wa -= p_sig;
+                }
+            }
+        }
+        chosen
     }
 
     /// Assembles the candidate block — the tail of [`build_template`]
