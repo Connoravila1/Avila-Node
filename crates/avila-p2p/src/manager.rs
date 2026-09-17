@@ -2707,10 +2707,11 @@ mod tests {
         .unwrap();
         let _ = v2_session.flush();
 
-        // Both sessions land through drain_inbounds.
+        // Both sessions land through drain_inbounds — each call
+        // drains only what completed, so accumulate across polls.
         let mut admitted = Vec::new();
         for _ in 0..600 {
-            admitted = mgr.drain_inbounds();
+            admitted.extend(mgr.drain_inbounds());
             if admitted.len() == 2 {
                 break;
             }
