@@ -9,6 +9,7 @@ pub mod events;
 pub mod rpc;
 pub mod sync;
 pub mod time;
+pub mod watch;
 
 use avila_core::{CAPABILITIES, Lifecycle, NodeSnapshot, ValidatedConfig};
 use thiserror::Error;

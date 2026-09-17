@@ -496,6 +496,25 @@ operation. Compare complete initial download and catch-up, not only local replay
   `FeeEstimator` records (rate, blocks-to-confirm) samples and
   `estimatesmartfee` serves any target with data, erroring honestly
   when the sample set is empty.
+  Watch-only descriptors landed (first slice): a `WatchWallet`
+  service (no signing keys) holds imported descriptors and expands
+  ranged/multipath forms to tracked scriptPubKeys, then scans blocks
+  lazily from each descriptor's timestamp (`"now"` asserts the
+  pre-import history empty; an explicit `rescanblockchain` still
+  searches the full range). Receipts and spends are recorded
+  per-outpoint; a reorg rewinds scanned heights and unspends
+  orphaned spends; unsearched gaps surface in `getbalances` warnings
+  rather than appearing as a zero balance; state persists to
+  `watchlist.dat`. `importdescriptors` accepts Core's request shape
+  (per-request `{desc, timestamp, active, internal, label, range,
+  next_index}` results and error surface — missing checksum `-5`,
+  private-key material rejected `-4`, range/label misuse `-8`, a
+  missing timestamp `-3` at call level), and `listdescriptors`,
+  `listunspent` (with `parent_descs`/ancestor fields),
+  `listreceivedbyaddress` (`involvesWatchonly`), `getbalances`
+  (watchonly bucket + `lastprocessedblock`) and `rescanblockchain`
+  complete the surface — verified live against Core 29.4 (import,
+  rescan, spend, reorg and restart-reload all matching).
 - [ ] Deliver Electrum/compact-filter services with tested clients and explicit index coverage.
 - [x] Pruned operation (first slice): `BlockStore::prune_to_bytes`
       deletes the oldest blk files past a byte budget (never the tail);

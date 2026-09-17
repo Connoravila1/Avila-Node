@@ -186,6 +186,12 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             // scantxoutset slot is pure RPC state (no sync-loop input).
             let waiters = std::sync::Arc::new(avila_node::rpc::BlockWaiters::new());
             let scan = std::sync::Arc::new(avila_node::rpc::TxoutScan::new());
+            // The watch-only wallet is an RPC-side service — the
+            // descriptor store loads lazily; `watchlist.dat` appears
+            // on first import.
+            let wallet = std::sync::Arc::new(std::sync::Mutex::new(
+                avila_node::watch::WatchWallet::open(data_dir.join("watchlist.dat")),
+            ));
             if let Some(addr) = rpc {
                 // Cookie auth, regenerated per run exactly like Core's
                 // .cookie — the file lives in the network data dir with
@@ -198,6 +204,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     Some(query_tx),
                     Some(waiters.clone()),
                     Some(scan.clone()),
+                    Some(wallet),
                     Some(cancel.clone()),
                     Some(avila_node::rpc::cookie_auth_header(&token)),
                 )
