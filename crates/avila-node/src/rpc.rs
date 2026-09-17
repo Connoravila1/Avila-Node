@@ -5964,9 +5964,17 @@ fn dispatch(
                             } else {
                                 "outbound-full-relay"
                             },
-                            // v2 transport (BIP324) is not implemented.
-                            "transport_protocol_type": "v1",
-                            "session_id": format!("{:016x}", p.telemetry.session_id),
+                            "transport_protocol_type": p.transport_protocol,
+                            // Core: hex of the BIP324 session id on v2,
+                            // "" on v1.
+                            "session_id": p
+                                .v2_session_id
+                                .map(|id| {
+                                    // Core stores it in a uint256 —
+                                    // hex display is byte-reversed.
+                                    id.iter().rev().map(|b| format!("{b:02x}")).collect::<String>()
+                                })
+                                .unwrap_or_default(),
                             "version": p.version,
                             // Core's field name is `subver` — there is
                             // no `subversion` in getpeerinfo.
@@ -9844,9 +9852,10 @@ fn dispatch(
             }
             // v2transport|connection_type_compat: a *string* in slot 3
             // is the pre-v26 connection_type position; otherwise it's
-            // the v2transport bool (we never run BIP324 → NODE_P2P_V2
-            // is unset → requesting it errors like Core).
+            // the v2transport bool. Requesting v2 while the node runs
+            // `-v2transport=0` errors like Core.
             let mut connection_type = "manual".to_string();
+            let mut want_v2: Option<bool> = None;
             let read_conn_type = |v: &Value, pos: usize| -> Result<&'static str, (i64, String)> {
                 let Some(s) = v.as_str() else {
                     return Err((
@@ -9871,17 +9880,8 @@ fn dispatch(
                         Err(e) => return (Value::Null, Some(e)),
                     }
                 }
-                Some(Value::Bool(true)) => {
-                    return (
-                        Value::Null,
-                        Some((
-                            RPC_INVALID_PARAMETER,
-                            "Error: v2transport requested but not enabled (see -v2transport)"
-                                .into(),
-                        )),
-                    );
-                }
-                Some(Value::Bool(false)) | Some(Value::Null) | None => {}
+                Some(Value::Bool(b)) => want_v2 = Some(*b),
+                Some(Value::Null) | None => {}
                 Some(v) => {
                     return (
                         Value::Null,
@@ -9904,6 +9904,15 @@ fn dispatch(
                 }
             }
             chain_query(queries, move |cs, mgr| {
+                // Core: requesting v2 on a `-v2transport=0` node is a
+                // parameter error, not a silent downgrade.
+                if want_v2 == Some(true) && !mgr.v2transport() {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "Error: v2transport requested but not enabled (see -v2transport)".into(),
+                    ));
+                }
+                let use_v2 = want_v2.unwrap_or_else(|| mgr.v2transport());
                 if command == "onetry" {
                     // OpenNetworkConnection resolves and dials async —
                     // we queue the same bounded attempt.
@@ -9915,6 +9924,7 @@ fn dispatch(
                             cs.tree().params().message_start,
                             sock.port() as u64,
                             cs.chain().len() as i32 - 1,
+                            use_v2,
                         );
                     }
                     return Ok(Value::Null);
@@ -9928,7 +9938,7 @@ fn dispatch(
                                 .into(),
                         ));
                     }
-                    if !mgr.add_node(node, false) {
+                    if !mgr.add_node(node, use_v2) {
                         return Err((
                             RPC_CLIENT_NODE_ALREADY_ADDED,
                             "Error: Node already added".into(),
@@ -10499,8 +10509,13 @@ fn dispatch(
         "getnetworkinfo" => chain_query(queries, |_cs, mgr| {
             let snaps = mgr.peer_snapshots();
             let inbound = snaps.iter().filter(|p| p.inbound).count();
-            // What we offer the network — NODE_NETWORK | NODE_WITNESS.
-            let services = avila_p2p::message::NODE_NETWORK | avila_p2p::message::NODE_WITNESS;
+            // What we offer the network — NODE_NETWORK | NODE_WITNESS,
+            // plus NODE_P2P_V2 when `-v2transport` is on (Core's
+            // GetLocalServices includes it in the version services).
+            let mut services = avila_p2p::message::NODE_NETWORK | avila_p2p::message::NODE_WITNESS;
+            if mgr.v2transport() {
+                services |= avila_p2p::message::NODE_P2P_V2;
+            }
             // Reachability is honest: clearnet only unless a proxy was
             // configured (the proxy knob is CLI-side; report onion as
             // unreachable until the config reaches this layer).
@@ -11126,7 +11141,12 @@ mod tests {
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["connections_in"], 0);
         assert_eq!(r["connections_out"], 0);
-        assert_eq!(r["localservicesnames"], json!(["NETWORK", "WITNESS"]));
+        // NODE_P2P_V2 joins the service names whenever the manager's
+        // `-v2transport` default is on (Core's default since v26).
+        assert_eq!(
+            r["localservicesnames"],
+            json!(["NETWORK", "WITNESS", "P2P_V2"])
+        );
     }
 
     /// Every expected string below is verbatim Knots 29.3
@@ -12596,6 +12616,8 @@ mod tests {
             None,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
+        // `v2transport: true` is accepted now that BIP324 exists —
+        // the node default is enabled so the flag just selects v2.
         let (_, e) = dispatch(
             "addnode",
             &json!(["x", "add", true]),
@@ -12605,7 +12627,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        assert!(e.is_none(), "{e:?}");
 
         // setnetworkactive: returns the post-set state; toggling with
         // no peers is a no-op; non-bool → -3; missing → -1.

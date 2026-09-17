@@ -35,7 +35,7 @@ fn main() -> Result<(), String> {
     let mut mgr = PeerManager::new(8);
     for (i, addr) in addrs.iter().enumerate() {
         let peer = mgr
-            .connect(*addr, params.message_start, 0xaaaa_bbbb + i as u64, 0)
+            .connect(*addr, params.message_start, 0xaaaa_bbbb + i as u64, 0, true)
             .map_err(|e| format!("connect {addr}: {e}"))?
             .ok_or("peer set full")?;
         println!("dialing {addr} as peer {peer}");

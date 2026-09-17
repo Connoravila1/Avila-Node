@@ -53,6 +53,11 @@ enum Command {
         /// -blockfilterindex) so getblockfilter/scanblocks serve.
         #[arg(long)]
         blockfilterindex: bool,
+        /// Attempt BIP324 v2 transport on outbound peers (Core's
+        /// -v2transport, default on). Pass --v2transport=false to
+        /// force cleartext.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        v2transport: bool,
     },
     /// Sync headers and blocks from live peers (headers-first, full
     /// consensus validation). Bounded by target height and timeout.
@@ -87,6 +92,10 @@ enum Command {
         /// -blockfilterindex) so getblockfilter/scanblocks serve.
         #[arg(long)]
         blockfilterindex: bool,
+        /// Attempt BIP324 v2 transport on outbound peers (Core's
+        /// -v2transport, default on).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        v2transport: bool,
     },
     /// Call a JSON-RPC method on a running daemon — the bitcoin-cli
     /// analog. Positional params are parsed as raw JSON values, falling
@@ -134,6 +143,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             rpc,
             txindex,
             blockfilterindex,
+            v2transport,
         } => {
             // A real daemon: unbounded headers-first sync — sync to the
             // tip, then keep serving, relaying, and announcing until
@@ -209,6 +219,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 prune_bytes: None,
                 txindex,
                 blockfilterindex,
+                v2transport,
                 status: Some(status),
                 queries: Some(std::sync::Arc::new(std::sync::Mutex::new(query_rx))),
                 waiters: Some(waiters),
@@ -244,6 +255,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             prune_mb,
             txindex,
             blockfilterindex,
+            v2transport,
         } => {
             use avila_consensus::params::Network as ConsensusNet;
             let network = config.get().network;
@@ -265,6 +277,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 prune_bytes: prune_mb.map(|m| m * 1024 * 1024),
                 txindex,
                 blockfilterindex,
+                v2transport,
                 status: None,
                 queries: None,
                 waiters: None,

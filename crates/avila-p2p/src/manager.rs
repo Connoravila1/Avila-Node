@@ -20,9 +20,9 @@ use avila_consensus::chainstate::Chainstate;
 use avila_consensus::hash::BlockHash;
 
 use crate::addrman::{self, AddrBook};
-use crate::message::{AddrV2Entry, Message, NetAddr};
+use crate::message::{AddrV2Entry, Message, NODE_P2P_V2, NetAddr, Version};
 use crate::session::{
-    PeerInfo, PeerSession, SessionError, SessionEvent, build_version, wall_epoch,
+    HANDSHAKE_TIMEOUT, PeerInfo, PeerSession, SessionError, SessionEvent, build_version, wall_epoch,
 };
 use crate::sync::{MAX_BLOCKS_IN_TRANSIT_PER_PEER, PeerSync};
 
@@ -196,6 +196,12 @@ pub struct PeerSnapshot {
     pub addr_rate_limited: u64,
     /// Outstanding `getdata` block hashes (for `inflight` heights).
     pub in_flight_hashes: Vec<BlockHash>,
+    /// `transport_protocol_type` — "v1"/"v2" (Core also has
+    /// "detecting" mid-handshake; our sessions resolve first).
+    pub transport_protocol: &'static str,
+    /// `session_id` — the BIP324 session id, `None` on v1 like Core's
+    /// empty string.
+    pub v2_session_id: Option<[u8; 32]>,
 }
 
 /// A bounded set of peers sharing one [`Chainstate`].
@@ -244,13 +250,14 @@ pub struct PeerManager<S> {
     /// Where `bans` persists — `<net-datadir>/banlist.json`, written on
     /// every mutation like Core's `DumpBanlist`.
     banlist_path: Option<std::path::PathBuf>,
-    /// Completed dial attempts — workers send `(addr, connect result)`
+    /// Completed dial attempts — workers send `(addr, session result)`
     /// here and `maintain_outbounds` drains it on the tick, so an
     /// unreachable candidate costs a worker's 5s timeout instead of
     /// blocking the sync loop (Core's `ThreadOpenConnections` runs
-    /// dials off the message loop the same way).
-    dial_tx: std::sync::mpsc::Sender<(SocketAddr, std::io::Result<TcpStream>)>,
-    dial_rx: std::sync::mpsc::Receiver<(SocketAddr, std::io::Result<TcpStream>)>,
+    /// dials off the message loop the same way). The session includes
+    /// any completed BIP324 handshake.
+    dial_tx: std::sync::mpsc::Sender<(SocketAddr, DialOutcome)>,
+    dial_rx: std::sync::mpsc::Receiver<(SocketAddr, DialOutcome)>,
     /// Dials in flight — counted against outbound slots so a dead
     /// network can't queue unbounded workers, and deduplicated so the
     /// same address is never dialed twice at once.
@@ -260,6 +267,10 @@ pub struct PeerManager<S> {
     /// `last_*` fields. Core's `GetTime`: [`wall_epoch`] until the
     /// node substitutes its mockable clock via [`Self::set_clock`].
     clock: fn() -> i64,
+    /// `-v2transport` — whether outbound dials attempt BIP324 first.
+    /// Core defaults to true since v26; `addnode`'s per-node flag
+    /// overrides for manual peers.
+    v2transport: bool,
 }
 
 impl<S: Read + Write> PeerManager<S> {
@@ -287,6 +298,7 @@ impl<S: Read + Write> PeerManager<S> {
             dial_rx: dial_channel.1,
             pending_dials: std::collections::HashSet::new(),
             clock: wall_epoch,
+            v2transport: true,
         }
     }
 
@@ -297,6 +309,20 @@ impl<S: Read + Write> PeerManager<S> {
     /// atomic, a later `setmocktime` still shifts every session.
     pub fn set_clock(&mut self, clock: fn() -> i64) {
         self.clock = clock;
+    }
+
+    /// `-v2transport` — Core's `fUseV2Transport`: automatic
+    /// outbounds attempt BIP324 when true (the Core default).
+    pub fn set_v2transport(&mut self, on: bool) {
+        self.v2transport = on;
+    }
+
+    /// The configured `-v2transport` default — `addnode` without an
+    /// explicit flag resolves against it, like Core's
+    /// `connOptions.m_use_v2transport`.
+    #[must_use]
+    pub fn v2transport(&self) -> bool {
+        self.v2transport
     }
 
     /// Removes a peer, folding its wire counters into the cumulative
@@ -370,6 +396,8 @@ impl<S: Read + Write> PeerManager<S> {
                     addr_processed: peer.addr_processed,
                     addr_rate_limited: peer.addr_rate_limited,
                     in_flight_hashes: peer.sync.in_flight_hashes().collect(),
+                    transport_protocol: peer.session.transport_protocol(),
+                    v2_session_id: peer.session.v2_session_id(),
                 }
             })
             .collect();
@@ -1247,13 +1275,16 @@ impl<S: Read + Write> PeerManager<S> {
 
 impl PeerManager<TcpStream> {
     /// Connects to `addr` over TCP and registers the outbound session.
-    /// Nonblocking — `tick` does the polling.
+    /// `use_v2` attempts BIP324 first and redials cleartext when the
+    /// peer answers in v1 (Core's `ShouldReconnectV1`). Blocking until
+    /// the transport handshake resolves — `tick` does the polling.
     pub fn connect(
         &mut self,
         addr: SocketAddr,
         magic: [u8; 4],
         our_version: u64, // nonce for build_version
         start_height: i32,
+        use_v2: bool,
     ) -> Result<Option<u64>, SessionError> {
         let remote = crate::addrman::net_addr_of(addr, 0);
         // `BanMan::IsBanned` gates dialing — Core never opens a
@@ -1261,11 +1292,13 @@ impl PeerManager<TcpStream> {
         if self.bans.is_banned(&remote.ip, (self.clock)()) {
             return Ok(None);
         }
-        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
-        stream.set_nonblocking(true)?;
-        stream.set_nodelay(true)?;
-        let version = build_version(our_version, start_height, remote, (self.clock)());
-        let session = PeerSession::initiate(stream, magic, version, SEND_BUDGET_PER_PEER)?;
+        let mut version = build_version(our_version, start_height, remote, (self.clock)());
+        if use_v2 {
+            // GetLocalServices() — advertise NODE_P2P_V2 like Core's
+            // `-v2transport`.
+            version.services |= NODE_P2P_V2;
+        }
+        let session = dial(addr, magic, version, use_v2)?;
         Ok(self.add(session, Some(remote), false))
     }
 
@@ -1351,21 +1384,14 @@ impl PeerManager<TcpStream> {
         // connect for the same reason.
         while let Ok((addr, result)) = self.dial_rx.try_recv() {
             self.pending_dials.remove(&addr);
-            let Ok(stream) = result else { continue };
+            let Ok(session) = result else { continue };
             let remote = addrman::net_addr_of(addr, 0);
+            // A ban or a full peer set that landed mid-dial still
+            // applies — Core rechecks IsBanned after connect.
             let admissible = self.network_active
                 && self.has_slot()
-                && !self.bans.is_banned(&remote.ip, (self.clock)())
-                && stream.set_nonblocking(true).is_ok()
-                && stream.set_nodelay(true).is_ok();
-            if admissible
-                && let Ok(session) = PeerSession::initiate(
-                    stream,
-                    magic,
-                    build_version(addr.port() as u64, start_height, remote, (self.clock)()),
-                    SEND_BUDGET_PER_PEER,
-                )
-            {
+                && !self.bans.is_banned(&remote.ip, (self.clock)());
+            if admissible {
                 self.add(session, Some(remote), false);
             }
         }
@@ -1375,7 +1401,7 @@ impl PeerManager<TcpStream> {
         // addnode entries are operator intent — try them ahead of the
         // book. A 30s retry backoff keeps a dead entry from
         // re-queueing every round.
-        for (node, _) in self.added_nodes.clone() {
+        for (node, use_v2) in self.added_nodes.clone() {
             if !self.outbound_open() {
                 break;
             }
@@ -1408,7 +1434,9 @@ impl PeerManager<TcpStream> {
                     if self.is_banned(&addrman::net_addr_of(sock, 0).ip, now) {
                         continue;
                     }
-                    self.queue_dial(sock, &mut dialed);
+                    // addnode's `v2transport` flag overrides the
+                    // `-v2transport` default for this peer.
+                    self.queue_dial(sock, use_v2, magic, start_height, &mut dialed);
                 }
             }
         }
@@ -1427,7 +1455,15 @@ impl PeerManager<TcpStream> {
             if self.is_banned(&candidate.ip, now) {
                 continue; // banned candidates aren't dialed
             }
-            self.queue_dial(addrman::socket_addr(&candidate), &mut dialed);
+            // Automatic outbounds use the `-v2transport` setting —
+            // Core's `use_v2transport` on OpenNetworkConnection.
+            self.queue_dial(
+                addrman::socket_addr(&candidate),
+                self.v2transport,
+                magic,
+                start_height,
+                &mut dialed,
+            );
         }
         dialed
     }
@@ -1442,14 +1478,30 @@ impl PeerManager<TcpStream> {
     /// Spawns a dial worker for `addr` — the worker's only job is the
     /// blocking `connect_timeout`; everything else (session init,
     /// ban recheck, slot check) happens on the tick that drains it.
-    fn queue_dial(&mut self, addr: SocketAddr, dialed: &mut Vec<SocketAddr>) {
+    fn queue_dial(
+        &mut self,
+        addr: SocketAddr,
+        use_v2: bool,
+        magic: [u8; 4],
+        start_height: i32,
+        dialed: &mut Vec<SocketAddr>,
+    ) {
         if !self.pending_dials.insert(addr) {
             return; // already in flight
         }
         dialed.push(addr);
         let tx = self.dial_tx.clone();
+        let mut version = build_version(
+            addr.port() as u64,
+            start_height,
+            addrman::net_addr_of(addr, 0),
+            (self.clock)(),
+        );
+        if use_v2 {
+            version.services |= NODE_P2P_V2;
+        }
         std::thread::spawn(move || {
-            let _ = tx.send((addr, TcpStream::connect_timeout(&addr, DIAL_TIMEOUT)));
+            let _ = tx.send((addr, dial(addr, magic, version, use_v2)));
         });
     }
 }
@@ -1458,6 +1510,42 @@ impl PeerManager<TcpStream> {
 /// (`nConnectTimeout` is only honored by proxies; direct dials use
 /// the same bound here).
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One dial worker's product — a live `PeerSession` (v1, or v2 with
+/// the BIP324 handshake already done) or the failure.
+type DialOutcome = Result<PeerSession<TcpStream>, SessionError>;
+
+/// `connect` + optional BIP324 handshake + nonblocking flip — shared
+/// by [`PeerManager::connect`] and the `queue_dial` workers. On
+/// `V1Fallback` the socket is dropped and the peer redialed in v1 —
+/// Core's `ShouldReconnectV1` (a v1-only peer can't parse the
+/// ellswift bytes we already sent).
+fn dial(addr: SocketAddr, magic: [u8; 4], version: Version, want_v2: bool) -> DialOutcome {
+    let stream = TcpStream::connect_timeout(&addr, DIAL_TIMEOUT)?;
+    stream.set_nodelay(true)?;
+    if want_v2 {
+        // The handshake blocks for at most the handshake timeout —
+        // the caller thread (dial worker or RPC) bounds it.
+        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        match PeerSession::initiate_v2(stream, magic, version.clone(), SEND_BUDGET_PER_PEER) {
+            Err(SessionError::V1Fallback) => {
+                let stream = TcpStream::connect_timeout(&addr, DIAL_TIMEOUT)?;
+                stream.set_nodelay(true)?;
+                stream.set_nonblocking(true)?;
+                return PeerSession::initiate(stream, magic, version, SEND_BUDGET_PER_PEER);
+            }
+            Ok(mut session) => {
+                let s = session.stream_mut();
+                s.set_read_timeout(None)?;
+                s.set_nonblocking(true)?;
+                return Ok(session);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    stream.set_nonblocking(true)?;
+    PeerSession::initiate(stream, magic, version, SEND_BUDGET_PER_PEER)
+}
 
 /// `AddrV2Entry` → `NetAddr` for the networks we understand (IPv4 = 1,
 /// IPv6 = 2); other BIP155 networks are opaque and skipped.

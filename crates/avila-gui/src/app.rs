@@ -796,6 +796,7 @@ impl AvilaApp {
             waiters: None,
             txindex: false,
             blockfilterindex: false,
+            v2transport: true,
             prune_bytes: self
                 .sync
                 .prune_input

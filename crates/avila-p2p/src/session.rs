@@ -161,6 +161,15 @@ pub enum SessionError {
     /// The stream reached end-of-file — the peer hung up.
     #[error("peer closed the connection")]
     Eof,
+    /// A BIP324 packet failed to authenticate or parse — the
+    /// transport desynchronized and the connection is unusable.
+    #[error("v2 transport: {0}")]
+    Transport(&'static str),
+    /// The peer answered the v2 handshake with a v1 `version` frame —
+    /// redial with the cleartext transport (Core's
+    /// `ShouldReconnectV1`).
+    #[error("peer is v1-only — redial cleartext")]
+    V1Fallback,
 }
 
 /// A single peer connection's protocol state.
@@ -182,6 +191,9 @@ pub struct PeerSession<S> {
     /// The clock `conntime`/`lastsend`/`lastrecv` read — [`wall_epoch`]
     /// until the owning manager substitutes its own.
     clock: fn() -> i64,
+    /// BIP324 channel state when this session speaks v2; `None` for
+    /// the legacy cleartext wire.
+    v2: Option<crate::bip324::V2Channel>,
 }
 
 impl<S: Read + Write> PeerSession<S> {
@@ -200,6 +212,68 @@ impl<S: Read + Write> PeerSession<S> {
         let mut session = Self::new(stream, magic, our_version, send_budget, true);
         session.send(&Message::Version(session.our_version.clone()))?;
         Ok(session)
+    }
+
+    /// `initiate` over BIP324: run the ellswift handshake on the
+    /// (blocking) stream, send our garbage terminator + version
+    /// packet, then queue `version` as the first encrypted message.
+    ///
+    /// # Errors
+    /// [`SessionError::V1Fallback`] when the peer's first bytes were
+    /// the v1 `magic||version` prefix — Core's `ShouldReconnectV1`;
+    /// the caller should redial with [`Self::initiate`].
+    pub fn initiate_v2(
+        mut stream: S,
+        magic: [u8; 4],
+        our_version: Version,
+        send_budget: usize,
+    ) -> Result<Self, SessionError> {
+        match crate::bip324::handshake(&mut stream, magic).map_err(SessionError::Io)? {
+            crate::bip324::Handshake::V2(cipher, garbage) => {
+                let mut channel = crate::bip324::V2Channel::new(cipher, garbage);
+                let tail = channel.handshake_tail();
+                stream.write_all(&tail).map_err(SessionError::Io)?;
+                let mut session = Self::new(stream, magic, our_version, send_budget, true);
+                session.v2 = Some(channel);
+                session.send(&Message::Version(session.our_version.clone()))?;
+                Ok(session)
+            }
+            crate::bip324::Handshake::V1Fallback => Err(SessionError::V1Fallback),
+        }
+    }
+
+    /// `initiate` on a stream whose BIP324 handshake already ran —
+    /// for callers that interleave `start_handshake`/`finish_handshake`
+    /// themselves (in-memory pipes, future inbound accepts).
+    ///
+    /// # Errors
+    /// Same budget overflow as [`Self::initiate`].
+    pub fn initiate_v2_channel(
+        stream: S,
+        magic: [u8; 4],
+        our_version: Version,
+        send_budget: usize,
+        channel: crate::bip324::V2Channel,
+    ) -> Result<Self, SessionError> {
+        let mut session = Self::new(stream, magic, our_version, send_budget, true);
+        session.v2 = Some(channel);
+        session.send(&Message::Version(session.our_version.clone()))?;
+        Ok(session)
+    }
+
+    /// `accept` on a responder-side BIP324 channel — the inbound
+    /// half of `initiate_v2_channel`.
+    #[must_use]
+    pub fn accept_v2_channel(
+        stream: S,
+        magic: [u8; 4],
+        our_version: Version,
+        send_budget: usize,
+        channel: crate::bip324::V2Channel,
+    ) -> Self {
+        let mut session = Self::new(stream, magic, our_version, send_budget, false);
+        session.v2 = Some(channel);
+        session
     }
 
     /// Wraps `stream` for an inbound connection — we wait for the peer's
@@ -233,6 +307,7 @@ impl<S: Read + Write> PeerSession<S> {
             },
             send_budget,
             clock: wall_epoch,
+            v2: None,
         }
     }
 
@@ -283,6 +358,28 @@ impl<S: Read + Write> PeerSession<S> {
         self.telemetry.clone()
     }
 
+    /// `getpeerinfo.transport_protocol_type` — "v2" when BIP324 is
+    /// active (Core also reports "detecting" mid-handshake; our
+    /// sessions resolve before registration).
+    #[must_use]
+    pub fn transport_protocol(&self) -> &'static str {
+        if self.v2.is_some() { "v2" } else { "v1" }
+    }
+
+    /// `getpeerinfo.session_id` — the BIP324 session id, hex; empty
+    /// on v1 like Core.
+    #[must_use]
+    pub fn v2_session_id(&self) -> Option<[u8; 32]> {
+        self.v2.as_ref().map(|c| c.session_id())
+    }
+
+    /// The wrapped stream — callers flip socket options
+    /// (nonblocking, timeouts) around the blocking handshake
+    /// `initiate_v2` performs.
+    pub fn stream_mut(&mut self) -> &mut S {
+        &mut self.stream
+    }
+
     /// Fails the session if the handshake has run past [`HANDSHAKE_TIMEOUT`].
     ///
     /// # Errors
@@ -305,7 +402,12 @@ impl<S: Read + Write> PeerSession<S> {
         let command = message
             .command()
             .ok_or(SessionError::Frame(FrameError::BadCommand))?;
-        let frame = encode_frame(self.magic, command, &message.encode());
+        let frame = match &mut self.v2 {
+            // v2: one message = one packet — `msgtype || payload` is
+            // the AEAD plaintext (no magic/length/checksum).
+            Some(channel) => channel.encode_message(command.name(), &message.encode()),
+            None => encode_frame(self.magic, command, &message.encode()),
+        };
         if self.send_buf.len() + frame.len() > self.send_budget {
             return Err(SessionError::Io(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -362,22 +464,45 @@ impl<S: Read + Write> PeerSession<S> {
                 Ok(0) => return Err(SessionError::Eof),
                 Ok(n) => {
                     self.telemetry.bytes_recv += n as u64;
-                    self.decoder.feed(&scratch[..n]);
+                    match &mut self.v2 {
+                        Some(channel) => {
+                            // Packet layer yields complete
+                            // (msgtype, payload) pairs — the decoder
+                            // step is per-packet, not per-frame.
+                            let msgs = channel
+                                .feed(&scratch[..n])
+                                .map_err(SessionError::Transport)?;
+                            for (name, payload) in msgs {
+                                let Some(command) = Command::new(&name) else {
+                                    continue; // undecodable name — drop like Core
+                                };
+                                *self.telemetry.recv_by_msg.entry(name).or_insert(0) +=
+                                    payload.len() as u64;
+                                self.telemetry.last_recv = (self.clock)();
+                                if let Some(event) = self.dispatch(command, &payload)? {
+                                    events.push(event);
+                                }
+                            }
+                        }
+                        None => self.decoder.feed(&scratch[..n]),
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(SessionError::Io(e)),
             }
-            while let Some((command, payload)) = self.decoder.next_frame()? {
-                // Whole wire frame: payload plus the 24-byte header.
-                *self
-                    .telemetry
-                    .recv_by_msg
-                    .entry(command.name().to_string())
-                    .or_insert(0) += payload.len() as u64 + 24;
-                self.telemetry.last_recv = (self.clock)();
-                if let Some(event) = self.dispatch(command, &payload)? {
-                    events.push(event);
+            if self.v2.is_none() {
+                while let Some((command, payload)) = self.decoder.next_frame()? {
+                    // Whole wire frame: payload plus the 24-byte header.
+                    *self
+                        .telemetry
+                        .recv_by_msg
+                        .entry(command.name().to_string())
+                        .or_insert(0) += payload.len() as u64 + 24;
+                    self.telemetry.last_recv = (self.clock)();
+                    if let Some(event) = self.dispatch(command, &payload)? {
+                        events.push(event);
+                    }
                 }
             }
         }
@@ -495,6 +620,7 @@ impl PeerSession<TcpStream> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::bip324;
     use crate::message::GetHeaders;
     use avila_consensus::hash::BlockHash;
 
@@ -753,5 +879,98 @@ mod tests {
             us.poll().unwrap_err().to_string(),
             "peer closed the connection"
         );
+    }
+
+    /// Full BIP324 session over an in-memory pipe: ellswift exchange
+    /// interleaved start/respond/finish, then the v2 packet channel
+    /// carries version → verack → ping like the cleartext wire.
+    #[test]
+    fn v2_session_handshakes_and_speaks() {
+        let (mut a, mut b) = testpipe::pair();
+
+        // Phase-interleaved handshake: initiator key+garbage →
+        // responder key+garbage+terminator+version-pkt → ECDH.
+        let pending = bip324::start_handshake(&mut a).unwrap();
+        let ch_b = bip324::respond_handshake(&mut b, MAGIC).unwrap();
+        let bip324::Handshake::V2(cipher_a, garbage_a) =
+            bip324::finish_handshake(&mut a, pending, MAGIC).unwrap()
+        else {
+            panic!("v1 fallback on a v2 peer");
+        };
+        let mut ch_a = bip324::V2Channel::new(cipher_a, garbage_a);
+        let tail = ch_a.handshake_tail();
+        a.write_all(&tail).unwrap();
+
+        let mut us =
+            PeerSession::initiate_v2_channel(a, MAGIC, version(100), BUDGET, ch_a).unwrap();
+        let mut them = PeerSession::accept_v2_channel(b, MAGIC, version(99), BUDGET, ch_b);
+
+        assert_eq!(us.transport_protocol(), "v2");
+        // Both sides derived the same session id.
+        assert_eq!(us.v2_session_id(), them.v2_session_id());
+
+        // Our queued version flushes onto the wire; this poll also
+        // consumes the responder's garbage/terminator/version-packet.
+        us.poll().unwrap();
+        // Responder reads our version, then replies.
+        let events = them.poll().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Message(Message::Version(_)))),
+            "initiator version didn't decrypt: {events:?}"
+        );
+        let events = us.poll().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Message(Message::Version(_)))),
+            "responder version didn't decrypt: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Established))
+        );
+        assert!(us.established());
+        let events = them.poll().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Established))
+        );
+
+        // A post-handshake message rides the encrypted channel.
+        them.send(&Message::Ping(0xdead_beef)).unwrap();
+        us.poll().unwrap();
+        them.poll().unwrap();
+    }
+
+    /// A peer answering the v2 handshake with the v1 `version` prefix
+    /// is detected — the caller falls back to cleartext.
+    #[test]
+    fn v1_only_peer_triggers_fallback() {
+        let (mut a, mut b) = testpipe::pair();
+        let pending = bip324::start_handshake(&mut a).unwrap();
+        // The "peer" speaks v1: first bytes are `magic||version…`.
+        testpipe::inject(&mut b, MAGIC, &Message::Version(version(1)));
+        match bip324::finish_handshake(&mut a, pending, MAGIC).unwrap() {
+            bip324::Handshake::V1Fallback => {}
+            _ => panic!("v1 peer not detected"),
+        }
+    }
+
+    /// A v1 peer aborts the moment our ellswift bytes fail its magic
+    /// check — an immediate EOF/RST means `ShouldReconnectV1` (Core
+    /// reconnects v1 while the receive buffer is still empty).
+    #[test]
+    fn v1_peer_eof_triggers_fallback() {
+        let (mut a, b) = testpipe::pair();
+        let pending = bip324::start_handshake(&mut a).unwrap();
+        drop(b); // v1 peer slams the door on our garbage
+        match bip324::finish_handshake(&mut a, pending, MAGIC).unwrap() {
+            bip324::Handshake::V1Fallback => {}
+            _ => panic!("eof before any bytes not detected"),
+        }
     }
 }

@@ -12,6 +12,11 @@ publish.workspace = true
 [dependencies]
 avila-consensus.workspace = true
 avila-mempool.workspace = true
+chacha20 = "0.10.2"
+chacha20poly1305 = "0.11.0"
+getrandom = "0.4.3"
+secp256k1.workspace = true
+sha2.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 

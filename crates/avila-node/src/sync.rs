@@ -43,6 +43,10 @@ pub struct SyncConfig {
     /// index (`cfilters.dat` under `data_dir`) so `getblockfilter` and
     /// `scanblocks` serve real data.
     pub blockfilterindex: bool,
+    /// Core's `-v2transport` (default true since v26): outbound peers
+    /// are dialed with BIP324 first, falling back to v1 when the peer
+    /// answers in cleartext.
+    pub v2transport: bool,
     /// When set, publish each tick's progress into this snapshot so a
     /// query surface (RPC, GUI) can read it without blocking sync.
     pub status: Option<crate::rpc::SharedStatus>,
@@ -72,6 +76,7 @@ impl Default for SyncConfig {
             prune_bytes: None,
             txindex: false,
             blockfilterindex: false,
+            v2transport: true,
             status: None,
             queries: None,
             waiters: None,
@@ -179,6 +184,7 @@ pub fn run(
     // `timestamp`s, conntime/lastsend/lastrecv and the last_* peer
     // fields — reads the node clock, so `setmocktime` shifts them too.
     mgr.set_clock(crate::time::time);
+    mgr.set_v2transport(cfg.v2transport);
     let started = Instant::now();
     // Core's `GetStartupTime` — wall-clock boot epoch. `uptime` reads
     // `GetTime() - GetStartupTime()`, so a pinned mock shifts it too.
@@ -213,7 +219,13 @@ pub fn run(
                 0,
                 cs.chain().len() as i32,
             ),
-            None => mgr.connect(*addr, params.message_start, 0, cs.chain().len() as i32),
+            None => mgr.connect(
+                *addr,
+                params.message_start,
+                0,
+                cs.chain().len() as i32,
+                cfg.v2transport,
+            ),
         };
         if let Ok(Some(_)) = attempted {
             dialed += 1;
