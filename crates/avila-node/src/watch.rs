@@ -280,7 +280,7 @@ impl WatchWallet {
                     if let Some(vout) = avila_consensus::silent::detect_silent_payment(
                         tx,
                         &self.silents[si],
-                        &resolve,
+                        resolve,
                     ) {
                         let out = &tx.outputs[vout as usize];
                         self.coins.insert(

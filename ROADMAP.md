@@ -584,9 +584,13 @@ operation. Compare complete initial download and catch-up, not only local replay
       actionable recovery. Landed: `backupwallet`/`restorewallet` for
       the watch-only wallet (Core's `-8 "Backup file does not exist"`,
       corrupt backups rejected without touching live state),
-      `-maxmempool` resource cap, per-file version markers that fail
-      loudly on downgrade. Node-level datadir backup and
-      migration/rollback tooling remain open.
+      node-level `avila-node backup`/`restore` (full datadir copy
+      with a backup-manifest; restore refuses to clobber a non-empty
+      datadir without --force), `-maxmempool` resource cap, per-file
+      version markers that fail loudly on downgrade. A live-node
+      backup still needs a stop-first workflow — no advisory file
+      lock exists yet — and versioned migration/rollback tooling
+      between releases remains open.
 
 Evidence: documented end-to-end wallet, mining, pruning, reorg, service-isolation and
 recovery tests. Headless and desktop workflows use the same commands and state.

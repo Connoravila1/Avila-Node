@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use std::net::SocketAddr;
@@ -151,6 +151,39 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:18443")]
         rpc_addr: SocketAddr,
     },
+    /// Copy the network data directory into `<dest>/<network>-<unix>`.
+    /// The node must be stopped — copying mid-flush can tear a file.
+    Backup {
+        /// Directory the backup lands under; created if absent.
+        dest: PathBuf,
+    },
+    /// Restore a datadir produced by `backup` over the configured
+    /// network directory. Refuses to clobber a non-empty live dir
+    /// unless --force.
+    Restore {
+        /// The `<network>-<unix>` backup directory to restore from.
+        src: PathBuf,
+        /// Overwrite an existing non-empty datadir.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+/// Recursive copy — every file under `src` lands at the same
+/// relative path under `dst`; a manifest records the run.
+fn copy_tree(src: &Path, dst: &Path, files: &mut Vec<String>) -> Result<(), Box<dyn Error>> {
+    std::fs::create_dir_all(dst)?;
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let to = dst.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            copy_tree(&e.path(), &to, files)?;
+        } else {
+            std::fs::copy(e.path(), &to)?;
+            files.push(e.file_name().to_string_lossy().to_string());
+        }
+    }
+    Ok(())
 }
 
 fn execute(args: Args) -> Result<(), Box<dyn Error>> {
@@ -468,6 +501,57 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 },
                 None => println!("null"),
             }
+        }
+        Command::Backup { dest } => {
+            let src = config.network_data_dir();
+            if !src.is_dir() {
+                return Err(format!("no datadir at {}", src.display()).into());
+            }
+            std::fs::create_dir_all(&dest)?;
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let target = dest.join(format!("{}-{stamp}", config.get().network));
+            let mut files = Vec::new();
+            copy_tree(&src, &target, &mut files)?;
+            std::fs::write(
+                target.join("backup-manifest.json"),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "network": config.get().network.to_string(),
+                    "created": stamp,
+                    "files": files,
+                }))?,
+            )?;
+            println!("Backed up {} file(s) to {}", files.len(), target.display());
+        }
+        Command::Restore { src, force } => {
+            let dst = config.network_data_dir();
+            if !src.join("backup-manifest.json").is_file() {
+                return Err(format!(
+                    "{} is not an avila-node backup (no manifest)",
+                    src.display()
+                )
+                .into());
+            }
+            if dst.is_dir() {
+                let non_empty = std::fs::read_dir(&dst)?.next().is_some();
+                if non_empty && !force {
+                    return Err(format!(
+                        "{} is non-empty — pass --force to overwrite",
+                        dst.display()
+                    )
+                    .into());
+                }
+                if non_empty {
+                    std::fs::remove_dir_all(&dst)?;
+                }
+            }
+            let mut files = Vec::new();
+            copy_tree(&src, &dst, &mut files)?;
+            // The manifest records the backup run, not live state.
+            let _ = std::fs::remove_file(dst.join("backup-manifest.json"));
+            println!("Restored {} file(s) into {}", files.len(), dst.display());
         }
     }
     Ok(())

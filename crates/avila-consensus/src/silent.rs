@@ -287,7 +287,9 @@ mod tests {
             let mut raw = hex(txid_hex);
             raw.reverse(); // display → internal LE
             let op = OutPoint {
-                txid: Txid::from_bytes(<[u8; 32]>::try_from(raw).unwrap_or_else(|_| unreachable!())),
+                txid: Txid::from_bytes(
+                    <[u8; 32]>::try_from(raw).unwrap_or_else(|_| unreachable!()),
+                ),
                 vout: 0,
             };
             prevouts.insert(op, hex(prev_hex));
