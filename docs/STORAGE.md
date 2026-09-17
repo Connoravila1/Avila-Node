@@ -58,11 +58,26 @@ against the deployed design.
 
 ## Decision and open risk
 
-The flat-file + in-memory design is kept: zero write amplification,
-simplest possible recovery story, and the sync path is already the
-bottleneck (network-bound, not disk-bound) on every measured profile.
-The documented cost is **memory** — this node targets
-regtest/testnet4/signet until a disk-backed coins view (candidate B)
-is qualified for mainnet scale. That port is a G5 follow-up: the
-`UtxoSet` API is already an opaque map, so the storage swap is
-behind one trait boundary.
+Deployed shape (as of commit `e1507c7`): candidate B landed as
+`coinsdb.redb` (redb, single-file embedded store) behind `UtxoSet`'s
+three-layer view — dirty map with tombstones over an optional overlay
+base over the backend. Commits are one redb write transaction
+(coins + height/hash-tagged undos + tip/count metadata), so the file
+is always internally consistent.
+
+- **Write amplification**: `state.dat` no longer rewrites the coin set
+  — only the header index, chain, and bookkeeping (`externalized`
+  flag). Coins flush at the `-dbcache` budget (default 450 MiB) or at
+  each checkpoint.
+- **Recovery**: crash windows resolve to "backend at most one commit
+  ahead of `state.dat`" — `reconcile_backend` disconnects the extra
+  blocks via their committed undos, then the post-snapshot bodies
+  replay forward. A v3 `state.dat` (inline coins) migrates on open.
+- **Memory**: `-dbcache` bounds the dirty map; clean reads hit redb's
+  mmap'd pages instead of process heap.
+
+The remaining open risk is **mainnet IBD throughput** — redb's
+B-tree point writes per commit are unmeasured at 150M-coin scale, and
+the dirty-map iteration order makes commit keys random (a sorted
+flush may pay off). Measure a real mainnet sync before claiming the
+bound closed.
