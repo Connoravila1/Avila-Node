@@ -86,7 +86,7 @@ pub fn compute(
 ) -> CoinStats {
     // Cursor order = (txid, vout) ascending on the raw txid bytes —
     // `Txid`'s `Ord` is exactly that lexicographic order.
-    let mut entries: Vec<(&OutPoint, &Coin)> = utxo.iter().collect();
+    let mut entries: Vec<(OutPoint, Coin)> = utxo.iter();
     entries.sort_by_key(|(op, _)| (op.txid, op.vout));
 
     let mut stats = CoinStats {

@@ -113,20 +113,72 @@ pub struct Coin {
     pub coinbase: bool,
 }
 
-/// The set of unspent transaction outputs — a flat `OutPoint → Coin` map with
-/// Core's `CCoinsView` semantics but no cache layering.
-///
-/// Invariants, matching `AddCoin`/`SpendCoin`:
-///
-/// * unspendable outputs ([`Script::is_unspendable`]) are never stored;
-/// * a spent coin is removed entirely — Core's spent-tombstone/`FRESH`
-///   bookkeeping exists for cache flushing, which this type doesn't do.
-///
-/// [`Script::is_unspendable`]: crate::transaction::Script::is_unspendable
-#[derive(Clone, Default, Debug, PartialEq, Eq)]
-pub struct UtxoSet {
-    map: HashMap<OutPoint, Coin>,
+/// One cache entry in [`UtxoSet::map`]: `Some` a live coin, `None` a
+/// tombstone over a coin that exists in a lower layer and was spent
+/// since the last flush.
+type CacheMap = HashMap<OutPoint, Option<Coin>>;
+
+/// Rough in-memory size of one cache entry — key + `Coin` + map
+/// overhead. Used for the `-dbcache` budget signal only; precision to
+/// the byte isn't required, the order of magnitude is.
+fn entry_bytes(coin: Option<&Coin>) -> usize {
+    36 + 8 + coin.map_or(32, |c| c.out.script_pubkey.as_bytes().len()) + 64
 }
+
+/// The set of unspent transaction outputs — Core's `CCoinsViewCache`
+/// shape: a small write-back cache of pending changes layered over a
+/// disk backend (`coinsdb.redb`) and/or a moved-in parent view.
+///
+/// Layered lookup order for `get`/`have`:
+///   1. `map` — dirty writes (`Some`) and tombstones (`None`)
+///   2. `base` — a moved-in parent view (reorg simulation overlay)
+///   3. `backend` — the persisted `redb` coins table
+///
+/// The cache is *write-back only*: reads that miss `map` go straight
+/// to the backend's mmap index rather than being cached, so `map`
+/// holds only state that must eventually flush. When `map` exceeds
+/// `budget` bytes the caller flushes it — commits are atomic
+/// coins+undo+tip transactions, so they may only happen at block
+/// boundaries; a single block's dirty set may transiently exceed the
+/// budget (Core's cache behaves the same way during `ConnectBlock`).
+///
+/// With no backend attached (`backend == None`) every entry lives in
+/// `map` as `Some` and behavior is exactly the old flat-map set —
+/// that's the mode tests and the mempool overlay use.
+#[derive(Debug)]
+pub struct UtxoSet {
+    /// Pending writes: `Some` = live coin, `None` = tombstone.
+    map: CacheMap,
+    /// Moved-in lower view — `Some` only inside reorg simulation.
+    base: Option<Box<UtxoSet>>,
+    /// The persisted coins store — `Some` only on the real leaf set.
+    backend: Option<std::sync::Arc<crate::coinsdb::CoinsBackend>>,
+    /// Approximate bytes held by `map` — the flush-pressure signal.
+    map_bytes: usize,
+    /// Soft cap on `map_bytes` — Core's `-dbcache` for the coins view.
+    budget: usize,
+    /// Coins live in `map` minus tombstones over lower-layer coins —
+    /// tracks the map's net contribution so `len()` stays O(1).
+    live_delta: i64,
+}
+
+impl Default for UtxoSet {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            base: None,
+            backend: None,
+            map_bytes: 0,
+            budget: DEFAULT_CACHE_BUDGET,
+            live_delta: 0,
+        }
+    }
+}
+
+/// Default coins-cache budget: 450 MiB — Core's `-dbcache` default,
+/// covering both the UTXO cache and block/filter indexes in Core's
+/// accounting. Here it bounds only the coins write-back cache.
+pub const DEFAULT_CACHE_BUDGET: usize = 450 * 1024 * 1024;
 
 impl UtxoSet {
     /// An empty UTXO set — the state at genesis. The genesis block is never
@@ -137,42 +189,211 @@ impl UtxoSet {
         Self::default()
     }
 
-    /// The number of tracked coins.
+    /// Attaches the disk backend — `Some` turns this set into a
+    /// write-back cache over `coinsdb.redb`; `None` leaves it the
+    /// in-memory map.
+    pub fn attach_backend(&mut self, backend: crate::coinsdb::CoinsBackend) {
+        self.backend = Some(std::sync::Arc::new(backend));
+    }
+
+    /// Attaches an already-shared backend handle — the chainstate
+    /// holds the `Arc` (for undo reads during overlay sims) and hands
+    /// the same one here.
+    pub fn attach_shared(&mut self, backend: std::sync::Arc<crate::coinsdb::CoinsBackend>) {
+        self.backend = Some(backend);
+    }
+
+    /// `true` when a disk backend is attached.
+    #[must_use]
+    pub fn has_backend(&self) -> bool {
+        self.backend.is_some()
+    }
+
+    /// The backend handle — `None` in memory-only mode.
+    #[must_use]
+    pub fn backend(&self) -> Option<&crate::coinsdb::CoinsBackend> {
+        self.backend.as_deref()
+    }
+
+    /// Sets the write-back cache budget in bytes (`-dbcache`).
+    pub fn set_budget(&mut self, bytes: usize) {
+        self.budget = bytes;
+    }
+
+    /// `true` when the dirty map exceeds the budget — the caller
+    /// should flush at the next block boundary.
+    #[must_use]
+    pub fn over_budget(&self) -> bool {
+        self.backend.is_some() && self.map_bytes > self.budget
+    }
+
+    /// The number of tracked coins — lower layers plus the map's net
+    /// `live_delta` (new coins minus tombstones over lower-layer ones).
+    /// O(1): the delta is maintained at write time.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.map.len()
+        let lower = self.base.as_deref().map_or(0, UtxoSet::len).saturating_add(
+            self.backend
+                .as_deref()
+                .map_or(0, |b| b.coins_len() as usize),
+        );
+        lower.saturating_add_signed(self.live_delta as isize)
     }
 
     /// `true` if no coins are tracked.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.len() == 0
     }
 
-    /// The coin at `outpoint`, if present (Core's `AccessCoin` for an unspent
-    /// entry — there are no spent tombstones to distinguish).
+    /// The coin at `outpoint` — layered lookup: dirty map, then the
+    /// simulation base, then the disk backend. Backend reads are not
+    /// cached in `map` (the cache is write-back only); `redb`'s mmap
+    /// lookups are cheap enough that read-caching buys little.
     #[must_use]
-    pub fn get(&self, outpoint: &OutPoint) -> Option<&Coin> {
-        self.map.get(outpoint)
+    pub fn get(&self, outpoint: &OutPoint) -> Option<Coin> {
+        if let Some(entry) = self.map.get(outpoint) {
+            return entry.clone();
+        }
+        if let Some(base) = &self.base {
+            return base.get(outpoint);
+        }
+        if let Some(be) = &self.backend {
+            return be.get(outpoint);
+        }
+        None
+    }
+
+    /// Borrowing view of `get` — returns the cached coin by reference
+    /// when it lives in `map`, else `None` (backend hits can't return
+    /// a reference). Callers that only need presence should use
+    /// [`UtxoSet::have`]; those needing the coin itself use `get`.
+    #[must_use]
+    pub fn get_cached(&self, outpoint: &OutPoint) -> Option<&Coin> {
+        self.map.get(outpoint).and_then(|e| e.as_ref())
     }
 
     /// `true` if `outpoint` holds a coin (Core's `HaveCoin`).
     #[must_use]
     pub fn have(&self, outpoint: &OutPoint) -> bool {
-        self.map.contains_key(outpoint)
+        if let Some(entry) = self.map.get(outpoint) {
+            return entry.is_some();
+        }
+        if let Some(base) = &self.base {
+            return base.have(outpoint);
+        }
+        self.backend.as_ref().is_some_and(|be| be.have(outpoint))
     }
 
-    /// Iterates every `OutPoint → Coin` entry — the snapshot hook; order is
-    /// unspecified (HashMap order) and must not be relied on.
-    pub fn iter(&self) -> impl Iterator<Item = (&OutPoint, &Coin)> {
-        self.map.iter()
+    /// Every live `OutPoint → Coin`, materialized — merges the dirty
+    /// map over the backend table (tombstones remove, `Some` override
+    /// or add). Snapshot/`gettxoutsetinfo`/`dumptxoutset` path; the
+    /// callers all collect anyway.
+    #[must_use]
+    pub fn iter(&self) -> Vec<(OutPoint, Coin)> {
+        let mut all: HashMap<OutPoint, Coin> = match &self.backend {
+            Some(be) => be.iter_coins().into_iter().collect(),
+            None => HashMap::new(),
+        };
+        if let Some(base) = &self.base {
+            for (op, c) in base.iter() {
+                all.insert(op, c);
+            }
+        }
+        for (op, entry) in &self.map {
+            match entry {
+                Some(c) => {
+                    all.insert(*op, c.clone());
+                }
+                None => {
+                    all.remove(op);
+                }
+            }
+        }
+        all.into_iter().collect()
     }
 
-    /// Inserts a coin directly — the staging hook for tests and future
-    /// chainstate seeding. Bypasses the unspendable check; the caller is
-    /// responsible for the invariant.
+    /// Inserts a coin directly — the staging hook for tests, mempool
+    /// overlays, and migration seeding. Bypasses the unspendable
+    /// check; the caller is responsible for the invariant.
     pub fn insert_synthetic(&mut self, outpoint: OutPoint, coin: Coin) {
-        self.map.insert(outpoint, coin);
+        self.put(outpoint, Some(coin));
+    }
+
+    /// Read-through to the layers below `map`.
+    fn lower_get(&self, outpoint: &OutPoint) -> Option<Coin> {
+        self.base
+            .as_deref()
+            .and_then(|b| b.get(outpoint))
+            .or_else(|| self.backend.as_deref().and_then(|be| be.get(outpoint)))
+    }
+
+    /// `true` if any layer below `map` holds `outpoint`.
+    fn lower_live(&self, outpoint: &OutPoint) -> bool {
+        self.base.as_deref().is_some_and(|b| b.have(outpoint))
+            || self.backend.as_deref().is_some_and(|be| be.have(outpoint))
+    }
+
+    /// Writes `entry` into `map`, keeping `live_delta` exact: the map's
+    /// net contribution is `is_live − was_live`, where "was live" counts
+    /// both an existing live map entry and a coin in a lower layer that
+    /// this entry now shadows.
+    fn put(&mut self, outpoint: OutPoint, entry: Option<Coin>) {
+        let was_live = match self.map.get(&outpoint) {
+            Some(old) => old.is_some(),
+            None => self.lower_live(&outpoint),
+        };
+        if let Some(old) = self.map.get(&outpoint) {
+            self.map_bytes = self.map_bytes.saturating_sub(entry_bytes(old.as_ref()));
+        }
+        self.map_bytes += entry_bytes(entry.as_ref());
+        self.live_delta += i64::from(entry.is_some()) - i64::from(was_live);
+        self.map.insert(outpoint, entry);
+    }
+
+    /// `spend` exposed to sibling-module tests (coinsdb's suite drives
+    /// the tombstone path without building a whole block).
+    #[cfg(test)]
+    pub(crate) fn test_spend(&mut self, outpoint: &OutPoint) -> Option<Coin> {
+        self.spend(outpoint)
+    }
+
+    /// Removes the coin at `outpoint`, returning it (Core's `SpendCoin`
+    /// with `moveout`). Misses `map` fall through to base/backend and
+    /// leave a tombstone.
+    fn spend(&mut self, outpoint: &OutPoint) -> Option<Coin> {
+        if let Some(entry) = self.map.get_mut(outpoint) {
+            self.map_bytes = self.map_bytes.saturating_sub(entry_bytes(entry.as_ref()));
+            let taken = entry.take();
+            if taken.is_some() {
+                self.live_delta -= 1;
+            }
+            return taken;
+        }
+        let coin = self.lower_get(outpoint)?;
+        self.live_delta -= 1;
+        self.map_bytes += entry_bytes(None);
+        self.map.insert(*outpoint, None);
+        Some(coin)
+    }
+
+    /// Drops `outpoint`'s entry — the disconnect path's "remove created
+    /// outputs" step. Two cases:
+    /// * the created coin is only in `map` (this block created it since
+    ///   the last commit) — drop it; if it shadowed a live lower coin
+    ///   (BIP30 overwrite) the lower coin resurfaces, and the
+    ///   overwritten-undo record rewrites it explicitly.
+    /// * the created coin lives in a lower layer (a committed block
+    ///   being disconnected during rewind) — shadow it with a
+    ///   tombstone so the removal reaches the backend on commit.
+    fn remove_entry(&mut self, outpoint: &OutPoint) {
+        if let Some(old) = self.map.remove(outpoint) {
+            self.map_bytes = self.map_bytes.saturating_sub(entry_bytes(old.as_ref()));
+            self.live_delta -= i64::from(old.is_some()) - i64::from(self.lower_live(outpoint));
+        }
+        if self.lower_live(outpoint) {
+            self.put(*outpoint, None);
+        }
     }
 
     /// Adds `tx`'s outputs at `height`, recording undo into `undo` — Core's
@@ -204,10 +425,14 @@ impl UtxoSet {
                 height,
                 coinbase,
             };
-            if let Some(previous) = self.map.insert(outpoint, coin) {
+            // The overwrite check must see through the cache: a coin
+            // living only in the backend still counts as unspent.
+            let previous = self.get(&outpoint);
+            self.put(outpoint, Some(coin));
+            if let Some(previous) = previous {
                 if !coinbase {
                     // Restore the entry so rollback sees pre-tx state.
-                    self.map.insert(outpoint, previous);
+                    self.put(outpoint, Some(previous));
                     return Err(ConnectError::Internal(
                         "non-coinbase tx overwrote an unspent coin past the BIP30 scan",
                     ));
@@ -218,12 +443,100 @@ impl UtxoSet {
         Ok(())
     }
 
-    /// Removes the coin at `outpoint`, returning it (Core's `SpendCoin` with
-    /// `moveout`). `None` when absent.
-    fn spend(&mut self, outpoint: &OutPoint) -> Option<Coin> {
-        self.map.remove(outpoint)
+    /// Produces a simulation overlay: this set's state is *moved* into
+    /// the overlay's `base` layer (an O(1) `mem::take`, not the old
+    /// O(utxo) clone), leaving `self` empty. The overlay's reads see
+    /// the full state; its writes land in its own `map`.
+    ///
+    /// The caller must hand the overlay back via [`UtxoSet::unoverlay`]
+    /// (success or failure) to restore `self` — see `chainstate`'s
+    /// `maybe_reorg` for the pattern.
+    #[must_use]
+    pub fn overlay(&mut self) -> UtxoSet {
+        UtxoSet {
+            map: HashMap::new(),
+            base: Some(Box::new(std::mem::take(self))),
+            backend: None,
+            map_bytes: 0,
+            budget: usize::MAX, // simulation never flushes
+            live_delta: 0,
+        }
+    }
+
+    /// Restores a set emptied by [`UtxoSet::overlay`]: folds the
+    /// overlay's `base` back into `self` when the simulation is
+    /// discarded, or applies the overlay's committed view when it
+    /// passed (the caller picks). `overlay` must be this set's child —
+    /// i.e. produced by `self.overlay()`.
+    ///
+    /// `commit == false`: discard the overlay — `self` gets its base
+    /// back untouched. `commit == true`: adopt the overlay — `self`
+    /// becomes `overlay` flattened (its base restored, its pending
+    /// writes merged on top).
+    pub fn unoverlay(&mut self, overlay: UtxoSet, commit: bool) {
+        let Some(base) = overlay.base else {
+            return;
+        };
+        if !commit {
+            *self = *base;
+            return;
+        }
+        // Adopt: restore the base into self, then replay the overlay's
+        // pending writes on top — same layering the backend gives.
+        *self = *base;
+        for (op, entry) in overlay.map {
+            self.put(op, entry);
+        }
+    }
+
+    /// Flushes the pending writes to the backend atomically together
+    /// with `new_undos` and the connected `tip` — Core's
+    /// `CCoinsViewCache::Sync` + `BatchWrite`. No-op without a backend.
+    ///
+    /// # Errors
+    /// `io::Error` on backend transaction failure.
+    pub fn flush_to_backend(
+        &mut self,
+        new_undos: &[(u32, crate::hash::BlockHash, BlockUndo)],
+        tip: u32,
+    ) -> std::io::Result<()> {
+        let Some(be) = &self.backend else {
+            return Ok(());
+        };
+        be.commit(&self.map, new_undos, tip)?;
+        self.map.clear();
+        self.map_bytes = 0;
+        self.live_delta = 0;
+        Ok(())
     }
 }
+
+impl Clone for UtxoSet {
+    fn clone(&self) -> Self {
+        Self {
+            map: self.map.clone(),
+            base: self.base.clone(),
+            backend: self.backend.clone(),
+            map_bytes: self.map_bytes,
+            budget: self.budget,
+            live_delta: self.live_delta,
+        }
+    }
+}
+
+impl PartialEq for UtxoSet {
+    /// Content equality — normalizes layering away by comparing the
+    /// merged view. O(n); test-only use.
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        let mine: HashMap<OutPoint, Coin> = self.iter().into_iter().collect();
+        let theirs: HashMap<OutPoint, Coin> = other.iter().into_iter().collect();
+        mine == theirs
+    }
+}
+impl Eq for UtxoSet {}
 
 /// The undo data for one transaction — everything needed to reverse its UTXO
 /// effects (Core's `CTxUndo`).
@@ -462,7 +775,7 @@ pub fn check_tx_inputs(
     let mut spent = Vec::with_capacity(tx.inputs.len());
     for input in &tx.inputs {
         match utxo.get(&input.previous_output) {
-            Some(coin) => spent.push(coin.clone()),
+            Some(coin) => spent.push(coin),
             None => return Err(ConnectError::InputsMissingOrSpent),
         }
     }
@@ -821,16 +1134,16 @@ fn rollback(block: &Block, utxo: &mut UtxoSet, applied: Vec<AppliedTx>) {
             if out.script_pubkey.is_unspendable() {
                 continue;
             }
-            utxo.map.remove(&OutPoint {
+            utxo.remove_entry(&OutPoint {
                 txid,
                 vout: vout as u32,
             });
         }
         for (outpoint, coin) in applied_tx.undo.overwritten {
-            utxo.map.insert(outpoint, coin);
+            utxo.put(outpoint, Some(coin));
         }
         for (input, coin) in tx.inputs.iter().zip(applied_tx.undo.spent.iter()) {
-            utxo.map.insert(input.previous_output, coin.clone());
+            utxo.put(input.previous_output, Some(coin.clone()));
         }
     }
 }
@@ -860,17 +1173,17 @@ pub fn disconnect_block(
             if out.script_pubkey.is_unspendable() {
                 continue;
             }
-            utxo.map.remove(&OutPoint {
+            utxo.remove_entry(&OutPoint {
                 txid,
                 vout: vout as u32,
             });
         }
         let tx_undo = &undo.txs[i];
         for (outpoint, coin) in &tx_undo.overwritten {
-            utxo.map.insert(*outpoint, coin.clone());
+            utxo.put(*outpoint, Some(coin.clone()));
         }
         for (input, coin) in tx.inputs.iter().zip(tx_undo.spent.iter()) {
-            utxo.map.insert(input.previous_output, coin.clone());
+            utxo.put(input.previous_output, Some(coin.clone()));
         }
     }
     Ok(())

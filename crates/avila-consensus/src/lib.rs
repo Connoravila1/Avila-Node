@@ -10,6 +10,7 @@ pub mod block;
 pub mod chain;
 pub mod chainstate;
 pub mod check;
+pub mod coinsdb;
 pub mod coinstats;
 pub mod connect;
 pub mod descriptor;

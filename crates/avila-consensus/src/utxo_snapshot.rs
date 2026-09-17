@@ -153,7 +153,7 @@ pub fn write_snapshot<W: Write>(
 /// LevelDB scan `WriteUTXOSnapshot` drives.
 #[must_use]
 pub fn sorted_coins(utxo: &UtxoSet) -> Vec<(OutPoint, Coin)> {
-    let mut coins: Vec<(OutPoint, Coin)> = utxo.iter().map(|(o, c)| (*o, c.clone())).collect();
+    let mut coins: Vec<(OutPoint, Coin)> = utxo.iter();
     coins.sort_by_key(|(o, _)| outpoint_key(o));
     coins
 }

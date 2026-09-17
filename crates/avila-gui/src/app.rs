@@ -790,6 +790,7 @@ impl AvilaApp {
                 .sync
                 .store
                 .then(|| self.node.config().network_data_dir()),
+            dbcache: None,
             cancel: Some(cancel.clone()),
             status: None,
             queries: None,

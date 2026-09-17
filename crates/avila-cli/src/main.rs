@@ -72,6 +72,12 @@ enum Command {
         /// -maxconnections; default 8).
         #[arg(long)]
         maxconnections: Option<usize>,
+        /// Coins-view cache budget in MB (Core's -dbcache; default
+        /// 450). The write-back cache commits at block boundaries
+        /// once it exceeds this — a lower value forces more frequent
+        /// commits (useful for low-memory operation).
+        #[arg(long)]
+        dbcache: Option<usize>,
         /// Accept inbound peer connections on this address (Core's
         /// -listen=<addr>). Inbound peers auto-negotiate v1 or BIP324
         /// and join under the manager's slot/eviction rules.
@@ -400,6 +406,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             maxmempool,
             v2transport,
             maxconnections,
+            dbcache,
             listen,
             electrum,
             sv2tp,
@@ -553,6 +560,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 timeout: Duration::from_secs(u64::MAX),
                 proxy,
                 data_dir: Some(data_dir.clone()),
+                dbcache: dbcache.map(|mb| mb * 1024 * 1024),
                 cancel: Some(cancel),
                 prune_bytes: None,
                 txindex,
@@ -617,6 +625,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 timeout: Duration::from_secs(timeout_secs),
                 proxy,
                 data_dir: store.then(|| config.network_data_dir()),
+                dbcache: None,
                 cancel: None,
                 prune_bytes: prune_mb.map(|m| m * 1024 * 1024),
                 txindex,

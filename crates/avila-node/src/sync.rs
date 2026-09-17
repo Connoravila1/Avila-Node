@@ -34,6 +34,10 @@ pub struct SyncConfig {
     /// When set, the chainstate persists under this directory —
     /// re-running resumes from the stored snapshot instead of genesis.
     pub data_dir: Option<std::path::PathBuf>,
+    /// Coins-view write-back cache budget in bytes — Core's `-dbcache`
+    /// (in Core it also covers block/filter indexes; here it bounds
+    /// only the coins cache). `None` = the 450 MiB default.
+    pub dbcache: Option<usize>,
     /// Cancellation flag — checked each tick; `true` ends the run early
     /// and still returns a report (state already flushed).
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -94,6 +98,7 @@ impl Default for SyncConfig {
             timeout: Duration::from_secs(120),
             proxy: None,
             data_dir: None,
+            dbcache: None,
             cancel: None,
             prune_bytes: None,
             txindex: false,
@@ -195,7 +200,11 @@ pub fn run(
     let mut cs = match &cfg.data_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir).map_err(SyncError::Store)?;
-            Chainstate::with_store(dir, params, unix_now()).map_err(SyncError::Store)?
+            let dbcache = cfg
+                .dbcache
+                .unwrap_or(avila_consensus::connect::DEFAULT_CACHE_BUDGET);
+            Chainstate::with_store_coinsdb(dir, params, unix_now(), dbcache)
+                .map_err(SyncError::Store)?
         }
         None => Chainstate::new(params),
     };

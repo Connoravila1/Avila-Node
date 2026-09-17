@@ -5607,7 +5607,13 @@ pub(crate) fn dispatch(
                         }
                     }
                 };
-                Ok(getblockstats_json(cs, node, &block, undo, wanted.as_ref()))
+                Ok(getblockstats_json(
+                    cs,
+                    node,
+                    &block,
+                    undo.as_ref(),
+                    wanted.as_ref(),
+                ))
             })
         }
         "gettxout" => {
@@ -9079,7 +9085,8 @@ pub(crate) fn dispatch(
                         RPC_MISC_ERROR,
                         "Could not roll back to requested height.".to_string(),
                     ))?;
-                    if avila_consensus::connect::disconnect_block(&body, &mut utxo, undo).is_err() {
+                    if avila_consensus::connect::disconnect_block(&body, &mut utxo, &undo).is_err()
+                    {
                         return Err((
                             RPC_MISC_ERROR,
                             "Could not roll back to requested height.".to_string(),
@@ -9458,7 +9465,7 @@ pub(crate) fn dispatch(
                     }
                     for (i, tx) in block.transactions.iter().enumerate() {
                         if !tx.is_coinbase()
-                            && let Some(tx_undo) = undo.and_then(|u| u.txs.get(i))
+                            && let Some(tx_undo) = undo.as_ref().and_then(|u| u.txs.get(i))
                         {
                             for (vin_idx, (coin, txin)) in
                                 tx_undo.spent.iter().zip(tx.inputs.iter()).enumerate()
@@ -10275,7 +10282,7 @@ pub(crate) fn dispatch(
                                 );
                             }
                             if needles.contains(coin.out.script_pubkey.as_bytes()) {
-                                coins.push((*outpoint, coin.clone()));
+                                coins.push((outpoint, coin.clone()));
                             }
                         }
                         if completed {

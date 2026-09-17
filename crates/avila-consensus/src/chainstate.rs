@@ -37,11 +37,12 @@ use crate::block::Block;
 use crate::chain::{ChainError, HeaderTree, InsertStatus};
 use crate::check::{self, BlockContext, BlockRuleError, ContextualBlockError, RuleError};
 use crate::coinstats::{self, CoinStats, CoinStatsHashType};
-use crate::connect::{self, BlockUndo, ConnectContext, ConnectError, UtxoSet};
+use crate::connect::{self, BlockUndo, Coin, ConnectContext, ConnectError, UtxoSet};
 use crate::hash::{BlockHash, Txid};
 use crate::header::BlockHeader;
 use crate::params::Params;
 use crate::store::{self, BlockStore, StateData};
+use crate::transaction::OutPoint;
 
 /// The outcome of a successful [`Chainstate::accept_block`] call.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -181,9 +182,15 @@ pub struct Chainstate {
     blocks: HashMap<BlockHash, Block>,
     /// The connected chain's block hashes, genesis at index 0.
     chain: Vec<BlockHash>,
-    /// Per-block undo for `chain[1..]` (the genesis is never connected):
-    /// `undos[k]` reverses the block at height `k + 1`.
+    /// Per-block undo *tail* — `undos[i]` reverses the block at height
+    /// `undo_base + 1 + i`. Older undos live in the coinsdb backend's
+    /// `undo` table once flushed (Core's `rev*.dat` role); in memory-only
+    /// mode `undo_base` is 0 and this Vec covers the whole chain.
     undos: Vec<BlockUndo>,
+    /// The shared coinsdb handle — the same `Arc` the `utxo` view
+    /// carries, mirrored here so undo reads work while `utxo` is
+    /// emptied mid-overlay (reorg simulation).
+    coins_backend: Option<std::sync::Arc<crate::coinsdb::CoinsBackend>>,
     /// The durable body store when this chainstate was opened with
     /// [`Chainstate::with_store`]; `None` keeps everything in memory.
     store: Option<BlockStore>,
@@ -737,6 +744,7 @@ impl Chainstate {
             blocks: HashMap::new(),
             chain: vec![genesis],
             undos: Vec::new(),
+            coins_backend: None,
             store: None,
             txindex: None,
             scripthashindex: None,
@@ -813,9 +821,8 @@ impl Chainstate {
             let Some(block) = self.body(&hash) else {
                 continue; // retained-map gap — unreachable on a stored chain
             };
-            let empty = BlockUndo::default();
-            let undo = self.undo(h).unwrap_or(&empty);
-            index.append(h, &block, undo);
+            let undo = self.undo(h).unwrap_or_default();
+            index.append(h, &block, &undo);
         }
         self.filterindex = Some(index);
         Ok(())
@@ -843,9 +850,8 @@ impl Chainstate {
             let Some(block) = self.body(&hash) else {
                 continue;
             };
-            let empty = BlockUndo::default();
-            let undo = self.undo(h).unwrap_or(&empty);
-            index.append(h, &block, undo);
+            let undo = self.undo(h).unwrap_or_default();
+            index.append(h, &block, &undo);
         }
         self.scripthashindex = Some(index);
         Ok(())
@@ -1034,9 +1040,20 @@ impl Chainstate {
         }
 
         let mut loaded = UtxoSet::new();
+        if let Some(be) = &self.coins_backend {
+            loaded.attach_shared(be.clone());
+        }
         crate::utxo_snapshot::read_coins(r, meta.coins_count, base_height, |outpoint, coin| {
             loaded.insert_synthetic(outpoint, coin)
         })?;
+        // Backend mode: the snapshot coins must land in the coinsdb —
+        // a dirty map this large would blow the budget on the next
+        // connect anyway.
+        if loaded.has_backend() {
+            loaded
+                .flush_to_backend(&[], base_height)
+                .map_err(|e| SnapshotError(format!("coinsdb import: {e}")))?;
+        }
 
         // `AssumeutxoHash` — hash_serialized_3 of the loaded set must
         // match the chainparams value.
@@ -1079,7 +1096,14 @@ impl Chainstate {
         chain.reverse();
         self.utxo = loaded;
         self.chain = chain;
-        self.undos = vec![BlockUndo::default(); base_height as usize];
+        // Below the base no undo exists anywhere. Memory mode keeps the
+        // `chain.len() - 1` invariant with empty placeholders; backend
+        // mode leaves the tail empty — committed undos live in coinsdb.
+        self.undos = if self.coins_backend.is_some() {
+            Vec::new()
+        } else {
+            vec![BlockUndo::default(); base_height as usize]
+        };
         self.connected = base;
         self.snapshot_base = Some(base_height);
         self.precious = None;
@@ -1162,16 +1186,51 @@ impl Chainstate {
         // see the store, so a post-snapshot side branch can reorg against
         // snapshotted (memory-absent) connected blocks.
         cs.store = Some(store);
+        cs.resume(dir, now)
+    }
+
+    /// `with_store` plus the disk-backed coins view — the default for
+    /// a real datadir (`-dbcache` tunes `cache_bytes`). The backend is
+    /// attached *before* `state.dat` loads so restore can migrate an
+    /// inline-UTXO snapshot or rewind a crash-ahead backend.
+    ///
+    /// # Errors
+    /// `io::Error` on store/backend open or resume failure.
+    pub fn with_store_coinsdb(
+        dir: &Path,
+        params: &Params,
+        now: u32,
+        cache_bytes: usize,
+    ) -> std::io::Result<Self> {
+        let store = BlockStore::open(dir, params.message_start)?;
+        let mut cs = Self::new(params);
+        cs.store = Some(store);
+        cs.enable_coinsdb(dir, cache_bytes)?;
+        cs.resume(dir, now)
+    }
+
+    /// The resume half of `with_store*`: read `state.dat` if present,
+    /// then replay any stored bodies it doesn't cover.
+    fn resume(self, dir: &Path, now: u32) -> std::io::Result<Self> {
+        let mut cs = self;
         // A snapshot that fails to load or restore falls back to full replay —
         // the blk files are the record of what arrived; state.dat only ever
         // re-derives it faster.
-        let mut pending = match store::read_state(dir, params.message_start) {
+        let mut pending = match store::read_state(dir, cs.tree.params().message_start) {
             Ok(Some(state)) => match cs.restore(state, now) {
                 Ok(pending) => pending,
                 Err(_) => {
+                    // Restore failed — rebuild a clean in-memory
+                    // chainstate; the backend keeps its data (a fresh
+                    // UtxoSet over it replays from blk files anyway).
                     let store = cs.store.take();
-                    cs = Self::new(params);
+                    let backend = cs.coins_backend.take();
+                    cs = Self::new(cs.tree.params());
                     cs.store = store;
+                    cs.coins_backend = backend;
+                    if let Some(be) = &cs.coins_backend {
+                        cs.utxo.attach_shared(be.clone());
+                    }
                     cs.stored_bodies(&HashSet::new())?
                 }
             },
@@ -1267,11 +1326,48 @@ impl Chainstate {
         }
         self.connected = state.tip;
         self.chain = state.chain;
-        self.undos = state.undos;
         self.snapshot_base = snapshot_base;
-        self.utxo = UtxoSet::new();
-        for (outpoint, coin) in state.utxo {
-            self.utxo.insert_synthetic(outpoint, coin);
+        // Coins view: `externalized` (v4) states keep coins+undos in
+        // coinsdb — reconcile it against this snapshot's tip. Inline
+        // states (v3, or v4 written without a backend) carry the data
+        // in `state.utxo`/`state.undos` — under a backend they migrate
+        // in; without one they load as the live set.
+        if state.externalized {
+            if self.coins_backend.is_none() {
+                return Err(corrupt(
+                    "state externalizes coins to coinsdb but no backend is attached",
+                ));
+            }
+            self.undos = Vec::new();
+            // Crash window: the backend may have committed past this
+            // snapshot's tip — rewind via the stored undos + bodies.
+            self.reconcile_backend(state.height)?;
+        } else if let Some(be) = &self.coins_backend {
+            // Inline-format state under a backend: stream the coins in
+            // bounded chunks, then the undos — one migration commit at
+            // the snapshot's own height.
+            let mut batch: HashMap<OutPoint, Option<Coin>> = HashMap::with_capacity(100_000);
+            for (op, coin) in state.utxo {
+                batch.insert(op, Some(coin));
+                if batch.len() >= 100_000 {
+                    be.commit(&batch, &[], state.height)?;
+                    batch.clear();
+                }
+            }
+            let undos: Vec<(u32, crate::hash::BlockHash, BlockUndo)> = state
+                .undos
+                .into_iter()
+                .enumerate()
+                .map(|(i, u)| (i as u32 + 1, self.chain[i + 1], u))
+                .collect();
+            be.commit(&batch, &undos, state.height)?;
+            self.undos = Vec::new();
+        } else {
+            self.undos = state.undos;
+            self.utxo = UtxoSet::new();
+            for (outpoint, coin) in state.utxo {
+                self.utxo.insert_synthetic(outpoint, coin);
+            }
         }
         let mut covered: HashSet<BlockHash> = state.failed.into_iter().collect();
         covered.extend(self.chain.iter().copied());
@@ -1321,18 +1417,25 @@ impl Chainstate {
     fn snapshot(&self) -> StateData {
         let mut failed = self.tree.failed_hashes();
         failed.sort_unstable();
+        // With a coinsdb backend the coins set and flushed undos live
+        // in `coinsdb.redb` — `state.dat` carries only the unflushed
+        // tail (still needed, since `flush_coins` runs before
+        // `write_state` the tail is empty anyway, but write it for
+        // correctness when called on a mid-flight state).
+        let externalized = self.coins_backend.is_some();
+        let (utxo, undos) = if externalized {
+            (Vec::new(), Vec::new())
+        } else {
+            (self.utxo.iter(), self.undos.clone())
+        };
         StateData {
             tip: self.connected,
             height: self.chain.len() as u32 - 1,
             headers: self.tree.headers_by_height(),
             best_header: self.tree.tip_hash(),
             chain: self.chain.clone(),
-            undos: self.undos.clone(),
-            utxo: self
-                .utxo
-                .iter()
-                .map(|(outpoint, coin)| (*outpoint, coin.clone()))
-                .collect(),
+            undos,
+            utxo,
             failed,
             tx_meta: {
                 let mut meta: Vec<(BlockHash, u32, u64)> = self
@@ -1347,6 +1450,7 @@ impl Chainstate {
                 meta
             },
             snapshot_base: self.snapshot_base.unwrap_or(0),
+            externalized,
         }
     }
 
@@ -1360,11 +1464,21 @@ impl Chainstate {
     ///
     /// `io::Error` on flush or snapshot-write failure.
     pub fn flush(&mut self) -> std::io::Result<()> {
-        let Some(store) = &mut self.store else {
-            return Ok(());
+        // Bodies first — the crash-rewind path disconnects blocks via
+        // their blk-file bodies, so they must be durable before the
+        // coins commit that could need them.
+        let (dir, magic) = {
+            let Some(store) = &mut self.store else {
+                return Ok(());
+            };
+            store.flush()?;
+            (store.dir().to_path_buf(), store.magic())
         };
-        store.flush()?;
-        let (dir, magic) = (store.dir().to_path_buf(), store.magic());
+        // Coins second: a crash here leaves the backend ahead of
+        // `state.dat`, which `reconcile_backend` rewinds via the
+        // committed undo records. The reverse order would leave the
+        // backend *behind* — unrecoverable without a full replay.
+        self.flush_coins()?;
         store::write_state(&dir, magic, &self.snapshot())
     }
 
@@ -1431,17 +1545,135 @@ impl Chainstate {
         self.blocks.get(hash)
     }
 
+    /// Heights `1..=undo_base` have their undo in the coinsdb backend
+    /// (or none, below the assumeutxo base); the in-memory tail covers
+    /// everything above.
+    /// First height NOT covered by `self.undos` — the undo tail starts
+    /// at `undo_base + 1`. With a backend it tracks the committed
+    /// watermark (flushed undos live in coinsdb); in memory mode the
+    /// vec holds one entry per height (empty placeholders below the
+    /// assumeutxo base) so the tail starts at 0.
+    fn undo_base(&self) -> u32 {
+        self.coins_backend.as_ref().map_or(0, |b| b.tip_height())
+    }
+
     /// The undo data for the *active-chain* block at `height` — Core's
-    /// `ReadBlockUndo`. `undos[h-1]` reverses `chain[h]`; genesis and
-    /// heights above the connected tip have none, and side-branch
-    /// blocks never get undo entries, matching Core's rev*.dat
-    /// semantics where undo exists only for the active chain.
+    /// `ReadBlockUndo`. Reads the backend's `undo` table for flushed
+    /// heights and the in-memory tail for the rest; genesis and heights
+    /// above the connected tip have none, and side-branch blocks never
+    /// get undo entries, matching Core's rev*.dat semantics.
     #[must_use]
-    pub fn undo(&self, height: u32) -> Option<&BlockUndo> {
+    pub fn undo(&self, height: u32) -> Option<BlockUndo> {
         if height == 0 {
             return None;
         }
-        self.undos.get(height as usize - 1)
+        let base = self.undo_base();
+        if height <= base {
+            return self
+                .coins_backend
+                .as_deref()
+                .and_then(|b| b.undo_at(height));
+        }
+        self.undos.get((height - base - 1) as usize).cloned()
+    }
+
+    /// Attaches the disk coins backend — Core's `CCoinsViewDB` under
+    /// the cache. Call before load/replay so every connect streams
+    /// through the write-back cache.
+    ///
+    /// # Errors
+    /// `io::Error` when `coinsdb.redb` cannot be opened or created.
+    pub fn enable_coinsdb(
+        &mut self,
+        dir: &std::path::Path,
+        cache_bytes: usize,
+    ) -> std::io::Result<()> {
+        let backend = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open(dir)?);
+        self.utxo.attach_shared(backend.clone());
+        self.utxo.set_budget(cache_bytes);
+        self.coins_backend = Some(backend);
+        Ok(())
+    }
+
+    /// Commits the dirty coins cache plus the in-memory undo tail to
+    /// the backend in one atomic transaction — Core's
+    /// `FlushStateToDisk` coins layer. No-op in memory-only mode.
+    ///
+    /// # Errors
+    /// `io::Error` on backend commit failure.
+    fn flush_coins(&mut self) -> std::io::Result<()> {
+        self.flush_coins_with(&[], self.chain.len() as u32 - 1)
+    }
+
+    /// `flush_coins` with `extra` undo records for heights at/below the
+    /// current backend watermark — used when a reorg replaces blocks
+    /// whose undos were already flushed. The commit stays atomic:
+    /// coins + every pending undo + the new `tip` land together.
+    fn flush_coins_with(
+        &mut self,
+        extra: &[(u32, crate::hash::BlockHash, BlockUndo)],
+        tip: u32,
+    ) -> std::io::Result<()> {
+        if self.coins_backend.is_none() {
+            // Memory mode: `extra` is unreachable — a fork below
+            // `undo_base` requires a backend watermark (memory mode's
+            // `undo_base` is `snapshot_base`, and the reorg guard
+            // forbids forking at or below it).
+            return Ok(());
+        }
+        let base = self.undo_base();
+        let mut pending: Vec<(u32, crate::hash::BlockHash, BlockUndo)> = extra.to_vec();
+        pending.extend(self.undos.iter().enumerate().map(|(i, u)| {
+            let h = base + 1 + i as u32;
+            (h, self.chain[h as usize], u.clone())
+        }));
+        self.utxo.flush_to_backend(&pending, tip)?;
+        self.undos.clear();
+        Ok(())
+    }
+
+    /// Rewinds the coins backend down to `state_tip` — the
+    /// crash-window repair when a coins commit landed but its
+    /// `state.dat` never did. Each height disconnects through a
+    /// scratch view sharing the backend, then commits — so progress
+    /// survives another crash mid-rewind.
+    fn reconcile_backend(&mut self, state_tip: u32) -> std::io::Result<()> {
+        let Some(be) = self.coins_backend.clone() else {
+            return Ok(());
+        };
+        let db_tip = be.tip_height();
+        if db_tip < state_tip {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "coinsdb tip {db_tip} behind state.dat tip {state_tip} —                      commit order makes this impossible; the database is corrupt"
+                ),
+            ));
+        }
+        for h in (state_tip + 1..=db_tip).rev() {
+            let Some((hash, undo)) = be.undo_entry(h) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("coinsdb rewind: no undo for height {h}"),
+                ));
+            };
+            let Some(block) = self.body(&hash) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("coinsdb rewind: no body for {hash} at {h}"),
+                ));
+            };
+            let mut scratch = UtxoSet::new();
+            scratch.attach_shared(be.clone());
+            connect::disconnect_block(&block, &mut scratch, &undo).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("coinsdb rewind: undo inconsistent at {h}"),
+                )
+            })?;
+            scratch.flush_to_backend(&[], h - 1)?;
+        }
+        Ok(())
     }
 
     /// Core's `GetChainTxStats` — transaction-count statistics for the
@@ -1537,7 +1769,7 @@ impl Chainstate {
     /// (VerifyDB's `check_depth` clamp); `check_level < 0` runs no
     /// checks and returns `true`, like Core.
     #[must_use]
-    pub fn verify_tip(&self, check_level: i32, depth: i64) -> bool {
+    pub fn verify_tip(&mut self, check_level: i32, depth: i64) -> bool {
         let tip = self.chain.len() as u32 - 1; // chain[0] is genesis
         if check_level < 0 {
             return true;
@@ -1549,53 +1781,63 @@ impl Chainstate {
         };
         let start = (u64::from(tip) + 1 - depth as u64) as u32;
         let params = *self.tree.params();
-        let mut utxo = self.utxo.clone();
-        // VerifyDB's backward pass: bodies present (level 0), CheckBlock
-        // (≥ 1), undo present (≥ 2), DisconnectBlock applies (≥ 3).
-        for height in (start..=tip).rev() {
-            let hash = self.chain[height as usize];
-            let Some(block) = self.body(&hash) else {
-                return false;
-            };
-            if check_level >= 1 && check::check_block(&block, &params).is_err() {
-                return false;
+        // Overlay, not clone: VerifyDB's scratch view must not pay an
+        // O(utxo) copy — it reads through to the live set and is
+        // discarded at the end either way.
+        let mut utxo = self.utxo.overlay();
+        let verdict = (|utxo: &mut UtxoSet| {
+            // VerifyDB's backward pass: bodies present (level 0),
+            // CheckBlock (≥ 1), undo present (≥ 2), DisconnectBlock
+            // applies (≥ 3).
+            for height in (start..=tip).rev() {
+                let hash = self.chain[height as usize];
+                let Some(block) = self.body(&hash) else {
+                    return false;
+                };
+                if check_level >= 1 && check::check_block(&block, &params).is_err() {
+                    return false;
+                }
+                let Some(undo) = self.undo(height) else {
+                    return check_level < 2;
+                };
+                if check_level >= 3 && connect::disconnect_block(&block, utxo, &undo).is_err() {
+                    return false;
+                }
             }
-            let Some(undo) = self.undos.get(height as usize - 1) else {
-                return check_level < 2;
-            };
-            if check_level >= 3 && connect::disconnect_block(&block, &mut utxo, undo).is_err() {
-                return false;
+            if check_level < 4 {
+                return true;
             }
-        }
-        if check_level < 4 {
-            return true;
-        }
-        // Forward pass: full reconnect — contextual checks plus
-        // ConnectBlock under the live assumevalid script decision.
-        for height in start..=tip {
-            let hash = self.chain[height as usize];
-            let Some(block) = self.body(&hash) else {
-                return false;
-            };
-            let ctx = BlockContext {
-                params: &params,
-                height,
-                parent_median_time_past: self.tree.median_time_past(&block.header.prev_block_hash),
-            };
-            if check::contextual_check_block(&block, &ctx).is_err() {
-                return false;
+            // Forward pass: full reconnect — contextual checks plus
+            // ConnectBlock under the live assumevalid script decision.
+            for height in start..=tip {
+                let hash = self.chain[height as usize];
+                let Some(block) = self.body(&hash) else {
+                    return false;
+                };
+                let ctx = BlockContext {
+                    params: &params,
+                    height,
+                    parent_median_time_past: self
+                        .tree
+                        .median_time_past(&block.header.prev_block_hash),
+                };
+                if check::contextual_check_block(&block, &ctx).is_err() {
+                    return false;
+                }
+                let cctx = ConnectContext {
+                    params: &params,
+                    tree: &self.tree,
+                    block_hash: hash,
+                    script_checks: self.script_checks(&hash, &params),
+                };
+                if connect::connect_block(&block, utxo, &cctx).is_err() {
+                    return false;
+                }
             }
-            let cctx = ConnectContext {
-                params: &params,
-                tree: &self.tree,
-                block_hash: hash,
-                script_checks: self.script_checks(&hash, &params),
-            };
-            if connect::connect_block(&block, &mut utxo, &cctx).is_err() {
-                return false;
-            }
-        }
-        true
+            true
+        })(&mut utxo);
+        self.utxo.unoverlay(utxo, false);
+        verdict
     }
 
     /// UTXO-set statistics over the active tip — `gettxoutsetinfo`'s
@@ -1786,6 +2028,15 @@ impl Chainstate {
                     self.undos.push(undo);
                     self.connected = hash;
                     self.tree.note_connected(&hash);
+                    // The write-back cache is flushed at block
+                    // boundaries — a full map commits coins + undo tail
+                    // + tip atomically (Core's `FlushStateToDisk` under
+                    // cache pressure).
+                    if self.utxo.over_budget() {
+                        self.flush_coins().map_err(|_| {
+                            BlockRejection::Connect(ConnectError::Internal("coinsdb flush failed"))
+                        })?;
+                    }
                     Ok(Acceptance::Connected {
                         height,
                         reorged: false,
@@ -1890,45 +2141,19 @@ impl Chainstate {
             return Ok(None);
         }
 
-        // Simulate on a clone: disconnect the old branch, connect the new one.
-        let mut utxo = self.utxo.clone();
-        for height in (fork_height + 1..=self.undos.len() as u32).rev() {
-            let block_hash = self.chain[height as usize];
-            let Some(block) = self.body(&block_hash) else {
-                return Err(ConnectError::Internal("missing connected block body"));
-            };
-            let undo = &self.undos[(height - 1) as usize];
-            connect::disconnect_block(&block, &mut utxo, undo)
-                .map_err(|_| ConnectError::Internal("disconnect undo inconsistent"))?;
-        }
-        let mut new_undos = Vec::with_capacity(branch_hashes.len());
-        for branch_hash in &branch_hashes {
-            let Some(block) = self.body(branch_hash) else {
-                return Err(ConnectError::Internal("missing branch block body"));
-            };
-            let ctx = ConnectContext {
-                params,
-                tree: &self.tree,
-                block_hash: *branch_hash,
-                script_checks: self.script_checks(branch_hash, params),
-            };
-            match connect::connect_block(&block, &mut utxo, &ctx) {
-                Ok(undo) => {
-                    // `ConnectTip` stamps nChainTx as each block lands —
-                    // kept even if a later branch block fails the whole
-                    // activation (those blocks genuinely connected).
-                    self.tree.note_connected(branch_hash);
-                    new_undos.push(undo);
-                }
-                Err(err) => {
-                    // The branch wins on work but this block is invalid: mark
-                    // it (and thereby every later descendant) and keep the old
-                    // active chain — `InvalidChainFound`'s exact behavior.
-                    self.tree.mark_invalid(*branch_hash);
-                    return Err(err);
-                }
+        // Simulate on an overlay: the live set moves into the overlay's
+        // base layer (an O(1) `mem::take`, not the old O(utxo) clone) —
+        // every disconnect/connect writes only to the overlay's dirty
+        // map. Any failure path restores `self.utxo` via `unoverlay`.
+        let mut sim = self.utxo.overlay();
+        let new_undos = match self.simulate_branch(&mut sim, fork_height, &branch_hashes, params) {
+            Ok(undos) => undos,
+            Err(err) => {
+                self.utxo.unoverlay(sim, false);
+                return Err(err);
             }
-        }
+        };
+        self.utxo.unoverlay(sim, true);
 
         // Commit. `disconnected` records whether any connected block was rolled
         // back — false when the branch merely extended the tip (a stored-body
@@ -1936,7 +2161,6 @@ impl Chainstate {
         // a reorg).
         let disconnected = (fork_height as usize) < self.chain.len() - 1;
         let old_tip_height = self.chain.len() as u32 - 1;
-        self.utxo = utxo;
         // The filter index follows the chain's own rewind/append: evicted
         // heights move to the hash index, then each reconnected block
         // chains its header off the fork point's.
@@ -1951,7 +2175,18 @@ impl Chainstate {
             }
         }
         self.chain.truncate(fork_height as usize + 1);
-        self.undos.truncate(fork_height as usize);
+        // `undos` is the tail above `undo_base` — the backend holds the
+        // rest. A fork below the watermark leaves flushed undo records
+        // in place; the new branch's undos for those heights are
+        // committed through `flush_coins` below (its overwrite keeps
+        // backend undo = active chain).
+        let base = self.undo_base();
+        if fork_height >= base {
+            self.undos
+                .truncate(fork_height.saturating_sub(base) as usize);
+        } else {
+            self.undos.clear();
+        }
         let bodies: Vec<Option<Block>> = branch_hashes.iter().map(|bh| self.body(bh)).collect();
         if let Some(index) = &mut self.filterindex {
             for (i, (b, u)) in bodies.iter().zip(new_undos.iter()).enumerate() {
@@ -1968,9 +2203,81 @@ impl Chainstate {
             }
         }
         self.chain.extend(branch_hashes);
-        self.undos.extend(new_undos);
+        // Undos for heights at/below the backend watermark can't sit in
+        // the tail — they're committed now, atomically with the coin
+        // delta, so backend undo records always describe the committed
+        // coin state (the crash-rewind invariant).
+        let base = self.undo_base();
+        let split = (base.saturating_sub(fork_height) as usize).min(new_undos.len());
+        if split > 0 {
+            let low: Vec<(u32, crate::hash::BlockHash, BlockUndo)> = new_undos[..split]
+                .iter()
+                .enumerate()
+                .map(|(i, u)| {
+                    let h = fork_height + 1 + i as u32;
+                    (h, self.chain[h as usize], u.clone())
+                })
+                .collect();
+            self.flush_coins_with(&low, self.chain.len() as u32 - 1)
+                .map_err(|_| ConnectError::Internal("coinsdb reorg flush"))?;
+        }
+        self.undos.extend(new_undos.into_iter().skip(split));
         self.connected = hash;
         Ok(Some(disconnected))
+    }
+
+    /// Runs a candidate branch against an overlay UTXO set: disconnect
+    /// the active chain to `fork_height`, then connect `branch_hashes`.
+    /// Returns the new branch's undo records. `sim` must be the overlay
+    /// produced by `self.utxo.overlay()` — the caller restores it via
+    /// `unoverlay` on both outcomes.
+    fn simulate_branch(
+        &mut self,
+        sim: &mut UtxoSet,
+        fork_height: u32,
+        branch_hashes: &[BlockHash],
+        params: &Params,
+    ) -> Result<Vec<BlockUndo>, ConnectError> {
+        for height in (fork_height + 1..self.chain.len() as u32).rev() {
+            let block_hash = self.chain[height as usize];
+            let Some(block) = self.body(&block_hash) else {
+                return Err(ConnectError::Internal("missing connected block body"));
+            };
+            let Some(undo) = self.undo(height) else {
+                return Err(ConnectError::Internal("missing connected undo"));
+            };
+            connect::disconnect_block(&block, sim, &undo)
+                .map_err(|_| ConnectError::Internal("disconnect undo inconsistent"))?;
+        }
+        let mut new_undos = Vec::with_capacity(branch_hashes.len());
+        for branch_hash in branch_hashes {
+            let Some(block) = self.body(branch_hash) else {
+                return Err(ConnectError::Internal("missing branch block body"));
+            };
+            let ctx = ConnectContext {
+                params,
+                tree: &self.tree,
+                block_hash: *branch_hash,
+                script_checks: self.script_checks(branch_hash, params),
+            };
+            match connect::connect_block(&block, sim, &ctx) {
+                Ok(undo) => {
+                    // `ConnectTip` stamps nChainTx as each block lands —
+                    // kept even if a later branch block fails the whole
+                    // activation (those blocks genuinely connected).
+                    self.tree.note_connected(branch_hash);
+                    new_undos.push(undo);
+                }
+                Err(err) => {
+                    // The branch wins on work but this block is invalid: mark
+                    // it (and thereby every later descendant) and keep the old
+                    // active chain — `InvalidChainFound`'s exact behavior.
+                    self.tree.mark_invalid(*branch_hash);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(new_undos)
     }
 
     /// `preciousblock` — marks `hash` as the equal-work tie winner and
@@ -2656,7 +2963,7 @@ mod tests {
     /// The coins view as a sorted vec — `UtxoSet` iteration order is
     /// unspecified, so equality checks go through this.
     fn sorted_utxo(cs: &Chainstate) -> Vec<(OutPoint, crate::connect::Coin)> {
-        let mut v: Vec<_> = cs.utxo().iter().map(|(op, c)| (*op, c.clone())).collect();
+        let mut v: Vec<_> = cs.utxo().iter();
         v.sort_by_key(|(op, _)| (op.txid.to_bytes(), op.vout));
         v
     }
@@ -3156,7 +3463,7 @@ mod tests {
         let base_hash = blocks[1].block_hash();
         let mut utxo = src.utxo().clone();
         let undo3 = src.undo(3).unwrap();
-        connect::disconnect_block(&blocks[2], &mut utxo, undo3).unwrap();
+        connect::disconnect_block(&blocks[2], &mut utxo, &undo3).unwrap();
         let stats = crate::coinstats::compute(
             &utxo,
             2,
@@ -3202,13 +3509,8 @@ mod tests {
         // The loaded view equals the source's h2 view, coin for coin.
         assert_eq!(cs.utxo().len(), utxo.len());
         for (op, coin) in &coins {
-            let got = cs
-                .utxo()
-                .iter()
-                .find(|(o, _)| *o == op)
-                .map(|(_, c)| c)
-                .unwrap();
-            assert_eq!(got, coin);
+            let got = cs.utxo().iter().into_iter().find(|(o, _)| *o == *op);
+            assert_eq!(got, Some((*op, coin.clone())));
         }
 
         // A second load is refused exactly like Core's double activate.
@@ -3337,5 +3639,165 @@ mod tests {
             err.to_string(),
             "Can't activate a snapshot when mempool not empty"
         );
+    }
+
+    // ---- coinsdb backend integration ----
+
+    #[test]
+    fn coinsdb_restart_resumes() {
+        let params = params();
+        let dir = store_dir("coinsdb-resume");
+        let blocks = probe_chain(20, &[], &params);
+        let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        for block in &blocks[..10] {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        cs.flush().unwrap();
+        let tip10 = cs.tip_hash();
+        let utxo10: Vec<_> = cs.utxo().iter();
+        drop(cs);
+
+        let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        assert_eq!(cs.tip_hash(), tip10);
+        // Coins come back from the backend, not the (empty) snapshot.
+        let mut resumed = cs.utxo().iter();
+        resumed.sort_by_key(|(o, _)| (o.txid, o.vout));
+        let mut expected = utxo10;
+        expected.sort_by_key(|(o, _)| (o.txid, o.vout));
+        assert_eq!(resumed, expected);
+        for block in &blocks[10..] {
+            assert!(cs.accept_block(block, NOW).is_ok());
+        }
+        assert_eq!(cs.tip_hash(), blocks[19].block_hash());
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn coinsdb_crash_ahead_rewinds() {
+        let params = params();
+        let dir = store_dir("coinsdb-rewind");
+        let blocks = probe_chain(15, &[], &params);
+        let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        for block in &blocks[..8] {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        cs.flush().unwrap();
+
+        // Connect 3 more and commit coins WITHOUT writing state.dat —
+        // the backend-ahead crash window.
+        for block in &blocks[8..11] {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        cs.flush_coins().unwrap();
+        let utxo11: Vec<_> = cs.utxo().iter();
+        drop(cs);
+
+        // Restart: state.dat says tip=8, coinsdb says 11 — the backend
+        // rewinds to 8, then the post-snapshot bodies (still in the blk
+        // files) replay forward, converging both to tip 11.
+        let cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        assert_eq!(cs.tip_hash(), blocks[10].block_hash());
+        let mut resumed = cs.utxo().iter();
+        resumed.sort_by_key(|(o, _)| (o.txid, o.vout));
+        let mut expected = utxo11;
+        expected.sort_by_key(|(o, _)| (o.txid, o.vout));
+        assert_eq!(resumed, expected, "replayed coins != pre-crash coins");
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn coinsdb_tiny_budget_flushes_and_reorgs() {
+        let params = params();
+        let dir = store_dir("coinsdb-budget");
+        // ~1 KiB budget — every block's coinbase output (~100B map
+        // entry) trips it quickly, forcing mid-sync commits.
+        let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 10).unwrap();
+        let blocks = probe_chain(30, &[], &params);
+        for block in &blocks[..20] {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        assert_eq!(cs.tip_hash(), blocks[19].block_hash());
+        // Backend holds committed coins even without flush().
+        assert!(cs.coins_backend.as_ref().unwrap().tip_height() > 0);
+        cs.flush().unwrap();
+        let tip20 = cs.tip_hash();
+        drop(cs);
+
+        // Reorg across the flushed watermark: a side branch off
+        // height 5 (below the backend tip) that outgrows the tip.
+        let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 10).unwrap();
+        assert_eq!(cs.tip_hash(), tip20);
+        let mut parent = blocks[4].header;
+        let mut branch = Vec::new();
+        for i in 0..18u32 {
+            let h = 6 + i;
+            let b = block_on(
+                &parent,
+                vec![tagged_coinbase(h, subsidy(h), script::OP_EQUAL)],
+                &params,
+            );
+            parent = b.header;
+            branch.push(b);
+        }
+        for block in &branch {
+            assert!(cs.accept_block(block, NOW).is_ok());
+        }
+        // 23-work branch tip vs 20-work active tip — reorged.
+        assert_eq!(cs.tip_hash(), branch.last().unwrap().block_hash());
+        // Undo for a below-watermark height describes the new branch.
+        let undo7 = cs.undo(7).unwrap();
+        assert!(!undo7.txs.is_empty());
+        // And the old branch's coin is gone.
+        assert!(!cs.utxo().have(&OutPoint {
+            txid: blocks[7].transactions[0].txid(),
+            vout: 0,
+        }));
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn coinsdb_v3_state_migrates() {
+        let params = params();
+        let dir = store_dir("coinsdb-migrate");
+        let blocks = probe_chain(10, &[], &params);
+        // Write a v3-format state: inline utxo/undos (memory-mode
+        // snapshot), then downgrade the version field.
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        for block in &blocks[..6] {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        cs.flush().unwrap();
+        let utxo6: Vec<_> = cs.utxo().iter();
+        let tip6 = cs.tip_hash();
+        drop(cs);
+
+        // Downgrade state.dat to v3: drop the trailing flags byte
+        // (v3's payload ends at snapshot_base), patch the version
+        // field, and re-cover the payload with a fresh checksum.
+        let state_path = dir.join("state.dat");
+        let mut bytes = std::fs::read(&state_path).unwrap();
+        let payload_end = bytes.len() - 1; // strip the v4 flags byte
+        bytes.truncate(payload_end);
+        bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+        let digest = crate::hash::sha256d(&bytes[40..]);
+        bytes[8..40].copy_from_slice(&digest);
+        std::fs::write(&state_path, bytes).unwrap();
+
+        // Reopen with the backend: inline coins migrate into coinsdb.
+        let cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        assert_eq!(cs.tip_hash(), tip6);
+        let be = cs.coins_backend.clone().unwrap();
+        assert_eq!(be.tip_height(), 6);
+        assert_eq!(be.coins_len() as usize, utxo6.len());
+        let mut resumed = cs.utxo().iter();
+        resumed.sort_by_key(|(o, _)| (o.txid, o.vout));
+        let mut expected = utxo6;
+        expected.sort_by_key(|(o, _)| (o.txid, o.vout));
+        assert_eq!(resumed, expected);
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

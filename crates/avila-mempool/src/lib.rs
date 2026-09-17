@@ -438,7 +438,7 @@ impl Mempool {
         op: &OutPoint,
     ) -> Option<Coin> {
         if let Some(coin) = cs.utxo().get(op) {
-            return Some(coin.clone());
+            return Some(coin);
         }
         // Unconfirmed parent: the pooled tx's output at `op.vout`.
         let parent = self.map.get(&op.txid)?;
@@ -525,7 +525,7 @@ impl Mempool {
         let mut conflicts: Vec<Txid> = Vec::new();
         for input in &tx.inputs {
             if let Some(coin) = cs.utxo().get(&input.previous_output) {
-                spent.push(coin.clone());
+                spent.push(coin);
             } else if self
                 .map
                 .get(&input.previous_output.txid)

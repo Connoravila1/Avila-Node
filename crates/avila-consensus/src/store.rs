@@ -390,7 +390,7 @@ const STATE_TMP: &str = "state.dat.tmp";
 // v3 adds `snapshot_base` — the assumeutxo base height (`0` = none) —
 // so a `loadtxoutset` chainstate resumes without demanding stored
 // bodies below the base.
-pub const STATE_VERSION: u32 = 3;
+pub const STATE_VERSION: u32 = 4;
 
 /// The complete validation state needed to resume without re-validation.
 #[derive(Clone, PartialEq, Debug)]
@@ -424,6 +424,10 @@ pub struct StateData {
     /// Heights `1..=snapshot_base` have no stored bodies and carry
     /// empty undo placeholders.
     pub snapshot_base: u32,
+    /// `true` when the coins view and undo records live in
+    /// `coinsdb.redb` instead of this file's `utxo`/`undos` sections —
+    /// the v4 flag byte. v3 files deserialize as `false`.
+    pub externalized: bool,
 }
 
 fn invalid(msg: impl Into<String>) -> io::Error {
@@ -562,6 +566,7 @@ pub fn write_state(dir: &Path, magic: [u8; 4], data: &StateData) -> io::Result<(
         payload.extend_from_slice(&n_chain_tx.to_le_bytes());
     }
     payload.extend_from_slice(&data.snapshot_base.to_le_bytes());
+    payload.push(u8::from(data.externalized));
 
     let mut file_bytes = Vec::with_capacity(payload.len() + 44);
     file_bytes.extend_from_slice(&magic);
@@ -601,7 +606,12 @@ pub fn read_state(dir: &Path, magic: [u8; 4]) -> io::Result<Option<StateData>> {
         return Err(invalid("state.dat: bad magic"));
     }
     let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    if version != STATE_VERSION {
+    // v3 and v4 share the wire layout; they differ only in whether
+    // the utxo/undo sections may be empty (v4 externalizes them to
+    // coinsdb.redb). A v3 file read under a coinsdb chainstate is
+    // migrated by the restore path; read in memory mode it loads as
+    // before.
+    if !(3..=STATE_VERSION).contains(&version) {
         return Err(invalid(format!("state.dat: version {version}")));
     }
     let checksum: [u8; 32] = bytes[8..40]
@@ -681,9 +691,20 @@ pub fn read_state(dir: &Path, magic: [u8; 4]) -> io::Result<Option<StateData>> {
     let snapshot_base = d
         .read_u32_le()
         .map_err(|e| invalid(format!("snapshot_base: {e}")))?;
+    let externalized = if version >= 4 {
+        match d.read_u8().map_err(|e| invalid(format!("flags: {e}")))? {
+            0 => false,
+            1 => true,
+            f => return Err(invalid(format!("flags: unknown {f}"))),
+        }
+    } else {
+        false
+    };
     d.finish().map_err(|e| invalid(format!("trailing: {e}")))?;
+    // Externalized states keep their coins/undos in coinsdb — the
+    // inline counts don't apply there.
     if chain.is_empty()
-        || chain.len() as u64 - 1 != undos.len() as u64
+        || (!externalized && chain.len() as u64 - 1 != undos.len() as u64)
         || chain.last() != Some(&tip)
         || u64::from(height) != chain.len() as u64 - 1
     {
@@ -700,6 +721,7 @@ pub fn read_state(dir: &Path, magic: [u8; 4]) -> io::Result<Option<StateData>> {
         failed,
         tx_meta,
         snapshot_base,
+        externalized,
     }))
 }
 
@@ -974,6 +996,7 @@ mod tests {
             failed: vec![BlockHash::from_bytes([0xee; 32])],
             tx_meta,
             snapshot_base: 0,
+            externalized: false,
         }
     }
 
