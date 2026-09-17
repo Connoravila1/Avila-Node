@@ -578,8 +578,10 @@ operation. Compare complete initial download and catch-up, not only local replay
       order and MAX_BLOCK_WEIGHT, pays subsidy+fees via a BIP34
       coinbase, and sets the BIP141 witness commitment when needed.
       Verified end-to-end: built templates pass `accept_block` and
-      connect. Ancestor-feerate package mining and Stratum V2 remain
-      open.
+      connect. Ancestor-feerate package mining landed; Stratum V2 is
+      investigated (`docs/STRATUM_V2.md`) — the node's role is the
+      Template Provider surface (matching Core's `-sv2`), with the
+      TP server itself still to implement.
 - [~] Provide backup/restore, migration/rollback, resource presets and
       actionable recovery. Landed: `backupwallet`/`restorewallet` for
       the watch-only wallet (Core's `-8 "Backup file does not exist"`,
