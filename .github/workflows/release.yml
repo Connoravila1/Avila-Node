@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  # For build provenance attestation (SLSA-style, keyless).
+  attestations: write
+  id-token: write
+
+jobs:
+  build:
+    name: Release build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Pinned Rust toolchain
+        run: rustup show
+      - name: GUI dependencies (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev libudev-dev
+      - name: Build release binaries
+        run: cargo build --release --workspace --locked
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/avila-node dist/ 2>/dev/null || cp target/release/avila-node.exe dist/
+          cp target/release/avila-gui dist/ 2>/dev/null || cp target/release/avila-gui.exe dist/ || true
+          sha256sum dist/* > dist/SHA256SUMS.txt
+          cat dist/SHA256SUMS.txt
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb3731943c40a36292d6f8c3c24f1afe72a37 # v2
+        with:
+          subject-path: dist/*
+      - name: Upload artifacts
+        uses: actions/upload-artifact@330a01d490aca151604b8c6390507d9f01f9d7ae # v4
+        with:
+          name: avila-${{ matrix.os }}
+          path: dist/
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          pattern: avila-*
+          merge-multiple: true
+      - name: Create GitHub release
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "Avila Node ${{ github.ref_name }}" \
+            --notes "See SHA256SUMS.txt for artifact hashes. Build provenance is attested via GitHub OIDC (verify: gh attestation verify <artifact> --owner Connoravila1)." \
+            ./*
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
