@@ -143,12 +143,11 @@ fn history_entries(
     out.sort_by_key(|(h, _)| *h);
     // Mempool: every tx creating an output to the script, or spending
     // a tracked outpoint. Height -1 when any parent is unconfirmed.
-    let mempool: Vec<Transaction> = mp
-        .txids()
-        .iter()
-        .filter_map(|t| mp.get(t).cloned())
-        .collect();
-    let mempool_ids: std::collections::HashSet<Txid> = mempool.iter().map(|t| t.txid()).collect();
+    // Borrow — a full pool cloned per query is a memory-churn DoS.
+    // `txids` are the map keys — reusing them avoids rehashing every tx.
+    let txids = mp.txids();
+    let mempool: Vec<&Transaction> = txids.iter().filter_map(|t| mp.get(t)).collect();
+    let mempool_ids: std::collections::HashSet<Txid> = txids.iter().copied().collect();
     let mut seen: std::collections::HashSet<Txid> =
         out.iter().map(|(_, t)| parse_txid(t)).collect();
     for tx in &mempool {

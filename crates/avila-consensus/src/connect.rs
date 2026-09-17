@@ -682,6 +682,11 @@ pub fn connect_block(
     let mut applied: Vec<AppliedTx> = Vec::with_capacity(block.transactions.len());
     let mut fees: i64 = 0;
     let mut sigops_cost: u64 = 0;
+    // Script checks are collected during the serial pass and run in
+    // parallel after — Core's `scriptcheckqueue` shape. A tx's check
+    // only needs its resolved prevouts, so it carries no dependence
+    // on the UTXO mutations happening around it.
+    let mut script_jobs: Vec<(&Transaction, Vec<TxOut>)> = Vec::new();
 
     let result = (|| -> Result<(), ConnectError> {
         for (i, tx) in block.transactions.iter().enumerate() {
@@ -714,12 +719,11 @@ pub fn connect_block(
             if sigops_cost > MAX_BLOCK_SIGOPS_COST {
                 return Err(ConnectError::SigopsExceeded);
             }
-            // Core's CheckInputScripts — per-input script evaluation, after
-            // sequence locks and sigop accounting, before UpdateCoins. Gated by
-            // `fScriptChecks` (validation.cpp: `!tx.IsCoinBase() && fScriptChecks`).
+            // Queue the script check — Core's CheckInputScripts posts
+            // to the validation queue rather than verifying inline.
             if !tx.is_coinbase() && ctx.script_checks {
                 let spent_outs: Vec<TxOut> = spent.iter().map(|c| c.out.clone()).collect();
-                check_input_scripts(tx, &spent_outs, flags).map_err(ConnectError::ScriptVerify)?;
+                script_jobs.push((tx, spent_outs));
             }
             // Apply (Core's UpdateCoins): spend inputs, then add outputs.
             for (input, coin) in tx.inputs.iter().zip(spent.iter()) {
@@ -747,6 +751,13 @@ pub fn connect_block(
                 limit: reward,
             });
         }
+        // Drain the queued script checks across worker threads —
+        // Core's `scriptcheckqueue` (control.wait() after queueing
+        // all of ConnectBlock's checks). Ordering within the block
+        // is irrelevant: every check reads only its own tx + prevouts.
+        if !script_jobs.is_empty() {
+            run_script_checks(&script_jobs, flags).map_err(ConnectError::ScriptVerify)?;
+        }
         Ok(())
     })();
 
@@ -763,6 +774,44 @@ pub fn connect_block(
 
 /// Reverses the applied prefix of a failed `connect_block`, restoring `utxo`
 /// to its pre-call state: each applied tx's outputs are removed, overwritten
+/// Verifies every queued (tx, prevouts) script check, spreading the
+/// work over `available_parallelism` scoped threads — the role of
+/// Core's `scriptcheckqueue` workers. A single-thread fallback keeps
+/// tiny blocks (and machines reporting one core) off the spawn path.
+fn run_script_checks(
+    jobs: &[(&Transaction, Vec<TxOut>)],
+    flags: crate::script::ScriptFlags,
+) -> Result<(), crate::interpreter::ScriptError> {
+    let workers = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(jobs.len());
+    if workers <= 1 {
+        for (tx, outs) in jobs {
+            check_input_scripts(tx, outs, flags)?;
+        }
+        return Ok(());
+    }
+    // Static slicing beats a work queue here: jobs are uniform enough
+    // (one verify per tx) that contention outweighs imbalance.
+    let chunk = jobs.len().div_ceil(workers);
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(workers);
+        for part in jobs.chunks(chunk) {
+            handles.push(s.spawn(move || {
+                for (tx, outs) in part {
+                    check_input_scripts(tx, outs, flags)?;
+                }
+                Ok::<_, crate::interpreter::ScriptError>(())
+            }));
+        }
+        handles.into_iter().try_fold((), |(), h| {
+            h.join()
+                .map_err(|_| crate::interpreter::ScriptError::EvalFalse)?
+        })
+    })
+}
+
 /// coins restored, and spent inputs re-added — newest transaction first.
 fn rollback(block: &Block, utxo: &mut UtxoSet, applied: Vec<AppliedTx>) {
     for applied_tx in applied.into_iter().rev() {

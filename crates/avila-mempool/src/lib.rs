@@ -902,7 +902,7 @@ impl Mempool {
             self.spends.insert(input.previous_output, txid);
         }
         self.wtxids.insert(tx.wtxid(), txid);
-        self.pool_bytes += tx.encode().len();
+        self.pool_bytes += tx_size;
         self.epoch += 1;
         self.map.insert(
             txid,
