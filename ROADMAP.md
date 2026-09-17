@@ -62,7 +62,11 @@ Workstreams W1–W4 begin here; security/privacy threat models begin with the in
 - [x] Implement Script and contextual transaction/block rules, UTXO transitions,
   historical activation behavior, competing chains and deterministic fork selection.
 - [x] Support offline block import, atomic commits, undo, reorgs and resumable replay.
-- [ ] Compare storage candidates on real state access, write amplification and recovery.
+- [x] Compare storage candidates on real state access, write amplification and recovery.
+  docs/STORAGE.md: append-only files + in-memory views chosen (zero
+  write amplification, blk-file replay recovery); the documented
+  bound is RAM — mainnet needs a disk-backed coins view (G5
+  follow-up behind the UtxoSet trait boundary).
 - [x] Separate active tip, complete validation coverage, index coverage and assumptions.
 - [x] Validate historical mainnet data and adversarial fixtures, including connect,
   disconnect and reconnect under interrupted writes, disk exhaustion and corruption.
