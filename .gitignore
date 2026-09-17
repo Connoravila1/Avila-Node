@@ -26,3 +26,4 @@ __pycache__/
 # local scratch (test daemons, comparison fixtures)
 /tmp/
 .lock
+data/
