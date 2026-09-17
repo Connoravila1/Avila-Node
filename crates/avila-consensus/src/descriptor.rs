@@ -350,6 +350,13 @@ pub enum Descriptor {
     Raw {
         script: Vec<u8>,
     },
+    /// A parsed Miniscript — `wsh(...)`/`tr()` bodies that aren't a
+    /// fixed-form function (`MiniscriptDescriptor`). `node.keys` index
+    /// into `keys` (Core's `Key` = `KeyParser::m_keys` index).
+    Miniscript {
+        keys: Vec<Provider>,
+        node: crate::miniscript::Node,
+    },
 }
 
 const HARDENED: u32 = 0x8000_0000;
@@ -1028,6 +1035,86 @@ fn parse_script(
         *error = "Can only have raw() at top level".to_string();
         return Vec::new();
     }
+    // Miniscript — Core falls through to `miniscript::FromString`
+    // here; it can only appear inside wsh()/tr().
+    {
+        let ms_ctx = if ctx == Ctx::P2wsh {
+            crate::miniscript::MsContext::P2wsh
+        } else {
+            crate::miniscript::MsContext::Tapscript
+        };
+        let parse_ctx = ctx;
+        let mut parser = MiniscriptKeyParser {
+            ms_ctx,
+            parse_ctx,
+            keys: Vec::new(),
+            error: String::new(),
+            out,
+            params,
+        };
+        let node = crate::miniscript::from_string(&to_str(expr), &mut parser);
+        if !parser.error.is_empty() {
+            *error = std::mem::take(&mut parser.error);
+            return Vec::new();
+        }
+        if let Some(node) = node {
+            if !matches!(ctx, Ctx::P2wsh | Ctx::P2tr) {
+                *error = "Miniscript expressions can only be used in wsh or tr.".to_string();
+                return Vec::new();
+            }
+            if !node.is_sane() || node.is_not_satisfiable() {
+                // Report the first insane subexpression, like Core.
+                let insane = node.find_insane_sub().unwrap_or(&node);
+                let mut err = insane
+                    .to_string(&KeyStrings {
+                        keys: &parser.keys.iter().map(|v| v[0].clone()).collect::<Vec<_>>(),
+                    })
+                    .unwrap_or_default();
+                if !insane.is_valid() {
+                    err += " is invalid";
+                } else if !node.is_sane() {
+                    err += " is not sane";
+                    if !insane.is_non_malleable() {
+                        err += ": malleable witnesses exist";
+                    } else if std::ptr::eq(insane, &node) && !insane.needs_signature() {
+                        err += ": witnesses without signature exist";
+                    } else if !insane.check_timelocks_mix() {
+                        err += ": contains mixes of timelocks expressed in blocks and seconds";
+                    } else if !insane.check_duplicate_key() {
+                        err += ": contains duplicate public keys";
+                    } else if !insane.valid_satisfactions() {
+                        err += ": needs witnesses that may exceed resource limits";
+                    }
+                } else {
+                    err += " is not satisfiable";
+                }
+                *error = err;
+                return Vec::new();
+            }
+            // Multipath expansion: all key provider vectors must be
+            // length 1 (broadcast) or the shared length.
+            let num_multipath = parser.keys.iter().map(Vec::len).max().unwrap_or(0);
+            for vec in &mut parser.keys {
+                if vec.len() == 1 {
+                    let first = vec[0].clone();
+                    vec.resize(num_multipath, first);
+                } else if vec.len() != num_multipath {
+                    *error = "Miniscript: Multipath derivation paths have mismatched lengths"
+                        .to_string();
+                    return Vec::new();
+                }
+            }
+            let mut ret = Vec::with_capacity(num_multipath);
+            for i in 0..num_multipath {
+                let pubs = parser.keys.iter().map(|v| v[i].clone()).collect();
+                ret.push(Descriptor::Miniscript {
+                    keys: pubs,
+                    node: node.clone(),
+                });
+            }
+            return ret;
+        }
+    }
     if ctx == Ctx::P2sh {
         *error = "A function is needed within P2SH".to_string();
         return Vec::new();
@@ -1171,6 +1258,106 @@ fn provider_string(provider: &Provider) -> String {
     }
 }
 
+/// `KeyStrings` — a `KeyCtx`/`ScriptCtx` over an already-parsed key
+/// table (canonical `ToString` and dup-compare via `provider_string`).
+struct KeyStrings<'a> {
+    keys: &'a [Provider],
+}
+
+impl crate::miniscript::KeyCtx for KeyStrings<'_> {
+    fn ms_context(&self) -> crate::miniscript::MsContext {
+        // Never invoked by to_string/duplicate_key_check.
+        crate::miniscript::MsContext::P2wsh
+    }
+    fn key_from_str(&mut self, _text: &str) -> Option<usize> {
+        None
+    }
+    fn key_string(&self, key: usize) -> Option<String> {
+        self.keys.get(key).map(provider_string)
+    }
+    fn key_cmp(&self, a: usize, b: usize) -> std::cmp::Ordering {
+        let (Some(a), Some(b)) = (self.keys.get(a), self.keys.get(b)) else {
+            return std::cmp::Ordering::Equal;
+        };
+        provider_string(a).cmp(&provider_string(b))
+    }
+}
+
+/// `MiniscriptKeyParser` — Core's `KeyParser`: parses key expressions
+/// into a table of provider vectors (multipath expansion included),
+/// collecting private material into `out` like `ParsePubkey`.
+struct MiniscriptKeyParser<'a> {
+    ms_ctx: crate::miniscript::MsContext,
+    parse_ctx: Ctx,
+    keys: Vec<Vec<Provider>>,
+    error: String,
+    out: &'a mut FlatProvider,
+    params: &'a Params,
+}
+
+impl crate::miniscript::KeyCtx for MiniscriptKeyParser<'_> {
+    fn ms_context(&self) -> crate::miniscript::MsContext {
+        self.ms_ctx
+    }
+    fn key_from_str(&mut self, text: &str) -> Option<usize> {
+        let providers = parse_pubkey(
+            text.as_bytes(),
+            self.parse_ctx,
+            self.out,
+            &mut self.error,
+            self.params,
+        );
+        if providers.is_empty() {
+            return None;
+        }
+        self.keys.push(providers);
+        Some(self.keys.len() - 1)
+    }
+    fn key_string(&self, key: usize) -> Option<String> {
+        self.keys
+            .get(key)
+            .and_then(|v| v.first())
+            .map(provider_string)
+    }
+    fn key_cmp(&self, a: usize, b: usize) -> std::cmp::Ordering {
+        // PubkeyProvider::operator< compares the canonical strings.
+        let a = self
+            .keys
+            .get(a)
+            .and_then(|v| v.first())
+            .map(provider_string)
+            .unwrap_or_default();
+        let b = self
+            .keys
+            .get(b)
+            .and_then(|v| v.first())
+            .map(provider_string)
+            .unwrap_or_default();
+        a.cmp(&b)
+    }
+}
+
+/// `ScriptMaker` — resolved pubkeys to script pushes for
+/// `Node::to_script` (`ToPKBytes` is xonly under tapscript).
+struct MiniscriptMaker<'a> {
+    pubkeys: &'a [Vec<u8>],
+    tapscript: bool,
+}
+
+impl crate::miniscript::ScriptCtx for MiniscriptMaker<'_> {
+    fn to_pk_bytes(&self, key: usize) -> Vec<u8> {
+        let pubkey = &self.pubkeys[key];
+        if self.tapscript {
+            pubkey[pubkey.len() - 32..].to_vec()
+        } else {
+            pubkey.clone()
+        }
+    }
+    fn to_pkh_bytes(&self, key: usize) -> Vec<u8> {
+        crate::hash::hash160(&self.to_pk_bytes(key)).to_vec()
+    }
+}
+
 fn provider_is_range(provider: &Provider) -> bool {
     match provider {
         Provider::Const { .. } => false,
@@ -1245,6 +1432,9 @@ impl Descriptor {
             Descriptor::RawTr { key } => join_descriptors("rawtr", "", &[provider_string(key)]),
             Descriptor::Addr { dest, .. } => join_descriptors("addr", dest, &[]),
             Descriptor::Raw { script } => join_descriptors("raw", &hex::encode(script), &[]),
+            Descriptor::Miniscript { keys, node } => {
+                node.to_string(&KeyStrings { keys }).unwrap_or_default()
+            }
         }
     }
 
@@ -1262,6 +1452,7 @@ impl Descriptor {
             Descriptor::Tr { internal, subs, .. } => {
                 provider_is_range(internal) || subs.iter().any(Self::is_range)
             }
+            Descriptor::Miniscript { keys, .. } => keys.iter().any(provider_is_range),
             Descriptor::Addr { .. } | Descriptor::Raw { .. } => false,
         }
     }
@@ -1623,6 +1814,17 @@ fn expand_descriptor(
         }
         Descriptor::Raw { script } => {
             out.push(script.clone());
+        }
+        Descriptor::Miniscript { keys, node } => {
+            let mut pubkeys = Vec::with_capacity(keys.len());
+            for k in keys {
+                pubkeys.push(key(k, out_provider)?);
+            }
+            let maker = MiniscriptMaker {
+                pubkeys: &pubkeys,
+                tapscript: node.ms_context() == crate::miniscript::MsContext::Tapscript,
+            };
+            out.push(node.to_script(&maker));
         }
     }
     Some(())
@@ -2340,5 +2542,205 @@ mod tests {
             parse_descriptors(&format!("wpkh({TPUB}/0h/0/*)"), &regtest(), false).unwrap();
         // `0h` in the path — public derivation alone can't do it.
         assert!(descs[0].expand(0, &provider).is_none());
+    }
+
+    // ---- miniscript: every vector from Core 29.4
+    // getdescriptorinfo + deriveaddresses on regtest ----
+
+    const K2: &str = "03f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
+
+    #[test]
+    fn miniscript_descriptors_match_core() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                &format!("wsh(and_v(v:pk({K}),pk({K2})))"),
+                "8k93svk3",
+                "00201263632cf57ae013ca310fcb1c65799285c4fc59f839876e316d0167e34966d2",
+            ),
+            (
+                &format!("wsh(or_b(pk({K}),s:pk({K2})))"),
+                "h2zc4538",
+                "00201768089be55aa6d2b0012d3da81dfc28374ba9a7ebe1df1339203b1011eff82e",
+            ),
+            (
+                &format!("wsh(or_d(pk({K}),pk({K2})))"),
+                "0xzszd0x",
+                "0020c980c464541f75b2c63bc78c3d387de3fa18cbfcf78b125e092e09f088895ed5",
+            ),
+            (
+                &format!("wsh(or_i(pk({K}),pk({K2})))"),
+                "jqyfklyu",
+                "0020ee9387b575dd8c325370860dbbe055df366c57ecfe3fc8f1dcaf54f86db30c1b",
+            ),
+            (
+                &format!("wsh(andor(pk({K}),older(100),pk({K2})))"),
+                "ttypvqxu",
+                "002046c85a575dbdc41549ca2e043e14710623c64fb8d3308df95be4d9bea95f7178",
+            ),
+            (
+                &format!("wsh(and_n(pk({K}),pk({K2})))"),
+                "5j30f325",
+                "002044c9cd1ae717f79c86566c79e7f5ee6d7c3a18a14542b9ac2c7d00e893796c57",
+            ),
+            (
+                &format!("wsh(thresh(2,pk({K}),s:pk({K2}),snl:older(100)))"),
+                "uv2h93hg",
+                "0020cfbe03b4d3d7c61849e37b102715f153c88a6aeadf92afeb18149abc45491c27",
+            ),
+            (
+                &format!("wsh(and_v(v:pk({K}),after(500000)))"),
+                "gyelkc26",
+                "0020e6ce11e5016d5b520a34a92bea84cabbe730642bf538f3398b7965e078497884",
+            ),
+            (
+                &format!("wsh(and_v(v:pk({K}),older(4194304)))"),
+                "2j6ngcd6",
+                "0020597f2bbb2dbd5a151906e07791db0e9767fa57bc0c9934050930d256df2df03e",
+            ),
+            (
+                &format!(
+                    "wsh(and_v(v:pk({K}),sha256(6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d)))"
+                ),
+                "hetamraq",
+                "00201fc8563b2de7b862ac0958e8a900bc78b5efb60903fcdff645a0d6dfac6ba5a2",
+            ),
+            (
+                &format!("wsh(j:pk({K}))"),
+                "tv22an3m",
+                "0020ae8f3831dcacf5fa119bd378152da16b0f42797a6b5bf66e9fdb833e7dbefdb0",
+            ),
+            (
+                &format!("wsh(n:pk({K}))"),
+                "4065xu6n",
+                "0020ef6bdc20e4aa93d2ae8f1ce6462be90c4cdfd30a4c4a3c35edf05af27f0f6b60",
+            ),
+            (
+                &format!("wsh(u:pk({K}))"),
+                "nhhjplsp",
+                "00208f1066b2e9f75f63f6902c249999d5ea08221c7fcdd4a4ed9174f50a0a180af8",
+            ),
+            (
+                &format!("wsh(l:pk({K}))"),
+                "yez9yqql",
+                "0020153bc4ef361c7e84f5ddba6e62c5bb745b7fe0b3f3d7218d7b361f24702cff56",
+            ),
+            (
+                &format!("tr({K},{{pk({K2}),pk({K})}})"),
+                "qle2cdjk",
+                "5120c1efad64a7a00683536516e655b632037d74ab1f108ffd2a62255bccdd48ba8a",
+            ),
+            (
+                &format!("tr({K},multi_a(1,{K2}))"),
+                "36yqnf3n",
+                "51206eaa55fcd7cc75d93115d37f05ec37cf096bb3bb12dcfe7d89546c60ed72fa79",
+            ),
+            (
+                &format!("tr({K},thresh(1,pk({K2}),a:pk({K})))"),
+                "8s5nj9rn",
+                "5120960e35877d42a52ac3932628866972064766f9937ff6c89638e539e664443325",
+            ),
+            (
+                &format!("tr({K},and_v(v:pk({K2}),pk({K})))"),
+                "8zavf7p2",
+                "5120b34bb7b5cc15a7e2151741efc949b1443f605c6c1dd248097ad0a49a32c92a2f",
+            ),
+            (
+                &format!("sh(wsh(or_d(pk({K}),pk({K2}))))"),
+                "3huah7u0",
+                "a9146edfb8af2b8d009326bdd7d02663d2a5d4cf30f687",
+            ),
+        ];
+        for (input, checksum, spk) in cases {
+            let (descs, provider, _) = parse_descriptors(input, &regtest(), false)
+                .unwrap_or_else(|e| panic!("{input}: {e}"));
+            let canon = descs[0].to_descriptor_string();
+            assert!(canon.ends_with(&format!("#{checksum}")), "{input}: {canon}");
+            let scripts = descs[0].expand(0, &provider).unwrap();
+            assert_eq!(hex::encode(&scripts[0]), *spk, "{input}");
+        }
+    }
+
+    #[test]
+    fn miniscript_sanity_errors_match_core() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "wsh(after(500000))",
+                "after(500000) is not sane: witnesses without signature exist",
+            ),
+            (
+                "wsh(older(4194304))",
+                "older(4194304) is not sane: witnesses without signature exist",
+            ),
+            (
+                "wsh(sha256(6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d))",
+                "sha256(6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d) \
+                 is not sane: witnesses without signature exist",
+            ),
+            (
+                &format!("wsh(v:pk({K}))"),
+                &format!("v:pk({K}) is not sane"),
+            ),
+            (&format!("wsh(d:pk({K}))"), &format!("d:pk({K}) is invalid")),
+            (&format!("wsh(t:pk({K}))"), &format!("t:pk({K}) is invalid")),
+            (
+                &format!("wsh(multi_a(1,{K2}))"),
+                "Can only have multi_a/sortedmulti_a inside tr()",
+            ),
+            (
+                &format!("tr({K},multi(1,{K2}))"),
+                "Can only have multi/sortedmulti at top level, in sh(), or in wsh()",
+            ),
+            (
+                &format!("pk(and_v(v:pk({K}),pk({K2})))"),
+                &format!("pk(): key 'and_v(v:pk({K}),pk({K2}))' is not valid"),
+            ),
+            (
+                &format!("wsh(and_v(v:pk({K}),pk({K})))"),
+                &format!("and_v(v:pk({K}),pk({K})) is not sane: contains duplicate public keys"),
+            ),
+            (
+                // Mixed height-based and time-based locks — the
+                // inner or_b is the invalid subexpression.
+                &format!("wsh(and_v(v:pk({K}),or_b(after(500000),after(500000001))))"),
+                "or_b(after(500000),after(500000001)) is invalid",
+            ),
+            (
+                // and_v's left argument must be V-type.
+                &format!("wsh(and_v(pk({K}),pk({K2})))"),
+                &format!("and_v(pk({K}),pk({K2})) is invalid"),
+            ),
+            (
+                // a: wraps to W-type — not a valid top-level B.
+                &format!("wsh(a:pk({K}))"),
+                &format!("a:pk({K}) is not sane"),
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = match parse_descriptors(input, &regtest(), false) {
+                Err(e) => e,
+                Ok(v) => panic!("{input} should fail: {} descs", v.0.len()),
+            };
+            assert_eq!(&err, expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn miniscript_canonical_sugar() {
+        // Wrapper sugar canonicalizes: c:pk_k → pk, t: → and_v(..,1), etc.
+        let cases: &[(&str, &str)] = &[
+            (&format!("wsh(c:pk_k({K}))"), &format!("wsh(pk({K}))")),
+            (
+                // t: sugar unfolds to and_v(x,1) then re-folds.
+                &format!("wsh(and_v(v:pk({K}),thresh(1,pk({K2}))))"),
+                &format!("wsh(and_v(v:pk({K}),thresh(1,pk({K2}))))"),
+            ),
+        ];
+        for (input, body) in cases {
+            let (descs, _, _) = parse_descriptors(input, &regtest(), false)
+                .unwrap_or_else(|e| panic!("{input}: {e}"));
+            let canon = descs[0].to_descriptor_string();
+            let checksum = descriptor_checksum(body);
+            assert_eq!(canon, format!("{body}#{checksum}"), "{input}");
+        }
     }
 }

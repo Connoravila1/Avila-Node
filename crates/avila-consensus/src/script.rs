@@ -42,10 +42,52 @@ pub const OP_1: u8 = 0x51;
 pub const OP_16: u8 = 0x60;
 /// `OP_RETURN`.
 pub const OP_RETURN: u8 = 0x6a;
+/// `OP_IF`.
+pub const OP_IF: u8 = 0x63;
+/// `OP_NOTIF`.
+pub const OP_NOTIF: u8 = 0x64;
+/// `OP_ELSE`.
+pub const OP_ELSE: u8 = 0x67;
+/// `OP_ENDIF`.
+pub const OP_ENDIF: u8 = 0x68;
+/// `OP_VERIFY`.
+pub const OP_VERIFY: u8 = 0x69;
+/// `OP_TOALTSTACK`.
+pub const OP_TOALTSTACK: u8 = 0x6b;
+/// `OP_FROMALTSTACK`.
+pub const OP_FROMALTSTACK: u8 = 0x6c;
+/// `OP_IFDUP`.
+pub const OP_IFDUP: u8 = 0x73;
+/// `OP_DUP`.
+pub const OP_DUP: u8 = 0x76;
+/// `OP_SWAP`.
+pub const OP_SWAP: u8 = 0x7c;
+/// `OP_SIZE`.
+pub const OP_SIZE: u8 = 0x82;
 /// `OP_EQUAL`.
 pub const OP_EQUAL: u8 = 0x87;
+/// `OP_EQUALVERIFY`.
+pub const OP_EQUALVERIFY: u8 = 0x88;
+/// `OP_0NOTEQUAL`.
+pub const OP_0NOTEQUAL: u8 = 0x92;
+/// `OP_ADD`.
+pub const OP_ADD: u8 = 0x93;
+/// `OP_BOOLAND`.
+pub const OP_BOOLAND: u8 = 0x9a;
+/// `OP_BOOLOR`.
+pub const OP_BOOLOR: u8 = 0x9b;
+/// `OP_NUMEQUAL`.
+pub const OP_NUMEQUAL: u8 = 0x9c;
+/// `OP_NUMEQUALVERIFY`.
+pub const OP_NUMEQUALVERIFY: u8 = 0x9d;
+/// `OP_RIPEMD160`.
+pub const OP_RIPEMD160: u8 = 0xa6;
+/// `OP_SHA256`.
+pub const OP_SHA256: u8 = 0xa8;
 /// `OP_HASH160`.
 pub const OP_HASH160: u8 = 0xa9;
+/// `OP_HASH256`.
+pub const OP_HASH256: u8 = 0xaa;
 /// `OP_CHECKSIG`.
 pub const OP_CHECKSIG: u8 = 0xac;
 /// `OP_CHECKSIGVERIFY`.
@@ -54,8 +96,14 @@ pub const OP_CHECKSIGVERIFY: u8 = 0xad;
 pub const OP_CHECKMULTISIG: u8 = 0xae;
 /// `OP_CHECKMULTISIGVERIFY`.
 pub const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
+/// `OP_CHECKLOCKTIMEVERIFY` (`OP_NOP2`).
+pub const OP_CLTV: u8 = 0xb1;
+/// `OP_CHECKSEQUENCEVERIFY` (`OP_NOP3`).
+pub const OP_CSV: u8 = 0xb2;
 /// `OP_NOP10` — Core's `MAX_OPCODE`, the largest opcode `HasValidOps` accepts.
 pub const OP_NOP10: u8 = 0xb9;
+/// `OP_CHECKSIGADD` — the BIP342 tapscript batch-checksig opcode.
+pub const OP_CHECKSIGADD: u8 = 0xba;
 
 /// Core `script/script.h`'s `MAX_PUBKEYS_PER_MULTISIG`: the sigop cost charged for a
 /// bare multisig opcode when the preceding opcode is not a small integer (or accuracy
