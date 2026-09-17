@@ -123,4 +123,94 @@ fn main() {
         },
         100_000,
     );
+
+    bench_coinsdb_commits();
+}
+
+/// Disk-backed coins view: commit throughput at a scale where the
+/// B-tree stops being trivial — 500k coins across 100-commit chunks.
+fn bench_coinsdb_commits() {
+    use avila_consensus::coinsdb::CoinsBackend;
+    use avila_consensus::connect::Coin;
+    use avila_consensus::transaction::{OutPoint, Script, TxOut};
+    use std::collections::HashMap;
+
+    let dir = std::env::temp_dir().join(format!("avila-bench-coinsdb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let be = CoinsBackend::open(&dir).unwrap_or_else(|e| panic!("open: {e}"));
+
+    let mk = |i: u32| {
+        let mut b = [0u8; 32];
+        b[..4].copy_from_slice(&i.to_le_bytes());
+        (
+            OutPoint {
+                txid: avila_consensus::hash::Txid::from_bytes(b),
+                vout: 0,
+            },
+            Coin {
+                out: TxOut {
+                    value: 50_000,
+                    script_pubkey: Script::new(vec![0x51; 25]),
+                },
+                height: i,
+                coinbase: false,
+            },
+        )
+    };
+
+    // 500k inserts, 100k per commit — the migration-size batch.
+    let t = Instant::now();
+    let mut n = 0u32;
+    for chunk in 0..5u32 {
+        let mut dirty = HashMap::with_capacity(100_000);
+        for _ in 0..100_000 {
+            let (op, c) = mk(n);
+            n += 1;
+            dirty.insert(op, Some(c));
+        }
+        be.commit(&dirty, &[], (chunk + 1) * 100_000)
+            .unwrap_or_else(|e| panic!("commit: {e}"));
+    }
+    let el = t.elapsed();
+    println!(
+        "coinsdb commit 500k inserts (100k/commit): {:.0?} — {:.0} coins/s",
+        el,
+        500_000.0 / el.as_secs_f64()
+    );
+
+    // Point reads — the per-input lookup cost.
+    let t = Instant::now();
+    let mut hits = 0u64;
+    for i in (0..200_000u32).step_by(7) {
+        if be.get(&mk(i).0).is_some() {
+            hits += 1;
+        }
+    }
+    let el = t.elapsed();
+    println!(
+        "coinsdb point reads: {:.0?} for {} lookups ({hits} hits) — {:.0}/s",
+        el,
+        200_000 / 7,
+        (200_000.0 / 7.0) / el.as_secs_f64()
+    );
+
+    // Mixed write: 50k commits of ~2k-entry deltas (block-shape writes).
+    let t = Instant::now();
+    for h in 6..56u32 {
+        let mut dirty = HashMap::with_capacity(2_000);
+        for j in 0..2_000u32 {
+            let (op, c) = mk(h * 10_000 + j);
+            dirty.insert(op, Some(c));
+        }
+        be.commit(&dirty, &[], h * 10_000)
+            .unwrap_or_else(|e| panic!("commit: {e}"));
+    }
+    let el = t.elapsed();
+    println!(
+        "coinsdb commit 50x2k inserts: {:.0?} — {:.0} coins/s, {:.0} commits/s",
+        el,
+        100_000.0 / el.as_secs_f64(),
+        50.0 / el.as_secs_f64()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
