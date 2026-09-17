@@ -1,9 +1,10 @@
 # Performance and quality scorecard
 
-**Status: measurement specification; no Avila node benchmarks have run.** The
-application foundation's tests do not establish consensus correctness, node
-performance, privacy or primary-node readiness. A runnable harness is part of G1
-in the [roadmap](../ROADMAP.md).
+**Status: measurement specification plus first evidence.** C1 and P1
+have measured baselines (see the Evidence column); the remaining rows
+are unmeasured pending the G1 harness. Functional interop verified
+live against Core 29.4 and Knots 29.3.0 is summarized below the
+table — it establishes correctness, not performance leadership.
 
 The aim is to lead the strongest reproducible alternatives across all relevant
 operating profiles. Publish each result independently. Do not collapse correctness,
@@ -82,6 +83,36 @@ node best, and missing a stretch target does not invalidate an otherwise useful 
 | Q2 | Recovery: restored state, downtime, replayed work, manual steps, upgrade success | Correct recovery for every declared fault; aim for **half p95 recovery time** with simpler operator steps | Abrupt faults, disk full/corruption, backup restore, format migration/rollback; **unmeasured** |
 | Q3 | GUI: frame time, input response, idle CPU/memory, large-table responsiveness | Initial budget: **p95 frame ≤16.7 ms**, **p99 input response ≤50 ms** on a declared reference desktop; no continuous repaint while idle | Native traces during sync/scan/large-data interaction; shell smoke checks only, **unmeasured** |
 | Q4 | Usability/accessibility: completion, errors, recovery, keyboard and screen-reader coverage | Complete every supported essential task; fewer errors and shorter completion than comparable workflows | Declared participants/tasks, all themes/scales, platform assistive technology; **unmeasured** |
+
+## Functional evidence (correctness, not performance)
+
+Verified live against pinned references; these support the C-rows'
+acceptance claims but do not substitute for the P/Q benchmarks above.
+
+- **RPC surface**: `tools/compare_rpc.py` — 75 calls exact-match
+  Core 29.4 regtest including getblocktemplate/getmininginfo
+  (experiments/2026-09-14-rpc-compat-matrix.md).
+- **BIP324 v2 transport**: live session against Core 29.4 —
+  session ids byte-identical on both ends; v1 fallback on a
+  v1-only peer matches Core's reconnect rule.
+- **Inbound peering**: Core 29.4 dialed us inbound over both v1
+  and BIP324; inbound v2 responder verified end-to-end.
+- **BIP157/158 serving**: `--peerblockfilters` serves
+  byte-identical filters to a wire client; misbehavior disconnects
+  match Core (unknown stop hash, overlong requests, unsubscribed
+  types).
+- **Electrum protocol**: scripthash subscribe/notify fires
+  exactly-once on connect and on mempool arrival; status hash
+  matches the Electrum spec byte-for-byte.
+- **BIP352 silent payments**: official test vectors pass
+  (send/receive, labeled outputs incl. change label m=0);
+  sequential-k multi-hit detection verified.
+- **Stratum V2 TP**: a probe client solo-mined a regtest block
+  through `--sv2tp` (SetupConnection → NewTemplate →
+  SubmitSolution → block connected).
+- **Operator tooling**: backup/restore/migrate round-trips,
+  datadir advisory lock, `-rpcwhitelist` scoping, crash-recovery
+  replay from blk files — all covered by tests + live runs.
 | Q5 | Interoperability and distribution: tested APIs/clients/platforms, install/upgrade success | All advertised workflows qualified, explicit compatibility matrix and unsupported cases | Client suites, native packages and release qualification; foundation Linux checks only |
 | Q6 | Maintainability and supply chain: reproducible builds, reviewability, build cost, repair effort | Reproducible release artifacts, documented component contracts and tested release/recovery procedures | Independent rebuilds, dependency inventory, scoped reviews, reproduction reports; **not qualified** |
 
