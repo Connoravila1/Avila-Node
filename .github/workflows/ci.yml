@@ -50,3 +50,28 @@ jobs:
         run: |
           cargo run --locked -p avila-cli -- --config config/default.toml check-config
           cargo run --locked -p avila-cli -- inspect --json
+
+  reproducible:
+    name: Reproducible release build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Pinned Rust toolchain
+        run: rustup show
+      - name: Build the release binary twice, independently
+        run: |
+          CARGO_TARGET_DIR=tg1 cargo build --release -p avila-cli --locked
+          CARGO_TARGET_DIR=tg2 cargo build --release -p avila-cli --locked
+      - name: Compare hashes
+        run: |
+          a=$(sha256sum tg1/release/avila-node | cut -d' ' -f1)
+          b=$(sha256sum tg2/release/avila-node | cut -d' ' -f1)
+          test "$a" = "$b"
+          echo "reproducible: $a"
+      - name: Dependency/license inventory
+        run: |
+          cargo tree --locked --prefix none -e normal | sort -u > dep-inventory.txt
+          cat dep-inventory.txt
