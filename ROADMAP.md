@@ -614,7 +614,12 @@ An unsupported API or incomplete scan reports its actual status.
 ### G5 — Public release qualification
 
 - [ ] Qualify supported Linux, Windows and macOS builds and selected x86-64/ARM64 hardware.
-- [ ] Exercise long-running loads, network partitions, resource exhaustion and crash recovery.
+- [~] Exercise long-running loads, network partitions, resource exhaustion and crash recovery.
+  Landed: crash recovery is replay-tested (corrupt/truncated/ahead
+  state.dat rebuilds from blk files); a live fork-resolution test
+  reorged onto Core's heavier chain after a competing sv2-mined
+  block diverged the tips. Open: sustained multi-hour soak and
+  real packet-loss partitions.
 - [ ] Publish scoped privacy/security evidence, independent review findings and fixes.
 - [~] Verify reproducible release builds, signed artifacts, provenance and dependency/license inventory.
   Landed: the CI `reproducible` job builds twice into independent
