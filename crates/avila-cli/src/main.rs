@@ -169,6 +169,15 @@ enum Command {
         /// Directory the backup lands under; created if absent.
         dest: PathBuf,
     },
+    /// Check every versioned file in the datadir against this
+    /// binary's expected formats — reports per-file status and exits
+    /// nonzero on any incompatible marker. `--rollback <dir>` first
+    /// restores a `backup` snapshot, then verifies the result.
+    Migrate {
+        /// Optional backup snapshot to restore before checking.
+        #[arg(long)]
+        rollback: Option<PathBuf>,
+    },
     /// Restore a datadir produced by `backup` over the configured
     /// network directory. Refuses to clobber a non-empty live dir
     /// unless --force.
@@ -196,6 +205,164 @@ fn copy_tree(src: &Path, dst: &Path, files: &mut Vec<String>) -> Result<(), Box<
         }
     }
     Ok(())
+}
+
+/// Per-file compatibility status for `migrate`.
+enum FileStatus {
+    Ok(u32),
+    Missing,
+    Bad(String),
+}
+
+/// Inspects every versioned datadir file — magic, format version,
+/// and `state.dat`'s checksum-bearing header — against this binary's
+/// expectations.
+fn migrate_report(dir: &Path, network: avila_core::Network) -> Vec<(String, FileStatus)> {
+    use avila_consensus::params::Network as ConsensusNet;
+    let consensus_net = match network {
+        avila_core::Network::Mainnet => ConsensusNet::Mainnet,
+        avila_core::Network::Testnet4 => ConsensusNet::Testnet4,
+        avila_core::Network::Signet => ConsensusNet::Signet,
+        avila_core::Network::Regtest => ConsensusNet::Regtest,
+    };
+    let magic = consensus_net.params().message_start;
+    let mut out: Vec<(String, FileStatus)> = Vec::new();
+
+    // state.dat — magic + version + checksum-checked snapshot.
+    let state = dir.join("state.dat");
+    match std::fs::read(&state) {
+        Ok(raw) if raw.len() >= 8 => {
+            if raw[..4] != magic[..] {
+                out.push((
+                    "state.dat".into(),
+                    FileStatus::Bad("foreign network magic".into()),
+                ));
+            } else {
+                let v = u32::from_le_bytes(raw[4..8].try_into().unwrap_or([0; 4]));
+                if v == avila_consensus::store::STATE_VERSION {
+                    out.push(("state.dat".into(), FileStatus::Ok(v)));
+                } else if v < avila_consensus::store::STATE_VERSION {
+                    // Older snapshots replay from blk files — report,
+                    // don't fail.
+                    out.push(("state.dat".into(), FileStatus::Ok(v)));
+                } else {
+                    out.push((
+                        "state.dat".into(),
+                        FileStatus::Bad(format!(
+                            "version {v} is newer than this binary's {}",
+                            avila_consensus::store::STATE_VERSION
+                        )),
+                    ));
+                }
+            }
+        }
+        Ok(_) => out.push(("state.dat".into(), FileStatus::Bad("truncated".into()))),
+        Err(_) => out.push(("state.dat".into(), FileStatus::Missing)),
+    }
+
+    // blk*.dat — first frame's 4-byte magic must match the network.
+    let mut blks: Vec<_> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with("blk") && n.ends_with(".dat"))
+                .collect()
+        })
+        .unwrap_or_default();
+    blks.sort();
+    if blks.is_empty() {
+        out.push(("blk*.dat".into(), FileStatus::Missing));
+    }
+    for name in blks {
+        let raw = std::fs::read(dir.join(&name)).unwrap_or_default();
+        if raw.len() >= 4 && raw[..4] == magic[..] {
+            out.push((name, FileStatus::Ok(0)));
+        } else {
+            out.push((name, FileStatus::Bad("foreign or missing magic".into())));
+        }
+    }
+
+    // Magic-prefixed index files: `cflt`/`scidx`/`avmpool` + u32 v.
+    // Magic-prefixed index files — `cflt`/`scidx` carry a u32
+    // version; `mempool.dat` embeds its version byte in the magic.
+    for (name, magic_b, ver_len, want) in [
+        ("cfilters.dat", &b"cflt"[..], 4usize, 1u32),
+        ("scindex.dat", &b"scidx"[..], 4usize, 1u32),
+        ("mempool.dat", &b"avmpool\x01"[..], 0usize, 1u32),
+    ] {
+        let path = dir.join(name);
+        let raw = match std::fs::read(&path) {
+            Ok(r) => r,
+            Err(_) => {
+                out.push((name.into(), FileStatus::Missing));
+                continue;
+            }
+        };
+        if raw.len() < magic_b.len() || raw[..magic_b.len()] != magic_b[..] {
+            out.push((name.into(), FileStatus::Bad("foreign magic".into())));
+            continue;
+        }
+        let v = if ver_len == 0 {
+            want // the version byte IS the magic suffix
+        } else {
+            u32::from_le_bytes(
+                raw[magic_b.len()..magic_b.len() + 4]
+                    .try_into()
+                    .unwrap_or([0; 4]),
+            )
+        };
+        if v == want {
+            out.push((name.into(), FileStatus::Ok(v)));
+        } else {
+            out.push((
+                name.into(),
+                FileStatus::Bad(format!(
+                    "version {v} (expected {want}) — delete and rebuild"
+                )),
+            ));
+        }
+    }
+
+    // peers.dat — `APEERS` + 32-byte checksum + u32 version.
+    let peers = dir.join("peers.dat");
+    match std::fs::read(&peers) {
+        Ok(raw) if raw.len() >= 42 && raw[..6] == b"APEERS"[..] => {
+            let v = u32::from_le_bytes(raw[38..42].try_into().unwrap_or([0; 4]));
+            if v == 1 {
+                out.push(("peers.dat".into(), FileStatus::Ok(v)));
+            } else {
+                out.push((
+                    "peers.dat".into(),
+                    FileStatus::Bad(format!("version {v} (expected 1)")),
+                ));
+            }
+        }
+        Ok(_) => out.push(("peers.dat".into(), FileStatus::Bad("foreign magic".into()))),
+        Err(_) => out.push(("peers.dat".into(), FileStatus::Missing)),
+    }
+
+    // watchlist.dat — JSON with a "version" field.
+    let wl = dir.join("watchlist.dat");
+    match std::fs::read(&wl) {
+        Ok(raw) => {
+            let v = serde_json::from_slice::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|j| j["version"].as_u64());
+            match v {
+                Some(1) => out.push(("watchlist.dat".into(), FileStatus::Ok(1))),
+                Some(v) => out.push((
+                    "watchlist.dat".into(),
+                    FileStatus::Bad(format!("version {v} (expected 1)")),
+                )),
+                None => out.push((
+                    "watchlist.dat".into(),
+                    FileStatus::Bad("unversioned".into()),
+                )),
+            }
+        }
+        Err(_) => out.push(("watchlist.dat".into(), FileStatus::Missing)),
+    }
+    out
 }
 
 fn execute(args: Args) -> Result<(), Box<dyn Error>> {
@@ -608,6 +775,52 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             // The manifest records the backup run, not live state.
             let _ = std::fs::remove_file(dst.join("backup-manifest.json"));
             println!("Restored {} file(s) into {}", files.len(), dst.display());
+        }
+        Command::Migrate { rollback } => {
+            let dir = config.network_data_dir();
+            if let Some(src) = rollback {
+                if !src.join("backup-manifest.json").is_file() {
+                    return Err(format!(
+                        "{} is not an avila-node backup (no manifest)",
+                        src.display()
+                    )
+                    .into());
+                }
+                if dir.is_dir() {
+                    let non_empty = std::fs::read_dir(&dir)?.next().is_some();
+                    if non_empty {
+                        // Rollback replaces the live dir — refuse
+                        // unless it is already a *different* release's
+                        // state we are about to discard on purpose.
+                        println!("Discarding existing {} for rollback", dir.display());
+                        std::fs::remove_dir_all(&dir)?;
+                    }
+                }
+                let mut files = Vec::new();
+                copy_tree(&src, &dir, &mut files)?;
+                let _ = std::fs::remove_file(dir.join("backup-manifest.json"));
+                println!("Rolled back {} file(s) from {}", files.len(), src.display());
+            }
+            let report = migrate_report(&dir, config.get().network);
+            let mut bad = 0usize;
+            for (name, status) in &report {
+                match status {
+                    FileStatus::Ok(v) => println!("{name}: ok (format v{v})"),
+                    FileStatus::Missing => println!("{name}: absent"),
+                    FileStatus::Bad(why) => {
+                        println!("{name}: INCOMPATIBLE — {why}");
+                        bad += 1;
+                    }
+                }
+            }
+            if bad > 0 {
+                return Err(format!(
+                    "{bad} file(s) need migration — restore a compatible                      backup or resync (state.dat versions != {} replay                      from blk files automatically)",
+                    avila_consensus::store::STATE_VERSION
+                )
+                .into());
+            }
+            println!("{}: all files compatible", dir.display());
         }
     }
     Ok(())

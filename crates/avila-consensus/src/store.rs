@@ -390,7 +390,7 @@ const STATE_TMP: &str = "state.dat.tmp";
 // v3 adds `snapshot_base` — the assumeutxo base height (`0` = none) —
 // so a `loadtxoutset` chainstate resumes without demanding stored
 // bodies below the base.
-const STATE_VERSION: u32 = 3;
+pub const STATE_VERSION: u32 = 3;
 
 /// The complete validation state needed to resume without re-validation.
 #[derive(Clone, PartialEq, Debug)]

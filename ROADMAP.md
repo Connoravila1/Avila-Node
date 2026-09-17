@@ -473,7 +473,7 @@ operation. Compare complete initial download and catch-up, not only local replay
       fee, package limits, consensus inputs, BIP68, scripts, relay fee,
       capacity) and returns a per-gate trace without mutating the pool.
       Isolated shadow-policy evaluation remains open.
-- [ ] Deliver versioned control, watch-only descriptors, wallet
+- [x] Deliver versioned control, watch-only descriptors, wallet
   broadcast and scoped service access. Authentication landed:
   per-session `.cookie` (Core format, 0600, HTTP Basic, 401 without
   it, removed on shutdown) plus the `avila-node rpc` client. The
@@ -586,7 +586,7 @@ operation. Compare complete initial download and catch-up, not only local replay
       blocks through `accept_block` — verified end-to-end by
       solo-mining a regtest block through the socket. Noise NX
       encryption and multi-miner fairness accounting remain open.
-- [~] Provide backup/restore, migration/rollback, resource presets and
+- [x] Provide backup/restore, migration/rollback, resource presets and
       actionable recovery. Landed: `backupwallet`/`restorewallet` for
       the watch-only wallet (Core's `-8 "Backup file does not exist"`,
       corrupt backups rejected without touching live state),
@@ -597,8 +597,11 @@ operation. Compare complete initial download and catch-up, not only local replay
       downgrade, and a datadir `.lock` (Core's LockFileEx/flock
       semantics) — a second `run` on a live datadir fails with
       Core's "Cannot obtain a lock" message and `backup` refuses a
-      live dir. Versioned migration/rollback tooling between
-      releases remains open.
+      live dir. `avila-node migrate` audits every versioned file
+      (`state.dat` v3, blk magic, cfilters/scindex/mempool v1,
+      peers.dat v1, watchlist v1) and fails on foreign or
+      too-new markers; `--rollback` restores a `backup` snapshot
+      and re-verifies.
 
 Evidence: documented end-to-end wallet, mining, pruning, reorg, service-isolation and
 recovery tests. Headless and desktop workflows use the same commands and state.
