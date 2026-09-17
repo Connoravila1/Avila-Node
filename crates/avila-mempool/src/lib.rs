@@ -62,6 +62,9 @@ pub struct MempoolEntry {
     /// `nFeeDelta`) — `fee + fee_delta` is the modified fee template
     /// ordering and `fees.modified` report.
     pub fee_delta: i64,
+    /// Serialized size — computed once at admission; `pool_bytes`
+    /// accounting and eviction reuse it instead of re-encoding.
+    pub size: usize,
 }
 
 impl MempoolEntry {
@@ -247,6 +250,10 @@ pub struct Mempool {
     max_bytes: usize,
     /// Live serialized bytes in the pool — the `max_bytes` accounting.
     pool_bytes: usize,
+    /// (feerate sat/kvB, txid) ordered index — the eviction cursor.
+    /// A plain sorted index beats rescanning `map` for the minimum on
+    /// every at-capacity admission (Core's `setMemPoolEntryByFeeRate`).
+    by_rate: std::collections::BTreeMap<(i64, Txid), ()>,
     /// Min relay fee rate in sat/kvB.
     min_relay_fee: i64,
     /// Full-RBF: deployed Core accepts replacements regardless of
@@ -280,6 +287,7 @@ impl Mempool {
             max_entries: DEFAULT_MAX_ENTRIES,
             max_bytes: DEFAULT_MAX_BYTES,
             pool_bytes: 0,
+            by_rate: std::collections::BTreeMap::new(),
             min_relay_fee: DEFAULT_MIN_RELAY_FEE,
             full_rbf: true,
             estimator: FeeEstimator::new(),
@@ -877,19 +885,18 @@ impl Mempool {
         //    `-maxmempool` analog) trips the evict-the-worst path; the
         //    candidate must outbid the victim to displace it.
         let tx_size = tx.encode().len();
-        if self.map.len() >= self.max_entries || self.pool_bytes + tx_size > self.max_bytes {
-            let my_rate = fee * 1000 / vsize as i64;
-            let Some((&worst_id, worst)) = self
-                .map
-                .iter()
-                .min_by_key(|(_, e)| e.fee * 1000 / e.vsize.max(1) as i64)
-            else {
+        let my_rate = fee * 1000 / vsize.max(1) as i64;
+        while self.map.len() >= self.max_entries || self.pool_bytes + tx_size > self.max_bytes {
+            // Cheapest pooled tx first — O(log n) off the sorted index.
+            let Some((&(worst_rate, worst_id), _)) = self.by_rate.first_key_value() else {
                 return Err(MempoolReject::Full);
             };
-            if my_rate <= worst.fee * 1000 / worst.vsize.max(1) as i64 {
+            if my_rate <= worst_rate {
                 return Err(MempoolReject::Full);
             }
-            self.remove(&worst_id);
+            // The evicted entry's descendants leave with it — Core's
+            // TrimToSize drops clusters, not lone txs.
+            self.remove_recursive(&worst_id);
         }
 
         // 10. BIP125 replacement: drop the conflicts (their descendants
@@ -903,10 +910,12 @@ impl Mempool {
         }
         self.wtxids.insert(tx.wtxid(), txid);
         self.pool_bytes += tx_size;
+        self.by_rate.insert((my_rate, txid), ());
         self.epoch += 1;
         self.map.insert(
             txid,
             MempoolEntry {
+                size: tx_size,
                 tx,
                 fee,
                 vsize,
@@ -1240,7 +1249,9 @@ impl Mempool {
         self.epoch += 1;
         self.unbroadcast.remove(txid);
         self.wtxids.remove(&entry.tx.wtxid());
-        self.pool_bytes = self.pool_bytes.saturating_sub(entry.tx.encode().len());
+        self.by_rate
+            .remove(&(entry.fee * 1000 / entry.vsize.max(1) as i64, *txid));
+        self.pool_bytes = self.pool_bytes.saturating_sub(entry.size);
         for input in &entry.tx.inputs {
             self.spends.remove(&input.previous_output);
         }

@@ -162,10 +162,20 @@ pub fn serve(
     auth: Option<RpcAuth>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     let listener = TcpListener::bind(addr)?;
+    // Bound concurrent connections — Core's `-rpcworkqueue` role.
+    // Without a cap a connection flood spawns unbounded threads.
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     Ok(thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    // Refuse past the cap — the client sees a closed
+                    // socket, same as a full Core work queue.
+                    if live.fetch_add(1, Ordering::Relaxed) >= MAX_RPC_CONNECTIONS {
+                        live.fetch_sub(1, Ordering::Relaxed);
+                        drop(stream);
+                        continue;
+                    }
                     let status = status.clone();
                     let queries = queries.clone();
                     let waiters = waiters.clone();
@@ -173,6 +183,7 @@ pub fn serve(
                     let wallet = wallet.clone();
                     let stop = stop.clone();
                     let auth = auth.clone();
+                    let live = live.clone();
                     thread::spawn(move || {
                         handle(
                             stream,
@@ -184,6 +195,7 @@ pub fn serve(
                             stop.as_ref(),
                             auth.as_ref(),
                         );
+                        live.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 Err(_) => continue,
@@ -191,6 +203,10 @@ pub fn serve(
         }
     }))
 }
+
+/// Core's `-rpcworkqueue` default is 16; the GUI + batch RPCs need
+/// headroom beyond it, so we cap at 64 — bounded either way.
+const MAX_RPC_CONNECTIONS: usize = 64;
 
 /// Minimal base64 encoding (RFC 4648, no padding omissions) — enough
 /// for HTTP Basic credentials without taking a dependency.

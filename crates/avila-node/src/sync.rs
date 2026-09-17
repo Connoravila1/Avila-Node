@@ -12,6 +12,11 @@ use avila_consensus::chainstate::Chainstate;
 use avila_consensus::params::Params;
 use avila_p2p::manager::{NetEvent, PeerManager};
 
+/// Connected-block interval between mid-sync `state.dat` checkpoints
+/// — Core's `FlushStateToDisk` cadence analogue. 2048 blocks bounds a
+/// crash to replaying at most that many blk-file entries.
+const FLUSH_INTERVAL: u32 = 2048;
+
 /// How far and how long a sync run should go.
 #[derive(Clone, Debug)]
 pub struct SyncConfig {
@@ -213,6 +218,9 @@ pub fn run(
             .map_err(SyncError::Store)?;
     }
     let resumed_height = cs.chain().len() as u32 - 1;
+    // `state.dat` checkpoint cadence — blocks between flushes during
+    // sync. The value bounds post-crash replay depth, not correctness.
+    let mut last_flush = resumed_height;
     let mut mgr = PeerManager::new(cfg.max_peers);
     // The whole p2p time domain — dial-path ban checks, version
     // `timestamp`s, conntime/lastsend/lastrecv and the last_* peer
@@ -375,6 +383,13 @@ pub fn run(
         // the store resumed at — a resumed chain doesn't re-trigger
         // the stop condition at its own height.
         let run_progress = connected.saturating_sub(resumed_height);
+        // Periodic chainstate checkpoint — Core's `FlushStateToDisk`
+        // cadence. A crash otherwise replays every blk file since the
+        // last state.dat; bounding the interval bounds the replay.
+        if cfg.data_dir.is_some() && last_flush + FLUSH_INTERVAL <= connected {
+            last_flush = connected;
+            cs.flush().map_err(SyncError::Store)?;
+        }
         // The last connected blocks, for the tape display.
         let chain = cs.chain();
         let recent: Vec<(u32, avila_consensus::hash::BlockHash)> = chain
