@@ -592,11 +592,13 @@ operation. Compare complete initial download and catch-up, not only local replay
       corrupt backups rejected without touching live state),
       node-level `avila-node backup`/`restore` (full datadir copy
       with a backup-manifest; restore refuses to clobber a non-empty
-      datadir without --force), `-maxmempool` resource cap, per-file
-      version markers that fail loudly on downgrade. A live-node
-      backup still needs a stop-first workflow — no advisory file
-      lock exists yet — and versioned migration/rollback tooling
-      between releases remains open.
+      datadir without --force), `-maxmempool`/`-maxconnections`
+      resource caps, per-file version markers that fail loudly on
+      downgrade, and a datadir `.lock` (Core's LockFileEx/flock
+      semantics) — a second `run` on a live datadir fails with
+      Core's "Cannot obtain a lock" message and `backup` refuses a
+      live dir. Versioned migration/rollback tooling between
+      releases remains open.
 
 Evidence: documented end-to-end wallet, mining, pruning, reorg, service-isolation and
 recovery tests. Headless and desktop workflows use the same commands and state.

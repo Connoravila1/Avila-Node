@@ -25,6 +25,9 @@ struct Args {
 }
 
 #[derive(Debug, Subcommand)]
+// Run carries the full flag set — boxed on construction is not
+// worth the churn for a once-per-process enum.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Validate configuration without starting services or creating data.
     CheckConfig,
@@ -65,6 +68,10 @@ enum Command {
         /// force cleartext.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         v2transport: bool,
+        /// Total peer slots, inbound + outbound (Core's
+        /// -maxconnections; default 8).
+        #[arg(long)]
+        maxconnections: Option<usize>,
         /// Accept inbound peer connections on this address (Core's
         /// -listen=<addr>). Inbound peers auto-negotiate v1 or BIP324
         /// and join under the manager's slot/eviction rules.
@@ -225,6 +232,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             peerblockfilters,
             maxmempool,
             v2transport,
+            maxconnections,
             listen,
             electrum,
             sv2tp,
@@ -269,6 +277,24 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 }
             }
             let data_dir = config.network_data_dir();
+            // Advisory datadir lock (Core's .lock via LockFileEx/flock):
+            // a second `run` on the same dir, or `backup` of a live
+            // dir, fails loudly instead of corrupting the chainstate.
+            let lock_path = data_dir.join(".lock");
+            std::fs::create_dir_all(&data_dir)
+                .map_err(|e| format!("datadir {}: {e}", data_dir.display()))?;
+            let lock_file = std::fs::File::options()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .map_err(|e| format!("datadir lock {}: {e}", lock_path.display()))?;
+            lock_file.try_lock().map_err(|_| {
+                format!(
+                    "Cannot obtain a lock on data directory {}. Avila-Node is probably already running.",
+                    data_dir.display()
+                )
+            })?;
             // The waitforblock* registry — RPC handlers park predicates,
             // the sync loop fires them on tick and on shutdown. The
             // scantxoutset slot is pure RPC state (no sync-loop input).
@@ -356,7 +382,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             let cfg = SyncConfig {
                 connect,
                 target_height: u32::MAX,
-                max_peers: 8,
+                max_peers: maxconnections.unwrap_or(8),
                 timeout: Duration::from_secs(u64::MAX),
                 proxy,
                 data_dir: Some(data_dir.clone()),
@@ -518,6 +544,24 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             let src = config.network_data_dir();
             if !src.is_dir() {
                 return Err(format!("no datadir at {}", src.display()).into());
+            }
+            // Refuse to copy a live datadir — the node holds .lock
+            // while running; a hot copy could catch mid-write state.
+            let lock_path = src.join(".lock");
+            if let Ok(lock) = std::fs::File::options()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+            {
+                lock.try_lock().map_err(|_| {
+                    format!(
+                        "{} is locked — stop the node before backing it up",
+                        src.display()
+                    )
+                })?;
+                // Not held — the empty .lock file stays as a marker,
+                // matching Core's datadir layout.
             }
             std::fs::create_dir_all(&dest)?;
             let stamp = std::time::SystemTime::now()
