@@ -74,6 +74,24 @@ enum Command {
         /// (e.g. 127.0.0.1:50001) and maintain the scripthash index.
         #[arg(long)]
         electrum: Option<SocketAddr>,
+        /// Authenticated RPC user (Core's -rpcuser); pairs with
+        /// --rpcpassword. Adds a Basic-auth credential alongside the
+        /// cookie.
+        #[arg(long)]
+        rpcuser: Option<String>,
+        /// Password for --rpcuser (Core's -rpcpassword).
+        #[arg(long)]
+        rpcpassword: Option<String>,
+        /// Restrict an RPC user to the listed methods (Core's
+        /// -rpcwhitelist=user:m1,m2; repeatable per user).
+        #[arg(long)]
+        rpcwhitelist: Vec<String>,
+        /// Whether users without a whitelist entry may call any method
+        /// (Core's -rpcwhitelistdefault, default 1). Pass
+        /// --rpcwhitelistdefault=0 to deny all unlisted methods.
+        /// Accepts 0/1/true/false like Core's bool parser.
+        #[arg(long)]
+        rpcwhitelistdefault: Option<String>,
     },
     /// Sync headers and blocks from live peers (headers-first, full
     /// consensus validation). Bounded by target height and timeout.
@@ -171,6 +189,10 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             v2transport,
             listen,
             electrum,
+            rpcuser,
+            rpcpassword,
+            rpcwhitelist,
+            rpcwhitelistdefault,
         } => {
             // A real daemon: unbounded headers-first sync — sync to the
             // tip, then keep serving, relaying, and announcing until
@@ -225,6 +247,36 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 // owner-only permissions.
                 let token = avila_node::rpc::write_cookie(&data_dir)
                     .map_err(|e| format!("cookie {}: {e}", data_dir.display()))?;
+                // Cookie is always accepted; --rpcuser adds named
+                // creds, --rpcwhitelist scopes their methods (Core's
+                // g_rpc_whitelist).
+                let mut auth = avila_node::rpc::RpcAuth::cookie(&token);
+                if let Some(u) = &rpcuser {
+                    let Some(p) = &rpcpassword else {
+                        return Err("--rpcuser requires --rpcpassword".to_string().into());
+                    };
+                    auth.add_user(u, p);
+                }
+                for wl in &rpcwhitelist {
+                    let Some((u, methods)) = wl.split_once(':') else {
+                        return Err(format!(
+                            "invalid --rpcwhitelist {wl:?} — expected user:method1,method2"
+                        )
+                        .into());
+                    };
+                    auth.whitelist(u, methods);
+                }
+                let wl_default = match rpcwhitelistdefault.as_deref() {
+                    None | Some("1") | Some("true") => true,
+                    Some("0") | Some("false") => false,
+                    Some(other) => {
+                        return Err(format!(
+                            "invalid --rpcwhitelistdefault {other:?} — expected 0 or 1"
+                        )
+                        .into());
+                    }
+                };
+                auth.set_whitelist_default(wl_default);
                 let _server = avila_node::rpc::serve(
                     addr,
                     status.clone(),
@@ -233,7 +285,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     Some(scan.clone()),
                     Some(wallet),
                     Some(cancel.clone()),
-                    Some(avila_node::rpc::cookie_auth_header(&token)),
+                    Some(auth),
                 )
                 .map_err(|e| format!("rpc bind {addr}: {e}"))?;
                 println!(

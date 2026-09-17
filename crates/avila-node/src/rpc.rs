@@ -159,7 +159,7 @@ pub fn serve(
     scan: Option<Arc<TxoutScan>>,
     wallet: Option<SharedWallet>,
     stop: Option<Arc<AtomicBool>>,
-    auth: Option<String>,
+    auth: Option<RpcAuth>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     let listener = TcpListener::bind(addr)?;
     Ok(thread::spawn(move || {
@@ -182,7 +182,7 @@ pub fn serve(
                             scan.as_ref(),
                             wallet.as_ref(),
                             stop.as_ref(),
-                            auth.as_deref(),
+                            auth.as_ref(),
                         );
                     });
                 }
@@ -272,6 +272,75 @@ pub fn cookie_auth_header(token: &str) -> String {
         "Basic {}",
         base64_encode(format!("__cookie__:{token}").as_bytes())
     )
+}
+
+/// RPC authentication + scoped access — Core's cookie, `-rpcuser`/
+/// `-rpcpassword` credentials and `-rpcwhitelist`/`whitelistdefault`
+/// method gates.
+#[derive(Clone)]
+pub struct RpcAuth {
+    /// Accepted `user:pass` pairs — `__cookie__` for the cookie token,
+    /// plus each `-rpcuser` entry.
+    creds: Vec<(String, String)>,
+    /// `-rpcwhitelist user:m1,m2` — an entry restricts that user to
+    /// the listed methods (Core's `g_rpc_whitelist`).
+    whitelists: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// `-rpcwhitelistdefault` — what a user with no whitelist entry
+    /// may call: `false` denies everything (Core's `0` default is
+    /// actually `1`; we default true to match Core).
+    whitelist_default: bool,
+}
+
+impl RpcAuth {
+    /// Cookie-only auth — the default when no `-rpcuser` is set.
+    #[must_use]
+    pub fn cookie(token: &str) -> Self {
+        Self {
+            creds: vec![("__cookie__".into(), token.into())],
+            whitelists: Default::default(),
+            whitelist_default: true,
+        }
+    }
+
+    /// Adds a `-rpcuser`/`-rpcpassword` credential pair.
+    pub fn add_user(&mut self, user: &str, password: &str) {
+        self.creds.push((user.into(), password.into()));
+    }
+
+    /// `-rpcwhitelist user:method1,method2` — later entries merge.
+    pub fn whitelist(&mut self, user: &str, methods: &str) {
+        self.whitelists
+            .entry(user.into())
+            .or_default()
+            .extend(methods.split(',').map(|m| m.trim().to_string()));
+    }
+
+    /// Core's `-rpcwhitelistdefault` — `false` denies unlisted users.
+    pub fn set_whitelist_default(&mut self, on: bool) {
+        self.whitelist_default = on;
+    }
+
+    /// Decodes `Authorization: Basic base64(user:pass)` and returns the
+    /// authenticated user — `None` on missing/wrong credentials.
+    fn authenticate(&self, header: &str) -> Option<String> {
+        let b64 = header.strip_prefix("Basic ")?;
+        let raw = base64_decode_strict(b64.trim())?;
+        let text = String::from_utf8(raw).ok()?;
+        let (user, pass) = text.split_once(':')?;
+        self.creds
+            .iter()
+            .find(|(u, p)| u == user && credentials_match(pass, p))
+            .map(|(u, _)| u.clone())
+    }
+
+    /// Core's `RPCAuthorized` — a whitelist entry restricts the user
+    /// to its methods; without one, `whitelist_default` decides.
+    fn allowed(&self, user: &str, method: &str) -> bool {
+        match self.whitelists.get(user) {
+            Some(set) => set.contains(method),
+            None => self.whitelist_default,
+        }
+    }
 }
 
 /// Constant-time-ish comparison for credential values (byte fold, no
@@ -411,7 +480,7 @@ fn handle(
     scan: Option<&Arc<TxoutScan>>,
     wallet: Option<&SharedWallet>,
     stop: Option<&Arc<AtomicBool>>,
-    auth: Option<&str>,
+    auth: Option<&RpcAuth>,
 ) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let Ok(read_half) = stream.try_clone() else {
@@ -462,18 +531,31 @@ fn handle(
             }
         }
     }
-    // Cookie auth — Core's default. A missing/wrong credential gets the
-    // same 401 bitcoind returns, no method is reachable without it.
-    if let Some(expected) = auth
-        && !credentials_match(&authorization, expected)
-    {
-        let _ = write!(
-            stream,
-            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"jsonrpc\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        let _ = stream.flush();
-        return;
-    }
+    // Cookie/rpcuser auth — Core's default. A missing/wrong
+    // credential gets the same 401 bitcoind returns; `user` (when
+    // auth is on) gates each method through the rpcwhitelist.
+    let user = match auth {
+        Some(a) => match a.authenticate(&authorization) {
+            Some(u) => Some(u),
+            None => {
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"jsonrpc\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.flush();
+                return;
+            }
+        },
+        None => None,
+    };
+    // A whitelisted-user check — Core's `RPCAuthorized`: a user with a
+    // `-rpcwhitelist` entry may call only its listed methods.
+    let permitted = |method: &str| -> bool {
+        match (&auth, &user) {
+            (Some(a), Some(u)) => a.allowed(u, method),
+            _ => true,
+        }
+    };
     if content_length == 0 || content_length > MAX_REQUEST {
         return;
     }
@@ -526,9 +608,16 @@ fn handle(
             let reply = match parse_request(elem, &mut id, &mut v2) {
                 Err(e) => reply_obj(Value::Null, Some(e), &id, v2),
                 Ok((method, params)) => {
-                    let (result, error) = dispatch(
-                        &method, &params, &snap, queries, waiters, scan, wallet, stop,
-                    );
+                    let (result, error) = if permitted(&method) {
+                        dispatch(
+                            &method, &params, &snap, queries, waiters, scan, wallet, stop,
+                        )
+                    } else {
+                        (
+                            Value::Null,
+                            Some((RPC_METHOD_NOT_FOUND, "Method not found".to_string())),
+                        )
+                    };
                     reply_obj(result, error, &id, v2)
                 }
             };
@@ -570,9 +659,11 @@ fn handle(
         Ok((method, params)) => {
             if v2 && id.is_none() {
                 // V2 notification — execute but never reply.
-                let _ = dispatch(
-                    &method, &params, &snap, queries, waiters, scan, wallet, stop,
-                );
+                if permitted(&method) {
+                    let _ = dispatch(
+                        &method, &params, &snap, queries, waiters, scan, wallet, stop,
+                    );
+                }
                 let _ = write!(
                     stream,
                     "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -580,9 +671,16 @@ fn handle(
                 let _ = stream.flush();
                 return;
             }
-            let (result, error) = dispatch(
-                &method, &params, &snap, queries, waiters, scan, wallet, stop,
-            );
+            let (result, error) = if permitted(&method) {
+                dispatch(
+                    &method, &params, &snap, queries, waiters, scan, wallet, stop,
+                )
+            } else {
+                (
+                    Value::Null,
+                    Some((RPC_METHOD_NOT_FOUND, "Method not found".to_string())),
+                )
+            };
             let status = match (&error, v2) {
                 // V2 catches method errors into a 200 reply.
                 (_, true) | (None, false) => "200 OK",
