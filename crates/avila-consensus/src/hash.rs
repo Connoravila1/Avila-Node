@@ -25,6 +25,19 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// BIP340 tagged hash — `sha256(sha256(tag) || sha256(tag) || data)`.
+/// Used by BIP352's `BIP0352/Inputs` and `BIP0352/SharedSecret` tweaks
+/// and taproot's internal tweaks.
+#[must_use]
+pub fn tagged_hash(tag: &[u8], data: &[u8]) -> [u8; 32] {
+    let tag_h = sha256(tag);
+    let mut buf = Vec::with_capacity(64 + data.len());
+    buf.extend_from_slice(&tag_h);
+    buf.extend_from_slice(&tag_h);
+    buf.extend_from_slice(data);
+    sha256(&buf)
+}
+
 /// Computes `SHA256(SHA256(data))`, Bitcoin's standard hashing operation.
 #[must_use]
 pub fn sha256d(data: &[u8]) -> [u8; 32] {

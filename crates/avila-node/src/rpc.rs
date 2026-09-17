@@ -1143,6 +1143,39 @@ fn import_one_descriptor(
     };
     let (descs, provider, _checksum) = parse_descriptors(&desc_str, cs.tree().params(), true)
         .map_err(|e| err(RPC_INVALID_ADDRESS_OR_KEY, &e))?;
+    // `sp()` is the exception to the no-keys rule: the scan secret
+    // detects payments but cannot spend them — holding it stays
+    // watch-only. Resolve the pair, register the silent watch, done.
+    if let avila_consensus::descriptor::Descriptor::Silent { .. } = &descs[0] {
+        let Some((scan_priv, spend_pub)) = descs[0].silent_keys(&provider) else {
+            return Err(err(
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "sp() requires the scan key's private key (WIF or xprv)",
+            ));
+        };
+        w.track_silent(avila_consensus::silent::SilentAddress {
+            scan_priv,
+            spend_pub,
+        });
+        return match timestamp {
+            // `"now"` — nothing historical to find; blocks below the
+            // tip are asserted empty (same as a `"now"` descriptor).
+            None => {
+                let tip = cs.chain().len().saturating_sub(1) as u32;
+                if tip < w.scan_floor || w.descs.is_empty() && w.silents.len() == 1 {
+                    w.scan_floor = tip;
+                }
+                Ok(None)
+            }
+            Some(t) => {
+                let floor = crate::watch::WatchWallet::rescan_height_for(cs, t - 7200);
+                if floor < w.scan_floor {
+                    w.scan_floor = floor;
+                }
+                Ok(Some(floor))
+            }
+        };
+    }
     // This wallet never holds keys — Core's
     // disable_private_keys=true import rule.
     if !provider.keys.is_empty() || !provider.xprvs.is_empty() {
@@ -16749,5 +16782,28 @@ mod tests {
             None,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
+    }
+    #[test]
+    fn rpc_auth_authenticates_cookie_and_whitelist() {
+        let mut a = RpcAuth::cookie("abc123");
+        a.add_user("alice", "secret");
+        a.whitelist("alice", "getblockcount,getblockhash");
+        a.set_whitelist_default(false);
+        // Cookie credential authenticates as __cookie__.
+        assert_eq!(
+            a.authenticate("Basic X19jb29raWVfXzphYmMxMjM=").as_deref(),
+            Some("__cookie__")
+        );
+        assert_eq!(
+            a.authenticate("Basic YWxpY2U6c2VjcmV0").as_deref(),
+            Some("alice")
+        );
+        assert!(a.authenticate("Basic YWxpY2U6d3Jvbmc=").is_none());
+        // Whitelist gates alice; cookie (no entry) uses the default.
+        assert!(a.allowed("alice", "getblockcount"));
+        assert!(!a.allowed("alice", "getblockchaininfo"));
+        assert!(!a.allowed("__cookie__", "getblockcount"));
+        a.set_whitelist_default(true);
+        assert!(a.allowed("__cookie__", "anything"));
     }
 }

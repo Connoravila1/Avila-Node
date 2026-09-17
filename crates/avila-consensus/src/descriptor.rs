@@ -342,6 +342,14 @@ pub enum Descriptor {
     RawTr {
         key: Provider,
     },
+    /// `sp(scan_key, spend_key)` — BIP352 silent-payments watch. The
+    /// scan key's secret (WIF or xprv-derived) lives in the provider
+    /// map like any key; `spend` is the x-only spend public key.
+    /// `expand` yields no fixed scripts — outputs derive per-tx.
+    Silent {
+        scan: Provider,
+        spend: Provider,
+    },
     /// `addr(...)` — stores the canonical re-encoded destination.
     Addr {
         dest: String,
@@ -751,6 +759,29 @@ fn parse_script(
             .into_iter()
             .map(|key| Descriptor::Pkh { key })
             .collect();
+    }
+    if ctx == Ctx::Top && parse_func("sp", &mut e) {
+        // BIP352 silent payments — `sp(scan_key, spend_key)`. Each
+        // parses like a normal key (WIF scan keys land their secret
+        // in the provider map for the wallet to resolve).
+        let args = split(e, b',');
+        if args.len() != 2 {
+            *error = "sp() expects exactly 2 arguments".to_string();
+            return Vec::new();
+        }
+        // The scan key is a normal key (WIF lands its secret in the
+        // provider map); the spend key is x-only — parsed under the
+        // taproot context so a 32-byte hex counts.
+        let scan = parse_pubkey(args[0], ctx, out, error, params);
+        let spend = parse_pubkey(args[1], Ctx::P2tr, out, error, params);
+        if scan.len() != 1 || spend.len() != 1 {
+            *error = format!("sp(): {error}");
+            return Vec::new();
+        }
+        return vec![Descriptor::Silent {
+            scan: scan.into_iter().next().unwrap_or_else(|| unreachable!()),
+            spend: spend.into_iter().next().unwrap_or_else(|| unreachable!()),
+        }];
     }
     if ctx == Ctx::Top && parse_func("combo", &mut e) {
         let keys = parse_pubkey(e, ctx, out, error, params);
@@ -1430,6 +1461,9 @@ impl Descriptor {
                 join_descriptors("tr", "", &parts)
             }
             Descriptor::RawTr { key } => join_descriptors("rawtr", "", &[provider_string(key)]),
+            Descriptor::Silent { scan, spend } => {
+                join_descriptors("sp", "", &[provider_string(scan), provider_string(spend)])
+            }
             Descriptor::Addr { dest, .. } => join_descriptors("addr", dest, &[]),
             Descriptor::Raw { script } => join_descriptors("raw", &hex::encode(script), &[]),
             Descriptor::Miniscript { keys, node } => {
@@ -1453,8 +1487,38 @@ impl Descriptor {
                 provider_is_range(internal) || subs.iter().any(Self::is_range)
             }
             Descriptor::Miniscript { keys, .. } => keys.iter().any(provider_is_range),
+            Descriptor::Silent { scan, spend } => {
+                provider_is_range(scan) || provider_is_range(spend)
+            }
             Descriptor::Addr { .. } | Descriptor::Raw { .. } => false,
         }
+    }
+
+    /// For `sp(scan, spend)` — resolves the watch pair: the scan
+    /// key's private half (required for BIP352 detection, drawn from
+    /// the provider's WIF/xprv map) and the spend key's x-only
+    /// public half.
+    #[must_use]
+    pub fn silent_keys(&self, signing: &FlatProvider) -> Option<([u8; 32], [u8; 32])> {
+        let Descriptor::Silent { scan, spend } = self else {
+            return None;
+        };
+        let mut cache = DeriveCache::new();
+        let scan_priv = provider_privkey(scan, 0, signing, &mut cache)?;
+        let (spend_full, _) = provider_pubkey(spend, 0, signing, &mut cache)?;
+        let mut sp = [0u8; 32];
+        sp.copy_from_slice(&scan_priv.secret_bytes());
+        let mut bp = [0u8; 32];
+        // The spend key's x-only half — last 32 bytes of a compressed
+        // pubkey, or the whole thing when already x-only.
+        if spend_full.len() == 33 {
+            bp.copy_from_slice(&spend_full[1..]);
+        } else if spend_full.len() == 32 {
+            bp.copy_from_slice(&spend_full);
+        } else {
+            return None;
+        }
+        Some((sp, bp))
     }
 
     /// `IsSolvable` — address/raw payloads carry no signing info.
@@ -1811,6 +1875,9 @@ fn expand_descriptor(
         }
         Descriptor::Addr { script, .. } => {
             out.push(script.as_bytes().to_vec());
+        }
+        Descriptor::Silent { .. } => {
+            // No fixed script set — outputs derive per-tx.
         }
         Descriptor::Raw { script } => {
             out.push(script.clone());

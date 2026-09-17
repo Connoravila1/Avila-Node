@@ -22,6 +22,18 @@ use avila_consensus::chainstate::Chainstate;
 use avila_consensus::hash::{BlockHash, Txid};
 use avila_consensus::transaction::OutPoint;
 
+/// A BIP352 silent-payments watch — (scan private key, spend public
+/// key). Only detection lives here: the spend key's private half is
+/// never required to watch, matching the wallet's watch-only rule.
+#[derive(Debug, Clone)]
+pub struct SilentWatch {
+    /// `d_scan` — the 32-byte scan private key.
+    pub scan_priv: [u8; 32],
+    /// `B_spend` — the x-only spend public key (taproot internal key
+    /// the sender tweaks per payment).
+    pub spend_pub: [u8; 32],
+}
+
 /// One imported descriptor — Core's `WalletDescriptor`: the
 /// checksummed string plus the import-request metadata. `scripts` is
 /// the expanded `[range]` script set keyed back to its derivation
@@ -98,6 +110,9 @@ pub struct WatchWallet {
     /// search before the earliest descriptor timestamp". An explicit
     /// `rescanblockchain` still searches the full requested range.
     pub scan_floor: u32,
+    /// BIP352 silent-payments watches — detected alongside descriptor
+    /// scripts; the coin's script is the tweaked taproot output.
+    pub silents: Vec<avila_consensus::silent::SilentAddress>,
     /// Dirty flag — set by any mutation, cleared by [`Self::persist`].
     dirty: bool,
 }
@@ -116,6 +131,7 @@ impl WatchWallet {
             chain: Vec::new(),
             gaps: Vec::new(),
             scan_floor: 0,
+            silents: Vec::new(),
             dirty: false,
         };
         if let Ok(text) = std::fs::read_to_string(&w.path) {
@@ -157,7 +173,7 @@ impl WatchWallet {
             }
             match cs.body(&hash) {
                 Some(block) => {
-                    self.scan_block(&block, h as u32, hash);
+                    self.scan_block(cs, &block, h as u32, hash);
                 }
                 None => {
                     // Body missing (pruned) — record the gap rather
@@ -177,11 +193,12 @@ impl WatchWallet {
     /// gap closed.
     pub fn scan_gap_height(
         &mut self,
+        cs: &Chainstate,
         block: &avila_consensus::block::Block,
         height: u32,
         hash: BlockHash,
     ) -> bool {
-        self.scan_block(block, height, hash);
+        self.scan_block(cs, block, height, hash);
         self.gaps
             .retain(|(lo, hi)| !(height >= *lo && height <= *hi));
         self.dirty = true;
@@ -200,7 +217,16 @@ impl WatchWallet {
 
     /// `ScanForWalletTransactions` over one connected block — record
     /// outputs paying tracked scripts, then mark spends of ours.
-    fn scan_block(&mut self, block: &avila_consensus::block::Block, height: u32, hash: BlockHash) {
+    fn scan_block(
+        &mut self,
+        cs: &Chainstate,
+        block: &avila_consensus::block::Block,
+        height: u32,
+        hash: BlockHash,
+    ) {
+        // Same-block prevout map — a tx later in the block can spend
+        // an earlier tx's output (not yet in the UTXO set).
+        let mut intra: HashMap<OutPoint, Vec<u8>> = HashMap::new();
         for tx in &block.transactions {
             let txid = tx.txid();
             for (vout, out) in tx.outputs.iter().enumerate() {
@@ -230,7 +256,59 @@ impl WatchWallet {
                     coin.spent_by = Some(txid);
                 }
             }
+            // BIP352 silent payments — every watched (scan_priv,
+            // spend_pub) pair tries the tx; a match records the
+            // tweaked taproot output like any tracked coin.
+            if !self.silents.is_empty() && !tx.is_coinbase() {
+                for (vout, out) in tx.outputs.iter().enumerate() {
+                    intra.insert(
+                        OutPoint {
+                            txid,
+                            vout: vout as u32,
+                        },
+                        out.script_pubkey.as_bytes().to_vec(),
+                    );
+                }
+                let resolve = |op: &OutPoint| -> Option<Vec<u8>> {
+                    intra.get(op).cloned().or_else(|| {
+                        cs.utxo()
+                            .get(op)
+                            .map(|c| c.out.script_pubkey.as_bytes().to_vec())
+                    })
+                };
+                for si in 0..self.silents.len() {
+                    if let Some(vout) = avila_consensus::silent::detect_silent_payment(
+                        tx,
+                        &self.silents[si],
+                        &resolve,
+                    ) {
+                        let out = &tx.outputs[vout as usize];
+                        self.coins.insert(
+                            (txid, vout),
+                            WatchedCoin {
+                                height,
+                                block: hash,
+                                value: out.value,
+                                script: out.script_pubkey.as_bytes().to_vec(),
+                                // Silent watches aren't descriptors —
+                                // usize::MAX marks the provenance.
+                                desc_idx: usize::MAX,
+                                coinbase: false,
+                                spent_height: None,
+                                spent_by: None,
+                            },
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    /// Registers a BIP352 silent-payments watch — detection secrets
+    /// only; the spend half stays unspendable here.
+    pub fn track_silent(&mut self, addr: avila_consensus::silent::SilentAddress) {
+        self.silents.push(addr);
+        self.dirty = true;
     }
 
     /// `importdescriptors` — register a descriptor's script set. The
@@ -387,6 +465,7 @@ impl WatchWallet {
             chain: Vec::new(),
             gaps: Vec::new(),
             scan_floor: 0,
+            silents: Vec::new(),
             dirty: false,
         };
         scratch
@@ -445,6 +524,16 @@ impl WatchWallet {
             "version": 1,
             "descs": descs,
             "coins": coins,
+            "silents": self
+                .silents
+                .iter()
+                .map(|a| {
+                    serde_json::json!({
+                        "scan": hex::encode(&a.scan_priv),
+                        "spend": hex::encode(&a.spend_pub),
+                    })
+                })
+                .collect::<Vec<_>>(),
             "chain": self.chain.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "gaps": self.gaps,
             "scan_floor": self.scan_floor,
@@ -492,6 +581,22 @@ impl WatchWallet {
                 self.scripts.entry(s.clone()).or_insert((idx, *pos));
             }
             self.descs.push(td);
+        }
+        // Silent-payments watches — absent on pre-BIP352 dumps.
+        for a in v["silents"].as_array().map_or(&[][..], Vec::as_slice) {
+            let scan = hex_bytes(&a["scan"]).ok_or(())?;
+            let spend = hex_bytes(&a["spend"]).ok_or(())?;
+            if scan.len() != 32 || spend.len() != 32 {
+                return Err(());
+            }
+            let mut sp = [0u8; 32];
+            sp.copy_from_slice(&scan);
+            let mut bp = [0u8; 32];
+            bp.copy_from_slice(&spend);
+            self.silents.push(avila_consensus::silent::SilentAddress {
+                scan_priv: sp,
+                spend_pub: bp,
+            });
         }
         let coins = v["coins"].as_array().ok_or(())?;
         for c in coins {
@@ -815,7 +920,7 @@ mod tests {
         for h in [1u32, 2, 3] {
             let hash = cs.chain()[h as usize];
             let body = cs.body(&hash).unwrap();
-            w.scan_gap_height(&body, h, hash);
+            w.scan_gap_height(&cs, &body, h, hash);
         }
         assert!(w.missing_heights().is_empty());
         // The refound coins match the original scan exactly.

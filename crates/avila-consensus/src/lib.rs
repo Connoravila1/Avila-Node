@@ -32,6 +32,7 @@ pub mod script;
 pub mod sigchecker;
 pub mod sign;
 pub mod signet;
+pub mod silent;
 pub mod store;
 pub mod transaction;
 pub mod utxo_snapshot;

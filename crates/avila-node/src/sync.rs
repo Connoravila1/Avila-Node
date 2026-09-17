@@ -435,7 +435,7 @@ pub fn run(
                         if let Some(hash) = job.pending.remove(&h)
                             && let Some(b) = cs.body(&hash)
                         {
-                            w.scan_gap_height(&b, h, hash);
+                            w.scan_gap_height(&cs, &b, h, hash);
                         }
                     }
                     let _ = w.persist();
