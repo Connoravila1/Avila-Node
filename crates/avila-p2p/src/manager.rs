@@ -356,6 +356,12 @@ impl<S: Read + Write> PeerManager<S> {
         self.serve_filters
     }
 
+    /// `-maxmempool` — the pool's serialized-byte cap (Core default
+    /// 300 MB). Lower values tighten eviction pressure.
+    pub fn set_max_mempool_bytes(&mut self, bytes: usize) {
+        self.mempool.set_max_bytes(bytes);
+    }
+
     /// Removes a peer, folding its wire counters into the cumulative
     /// totals so `getnettotals` keeps counting past sessions.
     fn drop_peer(&mut self, id: u64) {

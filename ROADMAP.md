@@ -570,7 +570,13 @@ operation. Compare complete initial download and catch-up, not only local replay
       Verified end-to-end: built templates pass `accept_block` and
       connect. Ancestor-feerate package mining and Stratum V2 remain
       open.
-- [ ] Provide backup/restore, migration/rollback, resource presets and actionable recovery.
+- [~] Provide backup/restore, migration/rollback, resource presets and
+      actionable recovery. Landed: `backupwallet`/`restorewallet` for
+      the watch-only wallet (Core's `-8 "Backup file does not exist"`,
+      corrupt backups rejected without touching live state),
+      `-maxmempool` resource cap, per-file version markers that fail
+      loudly on downgrade. Node-level datadir backup and
+      migration/rollback tooling remain open.
 
 Evidence: documented end-to-end wallet, mining, pruning, reorg, service-isolation and
 recovery tests. Headless and desktop workflows use the same commands and state.

@@ -308,6 +308,73 @@ impl WatchWallet {
         Ok(())
     }
 
+    /// `backupwallet` — flush, then copy the wallet file to `dest`.
+    /// A bare filename resolves against the wallet's directory like
+    /// Core resolves it against `-walletdir`.
+    ///
+    /// # Errors
+    /// `io` on persist/copy failure.
+    pub fn backup_to(&mut self, dest: &std::path::Path) -> io::Result<PathBuf> {
+        self.persist()?;
+        // The file may not exist yet when nothing was ever written —
+        // persist() only runs when dirty, so materialize it first.
+        if !self.path.exists() {
+            let text = self.dump();
+            std::fs::write(&self.path, text)?;
+        }
+        let target = if dest.is_absolute() {
+            dest.to_path_buf()
+        } else {
+            self.path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(dest)
+        };
+        std::fs::copy(&self.path, &target)?;
+        Ok(target)
+    }
+
+    /// `restorewallet` — load a backup file into this wallet. A bare
+    /// filename resolves against the wallet's directory; malformed
+    /// backups are rejected without touching live state.
+    ///
+    /// # Errors
+    /// `io` on read/write failure; `InvalidData` when the file isn't
+    /// a wallet backup.
+    pub fn restore_from(&mut self, src: &std::path::Path) -> io::Result<()> {
+        let target = if src.is_absolute() {
+            src.to_path_buf()
+        } else {
+            self.path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(src)
+        };
+        let text = std::fs::read_to_string(&target)?;
+        // Validate into a scratch wallet first — a corrupt backup must
+        // not tear down the live descriptor/coin state.
+        let mut scratch = Self {
+            path: self.path.clone(),
+            descs: Vec::new(),
+            scripts: HashMap::new(),
+            coins: BTreeMap::new(),
+            chain: Vec::new(),
+            gaps: Vec::new(),
+            scan_floor: 0,
+            dirty: false,
+        };
+        scratch
+            .load(&text)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not a wallet backup"))?;
+        let restored = Self {
+            path: self.path.clone(),
+            dirty: true,
+            ..scratch
+        };
+        *self = restored;
+        self.persist()
+    }
+
     /// JSON serialization — plain fields, hex for hashes/scripts.
     fn dump(&self) -> String {
         let descs: Vec<serde_json::Value> = self

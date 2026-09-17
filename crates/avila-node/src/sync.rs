@@ -43,6 +43,9 @@ pub struct SyncConfig {
     /// index (`cfilters.dat` under `data_dir`) so `getblockfilter` and
     /// `scanblocks` serve real data.
     pub blockfilterindex: bool,
+    /// Core's `-maxmempool` in bytes — the pool's serialized-byte cap
+    /// (Core default 300 MB). `None` keeps the built-in default.
+    pub maxmempool_bytes: Option<usize>,
     /// Core's `-peerblockfilters` (default off): advertise
     /// `NODE_COMPACT_FILTERS` and answer BIP157 requests. Requires the
     /// index, like Core — `-peerblockfilters` without
@@ -91,6 +94,7 @@ impl Default for SyncConfig {
             txindex: false,
             blockfilterindex: false,
             peerblockfilters: false,
+            maxmempool_bytes: None,
             v2transport: true,
             listen: None,
             electrum: None,
@@ -218,6 +222,9 @@ pub fn run(
     // The index we just enabled is what makes BIP157 serving
     // legitimate — advertise NODE_COMPACT_FILTERS only then.
     mgr.set_serve_filters(cfg.blockfilterindex && cfg.peerblockfilters);
+    if let Some(b) = cfg.maxmempool_bytes {
+        mgr.set_max_mempool_bytes(b);
+    }
     let started = Instant::now();
     // Core's `GetStartupTime` — wall-clock boot epoch. `uptime` reads
     // `GetTime() - GetStartupTime()`, so a pinned mock shifts it too.

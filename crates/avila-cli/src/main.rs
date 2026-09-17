@@ -57,6 +57,9 @@ enum Command {
         /// -peerblockfilters; requires --blockfilterindex).
         #[arg(long)]
         peerblockfilters: bool,
+        /// Mempool size cap in MB (Core's -maxmempool, default 300).
+        #[arg(long)]
+        maxmempool: Option<u64>,
         /// Attempt BIP324 v2 transport on outbound peers (Core's
         /// -v2transport, default on). Pass --v2transport=false to
         /// force cleartext.
@@ -109,6 +112,9 @@ enum Command {
         /// -peerblockfilters; requires --blockfilterindex).
         #[arg(long)]
         peerblockfilters: bool,
+        /// Mempool size cap in MB (Core's -maxmempool, default 300).
+        #[arg(long)]
+        maxmempool: Option<u64>,
         /// Attempt BIP324 v2 transport on outbound peers (Core's
         /// -v2transport, default on).
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -161,6 +167,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             txindex,
             blockfilterindex,
             peerblockfilters,
+            maxmempool,
             v2transport,
             listen,
             electrum,
@@ -261,6 +268,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 txindex,
                 blockfilterindex,
                 peerblockfilters,
+                maxmempool_bytes: maxmempool.map(|m| (m * 1024 * 1024) as usize),
                 v2transport,
                 listen,
                 electrum,
@@ -300,6 +308,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             txindex,
             blockfilterindex,
             peerblockfilters,
+            maxmempool,
             v2transport,
         } => {
             use avila_consensus::params::Network as ConsensusNet;
@@ -323,6 +332,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 txindex,
                 blockfilterindex,
                 peerblockfilters,
+                maxmempool_bytes: maxmempool.map(|m| (m * 1024 * 1024) as usize),
                 v2transport,
                 listen: None,
                 electrum: None,

@@ -797,6 +797,7 @@ impl AvilaApp {
             txindex: false,
             blockfilterindex: false,
             peerblockfilters: false,
+            maxmempool_bytes: None,
             v2transport: true,
             listen: None,
             electrum: None,

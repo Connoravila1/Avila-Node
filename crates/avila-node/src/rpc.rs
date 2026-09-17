@@ -2962,6 +2962,10 @@ const LISTDESCRIPTORS_HELP: &str = "listdescriptors ( private )\n\nList all desc
 
 const LISTUNSPENT_HELP: &str = "listunspent ( minconf maxconf [\"address\",...] include_unsafe query_options )\n\nReturns array of unspent transaction outputs\nwith between minconf and maxconf (inclusive) confirmations.\nOptionally filter to only include txouts paid to specified addresses.\n\nArguments:\n1. minconf           (numeric, optional, default=1) The minimum confirmations to filter\n2. maxconf           (numeric, optional, default=9999999) The maximum confirmations to filter\n3. addresses         (json array, optional, default=[]) The bitcoin addresses to filter\n     [\n       \"address\",    (string) bitcoin address\n       ...\n     ]\n4. include_unsafe    (boolean, optional, default=true) Include outputs that are not safe to spend\n                     See description of \"safe\" attribute below.\n5. query_options     (json object, optional) Options object that can be used to pass named arguments, listed below.\n\nNamed Arguments:\nminimumAmount                (numeric or string, optional, default=\"0.00\") Minimum value of each UTXO in BTC\nmaximumAmount                (numeric or string, optional, default=unlimited) Maximum value of each UTXO in BTC\nmaximumCount                 (numeric, optional, default=unlimited) Maximum number of UTXOs\nminimumSumAmount             (numeric or string, optional, default=unlimited) Minimum sum value of all UTXOs in BTC\ninclude_immature_coinbase    (boolean, optional, default=false) Include immature coinbase UTXOs\n\nResult:\n[                                (json array)\n  {                              (json object)\n    \"txid\" : \"hex\",              (string) the transaction id\n    \"vout\" : n,                  (numeric) the vout value\n    \"address\" : \"str\",           (string, optional) the bitcoin address\n    \"label\" : \"str\",             (string, optional) The associated label, or \"\" for the default label\n    \"scriptPubKey\" : \"str\",      (string) the output script\n    \"amount\" : n,                (numeric) the transaction output amount in BTC\n    \"confirmations\" : n,         (numeric) The number of confirmations\n    \"ancestorcount\" : n,         (numeric, optional) The number of in-mempool ancestor transactions, including this one (if transaction is in the mempool)\n    \"ancestorsize\" : n,          (numeric, optional) The virtual transaction size of in-mempool ancestors, including this one (if transaction is in the mempool)\n    \"ancestorfees\" : n,          (numeric, optional) The total fees of in-mempool ancestors (including this one) with fee deltas used for mining priority in sat (if transaction is in the mempool)\n    \"redeemScript\" : \"hex\",      (string, optional) The redeem script if the output script is P2SH\n    \"witnessScript\" : \"str\",     (string, optional) witness script if the output script is P2WSH or P2SH-P2WSH\n    \"spendable\" : true|false,    (boolean) Whether we have the private keys to spend this output\n    \"solvable\" : true|false,     (boolean) Whether we know how to spend this output, ignoring the lack of keys\n    \"reused\" : true|false,       (boolean, optional) (only present if avoid_reuse is set) Whether this output is reused/dirty (sent to an address that was previously spent from)\n    \"desc\" : \"str\",              (string, optional) (only when solvable) A descriptor for spending this output\n    \"parent_descs\" : [           (json array) List of parent descriptors for the output script of this coin.\n      \"str\",                     (string) The descriptor string.\n      ...\n    ],\n    \"safe\" : true|false          (boolean) Whether this output is considered safe to spend. Unconfirmed transactions\n                                 from outside keys and unconfirmed replacement transactions are considered unsafe\n                                 and are not eligible for spending by fundrawtransaction and sendtoaddress.\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli listunspent \n> bitcoin-cli listunspent 6 9999999 \"[\\\"bc1q09vm5lfy0j5reeulh4x5752q25uqqvz34hufdl\\\",\\\"bc1q02ad21edsxd23d32dfgqqsz4vv4nmtfzuklhy3\\\"]\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"listunspent\", \"params\": [6, 9999999 \"[\\\"bc1q09vm5lfy0j5reeulh4x5752q25uqqvz34hufdl\\\",\\\"bc1q02ad21edsxd23d32dfgqqsz4vv4nmtfzuklhy3\\\"]\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> bitcoin-cli listunspent 6 9999999 '[]' true '{ \"minimumAmount\": 0.005 }'\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"listunspent\", \"params\": [6, 9999999, [] , true, { \"minimumAmount\": 0.005 } ]}' -H 'content-type: application/json' http://127.0.0.1:8332/";
 
+const BACKUPWALLET_HELP: &str = "backupwallet \"destination\"\n\nSafely copies the current watch-only wallet file to the specified destination.\n\nArguments:\n1. destination    (string, required) The destination filename or path\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli backupwallet \"backup.dat\"\n";
+
+const RESTOREWALLET_HELP: &str = "restorewallet \"filename\" ( \"name\" load_on_startup )\n\nRestores the watch-only wallet from a backup file.\n\nArguments:\n1. filename          (string, required) The backup file that will be used\n2. name              (string, optional) Ignored — kept for Core CLI compatibility\n3. load_on_startup   (boolean, optional) Ignored — kept for Core CLI compatibility\n\nResult:\nnull    (json null)\n";
+
 const GETBALANCES_HELP: &str = "getbalances\n\nReturns an object with all balances in BTC.\n\nResult:\n{                               (json object)\n  \"mine\" : {                    (json object) balances from outputs that the wallet can sign\n    \"trusted\" : n,              (numeric) trusted balance (outputs created by the wallet or confirmed outputs)\n    \"untrusted_pending\" : n,    (numeric) untrusted pending balance (outputs created by others that are in the mempool)\n    \"immature\" : n,             (numeric) balance from immature coinbase outputs\n    \"used\" : n                  (numeric, optional) (only present if avoid_reuse is set) balance from coins sent to addresses that were previously spent from (potentially privacy violating)\n  },\n  \"watchonly\" : {               (json object, optional) watchonly balances (not present if wallet does not watch anything)\n    \"trusted\" : n,              (numeric) trusted balance (outputs created by the wallet or confirmed outputs)\n    \"untrusted_pending\" : n,    (numeric) untrusted pending balance (outputs created by others that are in the mempool)\n    \"immature\" : n              (numeric) balance from immature coinbase outputs\n  },\n  \"lastprocessedblock\" : {      (json object) hash and height of the block this information was generated on\n    \"hash\" : \"hex\",             (string) hash of the block this information was generated on\n    \"height\" : n                (numeric) height of the block this information was generated on\n  }\n}\n\nExamples:\n> bitcoin-cli getbalances \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getbalances\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/";
 
 const RESCANBLOCKCHAIN_HELP: &str = "rescanblockchain ( start_height stop_height )\n\nRescan the local blockchain for wallet related transactions.\nNote: Use \"getwalletinfo\" to query the scanning progress.\nThe rescan is significantly faster when used on a descriptor wallet\nand block filters are available (using startup option \"-blockfilterindex=1\").\n\nArguments:\n1. start_height    (numeric, optional, default=0) block height where the rescan should start\n2. stop_height     (numeric, optional) the last block height that should be scanned. If none is provided it will rescan up to the tip at return time of this call.\n\nResult:\n{                        (json object)\n  \"start_height\" : n,    (numeric) The block height where the rescan started (the requested height or 0)\n  \"stop_height\" : n      (numeric) The height of the last rescanned block. May be null in rare cases if there was a reorg and the call didn't scan any blocks because they were already scanned in the background.\n}\n\nExamples:\n> bitcoin-cli rescanblockchain 100000 120000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"rescanblockchain\", \"params\": [100000, 120000]}' -H 'content-type: application/json' http://127.0.0.1:8332/";
@@ -3933,7 +3937,21 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         ],
         LISTUNSPENT_HELP,
     ),
+    (
+        "backupwallet",
+        &[("destination", Some("string"), true)],
+        BACKUPWALLET_HELP,
+    ),
     ("getbalances", &[], GETBALANCES_HELP),
+    (
+        "restorewallet",
+        &[
+            ("filename", Some("string"), true),
+            ("name", Some("string"), false),
+            ("load_on_startup", Some("bool"), false),
+        ],
+        RESTOREWALLET_HELP,
+    ),
     (
         "rescanblockchain",
         &[
@@ -9617,6 +9635,69 @@ pub(crate) fn dispatch(
                 }
                 let _ = w.persist();
                 Ok(Value::Array(out))
+            })
+        }
+        // Core's `backupwallet` — copies the watch-only wallet file.
+        "backupwallet" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.len() != 1 {
+                return help_error(BACKUPWALLET_HELP);
+            }
+            let Some(dest) = arr[0].as_str() else {
+                return help_error(BACKUPWALLET_HELP);
+            };
+            let dest = dest.to_string();
+            let wallet = wallet.cloned();
+            chain_query(queries, move |_cs, _mgr| {
+                let Some(wallet) = wallet else {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    ));
+                };
+                let mut w = wallet
+                    .lock()
+                    .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                w.backup_to(std::path::Path::new(&dest))
+                    .map(|_| serde_json::Value::Null)
+                    .map_err(|e| {
+                        (
+                            RPC_MISC_ERROR,
+                            format!("Backup failed: could not copy wallet file: {e}"),
+                        )
+                    })
+            })
+        }
+        // Core's `restorewallet` — loads a backup file into the
+        // watch-only wallet. A bad file is rejected before live state
+        // is touched; missing files get Core's exact -8 text.
+        "restorewallet" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            if arr.is_empty() || arr.len() > 3 {
+                return help_error(RESTOREWALLET_HELP);
+            }
+            let Some(file) = arr[0].as_str() else {
+                return help_error(RESTOREWALLET_HELP);
+            };
+            let file = file.to_string();
+            let wallet = wallet.cloned();
+            chain_query(queries, move |_cs, _mgr| {
+                let Some(wallet) = wallet else {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    ));
+                };
+                let mut w = wallet
+                    .lock()
+                    .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                match w.restore_from(std::path::Path::new(&file)) {
+                    Ok(()) => Ok(serde_json::Value::Null),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Err((RPC_INVALID_PARAMETER, "Backup file does not exist".into()))
+                    }
+                    Err(e) => Err((RPC_MISC_ERROR, format!("Restore failed: {e}"))),
+                }
             })
         }
         // Core's `getbalances` — this wallet is watch-only, so only
