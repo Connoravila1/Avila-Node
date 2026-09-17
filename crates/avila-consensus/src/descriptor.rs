@@ -769,11 +769,10 @@ fn parse_script(
             *error = "sp() expects exactly 2 arguments".to_string();
             return Vec::new();
         }
-        // The scan key is a normal key (WIF lands its secret in the
-        // provider map); the spend key is x-only — parsed under the
-        // taproot context so a 32-byte hex counts.
+        // Both keys parse at the top context — the spend key keeps
+        // its compressed parity for the label-subtract scan.
         let scan = parse_pubkey(args[0], ctx, out, error, params);
-        let spend = parse_pubkey(args[1], Ctx::P2tr, out, error, params);
+        let spend = parse_pubkey(args[1], ctx, out, error, params);
         if scan.len() != 1 || spend.len() != 1 {
             *error = format!("sp(): {error}");
             return Vec::new();
@@ -1496,10 +1495,11 @@ impl Descriptor {
 
     /// For `sp(scan, spend)` — resolves the watch pair: the scan
     /// key's private half (required for BIP352 detection, drawn from
-    /// the provider's WIF/xprv map) and the spend key's x-only
-    /// public half.
+    /// the provider's WIF/xprv map) and the spend key's full
+    /// compressed public half (33 bytes — the `sp1q` encoding carries
+    /// its parity).
     #[must_use]
-    pub fn silent_keys(&self, signing: &FlatProvider) -> Option<([u8; 32], [u8; 32])> {
+    pub fn silent_keys(&self, signing: &FlatProvider) -> Option<([u8; 32], [u8; 33])> {
         let Descriptor::Silent { scan, spend } = self else {
             return None;
         };
@@ -1508,13 +1508,14 @@ impl Descriptor {
         let (spend_full, _) = provider_pubkey(spend, 0, signing, &mut cache)?;
         let mut sp = [0u8; 32];
         sp.copy_from_slice(&scan_priv.secret_bytes());
-        let mut bp = [0u8; 32];
-        // The spend key's x-only half — last 32 bytes of a compressed
-        // pubkey, or the whole thing when already x-only.
+        let mut bp = [0u8; 33];
+        // The spend key must be compressed — an x-only 32-byte entry
+        // lifts to even parity (the address encoding keeps parity).
         if spend_full.len() == 33 {
-            bp.copy_from_slice(&spend_full[1..]);
-        } else if spend_full.len() == 32 {
             bp.copy_from_slice(&spend_full);
+        } else if spend_full.len() == 32 {
+            bp[0] = 0x02;
+            bp[1..].copy_from_slice(&spend_full);
         } else {
             return None;
         }

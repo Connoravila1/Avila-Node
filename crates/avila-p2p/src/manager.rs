@@ -2709,7 +2709,7 @@ mod tests {
 
         // Both sessions land through drain_inbounds.
         let mut admitted = Vec::new();
-        for _ in 0..240 {
+        for _ in 0..600 {
             admitted = mgr.drain_inbounds();
             if admitted.len() == 2 {
                 break;

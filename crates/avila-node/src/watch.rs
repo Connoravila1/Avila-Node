@@ -277,11 +277,12 @@ impl WatchWallet {
                     })
                 };
                 for si in 0..self.silents.len() {
-                    if let Some(vout) = avila_consensus::silent::detect_silent_payment(
+                    for hit in avila_consensus::silent::detect_silent_payment(
                         tx,
                         &self.silents[si],
                         resolve,
                     ) {
+                        let vout = hit.vout;
                         let out = &tx.outputs[vout as usize];
                         self.coins.insert(
                             (txid, vout),
@@ -531,6 +532,7 @@ impl WatchWallet {
                     serde_json::json!({
                         "scan": hex::encode(&a.scan_priv),
                         "spend": hex::encode(&a.spend_pub),
+                        "labels": a.labels,
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -582,20 +584,31 @@ impl WatchWallet {
             }
             self.descs.push(td);
         }
-        // Silent-payments watches — absent on pre-BIP352 dumps.
+        // Silent-payments watches — absent on pre-BIP352 dumps. A
+        // malformed entry skips rather than aborting the whole load.
         for a in v["silents"].as_array().map_or(&[][..], Vec::as_slice) {
-            let scan = hex_bytes(&a["scan"]).ok_or(())?;
-            let spend = hex_bytes(&a["spend"]).ok_or(())?;
-            if scan.len() != 32 || spend.len() != 32 {
-                return Err(());
+            let (Some(scan), Some(spend)) = (hex_bytes(&a["scan"]), hex_bytes(&a["spend"])) else {
+                continue;
+            };
+            if scan.len() != 32 || spend.len() != 33 {
+                continue;
             }
             let mut sp = [0u8; 32];
             sp.copy_from_slice(&scan);
-            let mut bp = [0u8; 32];
+            let mut bp = [0u8; 33];
             bp.copy_from_slice(&spend);
             self.silents.push(avila_consensus::silent::SilentAddress {
                 scan_priv: sp,
                 spend_pub: bp,
+                labels: a["labels"]
+                    .as_array()
+                    .map(|v| {
+                        v.iter()
+                            .filter_map(serde_json::Value::as_u64)
+                            .map(|m| m as u32)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             });
         }
         let coins = v["coins"].as_array().ok_or(())?;

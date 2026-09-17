@@ -1156,6 +1156,9 @@ fn import_one_descriptor(
         w.track_silent(avila_consensus::silent::SilentAddress {
             scan_priv,
             spend_pub,
+            // Always detect the change label (m = 0) per BIP352's
+            // cross-compat recommendation.
+            labels: vec![0],
         });
         return match timestamp {
             // `"now"` — nothing historical to find; blocks below the

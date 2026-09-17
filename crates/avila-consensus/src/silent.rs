@@ -6,21 +6,40 @@
 //! outpoint, and `d_scan` is the recipient's scan key. Detection
 //! needs only `(d_scan, B_spend)` — no spend-side private key.
 
-#[cfg(test)]
-use secp256k1::SecretKey;
-use secp256k1::{PublicKey, Scalar, Secp256k1, XOnlyPublicKey};
+use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
 
 use crate::hash::tagged_hash;
 use crate::transaction::{OutPoint, Transaction};
 
 /// A watched silent-payments address — the scan private key plus the
-/// spend public key the sender tweaks per payment.
+/// spend public key the sender tweaks per payment. `spend_pub` is the
+/// FULL compressed key (33 bytes): the `sp1q` address encodes it that
+/// way and the label-subtract scan needs the true parity. `labels`
+/// holds the BIP352 label integers this address scans for (`m = 0`
+/// is the change label — every wallet checks it even when no other
+/// labels are used).
 #[derive(Debug, Clone)]
 pub struct SilentAddress {
     /// `d_scan` — the 32-byte scan private key.
     pub scan_priv: [u8; 32],
-    /// `B_spend` — the x-only spend public key.
-    pub spend_pub: [u8; 32],
+    /// `B_spend` — the 33-byte compressed spend public key.
+    pub spend_pub: [u8; 33],
+    /// BIP352 label integers to detect (always includes 0 = change).
+    pub labels: Vec<u32>,
+}
+
+/// `label_point = hash_BIP0352/Label(ser256(b_scan) || ser32(m))·G` —
+/// the precomputed label a receiving wallet compares `output - P_k`
+/// against. Returns the x-only encoding.
+#[must_use]
+fn label_point(scan_priv: &[u8; 32], m: u32) -> Option<PublicKey> {
+    let mut data = Vec::with_capacity(36);
+    data.extend_from_slice(scan_priv);
+    data.extend_from_slice(&m.to_be_bytes());
+    let t = tagged_hash(b"BIP0352/Label", &data);
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&t).ok()?;
+    Some(PublicKey::from_secret_key(&secp, &sk))
 }
 
 /// The public key a BIP352 input contributes to `A`. `prevout` is the
@@ -62,24 +81,37 @@ fn input_pubkey(txin: &crate::transaction::TxIn, prevout: &[u8]) -> Option<Publi
     None
 }
 
-/// Whether `tx` pays `addr` — BIP352's scanning routine. Returns the
-/// matching output index when a silent payment lands.
+/// A detected silent payment — the output index plus the label
+/// integer when a labeled (e.g. change-to-self, `m = 0`) output hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SilentHit {
+    /// The tx output index carrying the payment.
+    pub vout: u32,
+    /// The matched label, `None` for the base (unlabeled) address.
+    pub label: Option<u32>,
+}
+
+/// Whether `tx` pays `addr` — BIP352's scanning routine. Returns
+/// every matching output (a tx can carry several payments to the
+/// same recipient — the `k` counter advances per hit, not per
+/// output).
 ///
 /// `prevout_of` resolves an input's spent scriptPubKey — callers pass
 /// the UTXO set plus same-block outputs (a later tx's input may spend
 /// an earlier same-block tx's output).
 ///
 /// # Scope
-/// First slice: one output match per tx, no `label` tweak (change
-/// outputs to self aren't detected), no `sp()` descriptor grammar.
+/// First slice: one output match per tx, BIP352 labels via the
+/// `output - P_k` lookup (change label always checked), no
+/// `sp()`-address serving for light clients.
 #[must_use]
 pub fn detect_silent_payment(
     tx: &Transaction,
     addr: &SilentAddress,
     prevout_of: impl Fn(&OutPoint) -> Option<Vec<u8>>,
-) -> Option<u32> {
+) -> Vec<SilentHit> {
     if tx.is_coinbase() {
-        return None;
+        return Vec::new();
     }
     // Sum every input's extractable key into `A` — inputs without
     // public keys (or unresolvable prevouts) are skipped per BIP352;
@@ -94,10 +126,15 @@ pub fn detect_silent_payment(
         };
         agg = Some(match agg {
             None => key,
-            Some(a) => a.combine(&key).ok()?,
+            Some(a) => match a.combine(&key) {
+                Ok(x) => x,
+                Err(_) => return Vec::new(),
+            },
         });
     }
-    let a = agg?;
+    let Some(a) = agg else {
+        return Vec::new();
+    };
     // input_hash = tagged BIP0352/Inputs over smallest-outpoint || A —
     // `A` serializes as the full compressed point (ser_P).
     let smallest = tx
@@ -109,7 +146,8 @@ pub fn detect_silent_payment(
             b[32..].copy_from_slice(&i.previous_output.vout.to_le_bytes());
             b
         })
-        .min()?;
+        .min()
+        .unwrap_or([0u8; 36]);
     let mut ih_data = Vec::with_capacity(69);
     ih_data.extend_from_slice(&smallest);
     ih_data.extend_from_slice(&a.serialize());
@@ -117,32 +155,95 @@ pub fn detect_silent_payment(
 
     // shared_secret = input_hash · A · d_scan
     let secp = Secp256k1::new();
-    let ecdh = a
-        .mul_tweak(&secp, &Scalar::from_be_bytes(input_hash).ok()?)
-        .ok()?
-        .mul_tweak(&secp, &Scalar::from_be_bytes(addr.scan_priv).ok()?)
-        .ok()?;
+    let (Ok(ih_s), Ok(scan_s)) = (
+        Scalar::from_be_bytes(input_hash),
+        Scalar::from_be_bytes(addr.scan_priv),
+    ) else {
+        return Vec::new();
+    };
+    let Ok(ecdh) = a
+        .mul_tweak(&secp, &ih_s)
+        .and_then(|p| p.mul_tweak(&secp, &scan_s))
+    else {
+        return Vec::new();
+    };
 
-    // For each P2TR output index k: P_k = B_spend + t_k·G where
-    // t_k = tagged BIP0352/SharedSecret(ser256(ecdh) || ser32(k)).
-    let b_spend = XOnlyPublicKey::from_slice(&addr.spend_pub).ok()?;
-    for (vout, out) in tx.outputs.iter().enumerate() {
-        let spk = out.script_pubkey.as_bytes();
-        if spk.len() != 34 || spk[0] != 0x51 || spk[1] != 0x20 {
-            continue;
-        }
-        let mut td = Vec::with_capacity(37);
-        td.extend_from_slice(&ecdh.serialize());
-        td.extend_from_slice(&(vout as u32).to_le_bytes());
-        let t_k = tagged_hash(b"BIP0352/SharedSecret", &td);
-        let (p_k, _) = b_spend
-            .add_tweak(&secp, &Scalar::from_be_bytes(t_k).ok()?)
-            .ok()?;
-        if p_k.serialize() == spk[2..34] {
-            return Some(vout as u32);
+    // Precompute label points once — `m = 0` (change) is always in
+    // the set per the BIP's cross-compat rule.
+    let mut label_pts = std::collections::HashMap::new();
+    for m in addr.labels.iter().copied().chain(std::iter::once(0)) {
+        if let Some(p) = label_point(&addr.scan_priv, m) {
+            label_pts.insert(p.serialize(), m);
         }
     }
-    None
+
+    // `k` is a sequential payment counter, NOT the output index:
+    // start at 0, compute P_k = B_spend + t_k·G, check every taproot
+    // output; a match removes it and rescans with k++ (BIP352's
+    // K_max bounds the loop at 2323).
+    // `B_spend` keeps its address-encoded parity — the compressed
+    // point directly, no x-only re-lift.
+    let Ok(b_full) = PublicKey::from_slice(&addr.spend_pub) else {
+        return Vec::new();
+    };
+    let mut remaining: Vec<usize> = tx
+        .outputs
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| {
+            let b = o.script_pubkey.as_bytes();
+            b.len() == 34 && b[0] == 0x51 && b[1] == 0x20
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let mut hits = Vec::new();
+    let mut k = 0u32;
+    while k < 2323 && !remaining.is_empty() {
+        let mut td = Vec::with_capacity(37);
+        td.extend_from_slice(&ecdh.serialize());
+        td.extend_from_slice(&k.to_be_bytes());
+        let t_k = tagged_hash(b"BIP0352/SharedSecret", &td);
+        let Ok(t_sk) = SecretKey::from_slice(&t_k) else {
+            break;
+        };
+        let Ok(p_full) = b_full.combine(&PublicKey::from_secret_key(&secp, &t_sk)) else {
+            break;
+        };
+        let (p_k, _par) = p_full.x_only_public_key();
+        let p_neg = p_full.negate(&secp);
+        let mut hit: Option<(usize, Option<u32>)> = None;
+        for (pos, &i) in remaining.iter().enumerate() {
+            let spk = tx.outputs[i].script_pubkey.as_bytes();
+            if p_k.serialize() == spk[2..34] {
+                hit = Some((pos, None));
+                break;
+            }
+            // Label check: `output - P_k` should be a known label
+            // point; retry with the negated output for the lost Y.
+            let Ok(out_pt) = PublicKey::from_slice(&[&[0x02], &spk[2..34]].concat()) else {
+                continue;
+            };
+            for cand in [out_pt, out_pt.negate(&secp)] {
+                let Ok(diff) = cand.combine(&p_neg) else {
+                    continue;
+                };
+                if let Some(&m) = label_pts.get(&diff.serialize()) {
+                    hit = Some((pos, Some(m)));
+                    break;
+                }
+            }
+            if hit.is_some() {
+                break;
+            }
+        }
+        let Some((pos, m)) = hit else {
+            break;
+        };
+        let vout = remaining.remove(pos) as u32;
+        hits.push(SilentHit { vout, label: m });
+        k += 1;
+    }
+    hits
 }
 
 /// The recipient's side — compute the tweaked output key for
@@ -154,7 +255,7 @@ pub fn silent_output_key(
     a: PublicKey,
     a_priv: &SecretKey,
     smallest_outpoint: &[u8; 36],
-    b_spend: &XOnlyPublicKey,
+    b_spend: &PublicKey,
     scan_pub: &PublicKey,
     k: u32,
 ) -> Option<[u8; 32]> {
@@ -180,12 +281,13 @@ pub fn silent_output_key(
     // A·d_scan·ih = (a_sum·d_scan·ih)·G — equal when A = a·G. ✓
     let mut td = Vec::with_capacity(37);
     td.extend_from_slice(&ecdh.serialize());
-    td.extend_from_slice(&k.to_le_bytes());
+    td.extend_from_slice(&k.to_be_bytes());
     let t_k = tagged_hash(b"BIP0352/SharedSecret", &td);
-    let (p_k, _) = b_spend
-        .add_tweak(&secp, &Scalar::from_be_bytes(t_k).ok()?)
+    let t_sk = SecretKey::from_slice(&t_k).ok()?;
+    let p_k = b_spend
+        .combine(&PublicKey::from_secret_key(&secp, &t_sk))
         .ok()?;
-    Some(p_k.serialize())
+    Some(p_k.x_only_public_key().0.serialize())
 }
 
 #[cfg(test)]
@@ -207,9 +309,8 @@ mod tests {
         let scan_priv = SecretKey::from_slice(&[0x22; 32]).unwrap_or_else(|_| unreachable!());
         let scan_pub = PublicKey::from_secret_key(&secp, &scan_priv);
         let spend_priv = SecretKey::from_slice(&[0x33; 32]).unwrap_or_else(|_| unreachable!());
-        let _ = spend_priv;
-        let (spend_xonly, _) =
-            XOnlyPublicKey::from_keypair(&secp256k1::Keypair::from_secret_key(&secp, &spend_priv));
+        let spend_pub_full = PublicKey::from_secret_key(&secp, &spend_priv);
+        let spend_ser: [u8; 33] = spend_pub_full.serialize();
 
         let op = OutPoint {
             txid: Txid::from_bytes([0x44; 32]),
@@ -220,7 +321,7 @@ mod tests {
         smallest[32..].copy_from_slice(&0u32.to_le_bytes());
 
         // The sender's output key: B_spend + t_0·G.
-        let out_xonly = silent_output_key(a_pub, &a_priv, &smallest, &spend_xonly, &scan_pub, 0)
+        let out_xonly = silent_output_key(a_pub, &a_priv, &smallest, &spend_pub_full, &scan_pub, 0)
             .unwrap_or([0u8; 32]);
         let mut spk = vec![0x51, 0x20];
         spk.extend_from_slice(&out_xonly);
@@ -245,19 +346,26 @@ mod tests {
         prev.extend_from_slice(&[0xaa; 20]);
         let watch = SilentAddress {
             scan_priv: scan_priv.secret_bytes(),
-            spend_pub: spend_xonly.serialize(),
+            spend_pub: spend_ser,
+            labels: vec![0],
         };
         let found = detect_silent_payment(&tx, &watch, |o| (o == &op).then(|| prev.clone()));
-        assert_eq!(found, Some(0));
+        assert_eq!(
+            found,
+            vec![SilentHit {
+                vout: 0,
+                label: None
+            }]
+        );
 
         // A different watch must not match.
         let other = SilentAddress {
             scan_priv: [0x99; 32],
-            spend_pub: spend_xonly.serialize(),
+            spend_pub: spend_ser,
+            labels: vec![0],
         };
-        assert_eq!(
-            detect_silent_payment(&tx, &other, |o| (o == &op).then(|| prev.clone())),
-            None
+        assert!(
+            detect_silent_payment(&tx, &other, |o| (o == &op).then(|| prev.clone())).is_empty()
         );
     }
     /// The BIP352 spec's "Simple send: two inputs" receiving vector —
@@ -322,13 +430,101 @@ mod tests {
             "9d6ad855ce3417ef84e836892e5a56392bfba05fa5d97ccea30e266f540e08b3",
         ))
         .unwrap_or_else(|_| unreachable!());
-        let (spend_xonly, _) =
-            XOnlyPublicKey::from_keypair(&secp256k1::Keypair::from_secret_key(&secp, &spend_priv));
+        let spend_ser: [u8; 33] = PublicKey::from_secret_key(&secp, &spend_priv).serialize();
         let watch = SilentAddress {
             scan_priv: scan,
-            spend_pub: spend_xonly.serialize(),
+            spend_pub: spend_ser,
+            labels: vec![0],
         };
         let found = detect_silent_payment(&tx, &watch, |op| prevouts.get(op).cloned());
-        assert_eq!(found, Some(0));
+        assert_eq!(
+            found,
+            vec![SilentHit {
+                vout: 0,
+                label: None
+            }]
+        );
+    }
+    /// BIP352 "Single recipient: use silent payments for sender
+    /// change" — two p2pkh inputs, output 0 is the change labeled
+    /// with `m = 0`, output 1 is a different recipient. The scan must
+    /// hit vout 0 with `label = Some(0)`.
+    #[test]
+    fn bip352_vector_change_label() {
+        let hex = |s: &str| crate::hex::decode(s).unwrap_or_default();
+        let secp = Secp256k1::new();
+        let vins = [
+            (
+                "f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16",
+                "483046022100ad79e6801dd9a8727f342f31c71c4912866f59dc6e7981878e92c5844a0ce929022100fb0d2393e813968648b9753b7e9871d90ab3d815ebf91820d704b19f4ed224d621025a1e61f898173040e20616d43e9f496fba90338a39faa1ed98fcbaeee4dd9be5",
+                "76a91419c2f3ae0ca3b642bd3e49598b8da89f50c1416188ac",
+            ),
+            (
+                "a1075db55d416d3ca199f55b6084e2115b9345e16c5cf302fc80e9d5fbf5d48d",
+                "473045022100a8c61b2d470e393279d1ba54f254b7c237de299580b7fa01ffcc940442ecec4502201afba952f4e4661c40acde7acc0341589031ba103a307b886eb867b23b850b972103782eeb913431ca6e9b8c2fd80a5f72ed2024ef72a3c6fb10263c379937323338",
+                "76a9147cdd63cc408564188e8e472640e921c7c90e651d88ac",
+            ),
+        ];
+        let mut inputs = Vec::new();
+        let mut prevouts = std::collections::HashMap::new();
+        for (txid_hex, sig_hex, prev_hex) in &vins {
+            let mut raw = hex(txid_hex);
+            raw.reverse();
+            let op = OutPoint {
+                txid: Txid::from_bytes(
+                    <[u8; 32]>::try_from(raw).unwrap_or_else(|_| unreachable!()),
+                ),
+                vout: 0,
+            };
+            prevouts.insert(op, hex(prev_hex));
+            inputs.push(TxIn {
+                previous_output: op,
+                script_sig: Script::new(hex(sig_hex)),
+                sequence: 0xffff_ffff,
+                witness: Witness::EMPTY,
+            });
+        }
+        let outputs = [
+            "be368e28979d950245d742891ae6064020ba548c1e2e65a639a8bb0675d95cff",
+            "f207162b1a7abc51c42017bef055e9ec1efc3d3567cb720357e2b84325db33ac",
+        ]
+        .into_iter()
+        .map(|k| {
+            let mut spk = vec![0x51, 0x20];
+            spk.extend_from_slice(&hex(k));
+            TxOut {
+                value: 10_000,
+                script_pubkey: Script::new(spk),
+            }
+        })
+        .collect();
+        let tx = Transaction {
+            version: 2,
+            inputs,
+            outputs,
+            lock_time: 0,
+        };
+        let mut scan = [0u8; 32];
+        scan.copy_from_slice(&hex(
+            "11b7a82e06ca2648d5fded2366478078ec4fc9dc1d8ff487518226f229d768fd",
+        ));
+        let spend_priv = SecretKey::from_slice(&hex(
+            "b8f87388cbb41934c50daca018901b00070a5ff6cc25a7e9e716a9d5b9e4d664",
+        ))
+        .unwrap_or_else(|_| unreachable!());
+        let spend_ser: [u8; 33] = PublicKey::from_secret_key(&secp, &spend_priv).serialize();
+        let watch = SilentAddress {
+            scan_priv: scan,
+            spend_pub: spend_ser,
+            labels: vec![0],
+        };
+        let hits = detect_silent_payment(&tx, &watch, |op| prevouts.get(op).cloned());
+        assert_eq!(
+            hits,
+            vec![SilentHit {
+                vout: 0,
+                label: Some(0),
+            }]
+        );
     }
 }
