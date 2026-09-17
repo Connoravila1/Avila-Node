@@ -8,6 +8,7 @@ pub mod config;
 pub mod electrum;
 pub mod events;
 pub mod rpc;
+pub mod sv2;
 pub mod sync;
 pub mod time;
 pub mod watch;

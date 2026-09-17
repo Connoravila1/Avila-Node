@@ -579,9 +579,13 @@ operation. Compare complete initial download and catch-up, not only local replay
       coinbase, and sets the BIP141 witness commitment when needed.
       Verified end-to-end: built templates pass `accept_block` and
       connect. Ancestor-feerate package mining landed; Stratum V2 is
-      investigated (`docs/STRATUM_V2.md`) — the node's role is the
-      Template Provider surface (matching Core's `-sv2`), with the
-      TP server itself still to implement.
+      investigated (`docs/STRATUM_V2.md`) and the Template Provider
+      surface is live: `--sv2tp` serves SetupConnection, pushes
+      NewTemplate/SetNewPrevHash on subscription and tip change,
+      answers RequestTransactionData, and admits SubmitSolution
+      blocks through `accept_block` — verified end-to-end by
+      solo-mining a regtest block through the socket. Noise NX
+      encryption and multi-miner fairness accounting remain open.
 - [~] Provide backup/restore, migration/rollback, resource presets and
       actionable recovery. Landed: `backupwallet`/`restorewallet` for
       the watch-only wallet (Core's `-8 "Backup file does not exist"`,

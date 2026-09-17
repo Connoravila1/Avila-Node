@@ -74,6 +74,11 @@ enum Command {
         /// (e.g. 127.0.0.1:50001) and maintain the scripthash index.
         #[arg(long)]
         electrum: Option<SocketAddr>,
+        /// Bind the Stratum V2 Template Provider to this address
+        /// (plaintext framing — loopback solo mining only; see
+        /// docs/STRATUM_V2.md).
+        #[arg(long)]
+        sv2tp: Option<SocketAddr>,
         /// Authenticated RPC user (Core's -rpcuser); pairs with
         /// --rpcpassword. Adds a Basic-auth credential alongside the
         /// cookie.
@@ -222,6 +227,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             v2transport,
             listen,
             electrum,
+            sv2tp,
             rpcuser,
             rpcpassword,
             rpcwhitelist,
@@ -339,6 +345,12 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 )
                 .map_err(|e| format!("electrum bind {addr}: {e}"))?;
                 println!("Electrum listening on {addr}");
+                std::mem::forget(_server);
+            }
+            if let Some(addr) = sv2tp {
+                let _server = avila_node::sv2::serve(addr, query_tx.clone(), cancel.clone())
+                    .map_err(|e| format!("sv2tp bind {addr}: {e}"))?;
+                println!("Sv2 TP listening on {addr}");
                 std::mem::forget(_server);
             }
             let cfg = SyncConfig {
