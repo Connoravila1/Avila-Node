@@ -83,7 +83,9 @@ fn main() {
 
     // secp256k1 signature verification — the per-input hot path.
     let secp = secp256k1::Secp256k1::new();
-    let sk = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
+    let Ok(sk) = secp256k1::SecretKey::from_slice(&[7; 32]) else {
+        return;
+    };
     let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
     let msg = secp256k1::Message::from_digest([9; 32]);
     let sig = secp.sign_ecdsa(&msg, &sk);
