@@ -625,8 +625,15 @@ An unsupported API or incomplete scan reports its actual status.
   signing key + first tagged release.
 - [ ] Test clean installation, upgrade, rollback and restore with documented compatibility limits.
 - [ ] Validate accessibility, keyboard use, appearance, scaling and real operator tasks.
-- [ ] Publish the scorecard with successes, regressions, unsupported cases and reproduction data.
-- [ ] Establish security reporting, supported-release policy, contributor guidance and release ownership.
+- [~] Publish the scorecard with successes, regressions, unsupported cases and reproduction data.
+  docs/SCORECARD.md now carries the functional-evidence section
+  (live-verified RPC matrix, BIP324 both directions, BIP157 serving,
+  Electrum, BIP352 vectors, Sv2 TP solo-mine, operator tooling) —
+  the P/Q performance rows remain unmeasured pending the G1 harness
+  sweep on matched hardware.
+- [x] Establish security reporting, supported-release policy, contributor guidance and release ownership.
+  SECURITY.md (private GitHub reporting, pre-release support scope,
+  trust notes) + CONTRIBUTING.md (toolchain, checks, conventions).
 
 Primary-node readiness requires the combined evidence from G1–G5. Release labels
 must identify qualified profiles and features. A release can be useful before every
