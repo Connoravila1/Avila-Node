@@ -540,11 +540,17 @@ operation. Compare complete initial download and catch-up, not only local replay
       `mempool.get_fee_histogram` and `blockchain.relayfee` are all
       answered through the sync loop's chain-query channel — no direct
       chainstate access — and subscriptions push exactly-once
-      notifications on each new tip (verified live: header +
-      status-hash pushes on block connect, spec-exact status hash
-      `sha256("txid:height:"…)`). Electrum-protocol negotiation,
-      persistent-connection quirks and richer mempool-status updates
-      remain open.
+      notifications on each new tip AND on mempool movement: the
+      waiter check sees the pool (its predicate takes
+      `(chainstate, mempool)`), so a mempool tx touching a subscribed
+      script rehashes the status — mempool rows included — and pushes
+      without waiting for a block (verified live: a relayed
+      `sendrawtransaction` fired the push). `history_entries` also
+      used to bail on scripts with no confirmed history, hiding
+      mempool-only activity from `get_mempool`/`get_balance`/
+      `listunspent` — fixed by gating on the index flag instead of
+      history emptiness. Remaining gaps: `blockchain.address.*`
+      legacy aliases and connection-lifecycle knobs.
 - [x] Compact-filter service surface — BIP157/158 serving over the
       `getcfilters`/`cfilter`, `getcfheaders`/`cfheaders` and
       `getcfcheckpt`/`cfcheckpt` messages, backed by the persisted

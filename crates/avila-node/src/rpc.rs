@@ -750,9 +750,12 @@ const MAX_BLOCK_WAITERS: usize = 256;
 /// wakes the handler on the first hit — Core's validation-interface
 /// block notifications, by polling instead of callbacks.
 struct BlockWaiter {
-    check: Box<dyn Fn(&Chainstate) -> bool + Send>,
+    check: WaiterCheck,
     wake: mpsc::SyncSender<()>,
 }
+
+/// A parked predicate — `(chainstate, mempool) -> fired`.
+type WaiterCheck = Box<dyn Fn(&Chainstate, &avila_mempool::Mempool) -> bool + Send>;
 
 /// The waiter registry shared between the sync loop and RPC handlers.
 /// The loop calls [`BlockWaiters::notify`] once per tick and
@@ -777,11 +780,7 @@ impl BlockWaiters {
     /// loop already shut down — the caller then answers the
     /// timeout-shaped result immediately rather than queueing more
     /// waiter state.
-    pub(crate) fn register(
-        &self,
-        check: Box<dyn Fn(&Chainstate) -> bool + Send>,
-        wake: mpsc::SyncSender<()>,
-    ) -> bool {
+    pub(crate) fn register(&self, check: WaiterCheck, wake: mpsc::SyncSender<()>) -> bool {
         if self.shutdown.load(Ordering::Relaxed) {
             return false;
         }
@@ -796,12 +795,12 @@ impl BlockWaiters {
 
     /// Sync-loop hook, once per tick: fires and drops every waiter
     /// whose predicate now holds against the live chainstate.
-    pub fn notify(&self, cs: &Chainstate) {
+    pub fn notify(&self, cs: &Chainstate, mp: &avila_mempool::Mempool) {
         let Ok(mut pending) = self.pending.lock() else {
             return;
         };
         pending.retain(|w| {
-            if (w.check)(cs) {
+            if (w.check)(cs, mp) {
                 let _ = w.wake.try_send(());
                 false
             } else {
@@ -2102,8 +2101,9 @@ fn block_wait(
     };
     let (wake_tx, wake_rx) = mpsc::sync_channel(1);
     let registry = Arc::clone(waiters);
-    let (reg, reg_err) = chain_query(queries, move |cs, _| {
-        let satisfied = check(cs) || !registry.register(Box::new(check), wake_tx);
+    let (reg, reg_err) = chain_query(queries, move |cs, _mgr| {
+        let satisfied =
+            check(cs) || !registry.register(Box::new(move |cs2, _mp| check(cs2)), wake_tx);
         Ok(json!({"tip": wait_tip_result(cs), "waiting": !satisfied}))
     });
     if let Some(err) = reg_err {
@@ -16042,24 +16042,25 @@ mod tests {
     #[test]
     fn block_waiters_notify_and_shutdown() {
         let cs = Chainstate::new(&Network::Regtest.params());
+        let mp = avila_mempool::Mempool::new();
         let waiters = BlockWaiters::new();
 
         // A false predicate stays parked; a true one fires.
         let (tx, rx) = mpsc::sync_channel(1);
-        assert!(waiters.register(Box::new(|_| false), tx));
-        waiters.notify(&cs);
+        assert!(waiters.register(Box::new(|_, _| false), tx));
+        waiters.notify(&cs, &mp);
         assert!(rx.try_recv().is_err());
         let (tx, rx) = mpsc::sync_channel(1);
-        assert!(waiters.register(Box::new(|_| true), tx));
-        waiters.notify(&cs);
+        assert!(waiters.register(Box::new(|_, _| true), tx));
+        waiters.notify(&cs, &mp);
         assert!(rx.try_recv().is_ok());
 
         // The un-fired waiter and a fresh one both wake on shutdown.
         let (tx, rx) = mpsc::sync_channel(1);
-        assert!(waiters.register(Box::new(|_| false), tx));
+        assert!(waiters.register(Box::new(|_, _| false), tx));
         waiters.shutdown();
         assert!(rx.try_recv().is_ok());
-        assert!(!waiters.register(Box::new(|_| true), mpsc::sync_channel(1).0));
+        assert!(!waiters.register(Box::new(|_, _| true), mpsc::sync_channel(1).0));
     }
 
     /// `getchaintxstats` — on the genesis-only fixture every window

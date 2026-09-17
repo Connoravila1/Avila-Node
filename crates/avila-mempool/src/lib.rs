@@ -263,6 +263,9 @@ pub struct Mempool {
     /// `m_unbroadcast_txids`, cleared when a peer's getdata asks for
     /// the tx or the entry leaves the pool.
     unbroadcast: HashSet<Txid>,
+    /// Bumps on every membership change — subscription checks compare
+    /// it to skip recomputing when the pool hasn't moved.
+    epoch: u64,
 }
 
 impl Mempool {
@@ -282,6 +285,7 @@ impl Mempool {
             estimator: FeeEstimator::new(),
             deltas: HashMap::new(),
             unbroadcast: HashSet::new(),
+            epoch: 0,
         }
     }
 
@@ -899,6 +903,7 @@ impl Mempool {
         }
         self.wtxids.insert(tx.wtxid(), txid);
         self.pool_bytes += tx.encode().len();
+        self.epoch += 1;
         self.map.insert(
             txid,
             MempoolEntry {
@@ -1232,6 +1237,7 @@ impl Mempool {
     /// Drops `txid` and unindexes its input spends.
     pub fn remove(&mut self, txid: &Txid) -> Option<MempoolEntry> {
         let entry = self.map.remove(txid)?;
+        self.epoch += 1;
         self.unbroadcast.remove(txid);
         self.wtxids.remove(&entry.tx.wtxid());
         self.pool_bytes = self.pool_bytes.saturating_sub(entry.tx.encode().len());

@@ -457,7 +457,7 @@ pub fn run(
         // satisfies — the loop's half of Core's BlockConnected
         // notifications.
         if let Some(waiters) = &cfg.waiters {
-            waiters.notify(&cs);
+            waiters.notify(&cs, mgr.mempool());
         }
         progress(&snapshot);
         if run_progress >= cfg.target_height {

@@ -128,22 +128,25 @@ fn status_hash(entries: &[(i64, String)]) -> Option<String> {
 /// parent-confirmed rule). `None` when the index is off.
 fn history_entries(
     cs: &Chainstate,
-    mgr: &mut PeerManager<TcpStream>,
+    mp: &avila_mempool::Mempool,
     sh: &[u8; 32],
 ) -> Option<Vec<(i64, String)>> {
+    if !cs.scripthash_index_enabled() {
+        return None;
+    }
     let mut out: Vec<(i64, String)> = cs
-        .scripthash_history(sh)?
+        .scripthash_history(sh)
+        .unwrap_or(&[])
         .iter()
         .map(|(h, _pos, txid)| (i64::from(*h), txid.to_string()))
         .collect();
     out.sort_by_key(|(h, _)| *h);
     // Mempool: every tx creating an output to the script, or spending
     // a tracked outpoint. Height -1 when any parent is unconfirmed.
-    let mempool: Vec<Transaction> = mgr
-        .mempool()
+    let mempool: Vec<Transaction> = mp
         .txids()
         .iter()
-        .filter_map(|t| mgr.mempool().get(t).cloned())
+        .filter_map(|t| mp.get(t).cloned())
         .collect();
     let mempool_ids: std::collections::HashSet<Txid> = mempool.iter().map(|t| t.txid()).collect();
     let mut seen: std::collections::HashSet<Txid> =
@@ -296,7 +299,7 @@ fn full_status(queries: &QuerySender, sh: &[u8; 32]) -> Option<String> {
     let sh2 = *sh;
     let (query, rx) = crate::rpc::ChainQuery::new(move |cs, mgr| {
         Ok(json!(status_hash(
-            &history_entries(cs, mgr, &sh2).unwrap_or_default()
+            &history_entries(cs, mgr.mempool(), &sh2).unwrap_or_default()
         )))
     });
     if queries.send(query).is_err() {
@@ -386,20 +389,11 @@ fn reregister_script(
 ) {
     let cell = cell.clone();
     waiters.register(
-        Box::new(move |cs: &Chainstate| {
-            // The check runs inside notify()'s lock — compute the
-            // confirmed history only (mempool needs the manager, which
-            // the predicate can't reach); mempool txs flip the status
-            // on the next block, a documented first-slice gap.
-            let mut entries: Vec<(i64, String)> = cs
-                .scripthash_history(&sh)
-                .map(|hist| {
-                    hist.iter()
-                        .map(|(h, _p, t)| (i64::from(*h), t.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            entries.sort_by_key(|(h, _)| *h);
+        Box::new(move |cs: &Chainstate, mp: &avila_mempool::Mempool| {
+            // The full Electrum status — confirmed history plus
+            // mempool rows — so a mempool tx touching the script fires
+            // the subscription without waiting for a block.
+            let entries = history_entries(cs, mp, &sh).unwrap_or_default();
             let new = status_hash(&entries);
             let Ok(mut c) = cell.lock() else {
                 return false;
@@ -423,7 +417,7 @@ fn reregister_headers(
 ) {
     let cell = cell.clone();
     waiters.register(
-        Box::new(move |cs: &Chainstate| {
+        Box::new(move |cs: &Chainstate, _mp: &avila_mempool::Mempool| {
             let tip = cs.tip_hash();
             let height = cs.chain().len() as i64 - 1;
             let hex_hdr = cs
@@ -579,7 +573,7 @@ fn dispatch(
             // the first tick can't re-notify a status already sent.
             let out = chain_value(queries, id, move |cs, mgr, id: Value| {
                 let id = &id;
-                let entries = history_entries(cs, mgr, &sh).unwrap_or_default();
+                let entries = history_entries(cs, mgr.mempool(), &sh).unwrap_or_default();
                 let status = status_hash(&entries);
                 // The check compares confirmed history only — seed that
                 // basis separately so mempool entries can't fake a change.
@@ -703,7 +697,7 @@ fn dispatch(
             let mempool_only = method.ends_with("get_mempool");
             chain_value(queries, id, move |cs, mgr, id: Value| {
                 let id = &id;
-                let Some(entries) = history_entries(cs, mgr, &sh) else {
+                let Some(entries) = history_entries(cs, mgr.mempool(), &sh) else {
                     return reply_err(
                         id,
                         1,
@@ -1073,7 +1067,7 @@ mod tests {
             loop {
                 match qrx.recv_timeout(Duration::from_millis(50)) {
                     Ok(q) => q.answer(&mut cs, &mut mgr, &mut rescans),
-                    Err(mpsc::RecvTimeoutError::Timeout) => waiters2.notify(&cs),
+                    Err(mpsc::RecvTimeoutError::Timeout) => waiters2.notify(&cs, mgr.mempool()),
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
@@ -1150,6 +1144,148 @@ mod tests {
         let r = read(&mut rd);
         assert_eq!(r["result"]["height"], 1);
 
+        cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// A mempool tx paying a subscribed script must fire the
+    /// subscription without waiting for a block — the check sees the
+    /// pool, not just the chainstate.
+    #[test]
+    fn mempool_tx_fires_scripthash_subscription() {
+        let params = Network::Regtest.params();
+        let mut cs = Chainstate::new(&params);
+        cs.enable_scripthashindex(None).unwrap();
+        let b1 = block_on(&params.genesis_header, vec![cb(1)], &params);
+        cs.accept_block(&b1, 1_700_000_000).unwrap();
+        // Mature the spend source — 100-block coinbase maturity.
+        let mut parent = b1.header;
+        for h in 2..=101u32 {
+            let b = block_on(&parent, vec![cb(h)], &params);
+            cs.accept_block(&b, 1_700_000_000 + h).unwrap();
+            parent = b.header;
+        }
+        let (qtx, qrx) = mpsc::channel::<crate::rpc::ChainQuery>();
+        let waiters = Arc::new(BlockWaiters::new());
+        let waiters2 = waiters.clone();
+        let mut mgr = PeerManager::new(4);
+        let mut rescans = std::collections::VecDeque::new();
+        thread::spawn(move || {
+            loop {
+                match qrx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(q) => q.answer(&mut cs, &mut mgr, &mut rescans),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        waiters2.notify(&cs, mgr.mempool());
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+
+        let status: SharedStatus = Arc::new(RwLock::new(SyncProgress {
+            peers: 0,
+            connected_height: 1,
+            header_height: 1,
+            in_flight: 0,
+            established_total: 0,
+            disconnects: 0,
+            recent: Vec::new(),
+            peer_details: Vec::new(),
+            mempool: (0, 0, None),
+            elapsed_secs: 0,
+        }));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (qtx2, waiters3, status2, cancel2) =
+            (qtx.clone(), waiters.clone(), status.clone(), cancel.clone());
+        thread::spawn(move || {
+            while !cancel2.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((s, _)) => {
+                        let q = qtx2.clone();
+                        let w = waiters3.clone();
+                        let st = status2.clone();
+                        let c = cancel2.clone();
+                        thread::spawn(move || handle(s, q, w, st, c));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let conn = TcpStream::connect(addr).unwrap();
+        let mut wr = conn.try_clone().unwrap();
+        let mut send = |v: Value| {
+            wr.write_all(format!("{}\n", serde_json::to_string(&v).unwrap()).as_bytes())
+                .unwrap();
+        };
+        let mut rd = BufReader::new(conn);
+        rd.get_ref()
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let read = |rd: &mut BufReader<TcpStream>| -> Value {
+            let mut line = String::new();
+            rd.read_line(&mut line).unwrap();
+            serde_json::from_str(&line).unwrap()
+        };
+
+        // Subscribe to a fresh script — no history yet.
+        let watch_spk = vec![0x51u8, 0x02];
+        let watch_sh = sha256(&watch_spk);
+        send(
+            json!({"jsonrpc":"2.0","id":1,"method":"blockchain.scripthash.subscribe","params":[hex::encode(&watch_sh)]}),
+        );
+        let r = read(&mut rd);
+        assert!(r["result"].is_null(), "fresh script: {r}");
+
+        // Inject a mempool tx paying it — through the query channel so
+        // the pool mutation lands inside the notify loop's mgr.
+        let mtx = Transaction {
+            version: 2,
+            inputs: vec![avila_consensus::transaction::TxIn {
+                previous_output: OutPoint {
+                    txid: b1.transactions[0].txid(),
+                    vout: 0,
+                },
+                script_sig: Script::new(vec![]),
+                sequence: SEQUENCE_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: vec![avila_consensus::transaction::TxOut {
+                value: 1_000,
+                script_pubkey: Script::new(watch_spk.clone()),
+            }],
+            lock_time: 0,
+        };
+        let (q, rx2) = crate::rpc::ChainQuery::new(move |cs, mgr| {
+            mgr.mempool()
+                .accept_tx(mtx, cs, 1_700_000_100)
+                .unwrap_or_else(|e| panic!("mature coinbase spend must accept: {e:?}"));
+            Ok(serde_json::json!(null))
+        });
+        qtx.send(q).unwrap();
+        let _ = rx2.recv();
+
+        // The next notify tick must flip the status and push.
+        let mut got_push = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let mut line = String::new();
+            if rd.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let m: Value = serde_json::from_str(&line).unwrap();
+            if m["method"] == "blockchain.scripthash.subscribe" {
+                assert!(m["params"][1].is_string(), "push: {m}");
+                got_push = true;
+                break;
+            }
+        }
+        assert!(got_push, "mempool tx must fire the subscription");
         cancel.store(true, Ordering::Relaxed);
     }
 }
