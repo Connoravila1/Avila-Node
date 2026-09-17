@@ -47,6 +47,9 @@ pub struct SyncConfig {
     /// are dialed with BIP324 first, falling back to v1 when the peer
     /// answers in cleartext.
     pub v2transport: bool,
+    /// `--electrum addr`: bind the Electrum-protocol server there and
+    /// maintain the scripthash index (`scindex.dat`) it serves from.
+    pub electrum: Option<SocketAddr>,
     /// When set, publish each tick's progress into this snapshot so a
     /// query surface (RPC, GUI) can read it without blocking sync.
     pub status: Option<crate::rpc::SharedStatus>,
@@ -77,6 +80,7 @@ impl Default for SyncConfig {
             txindex: false,
             blockfilterindex: false,
             v2transport: true,
+            electrum: None,
             status: None,
             queries: None,
             waiters: None,
@@ -176,6 +180,10 @@ pub fn run(
     }
     if cfg.blockfilterindex {
         cs.enable_blockfilterindex(cfg.data_dir.as_deref())
+            .map_err(SyncError::Store)?;
+    }
+    if cfg.electrum.is_some() {
+        cs.enable_scripthashindex(cfg.data_dir.as_deref())
             .map_err(SyncError::Store)?;
     }
     let resumed_height = cs.chain().len() as u32 - 1;

@@ -5,6 +5,7 @@
 //! Live peer sync is available through [`sync::run`].
 
 pub mod config;
+pub mod electrum;
 pub mod events;
 pub mod rpc;
 pub mod sync;

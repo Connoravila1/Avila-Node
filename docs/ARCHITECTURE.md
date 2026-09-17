@@ -93,7 +93,10 @@ projects intact; the verification harness would need its fixtures and tools,
 which are committed alongside it.
 
 Track the active chain, fully validated history, snapshot assumptions, index coverage
-and connection freshness independently. The distinction between active and background
+and connection freshness independently. Optional indexes live beside the chainstate —
+`txindex.dat`, `cfilters.dat` (BIP158) and `scindex.dat` (scripthash, for the
+Electrum server) — each a resumable append log that rewinds with reorgs and
+backfills from retained bodies on first enable. The distinction between active and background
 chainstates is illustrated by [Core's AssumeUTXO design](https://github.com/bitcoin/bitcoin/blob/master/doc/design/assumeutxo.md).
 Avila has not implemented snapshot bootstrapping.
 

@@ -66,7 +66,25 @@ pub struct ChainQuery {
 }
 
 impl ChainQuery {
-    /// Executes the query against the live node state and delivers the
+    /// A query for non-RPC consumers (the Electrum server drives the
+    /// same channel rather than duplicating chainstate access).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn new(
+        f: impl FnOnce(&mut Chainstate, &mut PeerManager<TcpStream>) -> Result<Value, (i64, String)>
+        + Send
+        + 'static,
+    ) -> (Self, mpsc::Receiver<Result<Value, (i64, String)>>) {
+        let (reply, rx) = mpsc::channel();
+        (
+            Self {
+                run: Box::new(f),
+                reply,
+            },
+            rx,
+        )
+    }
+
+    /// Executes the query against the live chainstate and delivers the
     /// answer. Called by the sync loop; a dropped receiver just means the
     /// caller gave up waiting.
     pub fn answer(self, cs: &mut Chainstate, mgr: &mut PeerManager<TcpStream>) {
@@ -713,7 +731,7 @@ impl BlockWaiters {
     /// loop already shut down — the caller then answers the
     /// timeout-shaped result immediately rather than queueing more
     /// waiter state.
-    fn register(
+    pub(crate) fn register(
         &self,
         check: Box<dyn Fn(&Chainstate) -> bool + Send>,
         wake: mpsc::SyncSender<()>,
@@ -4712,7 +4730,7 @@ fn build_raw_tx(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch(
+pub(crate) fn dispatch(
     method: &str,
     params: &Value,
     snap: &SyncProgress,

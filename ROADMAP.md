@@ -515,7 +515,24 @@ operation. Compare complete initial download and catch-up, not only local replay
   (watchonly bucket + `lastprocessedblock`) and `rescanblockchain`
   complete the surface — verified live against Core 29.4 (import,
   rescan, spend, reorg and restart-reload all matching).
-- [ ] Deliver Electrum/compact-filter services with tested clients and explicit index coverage.
+- [x] Electrum-protocol service (first slice): `--electrum` binds a
+      line-delimited JSON-RPC-over-TCP server (`electrum.rs`) backed by
+      a persistent scripthash index (`scindex.dat`) that records every
+      touched scriptPubKey — created outputs and spent prevouts —
+      under `ScripthashIndex` in chainstate, wired at connect and
+      rewound on reorg. `server.version`/`features`/`ping`/`banner`,
+      `blockchain.headers.subscribe`/`block.header(s)`, scripthash
+      `get_history`/`get_balance`/`listunspent`/`subscribe`,
+      `transaction.get`/`get_merkle`/`broadcast`,
+      `mempool.get_fee_histogram` and `blockchain.relayfee` are all
+      answered through the sync loop's chain-query channel — no direct
+      chainstate access — and subscriptions push exactly-once
+      notifications on each new tip (verified live: header +
+      status-hash pushes on block connect, spec-exact status hash
+      `sha256("txid:height:"…)`). Electrum-protocol negotiation,
+      persistent-connection quirks and richer mempool-status updates
+      remain open.
+- [ ] Compact-filter service surface (BIP157/158 serving + tested clients).
 - [x] Pruned operation (first slice): `BlockStore::prune_to_bytes`
       deletes the oldest blk files past a byte budget (never the tail);
       `have_body` reports pruned bodies absent so sync refetches them,

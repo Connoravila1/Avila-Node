@@ -195,6 +195,10 @@ pub struct Chainstate {
     /// unless [`Chainstate::enable_blockfilterindex`] ran; indexed at
     /// connect time so spent-prevout scripts come from the undo data.
     filterindex: Option<FilterIndex>,
+    /// Electrum-style scripthash index — scriptPubKey-hash →
+    /// `(height, position, txid)` history. `None` unless
+    /// [`Chainstate::enable_scripthashindex`] ran.
+    scripthashindex: Option<ScripthashIndex>,
     /// `preciousblock` — the block that wins equal-work tie-breaks.
     /// Core implements it as the lowest `nSequenceId` (reception order
     /// settles work ties); a later call overrides the earlier one, and
@@ -471,6 +475,253 @@ impl FilterIndex {
     }
 }
 
+/// The scripthash index behind `--electrum`: for every connected
+/// block, every scriptPubKey each transaction creates *or* spends is
+/// hashed (Electrum's `SHA256(scriptPubKey)`) and mapped to
+/// `(height, tx position, txid)` — the history list `get_history`,
+/// `get_balance` and `listunspent` serve. Spent-script hashes come
+/// from the block's undo record, like the filter index.
+///
+/// Entries for a disconnected block are unwound through `by_height`
+/// (per-height tx → touched-scripts records). Persistence is an
+/// append log: connect records replay, `D` records apply rewinds, and
+/// a partial tail is cut back like the blk store's.
+pub struct ScripthashIndex {
+    /// script hash → history entries, append-ordered by connect.
+    by_script: HashMap<[u8; 32], Vec<(u32, u16, Txid)>>,
+    /// height → every tx and the script hashes it touched (for
+    /// disconnect rewinds).
+    /// One connected block's record: per tx, the touched script
+    /// hashes — the disconnect rewind list.
+    by_height: BTreeMap<u32, BlockScripts>,
+    /// The open append handle for `scindex.dat`, when persistence is on.
+    log: Option<std::fs::File>,
+}
+
+/// Per-block touched-script records for the scripthash index:
+/// `(txid, script hashes)` pairs in block order.
+type BlockScripts = Vec<(Txid, Vec<[u8; 32]>)>;
+
+impl ScripthashIndex {
+    const MAGIC: &'static [u8; 8] = b"scidx\x01\x00\x00";
+
+    fn empty() -> Self {
+        Self {
+            by_script: HashMap::new(),
+            by_height: BTreeMap::new(),
+            log: None,
+        }
+    }
+
+    /// Loads `dir/scindex.dat` and opens it for append. `C` records
+    /// replay connects (an overwritten height is first rewound), `D`
+    /// records replay disconnects, and a partial tail is cut back.
+    fn open(dir: &Path) -> std::io::Result<Self> {
+        use std::io::{Read, Write};
+        let path = dir.join("scindex.dat");
+        let mut idx = Self::empty();
+        let mut committed = Self::MAGIC.len() as u64;
+        let mut ok = false;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf)?;
+            if buf.len() >= 8 && buf[..8] == *Self::MAGIC {
+                let mut cursor = Self::MAGIC.len();
+                while cursor + 7 <= buf.len() {
+                    let height =
+                        u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap_or_default());
+                    match buf[cursor + 4] {
+                        b'D' => {
+                            idx.disconnect(height);
+                            cursor += 5;
+                        }
+                        b'C' => {
+                            let ntx = u16::from_le_bytes(
+                                buf[cursor + 5..cursor + 7].try_into().unwrap_or_default(),
+                            ) as usize;
+                            let mut recs = Vec::with_capacity(ntx);
+                            let mut p = cursor + 7;
+                            let mut whole = true;
+                            for _ in 0..ntx {
+                                if p + 34 > buf.len() {
+                                    whole = false;
+                                    break;
+                                }
+                                let mut txid = [0u8; 32];
+                                txid.copy_from_slice(&buf[p..p + 32]);
+                                let nsh = u16::from_le_bytes(
+                                    buf[p + 32..p + 34].try_into().unwrap_or_default(),
+                                ) as usize;
+                                p += 34;
+                                if p + 32 * nsh > buf.len() {
+                                    whole = false;
+                                    break;
+                                }
+                                let mut scripts = Vec::with_capacity(nsh);
+                                for _ in 0..nsh {
+                                    let mut sh = [0u8; 32];
+                                    sh.copy_from_slice(&buf[p..p + 32]);
+                                    scripts.push(sh);
+                                    p += 32;
+                                }
+                                recs.push((Txid::from_bytes(txid), scripts));
+                            }
+                            if !whole {
+                                break;
+                            }
+                            idx.apply_connect(height, &recs);
+                            cursor = p;
+                        }
+                        _ => break, // unknown record — treat as torn
+                    }
+                }
+                committed = cursor as u64;
+                ok = true;
+            }
+            // A partial tail is torn write — cut it.
+            if f.metadata()?.len() != committed {
+                f.set_len(committed)?;
+            }
+            idx.log = Some(f);
+            let _ = ok;
+        } else {
+            idx.log = Some(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&path)?,
+            );
+            if let Some(log) = &mut idx.log {
+                log.write_all(Self::MAGIC)?;
+            }
+        }
+        Ok(idx)
+    }
+
+    /// Applies one block's touched-script records — shared by log
+    /// replay and the live connect path.
+    fn apply_connect(&mut self, height: u32, recs: &BlockScripts) {
+        if let Some(old) = self.by_height.remove(&height) {
+            for (_txid, scripts) in old {
+                for sh in scripts {
+                    Self::unwind(&mut self.by_script, &sh, height);
+                }
+            }
+        }
+        for (pos, (txid, scripts)) in recs.iter().enumerate() {
+            for sh in scripts {
+                self.by_script
+                    .entry(*sh)
+                    .or_default()
+                    .push((height, pos as u16, *txid));
+            }
+        }
+        self.by_height.insert(height, recs.to_vec());
+    }
+
+    /// Indexes `block`'s touched scriptPubKeys at `height` — created
+    /// outputs from the block, spent prevouts' scripts from `undo`.
+    fn append(&mut self, height: u32, block: &Block, undo: &BlockUndo) {
+        // `apply_connect` already unwinds prior entries at this height.
+        let mut recs: BlockScripts = Vec::with_capacity(block.transactions.len());
+        for (i, tx) in block.transactions.iter().enumerate() {
+            let mut scripts: Vec<[u8; 32]> = Vec::new();
+            for out in &tx.outputs {
+                scripts.push(crate::hash::sha256(out.script_pubkey.as_bytes()));
+            }
+            if let Some(u) = undo.txs.get(i) {
+                for coin in &u.spent {
+                    scripts.push(crate::hash::sha256(coin.out.script_pubkey.as_bytes()));
+                }
+                for (_, coin) in &u.overwritten {
+                    scripts.push(crate::hash::sha256(coin.out.script_pubkey.as_bytes()));
+                }
+            }
+            scripts.sort_unstable();
+            scripts.dedup();
+            recs.push((tx.txid(), scripts));
+        }
+        self.apply_connect(height, &recs);
+        if let Some(log) = &mut self.log {
+            use std::io::Write;
+            let mut rec = Vec::new();
+            rec.extend_from_slice(&height.to_le_bytes());
+            rec.push(b'C');
+            rec.extend_from_slice(&(recs.len() as u16).to_le_bytes());
+            for (txid, scripts) in &recs {
+                rec.extend_from_slice(txid.as_bytes());
+                rec.extend_from_slice(&(scripts.len() as u16).to_le_bytes());
+                for sh in scripts {
+                    rec.extend_from_slice(sh);
+                }
+            }
+            let _ = log.write_all(&rec);
+        }
+    }
+
+    /// Removes the tail entries a disconnect orphaned — history
+    /// vectors are append-ordered by connect, so every entry at
+    /// `height` is a suffix pop.
+    fn unwind(
+        by_script: &mut HashMap<[u8; 32], Vec<(u32, u16, Txid)>>,
+        sh: &[u8; 32],
+        height: u32,
+    ) {
+        if let Some(entries) = by_script.get_mut(sh) {
+            while entries.last().is_some_and(|(h, _, _)| *h == height) {
+                entries.pop();
+            }
+            if entries.is_empty() {
+                by_script.remove(sh);
+            }
+        }
+    }
+
+    /// The disconnect half of a reorg — drops every entry recorded at
+    /// `height`.
+    fn disconnect(&mut self, height: u32) {
+        if let Some(recs) = self.by_height.remove(&height) {
+            for (_txid, scripts) in recs {
+                for sh in scripts {
+                    Self::unwind(&mut self.by_script, &sh, height);
+                }
+            }
+        }
+        if let Some(log) = &mut self.log {
+            use std::io::Write;
+            let mut rec = Vec::with_capacity(5);
+            rec.extend_from_slice(&height.to_le_bytes());
+            rec.push(b'D');
+            let _ = log.write_all(&rec);
+        }
+    }
+
+    /// `loadtxoutset` rewinds: heights below the snapshot base have no
+    /// bodies and no history to serve — the snapshot chainstate begins
+    /// with an empty index, like Core's.
+    fn reset_to_snapshot(&mut self) {
+        // A rewind record per abandoned height keeps replays
+        // consistent; the log is small and this path is rare.
+        let heights: Vec<u32> = self.by_height.keys().copied().collect();
+        self.by_script.clear();
+        self.by_height.clear();
+        if let Some(log) = &mut self.log {
+            use std::io::Write;
+            for h in heights {
+                let mut rec = Vec::with_capacity(5);
+                rec.extend_from_slice(&h.to_le_bytes());
+                rec.push(b'D');
+                let _ = log.write_all(&rec);
+            }
+        }
+    }
+}
+
 impl Chainstate {
     /// A chainstate at genesis on `params`' network — the state Core reaches at
     /// startup with an empty datadir (the genesis is in the block index and is
@@ -488,6 +739,7 @@ impl Chainstate {
             undos: Vec::new(),
             store: None,
             txindex: None,
+            scripthashindex: None,
             filterindex: None,
             precious: None,
             snapshot_base: None,
@@ -567,6 +819,52 @@ impl Chainstate {
         }
         self.filterindex = Some(index);
         Ok(())
+    }
+
+    /// Turns on the Electrum scripthash index (`--electrum`). With
+    /// `dir` the index persists as `scindex.dat` — an append log of
+    /// connect/disconnect records a restart replays, backfilling only
+    /// blocks never logged.
+    ///
+    /// # Errors
+    ///
+    /// `io::Error` when `dir` is given but `scindex.dat` cannot be
+    /// read or opened for append.
+    pub fn enable_scripthashindex(&mut self, dir: Option<&Path>) -> std::io::Result<()> {
+        let mut index = match dir {
+            Some(dir) => ScripthashIndex::open(dir)?,
+            None => ScripthashIndex::empty(),
+        };
+        for h in 0..self.chain.len() as u32 {
+            if index.by_height.contains_key(&h) {
+                continue;
+            }
+            let hash = self.chain[h as usize];
+            let Some(block) = self.body(&hash) else {
+                continue;
+            };
+            let empty = BlockUndo::default();
+            let undo = self.undo(h).unwrap_or(&empty);
+            index.append(h, &block, undo);
+        }
+        self.scripthashindex = Some(index);
+        Ok(())
+    }
+
+    /// The Electrum history list for `script_hash`
+    /// (`SHA256(scriptPubKey)`): `(height, tx position, txid)`
+    /// entries in connect order. `None` when the index is disabled.
+    pub fn scripthash_history(&self, script_hash: &[u8; 32]) -> Option<&[(u32, u16, Txid)]> {
+        self.scripthashindex
+            .as_ref()?
+            .by_script
+            .get(script_hash)
+            .map(Vec::as_slice)
+    }
+
+    /// Whether the scripthash index is enabled.
+    pub fn scripthash_index_enabled(&self) -> bool {
+        self.scripthashindex.is_some()
     }
 
     /// Whether `-blockfilterindex` is active — `getindexinfo` reports
@@ -780,6 +1078,9 @@ impl Chainstate {
         // append chains its header off nothing (Core's snapshot
         // chainstate starts with an empty index).
         if let Some(index) = &mut self.filterindex {
+            index.reset_to_snapshot();
+        }
+        if let Some(index) = &mut self.scripthashindex {
             index.reset_to_snapshot();
         }
         // The assumed state must be durable before the call returns —
@@ -1467,6 +1768,9 @@ impl Chainstate {
                     if let Some(index) = &mut self.filterindex {
                         index.append(height, block, &undo);
                     }
+                    if let Some(index) = &mut self.scripthashindex {
+                        index.append(height, block, &undo);
+                    }
                     self.chain.push(hash);
                     self.undos.push(undo);
                     self.connected = hash;
@@ -1630,10 +1934,22 @@ impl Chainstate {
                 index.disconnect(h);
             }
         }
+        if let Some(index) = &mut self.scripthashindex {
+            for h in (fork_height + 1..=old_tip_height).rev() {
+                index.disconnect(h);
+            }
+        }
         self.chain.truncate(fork_height as usize + 1);
         self.undos.truncate(fork_height as usize);
         let bodies: Vec<Option<Block>> = branch_hashes.iter().map(|bh| self.body(bh)).collect();
         if let Some(index) = &mut self.filterindex {
+            for (i, (b, u)) in bodies.iter().zip(new_undos.iter()).enumerate() {
+                if let Some(b) = b {
+                    index.append(fork_height + 1 + i as u32, b, u);
+                }
+            }
+        }
+        if let Some(index) = &mut self.scripthashindex {
             for (i, (b, u)) in bodies.iter().zip(new_undos.iter()).enumerate() {
                 if let Some(b) = b {
                     index.append(fork_height + 1 + i as u32, b, u);
@@ -2694,6 +3010,113 @@ mod tests {
         assert!(cs.block_filter(1, &blocks[0].block_hash()).is_some());
         assert!(cs.block_filter(2, &blocks[1].block_hash()).is_some());
         assert!(cs.block_filter(3, &blocks[2].block_hash()).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The scripthash index records every touched scriptPubKey —
+    /// outputs from the block, spent scripts from the undo — and a
+    /// reorg rewinds the disconnected heights' entries.
+    #[test]
+    fn scripthashindex_records_spends_and_survives_reorgs() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        cs.enable_scripthashindex(None).unwrap();
+        assert!(cs.scripthash_index_enabled());
+
+        // Blocks 1..=100 (coinbase maturity), then h101 spends h1's
+        // coinbase to a fresh script.
+        let a1 = block_on(&genesis_header(), vec![coinbase_tx(1, subsidy(1))], &params);
+        let a1_spk = a1.transactions[0].outputs[0].script_pubkey.as_bytes();
+        let a1_sh = crate::hash::sha256(a1_spk);
+        cs.accept_block(&a1, NOW).unwrap();
+        assert_eq!(cs.scripthash_history(&a1_sh).unwrap().len(), 1);
+
+        let mut parent = a1.header;
+        for h in 2..=100u32 {
+            let b = block_on(&parent, vec![coinbase_tx(h, subsidy(h))], &params);
+            cs.accept_block(&b, NOW).unwrap();
+            parent = b.header;
+        }
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: a1.transactions[0].txid(),
+                    vout: 0,
+                },
+                script_sig: Script::new(vec![script::OP_1]),
+                sequence: SEQUENCE_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: subsidy(1) - 1000,
+                script_pubkey: Script::new(vec![script::OP_0, script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let spend_spk = spend.outputs[0].script_pubkey.as_bytes();
+        let spend_sh = crate::hash::sha256(spend_spk);
+        let a101 = block_on(
+            &parent,
+            vec![coinbase_tx(101, subsidy(101)), spend],
+            &params,
+        );
+        cs.accept_block(&a101, NOW).unwrap();
+        // The spend touched BOTH scripts: the spent prevout's (from
+        // undo) and the new output's. (`coinbase_tx` pays one fixed
+        // script, so a1's script also carries every coinbase.)
+        let h1_hist = cs.scripthash_history(&a1_sh).unwrap();
+        let spend_tx = a101.transactions[1].txid();
+        assert!(h1_hist.iter().any(|(h, _p, t)| *h == 101 && *t == spend_tx));
+        assert_eq!(cs.scripthash_history(&spend_sh).unwrap().len(), 1);
+
+        // A heavier branch on h100 orphans h101 — both entries unwind.
+        let mut fork_parent = parent;
+        for h in 101..=102u32 {
+            let b = block_on(
+                &fork_parent,
+                vec![tagged_coinbase(h, subsidy(h), script::OP_EQUAL)],
+                &params,
+            );
+            cs.accept_block(&b, NOW).unwrap();
+            fork_parent = b.header;
+        }
+        assert!(
+            !cs.scripthash_history(&a1_sh)
+                .unwrap()
+                .iter()
+                .any(|(h, _p, t)| *h == 101 && *t == spend_tx)
+        );
+        assert!(cs.scripthash_history(&spend_sh).is_none());
+    }
+
+    /// `scindex.dat` replays connects and disconnects across restarts
+    /// and cuts a torn tail like the other index logs.
+    #[test]
+    fn scripthashindex_persists_and_recovers() {
+        let params = params();
+        let dir = store_dir("scindex-restart");
+        let blocks = probe_chain(4, &[], &params);
+        let spk = blocks[0].transactions[0].outputs[0]
+            .script_pubkey
+            .as_bytes();
+        let sh = crate::hash::sha256(spk);
+
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        cs.enable_scripthashindex(Some(&dir)).unwrap();
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        drop(cs);
+
+        // Reload: h1's coinbase script replays its history entry.
+        let mut cs2 = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        cs2.enable_scripthashindex(Some(&dir)).unwrap();
+        let hist = cs2.scripthash_history(&sh).unwrap();
+        assert_eq!(hist.len(), 4);
+        assert_eq!(hist[0].0, 1);
+        assert_eq!(hist[3].0, 4);
+        drop(cs2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
     /// `loadtxoutset` end to end on regtest: a snapshot written by

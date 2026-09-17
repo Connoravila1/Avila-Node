@@ -58,6 +58,10 @@ enum Command {
         /// force cleartext.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         v2transport: bool,
+        /// Bind the Electrum-protocol server to this address
+        /// (e.g. 127.0.0.1:50001) and maintain the scripthash index.
+        #[arg(long)]
+        electrum: Option<SocketAddr>,
     },
     /// Sync headers and blocks from live peers (headers-first, full
     /// consensus validation). Bounded by target height and timeout.
@@ -144,6 +148,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             txindex,
             blockfilterindex,
             v2transport,
+            electrum,
         } => {
             // A real daemon: unbounded headers-first sync — sync to the
             // tip, then keep serving, relaying, and announcing until
@@ -201,7 +206,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 let _server = avila_node::rpc::serve(
                     addr,
                     status.clone(),
-                    Some(query_tx),
+                    Some(query_tx.clone()),
                     Some(waiters.clone()),
                     Some(scan.clone()),
                     Some(wallet),
@@ -213,6 +218,20 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     "RPC listening on http://{addr} (cookie auth: {}/.cookie)",
                     data_dir.display()
                 );
+                std::mem::forget(_server);
+            }
+            if let Some(addr) = electrum {
+                // The Electrum-protocol service — the scripthash index
+                // it serves is enabled in the sync config below.
+                let _server = avila_node::electrum::serve(
+                    addr,
+                    query_tx.clone(),
+                    waiters.clone(),
+                    status.clone(),
+                    cancel.clone(),
+                )
+                .map_err(|e| format!("electrum bind {addr}: {e}"))?;
+                println!("Electrum listening on {addr}");
                 std::mem::forget(_server);
             }
             let cfg = SyncConfig {
@@ -227,6 +246,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 txindex,
                 blockfilterindex,
                 v2transport,
+                electrum,
                 status: Some(status),
                 queries: Some(std::sync::Arc::new(std::sync::Mutex::new(query_rx))),
                 waiters: Some(waiters),
@@ -285,6 +305,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 txindex,
                 blockfilterindex,
                 v2transport,
+                electrum: None,
                 status: None,
                 queries: None,
                 waiters: None,
