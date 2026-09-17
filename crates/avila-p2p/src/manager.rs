@@ -271,6 +271,14 @@ pub struct PeerManager<S> {
     /// Core defaults to true since v26; `addnode`'s per-node flag
     /// overrides for manual peers.
     v2transport: bool,
+    /// Accepted sockets whose transport handshake finished — workers
+    /// send `(remote addr, session)` here; `drain_inbounds` admits
+    /// them on the tick like `maintain_outbounds` drains dials.
+    inbound_tx: std::sync::mpsc::Sender<(SocketAddr, DialOutcome)>,
+    inbound_rx: std::sync::mpsc::Receiver<(SocketAddr, DialOutcome)>,
+    /// Accept-side handshakes in flight — bounds the worker pool a
+    /// connect-flood could otherwise grow without limit.
+    pending_accepts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<S: Read + Write> PeerManager<S> {
@@ -278,6 +286,7 @@ impl<S: Read + Write> PeerManager<S> {
     #[must_use]
     pub fn new(max_peers: usize) -> Self {
         let dial_channel = std::sync::mpsc::channel();
+        let inbound_channel = std::sync::mpsc::channel();
         Self {
             peers: HashMap::new(),
             next_id: 0,
@@ -297,6 +306,9 @@ impl<S: Read + Write> PeerManager<S> {
             dial_tx: dial_channel.0,
             dial_rx: dial_channel.1,
             pending_dials: std::collections::HashSet::new(),
+            inbound_tx: inbound_channel.0,
+            inbound_rx: inbound_channel.1,
+            pending_accepts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             clock: wall_epoch,
             v2transport: true,
         }
@@ -440,10 +452,20 @@ impl<S: Read + Write> PeerManager<S> {
     /// `SelectNodeToEvict` behavior (outbound peers are never evicted
     /// to admit inbound).
     pub fn add_inbound(&mut self, session: PeerSession<S>) -> Option<u64> {
+        self.add_inbound_from(session, None)
+    }
+
+    /// `add_inbound` carrying the peer's socket address — the
+    /// listener knows it; `PeerSession` doesn't retain it.
+    pub fn add_inbound_from(
+        &mut self,
+        session: PeerSession<S>,
+        remote: Option<NetAddr>,
+    ) -> Option<u64> {
         if !self.has_slot() {
             self.evict_worst_inbound();
         }
-        self.add(session, None, true)
+        self.add(session, remote, true)
     }
 
     /// Registers an outbound session with a known remote address.
@@ -1329,6 +1351,53 @@ impl PeerManager<TcpStream> {
         Ok(self.add(session, Some(remote), false))
     }
 
+    /// Hand an accepted TCP socket to a handshake worker — the
+    /// listener (sync loop) calls this per `accept()`; the worker
+    /// detects the peer's transport and runs the responder-side
+    /// handshake off the tick, reporting through the inbound channel.
+    /// `MAX_PENDING_ACCEPTS` bounds the pool a connect-flood could
+    /// grow; a full queue just drops the socket.
+    pub fn accept_peer(
+        &mut self,
+        stream: TcpStream,
+        remote: SocketAddr,
+        magic: [u8; 4],
+        our_version: u64,
+        start_height: i32,
+    ) {
+        let pending = self.pending_accepts.clone();
+        if pending.load(std::sync::atomic::Ordering::Relaxed) >= MAX_PENDING_ACCEPTS {
+            return; // drop the socket — the caller closes it
+        }
+        let tx = self.inbound_tx.clone();
+        let remote_addr = crate::addrman::net_addr_of(remote, 0);
+        let version = build_version(our_version, start_height, remote_addr, (self.clock)());
+        let v2 = self.v2transport;
+        pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::thread::spawn(move || {
+            let outcome = accept_one(stream, magic, version, v2);
+            pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = tx.send((remote, outcome));
+        });
+    }
+
+    /// Admits every completed inbound handshake — ban check, then
+    /// `add_inbound`'s slot/eviction rules. Returns the admitted ids.
+    pub fn drain_inbounds(&mut self) -> Vec<u64> {
+        let mut admitted = Vec::new();
+        while let Ok((addr, result)) = self.inbound_rx.try_recv() {
+            let Ok(session) = result else { continue };
+            let remote = crate::addrman::net_addr_of(addr, 0);
+            if !self.network_active || self.bans.is_banned(&remote.ip, (self.clock)()) {
+                continue;
+            }
+            if let Some(id) = self.add_inbound_from(session, Some(remote)) {
+                admitted.push(id);
+            }
+        }
+        admitted
+    }
+
     /// Resolves `params.dns_seeds` into the address book — the bootstrap
     /// path for real networks (regtest ships no seeds). Returns how many
     /// addresses were learned. Blocking DNS; run before the tick loop.
@@ -1455,15 +1524,16 @@ impl PeerManager<TcpStream> {
             if self.is_banned(&candidate.ip, now) {
                 continue; // banned candidates aren't dialed
             }
+            // Already connected or dialing — Core's
+            // `AlreadyConnectedTo`/`FindNode` check; the book may
+            // still carry peers we established sessions with.
+            let sock = addrman::socket_addr(&candidate);
+            if self.connected_to(sock) || self.pending_dials.contains(&sock) {
+                continue;
+            }
             // Automatic outbounds use the `-v2transport` setting —
             // Core's `use_v2transport` on OpenNetworkConnection.
-            self.queue_dial(
-                addrman::socket_addr(&candidate),
-                self.v2transport,
-                magic,
-                start_height,
-                &mut dialed,
-            );
+            self.queue_dial(sock, self.v2transport, magic, start_height, &mut dialed);
         }
         dialed
     }
@@ -1520,6 +1590,81 @@ type DialOutcome = Result<PeerSession<TcpStream>, SessionError>;
 /// `V1Fallback` the socket is dropped and the peer redialed in v1 —
 /// Core's `ShouldReconnectV1` (a v1-only peer can't parse the
 /// ellswift bytes we already sent).
+/// Inbound handshakes in flight at once — past this cap the listener
+/// drops accepted sockets rather than queue unbounded workers.
+const MAX_PENDING_ACCEPTS: usize = 32;
+
+/// The v1 transport's fixed 16-byte prefix on the wire: network magic
+/// followed by the padded `version` command. An inbound peer sending
+/// anything else is attempting BIP324 — exactly Core's
+/// `Transport::ReceivedMessage` discriminator.
+fn v1_version_prefix(magic: [u8; 4]) -> [u8; 16] {
+    let mut p = [0u8; 16];
+    p[..4].copy_from_slice(&magic);
+    // The 12-byte command field: "version" + five NULs.
+    p[4..11].copy_from_slice(b"version");
+    p
+}
+
+/// Responder side of a fresh inbound connection: peek at the first
+/// bytes to pick the transport, run the matching handshake (blocking,
+/// bounded by `HANDSHAKE_TIMEOUT` on the socket), then return a
+/// nonblocking session for `add_inbound`. v1 peers fall through to
+/// `PeerSession::accept` — their bytes stay in the socket for the
+/// session's own decoder.
+fn accept_one(
+    mut stream: TcpStream,
+    magic: [u8; 4],
+    version: Version,
+    want_v2: bool,
+) -> DialOutcome {
+    stream.set_nodelay(true)?;
+    if !want_v2 {
+        stream.set_nonblocking(true)?;
+        return Ok(PeerSession::accept(
+            stream,
+            magic,
+            version,
+            SEND_BUDGET_PER_PEER,
+        ));
+    }
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    // Peek until the full discriminator arrives — TCP may fragment the
+    // peer's first write.
+    let mut probe = [0u8; 16];
+    let want = v1_version_prefix(magic);
+    loop {
+        let n = stream.peek(&mut probe)?;
+        if n >= 16 || probe[..n] != want[..n] {
+            break;
+        }
+    }
+    if probe == want {
+        stream.set_read_timeout(None)?;
+        stream.set_nonblocking(true)?;
+        return Ok(PeerSession::accept(
+            stream,
+            magic,
+            version,
+            SEND_BUDGET_PER_PEER,
+        ));
+    }
+    match crate::bip324::respond_handshake(&mut stream, magic) {
+        Ok(channel) => {
+            stream.set_read_timeout(None)?;
+            stream.set_nonblocking(true)?;
+            Ok(PeerSession::accept_v2_channel(
+                stream,
+                magic,
+                version,
+                SEND_BUDGET_PER_PEER,
+                channel,
+            ))
+        }
+        Err(e) => Err(SessionError::Io(e)),
+    }
+}
+
 fn dial(addr: SocketAddr, magic: [u8; 4], version: Version, want_v2: bool) -> DialOutcome {
     let stream = TcpStream::connect_timeout(&addr, DIAL_TIMEOUT)?;
     stream.set_nodelay(true)?;
@@ -2328,5 +2473,77 @@ mod tests {
         assert!(dialed.is_empty());
         assert!(mgr.pending_dials.is_empty());
         assert_eq!(mgr.len(), 0);
+    }
+
+    /// Inbound accept: a v1 client opens with the `version` message —
+    /// `accept_one` detects the prefix and leaves the bytes for the
+    /// session's own decoder; a BIP324 client gets the responder
+    /// handshake. Both land as inbound sessions via `accept_peer` +
+    /// `drain_inbounds`.
+    #[test]
+    fn inbound_accepts_v1_and_v2_peers() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let laddr = listener.local_addr().unwrap();
+        let mut mgr = PeerManager::<TcpStream>::new(8);
+        mgr.set_v2transport(true);
+
+        // v1 peer: send a real version message in cleartext.
+        let mut v1 = TcpStream::connect(laddr).unwrap();
+        let version = peer_version(0);
+        let frame = crate::codec::encode_frame(
+            MAGIC,
+            crate::codec::Command::new("version").unwrap(),
+            &crate::message::Message::Version(version).encode(),
+        );
+        v1.write_all(&frame).unwrap();
+
+        let (stream, remote) = listener.accept().unwrap();
+        mgr.accept_peer(stream, remote, MAGIC, 0, 0);
+
+        // v2 peer: run the initiator handshake over a real socket.
+        let mut v2 = TcpStream::connect(laddr).unwrap();
+        v2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        v2.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (stream2, remote2) = listener.accept().unwrap();
+        mgr.accept_peer(stream2, remote2, MAGIC, 0, 0);
+        // Drive the initiator handshake — the worker responds.
+        let chan = match crate::bip324::handshake(&mut v2, MAGIC).unwrap() {
+            crate::bip324::Handshake::V2(c, g) => crate::bip324::V2Channel::new(c, g),
+            crate::bip324::Handshake::V1Fallback => panic!("responder fell back to v1"),
+        };
+        let mut v2_session = PeerSession::initiate_v2_channel(
+            v2,
+            MAGIC,
+            peer_version(0),
+            SEND_BUDGET_PER_PEER,
+            chan,
+        )
+        .unwrap();
+        let _ = v2_session.flush();
+
+        // Both sessions land through drain_inbounds.
+        let mut admitted = Vec::new();
+        for _ in 0..60 {
+            admitted = mgr.drain_inbounds();
+            if admitted.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(mgr.len(), 2);
+        for snap in mgr.peer_snapshots() {
+            assert!(snap.inbound);
+        }
+        // The v2 session carries a session id; v1 reports none.
+        let protocols: Vec<&str> = mgr
+            .peer_snapshots()
+            .iter()
+            .map(|p| p.transport_protocol)
+            .collect();
+        assert!(protocols.contains(&"v2"));
+        assert!(protocols.contains(&"v1"));
     }
 }

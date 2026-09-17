@@ -797,6 +797,7 @@ impl AvilaApp {
             txindex: false,
             blockfilterindex: false,
             v2transport: true,
+            listen: None,
             electrum: None,
             prune_bytes: self
                 .sync

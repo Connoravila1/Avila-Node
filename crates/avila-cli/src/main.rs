@@ -58,6 +58,11 @@ enum Command {
         /// force cleartext.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         v2transport: bool,
+        /// Accept inbound peer connections on this address (Core's
+        /// -listen=<addr>). Inbound peers auto-negotiate v1 or BIP324
+        /// and join under the manager's slot/eviction rules.
+        #[arg(long)]
+        listen: Option<SocketAddr>,
         /// Bind the Electrum-protocol server to this address
         /// (e.g. 127.0.0.1:50001) and maintain the scripthash index.
         #[arg(long)]
@@ -148,6 +153,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             txindex,
             blockfilterindex,
             v2transport,
+            listen,
             electrum,
         } => {
             // A real daemon: unbounded headers-first sync — sync to the
@@ -246,6 +252,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 txindex,
                 blockfilterindex,
                 v2transport,
+                listen,
                 electrum,
                 status: Some(status),
                 queries: Some(std::sync::Arc::new(std::sync::Mutex::new(query_rx))),
@@ -305,6 +312,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 txindex,
                 blockfilterindex,
                 v2transport,
+                listen: None,
                 electrum: None,
                 status: None,
                 queries: None,

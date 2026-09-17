@@ -47,6 +47,12 @@ pub struct SyncConfig {
     /// are dialed with BIP324 first, falling back to v1 when the peer
     /// answers in cleartext.
     pub v2transport: bool,
+    /// `-listen=<addr>` — accept inbound peer connections on this
+    /// address. Each accepted socket runs its handshake on a bounded
+    /// worker (v1 or BIP324, auto-detected from the peer's first
+    /// bytes — Core's `Transport` discriminator) and joins through
+    /// `PeerManager::add_inbound`'s slot/eviction rules.
+    pub listen: Option<SocketAddr>,
     /// `--electrum addr`: bind the Electrum-protocol server there and
     /// maintain the scripthash index (`scindex.dat`) it serves from.
     pub electrum: Option<SocketAddr>,
@@ -80,6 +86,7 @@ impl Default for SyncConfig {
             txindex: false,
             blockfilterindex: false,
             v2transport: true,
+            listen: None,
             electrum: None,
             status: None,
             queries: None,
@@ -217,6 +224,17 @@ pub fn run(
         }
     }
     let seeded = mgr.seed_from_dns(params, unix_now());
+    // `-listen` — the inbound side of Core's `-listen=1`: a
+    // nonblocking accept each tick hands sockets to bounded handshake
+    // workers; completed sessions join via `drain_inbounds`.
+    let listener = match cfg.listen {
+        Some(addr) => {
+            let l = std::net::TcpListener::bind(addr).map_err(SyncError::Store)?;
+            l.set_nonblocking(true).map_err(SyncError::Store)?;
+            Some(l)
+        }
+        None => None,
+    };
     let mut dialed = 0usize;
     for addr in &cfg.connect {
         let attempted = match cfg.proxy {
@@ -292,6 +310,24 @@ pub fn run(
                 explicit: cfg.connect.len(),
             });
         }
+        // Inbound accepts: hand each new socket to a handshake worker,
+        // then admit whatever completed since the last tick.
+        if let Some(l) = &listener {
+            loop {
+                match l.accept() {
+                    Ok((stream, remote)) => mgr.accept_peer(
+                        stream,
+                        remote,
+                        params.message_start,
+                        0,
+                        cs.chain().len() as i32,
+                    ),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        mgr.drain_inbounds();
         for event in mgr.tick_net(&mut cs, unix_now(), params.message_start, 0) {
             match event {
                 NetEvent::Connected { .. } => established_total += 1,

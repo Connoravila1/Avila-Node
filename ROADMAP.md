@@ -125,6 +125,17 @@ Storage and synchronization research can use this implementation before P2P is r
       evicted for inbound slots. Cancellation is implicit: a stalled or
       evicted peer's reservations release and the fill pass reassigns
       them next tick.
+- [x] Inbound peering: `--listen` binds a nonblocking accept loop in
+      the sync tick; each socket runs its transport handshake on a
+      bounded worker (32 max) — v1 peers detected by the
+      `magic||"version"` prefix keep their bytes for the session
+      decoder, everything else gets the BIP324 responder handshake —
+      then `drain_inbounds` admits sessions under `add_inbound`'s
+      slot/eviction rules with ban checks. Verified live: Core 29.4
+      dialed us inbound over BIP324 (matching session ids both sides),
+      a v1 `peer_probe` completed headers + block fetch. Also fixed
+      the outbound dial loop re-dialing already-connected book
+      candidates (Core's `AlreadyConnectedTo` check).
 - [x] Exercised on all four networks: regtest (full sync + serve, both
       directions against Knots), and live mainnet / signet / testnet4
       runs via `examples/mainnet_probe` — DNS-seeded discovery, real
