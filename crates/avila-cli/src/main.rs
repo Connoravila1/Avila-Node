@@ -53,6 +53,10 @@ enum Command {
         /// -blockfilterindex) so getblockfilter/scanblocks serve.
         #[arg(long)]
         blockfilterindex: bool,
+        /// Serve BIP157 compact filters to peers (Core's
+        /// -peerblockfilters; requires --blockfilterindex).
+        #[arg(long)]
+        peerblockfilters: bool,
         /// Attempt BIP324 v2 transport on outbound peers (Core's
         /// -v2transport, default on). Pass --v2transport=false to
         /// force cleartext.
@@ -101,6 +105,10 @@ enum Command {
         /// -blockfilterindex) so getblockfilter/scanblocks serve.
         #[arg(long)]
         blockfilterindex: bool,
+        /// Serve BIP157 compact filters to peers (Core's
+        /// -peerblockfilters; requires --blockfilterindex).
+        #[arg(long)]
+        peerblockfilters: bool,
         /// Attempt BIP324 v2 transport on outbound peers (Core's
         /// -v2transport, default on).
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -152,6 +160,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             rpc,
             txindex,
             blockfilterindex,
+            peerblockfilters,
             v2transport,
             listen,
             electrum,
@@ -251,6 +260,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 prune_bytes: None,
                 txindex,
                 blockfilterindex,
+                peerblockfilters,
                 v2transport,
                 listen,
                 electrum,
@@ -289,6 +299,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             prune_mb,
             txindex,
             blockfilterindex,
+            peerblockfilters,
             v2transport,
         } => {
             use avila_consensus::params::Network as ConsensusNet;
@@ -311,6 +322,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 prune_bytes: prune_mb.map(|m| m * 1024 * 1024),
                 txindex,
                 blockfilterindex,
+                peerblockfilters,
                 v2transport,
                 listen: None,
                 electrum: None,

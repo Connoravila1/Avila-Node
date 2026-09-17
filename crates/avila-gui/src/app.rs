@@ -796,6 +796,7 @@ impl AvilaApp {
             waiters: None,
             txindex: false,
             blockfilterindex: false,
+            peerblockfilters: false,
             v2transport: true,
             listen: None,
             electrum: None,

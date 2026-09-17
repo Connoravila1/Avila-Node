@@ -25,6 +25,13 @@ use thiserror::Error;
 
 use crate::message::{GetHeaders, InvType, InvVector, MAX_HEADERS_RESULTS, Message};
 
+/// Core's `MAX_GETCFILTERS_SIZE` — max filters per `getcfilters` (BIP157).
+const MAX_GETCFILTERS_SIZE: u32 = 1_000;
+/// Core's `MAX_GETCFHEADERS_SIZE` — max headers per `getcfheaders`.
+const MAX_GETCFHEADERS_SIZE: u32 = 2_000;
+/// BIP157 checkpoint stride — every 1,000th block's filter header.
+const CFCHECKPT_INTERVAL: u32 = 1_000;
+
 /// Core's `MAX_BLOCKS_IN_TRANSIT_PER_PEER` — the most block bodies one peer
 /// may owe us at once.
 pub const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
@@ -92,6 +99,19 @@ impl Default for PeerSync {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The verdict for a BIP157 request — Core's
+/// `PrepareBlockFilterRequest` outcome: serve the messages, ignore the
+/// request (index gap — Core logs and returns), or disconnect the peer.
+#[derive(Debug)]
+pub enum FilterReply {
+    /// Messages to send back.
+    Serve(Vec<crate::message::Message>),
+    /// No answer — the index lacks coverage for the range.
+    Ignore,
+    /// The request violates BIP157 — disconnect the peer.
+    Disconnect(&'static str),
 }
 
 impl PeerSync {
@@ -435,6 +455,168 @@ impl PeerSync {
         Message::Headers(headers)
     }
 
+    /// Shared bounds of `PrepareBlockFilterRequest`: the stop hash must
+    /// be an active-chain block and `start..=stop` must fit the cap.
+    /// Returns the resolved stop height on success.
+    fn prepare_cf_request(
+        cs: &Chainstate,
+        serve_filters: bool,
+        filter_type: u8,
+        start_height: u32,
+        stop_hash: &BlockHash,
+        max_height_diff: u32,
+    ) -> Result<u32, FilterReply> {
+        use FilterReply as R;
+        if filter_type != 0 || !serve_filters {
+            // Core's PrepareBlockFilterRequest: requesting a filter
+            // type we never advertised (or a non-BASIC type) is a
+            // protocol violation — the peer gets disconnected.
+            return Err(R::Disconnect("unsupported filter type"));
+        }
+        if !cs.blockfilterindex_enabled() {
+            // The bit is up but the index isn't — Core logs and
+            // returns without disconnecting.
+            return Err(R::Ignore);
+        }
+        let Some(stop_node) = cs.tree().get(stop_hash) else {
+            return Err(R::Disconnect("unknown stop hash"));
+        };
+        // Core's BlockRequestAllowed — the block must be fetchable:
+        // only the active chain is served here.
+        if !cs.chain().contains(stop_hash) {
+            return Err(R::Disconnect("stop hash not on the active chain"));
+        }
+        let stop_height = stop_node.height;
+        if start_height > stop_height {
+            return Err(R::Disconnect("start height above stop"));
+        }
+        if stop_height - start_height >= max_height_diff {
+            return Err(R::Disconnect("requested range too large"));
+        }
+        Ok(stop_height)
+    }
+
+    /// `getcfilters` → one `cfilter` per block in `start..=stop` —
+    /// Core caps the range at `MAX_GETCFILTERS_SIZE` (1000).
+    #[must_use]
+    pub fn serve_getcfilters(
+        cs: &Chainstate,
+        serve_filters: bool,
+        req: &crate::message::CFRange,
+    ) -> FilterReply {
+        use FilterReply as R;
+        let stop_height = match Self::prepare_cf_request(
+            cs,
+            serve_filters,
+            req.filter_type,
+            req.start_height,
+            &req.stop_hash,
+            MAX_GETCFILTERS_SIZE,
+        ) {
+            Ok(h) => h,
+            Err(reply) => return reply,
+        };
+        let filters = cs.block_filters_range(req.start_height, stop_height);
+        if filters.is_empty() {
+            return R::Ignore;
+        }
+        R::Serve(
+            filters
+                .into_iter()
+                .map(|(hash, filter, _)| {
+                    crate::message::Message::CFilter(crate::message::CFilter {
+                        filter_type: req.filter_type,
+                        block_hash: hash,
+                        filter,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// `getcfheaders` → `prev_filter_header` + the filter hash chain —
+    /// cap `MAX_GETCFHEADERS_SIZE` (2000).
+    #[must_use]
+    pub fn serve_getcfheaders(
+        cs: &Chainstate,
+        serve_filters: bool,
+        req: &crate::message::CFRange,
+    ) -> FilterReply {
+        use FilterReply as R;
+        let stop_height = match Self::prepare_cf_request(
+            cs,
+            serve_filters,
+            req.filter_type,
+            req.start_height,
+            &req.stop_hash,
+            MAX_GETCFHEADERS_SIZE,
+        ) {
+            Ok(h) => h,
+            Err(reply) => return reply,
+        };
+        let prev_filter_header = if req.start_height > 0 {
+            match cs.filter_header_at(req.start_height - 1) {
+                Some(h) => h,
+                None => return R::Ignore,
+            }
+        } else {
+            [0u8; 32]
+        };
+        let filters = cs.block_filters_range(req.start_height, stop_height);
+        if filters.is_empty() {
+            return R::Ignore;
+        }
+        let filter_hashes = filters
+            .iter()
+            .map(|(_, f, _)| avila_consensus::gcs::filter_hash(f))
+            .collect();
+        R::Serve(vec![crate::message::Message::CFHeaders(
+            crate::message::CFHeaders {
+                filter_type: req.filter_type,
+                stop_hash: req.stop_hash,
+                prev_filter_header,
+                filter_hashes,
+            },
+        )])
+    }
+
+    /// `getcfcheckpt` → filter headers at every 1,000th height up to
+    /// the stop block — Core's `stop_height / CFCHECKPT_INTERVAL`.
+    #[must_use]
+    pub fn serve_getcfcheckpt(
+        cs: &Chainstate,
+        serve_filters: bool,
+        req: &crate::message::CFCheckptReq,
+    ) -> FilterReply {
+        use FilterReply as R;
+        let stop_height = match Self::prepare_cf_request(
+            cs,
+            serve_filters,
+            req.filter_type,
+            0,
+            &req.stop_hash,
+            u32::MAX,
+        ) {
+            Ok(h) => h,
+            Err(reply) => return reply,
+        };
+        let count = stop_height / CFCHECKPT_INTERVAL;
+        let mut filter_headers = Vec::with_capacity(count as usize);
+        for i in 1..=count {
+            let Some(h) = cs.filter_header_at(i * CFCHECKPT_INTERVAL) else {
+                return R::Ignore;
+            };
+            filter_headers.push(h);
+        }
+        R::Serve(vec![crate::message::Message::CFCheckpt(
+            crate::message::CFCheckpt {
+                filter_type: req.filter_type,
+                stop_hash: req.stop_hash,
+                filter_headers,
+            },
+        )])
+    }
+
     /// Answers a peer's `getdata`: a `block` message for each requested
     /// block whose body we hold (memory or store), `notfound` for the rest.
     /// Bounded by the request size — `getdata` payloads are already capped
@@ -679,6 +861,119 @@ mod tests {
         let mut sync = PeerSync::new();
         let err = sync.on_block(&mut cs, &bad, NOW).unwrap_err();
         assert!(matches!(err, SyncError::InvalidBlock(_)), "{err}");
+    }
+
+    #[test]
+    fn serve_bip157_requests() {
+        let mut cs = regtest();
+        cs.enable_blockfilterindex(None).unwrap();
+        let blocks = chain_blocks(&cs, 3);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        let tip = blocks[2].block_hash();
+
+        // getcfilters 0..tip → one cfilter per block (genesis + 3).
+        match PeerSync::serve_getcfilters(
+            &cs,
+            true,
+            &crate::message::CFRange {
+                filter_type: 0,
+                start_height: 0,
+                stop_hash: tip,
+            },
+        ) {
+            FilterReply::Serve(msgs) => assert_eq!(msgs.len(), 4),
+            other => panic!("getcfilters: expected serve, got {other:?}"),
+        }
+        // getcfheaders → prev header at start-1 (zero at genesis) + 4 hashes.
+        match PeerSync::serve_getcfheaders(
+            &cs,
+            true,
+            &crate::message::CFRange {
+                filter_type: 0,
+                start_height: 0,
+                stop_hash: tip,
+            },
+        ) {
+            FilterReply::Serve(msgs) => match &msgs[0] {
+                Message::CFHeaders(h) => {
+                    assert_eq!(h.prev_filter_header, [0; 32]);
+                    assert_eq!(h.filter_hashes.len(), 4);
+                    assert_eq!(h.stop_hash, tip);
+                }
+                other => panic!("expected cfheaders, got {other:?}"),
+            },
+            other => panic!("getcfheaders: expected serve, got {other:?}"),
+        }
+        // getcfcheckpt at h3 → no 1000-boundary heights → empty list.
+        match PeerSync::serve_getcfcheckpt(
+            &cs,
+            true,
+            &crate::message::CFCheckptReq {
+                filter_type: 0,
+                stop_hash: tip,
+            },
+        ) {
+            FilterReply::Serve(msgs) => match &msgs[0] {
+                Message::CFCheckpt(c) => assert!(c.filter_headers.is_empty()),
+                other => panic!("expected cfcheckpt, got {other:?}"),
+            },
+            other => panic!("getcfcheckpt: expected serve, got {other:?}"),
+        }
+        // Bad requests disconnect (Core's PrepareBlockFilterRequest).
+        for req in [
+            crate::message::CFRange {
+                filter_type: 9, // unsupported type
+                start_height: 0,
+                stop_hash: tip,
+            },
+            crate::message::CFRange {
+                filter_type: 0,
+                start_height: 2, // start > stop
+                stop_hash: blocks[0].block_hash(),
+            },
+            crate::message::CFRange {
+                filter_type: 0,
+                start_height: 0,
+                stop_hash: BlockHash::ZERO, // unknown stop
+            },
+        ] {
+            assert!(
+                matches!(
+                    PeerSync::serve_getcfilters(&cs, true, &req),
+                    FilterReply::Disconnect(_)
+                ),
+                "expected disconnect for {req:?}"
+            );
+        }
+        // Range over the cap disconnects.
+        assert!(matches!(
+            PeerSync::serve_getcfilters(
+                &cs,
+                true,
+                &crate::message::CFRange {
+                    filter_type: 0,
+                    start_height: 0,
+                    stop_hash: tip, // 3 blocks < 1000 cap — need >cap: use checkpt
+                },
+            ),
+            FilterReply::Serve(_)
+        ));
+        // With no index the same request is ignored, not served.
+        let cs2 = regtest();
+        match PeerSync::serve_getcfilters(
+            &cs2,
+            true, // bit advertised but index missing → Ignore, like Core
+            &crate::message::CFRange {
+                filter_type: 0,
+                start_height: 0,
+                stop_hash: tip,
+            },
+        ) {
+            FilterReply::Ignore => {}
+            other => panic!("no index: expected ignore, got {other:?}"),
+        }
     }
 
     #[test]

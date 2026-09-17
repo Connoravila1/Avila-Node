@@ -43,6 +43,11 @@ pub struct SyncConfig {
     /// index (`cfilters.dat` under `data_dir`) so `getblockfilter` and
     /// `scanblocks` serve real data.
     pub blockfilterindex: bool,
+    /// Core's `-peerblockfilters` (default off): advertise
+    /// `NODE_COMPACT_FILTERS` and answer BIP157 requests. Requires the
+    /// index, like Core — `-peerblockfilters` without
+    /// `-blockfilterindex` is a startup error upstream.
+    pub peerblockfilters: bool,
     /// Core's `-v2transport` (default true since v26): outbound peers
     /// are dialed with BIP324 first, falling back to v1 when the peer
     /// answers in cleartext.
@@ -85,6 +90,7 @@ impl Default for SyncConfig {
             prune_bytes: None,
             txindex: false,
             blockfilterindex: false,
+            peerblockfilters: false,
             v2transport: true,
             listen: None,
             electrum: None,
@@ -158,6 +164,9 @@ pub enum SyncError {
     /// The block store could not be opened or the snapshot flushed.
     #[error("chainstate storage error: {0}")]
     Store(io::Error),
+    /// Invalid option combination — Core's `InitError` text.
+    #[error("{0}")]
+    Config(String),
 }
 
 fn unix_now() -> u32 {
@@ -189,6 +198,12 @@ pub fn run(
         cs.enable_blockfilterindex(cfg.data_dir.as_deref())
             .map_err(SyncError::Store)?;
     }
+    // Core's InitError: "-peerblockfilters without -blockfilterindex".
+    if cfg.peerblockfilters && !cfg.blockfilterindex {
+        return Err(SyncError::Config(
+            "Cannot set -peerblockfilters without -blockfilterindex.".into(),
+        ));
+    }
     if cfg.electrum.is_some() {
         cs.enable_scripthashindex(cfg.data_dir.as_deref())
             .map_err(SyncError::Store)?;
@@ -200,6 +215,9 @@ pub fn run(
     // fields — reads the node clock, so `setmocktime` shifts them too.
     mgr.set_clock(crate::time::time);
     mgr.set_v2transport(cfg.v2transport);
+    // The index we just enabled is what makes BIP157 serving
+    // legitimate — advertise NODE_COMPACT_FILTERS only then.
+    mgr.set_serve_filters(cfg.blockfilterindex && cfg.peerblockfilters);
     let started = Instant::now();
     // Core's `GetStartupTime` — wall-clock boot epoch. `uptime` reads
     // `GetTime() - GetStartupTime()`, so a pinned mock shifts it too.

@@ -271,6 +271,11 @@ pub struct PeerManager<S> {
     /// Core defaults to true since v26; `addnode`'s per-node flag
     /// overrides for manual peers.
     v2transport: bool,
+    /// Whether we advertise `NODE_COMPACT_FILTERS` (BIP157 serving) —
+    /// set when the caller enables `-blockfilterindex`; without it a
+    /// `getcf*` request means misbehavior (Core's
+    /// `peer.m_our_services & NODE_COMPACT_FILTERS` gate).
+    serve_filters: bool,
     /// Accepted sockets whose transport handshake finished — workers
     /// send `(remote addr, session)` here; `drain_inbounds` admits
     /// them on the tick like `maintain_outbounds` drains dials.
@@ -309,6 +314,7 @@ impl<S: Read + Write> PeerManager<S> {
             inbound_tx: inbound_channel.0,
             inbound_rx: inbound_channel.1,
             pending_accepts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            serve_filters: false,
             clock: wall_epoch,
             v2transport: true,
         }
@@ -335,6 +341,19 @@ impl<S: Read + Write> PeerManager<S> {
     #[must_use]
     pub fn v2transport(&self) -> bool {
         self.v2transport
+    }
+
+    /// `-peerblockfilters`/`blockfilterindex` — advertise
+    /// `NODE_COMPACT_FILTERS` in every version we send, so BIP157
+    /// requests become legitimate instead of misbehavior.
+    pub fn set_serve_filters(&mut self, on: bool) {
+        self.serve_filters = on;
+    }
+
+    /// Whether `NODE_COMPACT_FILTERS` is being advertised.
+    #[must_use]
+    pub fn serve_filters(&self) -> bool {
+        self.serve_filters
     }
 
     /// Removes a peer, folding its wire counters into the cumulative
@@ -553,6 +572,7 @@ impl<S: Read + Write> PeerManager<S> {
         // Aggregate reservation budget shared by every event this tick —
         // headers-driven and inv-driven fetches draw it down too.
         let mut global_free = self.max_in_flight_total.saturating_sub(self.in_flight());
+        let serve_filters = self.serve_filters;
         let Self {
             peers,
             addrbook,
@@ -590,6 +610,7 @@ impl<S: Read + Write> PeerManager<S> {
                             &mut global_free,
                             &mut events,
                             &mut dead,
+                            serve_filters,
                         );
                     }
                 }
@@ -785,6 +806,7 @@ impl<S: Read + Write> PeerManager<S> {
         global_free: &mut usize,
         events: &mut Vec<NetEvent>,
         dead: &mut Vec<(u64, DisconnectReason)>,
+        serve_filters: bool,
     ) {
         match event {
             SessionEvent::Established => {
@@ -932,6 +954,51 @@ impl<S: Read + Write> PeerManager<S> {
             SessionEvent::Message(Message::GetHeaders(req)) => {
                 let reply = PeerSync::serve_getheaders(cs, &req);
                 let _ = peer.session.send(&reply);
+            }
+            SessionEvent::Message(Message::GetCFilters(req)) => {
+                match PeerSync::serve_getcfilters(cs, serve_filters, &req) {
+                    crate::sync::FilterReply::Serve(msgs) => {
+                        for m in msgs {
+                            if peer.session.send(&m).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    crate::sync::FilterReply::Ignore => {}
+                    crate::sync::FilterReply::Disconnect(reason) => {
+                        dead.push((id, DisconnectReason::Misbehavior(reason.into())));
+                    }
+                }
+            }
+            SessionEvent::Message(Message::GetCFHeaders(req)) => {
+                match PeerSync::serve_getcfheaders(cs, serve_filters, &req) {
+                    crate::sync::FilterReply::Serve(msgs) => {
+                        for m in msgs {
+                            if peer.session.send(&m).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    crate::sync::FilterReply::Ignore => {}
+                    crate::sync::FilterReply::Disconnect(reason) => {
+                        dead.push((id, DisconnectReason::Misbehavior(reason.into())));
+                    }
+                }
+            }
+            SessionEvent::Message(Message::GetCFCheckpt(req)) => {
+                match PeerSync::serve_getcfcheckpt(cs, serve_filters, &req) {
+                    crate::sync::FilterReply::Serve(msgs) => {
+                        for m in msgs {
+                            if peer.session.send(&m).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    crate::sync::FilterReply::Ignore => {}
+                    crate::sync::FilterReply::Disconnect(reason) => {
+                        dead.push((id, DisconnectReason::Misbehavior(reason.into())));
+                    }
+                }
             }
             SessionEvent::Message(Message::GetData(reqs)) => {
                 // A peer asking for a tx acknowledges its broadcast —
@@ -1320,6 +1387,9 @@ impl PeerManager<TcpStream> {
             // `-v2transport`.
             version.services |= NODE_P2P_V2;
         }
+        if self.serve_filters {
+            version.services |= crate::message::NODE_COMPACT_FILTERS;
+        }
         let session = dial(addr, magic, version, use_v2)?;
         Ok(self.add(session, Some(remote), false))
     }
@@ -1346,7 +1416,10 @@ impl PeerManager<TcpStream> {
         let stream = crate::proxy::socks5_connect(proxy, target, Duration::from_secs(10))?;
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
-        let version = build_version(our_version, start_height, remote, (self.clock)());
+        let mut version = build_version(our_version, start_height, remote, (self.clock)());
+        if self.serve_filters {
+            version.services |= crate::message::NODE_COMPACT_FILTERS;
+        }
         let session = PeerSession::initiate(stream, magic, version, SEND_BUDGET_PER_PEER)?;
         Ok(self.add(session, Some(remote), false))
     }
@@ -1371,7 +1444,13 @@ impl PeerManager<TcpStream> {
         }
         let tx = self.inbound_tx.clone();
         let remote_addr = crate::addrman::net_addr_of(remote, 0);
-        let version = build_version(our_version, start_height, remote_addr, (self.clock)());
+        let mut version = build_version(our_version, start_height, remote_addr, (self.clock)());
+        if self.serve_filters {
+            version.services |= crate::message::NODE_COMPACT_FILTERS;
+        }
+        if self.v2transport {
+            version.services |= NODE_P2P_V2;
+        }
         let v2 = self.v2transport;
         pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::thread::spawn(move || {
@@ -1569,6 +1648,9 @@ impl PeerManager<TcpStream> {
         );
         if use_v2 {
             version.services |= NODE_P2P_V2;
+        }
+        if self.serve_filters {
+            version.services |= crate::message::NODE_COMPACT_FILTERS;
         }
         std::thread::spawn(move || {
             let _ = tx.send((addr, dial(addr, magic, version, use_v2)));

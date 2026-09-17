@@ -142,6 +142,63 @@ pub struct GetHeaders {
     pub stop: BlockHash,
 }
 
+/// Shared request shape of `getcfilters`/`getcfheaders`/`getcfcheckpt`
+/// — BIP157's `filter_type + start_height + stop_hash` triple.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CFRange {
+    /// BIP157 filter type — 0 is basic (the only defined type).
+    pub filter_type: u8,
+    /// First block height to serve.
+    pub start_height: u32,
+    /// Last block to serve, by hash.
+    pub stop_hash: BlockHash,
+}
+
+/// The `cfilter` payload — one block's encoded filter.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CFilter {
+    /// BIP157 filter type.
+    pub filter_type: u8,
+    /// The block this filter belongs to.
+    pub block_hash: BlockHash,
+    /// The GCS-encoded filter bytes.
+    pub filter: Vec<u8>,
+}
+
+/// The `cfheaders` payload — filter headers for `start..=stop`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CFHeaders {
+    /// BIP157 filter type.
+    pub filter_type: u8,
+    /// The last block in the range.
+    pub stop_hash: BlockHash,
+    /// Filter header of the block *before* the range (all-zero when
+    /// the range starts at genesis — BIP157).
+    pub prev_filter_header: [u8; 32],
+    /// One filter header per block in the range.
+    pub filter_hashes: Vec<[u8; 32]>,
+}
+
+/// The `getcfcheckpt` payload — filter type plus the stop hash.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CFCheckptReq {
+    /// BIP157 filter type.
+    pub filter_type: u8,
+    /// The last block covered.
+    pub stop_hash: BlockHash,
+}
+
+/// The `cfcheckpt` payload — filter headers at 1000-block intervals.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CFCheckpt {
+    /// BIP157 filter type.
+    pub filter_type: u8,
+    /// The last block covered.
+    pub stop_hash: BlockHash,
+    /// Filter headers — every 1,000th height within the range.
+    pub filter_headers: Vec<[u8; 32]>,
+}
+
 /// The `version` payload.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Version {
@@ -220,6 +277,19 @@ pub enum Message {
     Tx(Transaction),
     /// `mempool` — request for the relay set (BIP35).
     Mempool,
+    /// `getcfilters` — BIP157 request for basic filters in a range.
+    GetCFilters(CFRange),
+    /// `cfilter` — BIP157 filter response (one block's filter).
+    CFilter(CFilter),
+    /// `getcfheaders` — BIP157 request for the filter-header chain.
+    GetCFHeaders(CFRange),
+    /// `cfheaders` — BIP157 filter-header chain response.
+    CFHeaders(CFHeaders),
+    /// `getcfcheckpt` — BIP157 request for 1000-block-interval headers.
+    /// Its payload is only `filter_type + stop_hash` (no range).
+    GetCFCheckpt(CFCheckptReq),
+    /// `cfcheckpt` — BIP157 checkpoint response.
+    CFCheckpt(CFCheckpt),
     /// `reject` — BIP61 rejection notice.
     Reject(Reject),
     /// Any other command — Core ignores unknown commands; we preserve the
@@ -336,6 +406,12 @@ impl Message {
             Self::Block(_) => "block",
             Self::Tx(_) => "tx",
             Self::Mempool => "mempool",
+            Self::GetCFilters(_) => "getcfilters",
+            Self::CFilter(_) => "cfilter",
+            Self::GetCFHeaders(_) => "getcfheaders",
+            Self::CFHeaders(_) => "cfheaders",
+            Self::GetCFCheckpt(_) => "getcfcheckpt",
+            Self::CFCheckpt(_) => "cfcheckpt",
             Self::Reject(_) => "reject",
             Self::Unknown { command, .. } => command.as_str(),
         }
@@ -401,6 +477,38 @@ impl Message {
                 for header in headers {
                     out.extend_from_slice(&header.encode());
                     out.push(0); // BIP152-style zero txn count
+                }
+            }
+            Self::GetCFilters(r) | Self::GetCFHeaders(r) => {
+                out.push(r.filter_type);
+                out.extend_from_slice(&r.start_height.to_le_bytes());
+                out.extend_from_slice(r.stop_hash.as_bytes());
+            }
+            Self::GetCFCheckpt(r) => {
+                out.push(r.filter_type);
+                out.extend_from_slice(r.stop_hash.as_bytes());
+            }
+            Self::CFilter(f) => {
+                out.push(f.filter_type);
+                out.extend_from_slice(f.block_hash.as_bytes());
+                write_compact_size(&mut out, f.filter.len() as u64);
+                out.extend_from_slice(&f.filter);
+            }
+            Self::CFHeaders(h) => {
+                out.push(h.filter_type);
+                out.extend_from_slice(h.stop_hash.as_bytes());
+                out.extend_from_slice(&h.prev_filter_header);
+                write_compact_size(&mut out, h.filter_hashes.len() as u64);
+                for fh in &h.filter_hashes {
+                    out.extend_from_slice(fh);
+                }
+            }
+            Self::CFCheckpt(c) => {
+                out.push(c.filter_type);
+                out.extend_from_slice(c.stop_hash.as_bytes());
+                write_compact_size(&mut out, c.filter_headers.len() as u64);
+                for fh in &c.filter_headers {
+                    out.extend_from_slice(fh);
                 }
             }
             Self::Block(block) => out = block.encode(),
@@ -537,6 +645,85 @@ impl Message {
                 let stop =
                     BlockHash::from_bytes(d.read_array::<32>().map_err(|e| payload_err(name, e))?);
                 Self::GetHeaders(GetHeaders { locator, stop })
+            }
+            "getcfilters" | "getcfheaders" => {
+                let filter_type = d.read_u8().map_err(|e| payload_err(name, e))?;
+                let start_height = d.read_u32_le().map_err(|e| payload_err(name, e))?;
+                let stop_hash =
+                    BlockHash::from_bytes(d.read_array::<32>().map_err(|e| payload_err(name, e))?);
+                let range = CFRange {
+                    filter_type,
+                    start_height,
+                    stop_hash,
+                };
+                if name == "getcfilters" {
+                    Self::GetCFilters(range)
+                } else {
+                    Self::GetCFHeaders(range)
+                }
+            }
+            "getcfcheckpt" => {
+                let filter_type = d.read_u8().map_err(|e| payload_err(name, e))?;
+                let stop_hash =
+                    BlockHash::from_bytes(d.read_array::<32>().map_err(|e| payload_err(name, e))?);
+                Self::GetCFCheckpt(CFCheckptReq {
+                    filter_type,
+                    stop_hash,
+                })
+            }
+            "cfilter" => {
+                let filter_type = d.read_u8().map_err(|e| payload_err(name, e))?;
+                let block_hash =
+                    BlockHash::from_bytes(d.read_array::<32>().map_err(|e| payload_err(name, e))?);
+                let filter = d.read_var_bytes().map_err(|e| payload_err(name, e))?;
+                Self::CFilter(CFilter {
+                    filter_type,
+                    block_hash,
+                    filter,
+                })
+            }
+            "cfheaders" | "cfcheckpt" => {
+                let filter_type = d.read_u8().map_err(|e| payload_err(name, e))?;
+                let stop_hash =
+                    BlockHash::from_bytes(d.read_array::<32>().map_err(|e| payload_err(name, e))?);
+                if name == "cfheaders" {
+                    let prev = d.read_array::<32>().map_err(|e| payload_err(name, e))?;
+                    let count = d.read_compact_size().map_err(|e| payload_err(name, e))?;
+                    if count > MAX_HEADERS_RESULTS {
+                        return Err(payload_err(
+                            name,
+                            format!("cfheaders count {count} exceeds MAX_HEADERS_RESULTS"),
+                        ));
+                    }
+                    let mut filter_hashes = Vec::with_capacity(d.bounded_capacity(count, 32));
+                    for _ in 0..count {
+                        filter_hashes.push(d.read_array::<32>().map_err(|e| payload_err(name, e))?);
+                    }
+                    Self::CFHeaders(CFHeaders {
+                        filter_type,
+                        stop_hash,
+                        prev_filter_header: prev,
+                        filter_hashes,
+                    })
+                } else {
+                    let count = d.read_compact_size().map_err(|e| payload_err(name, e))?;
+                    if count > MAX_HEADERS_RESULTS {
+                        return Err(payload_err(
+                            name,
+                            format!("cfcheckpt count {count} exceeds MAX_HEADERS_RESULTS"),
+                        ));
+                    }
+                    let mut filter_headers = Vec::with_capacity(d.bounded_capacity(count, 32));
+                    for _ in 0..count {
+                        filter_headers
+                            .push(d.read_array::<32>().map_err(|e| payload_err(name, e))?);
+                    }
+                    Self::CFCheckpt(CFCheckpt {
+                        filter_type,
+                        stop_hash,
+                        filter_headers,
+                    })
+                }
             }
             "headers" => {
                 let count = d.read_compact_size().map_err(|e| payload_err(name, e))?;

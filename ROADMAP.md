@@ -79,7 +79,9 @@ Storage and synchronization research can use this implementation before P2P is r
       validation, and the sync-relevant command set (`version`/`verack`,
       `ping`/`pong`, `sendheaders`/`wtxidrelay`/`sendaddrv2`/`feefilter`,
       `getheaders`/`headers`, `inv`/`getdata`/`notfound`, `block`/`tx`,
-      `getaddr`/`addr`/`addrv2`, `mempool`, `reject`).
+      `getaddr`/`addr`/`addrv2`, `mempool`, `reject`, and the BIP157
+      `getcfilters`/`cfilter`, `getcfheaders`/`cfheaders`,
+      `getcfcheckpt`/`cfcheckpt` triple).
 - [x] Per-peer session state machine (`avila-p2p::session`): Core's
       `version`/`verack` choreography, handshake timeout, session-layer
       `ping`→`pong`, per-peer send budget, pre-version drop and
@@ -543,7 +545,17 @@ operation. Compare complete initial download and catch-up, not only local replay
       `sha256("txid:height:"…)`). Electrum-protocol negotiation,
       persistent-connection quirks and richer mempool-status updates
       remain open.
-- [ ] Compact-filter service surface (BIP157/158 serving + tested clients).
+- [x] Compact-filter service surface — BIP157/158 serving over the
+      `getcfilters`/`cfilter`, `getcfheaders`/`cfheaders` and
+      `getcfcheckpt`/`cfcheckpt` messages, backed by the persisted
+      basic index. `-peerblockfilters` (Core's default-off flag)
+      advertises `NODE_COMPACT_FILTERS` and enables serving; bad
+      requests disconnect like Core's `PrepareBlockFilterRequest`
+      (unsupported type, unknown stop hash, start>stop, ranges over
+      `MAX_GETCFILTERS_SIZE`/`MAX_GETCFHEADERS_SIZE`). Verified live:
+      served filter bytes match `getblockfilter` byte-for-byte, and a
+      `cfheaders` range chains `sha256d(hash||prev)` onto the tip's
+      indexed header exactly.
 - [x] Pruned operation (first slice): `BlockStore::prune_to_bytes`
       deletes the oldest blk files past a byte budget (never the tail);
       `have_body` reports pruned bodies absent so sync refetches them,

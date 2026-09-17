@@ -886,6 +886,17 @@ impl Chainstate {
             .map(|(f, h)| (f.to_vec(), *h))
     }
 
+    /// The stored filter *header* for an active-chain height — the
+    /// `cfheaders`/`cfcheckpt` half of BIP157 serving.
+    #[must_use]
+    pub fn filter_header_at(&self, height: u32) -> Option<[u8; 32]> {
+        self.filterindex
+            .as_ref()?
+            .by_height
+            .get(&height)
+            .map(|e| e.2)
+    }
+
     /// All active-chain filters in `start..=stop` — Core's
     /// `LookupFilterRange` for `scanblocks`. Heights the index never
     /// covered (shouldn't happen on a stored chain) skip silently —

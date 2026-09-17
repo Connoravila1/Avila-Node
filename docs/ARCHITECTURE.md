@@ -96,7 +96,11 @@ Track the active chain, fully validated history, snapshot assumptions, index cov
 and connection freshness independently. Optional indexes live beside the chainstate —
 `txindex.dat`, `cfilters.dat` (BIP158) and `scindex.dat` (scripthash, for the
 Electrum server) — each a resumable append log that rewinds with reorgs and
-backfills from retained bodies on first enable. The distinction between active and background
+backfills from retained bodies on first enable. With `-peerblockfilters`
+the filter index also answers BIP157 `getcfilters`/`getcfheaders`/
+`getcfcheckpt` peer requests; the peer layer then advertises
+`NODE_COMPACT_FILTERS` and disconnects requesters of unadvertised types,
+matching Core's `PrepareBlockFilterRequest` rules. The distinction between active and background
 chainstates is illustrated by [Core's AssumeUTXO design](https://github.com/bitcoin/bitcoin/blob/master/doc/design/assumeutxo.md).
 Avila has not implemented snapshot bootstrapping.
 

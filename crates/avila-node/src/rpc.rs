@@ -11301,6 +11301,9 @@ pub(crate) fn dispatch(
             if mgr.v2transport() {
                 services |= avila_p2p::message::NODE_P2P_V2;
             }
+            if mgr.serve_filters() {
+                services |= avila_p2p::message::NODE_COMPACT_FILTERS;
+            }
             // Reachability is honest: clearnet only unless a proxy was
             // configured (the proxy knob is CLI-side; report onion as
             // unreachable until the config reaches this layer).
