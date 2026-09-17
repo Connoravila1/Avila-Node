@@ -247,6 +247,12 @@ pub fn run(
         {
             eprintln!("mempool.dat: imported {imported}, skipped {skipped}");
         }
+        // The scheduler's first job — Core's `DumpAddrman` cadence:
+        // peers.dat saves every 15 min, not just at shutdown.
+        let peers_path = dir.join("peers.dat");
+        mgr.schedule_every("save_peers", 15 * 60, move |m| {
+            let _ = m.addrbook().save(&peers_path);
+        });
     }
     let seeded = mgr.seed_from_dns(params, unix_now());
     // `-listen` — the inbound side of Core's `-listen=1`: a
@@ -459,6 +465,9 @@ pub fn run(
         if let Some(waiters) = &cfg.waiters {
             waiters.notify(&cs, mgr.mempool());
         }
+        // The scheduler — periodic jobs (peers.dat dumps, …); on
+        // regtest `mockscheduler` fast-forwards this same queue.
+        mgr.run_due_tasks();
         progress(&snapshot);
         if run_progress >= cfg.target_height {
             break;

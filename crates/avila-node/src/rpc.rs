@@ -2918,6 +2918,9 @@ const SETNETWORKACTIVE_HELP: &str = "setnetworkactive state\n\nDisable/enable al
 /// Verbatim `help setmocktime` text (Bitcoin Core 29.4).
 const SETMOCKTIME_HELP: &str = "setmocktime timestamp\n\nSet the local time to given timestamp (-regtest only)\n\nArguments:\n1. timestamp    (numeric, required) UNIX epoch time\n                Pass 0 to go back to using the system time.\n\nResult:\nnull    (json null)\n";
 
+/// Verbatim `help mockscheduler` text (Bitcoin Core 29.4).
+const MOCKSCHEDULER_HELP: &str = "mockscheduler delta_time\n\nBump the scheduler into the future (-regtest only)\n\nArguments:\n1. delta_time    (numeric, required) Number of seconds to forward the scheduler into the future.\n\nResult:\nnull    (json null)\n";
+
 /// Verbatim `help getaddrmaninfo` text (Bitcoin Core 29.4).
 const GETADDRMANINFO_HELP: &str = "getaddrmaninfo\n\nProvides information about the node's address manager by returning the number of addresses in the `new` and `tried` tables and their sum for all networks.\n\nResult:\n{                   (json object) json object with network type as keys\n  \"network\" : {     (json object) the network (ipv4, ipv6, onion, i2p, cjdns, all_networks)\n    \"new\" : n,      (numeric) number of addresses in the new table, which represent potential peers the node has discovered but hasn't yet successfully connected to.\n    \"tried\" : n,    (numeric) number of addresses in the tried table, which represent peers the node has successfully connected to in the past.\n    \"total\" : n     (numeric) total number of addresses in both new/tried tables\n  },\n  ...\n}\n\nExamples:\n> bitcoin-cli getaddrmaninfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getaddrmaninfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
@@ -4410,6 +4413,11 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         "setmocktime",
         &[("timestamp", Some("number"), true)],
         SETMOCKTIME_HELP,
+    ),
+    (
+        "mockscheduler",
+        &[("delta_time", Some("number"), true)],
+        MOCKSCHEDULER_HELP,
     ),
     (
         "setnetworkactive",
@@ -10975,6 +10983,34 @@ pub(crate) fn dispatch(
                     ));
                 }
                 crate::time::set_mock_time(t);
+                Ok(Value::Null)
+            })
+        }
+        // Core's mockscheduler (rpc/node.cpp): regtest-only,
+        // 1..=3600s, forwards the manager's task queue — the same
+        // clock the tick's `run_due_tasks` reads.
+        "mockscheduler" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let Some(v) = arr.first().cloned() else {
+                return help_error(MOCKSCHEDULER_HELP);
+            };
+            chain_query(queries, move |cs, mgr| {
+                if cs.tree().params().network != avila_consensus::params::Network::Regtest {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "mockscheduler is for regression testing (-regtest mode) only".into(),
+                    ));
+                }
+                let Some(d) = v.as_i64() else {
+                    return Err((RPC_MISC_ERROR, "JSON integer out of range".into()));
+                };
+                if !(1..=3600).contains(&d) {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "delta_time must be between 1 and 3600 seconds (1 hr)".into(),
+                    ));
+                }
+                mgr.scheduler_forward(d as u64);
                 Ok(Value::Null)
             })
         }

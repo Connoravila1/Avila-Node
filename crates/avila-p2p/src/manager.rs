@@ -284,7 +284,28 @@ pub struct PeerManager<S> {
     /// Accept-side handshakes in flight — bounds the worker pool a
     /// connect-flood could otherwise grow without limit.
     pending_accepts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The node's task queue — Core's `CScheduler`. Periodic work
+    /// (`peers.dat` dumps, expirations) runs here so `mockscheduler`
+    /// can fast-forward it on regtest.
+    tasks: Vec<ScheduledTask<S>>,
 }
+
+/// One recurring scheduler entry — `run_due_tasks` fires `work` when
+/// `next_run <= now` on the manager's mockable clock.
+pub struct ScheduledTask<S> {
+    /// Human label — for logs and future introspection.
+    pub name: String,
+    /// Seconds between runs.
+    pub every_secs: u64,
+    /// Next fire time on the manager clock.
+    pub next_run: i64,
+    /// The job — `&mut PeerManager` so tasks can touch any subsystem.
+    pub work: TaskWork<S>,
+}
+
+/// A scheduled job body — `&mut PeerManager` so tasks can touch any
+/// subsystem.
+pub type TaskWork<S> = Box<dyn FnMut(&mut PeerManager<S>) + Send>;
 
 impl<S: Read + Write> PeerManager<S> {
     /// An empty manager — `max_peers` bounds the set.
@@ -317,6 +338,7 @@ impl<S: Read + Write> PeerManager<S> {
             serve_filters: false,
             clock: wall_epoch,
             v2transport: true,
+            tasks: Vec::new(),
         }
     }
 
@@ -692,6 +714,49 @@ impl<S: Read + Write> PeerManager<S> {
                     hash,
                 }]));
         }
+    }
+
+    /// Registers a periodic task — Core's `CScheduler::scheduleEvery`.
+    /// `work` runs each `every_secs` on the manager clock.
+    pub fn schedule_every(
+        &mut self,
+        name: &str,
+        every_secs: u64,
+        work: impl FnMut(&mut PeerManager<S>) + Send + 'static,
+    ) {
+        self.tasks.push(ScheduledTask {
+            name: name.to_string(),
+            every_secs,
+            next_run: (self.clock)() + every_secs as i64,
+            work: Box::new(work),
+        });
+    }
+
+    /// Runs every due task once — the sync loop calls this per tick.
+    /// `mem::take` frees the borrow so `work` can mutate the manager.
+    pub fn run_due_tasks(&mut self) {
+        let now = (self.clock)();
+        if self.tasks.iter().all(|t| t.next_run > now) {
+            return;
+        }
+        let mut tasks = std::mem::take(&mut self.tasks);
+        for t in &mut tasks {
+            if t.next_run <= now {
+                (t.work)(self);
+                t.next_run = now + t.every_secs as i64;
+            }
+        }
+        self.tasks = tasks;
+    }
+
+    /// `mockscheduler` — advances every task's clock by `secs` and runs
+    /// whatever falls due, like Core's `MockForward`. Each task runs at
+    /// most once regardless of how many intervals the delta spans.
+    pub fn scheduler_forward(&mut self, secs: u64) {
+        for t in &mut self.tasks {
+            t.next_run -= secs as i64;
+        }
+        self.run_due_tasks();
     }
 
     /// Fetch specific blocks by hash — the rescan reacquisition path.
@@ -2664,5 +2729,36 @@ mod tests {
             .collect();
         assert!(protocols.contains(&"v2"));
         assert!(protocols.contains(&"v1"));
+    }
+    /// The scheduler: `run_due_tasks` fires jobs whose `next_run`
+    /// passed on the mockable clock; `scheduler_forward` compresses
+    /// time for `mockscheduler`.
+    #[test]
+    fn scheduler_runs_due_and_forwards() {
+        use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+        static CLOCK: AtomicI64 = AtomicI64::new(1_700_000_000);
+        static RAN: AtomicU64 = AtomicU64::new(0);
+        fn now() -> i64 {
+            CLOCK.load(Ordering::Relaxed)
+        }
+        let mut mgr = PeerManager::<testpipe::End>::new(4);
+        mgr.set_clock(now);
+        mgr.schedule_every("tick", 60, |_| {
+            RAN.fetch_add(1, Ordering::Relaxed);
+        });
+
+        // Not due yet — 59s under the interval.
+        CLOCK.store(1_700_000_059, Ordering::Relaxed);
+        mgr.run_due_tasks();
+        assert_eq!(RAN.load(Ordering::Relaxed), 0);
+
+        // Due at +60s.
+        CLOCK.store(1_700_000_060, Ordering::Relaxed);
+        mgr.run_due_tasks();
+        assert_eq!(RAN.load(Ordering::Relaxed), 1);
+
+        // mockscheduler 3600 — forward fires it once (not 60×).
+        mgr.scheduler_forward(3600);
+        assert_eq!(RAN.load(Ordering::Relaxed), 2);
     }
 }
