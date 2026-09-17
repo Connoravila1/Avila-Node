@@ -561,8 +561,12 @@ operation. Compare complete initial download and catch-up, not only local replay
       `have_body` reports pruned bodies absent so sync refetches them,
       resubmitted pruned blocks re-store on `accept_block`, and a reorg
       reaching a pruned body fails loudly at disconnect. Wired as
-      `avila-node sync --prune-mb` and the GUI's prune field. Verified
-      historical reacquisition for rescans remains open.
+      `avila-node sync --prune-mb` and the GUI's prune field. Missing
+      bodies reacquire automatically — the sync loop refetches them at
+      steady state, and a rescan/import that lands mid-refetch parks
+      on a deferred query: each arrived body scans into the wallet's
+      gaps, and the RPC answers when the range is covered (or reports
+      the still-missing count at the deadline).
 - [x] Mining templates (engine slice): `Mempool::build_template`
       greedily fills a block by fee rate respecting in-pool parent
       order and MAX_BLOCK_WEIGHT, pays subsidy+fees via a BIP34

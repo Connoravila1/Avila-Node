@@ -316,6 +316,10 @@ pub fn run(
         }
     }
     let _waiter_shutdown = WaiterShutdown(cfg.waiters.as_ref());
+    // Rescans that deferred — jobs parked until their pruned range
+    // reacquires bodies.
+    let mut rescans: std::collections::VecDeque<crate::rpc::DeferredQuery> =
+        std::collections::VecDeque::new();
 
     while started.elapsed() < cfg.timeout
         && connected.saturating_sub(resumed_height) < cfg.target_height
@@ -401,10 +405,53 @@ pub fn run(
         {
             for _ in 0..64 {
                 match rx.try_recv() {
-                    Ok(q) => q.answer(&mut cs, &mut mgr),
+                    Ok(q) => q.answer(&mut cs, &mut mgr, &mut rescans),
                     Err(_) => break,
                 }
             }
+        }
+        // Drive deferred rescans: scan bodies that arrived, refetch
+        // the rest, answer when the range is covered or the deadline
+        // passes.
+        if !rescans.is_empty() {
+            let mut keep = std::collections::VecDeque::new();
+            while let Some(mut job) = rescans.pop_front() {
+                let arrived: Vec<u32> = job
+                    .pending
+                    .iter()
+                    .filter(|(_, h)| cs.have_body(h))
+                    .map(|(h, _)| *h)
+                    .collect();
+                if !arrived.is_empty()
+                    && let Ok(mut w) = job.wallet.lock()
+                {
+                    for h in arrived {
+                        if let Some(hash) = job.pending.remove(&h)
+                            && let Some(b) = cs.body(&hash)
+                        {
+                            w.scan_gap_height(&b, h, hash);
+                        }
+                    }
+                    let _ = w.persist();
+                }
+                if job.pending.is_empty() {
+                    let _ = job.reply.send(Ok(job.done));
+                } else if std::time::Instant::now() >= job.deadline {
+                    let _ = job.reply.send(Err((
+                        -4,
+                        format!(
+                            "Rescan incomplete — {} blocks still missing bodies",
+                            job.pending.len()
+                        ),
+                    )));
+                } else {
+                    let want: Vec<avila_consensus::hash::BlockHash> =
+                        job.pending.values().take(16).copied().collect();
+                    mgr.request_blocks(&want);
+                    keep.push_back(job);
+                }
+            }
+            rescans = keep;
         }
         // Fire every `waitforblock*` predicate that this tick's state
         // satisfies — the loop's half of Core's BlockConnected

@@ -1068,10 +1068,11 @@ mod tests {
         let waiters = Arc::new(BlockWaiters::new());
         let waiters2 = waiters.clone();
         let mut mgr = PeerManager::new(4);
+        let mut rescans = std::collections::VecDeque::new();
         thread::spawn(move || {
             loop {
                 match qrx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(q) => q.answer(&mut cs, &mut mgr),
+                    Ok(q) => q.answer(&mut cs, &mut mgr, &mut rescans),
                     Err(mpsc::RecvTimeoutError::Timeout) => waiters2.notify(&cs),
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }

@@ -53,9 +53,7 @@ pub type SharedStatus = Arc<RwLock<SyncProgress>>;
 /// JSON-RPC `(code, message)` error. `&mut` receivers let mutation
 /// methods (`sendrawtransaction`, `submitblock`) reach the mempool,
 /// the chainstate, and relay.
-type QueryFn = Box<
-    dyn FnOnce(&mut Chainstate, &mut PeerManager<TcpStream>) -> Result<Value, (i64, String)> + Send,
->;
+type QueryFn = Box<dyn FnOnce(&mut Chainstate, &mut PeerManager<TcpStream>) -> QueryReply + Send>;
 
 /// A query the sync loop answers against the live chainstate
 /// and peer manager between ticks. The reply carries either the JSON
@@ -77,19 +75,57 @@ impl ChainQuery {
         let (reply, rx) = mpsc::channel();
         (
             Self {
-                run: Box::new(f),
+                run: Box::new(move |cs, mgr| QueryReply::Now(f(cs, mgr))),
                 reply,
             },
             rx,
         )
     }
 
-    /// Executes the query against the live chainstate and delivers the
-    /// answer. Called by the sync loop; a dropped receiver just means the
-    /// caller gave up waiting.
-    pub fn answer(self, cs: &mut Chainstate, mgr: &mut PeerManager<TcpStream>) {
-        let _ = self.reply.send((self.run)(cs, mgr));
+    /// Executes the query
+    /// A `Defer` outcome parks the query on `rescans` — the sync loop
+    /// refetches the listed blocks and finishes the job when they land.
+    pub fn answer(
+        self,
+        cs: &mut Chainstate,
+        mgr: &mut PeerManager<TcpStream>,
+        rescans: &mut std::collections::VecDeque<DeferredQuery>,
+    ) {
+        match (self.run)(cs, mgr) {
+            QueryReply::Now(result) => {
+                let _ = self.reply.send(result);
+            }
+            QueryReply::Defer(deferred) => rescans.push_back(DeferredQuery {
+                reply: self.reply,
+                ..deferred
+            }),
+        }
     }
+}
+
+/// What a query wants done — answer now, or park for block
+/// reacquisition (a rescan whose range includes pruned bodies).
+pub enum QueryReply {
+    /// Send the result immediately.
+    Now(Result<Value, (i64, String)>),
+    /// The query found `pending` heights without bodies — fetch them
+    /// and finish when they arrive (or the deadline passes).
+    Defer(DeferredQuery),
+}
+
+/// A parked rescan — the blocks still missing, the wallet to scan them
+/// into, and where the answer goes.
+pub struct DeferredQuery {
+    /// Wallet whose gaps the blocks fill.
+    pub wallet: SharedWallet,
+    /// Height → block hash still missing a body.
+    pub pending: std::collections::BTreeMap<u32, avila_consensus::hash::BlockHash>,
+    /// When to give up and report the gap.
+    pub deadline: std::time::Instant,
+    /// What the reply carries when every block is rescanned.
+    pub done: Value,
+    /// The reply channel — set by `answer` (the query's own sender).
+    pub reply: mpsc::Sender<Result<Value, (i64, String)>>,
 }
 
 /// The sending half of the chain-query channel — the RPC server holds
@@ -657,11 +693,12 @@ fn reply_obj(result: Value, error: Option<(i64, String)>, id: &Option<Value>, v2
 
 /// Runs `f` against the live chainstate through the query channel and
 /// shapes the outcome as `dispatch`'s `(result, error)` pair.
-fn chain_query(
+/// `chain_query` whose closure may defer the reply for block
+/// reacquisition — `Defer` parks the query on the sync loop's rescan
+/// queue until the missing bodies arrive or the deadline passes.
+fn chain_query_deferred(
     queries: Option<&QuerySender>,
-    f: impl FnOnce(&mut Chainstate, &mut PeerManager<TcpStream>) -> Result<Value, (i64, String)>
-    + Send
-    + 'static,
+    f: impl FnOnce(&mut Chainstate, &mut PeerManager<TcpStream>) -> QueryReply + Send + 'static,
 ) -> (Value, Option<(i64, String)>) {
     let Some(tx) = queries else {
         return (
@@ -693,6 +730,15 @@ fn chain_query(
             Some((RPC_MISC_ERROR, "chain query timed out".into())),
         ),
     }
+}
+
+fn chain_query(
+    queries: Option<&QuerySender>,
+    f: impl FnOnce(&mut Chainstate, &mut PeerManager<TcpStream>) -> Result<Value, (i64, String)>
+    + Send
+    + 'static,
+) -> (Value, Option<(i64, String)>) {
+    chain_query_deferred(queries, move |cs, mgr| QueryReply::Now(f(cs, mgr)))
 }
 
 /// The cap on parked `waitforblock*` predicates — a flood of wait calls
@@ -9340,36 +9386,42 @@ pub(crate) fn dispatch(
             }
             let requests = arr[0].clone();
             let wallet = wallet.cloned();
-            chain_query(queries, move |cs, _| {
+            chain_query_deferred(queries, move |cs, _| {
                 let Some(wallet) = wallet else {
-                    return Err((
+                    return QueryReply::Now(Err((
                         RPC_MISC_ERROR,
                         "watch-only wallet is not available on this node".into(),
-                    ));
+                    )));
                 };
                 let Some(requests) = requests.as_array() else {
-                    return Err((
+                    return QueryReply::Now(Err((
                         RPC_TYPE_ERROR,
                         wrong_type_message(1, "requests", &requests, "array"),
-                    ));
+                    )));
                 };
                 let mut results = Vec::with_capacity(requests.len());
                 // Core resolves every request's timestamp first — the
                 // rescan starts at min(ts) - 2h once for the batch.
                 let mut rescan_at: Option<u32> = None;
                 {
-                    let mut w = wallet
-                        .lock()
-                        .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                    let mut w = match wallet.lock() {
+                        Ok(w) => w,
+                        Err(_) => {
+                            return QueryReply::Now(Err((
+                                RPC_MISC_ERROR,
+                                "wallet lock poisoned".into(),
+                            )));
+                        }
+                    };
                     for req in requests {
                         // Core's RPCTypeCheck — a missing timestamp
                         // field is a call-level -3, not a
                         // per-request failure.
                         if req.get("timestamp").is_none_or(Value::is_null) {
-                            return Err((
+                            return QueryReply::Now(Err((
                                 RPC_TYPE_ERROR,
                                 "Missing required timestamp field for key".into(),
-                            ));
+                            )));
                         }
                         match import_one_descriptor(&mut w, cs, req) {
                             Ok(Some(h)) => {
@@ -9389,10 +9441,29 @@ pub(crate) fn dispatch(
                     }
                     if let Some(h) = rescan_at {
                         w.rescan_from(cs, h);
+                        // Pruned bodies leave gaps — park; the sync
+                        // loop refetches them and finishes the scan.
+                        let missing = w.missing_heights();
+                        let pending: std::collections::BTreeMap<u32, _> = missing
+                            .into_iter()
+                            .filter_map(|h| cs.chain().get(h as usize).map(|hash| (h, *hash)))
+                            .collect();
+                        if !pending.is_empty() {
+                            let _ = w.persist();
+                            let wallet = wallet.clone();
+                            return QueryReply::Defer(DeferredQuery {
+                                wallet,
+                                pending,
+                                deadline: std::time::Instant::now()
+                                    + std::time::Duration::from_secs(600),
+                                done: Value::Array(results),
+                                reply: mpsc::channel().0,
+                            });
+                        }
                     }
                     let _ = w.persist();
                 }
-                Ok(Value::Array(results))
+                QueryReply::Now(Ok(Value::Array(results)))
             })
         }
         // Core's `listdescriptors` — the imported descriptor table.
@@ -9440,27 +9511,65 @@ pub(crate) fn dispatch(
             let start = arr.first().and_then(Value::as_i64).unwrap_or(0);
             let stop = arr.get(1).and_then(Value::as_i64);
             let wallet = wallet.cloned();
-            chain_query(queries, move |cs, _| {
+            chain_query_deferred(queries, move |cs, _| {
                 let Some(wallet) = wallet else {
-                    return Err((
+                    return QueryReply::Now(Err((
                         RPC_MISC_ERROR,
                         "watch-only wallet is not available on this node".into(),
-                    ));
+                    )));
                 };
                 let tip = cs.chain().len().saturating_sub(1) as i64;
                 if start < 0 || start > tip {
-                    return Err((RPC_INVALID_PARAMETER, "Invalid start_height".into()));
+                    return QueryReply::Now(Err((
+                        RPC_INVALID_PARAMETER,
+                        "Invalid start_height".into(),
+                    )));
                 }
                 if let Some(st) = stop
                     && (st < start || st > tip)
                 {
-                    return Err((RPC_INVALID_PARAMETER, "Invalid stop_height".into()));
+                    return QueryReply::Now(Err((
+                        RPC_INVALID_PARAMETER,
+                        "Invalid stop_height".into(),
+                    )));
                 }
                 let stop_h = stop.unwrap_or(tip);
-                let mut w = wallet
-                    .lock()
-                    .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                let mut w = match wallet.lock() {
+                    Ok(w) => w,
+                    Err(_) => {
+                        return QueryReply::Now(Err((
+                            RPC_MISC_ERROR,
+                            "wallet lock poisoned".into(),
+                        )));
+                    }
+                };
                 w.rescan_from(cs, start as u32);
+                // Pruned bodies leave gaps — park the query; the sync
+                // loop refetches them and finishes the rescan.
+                let missing = w.missing_heights();
+                if !missing.is_empty() {
+                    let pending: std::collections::BTreeMap<u32, _> = missing
+                        .into_iter()
+                        .filter_map(|h| cs.chain().get(h as usize).map(|hash| (h, *hash)))
+                        .collect();
+                    if pending.is_empty() {
+                        // Heights past the connected tip — nothing to
+                        // refetch; they're genuinely unscanned.
+                    } else {
+                        drop(w);
+                        return QueryReply::Defer(DeferredQuery {
+                            wallet,
+                            pending,
+                            deadline: std::time::Instant::now()
+                                + std::time::Duration::from_secs(600),
+                            done: json!({
+                                "start_height": start,
+                                "stop_height": stop_h,
+                            }),
+                            reply: mpsc::channel().0, // replaced by answer
+                        });
+                    }
+                }
                 // A bounded rescan stops short of the tip — truncate
                 // the recorded chain at stop_h.
                 if stop_h < tip {
@@ -9475,10 +9584,10 @@ pub(crate) fn dispatch(
                     w.chain.truncate(keep);
                 }
                 let _ = w.persist();
-                Ok(json!({
+                QueryReply::Now(Ok(json!({
                     "start_height": start,
                     "stop_height": stop_h,
-                }))
+                })))
             })
         }
         // Core's `listunspent` — confirmed coins plus (with
@@ -11747,9 +11856,10 @@ mod tests {
         let (tx, rx) = mpsc::channel::<ChainQuery>();
         let mut mgr: PeerManager<TcpStream> = PeerManager::new(8);
         let mut cs = cs;
+        let mut rescans = std::collections::VecDeque::new();
         thread::spawn(move || {
             while let Ok(q) = rx.recv() {
-                q.answer(&mut cs, &mut mgr);
+                q.answer(&mut cs, &mut mgr, &mut rescans);
             }
         });
         tx

@@ -694,6 +694,37 @@ impl<S: Read + Write> PeerManager<S> {
         }
     }
 
+    /// Fetch specific blocks by hash — the rescan reacquisition path.
+    /// Picks the first established peer that advertises full/limited
+    /// block service; returns true when a request went out.
+    pub fn request_blocks(&mut self, hashes: &[avila_consensus::hash::BlockHash]) -> bool {
+        let invs: Vec<crate::message::InvVector> = hashes
+            .iter()
+            .map(|hash| crate::message::InvVector {
+                inv_type: crate::message::InvType::WitnessBlock,
+                hash: *hash,
+            })
+            .collect();
+        if invs.is_empty() {
+            return false;
+        }
+        let msg = Message::GetData(invs);
+        for peer in self.peers.values_mut() {
+            if !peer.session.established() {
+                continue;
+            }
+            let services = peer.session.peer().map(|p| p.services).unwrap_or_default();
+            if services & (crate::message::NODE_NETWORK | crate::message::NODE_NETWORK_LIMITED) == 0
+            {
+                continue;
+            }
+            if peer.session.send(&msg).is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Announces a locally submitted transaction to every relay-accepting
     /// peer — the broadcast half of `sendrawtransaction`.
     pub fn announce_tx(

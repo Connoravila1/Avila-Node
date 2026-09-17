@@ -172,6 +172,32 @@ impl WatchWallet {
         self.dirty
     }
 
+    /// Scan a single gap block that reacquisition fetched — records
+    /// the txs and drops `height` from `gaps`. Returns true when the
+    /// gap closed.
+    pub fn scan_gap_height(
+        &mut self,
+        block: &avila_consensus::block::Block,
+        height: u32,
+        hash: BlockHash,
+    ) -> bool {
+        self.scan_block(block, height, hash);
+        self.gaps
+            .retain(|(lo, hi)| !(height >= *lo && height <= *hi));
+        self.dirty = true;
+        true
+    }
+
+    /// Heights still uncovered by any scan — the pending-refetch list.
+    #[must_use]
+    pub fn missing_heights(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        for (lo, hi) in &self.gaps {
+            out.extend(*lo..=*hi);
+        }
+        out
+    }
+
     /// `ScanForWalletTransactions` over one connected block — record
     /// outputs paying tracked scripts, then mark spends of ours.
     fn scan_block(&mut self, block: &avila_consensus::block::Block, height: u32, hash: BlockHash) {
@@ -766,5 +792,34 @@ mod tests {
         w.advance(&cs);
         assert_eq!(w.unspent().count(), 4);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn gap_reacquisition_rescans_arrived_bodies() {
+        // A wallet scanned over pruned blocks records gaps; when the
+        // bodies reacquire (getdata → accept_block), `scan_gap_height`
+        // fills them and `missing_heights` shrinks to empty.
+        let cs = chain_of(4);
+        let mut w = WatchWallet::open(PathBuf::from("/nonexistent/watchlist.dat"));
+        w.track(tracked(WATCHED), 0);
+        w.advance(&cs);
+        assert_eq!(w.unspent().count(), 4);
+
+        // Simulate a rescan that skipped blocks 1..=3 — wipe the coins
+        // they made and mark the gap like `advance` does on missing
+        // bodies.
+        w.coins.retain(|_, c| c.height == 0 || c.height >= 4);
+        w.gaps.push((1, 3));
+        assert_eq!(w.missing_heights(), vec![1, 2, 3]);
+
+        // The fetched blocks arrive — scan each gap height.
+        for h in [1u32, 2, 3] {
+            let hash = cs.chain()[h as usize];
+            let body = cs.body(&hash).unwrap();
+            w.scan_gap_height(&body, h, hash);
+        }
+        assert!(w.missing_heights().is_empty());
+        // The refound coins match the original scan exactly.
+        assert_eq!(w.unspent().count(), 4);
+        assert!(w.coins.values().all(|c| c.spent_height.is_none()));
     }
 }
