@@ -466,6 +466,7 @@ pub fn call(addr: SocketAddr, auth: Option<&str>, request: &Value) -> Result<Val
 
 /// JSON-RPC error codes Core uses.
 const RPC_MISC_ERROR: i64 = -1;
+const RPC_DATABASE_ERROR: i64 = -2;
 const RPC_WALLET_ERROR: i64 = -4;
 const RPC_TYPE_ERROR: i64 = -3;
 const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
@@ -3094,6 +3095,12 @@ const GETINDEXINFO_HELP: &str = "getindexinfo ( \"index_name\" )\n\nReturns the 
 /// Verbatim `help preciousblock` text (Bitcoin Core 29.4).
 const PRECIOUSBLOCK_HELP: &str = "preciousblock \"blockhash\"\n\nTreats a block as if it were received before others with the same work.\n\nA later preciousblock call can override the effect of an earlier one.\n\nThe effects of preciousblock are not retained across restarts.\n\nArguments:\n1. blockhash    (string, required) the hash of the block to mark as precious\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli preciousblock \"blockhash\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"preciousblock\", \"params\": [\"blockhash\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
+/// Verbatim `help invalidateblock` text (Bitcoin Core 29.4).
+const INVALIDATEBLOCK_HELP: &str = "invalidateblock \"blockhash\"\n\nPermanently marks a block as invalid, as if it violated a consensus rule.\n\nArguments:\n1. blockhash    (string, required) the hash of the block to mark as invalid\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli invalidateblock \"blockhash\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"invalidateblock\", \"params\": [\"blockhash\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
+/// Verbatim `help reconsiderblock` text (Bitcoin Core 29.4).
+const RECONSIDERBLOCK_HELP: &str = "reconsiderblock \"blockhash\"\n\nRemoves invalidity status of a block, its ancestors and its descendants, reconsider them for activation.\nThis can be used to undo the effects of invalidateblock.\n\nArguments:\n1. blockhash    (string, required) the hash of the block to reconsider\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli reconsiderblock \"blockhash\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"reconsiderblock\", \"params\": [\"blockhash\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+
 const GETCHAINTXSTATS_HELP: &str = "getchaintxstats ( nblocks \"blockhash\" )\n\nCompute statistics about the total number and rate of transactions in the chain.\n\nArguments:\n1. nblocks      (numeric, optional, default=one month) Size of the window in number of blocks\n2. blockhash    (string, optional, default=chain tip) The hash of the block that ends the window.\n\nResult:\n{                                       (json object)\n  \"time\" : xxx,                         (numeric) The timestamp for the final block in the window, expressed in UNIX epoch time\n  \"txcount\" : n,                        (numeric, optional) The total number of transactions in the chain up to that point, if known. It may be unknown when using assumeutxo.\n  \"window_final_block_hash\" : \"hex\",    (string) The hash of the final block in the window\n  \"window_final_block_height\" : n,      (numeric) The height of the final block in the window.\n  \"window_block_count\" : n,             (numeric) Size of the window in number of blocks\n  \"window_interval\" : n,                (numeric, optional) The elapsed time in the window in seconds. Only returned if \"window_block_count\" is > 0\n  \"window_tx_count\" : n,                (numeric, optional) The number of transactions in the window. Only returned if \"window_block_count\" is > 0 and if txcount exists for the start and end of the window.\n  \"txrate\" : n                          (numeric, optional) The average rate of transactions per second in the window. Only returned if \"window_interval\" is > 0 and if window_tx_count exists.\n}\n\nExamples:\n> bitcoin-cli getchaintxstats \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getchaintxstats\", \"params\": [2016]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help gettxoutsetinfo` text (Bitcoin Core 29.4).
@@ -4511,6 +4518,16 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         "preciousblock",
         &[("blockhash", Some("string"), true)],
         PRECIOUSBLOCK_HELP,
+    ),
+    (
+        "invalidateblock",
+        &[("blockhash", Some("string"), true)],
+        INVALIDATEBLOCK_HELP,
+    ),
+    (
+        "reconsiderblock",
+        &[("blockhash", Some("string"), true)],
+        RECONSIDERBLOCK_HELP,
     ),
     (
         "prioritisetransaction",
@@ -8819,6 +8836,42 @@ pub(crate) fn dispatch(
                 Err(_) => Err((RPC_MISC_ERROR, "preciousblock revalidation failed".into())),
             })
         }
+        "invalidateblock" | "reconsiderblock" => {
+            let is_invalidate = method == "invalidateblock";
+            let help = if is_invalidate {
+                INVALIDATEBLOCK_HELP
+            } else {
+                RECONSIDERBLOCK_HELP
+            };
+            let [v] = params.as_array().map(Vec::as_slice).unwrap_or(&[]) else {
+                return help_error(help);
+            };
+            let Some(s) = v.as_str() else {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        wrong_type_message(1, "blockhash", v, "string"),
+                    )),
+                );
+            };
+            let hash: BlockHash = match parse_hash_v(s, "blockhash") {
+                Ok(h) => h,
+                Err(e) => return (Value::Null, Some(e)),
+            };
+            chain_query(queries, move |cs, _mgr| {
+                let result = if is_invalidate {
+                    cs.invalidate_block(&hash)
+                } else {
+                    cs.reconsider_block(&hash)
+                };
+                match result {
+                    Ok(true) => Ok(Value::Null),
+                    Ok(false) => Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into())),
+                    Err(e) => Err((RPC_DATABASE_ERROR, format!("{e:?}"))),
+                }
+            })
+        }
         "getchaintxstats" => {
             let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
             if arr.len() > 2 {
@@ -11855,6 +11908,7 @@ pub(crate) fn dispatch(
                      \x20   dumptxoutset <path> [type] [options], loadtxoutset <path>,\n\
                      \x20   importmempool <path> [options], savemempool,\n\
                      \x20   getblockfilter <hash> [type],\n\
+                     \x20   invalidateblock <hash>, reconsiderblock <hash>,\n\
                      \x20   scanblocks <action> [...],\n\
                      \x20   getdescriptoractivity <hashes> <scanobjects>\n\
                      \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
@@ -14816,6 +14870,110 @@ mod tests {
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
+    }
+
+    /// `invalidateblock`/`reconsiderblock` — ParseHashV errors, `-5`
+    /// for a hash outside the index, `null` on success. Genesis is a
+    /// Core-documented no-op success (`nHeight == 0` returns early).
+    #[test]
+    fn invalidate_reconsider_dispatch_contract() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        for method in ["invalidateblock", "reconsiderblock"] {
+            // Missing/extra args → -1 + help; non-string → -3.
+            let (_, e) = dispatch(
+                method,
+                &json!([]),
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(e.unwrap().0, RPC_MISC_ERROR, "{method}");
+            let (_, e) = dispatch(
+                method,
+                &json!([7]),
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(e.unwrap().0, RPC_TYPE_ERROR, "{method}");
+            let (_, e) = dispatch(
+                method,
+                &json!(["00", "x"]),
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(e.unwrap().0, RPC_MISC_ERROR, "{method}");
+
+            // ParseHashV: wrong length → -8.
+            let (_, e) = dispatch(
+                method,
+                &json!(["00"]),
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER, "{method}");
+
+            // Well-formed but unknown → -5 Block not found.
+            let (_, e) = dispatch(
+                method,
+                &json!(["00".repeat(32)]),
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(
+                e.unwrap(),
+                (RPC_INVALID_ADDRESS_OR_KEY, "Block not found".to_string()),
+                "{method}"
+            );
+        }
+
+        // Genesis: invalidating is a Core-silent no-op returning null;
+        // reconsidering a never-failed block is a null no-op too.
+        let (r, e) = dispatch(
+            "getblockhash",
+            &json!([0]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none());
+        let genesis = r.as_str().unwrap().to_string();
+        for method in ["invalidateblock", "reconsiderblock"] {
+            let (r, e) = dispatch(
+                method,
+                &json!([genesis]),
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert!(e.is_none(), "{method}: {e:?}");
+            assert_eq!(r, Value::Null, "{method}");
+        }
     }
 
     /// `prioritisetransaction` — Core 29.4's validation order: exactly

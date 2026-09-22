@@ -33,6 +33,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
+use crate::arith::Work;
 use crate::block::Block;
 use crate::chain::{ChainError, HeaderTree, InsertStatus};
 use crate::check::{self, BlockContext, BlockRuleError, ContextualBlockError, RuleError};
@@ -2319,6 +2320,139 @@ impl Chainstate {
         self.maybe_reorg(*hash, &params)?;
         Ok(true)
     }
+
+    /// `invalidateblock` — permanently marks `hash` failed along with every
+    /// descendant (Core's `BLOCK_FAILED_VALID`/`BLOCK_FAILED_CHILD` sweep),
+    /// disconnecting the chain down to its parent when it sits on the active
+    /// tip path, then re-runs tip selection over what remains.
+    ///
+    /// Returns `Ok(false)` when `hash` is not in the block index (the RPC maps
+    /// that to `-5` "Block not found"); `Ok(true)` otherwise — including the
+    /// genesis block, whose invalidation Core refuses silently (`nHeight == 0`
+    /// returns early, so the RPC still reports success).
+    ///
+    /// Disconnected transactions are not fed back to a mempool — Core's
+    /// `MaybeUpdateMempoolForReorg` `fAddToMempool` path has no counterpart
+    /// here yet.
+    ///
+    /// # Errors
+    ///
+    /// `ConnectError` when a disconnect or the follow-up activation hits an
+    /// internal inconsistency (missing body/undo, undo mismatch, coinsdb
+    /// commit failure).
+    pub fn invalidate_block(&mut self, hash: &BlockHash) -> Result<bool, ConnectError> {
+        let Some(node) = self.tree.get(hash) else {
+            return Ok(false);
+        };
+        if node.height == 0 {
+            return Ok(true);
+        }
+        let height = node.height;
+        self.tree.mark_invalid_subtree(hash);
+        if self.chain.get(height as usize) == Some(hash) {
+            self.rewind_connected(height - 1)?;
+        }
+        self.activate_best()?;
+        Ok(true)
+    }
+
+    /// `reconsiderblock` — clears the failed flag on `hash`, its ancestors and
+    /// descendants (Core's `ResetBlockFailureFlags`), then re-runs tip
+    /// selection: a previously disconnected branch that still carries the most
+    /// work re-activates through the normal connect path.
+    ///
+    /// Returns `Ok(false)` when `hash` is not in the block index.
+    ///
+    /// # Errors
+    ///
+    /// `ConnectError` on the same internal failures as `invalidate_block`.
+    pub fn reconsider_block(&mut self, hash: &BlockHash) -> Result<bool, ConnectError> {
+        if !self.tree.contains(hash) {
+            return Ok(false);
+        }
+        self.tree.clear_invalid_subtree(hash);
+        self.activate_best()?;
+        Ok(true)
+    }
+
+    /// Disconnects the connected chain down to `target` — the `DisconnectTip`
+    /// loop inside Core's `InvalidateBlock`. Each popped block's undo reverses
+    /// its UTXO application and the height drops out of the filter/scripthash
+    /// indexes; the coin delta and new tip then commit in one transaction via
+    /// `flush_coins`.
+    fn rewind_connected(&mut self, target: u32) -> Result<(), ConnectError> {
+        while self.chain.len() as u32 - 1 > target {
+            let height = self.chain.len() as u32 - 1;
+            let block_hash = self.chain[height as usize];
+            let block = self
+                .body(&block_hash)
+                .ok_or(ConnectError::Internal("missing connected block body"))?;
+            let undo = self
+                .undo(height)
+                .ok_or(ConnectError::Internal("missing connected undo"))?;
+            connect::disconnect_block(&block, &mut self.utxo, &undo)
+                .map_err(|_| ConnectError::Internal("disconnect undo inconsistent"))?;
+            if let Some(index) = &mut self.filterindex {
+                index.disconnect(height);
+            }
+            if let Some(index) = &mut self.scripthashindex {
+                index.disconnect(height);
+            }
+            self.chain.pop();
+            let base = self.undo_base();
+            self.undos
+                .truncate((height - 1).saturating_sub(base) as usize);
+        }
+        if let Some(tip) = self.chain.last() {
+            self.connected = *tip;
+        }
+        self.flush_coins()
+            .map_err(|_| ConnectError::Internal("coinsdb flush failed"))?;
+        Ok(())
+    }
+
+    /// `ActivateBestChain` — while a stored-body, non-failed branch outworks
+    /// the connected tip (or ties it as the `preciousblock`), reorg to the
+    /// heaviest such candidate and rescan. A candidate that fails to connect
+    /// is marked inside `maybe_reorg` and drops out of the next scan; one that
+    /// merely cannot activate (header-only ancestors, the snapshot floor) is
+    /// tried once per call and skipped.
+    fn activate_best(&mut self) -> Result<(), ConnectError> {
+        let params = *self.tree.params();
+        let mut tried: HashSet<BlockHash> = HashSet::new();
+        loop {
+            let conn_work = self
+                .tree
+                .get(&self.connected)
+                .map_or(Work::ZERO, |n| n.chainwork);
+            let mut best: Option<(Work, BlockHash)> = None;
+            for (h, node) in self.tree.nodes() {
+                if *h == self.connected
+                    || tried.contains(h)
+                    || self.tree.is_failed(h)
+                    || !self.have_body(h)
+                {
+                    continue;
+                }
+                let eligible = node.chainwork > conn_work
+                    || (node.chainwork == conn_work && self.precious == Some(*h));
+                if eligible && best.as_ref().is_none_or(|(w, _)| node.chainwork > *w) {
+                    best = Some((node.chainwork, *h));
+                }
+            }
+            let Some((_, candidate)) = best else {
+                break;
+            };
+            match self.maybe_reorg(candidate, &params) {
+                // The tip moved — rescan for deeper candidates.
+                Ok(Some(_)) => tried.clear(),
+                Ok(None) | Err(_) => {
+                    tried.insert(candidate);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -3814,5 +3948,96 @@ mod tests {
         assert_eq!(resumed, expected);
         drop(cs);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `invalidateblock`/`reconsiderblock`: invalidating a mid-chain block
+    /// rewinds the connected chain and activates a heavier competitor;
+    /// reconsidering clears the marks and reconnects the branch back to
+    /// its original tip.
+    #[test]
+    fn invalidate_and_reconsider_rewind_and_restore() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        let genesis = genesis_header();
+
+        // Main chain g→b1→b2→b3.
+        let b1 = block_on(&genesis, vec![coinbase_tx(1, subsidy(1))], &params);
+        let b2 = block_on(&b1.header, vec![coinbase_tx(2, subsidy(2))], &params);
+        let b3 = block_on(&b2.header, vec![coinbase_tx(3, subsidy(3))], &params);
+        for b in [&b1, &b2, &b3] {
+            assert!(matches!(
+                cs.accept_block(b, NOW),
+                Ok(Acceptance::Connected { .. })
+            ));
+        }
+
+        // Equal-work side branch g→b1→c2→c3, parked on arrival.
+        let c2 = block_on(
+            &b1.header,
+            vec![tagged_coinbase(2, subsidy(2), 0xC2)],
+            &params,
+        );
+        let c3 = block_on(
+            &c2.header,
+            vec![tagged_coinbase(3, subsidy(3), 0xC3)],
+            &params,
+        );
+        for b in [&c2, &c3] {
+            assert!(matches!(
+                cs.accept_block(b, NOW),
+                Ok(Acceptance::Parked { .. })
+            ));
+        }
+        assert_eq!(cs.chain().len(), 4);
+        assert_eq!(cs.tip_hash(), b3.block_hash());
+
+        // Unknown hash → false; genesis → true no-op.
+        assert_eq!(cs.invalidate_block(&BlockHash::from([0xAB; 32])), Ok(false));
+        assert!(cs.invalidate_block(&genesis.hash()).unwrap());
+        assert_eq!(cs.chain().len(), 4);
+
+        // Invalidate b2: b2 and b3 are marked, the chain rewinds to b1,
+        // and the surviving c-branch out-works the stub — it activates.
+        assert!(cs.invalidate_block(&b2.block_hash()).unwrap());
+        assert!(cs.tree().is_failed(&b2.block_hash()));
+        assert!(cs.tree().is_failed(&b3.block_hash()));
+        assert_eq!(cs.tip_hash(), c3.block_hash());
+        assert_eq!(cs.chain()[2], c2.block_hash());
+        assert_eq!(cs.chain()[3], c3.block_hash());
+
+        // Reconsider b2: clears b2/b3 and any flagged ancestors. b3 and
+        // c3 tie on work and c3 is already the tip, so the b-branch
+        // stays parked until preciousblock breaks the tie.
+        assert!(cs.reconsider_block(&b2.block_hash()).unwrap());
+        assert!(!cs.tree().is_failed(&b2.block_hash()));
+        assert!(!cs.tree().is_failed(&b3.block_hash()));
+        assert_eq!(cs.tip_hash(), c3.block_hash());
+
+        // Precious b3 breaks the tie — the b-branch reactivates.
+        assert!(cs.precious_block(&b3.block_hash()).unwrap());
+        assert_eq!(cs.tip_hash(), b3.block_hash());
+    }
+
+    /// Invalidating the tip with no surviving competitor simply rewinds.
+    #[test]
+    fn invalidate_tip_rewinds_one_block() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        let genesis = genesis_header();
+        let b1 = block_on(&genesis, vec![coinbase_tx(1, subsidy(1))], &params);
+        let b2 = block_on(&b1.header, vec![coinbase_tx(2, subsidy(2))], &params);
+        for b in [&b1, &b2] {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        assert!(cs.invalidate_block(&b2.block_hash()).unwrap());
+        assert_eq!(cs.tip_hash(), b1.block_hash());
+        assert_eq!(cs.chain().len(), 2);
+        assert!(cs.tree().is_failed(&b2.block_hash()));
+
+        // Reconsider reconnects it — the body is still stored and the
+        // branch out-works b1.
+        assert!(cs.reconsider_block(&b2.block_hash()).unwrap());
+        assert_eq!(cs.tip_hash(), b2.block_hash());
+        assert_eq!(cs.chain().len(), 3);
     }
 }

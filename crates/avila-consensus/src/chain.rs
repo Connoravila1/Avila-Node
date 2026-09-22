@@ -407,6 +407,52 @@ impl HeaderTree {
         self.invalid.contains(hash)
     }
 
+    /// `InvalidateBlock`'s subtree marking — `hash` takes `BLOCK_FAILED_VALID` and
+    /// every descendant `BLOCK_FAILED_CHILD`; this set tracks the mask, not the
+    /// individual flags. Descendants are found by a full index scan — the same
+    /// `mapBlockIndex` sweep Core runs, O(nodes × ancestor walk), so callers use
+    /// this for operator-initiated invalidation, not per-block paths.
+    pub(crate) fn mark_invalid_subtree(&mut self, hash: &BlockHash) {
+        let Some(target) = self.nodes.get(hash) else {
+            return;
+        };
+        let base_height = target.height;
+        self.invalid.insert(*hash);
+        let descendants: Vec<BlockHash> = self
+            .nodes
+            .iter()
+            .filter(|(_, cand)| cand.height > base_height && self.is_ancestor(target, cand))
+            .map(|(h, _)| *h)
+            .collect();
+        self.invalid.extend(descendants);
+    }
+
+    /// `ResetBlockFailureFlags` — clears the failed flag on `hash` and all its
+    /// descendants (the index sweep), then on every ancestor (the `pprev` walk).
+    /// Other descendants of a flagged ancestor stay failed, matching Core.
+    pub(crate) fn clear_invalid_subtree(&mut self, hash: &BlockHash) {
+        let Some(target) = self.nodes.get(hash) else {
+            return;
+        };
+        let base_height = target.height;
+        let mut to_clear: Vec<BlockHash> = self
+            .nodes
+            .iter()
+            .filter(|(_, cand)| cand.height >= base_height && self.is_ancestor(target, cand))
+            .map(|(h, _)| *h)
+            .collect();
+        let mut cursor = Some(target.header.prev_block_hash);
+        while let Some(h) = cursor {
+            if self.invalid.contains(&h) {
+                to_clear.push(h);
+            }
+            cursor = self.nodes.get(&h).map(|n| n.header.prev_block_hash);
+        }
+        for h in to_clear {
+            self.invalid.remove(&h);
+        }
+    }
+
     /// The best (most-work) header chain, genesis at index 0 — the chain
     /// `getheaders` serves from. Rebuilt by walking the tip's ancestry, so
     /// `O(tip height)`; the serving path caps responses at 2000 headers but
