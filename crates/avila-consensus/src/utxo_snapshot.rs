@@ -77,9 +77,8 @@ fn compress_script(script: &Script) -> (u64, Vec<u8>) {
             // 4/5 — uncompressed keys keep X; Y is recomputed on decode.
             (4 + u64::from(key[64] & 1), key[1..33].to_vec())
         }
-        // IDs 28/29/30 (P2WPKH/P2WSH/P2TR) are decode-only leftovers —
-        // Core stopped writing them in v23, so witness scripts take
-        // the default `len + 6` + raw form like everything else.
+        // Witness and everything else take the default `len + 6` +
+        // raw form — Core's `CompressScript` has no witness cases.
         _ => (script.len() as u64 + 6, script.as_bytes().to_vec()),
     }
 }
@@ -384,28 +383,6 @@ fn decompress_script(r: &mut impl std::io::Read, size_id: u64) -> std::io::Resul
             s.push(0xac);
             Ok(Script::new(s))
         }
-        // Decode-only legacy witness ids.
-        28 => {
-            let h = take(20)?;
-            let mut s = Vec::with_capacity(22);
-            s.extend_from_slice(&[0x00, 0x14]);
-            s.extend_from_slice(&h);
-            Ok(Script::new(s))
-        }
-        29 => {
-            let h = take(32)?;
-            let mut s = Vec::with_capacity(34);
-            s.extend_from_slice(&[0x00, 0x20]);
-            s.extend_from_slice(&h);
-            Ok(Script::new(s))
-        }
-        30 => {
-            let h = take(32)?;
-            let mut s = Vec::with_capacity(34);
-            s.extend_from_slice(&[0x51, 0x20]);
-            s.extend_from_slice(&h);
-            Ok(Script::new(s))
-        }
         n => {
             let payload = take((n - 6) as usize)?;
             Ok(Script::new(payload))
@@ -515,7 +492,13 @@ pub fn read_coins<R: std::io::Read>(
             };
             if coin.height > base_height || outpoint_vout >= u64::from(u32::MAX) {
                 return Err(SnapshotError(format!(
-                    "Bad snapshot data after deserializing {coins_processed} coins"
+                    "Bad snapshot data after deserializing {coins_processed} coins (height={} vout={} code={} size_id={} amt_raw={} txid={})",
+                    coin.height,
+                    outpoint_vout,
+                    code,
+                    size_id,
+                    amount_raw,
+                    crate::hash::format_display_hex(&txid),
                 )));
             }
             if !(0..=crate::check::MAX_MONEY).contains(&coin.out.value) {

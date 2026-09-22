@@ -1043,12 +1043,27 @@ impl Chainstate {
         if let Some(be) = &self.coins_backend {
             loaded.attach_shared(be.clone());
         }
+        // Backend mode: stream the coins through the dirty map in
+        // bounded batches — a single commit of a full mainnet snapshot
+        // (~166M entries) would balloon the write transaction.
+        let mut since_flush = 0u32;
+        let mut flush_err: Option<std::io::Error> = None;
         crate::utxo_snapshot::read_coins(r, meta.coins_count, base_height, |outpoint, coin| {
-            loaded.insert_synthetic(outpoint, coin)
+            if flush_err.is_some() {
+                return;
+            }
+            loaded.insert_synthetic(outpoint, coin);
+            since_flush += 1;
+            if since_flush >= 2_000_000 && loaded.has_backend() {
+                if let Err(e) = loaded.flush_partial_to_backend() {
+                    flush_err = Some(e);
+                }
+                since_flush = 0;
+            }
         })?;
-        // Backend mode: the snapshot coins must land in the coinsdb —
-        // a dirty map this large would blow the budget on the next
-        // connect anyway.
+        if let Some(e) = flush_err {
+            return Err(SnapshotError(format!("coinsdb import: {e}")));
+        }
         if loaded.has_backend() {
             loaded
                 .flush_to_backend(&[], base_height)

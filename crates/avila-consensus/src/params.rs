@@ -134,6 +134,18 @@ impl Network {
                         n_chain_tx: 1_145_604_538,
                         blockhash: "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880",
                     },
+                    AssumeutxoData {
+                        height: 910_000,
+                        hash_serialized: "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
+                        n_chain_tx: 1_226_586_151,
+                        blockhash: "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+                    },
+                    AssumeutxoData {
+                        height: 935_000,
+                        hash_serialized: "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050",
+                        n_chain_tx: 1_305_397_408,
+                        blockhash: "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee",
+                    },
                 ],
                 genesis_header: MAINNET_GENESIS,
             },

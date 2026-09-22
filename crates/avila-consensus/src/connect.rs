@@ -320,6 +320,12 @@ impl UtxoSet {
         self.put(outpoint, Some(coin));
     }
 
+    /// Spends `outpoint` — Core's `SpendCoin`. Returns the consumed
+    /// coin; a tombstone is recorded so the deletion survives flush.
+    pub fn spend_coin(&mut self, outpoint: &OutPoint) -> Option<Coin> {
+        self.spend(outpoint)
+    }
+
     /// Read-through to the layers below `map`.
     fn lower_get(&self, outpoint: &OutPoint) -> Option<Coin> {
         self.base
@@ -504,6 +510,21 @@ impl UtxoSet {
             return Ok(());
         };
         be.commit(&self.map, new_undos, tip)?;
+        self.map.clear();
+        self.map_bytes = 0;
+        self.live_delta = 0;
+        Ok(())
+    }
+
+    /// Coins-only flush that does NOT advance the backend tip — the
+    /// bounded-batch drain inside snapshot import. A crash between
+    /// batches leaves the backend at its old committed tip with extra
+    /// coins orphaned (re-import overwrites them), never a false tip.
+    pub fn flush_partial_to_backend(&mut self) -> std::io::Result<()> {
+        let Some(be) = &self.backend else {
+            return Ok(());
+        };
+        be.commit_partial(&self.map)?;
         self.map.clear();
         self.map_bytes = 0;
         self.live_delta = 0;

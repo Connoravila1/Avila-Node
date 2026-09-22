@@ -12,11 +12,15 @@
 //! * `meta`: `tip_height`, `coins_len` — self-describing consistency
 //!   markers committed in the same transaction as the coins.
 //!
-//! Consistency model: a commit is atomic, so `tip_height` always
-//! describes exactly the coin state on disk. `state.dat` is written
+//! Consistency model: a commit is atomic, so `tip_height` never
+//! describes more than the coin state on disk. `state.dat` is written
 //! *after* the commit lands, so on load the backend may be ahead of
 //! the snapshot (rewind via stored undos + blk-file bodies) but never
 //! behind — a behind-state is declared corrupt, not silently patched.
+//! `commit_partial` (snapshot import batches) deliberately commits
+//! coins without advancing `tip_height`: a torn import leaves the old
+//! tip with extra orphaned coins, which re-import overwrites — never
+//! a tip claiming uncommitted state.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -248,6 +252,22 @@ impl CoinsBackend {
         new_undos: &[(u32, crate::hash::BlockHash, BlockUndo)],
         tip: u32,
     ) -> std::io::Result<()> {
+        self.commit_inner(dirty, new_undos, Some(tip))
+    }
+
+    /// Like `commit` but leaves the meta tip untouched — mid-import
+    /// batches in snapshot loading. A torn import then still reads
+    /// tip=old (an unfinished activation never looks committed).
+    pub fn commit_partial(&self, dirty: &HashMap<OutPoint, Option<Coin>>) -> std::io::Result<()> {
+        self.commit_inner(dirty, &[], None)
+    }
+
+    fn commit_inner(
+        &self,
+        dirty: &HashMap<OutPoint, Option<Coin>>,
+        new_undos: &[(u32, crate::hash::BlockHash, BlockUndo)],
+        tip: Option<u32>,
+    ) -> std::io::Result<()> {
         let w = self
             .db
             .begin_write()
@@ -292,8 +312,10 @@ impl CoinsBackend {
                 .map_err(|e| std::io::Error::other(format!("coinsdb meta: {e}")))?;
             meta.insert(K_LEN, new_len.to_le_bytes().as_slice())
                 .map_err(|e| std::io::Error::other(format!("coinsdb meta len: {e}")))?;
-            meta.insert(K_TIP, tip.to_le_bytes().as_slice())
-                .map_err(|e| std::io::Error::other(format!("coinsdb meta tip: {e}")))?;
+            if let Some(tip) = tip {
+                meta.insert(K_TIP, tip.to_le_bytes().as_slice())
+                    .map_err(|e| std::io::Error::other(format!("coinsdb meta tip: {e}")))?;
+            }
         }
         w.commit()
             .map_err(|e| std::io::Error::other(format!("coinsdb commit: {e}")))?;
