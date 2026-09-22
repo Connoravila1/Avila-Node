@@ -283,7 +283,13 @@ pub fn run(
             let _ = m.addrbook().save(&peers_path);
         });
     }
-    let seeded = mgr.seed_from_dns(params, unix_now());
+    // `-connect` is exclusive in Core — naming peers suppresses DNS
+    // seeding entirely (and `-connect=0` yields a fully offline node).
+    let seeded = if cfg.connect.is_empty() {
+        mgr.seed_from_dns(params, unix_now())
+    } else {
+        0
+    };
     // `-listen` — the inbound side of Core's `-listen=1`: a
     // nonblocking accept each tick hands sockets to bounded handshake
     // workers; completed sessions join via `drain_inbounds`.

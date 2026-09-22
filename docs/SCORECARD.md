@@ -102,6 +102,12 @@ acceptance claims but do not substitute for the P/Q benchmarks above.
   P2TR Schnorr key-path), a deliberately-invalid mempool verdict, and
   an invalidateblock+heavier-branch reorg with mempool refill. Result:
   byte-identical UTXO state and fee accounting at every height.
+- **Real-block state differential**: `tools/diff_segment.py` — a
+  committed blk.dat segment (real 2009-era mainnet blocks 0–500,
+  including the chain's first P2PK spends at h170+) fed via
+  `submitblock` to both engines on mainnet params, comparing
+  `gettxoutsetinfo` after every block. Result: identical verdicts and
+  byte-identical UTXO state at all 501 heights.
 - **BIP324 v2 transport**: live session against Core 29.4 —
   session ids byte-identical on both ends; v1 fallback on a
   v1-only peer matches Core's reconnect rule.

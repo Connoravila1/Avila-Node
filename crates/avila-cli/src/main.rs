@@ -38,7 +38,8 @@ enum Command {
     },
     /// Run the node: sync to tip, then keep serving and relaying until killed.
     Run {
-        /// Explicit peer addr:port (repeatable); DNS seeds are also used.
+        /// Explicit peer addr:port (repeatable); Core's -connect — exclusive:
+        /// naming any peer suppresses DNS seeding entirely.
         #[arg(long)]
         connect: Vec<SocketAddr>,
         /// Route all outbound connections through this SOCKS5 proxy.
@@ -123,7 +124,8 @@ enum Command {
         /// Wall-clock bound in seconds.
         #[arg(long, default_value_t = 120)]
         timeout_secs: u64,
-        /// Explicit peer addr:port (repeatable); DNS seeds are also used.
+        /// Explicit peer addr:port (repeatable); Core's -connect — exclusive:
+        /// naming any peer suppresses DNS seeding entirely.
         #[arg(long)]
         connect: Vec<SocketAddr>,
         /// Route all outbound connections through this SOCKS5 proxy.
