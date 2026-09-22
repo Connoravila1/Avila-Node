@@ -137,8 +137,12 @@ the filter index also answers BIP157 `getcfilters`/`getcfheaders`/
 matching Core's `PrepareBlockFilterRequest` rules. The distinction between active and background
 chainstates is illustrated by [Core's AssumeUTXO design](https://github.com/bitcoin/bitcoin/blob/master/doc/design/assumeutxo.md).
 `loadtxoutset`/`dumptxoutset` operate on the single chainstate with Core's
-snapshot format; the two-chainstate background-validation model is not yet
-implemented.
+snapshot format. Background validation replays stored pre-base bodies into an
+independent UTXO set on the sync tick and proves the loaded set by recomputing
+the chainparams content hash — the security property of Core's two-chainstate
+model without duplicating the block index; a restart replays from height 1
+rather than resuming mid-replay, and `getchainstates` reports the replay as a
+second `validated: true` entry until it completes.
 
 Future network inputs, service permissions, queues, disk use, log payloads and
 configuration sizes require explicit limits. Preserve provenance and redaction

@@ -5114,25 +5114,26 @@ pub(crate) fn dispatch(
             }))
         }),
         "getchainstates" => chain_query(queries, |cs, _| {
-            // One chainstate — a `loadtxoutset` snapshot reports
-            // `validated: false` until the assumed prefix is
-            // re-validated (Core's snapshot chainstate flag).
+            // Core's `getchainstates`: chainstates ordered by work,
+            // most-work last. An unverified snapshot reports two
+            // entries — the background-validation replay first
+            // (`validated: true`, honestly validated to its own tip),
+            // then the snapshot chainstate (`validated: false` plus
+            // `snapshot_blockhash`). After verification merges them the
+            // single entry reports `validated: true`.
             let tip = cs.tip_hash();
             let connected = cs.chain().len().saturating_sub(1) as u32;
             let best_header = cs.tree().tip();
-            let Some(node) = cs.tree().get(&tip) else {
-                return Err((RPC_MISC_ERROR, "tip not indexed".into()));
-            };
-            Ok(json!({
-                "headers": best_header.height,
-                "chainstates": [{
-                    "blocks": connected,
-                    "bestblockhash": tip.to_string(),
+            let chainstate_entry = |height: u32, hash: BlockHash| -> Option<Value> {
+                let node = cs.tree().get(&hash)?;
+                Some(json!({
+                    "blocks": height,
+                    "bestblockhash": hash.to_string(),
                     "bits": format!("{:08x}", node.header.bits.0),
                     "target": node.header.bits.expand().value.to_hex(),
                     "difficulty": core_num(difficulty(node.header.bits.0)),
                     "verificationprogress": core_num(if best_header.height > 0 {
-                        connected as f64 / best_header.height as f64
+                        height as f64 / best_header.height as f64
                     } else {
                         1.0
                     }),
@@ -5140,8 +5141,34 @@ pub(crate) fn dispatch(
                     // state itself, held without a byte budget.
                     "coins_db_cache_bytes": 0,
                     "coins_tip_cache_bytes": 0,
-                    "validated": cs.snapshot_base().is_none(),
-                }],
+                }))
+            };
+            let mut chainstates: Vec<Value> = Vec::new();
+            if cs.snapshot_base().is_some()
+                && !cs.snapshot_verified()
+                && let Some(bg_height) = cs.background_height()
+            {
+                if bg_height == 0 {
+                    // Core's make_chain_data returns an empty object for
+                    // a chainstate with no tip yet.
+                    chainstates.push(json!({}));
+                } else if let Some(mut bg) =
+                    chainstate_entry(bg_height, cs.chain()[bg_height as usize])
+                {
+                    bg["validated"] = Value::Bool(true);
+                    chainstates.push(bg);
+                }
+            }
+            let mut active = chainstate_entry(connected, tip)
+                .ok_or((RPC_MISC_ERROR, "tip not indexed".to_string()))?;
+            active["validated"] = Value::Bool(cs.snapshot_verified());
+            if let Some(base) = cs.snapshot_base() {
+                active["snapshot_blockhash"] = Value::String(cs.chain()[base as usize].to_string());
+            }
+            chainstates.push(active);
+            Ok(json!({
+                "headers": best_header.height,
+                "chainstates": chainstates,
             }))
         }),
         "getdeploymentinfo" => {

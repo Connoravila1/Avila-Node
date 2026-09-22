@@ -218,6 +218,58 @@ pub struct Chainstate {
     /// below it are assume-valid: their `undos` slots are empty
     /// placeholders and no reorg may fork below it.
     snapshot_base: Option<u32>,
+    /// Core's ibd chainstate while a snapshot is active — replays the
+    /// stored bodies of heights `1..=snapshot_base` into an independent
+    /// UTXO set; on reaching the base, its recomputed content hash must
+    /// equal the chainparams value or the snapshot was dishonest.
+    /// `None` when no snapshot is loaded, when pre-base bodies have
+    /// never been retained, or after verification completes (Core frees
+    /// the ibd chainstate at merge).
+    background: Option<BackgroundValidation>,
+    /// `true` once the background replay reached the base and its
+    /// hash matched — the moment Core merges the snapshot chainstate
+    /// into the fully validated one and `getchainstates` reports a
+    /// single `validated: true` entry.
+    snapshot_verified: bool,
+}
+
+/// The background validation replay beneath an active snapshot — a
+/// second UTXO set built block-by-block from stored bodies, purely to
+/// prove the loaded set. Core carries this as a whole second
+/// `Chainstate`; here it is the coin set plus a height cursor — the
+/// header index, body store and chain path are already shared.
+struct BackgroundValidation {
+    /// The replayed set — coin-for-coin with what honest validation
+    /// produces at the base, before the hash check confirms it.
+    utxo: UtxoSet,
+    /// The next height to replay (`1` at start; `> base` when done).
+    next: u32,
+}
+
+/// Where [`Chainstate::background_step`] left the snapshot replay —
+/// the progress Core's `getchainstates` reports as the second
+/// chainstate's `blocks`/`bestblockhash`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BackgroundStatus {
+    /// No snapshot is active — nothing to replay.
+    NoSnapshot,
+    /// The replay is waiting for a block body that has never been
+    /// stored (Core stalls background validation until the block
+    /// downloads).
+    WaitingForBody {
+        /// The height whose body is missing.
+        height: u32,
+    },
+    /// Replayed up to `done` of `base`; still running.
+    InProgress {
+        /// Heights `1..=done` are replayed.
+        done: u32,
+        /// The snapshot base height the replay must reach.
+        base: u32,
+    },
+    /// The replay reached the base and its content hash matched the
+    /// chainparams value — the snapshot is now proven, not assumed.
+    Verified,
 }
 
 /// The transaction index behind `-txindex`: every retained block's
@@ -752,6 +804,8 @@ impl Chainstate {
             filterindex: None,
             precious: None,
             snapshot_base: None,
+            background: None,
+            snapshot_verified: false,
         }
     }
 
@@ -1122,6 +1176,14 @@ impl Chainstate {
         };
         self.connected = base;
         self.snapshot_base = Some(base_height);
+        // Core creates the ibd chainstate at activation — background
+        // validation replays `1..=base` from stored bodies and checks
+        // the recomputed hash before the assumed prefix is trusted.
+        self.background = Some(BackgroundValidation {
+            utxo: UtxoSet::new(),
+            next: 1,
+        });
+        self.snapshot_verified = false;
         self.precious = None;
         self.tree.apply_tx_meta(&base, 0, au_data.n_chain_tx);
         // The filter index belongs to the connected chain — every
@@ -1343,6 +1405,17 @@ impl Chainstate {
         self.connected = state.tip;
         self.chain = state.chain;
         self.snapshot_base = snapshot_base;
+        self.snapshot_verified = state.snapshot_verified;
+        // A resumed snapshot that never finished its background
+        // validation re-replays it — the ibd chainstate is rebuilt at
+        // height 1 (Core persists its progress; replay from scratch is
+        // the honest equivalent).
+        if snapshot_base.is_some() && !state.snapshot_verified {
+            self.background = Some(BackgroundValidation {
+                utxo: UtxoSet::new(),
+                next: 1,
+            });
+        }
         // Coins view: `externalized` (v4) states keep coins+undos in
         // coinsdb — reconcile it against this snapshot's tip. Inline
         // states (v3, or v4 written without a backend) carry the data
@@ -1466,6 +1539,7 @@ impl Chainstate {
                 meta
             },
             snapshot_base: self.snapshot_base.unwrap_or(0),
+            snapshot_verified: self.snapshot_verified,
             externalized,
         }
     }
@@ -2409,6 +2483,111 @@ impl Chainstate {
         self.flush_coins()
             .map_err(|_| ConnectError::Internal("coinsdb flush failed"))?;
         Ok(())
+    }
+
+    /// Steps the snapshot's background validation: replays up to
+    /// `max_blocks` stored bodies into the independent UTXO set, then —
+    /// once the base is reached — compares its recomputed content hash
+    /// to the chainparams `hash_serialized`. A match flips
+    /// [`Self::snapshot_verified`]; a mismatch is fatal-by-design (Core
+    /// aborts the node) and surfaces as `ConnectError::Internal`.
+    ///
+    /// Drives like Core's background validation thread: callers invoke
+    /// it on a cadence (the sync tick does) and it stalls, reporting
+    /// [`BackgroundStatus::WaitingForBody`], while a pre-base body has
+    /// not been stored yet.
+    ///
+    /// # Errors
+    ///
+    /// `ConnectError` when a stored body fails replay — impossible under
+    /// honest construction (these headers were validated and the bodies
+    /// once connected) — or when the recomputed hash disagrees with the
+    /// chainparams snapshot hash.
+    pub fn background_step(&mut self, max_blocks: u32) -> Result<BackgroundStatus, ConnectError> {
+        let Some(base) = self.snapshot_base else {
+            return Ok(BackgroundStatus::NoSnapshot);
+        };
+        if self.snapshot_verified {
+            return Ok(BackgroundStatus::Verified);
+        }
+        let Some(mut bg) = self.background.take() else {
+            return Ok(BackgroundStatus::Verified);
+        };
+        let params = *self.tree.params();
+        let mut waiting: Option<u32> = None;
+        for _ in 0..max_blocks {
+            if bg.next > base {
+                break;
+            }
+            let h = bg.next;
+            let Some(block) = self.body(&self.chain[h as usize]) else {
+                waiting = Some(h);
+                break;
+            };
+            let hash = block.block_hash();
+            let ctx = ConnectContext {
+                params: &params,
+                tree: &self.tree,
+                block_hash: hash,
+                script_checks: self.script_checks(&hash, &params),
+            };
+            match connect::connect_block(&block, &mut bg.utxo, &ctx) {
+                Ok(_undo) => bg.next += 1,
+                Err(e) => {
+                    self.background = Some(bg);
+                    return Err(e);
+                }
+            }
+        }
+        if bg.next <= base {
+            let done = bg.next - 1;
+            self.background = Some(bg);
+            return Ok(match waiting {
+                Some(height) => BackgroundStatus::WaitingForBody { height },
+                None => BackgroundStatus::InProgress { done, base },
+            });
+        }
+        // Replay reached the base — recompute the content hash exactly
+        // as `activate_snapshot` verified the file's.
+        let base_hash = self.chain[base as usize];
+        let au = params
+            .assumeutxo_data
+            .iter()
+            .find(|d| d.height == base)
+            .ok_or(ConnectError::Internal(
+                "snapshot base not in assumeutxo table",
+            ))?;
+        let stats = crate::coinstats::compute(
+            &bg.utxo,
+            i64::from(base),
+            base_hash,
+            crate::coinstats::CoinStatsHashType::HashSerialized,
+        );
+        let got = stats
+            .hash_serialized
+            .map(|h| crate::hash::format_display_hex(h.as_bytes()))
+            .unwrap_or_default();
+        if got != au.hash_serialized {
+            return Err(ConnectError::Internal("snapshot content hash mismatch"));
+        }
+        self.snapshot_verified = true;
+        Ok(BackgroundStatus::Verified)
+    }
+
+    /// `true` when no snapshot is active or the snapshot's assumed
+    /// prefix has been proven by background validation — the
+    /// `validated` flag Core's `getchainstates` reports.
+    #[must_use]
+    pub fn snapshot_verified(&self) -> bool {
+        self.snapshot_base.is_none() || self.snapshot_verified
+    }
+
+    /// The background replay's tip height — the second entry's
+    /// `blocks` in `getchainstates`. `None` when no snapshot is active
+    /// or verification already freed the replay set.
+    #[must_use]
+    pub fn background_height(&self) -> Option<u32> {
+        self.background.as_ref().map(|bg| bg.next - 1)
     }
 
     /// `ActivateBestChain` — while a stored-body, non-failed branch outworks
@@ -3701,6 +3880,147 @@ mod tests {
         assert_eq!(cs.tip_hash(), blocks[2].block_hash());
         assert_eq!(cs.snapshot_base(), Some(2));
         assert_eq!(sorted_utxo(&cs).len(), utxo.len() + 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Background validation: a snapshot starts unverified, the replay
+    /// stalls on missing bodies, then proves the assumed set once every
+    /// pre-base body has been retained and replayed.
+    #[test]
+    fn assumeutxo_background_validation_verifies() {
+        use crate::params::AssumeutxoData;
+        use crate::utxo_snapshot::{read_metadata, sorted_coins, write_snapshot};
+        let mut p = params();
+        let mut src = Chainstate::new(&p);
+        let mut blocks = Vec::new();
+        let mut parent = genesis_header();
+        for h in 1..=3u32 {
+            let b = block_on(&parent, vec![coinbase_tx(h, subsidy(h))], &p);
+            src.accept_block(&b, NOW).unwrap();
+            parent = b.header;
+            blocks.push(b);
+        }
+        let base_hash = blocks[1].block_hash();
+        let mut utxo = src.utxo().clone();
+        let undo3 = src.undo(3).unwrap();
+        connect::disconnect_block(&blocks[2], &mut utxo, &undo3).unwrap();
+        let stats = crate::coinstats::compute(
+            &utxo,
+            2,
+            base_hash,
+            crate::coinstats::CoinStatsHashType::HashSerialized,
+        );
+        let coins = sorted_coins(&utxo);
+        let mut snap = Vec::new();
+        write_snapshot(
+            &mut snap,
+            p.message_start,
+            &base_hash,
+            coins.len() as u64,
+            &coins,
+        )
+        .unwrap();
+        p.assumeutxo_data = Box::leak(Box::new([AssumeutxoData {
+            height: 2,
+            hash_serialized: Box::leak(stats.hash_serialized.unwrap().to_string().into_boxed_str()),
+            n_chain_tx: 3,
+            blockhash: Box::leak(base_hash.to_string().into_boxed_str()),
+        }]));
+        let dir = store_dir("assumeutxo-bg");
+        let mut cs = Chainstate::with_store(&dir, &p, NOW).unwrap();
+        for b in &blocks {
+            cs.tree.insert(&b.header, NOW).unwrap();
+        }
+        let mut cursor = std::io::Cursor::new(&snap);
+        let meta = read_metadata(&mut cursor, p.message_start).unwrap();
+        cs.activate_snapshot(&mut cursor, &meta, false).unwrap();
+
+        // Freshly activated: unverified, replay stalled at height 1 —
+        // the loading node never had pre-base bodies.
+        assert!(!cs.snapshot_verified());
+        assert_eq!(cs.background_height(), Some(0));
+        assert_eq!(
+            cs.background_step(10),
+            Ok(BackgroundStatus::WaitingForBody { height: 1 })
+        );
+
+        // Bodies for h1/h2 arrive (sub-base bodies store but never
+        // connect); the replay then reaches the base and the hash
+        // matches — the assumed prefix is now proven.
+        for b in [&blocks[0], &blocks[1]] {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        assert_eq!(cs.background_step(10), Ok(BackgroundStatus::Verified));
+        assert!(cs.snapshot_verified());
+        assert_eq!(cs.background_height(), None);
+        assert_eq!(cs.tip_hash(), base_hash);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dishonest snapshot — valid serialization, wrong content hash —
+    /// fails the replay's final check once the real bodies arrive.
+    #[test]
+    fn assumeutxo_background_validation_rejects_lie() {
+        use crate::params::AssumeutxoData;
+        use crate::utxo_snapshot::{read_metadata, sorted_coins, write_snapshot};
+        let mut p = params();
+        let mut src = Chainstate::new(&p);
+        let mut blocks = Vec::new();
+        let mut parent = genesis_header();
+        for h in 1..=3u32 {
+            let b = block_on(&parent, vec![coinbase_tx(h, subsidy(h))], &p);
+            src.accept_block(&b, NOW).unwrap();
+            parent = b.header;
+            blocks.push(b);
+        }
+        let base_hash = blocks[1].block_hash();
+        // The snapshot claims the h1-only UTXO set at base h2 — a
+        // coin is missing. The chainparams entry is computed over
+        // that same lie, so the file-hash gate passes; only honest
+        // replay of the real bodies can catch it.
+        let mut utxo = src.utxo().clone();
+        let undo3 = src.undo(3).unwrap();
+        connect::disconnect_block(&blocks[2], &mut utxo, &undo3).unwrap();
+        let undo2 = src.undo(2).unwrap();
+        connect::disconnect_block(&blocks[1], &mut utxo, &undo2).unwrap();
+        let stats = crate::coinstats::compute(
+            &utxo,
+            2,
+            base_hash,
+            crate::coinstats::CoinStatsHashType::HashSerialized,
+        );
+        let coins = sorted_coins(&utxo);
+        let mut snap = Vec::new();
+        write_snapshot(
+            &mut snap,
+            p.message_start,
+            &base_hash,
+            coins.len() as u64,
+            &coins,
+        )
+        .unwrap();
+        p.assumeutxo_data = Box::leak(Box::new([AssumeutxoData {
+            height: 2,
+            hash_serialized: Box::leak(stats.hash_serialized.unwrap().to_string().into_boxed_str()),
+            n_chain_tx: 3,
+            blockhash: Box::leak(base_hash.to_string().into_boxed_str()),
+        }]));
+        let dir = store_dir("assumeutxo-bg-lie");
+        let mut cs = Chainstate::with_store(&dir, &p, NOW).unwrap();
+        for b in &blocks {
+            cs.tree.insert(&b.header, NOW).unwrap();
+        }
+        let mut cursor = std::io::Cursor::new(&snap);
+        let meta = read_metadata(&mut cursor, p.message_start).unwrap();
+        cs.activate_snapshot(&mut cursor, &meta, false).unwrap();
+        for b in [&blocks[0], &blocks[1]] {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        // Honest replay produces the true h2 set — which the (lying)
+        // chainparams hash no longer matches. Hard error, no verified.
+        assert!(cs.background_step(10).is_err());
+        assert!(!cs.snapshot_verified());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -181,6 +181,12 @@ pub enum SyncError {
     /// Invalid option combination — Core's `InitError` text.
     #[error("{0}")]
     Config(String),
+    /// A `loadtxoutset` snapshot's background validation failed —
+    /// either a stored body refused to replay or the recomputed UTXO
+    /// hash disagreed with the chainparams value (a dishonest
+    /// snapshot; Core reports this as a fatal error).
+    #[error("snapshot background validation failed: {0}")]
+    SnapshotValidation(#[from] avila_consensus::connect::ConnectError),
 }
 
 fn unix_now() -> u32 {
@@ -398,6 +404,26 @@ pub fn run(
         if cfg.data_dir.is_some() && last_flush + FLUSH_INTERVAL <= connected {
             last_flush = connected;
             cs.flush().map_err(SyncError::Store)?;
+        }
+        // Snapshot background validation — Core's scheduler-driven ibd
+        // chainstate: replay pre-base bodies into the proof UTXO set.
+        // A bounded slice per tick keeps it off the sync critical path.
+        // When a pre-base body is missing, fetch it — the same windowed
+        // request path rescans use.
+        if cs.snapshot_base().is_some()
+            && !cs.snapshot_verified()
+            && let avila_consensus::chainstate::BackgroundStatus::WaitingForBody { height } =
+                cs.background_step(32)?
+        {
+            let base = cs.snapshot_base().unwrap_or(0);
+            let want: Vec<avila_consensus::hash::BlockHash> = cs.chain()
+                [height as usize..=base as usize]
+                .iter()
+                .take(16)
+                .filter(|h| !cs.have_body(h))
+                .copied()
+                .collect();
+            mgr.request_blocks(&want);
         }
         // The last connected blocks, for the tape display.
         let chain = cs.chain();

@@ -426,8 +426,13 @@ pub struct StateData {
     pub snapshot_base: u32,
     /// `true` when the coins view and undo records live in
     /// `coinsdb.redb` instead of this file's `utxo`/`undos` sections —
-    /// the v4 flag byte. v3 files deserialize as `false`.
+    /// the v4 flag byte's bit 0. v3 files deserialize as `false`.
     pub externalized: bool,
+    /// `true` once the assumeutxo snapshot's background validation
+    /// replayed to the base and the recomputed content hash matched —
+    /// the v4 flag byte's bit 1. Without it a resumed snapshot re-runs
+    /// the replay.
+    pub snapshot_verified: bool,
 }
 
 fn invalid(msg: impl Into<String>) -> io::Error {
@@ -566,7 +571,11 @@ pub fn write_state(dir: &Path, magic: [u8; 4], data: &StateData) -> io::Result<(
         payload.extend_from_slice(&n_chain_tx.to_le_bytes());
     }
     payload.extend_from_slice(&data.snapshot_base.to_le_bytes());
-    payload.push(u8::from(data.externalized));
+    // The flags byte is a bitmask: bit0 = externalized (v4's original
+    // meaning), bit1 = snapshot verified. Old v4 writers only ever
+    // emitted 0/1, so values 2/3 read cleanly on upgrade.
+    let flags = u8::from(data.externalized) | (u8::from(data.snapshot_verified) << 1);
+    payload.push(flags);
 
     let mut file_bytes = Vec::with_capacity(payload.len() + 44);
     file_bytes.extend_from_slice(&magic);
@@ -691,14 +700,13 @@ pub fn read_state(dir: &Path, magic: [u8; 4]) -> io::Result<Option<StateData>> {
     let snapshot_base = d
         .read_u32_le()
         .map_err(|e| invalid(format!("snapshot_base: {e}")))?;
-    let externalized = if version >= 4 {
+    let (externalized, snapshot_verified) = if version >= 4 {
         match d.read_u8().map_err(|e| invalid(format!("flags: {e}")))? {
-            0 => false,
-            1 => true,
+            f @ 0..=3 => (f & 1 != 0, f & 2 != 0),
             f => return Err(invalid(format!("flags: unknown {f}"))),
         }
     } else {
-        false
+        (false, false)
     };
     d.finish().map_err(|e| invalid(format!("trailing: {e}")))?;
     // Externalized states keep their coins/undos in coinsdb — the
@@ -722,6 +730,7 @@ pub fn read_state(dir: &Path, magic: [u8; 4]) -> io::Result<Option<StateData>> {
         tx_meta,
         snapshot_base,
         externalized,
+        snapshot_verified,
     }))
 }
 
@@ -997,6 +1006,7 @@ mod tests {
             tx_meta,
             snapshot_base: 0,
             externalized: false,
+            snapshot_verified: false,
         }
     }
 
