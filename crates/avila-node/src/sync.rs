@@ -41,6 +41,11 @@ pub struct SyncConfig {
     /// Cancellation flag — checked each tick; `true` ends the run early
     /// and still returns a report (state already flushed).
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// `true` for the long-running `run` daemon: never exit on zero
+    /// reachable peers — the manager redials forever and `addnode` can
+    /// arrive over RPC later (Core's daemon behavior). `false` for a
+    /// bounded `sync` run, where no candidates means fail fast.
+    pub persist: bool,
     /// When set with `data_dir`, prune blk files after the final flush
     /// so the on-disk total stays under this many bytes.
     pub prune_bytes: Option<u64>,
@@ -100,6 +105,7 @@ impl Default for SyncConfig {
             data_dir: None,
             dbcache: None,
             cancel: None,
+            persist: false,
             prune_bytes: None,
             txindex: false,
             blockfilterindex: false,
@@ -318,7 +324,7 @@ pub fn run(
     for addr in &cfg.connect {
         mgr.add_node(addr.to_string(), false);
     }
-    if mgr.is_empty() && seeded == 0 {
+    if !cfg.persist && mgr.is_empty() && seeded == 0 {
         return Err(SyncError::NoPeers {
             seeded,
             explicit: cfg.connect.len(),
@@ -354,11 +360,14 @@ pub fn run(
         && connected.saturating_sub(resumed_height) < cfg.target_height
         && !cancelled()
     {
-        // Nothing to talk to and nothing left to try — fail fast rather
-        // than idling until the timeout (e.g. regtest with no seeds).
-        // While `setnetworkactive false` holds, an empty peer set is
-        // the operator's intent, not exhaustion — keep ticking.
-        if mgr.is_empty()
+        // Nothing to talk to and nothing left to try — a bounded sync
+        // fails fast rather than idling until the timeout (e.g.
+        // regtest with no seeds). A persistent daemon keeps ticking:
+        // Core never exits on zero peers, and `addnode` may arrive
+        // over RPC at any time. While `setnetworkactive false` holds,
+        // an empty peer set is the operator's intent either way.
+        if !cfg.persist
+            && mgr.is_empty()
             && mgr.addrbook().is_empty()
             && mgr.added_nodes().is_empty()
             && mgr.network_active()

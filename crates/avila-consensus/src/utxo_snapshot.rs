@@ -310,9 +310,10 @@ fn decompress_amount(mut x: u64) -> u64 {
     x -= 1;
     let mut e = x % 10;
     x /= 10;
+    // x = 9*n + d - 1 — the digit part is packed base-9, not base-10.
     let mut n = if e < 9 {
-        let d = (x % 10) + 1;
-        x /= 10;
+        let d = (x % 9) + 1;
+        x /= 9;
         x * 10 + d
     } else {
         x + 1
@@ -520,4 +521,39 @@ pub fn read_coins<R: std::io::Read>(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// `CompressAmount`/`DecompressAmount` roundtrip — the digit part is
+    /// packed base-9 (`9*n + d - 1`), which a naive base-10 decode
+    /// silently corrupts (the first real `dumptxoutset` caught this:
+    /// 25 BTC compressed to 229 decoded as 2.3e9).
+    #[test]
+    fn amount_compress_roundtrip() {
+        // Core compressor.cpp vectors: (sats, compressed).
+        let vectors: [(u64, u64); 6] = [
+            (0, 0),
+            (1, 1),
+            (100_000_000, 9),          // 1 BTC — 8 trailing zeros
+            (5_000_000_000, 50),       // 50 BTC — e==9 branch
+            (2_500_000_000, 229),      // 25 BTC — base-9 digit path
+            (123_456_789, 1_111_111_101),
+        ];
+        for (sats, want) in &vectors {
+            assert_eq!(compress_amount(*sats), *want, "compress({sats})");
+            assert_eq!(decompress_amount(*want), *sats, "decompress({want})");
+        }
+        // Broad roundtrip — every boundary of the encoding.
+        for sats in [
+            1u64, 9, 10, 11, 99, 100, 101, 999, 1000, 5_462, 54_620,
+            546_200, 5_462_000, 99_999_999, 1_000_000_000, 21_000_000_000_000_000,
+        ] {
+            let c = compress_amount(sats);
+            assert_eq!(decompress_amount(c), sats, "roundtrip({sats}) via {c}");
+        }
+    }
 }

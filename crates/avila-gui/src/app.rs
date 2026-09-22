@@ -792,6 +792,7 @@ impl AvilaApp {
                 .then(|| self.node.config().network_data_dir()),
             dbcache: None,
             cancel: Some(cancel.clone()),
+            persist: false,
             status: None,
             queries: None,
             waiters: None,
