@@ -991,7 +991,6 @@ impl<S: Read + Write> PeerManager<S> {
                 }
             }
             SessionEvent::Message(Message::Block(block)) => {
-                let old_tip = cs.tip_hash();
                 peer.last_block_time = Some(i64::from(now));
                 match peer.sync.on_block(cs, &block, now) {
                     Ok(outcome) => {
@@ -1017,17 +1016,11 @@ impl<S: Read + Write> PeerManager<S> {
                             if reorged {
                                 // The disconnected branch's txs are
                                 // unconfirmed again — re-admit them
-                                // (Core's DisconnectedBlockTransactions).
-                                let mut walk = old_tip;
-                                while let Some(node) = cs.tree().get(&walk) {
-                                    if cs.chain().contains(&walk) {
-                                        break; // reached the fork point
-                                    }
-                                    if let Some(b) = cs.body(&walk) {
-                                        mempool.reinsert_disconnected(&b, cs, now);
-                                    }
-                                    walk = node.header.prev_block_hash;
-                                }
+                                // fork-adjacent block first (Core's
+                                // DisconnectedBlockTransactions reverse
+                                // drain, parent before child).
+                                let gone = cs.take_disconnected();
+                                mempool.refill_from_disconnected(&gone, cs, now, true, usize::MAX);
                             }
                             events.push(NetEvent::TipAdvanced(cs.chain().len() as u32 - 1));
                             // Relay the new tip to everyone except the peer

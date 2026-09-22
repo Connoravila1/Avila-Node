@@ -4070,8 +4070,15 @@ fn mine_and_connect(
         }
     }
     match cs.accept_block(&block, now) {
-        Ok(avila_consensus::chainstate::Acceptance::Connected { height, .. }) => {
+        Ok(avila_consensus::chainstate::Acceptance::Connected {
+            height, reorged, ..
+        }) => {
             mgr.mempool().on_block_connected(&block, height);
+            if reorged {
+                let gone = cs.take_disconnected();
+                mgr.mempool()
+                    .refill_from_disconnected(&gone, cs, now, true, usize::MAX);
+            }
             mgr.announce_tip(cs);
             Ok(block.block_hash().to_string())
         }
@@ -8786,11 +8793,27 @@ pub(crate) fn dispatch(
                 // Core's submitblock reports a status STRING in result —
                 // errors are only for decode/parameter failures.
                 match cs.accept_block(&block, now) {
-                    Ok(avila_consensus::chainstate::Acceptance::Connected { height, .. }) => {
+                    Ok(avila_consensus::chainstate::Acceptance::Connected {
+                        height,
+                        reorged,
+                        ..
+                    }) => {
                         // Purge confirmed txs, then relay the new tip
                         // (Core's NewPoWValidBlock fan-out — no source
                         // peer for a local submission).
                         mgr.mempool().on_block_connected(&block, height);
+                        if reorged {
+                            // The rolled-back branch's txs are
+                            // unconfirmed again — refill fork-first.
+                            let gone = cs.take_disconnected();
+                            mgr.mempool().refill_from_disconnected(
+                                &gone,
+                                cs,
+                                now,
+                                true,
+                                usize::MAX,
+                            );
+                        }
                         mgr.announce_tip(cs);
                         Ok(Value::Null)
                     }
@@ -8857,8 +8880,16 @@ pub(crate) fn dispatch(
                 Ok(h) => h,
                 Err(e) => return (Value::Null, Some(e)),
             };
-            chain_query(queries, move |cs, _mgr| match cs.precious_block(&hash) {
-                Ok(true) => Ok(Value::Null),
+            chain_query(queries, move |cs, mgr| match cs.precious_block(&hash) {
+                Ok(true) => {
+                    // A precious branch can displace the active tip —
+                    // refill the mempool from the rolled-back blocks.
+                    let now = crate::time::time() as u32;
+                    let gone = cs.take_disconnected();
+                    mgr.mempool()
+                        .refill_from_disconnected(&gone, cs, now, true, usize::MAX);
+                    Ok(Value::Null)
+                }
                 Ok(false) => Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into())),
                 Err(_) => Err((RPC_MISC_ERROR, "preciousblock revalidation failed".into())),
             })
@@ -8886,16 +8917,49 @@ pub(crate) fn dispatch(
                 Ok(h) => h,
                 Err(e) => return (Value::Null, Some(e)),
             };
-            chain_query(queries, move |cs, _mgr| {
-                let result = if is_invalidate {
-                    cs.invalidate_block(&hash)
+            chain_query(queries, move |cs, mgr| {
+                let now = crate::time::time() as u32;
+                if is_invalidate {
+                    match cs.invalidate_block(&hash) {
+                        Ok(Some(rewound)) => {
+                            // Core's MaybeUpdateMempoolForReorg: the
+                            // rewind loop feeds each disconnected block
+                            // tip-first, capped at the first 10
+                            // DisconnectTips; the ActivateBestChain tail
+                            // is a normal reorg refill, fork-first.
+                            let gone = cs.take_disconnected();
+                            let split = (rewound as usize).min(gone.len());
+                            let (rewind, reorg) = gone.split_at(split);
+                            mgr.mempool()
+                                .refill_from_disconnected(rewind, cs, now, false, 10);
+                            mgr.mempool().refill_from_disconnected(
+                                reorg,
+                                cs,
+                                now,
+                                true,
+                                usize::MAX,
+                            );
+                            Ok(Value::Null)
+                        }
+                        Ok(None) => Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into())),
+                        Err(e) => Err((RPC_DATABASE_ERROR, format!("{e:?}"))),
+                    }
                 } else {
-                    cs.reconsider_block(&hash)
-                };
-                match result {
-                    Ok(true) => Ok(Value::Null),
-                    Ok(false) => Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into())),
-                    Err(e) => Err((RPC_DATABASE_ERROR, format!("{e:?}"))),
+                    match cs.reconsider_block(&hash) {
+                        Ok(true) => {
+                            let gone = cs.take_disconnected();
+                            mgr.mempool().refill_from_disconnected(
+                                &gone,
+                                cs,
+                                now,
+                                true,
+                                usize::MAX,
+                            );
+                            Ok(Value::Null)
+                        }
+                        Ok(false) => Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into())),
+                        Err(e) => Err((RPC_DATABASE_ERROR, format!("{e:?}"))),
+                    }
                 }
             })
         }

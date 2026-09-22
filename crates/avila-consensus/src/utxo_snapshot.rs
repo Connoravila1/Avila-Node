@@ -538,9 +538,9 @@ mod tests {
         let vectors: [(u64, u64); 6] = [
             (0, 0),
             (1, 1),
-            (100_000_000, 9),          // 1 BTC — 8 trailing zeros
-            (5_000_000_000, 50),       // 50 BTC — e==9 branch
-            (2_500_000_000, 229),      // 25 BTC — base-9 digit path
+            (100_000_000, 9),     // 1 BTC — 8 trailing zeros
+            (5_000_000_000, 50),  // 50 BTC — e==9 branch
+            (2_500_000_000, 229), // 25 BTC — base-9 digit path
             (123_456_789, 1_111_111_101),
         ];
         for (sats, want) in &vectors {
@@ -549,8 +549,22 @@ mod tests {
         }
         // Broad roundtrip — every boundary of the encoding.
         for sats in [
-            1u64, 9, 10, 11, 99, 100, 101, 999, 1000, 5_462, 54_620,
-            546_200, 5_462_000, 99_999_999, 1_000_000_000, 21_000_000_000_000_000,
+            1u64,
+            9,
+            10,
+            11,
+            99,
+            100,
+            101,
+            999,
+            1000,
+            5_462,
+            54_620,
+            546_200,
+            5_462_000,
+            99_999_999,
+            1_000_000_000,
+            21_000_000_000_000_000,
         ] {
             let c = compress_amount(sats);
             assert_eq!(decompress_amount(c), sats, "roundtrip({sats}) via {c}");

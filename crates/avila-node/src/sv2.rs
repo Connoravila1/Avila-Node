@@ -287,9 +287,21 @@ fn handle(mut stream: TcpStream, queries: QuerySender, cancel: Arc<AtomicBool>) 
                     let now = crate::time::time() as u32;
                     match cs.accept_block(&block, now) {
                         Ok(avila_consensus::chainstate::Acceptance::Connected {
-                            height, ..
+                            height,
+                            reorged,
+                            ..
                         }) => {
                             mgr.mempool().on_block_connected(&block, height);
+                            if reorged {
+                                let gone = cs.take_disconnected();
+                                mgr.mempool().refill_from_disconnected(
+                                    &gone,
+                                    cs,
+                                    now,
+                                    true,
+                                    usize::MAX,
+                                );
+                            }
                             mgr.announce_tip(cs);
                             Ok(serde_json::json!("accepted"))
                         }

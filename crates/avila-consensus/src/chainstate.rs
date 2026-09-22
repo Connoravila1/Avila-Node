@@ -231,6 +231,12 @@ pub struct Chainstate {
     /// into the fully validated one and `getchainstates` reports a
     /// single `validated: true` entry.
     snapshot_verified: bool,
+    /// Hashes of blocks disconnected since the last
+    /// [`Self::take_disconnected`] drain, in disconnect order — the
+    /// most-recent tip first. Core's `DisconnectedBlockTransactions`
+    /// queue; the node layer feeds their non-coinbase transactions back
+    /// to the mempool after each disconnecting operation.
+    disconnected: Vec<BlockHash>,
 }
 
 /// The background validation replay beneath an active snapshot — a
@@ -806,6 +812,7 @@ impl Chainstate {
             snapshot_base: None,
             background: None,
             snapshot_verified: false,
+            disconnected: Vec::new(),
         }
     }
 
@@ -2264,6 +2271,12 @@ impl Chainstate {
                 index.disconnect(h);
             }
         }
+        // Core's `disconnectpool`: every rolled-back block's non-coinbase
+        // txs are mempool candidates again, in disconnect order
+        // (tip → fork).
+        for h in (fork_height + 1..=old_tip_height).rev() {
+            self.disconnected.push(self.chain[h as usize]);
+        }
         self.chain.truncate(fork_height as usize + 1);
         // `undos` is the tail above `undo_base` — the backend holds the
         // rest. A fork below the watermark leaves flushed undo records
@@ -2400,34 +2413,36 @@ impl Chainstate {
     /// disconnecting the chain down to its parent when it sits on the active
     /// tip path, then re-runs tip selection over what remains.
     ///
-    /// Returns `Ok(false)` when `hash` is not in the block index (the RPC maps
-    /// that to `-5` "Block not found"); `Ok(true)` otherwise — including the
-    /// genesis block, whose invalidation Core refuses silently (`nHeight == 0`
-    /// returns early, so the RPC still reports success).
-    ///
-    /// Disconnected transactions are not fed back to a mempool — Core's
-    /// `MaybeUpdateMempoolForReorg` `fAddToMempool` path has no counterpart
-    /// here yet.
+    /// Returns `Ok(None)` when `hash` is not in the block index (the RPC maps
+    /// that to `-5` "Block not found"); `Ok(Some(rewound))` otherwise —
+    /// `rewound` is the number of leading entries in the next
+    /// [`Self::take_disconnected`] drain that came from the rewind loop,
+    /// the phase Core feeds to the mempool tip-first and only for the
+    /// first 10 `DisconnectTip`s. Entries after it are the follow-up
+    /// `ActivateBestChain` reorg, fed fork-first like any other reorg.
+    /// Genesis's invalidation is a silent no-op (`rewound == 0`).
     ///
     /// # Errors
     ///
     /// `ConnectError` when a disconnect or the follow-up activation hits an
     /// internal inconsistency (missing body/undo, undo mismatch, coinsdb
     /// commit failure).
-    pub fn invalidate_block(&mut self, hash: &BlockHash) -> Result<bool, ConnectError> {
+    pub fn invalidate_block(&mut self, hash: &BlockHash) -> Result<Option<u32>, ConnectError> {
         let Some(node) = self.tree.get(hash) else {
-            return Ok(false);
+            return Ok(None);
         };
         if node.height == 0 {
-            return Ok(true);
+            return Ok(Some(0));
         }
         let height = node.height;
         self.tree.mark_invalid_subtree(hash);
+        let rewind_start = self.disconnected.len();
         if self.chain.get(height as usize) == Some(hash) {
             self.rewind_connected(height - 1)?;
         }
+        let rewound = (self.disconnected.len() - rewind_start) as u32;
         self.activate_best()?;
-        Ok(true)
+        Ok(Some(rewound))
     }
 
     /// `reconsiderblock` — clears the failed flag on `hash`, its ancestors and
@@ -2473,6 +2488,10 @@ impl Chainstate {
                 index.disconnect(height);
             }
             self.chain.pop();
+            // Core's `DisconnectTip` → `disconnectpool`: the block's
+            // non-coinbase txs are mempool candidates again. Disconnect
+            // order is tip-first.
+            self.disconnected.push(block_hash);
             let base = self.undo_base();
             self.undos
                 .truncate((height - 1).saturating_sub(base) as usize);
@@ -2483,6 +2502,17 @@ impl Chainstate {
         self.flush_coins()
             .map_err(|_| ConnectError::Internal("coinsdb flush failed"))?;
         Ok(())
+    }
+
+    /// Drains the disconnected-block queue — the hashes of every block
+    /// unwound since the last drain, in disconnect order (most-recent
+    /// tip first). The node layer re-admits their non-coinbase
+    /// transactions to the mempool: Core's `MaybeUpdateMempoolForReorg`
+    /// feed order is this list reversed (fork-adjacent block first,
+    /// txs in block order) for a batched reorg, or in-order for
+    /// `invalidateblock`'s per-tip loop.
+    pub fn take_disconnected(&mut self) -> Vec<BlockHash> {
+        std::mem::take(&mut self.disconnected)
     }
 
     /// Steps the snapshot's background validation: replays up to
@@ -4311,14 +4341,15 @@ mod tests {
         assert_eq!(cs.chain().len(), 4);
         assert_eq!(cs.tip_hash(), b3.block_hash());
 
-        // Unknown hash → false; genesis → true no-op.
-        assert_eq!(cs.invalidate_block(&BlockHash::from([0xAB; 32])), Ok(false));
-        assert!(cs.invalidate_block(&genesis.hash()).unwrap());
+        // Unknown hash → None; genesis → Some(0) no-op.
+        assert_eq!(cs.invalidate_block(&BlockHash::from([0xAB; 32])), Ok(None));
+        assert_eq!(cs.invalidate_block(&genesis.hash()), Ok(Some(0)));
         assert_eq!(cs.chain().len(), 4);
 
-        // Invalidate b2: b2 and b3 are marked, the chain rewinds to b1,
-        // and the surviving c-branch out-works the stub — it activates.
-        assert!(cs.invalidate_block(&b2.block_hash()).unwrap());
+        // Invalidate b2: b2 and b3 are marked, the chain rewinds to b1
+        // (2 blocks rewound), and the surviving c-branch out-works the
+        // stub — it activates.
+        assert_eq!(cs.invalidate_block(&b2.block_hash()), Ok(Some(2)));
         assert!(cs.tree().is_failed(&b2.block_hash()));
         assert!(cs.tree().is_failed(&b3.block_hash()));
         assert_eq!(cs.tip_hash(), c3.block_hash());
@@ -4349,7 +4380,7 @@ mod tests {
         for b in [&b1, &b2] {
             cs.accept_block(b, NOW).unwrap();
         }
-        assert!(cs.invalidate_block(&b2.block_hash()).unwrap());
+        assert_eq!(cs.invalidate_block(&b2.block_hash()), Ok(Some(1)));
         assert_eq!(cs.tip_hash(), b1.block_hash());
         assert_eq!(cs.chain().len(), 2);
         assert!(cs.tree().is_failed(&b2.block_hash()));
@@ -4359,5 +4390,59 @@ mod tests {
         assert!(cs.reconsider_block(&b2.block_hash()).unwrap());
         assert_eq!(cs.tip_hash(), b2.block_hash());
         assert_eq!(cs.chain().len(), 3);
+    }
+
+    /// `take_disconnected` drains evicted blocks in disconnect order
+    /// (tip → fork) — Core's `DisconnectedBlockTransactions` queue — and
+    /// `invalidate_block` reports the rewind count separately from the
+    /// follow-up `ActivateBestChain` disconnects, because Core feeds the
+    /// two phases to the mempool in opposite orders.
+    #[test]
+    fn disconnected_queue_orders_reorg_and_rewind() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        let genesis = genesis_header();
+        let b1 = block_on(&genesis, vec![coinbase_tx(1, subsidy(1))], &params);
+        let b2 = block_on(&b1.header, vec![coinbase_tx(2, subsidy(2))], &params);
+        let b3 = block_on(&b2.header, vec![coinbase_tx(3, subsidy(3))], &params);
+        for b in [&b1, &b2, &b3] {
+            cs.accept_block(b, NOW).unwrap();
+        }
+
+        // A heavier rival from genesis evicts the whole b-branch — the
+        // drain lists the evictions tip-first.
+        let mut c_blocks = Vec::new();
+        let mut parent = genesis;
+        for h in 1..=4u32 {
+            let c = block_on(
+                &parent,
+                vec![tagged_coinbase(h, subsidy(h), 0xC0 + h as u8)],
+                &params,
+            );
+            cs.accept_block(&c, NOW).unwrap();
+            parent = c.header;
+            c_blocks.push(c);
+        }
+        assert_eq!(cs.chain().len(), 5);
+        assert_eq!(
+            cs.take_disconnected(),
+            vec![b3.block_hash(), b2.block_hash(), b1.block_hash()]
+        );
+        assert!(cs.take_disconnected().is_empty());
+
+        // Invalidate c2: the rewind pops c4→c3→c2 (rewound == 3), then
+        // activation evicts c1 to switch onto the surviving b-branch —
+        // the drain's tail is that reorg's disconnect, tip-first too.
+        assert_eq!(cs.invalidate_block(&c_blocks[1].block_hash()), Ok(Some(3)));
+        assert_eq!(
+            cs.take_disconnected(),
+            vec![
+                c_blocks[3].block_hash(),
+                c_blocks[2].block_hash(),
+                c_blocks[1].block_hash(),
+                c_blocks[0].block_hash(),
+            ]
+        );
+        assert_eq!(cs.tip_hash(), b3.block_hash());
     }
 }

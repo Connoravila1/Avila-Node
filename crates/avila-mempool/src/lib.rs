@@ -139,6 +139,11 @@ pub const DESCENDANT_SIZE_LIMIT_KVB: usize = 101;
 /// txs or blow memory.
 pub const MAX_ORPHANS: usize = 100;
 
+/// Core's `MAX_DISCONNECTED_TX_POOL_BYTES` — 20 × `MAX_BLOCK_WEIGHT`:
+/// the byte bound on the `DisconnectedBlockTransactions` queue during a
+/// reorg; excess evicts the oldest-queued (fork-side) transactions.
+pub const MAX_DISCONNECTED_TX_POOL_BYTES: usize = 20 * 4_000_000;
+
 /// Core's `ORPHAN_TX_EXPIRE_TIME` — orphans live at most 20 minutes.
 pub const ORPHAN_EXPIRE_SECS: u32 = 20 * 60;
 
@@ -1280,6 +1285,29 @@ impl Mempool {
         self.remove(txid);
     }
 
+    /// `remove_recursive` for a transaction that is not itself pooled —
+    /// Core's `removeRecursive(tx)` on a failed resurrected tx, whose
+    /// in-pool dependents must drop even though `tx` never made it in.
+    /// The tx's outpoints are enumerable from the object, so its
+    /// children are found via the spends index directly.
+    fn remove_dependents(&mut self, tx: &Transaction) {
+        let txid = tx.txid();
+        let children: Vec<Txid> = (0..tx.outputs.len())
+            .filter_map(|vout| {
+                self.spends
+                    .get(&OutPoint {
+                        txid,
+                        vout: vout as u32,
+                    })
+                    .copied()
+            })
+            .collect();
+        for child in children {
+            self.remove_recursive(&child);
+        }
+        self.remove(&txid);
+    }
+
     /// Marks `txid` as locally submitted but not yet requested by any
     /// peer — Core's `AddToUnbroadcastTxSet`.
     pub fn mark_unbroadcast(&mut self, txid: &Txid) {
@@ -1371,7 +1399,10 @@ impl Mempool {
     /// Re-admits the non-coinbase transactions of a *disconnected* block
     /// — Core's `DisconnectedBlockTransactions` queue: after a reorg the
     /// old branch's txs are valid unconfirmed again. Each goes through
-    /// full admission (a tx may now conflict with the new chain).
+    /// full admission (a tx may now conflict with the new chain); a tx
+    /// that fails admission takes its in-pool descendants down with it
+    /// (Core's `removeRecursive` on the failed re-add) and never parks
+    /// as an orphan.
     pub fn reinsert_disconnected(
         &mut self,
         block: &avila_consensus::block::Block,
@@ -1383,9 +1414,67 @@ impl Mempool {
             if tx.is_coinbase() {
                 continue;
             }
-            if self.accept_tx(tx.clone(), cs, now).is_ok() {
-                readmitted += 1;
+            match self.accept_tx(tx.clone(), cs, now) {
+                Ok(_) => readmitted += 1,
+                Err(_) => {
+                    // Core runs the resurrected tx through
+                    // `AcceptToMemoryPool` — no orphanage — and
+                    // `removeRecursive`s it on failure so in-pool
+                    // dependents don't outlive a lost parent.
+                    self.orphans.remove(&tx.txid());
+                    self.remove_dependents(tx);
+                }
             }
+        }
+        readmitted
+    }
+
+    /// Core's `MaybeUpdateMempoolForReorg` over a batch of disconnected
+    /// blocks. `disconnected` carries block hashes in disconnect order
+    /// (most-recent tip first — [`Chainstate::take_disconnected`]).
+    ///
+    /// `fork_first` picks the feed order: `true` iterates fork-adjacent
+    /// block first (the batched `ActivateBestChain` reorg — Core's
+    /// reverse-order drain); `false` keeps disconnect order
+    /// (`invalidateblock`'s per-`DisconnectTip` feed, where children
+    /// whose parents are still connected fail and drop).
+    ///
+    /// `max_blocks` caps how many disconnect-order blocks contribute —
+    /// Core's `(++disconnected <= 10)` gate on `invalidateblock`; pass
+    /// `usize::MAX` for the uncapped reorg path. Queued bytes are capped
+    /// at [`MAX_DISCONNECTED_TX_POOL_BYTES`], evicting from the fork
+    /// side, matching Core's queue bound.
+    ///
+    /// Returns the number of transactions re-admitted.
+    pub fn refill_from_disconnected(
+        &mut self,
+        disconnected: &[avila_consensus::hash::BlockHash],
+        cs: &avila_consensus::chainstate::Chainstate,
+        now: u32,
+        fork_first: bool,
+        max_blocks: usize,
+    ) -> usize {
+        // Queue in disconnect order, bounded by serialized bytes — over
+        // the cap, the fork-side (oldest-queued) blocks lose their txs.
+        let mut queued: Vec<avila_consensus::block::Block> = Vec::new();
+        let mut bytes = 0usize;
+        for hash in disconnected.iter().take(max_blocks) {
+            let Some(block) = cs.body(hash) else {
+                continue;
+            };
+            let size: usize = block.transactions.iter().map(|tx| tx.encode().len()).sum();
+            if bytes + size > MAX_DISCONNECTED_TX_POOL_BYTES {
+                break;
+            }
+            bytes += size;
+            queued.push(block);
+        }
+        if fork_first {
+            queued.reverse();
+        }
+        let mut readmitted = 0usize;
+        for block in &queued {
+            readmitted += self.reinsert_disconnected(block, cs, now);
         }
         readmitted
     }
@@ -2197,5 +2286,127 @@ mod tests {
         assert_eq!(fresh.deltas.get(&ghost), Some(&1_000));
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&dir).unwrap();
+    }
+
+    /// A block carrying `coinbase + extra` txs — `block_on` variant for
+    /// refill tests that need non-coinbase transactions on-chain.
+    fn block_with(prev: &BlockHeader, height: u32, extra: Transaction, params: &Params) -> Block {
+        let mut block = block_on(prev, height, params);
+        block.transactions.push(extra);
+        let (root, _) = block.merkle_root();
+        block.header.merkle_root = root;
+        while pow::check_proof_of_work(&block.block_hash(), block.header.bits, params).is_err() {
+            block.header.nonce += 1;
+        }
+        block
+    }
+
+    /// Reorg refill: the evicted block's non-coinbase txs re-enter the
+    /// pool — Core's `DisconnectedBlockTransactions` drain.
+    #[test]
+    fn refill_readmits_disconnected_spends() {
+        let (mut cs, blocks) = chainstate_at(101);
+        let params = Network::Regtest.params();
+        let spend = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let spend_txid = spend.txid();
+        let b102 = block_with(&blocks[100].header, 102, spend, &params);
+        cs.accept_block(&b102, NOW).unwrap();
+
+        // A heavier rival evicts b102 — its spend is unconfirmed again.
+        let c102 = block_on(&blocks[100].header, 102, &params);
+        let c103 = block_on(&c102.header, 103, &params);
+        cs.accept_block(&c102, NOW).unwrap();
+        cs.accept_block(&c103, NOW).unwrap();
+        let gone = cs.take_disconnected();
+        assert_eq!(gone, vec![b102.block_hash()]);
+
+        let mut pool = Mempool::new();
+        assert_eq!(
+            pool.refill_from_disconnected(&gone, &cs, NOW, true, usize::MAX),
+            1
+        );
+        assert!(pool.get(&spend_txid).is_some());
+    }
+
+    /// A resurrected tx whose input the new chain spent drops — and
+    /// takes its in-pool descendants with it (Core's `removeRecursive`
+    /// on a failed re-add), even though the failed tx was never pooled.
+    #[test]
+    fn refill_drops_conflicts_and_dependents() {
+        let (mut cs, blocks) = chainstate_at(101);
+        let params = Network::Regtest.params();
+        let op = mature_outpoint(&blocks, 1);
+        let losing = spend_tx(op, 4_999_000_000, SEQ_FINAL);
+        let losing_txid = losing.txid();
+        let b102 = block_with(&blocks[100].header, 102, losing, &params);
+        cs.accept_block(&b102, NOW).unwrap();
+
+        // While b102 is connected its outputs are UTXOs — a child
+        // spending one is admissible to the pool.
+        let mut pool = Mempool::new();
+        let child = spend_tx(
+            OutPoint {
+                txid: losing_txid,
+                vout: 0,
+            },
+            4_998_000_000,
+            SEQ_FINAL,
+        );
+        let child_txid = child.txid();
+        pool.accept_tx(child, &cs, NOW).unwrap();
+
+        // The winning branch double-spends the coinbase: the losing
+        // spend can never come back and the pooled child is dangling.
+        let winner = spend_tx(op, 4_999_500_000, SEQ_FINAL);
+        let c102 = block_with(&blocks[100].header, 102, winner, &params);
+        let c103 = block_on(&c102.header, 103, &params);
+        cs.accept_block(&c102, NOW).unwrap();
+        cs.accept_block(&c103, NOW).unwrap();
+        let gone = cs.take_disconnected();
+        assert_eq!(gone, vec![b102.block_hash()]);
+
+        assert_eq!(
+            pool.refill_from_disconnected(&gone, &cs, NOW, true, usize::MAX),
+            0
+        );
+        assert!(pool.get(&losing_txid).is_none());
+        assert!(pool.get(&child_txid).is_none());
+        assert!(pool.is_empty());
+    }
+
+    /// `invalidateblock` semantics: only the first `max_blocks`
+    /// disconnect-order blocks feed the pool — Core's
+    /// `(++disconnected <= 10)` gate on deep invalidations.
+    #[test]
+    fn refill_caps_invalidation_depth() {
+        let (mut cs, blocks) = chainstate_at(101);
+        let params = Network::Regtest.params();
+        // Blocks h102..h113 each carry one spend of a distinct mature
+        // coinbase (h1..h12) so none conflict.
+        let mut txs = Vec::new();
+        let mut prev = blocks[100].header;
+        for i in 0..12usize {
+            let h = 102 + i as u32;
+            let spend = spend_tx(mature_outpoint(&blocks, i + 1), 4_999_000_000, SEQ_FINAL);
+            txs.push(spend.txid());
+            let b = block_with(&prev, h, spend, &params);
+            cs.accept_block(&b, NOW).unwrap();
+            prev = b.header;
+        }
+        // Invalidate h102 — twelve blocks disconnect, but the refill cap
+        // keeps the deepest two out of the pool.
+        let target = cs.chain()[102];
+        assert_eq!(cs.invalidate_block(&target), Ok(Some(12)));
+        let gone = cs.take_disconnected();
+        assert_eq!(gone.len(), 12);
+
+        let mut pool = Mempool::new();
+        let n = pool.refill_from_disconnected(&gone, &cs, NOW, false, 10);
+        // Disconnect order is tip-first: h113's spend feeds first,
+        // h103/h102's are past the cap.
+        assert_eq!(n, 10);
+        assert_eq!(pool.len(), 10);
+        assert!(pool.get(&txs[11]).is_some());
+        assert!(pool.get(&txs[0]).is_none());
     }
 }
