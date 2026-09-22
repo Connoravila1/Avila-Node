@@ -37,6 +37,40 @@ Create these modules/crates when implementing their first complete behavior. Kee
 interfaces small enough to extract useful implementations into other node projects.
 The architecture specifies responsibilities, not empty success-returning services.
 
+## Kernel and profiles
+
+The organizing direction is a kernel-and-profiles split, enforced by interface
+discipline rather than convention.
+
+**The kernel** is the consensus engine plus the state transitions it guarantees:
+parsing, script, UTXO semantics, chain selection, undo. Consensus rules are fixed
+by the network, never by configuration — the kernel's API must not expose them as
+options. Every deployment shares the same kernel; that is what keeps the project
+experimental without ever becoming a fork vehicle.
+
+**Profiles** are named bundles of everything else: storage engine and footprint,
+sync strategy, mempool and relay policy, indexes, privacy routes, and interfaces.
+One binary selects a profile; a profile cannot select consensus behavior. Storage
+(`CoinsBackend`), block sources, policy engines, and signers are the pluggable
+slots — sized so implementations can be swapped and measured against each other.
+
+**Interface discipline** is the mechanism. Components reach each other only
+through defined seams — no reaching inside another component's consensus-relevant
+state. Seams are also where verification coverage is reported: validation results
+carry *what was checked and what was assumed* as typed outputs, so a profile
+cannot claim checks it did not perform. Snapshot-assisted state is labeled as such
+by construction, not by documentation.
+
+**Extensions live out of process.** Indexers and application-facing consumers use
+wire interfaces; serving token or application data is not a roadmap item. The
+interfaces remain neutral — what others build on them is their code, not the
+node's direction.
+
+This reframes the workstreams: consensus assurance (W1) hardens the kernel;
+storage (W4), sync (W3), policy (W7), privacy (W9), and interfaces (W11) are
+profile dimensions; differential testing and the scorecard measure whether the
+seams hold their claims.
+
 ## Data and concurrency
 
 Validation receives explicit chain context and produces typed results. Distinguish
@@ -102,7 +136,9 @@ the filter index also answers BIP157 `getcfilters`/`getcfheaders`/
 `NODE_COMPACT_FILTERS` and disconnects requesters of unadvertised types,
 matching Core's `PrepareBlockFilterRequest` rules. The distinction between active and background
 chainstates is illustrated by [Core's AssumeUTXO design](https://github.com/bitcoin/bitcoin/blob/master/doc/design/assumeutxo.md).
-Avila has not implemented snapshot bootstrapping.
+`loadtxoutset`/`dumptxoutset` operate on the single chainstate with Core's
+snapshot format; the two-chainstate background-validation model is not yet
+implemented.
 
 Future network inputs, service permissions, queues, disk use, log payloads and
 configuration sizes require explicit limits. Preserve provenance and redaction
