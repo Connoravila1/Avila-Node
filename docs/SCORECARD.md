@@ -92,6 +92,16 @@ acceptance claims but do not substitute for the P/Q benchmarks above.
 - **RPC surface**: `tools/compare_rpc.py` — 75 calls exact-match
   Core 29.4 regtest including getblocktemplate/getmininginfo
   (experiments/2026-09-14-rpc-compat-matrix.md).
+- **State-level differential**: `tools/diff_validate.py` — the same
+  block stream driven through Avila and Knots on a shared regtest
+  chain, comparing `gettxoutsetinfo` (hash_serialized_3, txouts,
+  total_amount) and `getblockstats` (totalfee/subsidy/ins/outs) after
+  every block. Coverage per run: coinbase-only funding blocks, all four
+  standard output types, OP_RETURN data outputs, explicit spends of
+  each input type (P2PKH legacy sighash, P2SH-P2WPKH, P2WPKH BIP143,
+  P2TR Schnorr key-path), a deliberately-invalid mempool verdict, and
+  an invalidateblock+heavier-branch reorg with mempool refill. Result:
+  byte-identical UTXO state and fee accounting at every height.
 - **BIP324 v2 transport**: live session against Core 29.4 —
   session ids byte-identical on both ends; v1 fallback on a
   v1-only peer matches Core's reconnect rule.
