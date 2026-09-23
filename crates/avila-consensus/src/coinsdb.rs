@@ -43,6 +43,39 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 const K_TIP: &str = "tip_height";
 const K_LEN: &str = "coins_len";
+/// The record-encoding marker — absent means [`CoinFormat::Legacy`].
+const K_FORMAT: &str = "format";
+
+/// The coin-record encoding a `coinsdb.redb` carries, stamped into
+/// `meta` at creation and read back on open. A database keeps its
+/// creation format for life — undo records embed the same coin
+/// encoding, so mid-life switches would misdecode stored undos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoinFormat {
+    /// Original layout: `i64 value | varbytes(script) | u32 height |
+    /// u8 coinbase` (~39 bytes for a 25-byte script).
+    Legacy,
+    /// Core's `Coin` layout: `VARINT(height<<1|coinbase) |
+    /// VARINT(CompressAmount) | VARINT(size_id) | payload` — reuses
+    /// the snapshot codec (~26 bytes for the same P2PKH coin).
+    Compact,
+}
+
+impl CoinFormat {
+    fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Legacy),
+            1 => Some(Self::Compact),
+            _ => None,
+        }
+    }
+    fn byte(self) -> u8 {
+        match self {
+            Self::Legacy => 0,
+            Self::Compact => 1,
+        }
+    }
+}
 
 /// outpoint → 36-byte key (wire byte order: txid || vout LE).
 fn key_of(op: &OutPoint) -> [u8; 36] {
@@ -52,18 +85,60 @@ fn key_of(op: &OutPoint) -> [u8; 36] {
     k
 }
 
-/// Coin codec — same field order as `store::put_coin`/`get_coin`.
-fn encode_coin(c: &Coin) -> Vec<u8> {
-    let mut v = Vec::new();
-    v.extend_from_slice(&c.out.value.to_le_bytes());
-    crate::encode::write_var_bytes(&mut v, c.out.script_pubkey.as_bytes());
-    v.extend_from_slice(&c.height.to_le_bytes());
-    v.push(u8::from(c.coinbase));
-    v
+/// Coin codec — `Legacy` is the original field order (same as
+/// `store::put_coin`/`get_coin`); `Compact` is Core's `Coin`
+/// serialization (the snapshot dump's wire codec, byte for byte).
+fn encode_coin(c: &Coin, fmt: CoinFormat) -> Vec<u8> {
+    match fmt {
+        CoinFormat::Legacy => {
+            let mut v = Vec::new();
+            v.extend_from_slice(&c.out.value.to_le_bytes());
+            crate::encode::write_var_bytes(&mut v, c.out.script_pubkey.as_bytes());
+            v.extend_from_slice(&c.height.to_le_bytes());
+            v.push(u8::from(c.coinbase));
+            v
+        }
+        CoinFormat::Compact => {
+            let mut v = Vec::new();
+            crate::utxo_snapshot::write_varint(
+                &mut v,
+                u64::from(c.height) * 2 + u64::from(c.coinbase),
+            );
+            debug_assert!(c.out.value >= 0, "UTXO coins are never negative");
+            crate::utxo_snapshot::write_varint(
+                &mut v,
+                crate::utxo_snapshot::compress_amount(c.out.value.max(0) as u64),
+            );
+            let (size_id, payload) = crate::utxo_snapshot::compress_script(&c.out.script_pubkey);
+            crate::utxo_snapshot::write_varint(&mut v, size_id);
+            v.extend_from_slice(&payload);
+            v
+        }
+    }
 }
 
-fn decode_coin(b: &[u8]) -> Option<Coin> {
-    decode_coin_from(&mut Decoder::new(b))
+fn decode_coin(b: &[u8], fmt: CoinFormat) -> Option<Coin> {
+    match fmt {
+        CoinFormat::Legacy => decode_coin_from(&mut Decoder::new(b)),
+        CoinFormat::Compact => decode_coin_compact(&mut &b[..]),
+    }
+}
+
+/// `Compact` records decode through a byte-slice reader — the varints
+/// are Core's `VARINT` (MSB-first base-128), not CompactSize.
+fn decode_coin_compact(r: &mut &[u8]) -> Option<Coin> {
+    let code = crate::utxo_snapshot::read_varint(r).ok()?;
+    let amount = crate::utxo_snapshot::read_varint(r).ok()?;
+    let size_id = crate::utxo_snapshot::read_varint(r).ok()?;
+    let script = crate::utxo_snapshot::decompress_script(r, size_id).ok()?;
+    Some(Coin {
+        out: crate::transaction::TxOut {
+            value: crate::utxo_snapshot::decompress_amount(amount) as i64,
+            script_pubkey: script,
+        },
+        height: (code / 2) as u32,
+        coinbase: code % 2 == 1,
+    })
 }
 
 /// A coin record is self-delimiting (the script is length-prefixed),
@@ -85,28 +160,38 @@ fn decode_coin_from(d: &mut Decoder<'_>) -> Option<Coin> {
 }
 
 /// Undo record codec — the connecting block's hash followed by the
-/// `BlockUndo` in `store::put_undo` layout.
-fn encode_undo(hash: &crate::hash::BlockHash, u: &BlockUndo) -> Vec<u8> {
+/// `BlockUndo` in `store::put_undo` layout. Coins inside carry the
+/// database's [`CoinFormat`].
+fn encode_undo(hash: &crate::hash::BlockHash, u: &BlockUndo, fmt: CoinFormat) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(hash.as_bytes());
     crate::encode::write_compact_size(&mut v, u.txs.len() as u64);
     for tx in &u.txs {
         crate::encode::write_compact_size(&mut v, tx.spent.len() as u64);
         for coin in &tx.spent {
-            v.extend_from_slice(&encode_coin(coin));
+            v.extend_from_slice(&encode_coin(coin, fmt));
         }
         crate::encode::write_compact_size(&mut v, tx.overwritten.len() as u64);
         for (op, coin) in &tx.overwritten {
             v.extend_from_slice(op.txid.as_bytes());
             v.extend_from_slice(&op.vout.to_le_bytes());
-            v.extend_from_slice(&encode_coin(coin));
+            v.extend_from_slice(&encode_coin(coin, fmt));
         }
     }
     v
 }
 
-/// `(block hash, undo)` — `None` on malformed records.
-fn decode_undo(b: &[u8]) -> Option<(crate::hash::BlockHash, BlockUndo)> {
+/// `(block hash, undo)` — `None` on malformed records. Legacy coins
+/// decode through `Decoder`; compact coins through a slice cursor —
+/// the two varint schemes differ, so each branch keeps one cursor.
+fn decode_undo(b: &[u8], fmt: CoinFormat) -> Option<(crate::hash::BlockHash, BlockUndo)> {
+    match fmt {
+        CoinFormat::Legacy => decode_undo_legacy(b),
+        CoinFormat::Compact => decode_undo_compact(b),
+    }
+}
+
+fn decode_undo_legacy(b: &[u8]) -> Option<(crate::hash::BlockHash, BlockUndo)> {
     let mut d = Decoder::new(b);
     let hash = crate::hash::BlockHash::from_bytes(d.read_array::<32>().ok()?);
     let tx_count = d.read_compact_size().ok()?;
@@ -137,12 +222,67 @@ fn decode_undo(b: &[u8]) -> Option<(crate::hash::BlockHash, BlockUndo)> {
     Some((hash, BlockUndo { txs }))
 }
 
+/// The compact-format undo — same container layout (CompactSize
+/// counts), but each coin is a `decode_coin_compact` record.
+fn decode_undo_compact(b: &[u8]) -> Option<(crate::hash::BlockHash, BlockUndo)> {
+    let (head, mut r) = b.split_at_checked(32)?;
+    let hash = crate::hash::BlockHash::from_bytes(head.try_into().ok()?);
+    let cs_u64 = |r: &mut &[u8]| -> Option<u64> {
+        let b0 = *r.first()?;
+        let (n, len) = match b0 {
+            0..=0xfc => (u64::from(b0), 1),
+            0xfd => (
+                u64::from(u16::from_le_bytes(r.get(1..3)?.try_into().ok()?)),
+                3,
+            ),
+            0xfe => (
+                u64::from(u32::from_le_bytes(r.get(1..5)?.try_into().ok()?)),
+                5,
+            ),
+            0xff => (u64::from_le_bytes(r.get(1..9)?.try_into().ok()?), 9),
+        };
+        *r = r.get(len..)?;
+        Some(n)
+    };
+    let tx_count = cs_u64(&mut r)?;
+    let mut txs = Vec::with_capacity((tx_count.min(10_000)) as usize);
+    for _ in 0..tx_count {
+        let spent_count = cs_u64(&mut r)?;
+        let mut spent = Vec::with_capacity((spent_count.min(1_000_000)) as usize);
+        for _ in 0..spent_count {
+            spent.push(decode_coin_compact(&mut r)?);
+        }
+        let over_count = cs_u64(&mut r)?;
+        let mut overwritten = Vec::with_capacity((over_count.min(1_000_000)) as usize);
+        for _ in 0..over_count {
+            let (head, tail) = r.split_at_checked(36)?;
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(&head[..32]);
+            let vout = u32::from_le_bytes(head[32..].try_into().ok()?);
+            r = tail;
+            let coin = decode_coin_compact(&mut r)?;
+            overwritten.push((
+                OutPoint {
+                    txid: crate::hash::Txid::from_bytes(txid),
+                    vout,
+                },
+                coin,
+            ));
+        }
+        txs.push(crate::connect::TxUndo { spent, overwritten });
+    }
+    Some((hash, BlockUndo { txs }))
+}
+
 /// The on-disk coins store. Commits are whole-cache-delta
 /// transactions — Core's `BatchWrite` where coins, undo and meta land
 /// together or not at all.
 #[derive(Debug)]
 pub struct CoinsBackend {
     db: redb::Database,
+    /// The coin encoding every record in this database carries —
+    /// fixed at creation, read from `meta` on open.
+    format: CoinFormat,
     /// Cached `coins_len` — avoids a meta read per `len()` call.
     /// Atomic so commits stay `&self` (the backend lives behind `Arc`
     /// inside `UtxoSet`; the sync loop is still the only writer).
@@ -150,29 +290,117 @@ pub struct CoinsBackend {
 }
 
 impl CoinsBackend {
-    /// Opens (creating) the database at `dir/coinsdb.redb`.
+    /// Opens (creating) the database at `dir/coinsdb.redb`. An
+    /// existing database decodes under its stored format (absent
+    /// marker → Legacy); a fresh one is created [`CoinFormat::Compact`].
     ///
     /// # Errors
     /// `io::Error` on open/create or initial metadata read failure.
     pub fn open(dir: &Path) -> std::io::Result<Self> {
+        Self::open_inner(dir, None, None)
+    }
+
+    /// Opens with an explicit record format. A fresh database is
+    /// stamped with `format`; an existing database must already carry
+    /// that format — a mismatch is an error rather than a silent mix.
+    ///
+    /// # Errors
+    /// `io::Error` on open/create or metadata failure, or when the
+    /// database's stored format differs from `format`.
+    pub fn open_with_format(dir: &Path, format: CoinFormat) -> std::io::Result<Self> {
+        Self::open_inner(dir, Some(format), None)
+    }
+
+    /// `open_with_format` plus a redb cache budget — the memory-side
+    /// knob for the profile experiment (`None` = redb's 1 GiB default).
+    ///
+    /// # Errors
+    /// As [`Self::open_with_format`].
+    pub fn open_tuned(dir: &Path, format: CoinFormat, cache_bytes: usize) -> std::io::Result<Self> {
+        Self::open_inner(dir, Some(format), Some(cache_bytes))
+    }
+
+    /// `requested = None` accepts whatever the database stores
+    /// (fresh → Compact default); `Some` demands an exact match.
+    fn open_inner(
+        dir: &Path,
+        requested: Option<CoinFormat>,
+        cache_bytes: Option<usize>,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let db = redb::Database::create(dir.join("coinsdb.redb"))
-            .map_err(|e| std::io::Error::other(format!("coinsdb open: {e}")))?;
-        let coins_len = {
+        let db = {
+            let mut b = redb::Database::builder();
+            if let Some(cache) = cache_bytes {
+                b.set_cache_size(cache);
+            }
+            b.create(dir.join("coinsdb.redb"))
+        }
+        .map_err(|e| std::io::Error::other(format!("coinsdb open: {e}")))?;
+        // `(coins_len, has_tables, stored_format)` — `has_tables`
+        // distinguishes a truly fresh database (stamp the requested
+        // format) from a pre-format database (marker absent → Legacy).
+        let (coins_len, has_tables, stored_format) = {
             let r = db
                 .begin_read()
                 .map_err(|e| std::io::Error::other(format!("coinsdb read tx: {e}")))?;
             match r.open_table(META) {
-                Ok(m) => m
-                    .get(K_LEN)
-                    .map_err(|e| std::io::Error::other(format!("coinsdb meta: {e}")))?
-                    .map(|g| u64::from_le_bytes(g.value().try_into().unwrap_or_default()))
-                    .unwrap_or(0),
-                Err(_) => 0, // fresh database — no tables yet
+                Ok(m) => {
+                    let len = m
+                        .get(K_LEN)
+                        .map_err(|e| std::io::Error::other(format!("coinsdb meta: {e}")))?
+                        .map(|g| u64::from_le_bytes(g.value().try_into().unwrap_or_default()))
+                        .unwrap_or(0);
+                    let fmt = m
+                        .get(K_FORMAT)
+                        .map_err(|e| std::io::Error::other(format!("coinsdb meta: {e}")))?
+                        .and_then(|g| g.value().first().copied())
+                        .and_then(CoinFormat::from_byte);
+                    (len, true, fmt)
+                }
+                Err(_) => (0, false, None), // fresh database — no tables yet
+            }
+        };
+        // No marker on an existing database = written before formats
+        // existed = Legacy. Only a table-less database is fresh.
+        let stored_format = match (has_tables, stored_format) {
+            (true, None) => Some(CoinFormat::Legacy),
+            (true, f) => f,
+            (false, _) => None,
+        };
+        let format = match stored_format {
+            Some(f) => {
+                if let Some(req) = requested
+                    && req != f
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("coinsdb format mismatch: stored {f:?}, requested {req:?}"),
+                    ));
+                }
+                f
+            }
+            None => {
+                // Fresh database — stamp the requested format (or the
+                // Compact default when the caller doesn't care).
+                let fmt = requested.unwrap_or(CoinFormat::Compact);
+                let w = db
+                    .begin_write()
+                    .map_err(|e| std::io::Error::other(format!("coinsdb write tx: {e}")))?;
+                {
+                    let mut m = w
+                        .open_table(META)
+                        .map_err(|e| std::io::Error::other(format!("coinsdb meta fmt: {e}")))?;
+                    m.insert(K_FORMAT, &[fmt.byte()][..])
+                        .map_err(|e| std::io::Error::other(format!("coinsdb meta fmt: {e}")))?;
+                }
+                w.commit()
+                    .map_err(|e| std::io::Error::other(format!("coinsdb commit: {e}")))?;
+                fmt
             }
         };
         Ok(Self {
             db,
+            format,
             coins_len: AtomicU64::new(coins_len),
         })
     }
@@ -209,7 +437,7 @@ impl CoinsBackend {
         let r = self.db.begin_read().ok()?;
         let t = r.open_table(COINS).ok()?;
         let g = t.get(&key_of(outpoint)[..]).ok()??;
-        decode_coin(g.value())
+        decode_coin(g.value(), self.format)
     }
 
     /// `true` if the backend holds `outpoint` — cheaper than `get`
@@ -236,7 +464,7 @@ impl CoinsBackend {
         let r = self.db.begin_read().ok()?;
         let t = r.open_table(UNDO).ok()?;
         let g = t.get(height).ok()??;
-        decode_undo(g.value())
+        decode_undo(g.value(), self.format)
     }
 
     /// Atomically commits a cache delta: `dirty` entries (`Some` =
@@ -277,11 +505,16 @@ impl CoinsBackend {
             let mut coins = w
                 .open_table(COINS)
                 .map_err(|e| std::io::Error::other(format!("coinsdb coins: {e}")))?;
-            for (op, entry) in dirty {
+            // Insert in key order — sequential B-tree leaf fills beat
+            // the HashMap's random walk, especially on large deltas
+            // where random inserts thrash pages.
+            let mut ordered: Vec<_> = dirty.iter().collect();
+            ordered.sort_by_key(|(op, _)| key_of(op));
+            for (op, entry) in ordered {
                 match entry {
                     Some(c) => {
                         let had = coins
-                            .insert(&key_of(op)[..], encode_coin(c).as_slice())
+                            .insert(&key_of(op)[..], encode_coin(c, self.format).as_slice())
                             .map_err(|e| std::io::Error::other(format!("coinsdb insert: {e}")))?
                             .is_some();
                         if !had {
@@ -303,7 +536,7 @@ impl CoinsBackend {
                 .open_table(UNDO)
                 .map_err(|e| std::io::Error::other(format!("coinsdb undo: {e}")))?;
             for (h, hash, u) in new_undos {
-                undo.insert(*h, encode_undo(hash, u).as_slice())
+                undo.insert(*h, encode_undo(hash, u, self.format).as_slice())
                     .map_err(|e| std::io::Error::other(format!("coinsdb undo put: {e}")))?;
             }
             let new_len = (self.coins_len() as i64 + delta).max(0) as u64;
@@ -355,7 +588,7 @@ impl CoinsBackend {
                     txid: crate::hash::Txid::from_bytes(txid),
                     vout,
                 },
-                decode_coin(v.value())?,
+                decode_coin(v.value(), self.format)?,
             ))
         })
         .collect()
@@ -550,5 +783,140 @@ mod tests {
         // And it's still only in the dirty map until flushed.
         set.flush_to_backend(&[], 2).unwrap();
         assert!(set.have(&op(9, 0)));
+    }
+
+    /// Every standard script shape must survive the compact codec —
+    /// P2PKH/P2SH take the type-id path, compressed/uncompressed P2PK
+    /// the key path, and witness/OP_RETURN the raw fallback.
+    #[test]
+    fn compact_codec_roundtrips_all_script_types() {
+        let p2pkh = {
+            let mut s = vec![0x76, 0xa9, 0x14];
+            s.extend_from_slice(&[0x42; 20]);
+            s.extend_from_slice(&[0x88, 0xac]);
+            Script::new(s)
+        };
+        let p2sh = {
+            let mut s = vec![0xa9, 0x14];
+            s.extend_from_slice(&[0x43; 20]);
+            s.push(0x87);
+            Script::new(s)
+        };
+        let p2pk_c = {
+            let mut s = vec![0x21, 0x02];
+            s.extend_from_slice(&[0x44; 32]);
+            s.push(0xac);
+            Script::new(s)
+        };
+        let p2wpkh = {
+            let mut s = vec![0x00, 0x14];
+            s.extend_from_slice(&[0x45; 20]);
+            Script::new(s)
+        };
+        let p2tr = {
+            let mut s = vec![0x51, 0x20];
+            s.extend_from_slice(&[0x46; 32]);
+            Script::new(s)
+        };
+        let opret = {
+            let mut s = vec![0x6a, 0x08];
+            s.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0, 1, 2, 3]);
+            Script::new(s)
+        };
+        for (i, script) in [p2pkh, p2sh, p2pk_c, p2wpkh, p2tr, opret]
+            .into_iter()
+            .enumerate()
+        {
+            for (value, height, cb) in [
+                (50_000i64, 1u32, false),
+                (5_000_000_000, 500, true), // 50 BTC coinbase — the 229-compression case
+                (1, 0, false),
+                (2_100_000_000_000_000, 900_000, false),
+            ] {
+                let c = Coin {
+                    out: TxOut {
+                        value,
+                        script_pubkey: script.clone(),
+                    },
+                    height,
+                    coinbase: cb,
+                };
+                for fmt in [CoinFormat::Legacy, CoinFormat::Compact] {
+                    let enc = encode_coin(&c, fmt);
+                    let dec = decode_coin(&enc, fmt)
+                        .unwrap_or_else(|| panic!("decode failed: script {i} fmt {fmt:?}"));
+                    assert_eq!(dec.out.value, c.out.value, "value: script {i} fmt {fmt:?}");
+                    assert_eq!(
+                        dec.out.script_pubkey.as_bytes(),
+                        c.out.script_pubkey.as_bytes(),
+                        "script: {i} fmt {fmt:?}"
+                    );
+                    assert_eq!(dec.height, c.height, "height: {i} fmt {fmt:?}");
+                    assert_eq!(dec.coinbase, c.coinbase, "coinbase: {i} fmt {fmt:?}");
+                }
+            }
+        }
+    }
+
+    /// A compact record is smaller than the legacy one on a standard
+    /// output — the whole point of the encoding.
+    #[test]
+    fn compact_is_smaller_on_standard_outputs() {
+        let mut s = vec![0x76, 0xa9, 0x14];
+        s.extend_from_slice(&[0x42; 20]);
+        s.extend_from_slice(&[0x88, 0xac]);
+        let c = Coin {
+            out: TxOut {
+                value: 50_000,
+                script_pubkey: Script::new(s),
+            },
+            height: 500,
+            coinbase: false,
+        };
+        let legacy = encode_coin(&c, CoinFormat::Legacy).len();
+        let compact = encode_coin(&c, CoinFormat::Compact).len();
+        assert!(
+            compact < legacy,
+            "compact {compact} should beat legacy {legacy}"
+        );
+    }
+
+    /// The format marker persists: a Compact db reopens as Compact and
+    /// rejects a conflicting request; a Legacy db (no marker or 0)
+    /// stays Legacy.
+    #[test]
+    fn format_marker_persists_and_rejects_mismatch() {
+        let dir = test_dir("format-marker");
+        {
+            let be = CoinsBackend::open_with_format(&dir, CoinFormat::Compact).unwrap();
+            let mut dirty = HashMap::new();
+            dirty.insert(op(1, 0), Some(coin(42, 1)));
+            be.commit(&dirty, &[], 1).unwrap();
+        }
+        // Reopen with the matching format — reads decode.
+        {
+            let be = CoinsBackend::open_with_format(&dir, CoinFormat::Compact).unwrap();
+            assert_eq!(be.get(&op(1, 0)).unwrap().out.value, 42);
+        }
+        // A conflicting open must fail, not silently mix encodings.
+        assert!(CoinsBackend::open_with_format(&dir, CoinFormat::Legacy).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Undo records round-trip under the compact codec too — coins
+    /// inside undo entries use the database's format.
+    #[test]
+    fn undo_roundtrips_under_compact() {
+        let dir = test_dir("undo-compact");
+        let be = CoinsBackend::open_with_format(&dir, CoinFormat::Compact).unwrap();
+        let mut dirty = HashMap::new();
+        dirty.insert(op(1, 0), Some(coin(42, 1)));
+        be.commit(&dirty, &[(1, hash(7), undo(7))], 1).unwrap();
+        let (h, u) = be.undo_entry(1).unwrap();
+        assert_eq!(h, hash(7));
+        assert_eq!(u.txs.len(), 2);
+        assert_eq!(u.txs[1].spent[0].out.value, 50_000);
+        assert_eq!(u.txs[1].overwritten[0].1.out.value, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

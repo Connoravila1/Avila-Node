@@ -149,8 +149,15 @@ fn main() {
     let _ = std::fs::remove_dir_all(&dir);
 
     let mut set = UtxoSet::new();
+    // SNAP_BENCH_FORMAT=legacy|compact selects the record encoding
+    // (default: compact) — the layout experiment's knob.
+    let fmt = match std::env::var("SNAP_BENCH_FORMAT").as_deref() {
+        Ok("legacy") => avila_consensus::coinsdb::CoinFormat::Legacy,
+        _ => avila_consensus::coinsdb::CoinFormat::Compact,
+    };
     let be = std::sync::Arc::new(
-        avila_consensus::coinsdb::CoinsBackend::open(&dir).unwrap_or_else(|e| panic!("be: {e}")),
+        avila_consensus::coinsdb::CoinsBackend::open_with_format(&dir, fmt)
+            .unwrap_or_else(|e| panic!("be: {e}")),
     );
     set.attach_shared(be.clone());
     set.set_budget(512 << 20);

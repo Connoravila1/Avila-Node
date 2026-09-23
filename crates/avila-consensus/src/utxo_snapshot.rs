@@ -23,7 +23,7 @@ use std::io::Write;
 
 /// Writes Core's `VARINT` (`VarIntMode::NONNEGATIVE_SIGNED`): base-128,
 /// most-significant group first, `n = (n >> 7) - 1` between groups.
-fn write_varint(out: &mut Vec<u8>, mut n: u64) {
+pub(crate) fn write_varint(out: &mut Vec<u8>, mut n: u64) {
     let mut tmp = [0u8; 10];
     let mut len = 0usize;
     loop {
@@ -42,7 +42,7 @@ fn write_varint(out: &mut Vec<u8>, mut n: u64) {
 
 /// Core's `CompressAmount` (`compressor.cpp`) — decimal digit-exponent
 /// compression of the satoshi value.
-fn compress_amount(mut n: u64) -> u64 {
+pub(crate) fn compress_amount(mut n: u64) -> u64 {
     if n == 0 {
         return 0;
     }
@@ -64,7 +64,7 @@ fn compress_amount(mut n: u64) -> u64 {
 /// Core's `CompressScript`: the compact script encodings `Coin`
 /// serialization uses for standard templates. Returns
 /// `(size_or_id, payload)` — `size_or_id` is the VARINT-written field.
-fn compress_script(script: &Script) -> (u64, Vec<u8>) {
+pub(crate) fn compress_script(script: &Script) -> (u64, Vec<u8>) {
     match script.classify() {
         ScriptType::PubKeyHash(h) => (0, h.to_vec()),
         ScriptType::ScriptHash(h) => (1, h.to_vec()),
@@ -276,7 +276,7 @@ fn read_metadata_inner(
 /// `VARINT`'s inverse — `ReadVarInt` in `NONNEGATIVE_SIGNED` mode:
 /// MSB-first base-128, `n = (n << 7) | (b & 0x7f)`, with the extra
 /// `n++` Core applies per continuation byte.
-fn read_varint(r: &mut impl std::io::Read) -> std::io::Result<u64> {
+pub(crate) fn read_varint(r: &mut impl std::io::Read) -> std::io::Result<u64> {
     let mut buf = [0u8; 1];
     let mut n = 0u64;
     loop {
@@ -302,7 +302,7 @@ fn read_varint(r: &mut impl std::io::Read) -> std::io::Result<u64> {
 }
 
 /// `DecompressAmount` — the inverse of [`compress_amount`].
-fn decompress_amount(mut x: u64) -> u64 {
+pub(crate) fn decompress_amount(mut x: u64) -> u64 {
     if x == 0 {
         return 0;
     }
@@ -329,7 +329,10 @@ fn decompress_amount(mut x: u64) -> u64 {
 /// carries. `size_id` 0..=5 are the standard templates; 28/29/30 are
 /// the decode-only legacy witness ids; `>= 6` reads `size_id - 6` raw
 /// bytes.
-fn decompress_script(r: &mut impl std::io::Read, size_id: u64) -> std::io::Result<Script> {
+pub(crate) fn decompress_script(
+    r: &mut impl std::io::Read,
+    size_id: u64,
+) -> std::io::Result<Script> {
     let mut take = |n: usize| -> std::io::Result<Vec<u8>> {
         let mut v = vec![0u8; n];
         r.read_exact(&mut v)?;
