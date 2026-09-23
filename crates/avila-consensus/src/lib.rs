@@ -18,6 +18,7 @@ pub mod encode;
 pub mod extended_key;
 pub mod gcs;
 pub mod hash;
+pub mod hashstore;
 pub mod header;
 pub mod hex;
 pub mod interpreter;

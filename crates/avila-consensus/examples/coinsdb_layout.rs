@@ -5,12 +5,12 @@
 //!
 //!   cargo run --release -p avila-consensus --example coinsdb_layout
 
-use avila_consensus::coinsdb::{CoinFormat, CoinsBackend};
+use avila_consensus::coinsdb::{CoinFormat, CoinsBackend, Engine};
 use avila_consensus::connect::Coin;
 use avila_consensus::hash::Txid;
 use avila_consensus::transaction::{OutPoint, Script, TxOut};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Instant;
 
 const COINS_TOTAL: u32 = 500_000;
@@ -99,11 +99,14 @@ fn mk(i: u32, height: u32) -> (OutPoint, Coin) {
     )
 }
 
-fn dir_size(dir: &PathBuf) -> u64 {
+/// Allocated bytes (st_blocks·512) — the honest figure: the hash
+/// index file is sparse, so logical length would overstate it.
+fn dir_size(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
     std::fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok())
-                .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                .map(|e| e.metadata().map(|m| m.blocks() * 512).unwrap_or(0))
                 .sum()
         })
         .unwrap_or(0)
@@ -116,8 +119,19 @@ fn run_format(fmt: CoinFormat, name: &str, cache: Option<usize>) {
         Some(b) => CoinsBackend::open_tuned(&dir, fmt, b).unwrap_or_else(|e| panic!("open: {e}")),
         None => CoinsBackend::open_with_format(&dir, fmt).unwrap_or_else(|e| panic!("open: {e}")),
     };
+    run_bench(be, name, &dir);
+}
 
-    // Bulk inserts — migration/snapshot-ingest shape.
+/// The hash-indexed engine — same workloads through `CoinsBackend`.
+fn run_hash(name: &str) {
+    let dir = std::env::temp_dir().join(format!("avila-layout-{}-{}", name, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let be =
+        CoinsBackend::open_with_engine(&dir, Engine::Hash).unwrap_or_else(|e| panic!("open: {e}"));
+    run_bench(be, name, &dir);
+}
+
+fn run_bench(be: CoinsBackend, name: &str, dir: &std::path::Path) {
     let t = Instant::now();
     let mut n = 0u32;
     for chunk in 0..(COINS_TOTAL / BULK_CHUNK) {
@@ -161,7 +175,7 @@ fn run_format(fmt: CoinFormat, name: &str, cache: Option<usize>) {
     }
     let block_el = t.elapsed();
 
-    let bytes = dir_size(&dir);
+    let bytes = dir_size(dir);
     println!(
         "{name:>10} | bulk {:>7.0}/s | reads {:>7.0}/s ({hits} hits) | iter {:>6.2?} | blocks {:>5.1}/s | file {:>5.1} MiB",
         COINS_TOTAL as f64 / bulk_el.as_secs_f64(),
@@ -186,4 +200,6 @@ fn main() {
     // Cache dimension: same compact layout, tight vs generous redb cache.
     run_format(CoinFormat::Compact, "compact-32M", Some(32 << 20));
     run_format(CoinFormat::Compact, "compact-4G", Some(4 << 30));
+    // Engine dimension: unordered hash index + append log.
+    run_hash("hash");
 }

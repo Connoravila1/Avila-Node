@@ -155,9 +155,18 @@ fn main() {
         Ok("legacy") => avila_consensus::coinsdb::CoinFormat::Legacy,
         _ => avila_consensus::coinsdb::CoinFormat::Compact,
     };
+    // SNAP_BENCH_ENGINE=hash swaps the coins table for the
+    // hash-indexed store (undo/meta stay in the redb sidecar).
     let be = std::sync::Arc::new(
-        avila_consensus::coinsdb::CoinsBackend::open_with_format(&dir, fmt)
-            .unwrap_or_else(|e| panic!("be: {e}")),
+        if std::env::var("SNAP_BENCH_ENGINE").as_deref() == Ok("hash") {
+            avila_consensus::coinsdb::CoinsBackend::open_with_engine(
+                &dir,
+                avila_consensus::coinsdb::Engine::Hash,
+            )
+        } else {
+            avila_consensus::coinsdb::CoinsBackend::open_with_format(&dir, fmt)
+        }
+        .unwrap_or_else(|e| panic!("be: {e}")),
     );
     set.attach_shared(be.clone());
     set.set_budget(512 << 20);
@@ -304,12 +313,19 @@ fn main() {
     }
 
     measure(&mut set, &be, &sample_ops, base_height);
-    let db_size = std::fs::metadata(dir.join("coinsdb.redb"))
-        .map(|m| m.len())
+    // Whole-dir allocated size — under the hash engine the coins live
+    // in coins.idx/coins.dat, not coinsdb.redb.
+    let dir_bytes: u64 = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| {
+                    std::os::unix::fs::MetadataExt::blocks(
+                        &e.metadata().unwrap_or_else(|e| panic!("meta: {e}")),
+                    ) * 512
+                })
+                .sum()
+        })
         .unwrap_or(0);
-    println!(
-        "coinsdb.redb = {:.1} GiB",
-        db_size as f64 / (1 << 30) as f64
-    );
+    println!("datadir = {:.1} GiB", dir_bytes as f64 / (1 << 30) as f64);
     let _ = std::fs::remove_dir_all(&dir);
 }

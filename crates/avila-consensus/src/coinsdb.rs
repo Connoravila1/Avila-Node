@@ -45,6 +45,8 @@ const K_TIP: &str = "tip_height";
 const K_LEN: &str = "coins_len";
 /// The record-encoding marker — absent means [`CoinFormat::Legacy`].
 const K_FORMAT: &str = "format";
+/// The coins-table engine marker — absent means [`Engine::Redb`].
+const K_ENGINE: &str = "engine";
 
 /// The coin-record encoding a `coinsdb.redb` carries, stamped into
 /// `meta` at creation and read back on open. A database keeps its
@@ -77,8 +79,40 @@ impl CoinFormat {
     }
 }
 
+/// Which data structure owns the coins table. Stamped into `meta` at
+/// creation; an absent marker means the B-tree engine (every database
+/// written before engines existed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// redb B-tree `coins` table inside `coinsdb.redb` — ordered, so
+    /// canonical dumps iterate directly.
+    Redb,
+    /// [`crate::hashstore::HashStore`] — unordered hash index +
+    /// append log (`coins.idx`/`coins.dat` beside `coinsdb.redb`,
+    /// which still carries undo+meta). Canonical-order consumers sort
+    /// externally.
+    Hash,
+}
+
+impl Engine {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Redb => 0,
+            Self::Hash => 1,
+        }
+    }
+
+    fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Redb),
+            1 => Some(Self::Hash),
+            _ => None,
+        }
+    }
+}
+
 /// outpoint → 36-byte key (wire byte order: txid || vout LE).
-fn key_of(op: &OutPoint) -> [u8; 36] {
+pub(crate) fn key_of(op: &OutPoint) -> [u8; 36] {
     let mut k = [0u8; 36];
     k[..32].copy_from_slice(op.txid.as_bytes());
     k[32..].copy_from_slice(&op.vout.to_le_bytes());
@@ -88,7 +122,7 @@ fn key_of(op: &OutPoint) -> [u8; 36] {
 /// Coin codec — `Legacy` is the original field order (same as
 /// `store::put_coin`/`get_coin`); `Compact` is Core's `Coin`
 /// serialization (the snapshot dump's wire codec, byte for byte).
-fn encode_coin(c: &Coin, fmt: CoinFormat) -> Vec<u8> {
+pub(crate) fn encode_coin(c: &Coin, fmt: CoinFormat) -> Vec<u8> {
     match fmt {
         CoinFormat::Legacy => {
             let mut v = Vec::new();
@@ -117,7 +151,7 @@ fn encode_coin(c: &Coin, fmt: CoinFormat) -> Vec<u8> {
     }
 }
 
-fn decode_coin(b: &[u8], fmt: CoinFormat) -> Option<Coin> {
+pub(crate) fn decode_coin(b: &[u8], fmt: CoinFormat) -> Option<Coin> {
     match fmt {
         CoinFormat::Legacy => decode_coin_from(&mut Decoder::new(b)),
         CoinFormat::Compact => decode_coin_compact(&mut &b[..]),
@@ -279,10 +313,17 @@ fn decode_undo_compact(b: &[u8]) -> Option<(crate::hash::BlockHash, BlockUndo)> 
 /// together or not at all.
 #[derive(Debug)]
 pub struct CoinsBackend {
+    /// redb file — under [`Engine::Redb`] it owns the coins table too;
+    /// under [`Engine::Hash`] it carries only undo+meta and the coins
+    /// live in `hash` (`coins.idx`/`coins.dat`).
     db: redb::Database,
+    /// Which data structure owns the coins table — fixed at creation.
+    engine: Engine,
     /// The coin encoding every record in this database carries —
     /// fixed at creation, read from `meta` on open.
     format: CoinFormat,
+    /// The hash store when `engine == Engine::Hash`.
+    hash: Option<crate::hashstore::HashStore>,
     /// Cached `coins_len` — avoids a meta read per `len()` call.
     /// Atomic so commits stay `&self` (the backend lives behind `Arc`
     /// inside `UtxoSet`; the sync loop is still the only writer).
@@ -291,13 +332,20 @@ pub struct CoinsBackend {
 
 impl CoinsBackend {
     /// Opens (creating) the database at `dir/coinsdb.redb`. An
-    /// existing database decodes under its stored format (absent
-    /// marker → Legacy); a fresh one is created [`CoinFormat::Compact`].
+    /// existing database decodes under its stored format/engine
+    /// (absent markers → Legacy + Redb); a fresh one defaults to
+    /// Compact + Redb — `AVILA_COINS_ENGINE=hash` selects the
+    /// hash-indexed store for a fresh database (the experiment knob).
     ///
     /// # Errors
     /// `io::Error` on open/create or initial metadata read failure.
     pub fn open(dir: &Path) -> std::io::Result<Self> {
-        Self::open_inner(dir, None, None)
+        let eng = match std::env::var("AVILA_COINS_ENGINE").as_deref() {
+            Ok("hash") => Some(Engine::Hash),
+            Ok("redb") => Some(Engine::Redb),
+            _ => None,
+        };
+        Self::open_inner(dir, None, None, eng)
     }
 
     /// Opens with an explicit record format. A fresh database is
@@ -308,7 +356,7 @@ impl CoinsBackend {
     /// `io::Error` on open/create or metadata failure, or when the
     /// database's stored format differs from `format`.
     pub fn open_with_format(dir: &Path, format: CoinFormat) -> std::io::Result<Self> {
-        Self::open_inner(dir, Some(format), None)
+        Self::open_inner(dir, Some(format), None, None)
     }
 
     /// `open_with_format` plus a redb cache budget — the memory-side
@@ -317,15 +365,26 @@ impl CoinsBackend {
     /// # Errors
     /// As [`Self::open_with_format`].
     pub fn open_tuned(dir: &Path, format: CoinFormat, cache_bytes: usize) -> std::io::Result<Self> {
-        Self::open_inner(dir, Some(format), Some(cache_bytes))
+        Self::open_inner(dir, Some(format), Some(cache_bytes), None)
+    }
+
+    /// Opens demanding a specific coins-table engine — the storage
+    /// experiment's A/B path. Fresh databases are stamped with it;
+    /// existing databases must already carry it.
+    ///
+    /// # Errors
+    /// As [`Self::open_with_format`], or on engine mismatch.
+    pub fn open_with_engine(dir: &Path, engine: Engine) -> std::io::Result<Self> {
+        Self::open_inner(dir, None, None, Some(engine))
     }
 
     /// `requested = None` accepts whatever the database stores
-    /// (fresh → Compact default); `Some` demands an exact match.
+    /// (fresh → Compact/Redb defaults); `Some` demands an exact match.
     fn open_inner(
         dir: &Path,
         requested: Option<CoinFormat>,
         cache_bytes: Option<usize>,
+        requested_engine: Option<Engine>,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let db = {
@@ -336,10 +395,11 @@ impl CoinsBackend {
             b.create(dir.join("coinsdb.redb"))
         }
         .map_err(|e| std::io::Error::other(format!("coinsdb open: {e}")))?;
-        // `(coins_len, has_tables, stored_format)` — `has_tables`
-        // distinguishes a truly fresh database (stamp the requested
-        // format) from a pre-format database (marker absent → Legacy).
-        let (coins_len, has_tables, stored_format) = {
+        // `(coins_len, has_tables, stored_format, stored_engine)` —
+        // `has_tables` distinguishes a truly fresh database (stamp the
+        // requested markers) from a pre-format one (absent → Legacy,
+        // and absent engine → Redb: every pre-engine database is).
+        let (coins_len, has_tables, stored_format, stored_engine) = {
             let r = db
                 .begin_read()
                 .map_err(|e| std::io::Error::other(format!("coinsdb read tx: {e}")))?;
@@ -355,18 +415,38 @@ impl CoinsBackend {
                         .map_err(|e| std::io::Error::other(format!("coinsdb meta: {e}")))?
                         .and_then(|g| g.value().first().copied())
                         .and_then(CoinFormat::from_byte);
-                    (len, true, fmt)
+                    let eng = m
+                        .get(K_ENGINE)
+                        .map_err(|e| std::io::Error::other(format!("coinsdb meta: {e}")))?
+                        .and_then(|g| g.value().first().copied())
+                        .and_then(Engine::from_byte);
+                    (len, true, fmt, eng)
                 }
-                Err(_) => (0, false, None), // fresh database — no tables yet
+                Err(_) => (0, false, None, None), // fresh database — no tables yet
             }
         };
-        // No marker on an existing database = written before formats
-        // existed = Legacy. Only a table-less database is fresh.
+        // No markers on an existing database = written before formats/
+        // engines existed = Legacy + Redb. Only a table-less database
+        // is fresh.
         let stored_format = match (has_tables, stored_format) {
             (true, None) => Some(CoinFormat::Legacy),
             (true, f) => f,
             (false, _) => None,
         };
+        let stored_engine = match (has_tables, stored_engine) {
+            (true, None) => Some(Engine::Redb),
+            (true, e) => e,
+            (false, _) => None,
+        };
+        if let (Some(stored), Some(req)) = (stored_engine, requested_engine)
+            && stored != req
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("coinsdb engine mismatch: stored {stored:?}, requested {req:?}"),
+            ));
+        }
+        let engine = stored_engine.or(requested_engine).unwrap_or(Engine::Redb);
         let format = match stored_format {
             Some(f) => {
                 if let Some(req) = requested
@@ -380,8 +460,9 @@ impl CoinsBackend {
                 f
             }
             None => {
-                // Fresh database — stamp the requested format (or the
-                // Compact default when the caller doesn't care).
+                // Fresh database — stamp the requested format and
+                // engine (or the Compact/Redb defaults when the
+                // caller doesn't care).
                 let fmt = requested.unwrap_or(CoinFormat::Compact);
                 let w = db
                     .begin_write()
@@ -392,17 +473,34 @@ impl CoinsBackend {
                         .map_err(|e| std::io::Error::other(format!("coinsdb meta fmt: {e}")))?;
                     m.insert(K_FORMAT, &[fmt.byte()][..])
                         .map_err(|e| std::io::Error::other(format!("coinsdb meta fmt: {e}")))?;
+                    m.insert(K_ENGINE, &[engine.byte()][..])
+                        .map_err(|e| std::io::Error::other(format!("coinsdb meta eng: {e}")))?;
                 }
                 w.commit()
                     .map_err(|e| std::io::Error::other(format!("coinsdb commit: {e}")))?;
                 fmt
             }
         };
+        // Under the hash engine the meta byte records the redb-side
+        // codec; hash log records are always Compact-encoded.
+        let hash = if engine == Engine::Hash {
+            Some(crate::hashstore::HashStore::open(dir)?)
+        } else {
+            None
+        };
         Ok(Self {
             db,
+            engine,
             format,
+            hash,
             coins_len: AtomicU64::new(coins_len),
         })
+    }
+
+    /// The coins-table engine this database was created with.
+    #[must_use]
+    pub fn engine(&self) -> Engine {
+        self.engine
     }
 
     /// The tip height the coins+undo tables describe — `0` on a fresh
@@ -430,10 +528,13 @@ impl CoinsBackend {
         self.tip_height() == 0 && self.coins_len() == 0
     }
 
-    /// The persisted coin at `outpoint` — a direct mmap lookup; the
+    /// The persisted coin at `outpoint` — a direct lookup; the
     /// in-memory layer above owns caching.
     #[must_use]
     pub fn get(&self, outpoint: &OutPoint) -> Option<Coin> {
+        if let Some(h) = &self.hash {
+            return h.get(&key_of(outpoint));
+        }
         let r = self.db.begin_read().ok()?;
         let t = r.open_table(COINS).ok()?;
         let g = t.get(&key_of(outpoint)[..]).ok()??;
@@ -444,6 +545,9 @@ impl CoinsBackend {
     /// when the coin itself isn't needed.
     #[must_use]
     pub fn have(&self, outpoint: &OutPoint) -> bool {
+        if let Some(h) = &self.hash {
+            return h.have(&key_of(outpoint));
+        }
         self.db
             .begin_read()
             .ok()
@@ -496,6 +600,43 @@ impl CoinsBackend {
         new_undos: &[(u32, crate::hash::BlockHash, BlockUndo)],
         tip: Option<u32>,
     ) -> std::io::Result<()> {
+        // Hash engine: coins land in the log+index first (fsynced),
+        // then the bookkeeping tx — torn state always replays as
+        // "commit the same delta again", which is idempotent.
+        if let Some(h) = &self.hash {
+            let delta = h.commit_coins(dirty)?;
+            h.sync()?;
+            let w = self
+                .db
+                .begin_write()
+                .map_err(|e| std::io::Error::other(format!("coinsdb write tx: {e}")))?;
+            {
+                let mut undo = w
+                    .open_table(UNDO)
+                    .map_err(|e| std::io::Error::other(format!("coinsdb undo: {e}")))?;
+                for (hgt, hash, u) in new_undos {
+                    undo.insert(*hgt, encode_undo(hash, u, self.format).as_slice())
+                        .map_err(|e| std::io::Error::other(format!("coinsdb undo put: {e}")))?;
+                }
+                let new_len = (self.coins_len() as i64 + delta).max(0) as u64;
+                let mut meta = w
+                    .open_table(META)
+                    .map_err(|e| std::io::Error::other(format!("coinsdb meta: {e}")))?;
+                meta.insert(K_LEN, new_len.to_le_bytes().as_slice())
+                    .map_err(|e| std::io::Error::other(format!("coinsdb meta len: {e}")))?;
+                if let Some(tip) = tip {
+                    meta.insert(K_TIP, tip.to_le_bytes().as_slice())
+                        .map_err(|e| std::io::Error::other(format!("coinsdb meta tip: {e}")))?;
+                }
+            }
+            w.commit()
+                .map_err(|e| std::io::Error::other(format!("coinsdb commit: {e}")))?;
+            self.coins_len.store(
+                (self.coins_len() as i64 + delta).max(0) as u64,
+                Ordering::Relaxed,
+            );
+            return Ok(());
+        }
         let w = self
             .db
             .begin_write()
@@ -565,6 +706,9 @@ impl CoinsBackend {
     /// transaction that produced it under redb's ownership rules).
     #[must_use]
     pub fn iter_coins(&self) -> Vec<(OutPoint, Coin)> {
+        if let Some(h) = &self.hash {
+            return h.iter_coins();
+        }
         let Ok(r) = self.db.begin_read() else {
             return Vec::new();
         };

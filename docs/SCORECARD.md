@@ -107,7 +107,14 @@ acceptance claims but do not substitute for the P/Q benchmarks above.
   including the chain's first P2PK spends at h170+) fed via
   `submitblock` to both engines on mainnet params, comparing
   `gettxoutsetinfo` after every block. Result: identical verdicts and
-  byte-identical UTXO state at all 501 heights.
+  byte-identical UTXO state at all 501 heights. The same run passes
+  under the **hash-indexed coins engine** (`AVILA_COINS_ENGINE=hash`)
+  — the alternative UTXO store is consensus-identical on real blocks.
+- **Coins-engine experiment**: `experiments/2026-09-23-coinsdb-hash-engine.md`
+  — hash-indexed `coins.idx`/`coins.dat` vs redb B-tree: block commits
+  +96%, 5M ingest +16%, datadir −50% at 5M; point reads −22% (no mmap
+  under the unsafe forbid) and iteration ~1.8× slower. Opt-in, redb stays
+  default.
 - **BIP324 v2 transport**: live session against Core 29.4 —
   session ids byte-identical on both ends; v1 fallback on a
   v1-only peer matches Core's reconnect rule.
