@@ -488,7 +488,33 @@ impl CoinsBackend {
         // Under the hash engine the meta byte records the redb-side
         // codec; hash log records are always Compact-encoded.
         let hash = if engine == Engine::Hash {
-            Some(crate::hashstore::HashStore::open(dir)?)
+            let h = crate::hashstore::HashStore::open(dir)?;
+            // Ordering tear: the index-header watermark commits with
+            // the coins (phase 1), before this database's meta tx
+            // (phase 3). Watermark > meta tip means a crash landed
+            // between them — the coins are ahead of the tip and the
+            // undo needed to rewind them was never written. Loud
+            // error, not a MissingInput wedge downstream.
+            let wm = h.tip_watermark();
+            let meta_tip = {
+                let r = db
+                    .begin_read()
+                    .map_err(|e| std::io::Error::other(format!("coinsdb read: {e}")))?;
+                r.open_table(META)
+                    .ok()
+                    .and_then(|m| m.get(K_TIP).ok().flatten())
+                    .and_then(|g| g.value().try_into().ok().map(u32::from_le_bytes))
+                    .unwrap_or(0) as u64
+            };
+            if wm != u64::MAX && wm > meta_tip {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "coinsdb: hash coins at height {wm} but meta tip is {meta_tip} —                          torn commit, resync or restore required"
+                    ),
+                ));
+            }
+            Some(h)
         } else {
             None
         };
@@ -648,7 +674,7 @@ impl CoinsBackend {
         // then the bookkeeping tx — torn state always replays as
         // "commit the same delta again", which is idempotent.
         if let Some(h) = &self.hash {
-            let delta = h.commit_coins(dirty)?;
+            let delta = h.commit_coins(dirty, tip)?;
             h.sync()?;
             let w = self
                 .db

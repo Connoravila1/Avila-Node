@@ -52,7 +52,7 @@ const SLOT_US: usize = SLOT as usize;
 const MAX_LOAD_NUM: u64 = 7;
 const MAX_LOAD_DEN: u64 = 10;
 const INIT_CAP: u64 = 1024;
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// SipHash-1-3 over the 36-byte key — keyed so a mined-txid cluster
 /// can't target one bucket chain.
@@ -99,6 +99,73 @@ fn sip13(key: &[u8; 36], k0: u64, k1: u64) -> u64 {
     round(&mut v);
     round(&mut v);
     v[0] ^ v[1] ^ v[2] ^ v[3]
+}
+
+/// SipHash-1-3 over arbitrary bytes — same construction as [`sip13`]
+/// but streaming (used for record tags, where the payload is a
+/// coin record, not a fixed 36-byte key).
+fn sip13b(parts: &[&[u8]], k0: u64, k1: u64) -> u64 {
+    #[inline]
+    fn round(v: &mut [u64; 4]) {
+        v[0] = v[0].wrapping_add(v[1]);
+        v[1] = v[1].rotate_left(13);
+        v[1] ^= v[0];
+        v[0] = v[0].rotate_left(32);
+        v[2] = v[2].wrapping_add(v[3]);
+        v[3] = v[3].rotate_left(16);
+        v[3] ^= v[2];
+        v[0] = v[0].wrapping_add(v[3]);
+        v[3] = v[3].rotate_left(21);
+        v[3] ^= v[0];
+        v[2] = v[2].wrapping_add(v[1]);
+        v[1] = v[1].rotate_left(17);
+        v[1] ^= v[2];
+        v[2] = v[2].rotate_left(32);
+    }
+    let mut v = [
+        k0 ^ 0x736f_6d65_7073_6575,
+        k1 ^ 0x646f_7261_6e64_6f6d,
+        k0 ^ 0x6c79_6765_6e65_7261,
+        k1 ^ 0x7465_6462_7974_6573,
+    ];
+    // Stream the parts as one continuous byte sequence — the tail
+    // is the leftover <8 bytes with the total length in the top byte.
+    let mut total = 0usize;
+    let mut tail = [0u8; 8];
+    let mut n = 0usize;
+    for part in parts {
+        total += part.len();
+        for &b in part.iter() {
+            tail[n] = b;
+            n += 1;
+            if n == 8 {
+                let m = u64::from_le_bytes(tail);
+                v[3] ^= m;
+                round(&mut v);
+                v[0] ^= m;
+                n = 0;
+            }
+        }
+    }
+    tail[n..].fill(0);
+    tail[7] = total as u8;
+    let m = u64::from_le_bytes(tail);
+    v[3] ^= m;
+    round(&mut v);
+    v[0] ^= m;
+    v[2] ^= 0xff;
+    round(&mut v);
+    round(&mut v);
+    round(&mut v);
+    v[0] ^ v[1] ^ v[2] ^ v[3]
+}
+
+/// 4-byte integrity tag for a stored record — SipHash-1-3 over
+/// `key || record` with the database's random seeds. The key binds
+/// the record to its slot (a torn slot pointing at another key's
+/// record mismatches); the record bytes catch mid-record tears.
+fn rec_tag(key: &[u8; 36], rec: &[u8], k0: u64, k1: u64) -> u32 {
+    sip13b(&[&key[..], rec], k0, k1) as u32
 }
 
 fn random_seed() -> u64 {
@@ -181,6 +248,11 @@ impl Inner {
 #[derive(Debug)]
 pub struct HashStore {
     dir: PathBuf,
+    /// Tip watermark — the highest height passed to
+    /// `commit_coins(tip)`, mirrored into the index header. u64::MAX
+    /// when no height has ever committed (fresh store / mid-import
+    /// partial commits).
+    tip: AtomicU64,
     k0: u64,
     k1: u64,
     /// Live entry count, mirrored into the index header on flush.
@@ -224,6 +296,13 @@ impl HashStore {
             hdr[24..32].copy_from_slice(&0u64.to_le_bytes());
             hdr[32..40].copy_from_slice(&k0.to_le_bytes());
             hdr[40..48].copy_from_slice(&k1.to_le_bytes());
+            // [48..56]: tip watermark — the highest committed height.
+            // Written during commit_coins (phase 1), before the redb
+            // bookkeeping tx (phase 3): watermark > meta tip on open
+            // means the crash landed between them — coins ahead of
+            // the tip, a detectable corruption rather than a silent
+            // MissingInput wedge.
+            hdr[48..56].copy_from_slice(&u64::MAX.to_le_bytes());
             idx.write_all_at(&hdr, 0)?;
             // Sparse file: the slot array reads back as zeros = empty.
             idx.set_len(IDX_HDR + INIT_CAP * SLOT)?;
@@ -233,6 +312,7 @@ impl HashStore {
                 dir: dir.to_path_buf(),
                 k0,
                 k1,
+                tip: AtomicU64::new(u64::MAX),
                 count: AtomicU64::new(0),
                 inner: Mutex::new(Inner {
                     idx,
@@ -269,10 +349,12 @@ impl HashStore {
         let count = u64::from_le_bytes(hdr[24..32].try_into().unwrap());
         let k0 = u64::from_le_bytes(hdr[32..40].try_into().unwrap());
         let k1 = u64::from_le_bytes(hdr[40..48].try_into().unwrap());
+        let tip = u64::from_le_bytes(hdr[48..56].try_into().unwrap());
         Ok(Self {
             dir: dir.to_path_buf(),
             k0,
             k1,
+            tip: AtomicU64::new(tip),
             count: AtomicU64::new(count),
             inner: Mutex::new(Inner {
                 idx,
@@ -281,6 +363,15 @@ impl HashStore {
                 page: (u64::MAX, Box::new([0u8; 4096])),
             }),
         })
+    }
+
+    /// Tip watermark — the highest height committed through
+    /// `commit_coins`, or `u64::MAX` before any tipped commit.
+    /// `> meta tip` after a crash means coins committed whose
+    /// bookkeeping tx never landed.
+    #[must_use]
+    pub fn tip_watermark(&self) -> u64 {
+        self.tip.load(Ordering::Relaxed)
     }
 
     /// Persisted live-coin count (index header copy).
@@ -318,7 +409,16 @@ impl HashStore {
         let (off, len) = Self::slot_rec(&s);
         let mut b = vec![0u8; len as usize];
         inner.dat.read_exact_at(&mut b, off).ok()?;
-        crate::coinsdb::decode_coin(&b, CoinFormat::Compact)
+        // Torn-write check: the stored 4-byte tag must match
+        // key+record — a mismatch is a detectable miss, never a
+        // silently-wrong coin.
+        if b.len() < 4
+            || u32::from_le_bytes(b[..4].try_into().unwrap())
+                != rec_tag(key, &b[4..], self.k0, self.k1)
+        {
+            return None;
+        }
+        crate::coinsdb::decode_coin(&b[4..], CoinFormat::Compact)
     }
 
     /// `true` when `key` is present — probe only, no log read.
@@ -376,6 +476,10 @@ impl HashStore {
     /// Applies a dirty-map delta: `Some` = put/overwrite, `None` =
     /// delete. Returns the live-count delta. Does not fsync — the
     /// caller commits bookkeeping (undo+meta) after [`Self::sync`].
+    /// `tip` is the connecting block's height — written into the
+    /// index header *before* the caller's meta commit lands, so a
+    /// crash between the two leaves watermark > meta tip: detectable
+    /// coins-ahead-of-tip on open.
     ///
     /// Slot writes stage in an overlay that probes consult first —
     /// without it, two same-home inserts in one commit would collide
@@ -384,7 +488,11 @@ impl HashStore {
     ///
     /// # Errors
     /// `io::Error` on any file write.
-    pub fn commit_coins(&self, dirty: &HashMap<OutPoint, Option<Coin>>) -> io::Result<i64> {
+    pub fn commit_coins(
+        &self,
+        dirty: &HashMap<OutPoint, Option<Coin>>,
+        tip: Option<u32>,
+    ) -> io::Result<i64> {
         let mut inner = self
             .inner
             .lock()
@@ -401,37 +509,44 @@ impl HashStore {
             match entry {
                 Some(coin) => {
                     let rec = crate::coinsdb::encode_coin(coin, CoinFormat::Compact);
+                    // Stored layout: [4B tag][compact record] — the
+                    // tag binds key+bytes so a torn write decodes as
+                    // a detectable miss, not a wrong coin.
+                    let tag = rec_tag(&key, &rec, self.k0, self.k1).to_le_bytes();
+                    let mut stored = Vec::with_capacity(4 + rec.len());
+                    stored.extend_from_slice(&tag);
+                    stored.extend_from_slice(&rec);
                     let (i, found) = self.probe_staged(&mut inner, &stage, &key)?;
                     if found {
                         let s = Self::slot_at(&mut inner, &stage, i)?.unwrap();
                         let (off, old_len) = Self::slot_rec(&s);
-                        if rec.len() as u32 <= old_len {
+                        if stored.len() as u32 <= old_len {
                             // Fits the old allocation — overwrite in
                             // place, no log growth.
-                            inner.dat.write_all_at(&rec, off)?;
-                            if rec.len() as u32 != old_len {
+                            inner.dat.write_all_at(&stored, off)?;
+                            if stored.len() as u32 != old_len {
                                 let mut ns = s;
-                                ns[44..48].copy_from_slice(&(rec.len() as u32).to_le_bytes());
+                                ns[44..48].copy_from_slice(&(stored.len() as u32).to_le_bytes());
                                 stage.insert(i, Some(ns));
                             }
                             continue;
                         }
                         // Doesn't fit — append and repoint.
                         let new_off = dat_len;
-                        dat_appends.extend_from_slice(&rec);
-                        dat_len += rec.len() as u64;
+                        dat_appends.extend_from_slice(&stored);
+                        dat_len += stored.len() as u64;
                         let mut ns = s;
                         ns[36..44].copy_from_slice(&new_off.to_le_bytes());
-                        ns[44..48].copy_from_slice(&(rec.len() as u32).to_le_bytes());
+                        ns[44..48].copy_from_slice(&(stored.len() as u32).to_le_bytes());
                         stage.insert(i, Some(ns));
                     } else {
                         let new_off = dat_len;
-                        dat_appends.extend_from_slice(&rec);
-                        dat_len += rec.len() as u64;
+                        dat_appends.extend_from_slice(&stored);
+                        dat_len += stored.len() as u64;
                         let mut ns = [0u8; SLOT_US];
                         ns[..36].copy_from_slice(&key);
                         ns[36..44].copy_from_slice(&new_off.to_le_bytes());
-                        ns[44..48].copy_from_slice(&(rec.len() as u32).to_le_bytes());
+                        ns[44..48].copy_from_slice(&(stored.len() as u32).to_le_bytes());
                         stage.insert(i, Some(ns));
                         delta += 1;
                     }
@@ -483,10 +598,16 @@ impl HashStore {
         }
         // The page cache holds pre-write pages — drop it.
         inner.page.0 = u64::MAX;
-        // Mirror count into the index header (offset 24).
+        // Mirror count into the index header (offset 24) and the tip
+        // watermark (offset 48) — the watermark commits before the
+        // caller's meta tx, so it can only ever run *ahead*.
         inner
             .idx
             .write_all_at(&self.len().wrapping_add_signed(delta).to_le_bytes(), 24)?;
+        if let Some(tip) = tip {
+            inner.idx.write_all_at(&(tip as u64).to_le_bytes(), 48)?;
+            self.tip.store(tip as u64, Ordering::Relaxed);
+        }
         self.count
             .store(self.len().wrapping_add_signed(delta), Ordering::Relaxed);
         Ok(delta)
@@ -705,7 +826,18 @@ impl HashStore {
                 let Some(rec) = dat.get(roff as usize..roff as usize + rlen as usize) else {
                     continue;
                 };
-                let Some(coin) = crate::coinsdb::decode_coin(rec, CoinFormat::Compact) else {
+                // Skip + verify the 4B integrity tag — torn records
+                // are dropped from the iteration, never mis-decoded.
+                if rec.len() < 4 {
+                    continue;
+                }
+                let key: &[u8; 36] = s[..36].try_into().unwrap();
+                if u32::from_le_bytes(rec[..4].try_into().unwrap())
+                    != rec_tag(key, &rec[4..], self.k0, self.k1)
+                {
+                    continue;
+                }
+                let Some(coin) = crate::coinsdb::decode_coin(&rec[4..], CoinFormat::Compact) else {
                     continue;
                 };
                 let mut txid = [0u8; 32];
@@ -768,7 +900,7 @@ mod tests {
         for i in 0..100u32 {
             dirty.insert(op(i), Some(coin(i as i64 * 7, i)));
         }
-        s.commit_coins(&dirty).unwrap();
+        s.commit_coins(&dirty, None).unwrap();
         s.sync().unwrap();
         assert_eq!(s.len(), 100);
         for i in 0..100u32 {
@@ -779,7 +911,7 @@ mod tests {
         for i in 0..50u32 {
             del.insert(op(i), None);
         }
-        s.commit_coins(&del).unwrap();
+        s.commit_coins(&del, None).unwrap();
         assert_eq!(s.len(), 50);
         for i in 0..100u32 {
             let got = s.get(&crate::coinsdb::key_of(&op(i)));
@@ -822,7 +954,7 @@ mod tests {
                     oracle.insert(o, c);
                 }
             }
-            s.commit_coins(&dirty).unwrap();
+            s.commit_coins(&dirty, None).unwrap();
             s.sync().unwrap();
             // Spot-check this round's survivors plus a stale sample.
             for (o, c) in oracle.iter().step_by(37) {
@@ -897,7 +1029,7 @@ mod tests {
         let s2 = s.clone();
         let mut dirty = HashMap::new();
         dirty.insert(op(1), Some(coin(5, 1)));
-        s2.commit_coins(&dirty).unwrap();
+        s2.commit_coins(&dirty, None).unwrap();
         assert_eq!(s.get(&crate::coinsdb::key_of(&op(1))).unwrap().out.value, 5);
         eprintln!("DIR={d:?}");
     }
@@ -914,7 +1046,7 @@ mod tests {
                 dirty.insert(op(n), Some(coin(n as i64, 1)));
                 n += 1;
             }
-            s.commit_coins(&dirty).unwrap();
+            s.commit_coins(&dirty, None).unwrap();
         }
         assert_eq!(s.len(), 500_000);
         assert_eq!(s.iter_coins().len(), 500_000, "iter lost coins");
@@ -972,7 +1104,7 @@ mod tests {
                     None => oracle.remove(&op(n)),
                 };
             }
-            s.commit_coins(&dirty).unwrap();
+            s.commit_coins(&dirty, None).unwrap();
             s.compact().unwrap();
             assert_eq!(s.len() as usize, oracle.len(), "round {round} len");
             for (o, want) in &oracle {
