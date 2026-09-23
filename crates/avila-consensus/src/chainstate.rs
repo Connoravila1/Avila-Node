@@ -260,6 +260,14 @@ struct BackgroundValidation {
     utxo: UtxoSet,
     /// The next height to replay (`1` at start; `> base` when done).
     next: u32,
+    /// Deferred script checks: the serial UTXO replay runs ahead while
+    /// signatures verify on the pool — the same pipeline the live path
+    /// gets from `enable_speculative_connect`, bounded by `pending`.
+    pool: Option<std::sync::Arc<connect::ScriptPool>>,
+    /// Blocks applied but not yet drained — `(height, handle)`.
+    /// Failure kills the snapshot outright; ordering only matters for
+    /// reporting which height lied.
+    pending: std::collections::VecDeque<(u32, std::sync::Arc<connect::BlockCheck>)>,
 }
 
 /// Where [`Chainstate::background_step`] left the snapshot replay —
@@ -1259,6 +1267,8 @@ impl Chainstate {
         self.background = Some(BackgroundValidation {
             utxo: UtxoSet::new(),
             next: 1,
+            pool: None,
+            pending: std::collections::VecDeque::new(),
         });
         self.snapshot_verified = false;
         self.precious = None;
@@ -1491,6 +1501,8 @@ impl Chainstate {
             self.background = Some(BackgroundValidation {
                 utxo: UtxoSet::new(),
                 next: 1,
+                pool: None,
+                pending: std::collections::VecDeque::new(),
             });
         }
         // Coins view: `externalized` (v4) states keep coins+undos in
@@ -2640,8 +2652,32 @@ impl Chainstate {
         };
         let params = *self.tree.params();
         let mut waiting: Option<u32> = None;
+        // Lazy pool — the deferred-connect pipeline overlaps the serial
+        // UTXO replay with signature verification, same as the live path.
+        if bg.pool.is_none() {
+            let workers = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(4);
+            bg.pool = Some(connect::ScriptPool::new(workers));
+        }
+        let pool = bg.pool.clone();
+        // Backpressure: cap applied-but-unverified blocks so a fast
+        // replay can't outrun the script queue unboundedly.
+        const MAX_PENDING: usize = 64;
+        let mut failed: Option<ConnectError> = None;
         for _ in 0..max_blocks {
             if bg.next > base {
+                break;
+            }
+            while bg.pending.len() >= MAX_PENDING {
+                let (h, check) = bg.pending.pop_front().unwrap();
+                if let Err(e) = check.wait() {
+                    failed = Some(ConnectError::ScriptVerify(e));
+                    let _ = h;
+                    break;
+                }
+            }
+            if failed.is_some() {
                 break;
             }
             let h = bg.next;
@@ -2655,15 +2691,22 @@ impl Chainstate {
                 tree: &self.tree,
                 block_hash: hash,
                 script_checks: self.script_checks(&hash, &params),
-                script_pool: None,
+                script_pool: pool.as_deref(),
             };
-            match connect::connect_block(&block, &mut bg.utxo, &ctx) {
-                Ok(_undo) => bg.next += 1,
+            match connect::connect_block_deferred(&block, &mut bg.utxo, &ctx) {
+                Ok((_undo, check)) => {
+                    bg.pending.push_back((h, check));
+                    bg.next += 1;
+                }
                 Err(e) => {
-                    self.background = Some(bg);
-                    return Err(e);
+                    failed = Some(e);
+                    break;
                 }
             }
+        }
+        if let Some(e) = failed {
+            self.background = Some(bg);
+            return Err(e);
         }
         if bg.next <= base {
             let done = bg.next - 1;
@@ -2672,6 +2715,15 @@ impl Chainstate {
                 Some(height) => BackgroundStatus::WaitingForBody { height },
                 None => BackgroundStatus::InProgress { done, base },
             });
+        }
+        // Replay reached the base — every deferred script check must
+        // have passed before the content hash means anything.
+        while let Some((h, check)) = bg.pending.pop_front() {
+            if let Err(e) = check.wait() {
+                self.background = Some(bg);
+                return Err(ConnectError::ScriptVerify(e));
+            }
+            let _ = h;
         }
         // Replay reached the base — recompute the content hash exactly
         // as `activate_snapshot` verified the file's.

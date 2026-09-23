@@ -136,6 +136,13 @@ fn main() {
         }
     }
     let bg_t = t0.elapsed();
+    let sigh = avila_consensus::sigchecker::SIGHASH_NS.load(std::sync::atomic::Ordering::Relaxed);
+    let verf = avila_consensus::sigchecker::VERIFY_NS.load(std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "    (bg sighash {:.2}s | ecdsa {:.2}s)",
+        sigh as f64 / 1e9,
+        verf as f64 / 1e9
+    );
     assert!(dst.snapshot_verified());
     println!(
         "D. background validation of 0..{base_h}: {:.1}s",
