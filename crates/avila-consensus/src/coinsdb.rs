@@ -528,6 +528,20 @@ impl CoinsBackend {
         self.tip_height() == 0 && self.coins_len() == 0
     }
 
+    /// Hash-engine maintenance: rewrite `coins.dat` in slot order —
+    /// restores read locality and reclaims dead-append space. No-op on
+    /// the redb engine. Not crash-safe yet; hold the store quiescent.
+    ///
+    /// # Errors
+    /// `io::Error` on compaction failure (hash engine only).
+    pub fn compact_coins(&self) -> std::io::Result<()> {
+        if let Some(h) = &self.hash {
+            h.compact()
+        } else {
+            Ok(())
+        }
+    }
+
     /// The persisted coin at `outpoint` — a direct lookup; the
     /// in-memory layer above owns caching.
     #[must_use]

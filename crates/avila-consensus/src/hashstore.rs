@@ -492,6 +492,94 @@ impl HashStore {
         Ok(delta)
     }
 
+    /// Rewrites `coins.dat` in slot order: occupied slots walked
+    /// 0..cap, each record appended to a fresh log at its slot's
+    /// position. Restores read locality — a probe cluster's records
+    /// land in the same log region — and drops dead records left by
+    /// appends (the log shrinks to live-set size). Same idea as LSM
+    /// compaction, applied to the log the index points into.
+    ///
+    /// NOT crash-safe yet: the dat/idx renames aren't atomic, so a
+    /// power loss mid-compact can leave the index pointing into a
+    /// wrong-generation log. Maintenance operation only — callers hold
+    /// the store quiescent. A dat-generation marker in the index
+    /// header is the planned fix.
+    ///
+    /// # Errors
+    /// `io::Error` on allocation, read, write, sync, or rename failure.
+    pub fn compact(&self) -> io::Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("hashstore lock: {e}")))?;
+        let dtmp = self.dir.join("coins.dat.new");
+        let itmp = self.dir.join("coins.idx.new");
+        let ndat = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dtmp)?;
+        let mut dhdr = [0u8; DAT_HDR as usize];
+        dhdr[..8].copy_from_slice(DAT_MAGIC);
+        ndat.write_all_at(&dhdr, 0)?;
+        let nidx = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&itmp)?;
+        nidx.set_len(IDX_HDR + inner.cap * SLOT)?;
+
+        // Slot-ordered rewrite: scan the old index in aligned windows;
+        // each window's slot bytes are patched in place (offset → new
+        // log position) and written out sequentially.
+        let mut noff = DAT_HDR;
+        let mut buf = vec![0u8; (1 << 20) / SLOT_US * SLOT_US];
+        let mut off = IDX_HDR;
+        let end = IDX_HDR + inner.cap * SLOT;
+        while off < end {
+            let want = ((end - off) as usize).min(buf.len());
+            buf.truncate(want);
+            inner.idx.read_exact_at(&mut buf, off)?;
+            for s in buf.chunks_exact_mut(SLOT_US) {
+                let roff = u64::from_le_bytes(s[36..44].try_into().unwrap());
+                let rlen = u32::from_le_bytes(s[44..48].try_into().unwrap());
+                if roff == 0 {
+                    continue;
+                }
+                let mut rec = vec![0u8; rlen as usize];
+                inner.dat.read_exact_at(&mut rec, roff)?;
+                ndat.write_all_at(&rec, noff)?;
+                s[36..44].copy_from_slice(&noff.to_le_bytes());
+                noff += rlen as u64;
+            }
+            nidx.write_all_at(&buf, off)?;
+            off += want as u64;
+        }
+        // Index header — same cap/count, new generation implied by dat.
+        let mut hdr = [0u8; IDX_HDR as usize];
+        inner.idx.read_exact_at(&mut hdr, 0)?;
+        nidx.write_all_at(&hdr, 0)?;
+        ndat.sync_data()?;
+        nidx.sync_data()?;
+        // Swap: dat first so a torn compact leaves old idx pointing at
+        // offsets that are at least still readable (old log is only
+        // replaced once — the torn case still needs the gen marker).
+        std::fs::rename(&dtmp, self.dir.join("coins.dat"))?;
+        std::fs::rename(&itmp, self.dir.join("coins.idx"))?;
+        inner.dat = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.dir.join("coins.dat"))?;
+        inner.idx = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.dir.join("coins.idx"))?;
+        inner.page.0 = u64::MAX;
+        Ok(())
+    }
+
     /// fsync log then index — the commit ordering's durability barrier.
     ///
     /// # Errors
@@ -852,5 +940,47 @@ mod tests {
         // collapse or clump wildly.
         assert!(used > 30_000 && used < 40_000);
         assert!(max <= 10);
+    }
+
+    /// `compact` must preserve every coin byte-exact — slot-ordered
+    /// log rewrite is a pure re-placement.
+    #[test]
+    fn compact_preserves_all() {
+        let d = dir("compact");
+        let s = HashStore::open(&d).unwrap();
+        let mut oracle = HashMap::new();
+        let mut rng_state = 0x9E3779B97F4A7C15u64;
+        let mut rand = || {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state
+        };
+        // Two rounds: insert → compact → verify → churn → compact → verify.
+        for round in 0..2 {
+            let mut dirty = HashMap::new();
+            for _ in 0..20_000 {
+                let n = (rand() % 60_000) as u32;
+                let c = if rand() % 3 == 0 {
+                    None
+                } else {
+                    Some(coin(n as i64, n % 4))
+                };
+                dirty.insert(op(n), c.clone());
+                match c {
+                    Some(c) => oracle.insert(op(n), c),
+                    None => oracle.remove(&op(n)),
+                };
+            }
+            s.commit_coins(&dirty).unwrap();
+            s.compact().unwrap();
+            assert_eq!(s.len() as usize, oracle.len(), "round {round} len");
+            for (o, want) in &oracle {
+                let got = s.get(&crate::coinsdb::key_of(o));
+                assert_eq!(got.as_ref(), Some(want), "round {round} lost {o:?}");
+            }
+            assert_eq!(s.iter_coins().len(), oracle.len(), "round {round} iter");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

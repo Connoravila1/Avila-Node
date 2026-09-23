@@ -19,10 +19,13 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 
 | 11 | 09-23 | Real-disk 40M ingest | tmpfs numbers should hold on NVMe | **partial — caveat was real** | hash 1.9× ingest / 2.8× commits / −44% disk hold, but cold reads lose 0.4× (append-log scatters placement → no locality) | [hash-engine](2026-09-23-coinsdb-hash-engine.md) |
 
+| 12 | 09-23 | Slot-order log compaction | Clustered placement restores cold-read locality | **partial — bar not met** | 15.8k→22.6k/s (+43%) post-compact; still 2× behind redb 46k/s. Placement helps, per-lookup page touches dominate | [hash-engine](2026-09-23-coinsdb-hash-engine.md) |
+
 ## Pending / running
 
-- Log-locality fix: compaction rewriting `coins.dat` in slot order, or
-  an index-resident read cache — the cold-read regression is the open
-  item (#11's finding).
+- Inline small records into the slot (wide-slot variant) — the 2-page
+  touch per read is structural; only colocating record with index
+  slot cuts it to 1.
 - ~170M-scale ingest — the full-depth proof.
-- Crash fault-injection on the hash commit ordering.
+- Crash fault-injection on the hash commit ordering (incl. the
+  compact() rename torn-write gap).

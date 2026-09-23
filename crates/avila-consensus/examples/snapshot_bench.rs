@@ -313,6 +313,36 @@ fn main() {
     }
 
     measure(&mut set, &be, &sample_ops, base_height);
+    // SNAP_BENCH_COMPACT=1: hash-engine log-locality experiment —
+    // rewrite coins.dat in slot order, then re-measure reads.
+    if std::env::var("SNAP_BENCH_COMPACT").as_deref() == Ok("1") {
+        let t = Instant::now();
+        be.compact_coins()
+            .unwrap_or_else(|e| panic!("compact: {e}"));
+        println!("compact: {:.0?}", t.elapsed());
+        // sample_ops were spent by measure()'s mixed commit — draw
+        // fresh probes from the backend's live set instead.
+        let live: Vec<_> = be
+            .iter_coins()
+            .iter()
+            .step_by(65536)
+            .map(|(o, _)| *o)
+            .collect();
+        let t = Instant::now();
+        let mut hits = 0u64;
+        for op in &live {
+            if be.get(op).is_some() {
+                hits += 1;
+            }
+        }
+        let el = t.elapsed();
+        println!(
+            "post-compact backend reads: {} in {:.0?} — {:.0}/s ({hits} hits)",
+            live.len(),
+            el,
+            live.len() as f64 / el.as_secs_f64()
+        );
+    }
     // Whole-dir allocated size — under the hash engine the coins live
     // in coins.idx/coins.dat, not coinsdb.redb.
     let dir_bytes: u64 = std::fs::read_dir(&dir)

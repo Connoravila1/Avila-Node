@@ -80,9 +80,14 @@ scatters records in insertion order — every random read is a separate
 cold page (~2 preads, no locality). redb's leaf pages pack hundreds of
 keys, so one cold page serves many lookups. The same property that
 makes the log's writes fast makes its reads scattered. Writes, commits,
-and size keep their wins; the read path needs locality — compaction
-that rewrites the log in slot order, or a read cache. That is the
-next experiment.
+and size keep their wins; the read path needs locality.
+
+**Compaction attempt** (`HashStore::compact`, rewrites `coins.dat` in
+slot order — LSM-style): 15.8k→22.6k reads/s (+43%) and reclaims
+dead-record space, but still 2× behind redb's 46k/s. Placement helps;
+the residual cost is structural — every lookup touches ~2 cold pages
+(index slot + record) regardless of order. Closing that needs the
+record inlined in the slot (1 touch), not better placement.
 
 Differential correctness: PASS — all 501 blocks, identical verdicts
 and byte-identical UTXO state at every height under the hash engine.
@@ -109,8 +114,9 @@ and byte-identical UTXO state at every height under the hash engine.
 - 40M ≈ a quarter of real scale (~170M) — the trend says hash's
   write edge widens further; reads need the locality fix first.
 - Single runs per scale, ~611-read samples; no reps.
-- tmpfs vs NVMe divergence is real and measured — the cold-read
-  regression is the open item, not speculation.
+- tmpfs vs NVMe divergence is real and measured — cold reads lose
+  ~2× even after slot-order compaction; the fix is a format change
+  (wider slots, inline records), not placement.
 - Undo/meta still in redb — the hybrid is deliberate (atomic
   bookkeeping) but means the sidecar's write cost is shared.
 - Crash-path replay is designed-for, not fault-injected yet.
