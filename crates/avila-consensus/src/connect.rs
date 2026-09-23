@@ -1296,7 +1296,13 @@ fn connect_block_inner(
             }
             // Queue the script check — Core's CheckInputScripts posts
             // to the validation queue rather than verifying inline.
-            if !tx.is_coinbase() && ctx.script_checks {
+            // Txs whose scripts already passed (mempool acceptance)
+            // under a superset flag-set are skipped — the cache hit
+            // avoids a second full signature-verification pass.
+            if !tx.is_coinbase()
+                && ctx.script_checks
+                && !crate::sigchecker::scripts_verified(&tx.txid(), flags)
+            {
                 let spent_outs: Vec<TxOut> = spent.iter().map(|c| c.out.clone()).collect();
                 if ctx.script_pool.is_some() {
                     owned_jobs.push((tx.clone(), spent_outs));

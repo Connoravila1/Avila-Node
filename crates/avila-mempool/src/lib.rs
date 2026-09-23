@@ -879,6 +879,7 @@ impl Mempool {
         let flags = standard_script_flags(cs, next_height, &tip);
         let spent_outs: Vec<_> = spent.iter().map(|c| c.out.clone()).collect();
         check_input_scripts(&tx, &spent_outs, flags).map_err(MempoolReject::ScriptVerify)?;
+        avila_consensus::sigchecker::mark_scripts_verified(tx.txid(), flags);
 
         // 8. Min relay fee (Core: fee >= GetVirtualTransactionSize *
         //    minRelayTxFee / 1000).

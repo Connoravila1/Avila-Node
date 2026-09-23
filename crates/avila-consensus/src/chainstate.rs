@@ -3367,6 +3367,60 @@ mod tests {
     }
 
     #[test]
+    fn verified_cache_skips_reverify() {
+        // Mempool-style: verify a block's txs, mark them, then connect
+        // — every script check must be a cache hit, not a re-verify.
+        let params = params();
+        let blocks = spend_chain(150, &params);
+        let mut cs = Chainstate::new(&params);
+        let hits0 = crate::sigchecker::VERIFIED_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        for block in &blocks {
+            let flags = crate::script::block_script_flags(
+                &params,
+                cs.chain().len() as u32,
+                &block.block_hash(),
+            );
+            for tx in &block.transactions {
+                if tx.is_coinbase() {
+                    continue;
+                }
+                let outs: Vec<_> = tx
+                    .inputs
+                    .iter()
+                    .map(|i| cs.utxo().get(&i.previous_output).unwrap().out)
+                    .collect();
+                crate::sigchecker::check_input_scripts(tx, &outs, flags).unwrap();
+                crate::sigchecker::mark_scripts_verified(tx.txid(), flags);
+            }
+            cs.accept_block(block, NOW)
+                .unwrap_or_else(|e| panic!("accept {e:?}"));
+        }
+        let hits =
+            crate::sigchecker::VERIFIED_HITS.load(std::sync::atomic::Ordering::Relaxed) - hits0;
+        let misses = crate::sigchecker::VERIFIED_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("hits={hits} misses={misses}");
+        assert!(hits >= 40, "expected dedup hits, got {hits}");
+    }
+
+    #[test]
+    fn verified_cache_flag_containment() {
+        // A tx verified under a flag-set that does NOT contain the
+        // block's flags must not be skipped — containment, not equality.
+        let txid = crate::hash::Txid::from_bytes([7; 32]);
+        crate::sigchecker::mark_scripts_verified(txid, crate::script::ScriptFlags::P2SH);
+        let strict = crate::script::ScriptFlags::P2SH
+            .union(crate::script::ScriptFlags::WITNESS)
+            .union(crate::script::ScriptFlags::TAPROOT);
+        assert!(!crate::sigchecker::scripts_verified(&txid, strict));
+        // Verified under strict, queried under subset — a real hit.
+        crate::sigchecker::mark_scripts_verified(txid, strict);
+        assert!(crate::sigchecker::scripts_verified(
+            &txid,
+            crate::script::ScriptFlags::P2SH
+        ));
+    }
+
+    #[test]
     fn speculative_failure_rewinds_pending_blocks() {
         // Block 110 spends an always-false OP_0 output — the script
         // check fails. With the pool, blocks 111.. enter the pending

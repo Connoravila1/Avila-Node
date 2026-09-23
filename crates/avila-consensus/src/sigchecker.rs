@@ -598,6 +598,7 @@ impl SignatureChecker for TransactionSignatureChecker<'_> {
             return false;
         }
 
+        let _t = std::time::Instant::now();
         let sighash = signature_hash(
             &Script::new(script_code.to_vec()),
             self.tx,
@@ -607,7 +608,17 @@ impl SignatureChecker for TransactionSignatureChecker<'_> {
             sigversion,
             self.txdata,
         );
-        Self::verify_ecdsa_signature(sig, pubkey, &sighash)
+        SIGHASH_NS.fetch_add(
+            _t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let _t = std::time::Instant::now();
+        let r = Self::verify_ecdsa_signature(sig, pubkey, &sighash);
+        VERIFY_NS.fetch_add(
+            _t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        r
     }
 
     /// `CheckSchnorrSignature` — every failure path maps to the ScriptError
@@ -775,3 +786,74 @@ pub fn check_input_scripts(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;
+
+/// Cumulative ns in ECDSA sighash computation (all script checks).
+pub static SIGHASH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Cumulative ns in the libsecp verify call itself.
+pub static VERIFY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// Verified-tx cache — mempool→block script-check dedup
+// ---------------------------------------------------------------------------
+
+/// Txs whose input scripts already passed `check_input_scripts` under
+/// flag-set F needn't be re-verified at block connect when the block's
+/// flags ⊆ F (script flags are monotone-strictening — removing a flag
+/// never adds a requirement). Core's mempool does the same dedup via
+/// its script-check cache.
+///
+/// Keyed by txid — the txid commits to the full tx (inputs, outputs,
+/// sequences), and the spent outpoints uniquely determine the coins
+/// read, so a cached pass is sound for the same tx under any height.
+/// FIFO eviction, bounded.
+struct VerifiedCache {
+    map: std::collections::HashMap<crate::hash::Txid, u32>,
+    order: std::collections::VecDeque<crate::hash::Txid>,
+}
+
+static VERIFIED: std::sync::LazyLock<std::sync::Mutex<VerifiedCache>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(VerifiedCache {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        })
+    });
+
+const VERIFIED_CAP: usize = 50_000;
+
+/// Records a tx's scripts as verified under `flags` (call after a
+/// successful `check_input_scripts`, e.g. mempool acceptance).
+pub fn mark_scripts_verified(txid: crate::hash::Txid, flags: crate::script::ScriptFlags) {
+    let mut c = VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
+    if c.map.contains_key(&txid) {
+        return;
+    }
+    if c.order.len() >= VERIFIED_CAP {
+        if let Some(old) = c.order.pop_front() {
+            c.map.remove(&old);
+        }
+    }
+    c.order.push_back(txid);
+    c.map.insert(txid, flags.bits());
+}
+
+/// True when the tx's scripts were verified under a flag-set that
+/// contains `flags` (block_flags ⊆ verified_flags → skip is sound).
+pub fn scripts_verified(txid: &crate::hash::Txid, flags: crate::script::ScriptFlags) -> bool {
+    let c = VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
+    match c.map.get(txid) {
+        Some(&verified) if flags.bits() & !verified == 0 => {
+            VERIFIED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        _ => {
+            VERIFIED_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+/// Cache hits — block txs whose script checks were skipped.
+pub static VERIFIED_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Cache misses — block txs verified the hard way.
+pub static VERIFIED_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

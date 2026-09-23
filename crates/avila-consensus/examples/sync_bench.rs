@@ -51,6 +51,9 @@ fn main() {
     if spec {
         cs.enable_speculative_connect();
     }
+    // --mempool-first: script-verify every tx up front and mark it
+    // (the mempool's job); block connect should then skip re-verifying.
+    let mempool_first = std::env::args().any(|a| a == "--mempool-first");
 
     let mut t_decode = 0u128;
     let mut t_header = 0u128;
@@ -67,6 +70,24 @@ fn main() {
         t_decode += t0.elapsed().as_nanos();
         ntx += block.transactions.len() as u64;
 
+        if mempool_first {
+            use avila_consensus::script::block_script_flags;
+            use avila_consensus::sigchecker::{check_input_scripts, mark_scripts_verified};
+            let h = n as u32;
+            let flags = block_script_flags(&params, h, &block.block_hash());
+            for tx in &block.transactions {
+                if tx.is_coinbase() {
+                    continue;
+                }
+                let outs: Vec<_> = tx
+                    .inputs
+                    .iter()
+                    .map(|i| cs.utxo().get(&i.previous_output).expect("in-fx utxo").out)
+                    .collect();
+                check_input_scripts(tx, &outs, flags).expect("mempool verify");
+                mark_scripts_verified(tx.txid(), flags);
+            }
+        }
         let t0 = Instant::now();
         cs.accept_header(&block.header, now())
             .unwrap_or_else(|e| panic!("header {n}: {e:?}"));
@@ -125,5 +146,17 @@ fn main() {
     println!("    apply  {:>8.0} ms", ms(t.apply_ns as u128));
     println!("    scripts{:>8.0} ms", ms(t.script_ns as u128));
     println!("    bip30  {:>8.0} ms", ms(t.bip30_ns as u128));
+    let sigh = avila_consensus::sigchecker::SIGHASH_NS.load(std::sync::atomic::Ordering::Relaxed);
+    let verf = avila_consensus::sigchecker::VERIFY_NS.load(std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "  inside scripts: sighash {:>8.0} ms | ecdsa verify {:>8.0} ms",
+        ms(sigh as u128),
+        ms(verf as u128)
+    );
+    let hits =
+        avila_consensus::sigchecker::VERIFIED_HITS.load(std::sync::atomic::Ordering::Relaxed);
+    let miss =
+        avila_consensus::sigchecker::VERIFIED_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+    println!("  verified-cache: {hits} hits, {miss} misses");
     let _ = std::fs::remove_dir_all(&dir);
 }
