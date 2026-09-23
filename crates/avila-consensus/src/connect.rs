@@ -646,6 +646,11 @@ pub struct ConnectContext<'a> {
     /// valid through external verification. Every other check (inputs, maturity,
     /// values, sigops, locks, coinbase amount) still runs.
     pub script_checks: bool,
+    /// When set, `connect_block` enqueues script checks and returns a
+    /// [`BlockCheck`] handle instead of draining inline — the caller
+    /// decides when to wait (`Chainstate`'s speculative pipeline waits
+    /// a bounded window of blocks back, overlapping serial passes).
+    pub script_pool: Option<&'a ScriptPool>,
 }
 
 /// A consensus or internal failure while connecting a block. Every
@@ -1019,6 +1024,106 @@ fn tick(i: usize, start: std::time::Instant) {
     TIMING[i].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
+/// A block's outstanding script checks: workers decrement
+/// `remaining` as each tx verifies; `wait` returns when all pass or
+/// the first failure lands. The block's UTXO effects are already
+/// applied — this only tracks verification, which mutates nothing.
+pub struct BlockCheck {
+    remaining: AtomicU64,
+    error: std::sync::Mutex<Option<crate::interpreter::ScriptError>>,
+    done: std::sync::Condvar,
+}
+
+impl BlockCheck {
+    fn new(jobs: usize) -> Self {
+        Self {
+            remaining: AtomicU64::new(jobs as u64),
+            error: std::sync::Mutex::new(None),
+            done: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Blocks until the block's script queue drains; returns the first
+    /// verification failure, if any.
+    pub fn wait(&self) -> Result<(), crate::interpreter::ScriptError> {
+        let mut guard = self.error.lock().unwrap_or_else(|e| e.into_inner());
+        while self.remaining.load(Ordering::Relaxed) != 0 {
+            guard = self.done.wait(guard).unwrap_or_else(|e| e.into_inner());
+        }
+        match *guard {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
+/// One queued script verification — owned so the worker never borrows
+/// block memory (the block may be disconnected before the job runs).
+struct ScriptJob {
+    tx: Transaction,
+    outs: Vec<TxOut>,
+    flags: crate::script::ScriptFlags,
+    check: std::sync::Arc<BlockCheck>,
+}
+
+/// A persistent script-check pool — Core's `scriptcheckqueue` with the
+/// per-block barrier relaxed into a handle the caller waits on when it
+/// chooses. Lets a block's serial connect overlap the previous block's
+/// drain; verification results are consensus-exact either way.
+pub struct ScriptPool {
+    queue: std::sync::Mutex<std::collections::VecDeque<ScriptJob>>,
+    avail: std::sync::Condvar,
+}
+
+impl ScriptPool {
+    /// Spawns `workers` detached worker threads (same count rule as
+    /// [`run_script_checks`]: `available_parallelism`, capped by the
+    /// caller's queue depth).
+    #[must_use]
+    pub fn new(workers: usize) -> std::sync::Arc<Self> {
+        let pool = std::sync::Arc::new(Self {
+            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            avail: std::sync::Condvar::new(),
+        });
+        for _ in 0..workers.max(1) {
+            let pool = std::sync::Arc::clone(&pool);
+            std::thread::spawn(move || pool.worker());
+        }
+        pool
+    }
+
+    fn worker(&self) {
+        loop {
+            let job = {
+                let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(job) = q.pop_front() {
+                        break job;
+                    }
+                    q = self.avail.wait(q).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            if let Err(err) = check_input_scripts(&job.tx, &job.outs, job.flags) {
+                let mut guard = job.check.error.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.is_none() {
+                    *guard = Some(err);
+                }
+            }
+            if job.check.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                job.check.done.notify_all();
+            }
+        }
+    }
+
+    fn submit(&self, job: ScriptJob) {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(job);
+        self.avail.notify_one();
+    }
+}
+
 /// Reads the cumulative `connect_block` phase timers — benchmark
 /// instrumentation, not consensus state.
 #[must_use]
@@ -1058,6 +1163,44 @@ pub fn connect_block(
     utxo: &mut UtxoSet,
     ctx: &ConnectContext<'_>,
 ) -> Result<BlockUndo, ConnectError> {
+    let (undo, pending) = connect_block_inner(block, utxo, ctx)?;
+    if let Some(check) = pending {
+        if let Err(err) = check.wait() {
+            // Deferred check failed: undo the application, exactly as
+            // the inline drain's rollback does.
+            let _ = disconnect_block(block, utxo, &undo);
+            return Err(ConnectError::ScriptVerify(err));
+        }
+    }
+    Ok(undo)
+}
+
+/// `connect_block` through a [`ScriptPool`]: applies the block and
+/// returns its undo plus a handle for the outstanding script checks.
+/// The caller MUST `wait()` the handle before treating the block as
+/// validated — the UTXO mutations are final either way; a `wait`
+/// failure means the block (and anything applied on top) must roll
+/// back, exactly as if the drain had failed inline.
+pub fn connect_block_deferred(
+    block: &Block,
+    utxo: &mut UtxoSet,
+    ctx: &ConnectContext<'_>,
+) -> Result<(BlockUndo, std::sync::Arc<BlockCheck>), ConnectError> {
+    let (undo, pending) = connect_block_inner(block, utxo, ctx)?;
+    let Some(check) = pending else {
+        // Pool was absent — nothing outstanding; report an
+        // already-complete handle so callers don't branch.
+        let done = std::sync::Arc::new(BlockCheck::new(0));
+        return Ok((undo, done));
+    };
+    Ok((undo, check))
+}
+
+fn connect_block_inner(
+    block: &Block,
+    utxo: &mut UtxoSet,
+    ctx: &ConnectContext<'_>,
+) -> Result<(BlockUndo, Option<std::sync::Arc<BlockCheck>>), ConnectError> {
     let t_total = std::time::Instant::now();
     let Some(node) = ctx.tree.get(&ctx.block_hash) else {
         return Err(ConnectError::UnknownBlock);
@@ -1103,8 +1246,9 @@ pub fn connect_block(
     // only needs its resolved prevouts, so it carries no dependence
     // on the UTXO mutations happening around it.
     let mut script_jobs: Vec<(&Transaction, Vec<TxOut>)> = Vec::new();
+    let mut owned_jobs: Vec<(Transaction, Vec<TxOut>)> = Vec::new();
 
-    let result = (|| -> Result<(), ConnectError> {
+    let result = (|| -> Result<Option<std::sync::Arc<BlockCheck>>, ConnectError> {
         for (i, tx) in block.transactions.iter().enumerate() {
             let mut tx_undo = TxUndo::default();
             let mut spent = Vec::new();
@@ -1141,7 +1285,11 @@ pub fn connect_block(
             // to the validation queue rather than verifying inline.
             if !tx.is_coinbase() && ctx.script_checks {
                 let spent_outs: Vec<TxOut> = spent.iter().map(|c| c.out.clone()).collect();
-                script_jobs.push((tx, spent_outs));
+                if ctx.script_pool.is_some() {
+                    owned_jobs.push((tx.clone(), spent_outs));
+                } else {
+                    script_jobs.push((tx, spent_outs));
+                }
             }
             // Apply (Core's UpdateCoins): spend inputs, then add outputs.
             let t_apply = std::time::Instant::now();
@@ -1171,24 +1319,40 @@ pub fn connect_block(
                 limit: reward,
             });
         }
-        // Drain the queued script checks across worker threads —
-        // Core's `scriptcheckqueue` (control.wait() after queueing
-        // all of ConnectBlock's checks). Ordering within the block
-        // is irrelevant: every check reads only its own tx + prevouts.
+        // Drain the queued script checks — or hand them to the
+        // caller's pool for deferred waiting. Ordering within the
+        // block is irrelevant either way: every check reads only its
+        // own tx + prevouts.
         let t_script = std::time::Instant::now();
+        if let Some(pool) = ctx.script_pool {
+            let check = std::sync::Arc::new(BlockCheck::new(owned_jobs.len()));
+            for (tx, outs) in owned_jobs {
+                pool.submit(ScriptJob {
+                    tx,
+                    outs,
+                    flags,
+                    check: check.clone(),
+                });
+            }
+            tick(4, t_script);
+            return Ok(Some(check));
+        }
         if !script_jobs.is_empty() {
             run_script_checks(&script_jobs, flags).map_err(ConnectError::ScriptVerify)?;
         }
         tick(4, t_script);
-        Ok(())
+        Ok(None)
     })();
 
     TIMING[0].fetch_add(1, Ordering::Relaxed);
     tick(1, t_total);
     match result {
-        Ok(()) => Ok(BlockUndo {
-            txs: applied.into_iter().map(|a| a.undo).collect(),
-        }),
+        Ok(pending) => Ok((
+            BlockUndo {
+                txs: applied.into_iter().map(|a| a.undo).collect(),
+            },
+            pending,
+        )),
         Err(error) => {
             rollback(block, utxo, applied);
             Err(error)
@@ -1453,6 +1617,7 @@ mod tests {
                 tree: &self.tree,
                 block_hash: block.block_hash(),
                 script_checks: true,
+                script_pool: None,
             };
             connect_block(&block, &mut self.utxo, &ctx)?;
             self.tip = block.block_hash();
@@ -1833,6 +1998,7 @@ mod tests {
             tree: &chain.tree,
             block_hash: block.block_hash(),
             script_checks: true,
+            script_pool: None,
         };
         // Re-run connect on a clone to capture the undo (extend already applied
         // it); disconnect must restore `before` exactly.
@@ -1874,6 +2040,7 @@ mod tests {
             tree: &chain.tree,
             block_hash: block.block_hash(),
             script_checks: true,
+            script_pool: None,
         };
         assert_eq!(
             connect_block(&block, &mut chain.utxo, &ctx).unwrap_err(),
@@ -1982,6 +2149,7 @@ mod tests {
             tree: &chain.tree,
             block_hash: block.block_hash(),
             script_checks: true,
+            script_pool: None,
         };
         let base = chain.utxo.clone();
         let undo = connect_block(&block, &mut chain.utxo, &ctx).unwrap();

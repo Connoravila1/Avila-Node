@@ -237,6 +237,16 @@ pub struct Chainstate {
     /// queue; the node layer feeds their non-coinbase transactions back
     /// to the mempool after each disconnecting operation.
     disconnected: Vec<BlockHash>,
+    /// Speculative script-check pool — `None` until
+    /// [`Self::enable_speculative_connect`]; when set, block connects
+    /// return with verification still in flight.
+    script_pool: Option<std::sync::Arc<connect::ScriptPool>>,
+    /// Blocks applied to `utxo` whose script checks have not yet
+    /// drained — a strictly-increasing tail of the connected chain.
+    /// Bounded by the pipeline depth in `accept_block`; emptied by
+    /// [`Self::drain_scripts`] before flushes, snapshots, reorgs.
+    pending_scripts:
+        std::collections::VecDeque<(BlockHash, u32, std::sync::Arc<connect::BlockCheck>)>,
 }
 
 /// The background validation replay beneath an active snapshot — a
@@ -813,7 +823,60 @@ impl Chainstate {
             background: None,
             snapshot_verified: false,
             disconnected: Vec::new(),
+            script_pool: None,
+            pending_scripts: std::collections::VecDeque::new(),
         }
+    }
+
+    /// Turns on speculative connect: script checks run on a persistent
+    /// worker pool and `accept_block` returns once the pipeline window
+    /// is full rather than once every queued check has drained. A
+    /// block reported `Connected` under the pool may still have
+    /// outstanding script jobs — callers needing the verified tip must
+    /// `drain_scripts` first (flushes do so automatically). The
+    /// consensus verdict is unchanged; only the wait boundary moved.
+    pub fn enable_speculative_connect(&mut self) {
+        let workers = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1);
+        self.script_pool = Some(connect::ScriptPool::new(workers));
+    }
+
+    /// Waits out every speculatively-applied block — verifies any
+    /// outstanding script jobs and surfaces the first failure. Called
+    /// before any point that needs a fully-verified tip (flushes,
+    /// snapshots, restore) or that observes `self.connected` as
+    /// authoritative.
+    ///
+    /// # Errors
+    ///
+    /// The first script failure in pending order: that block and the
+    /// pending suffix on top of it are rolled back and the failed
+    /// block marked invalid — identical consensus state to an inline
+    /// drain failing.
+    pub fn drain_scripts(&mut self) -> Result<(), ConnectError> {
+        self.drain_pending_to(0)
+    }
+
+    /// Waits until at most `depth` speculatively-applied blocks remain
+    /// unverified — the pipeline's steady-state boundary inside
+    /// `accept_block`.
+    fn drain_pending_to(&mut self, depth: usize) -> Result<(), ConnectError> {
+        while self.pending_scripts.len() > depth {
+            let Some((hash, height, check)) = self.pending_scripts.pop_front() else {
+                break;
+            };
+            if let Err(err) = check.wait() {
+                // The failed block and everything pending above it can
+                // never connect — drop their pending entries, mark the
+                // block invalid, rewind to its parent.
+                self.pending_scripts.retain(|(_, h, _)| *h < height);
+                self.tree.mark_invalid(hash);
+                self.rewind_connected(height.saturating_sub(1))?;
+                return Err(ConnectError::ScriptVerify(err));
+            }
+        }
+        Ok(())
     }
 
     /// Turns on the transaction index — Core's `-txindex`. With `dir`
@@ -1699,6 +1762,12 @@ impl Chainstate {
     /// # Errors
     /// `io::Error` on backend commit failure.
     fn flush_coins(&mut self) -> std::io::Result<()> {
+        // A flush persists the tip + undo tail — every pending block
+        // must be verified first. Empty unless speculative connect is
+        // on; on failure the rewind path re-enters here with the
+        // queue already cleared.
+        self.drain_scripts()
+            .map_err(|_| std::io::Error::other("pending script check failed"))?;
         self.flush_coins_with(&[], self.chain.len() as u32 - 1)
     }
 
@@ -1926,6 +1995,7 @@ impl Chainstate {
                     tree: &self.tree,
                     block_hash: hash,
                     script_checks: self.script_checks(&hash, &params),
+                    script_pool: None,
                 };
                 if connect::connect_block(&block, utxo, &cctx).is_err() {
                     return false;
@@ -2112,9 +2182,16 @@ impl Chainstate {
                 tree: &self.tree,
                 block_hash: hash,
                 script_checks: self.script_checks(&hash, &params),
+                script_pool: self.script_pool.as_deref(),
             };
-            match connect::connect_block(block, &mut self.utxo, &ctx) {
-                Ok(undo) => {
+            let connected = if ctx.script_pool.is_some() {
+                connect::connect_block_deferred(block, &mut self.utxo, &ctx)
+                    .map(|(undo, check)| (undo, Some(check)))
+            } else {
+                connect::connect_block(block, &mut self.utxo, &ctx).map(|undo| (undo, None))
+            };
+            match connected {
+                Ok((undo, check)) => {
                     if let Some(index) = &mut self.filterindex {
                         index.append(height, block, &undo);
                     }
@@ -2125,6 +2202,16 @@ impl Chainstate {
                     self.undos.push(undo);
                     self.connected = hash;
                     self.tree.note_connected(&hash);
+                    if let Some(check) = check {
+                        // Pipeline window: leave this block's checks
+                        // outstanding while the next block's serial
+                        // phase overlaps them; only the oldest pending
+                        // block waits here.
+                        const SPEC_DEPTH: usize = 8;
+                        self.pending_scripts.push_back((hash, height, check));
+                        self.drain_pending_to(SPEC_DEPTH)
+                            .map_err(BlockRejection::Connect)?;
+                    }
                     // The write-back cache is flushed at block
                     // boundaries — a full map commits coins + undo tail
                     // + tip atomically (Core's `FlushStateToDisk` under
@@ -2362,6 +2449,7 @@ impl Chainstate {
                 tree: &self.tree,
                 block_hash: *branch_hash,
                 script_checks: self.script_checks(branch_hash, params),
+                script_pool: None,
             };
             match connect::connect_block(&block, sim, &ctx) {
                 Ok(undo) => {
@@ -2560,6 +2648,7 @@ impl Chainstate {
                 tree: &self.tree,
                 block_hash: hash,
                 script_checks: self.script_checks(&hash, &params),
+                script_pool: None,
             };
             match connect::connect_block(&block, &mut bg.utxo, &ctx) {
                 Ok(_undo) => bg.next += 1,
@@ -3206,6 +3295,98 @@ mod tests {
             blocks.push(block);
         }
         blocks
+    }
+
+    /// A chain of `tip` blocks; from height 102 each block also spends
+    /// the coinbase from 101 blocks back (always-mature `OP_1`
+    /// outputs — trivially valid scripts, real spend traffic).
+    fn spend_chain(tip_height: u32, params: &Params) -> Vec<Block> {
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut parent = params.genesis_header;
+        for height in 1..=tip_height {
+            let mut txs = vec![coinbase_tx(height, subsidy(height))];
+            if height > 101 {
+                txs.push(Transaction {
+                    version: 1,
+                    inputs: vec![TxIn {
+                        previous_output: OutPoint {
+                            txid: blocks[(height - 102) as usize].transactions[0].txid(),
+                            vout: 0,
+                        },
+                        script_sig: Script::new(vec![]),
+                        sequence: SEQUENCE_FINAL,
+                        witness: Witness::default(),
+                    }],
+                    outputs: vec![TxOut {
+                        value: subsidy(height - 101) - 1000,
+                        script_pubkey: Script::new(vec![script::OP_1]),
+                    }],
+                    lock_time: 0,
+                });
+            }
+            let block = block_on(&parent, txs, params);
+            parent = block.header;
+            blocks.push(block);
+        }
+        blocks
+    }
+
+    #[test]
+    fn speculative_connect_matches_sequential() {
+        let params = params();
+        let blocks = spend_chain(140, &params);
+
+        let mut plain = Chainstate::new(&params);
+        for block in &blocks {
+            assert!(plain.accept_block(block, NOW).is_ok());
+        }
+
+        let mut spec = Chainstate::new(&params);
+        spec.enable_speculative_connect();
+        for block in &blocks {
+            assert!(spec.accept_block(block, NOW).is_ok());
+        }
+        spec.drain_scripts().unwrap();
+
+        assert_eq!(plain.chain(), spec.chain());
+        assert_eq!(plain.utxo().len(), spec.utxo().len());
+        for block in blocks.iter().step_by(17) {
+            let txid = block.transactions[0].txid();
+            assert_eq!(
+                plain.utxo().have(&OutPoint { txid, vout: 0 }),
+                spec.utxo().have(&OutPoint { txid, vout: 0 })
+            );
+        }
+    }
+
+    #[test]
+    fn speculative_failure_rewinds_pending_blocks() {
+        // Block 110 spends an always-false OP_0 output — the script
+        // check fails. With the pool, blocks 111.. enter the pending
+        // window before 110's drain surfaces the error; the drain must
+        // roll them all back and leave the tip at 109.
+        let params = params();
+        let blocks = probe_chain(130, &[(110, 1)], &params);
+        let mut cs = Chainstate::new(&params);
+        cs.enable_speculative_connect();
+        let mut failed_at = None;
+        for (i, block) in blocks.iter().enumerate() {
+            match cs.accept_block(block, NOW) {
+                Ok(_) => {}
+                Err(BlockRejection::Connect(ConnectError::ScriptVerify(_))) => {
+                    failed_at = Some(i);
+                    break;
+                }
+                Err(e) => panic!("unexpected rejection {e:?}"),
+            }
+        }
+        // The failure may surface a few blocks late (pending window);
+        // the assert is about the resulting state, not the exact index.
+        assert!(failed_at.is_some());
+        cs.drain_scripts().ok();
+        // Tip is back at the last good block and the bad one is marked.
+        assert_eq!(cs.chain().len() as u32, 110); // genesis + 109
+        assert!(cs.tree().is_failed(&blocks[109].block_hash()));
     }
 
     #[test]

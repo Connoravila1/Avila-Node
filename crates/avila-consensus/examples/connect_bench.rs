@@ -49,14 +49,18 @@ fn main() {
         .unwrap_or(512 << 20);
     let mut cs = Chainstate::with_store_coinsdb(&dir, &params, now(), budget)
         .unwrap_or_else(|e| panic!("chainstate: {e}"));
+    let spec = args.any(|a| a == "--spec");
+    if spec {
+        cs.enable_speculative_connect();
+    }
 
     let mut off = 0usize;
     let mut n = 0u64;
     let t_wall = std::time::Instant::now();
     while off + 8 <= raw.len() {
         let len = u32::from_le_bytes(raw[off + 4..off + 8].try_into().unwrap()) as usize;
-        let block =
-            avila_consensus::block::Block::decode(&raw[off + 8..off + 8 + len]).unwrap_or_else(|e| {
+        let block = avila_consensus::block::Block::decode(&raw[off + 8..off + 8 + len])
+            .unwrap_or_else(|e| {
                 panic!("decode block {n}: {e:?}");
             });
         cs.accept_header(&block.header, now())
@@ -68,6 +72,7 @@ fn main() {
         n += 1;
         off += 8 + len;
     }
+    cs.drain_scripts().expect("drain");
     let wall = t_wall.elapsed();
 
     let t = connect_timing();
@@ -75,14 +80,32 @@ fn main() {
     let other = t
         .total_ns
         .saturating_sub(t.read_ns + t.apply_ns + t.script_ns + t.bip30_ns);
-    println!("blocks: {n} in {:.1?} — {:.0} blocks/s (cache {} MiB)", wall, n as f64 / wall.as_secs_f64(), budget >> 20);
+    println!(
+        "blocks: {n} in {:.1?} — {:.0} blocks/s (cache {} MiB, spec={})",
+        wall,
+        n as f64 / wall.as_secs_f64(),
+        budget >> 20,
+        spec
+    );
     println!("connect_block breakdown (cum over {n} blocks):");
     println!("  total   {:>9.0} ms", ms(t.total_ns));
-    println!("  read    {:>9.0} ms  (utxo.get inside check_tx_inputs)", ms(t.read_ns));
-    println!("  apply   {:>9.0} ms  (spend + add_tx_outputs)", ms(t.apply_ns));
-    println!("  scripts {:>9.0} ms  (parallel sig checks)", ms(t.script_ns));
+    println!(
+        "  read    {:>9.0} ms  (utxo.get inside check_tx_inputs)",
+        ms(t.read_ns)
+    );
+    println!(
+        "  apply   {:>9.0} ms  (spend + add_tx_outputs)",
+        ms(t.apply_ns)
+    );
+    println!(
+        "  scripts {:>9.0} ms  (parallel sig checks)",
+        ms(t.script_ns)
+    );
     println!("  bip30   {:>9.0} ms", ms(t.bip30_ns));
-    println!("  other   {:>9.0} ms  (headers/tree/undo/hashing/misc)", ms(other));
+    println!(
+        "  other   {:>9.0} ms  (headers/tree/undo/hashing/misc)",
+        ms(other)
+    );
     let pct = |x: u64| 100.0 * x as f64 / t.total_ns as f64;
     println!(
         "storage share (read+apply): {:.1}% of connect time",
