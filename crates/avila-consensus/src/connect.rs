@@ -36,6 +36,7 @@
 //! [`HeaderTree`]: crate::chain::HeaderTree
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::block::{Block, WITNESS_SCALE_FACTOR};
 use crate::chain::HeaderTree;
@@ -991,6 +992,47 @@ struct AppliedTx {
 
 /// Applies `block`'s UTXO effects and enforces the UTXO-dependent consensus
 /// rules — Core's `ConnectBlock` minus `CheckInputScripts` (see the module
+/// Coarse phase timers for `connect_block` — relaxed atomics, a few
+/// nanoseconds per bucket bump. Buckets: total wall, `check_tx_inputs`
+/// (input fetches + value math — the UTXO read cost), spend+output
+/// application (map writes), the parallel script-check drain, and
+/// the BIP30 pre-scan.
+pub struct ConnectTiming {
+    pub blocks: u64,
+    pub total_ns: u64,
+    pub read_ns: u64,
+    pub apply_ns: u64,
+    pub script_ns: u64,
+    pub bip30_ns: u64,
+}
+
+static TIMING: [AtomicU64; 6] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn tick(i: usize, start: std::time::Instant) {
+    TIMING[i].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Reads the cumulative `connect_block` phase timers — benchmark
+/// instrumentation, not consensus state.
+#[must_use]
+pub fn connect_timing() -> ConnectTiming {
+    ConnectTiming {
+        blocks: TIMING[0].load(Ordering::Relaxed),
+        total_ns: TIMING[1].load(Ordering::Relaxed),
+        read_ns: TIMING[2].load(Ordering::Relaxed),
+        apply_ns: TIMING[3].load(Ordering::Relaxed),
+        script_ns: TIMING[4].load(Ordering::Relaxed),
+        bip30_ns: TIMING[5].load(Ordering::Relaxed),
+    }
+}
+
 /// docs for the script boundary).
 ///
 /// # Preconditions
@@ -1016,6 +1058,7 @@ pub fn connect_block(
     utxo: &mut UtxoSet,
     ctx: &ConnectContext<'_>,
 ) -> Result<BlockUndo, ConnectError> {
+    let t_total = std::time::Instant::now();
     let Some(node) = ctx.tree.get(&ctx.block_hash) else {
         return Err(ConnectError::UnknownBlock);
     };
@@ -1035,6 +1078,7 @@ pub fn connect_block(
 
     // BIP30 duplicate-output scan — against the pre-block view, before any
     // transaction is applied (Core's ConnectBlock ordering).
+    let t_bip30 = std::time::Instant::now();
     if enforce_bip30(height, &ctx.block_hash, ctx) {
         for tx in &block.transactions {
             let txid = tx.txid();
@@ -1049,6 +1093,7 @@ pub fn connect_block(
             }
         }
     }
+    tick(5, t_bip30);
 
     let mut applied: Vec<AppliedTx> = Vec::with_capacity(block.transactions.len());
     let mut fees: i64 = 0;
@@ -1064,7 +1109,9 @@ pub fn connect_block(
             let mut tx_undo = TxUndo::default();
             let mut spent = Vec::new();
             if !tx.is_coinbase() {
+                let t_read = std::time::Instant::now();
                 let (spent_coins, fee) = check_tx_inputs(tx, utxo, height)?;
+                tick(2, t_read);
                 spent = spent_coins;
                 fees = match fees.checked_add(fee) {
                     Some(total) => total,
@@ -1097,6 +1144,7 @@ pub fn connect_block(
                 script_jobs.push((tx, spent_outs));
             }
             // Apply (Core's UpdateCoins): spend inputs, then add outputs.
+            let t_apply = std::time::Instant::now();
             for (input, coin) in tx.inputs.iter().zip(spent.iter()) {
                 let removed = utxo.spend(&input.previous_output);
                 debug_assert!(
@@ -1106,6 +1154,7 @@ pub fn connect_block(
                 tx_undo.spent.push(coin.clone());
             }
             utxo.add_tx_outputs(tx, height, &mut tx_undo)?;
+            tick(3, t_apply);
             applied.push(AppliedTx {
                 index: i,
                 undo: tx_undo,
@@ -1126,12 +1175,16 @@ pub fn connect_block(
         // Core's `scriptcheckqueue` (control.wait() after queueing
         // all of ConnectBlock's checks). Ordering within the block
         // is irrelevant: every check reads only its own tx + prevouts.
+        let t_script = std::time::Instant::now();
         if !script_jobs.is_empty() {
             run_script_checks(&script_jobs, flags).map_err(ConnectError::ScriptVerify)?;
         }
+        tick(4, t_script);
         Ok(())
     })();
 
+    TIMING[0].fetch_add(1, Ordering::Relaxed);
+    tick(1, t_total);
     match result {
         Ok(()) => Ok(BlockUndo {
             txs: applied.into_iter().map(|a| a.undo).collect(),

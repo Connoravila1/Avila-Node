@@ -120,6 +120,11 @@ acceptance claims but do not substitute for the P/Q benchmarks above.
   backend deletes — 20–25% fewer coins ops on synthetic churn
   (`experiments/2026-09-23-net-effect-writes.md`). Consensus-neutral,
   verified by the 501-block differential under the hash engine.
+- **Connect phase timing** (`connect::ConnectTiming` +
+  `examples/connect_bench.rs`): per-block validation is ~95% script
+  checks, ~3.5% UTXO read/apply at cache scale — storage wins are
+  capacity/ingest, not per-block latency
+  (`experiments/2026-09-23-connect-timing.md`).
 - **BIP324 v2 transport**: live session against Core 29.4 —
   session ids byte-identical on both ends; v1 fallback on a
   v1-only peer matches Core's reconnect rule.
