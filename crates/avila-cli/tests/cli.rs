@@ -26,9 +26,11 @@ fn inspection_is_explicit_and_has_no_fake_tip() {
 
 #[test]
 fn run_with_no_peers_fails_honestly() {
-    // `run` is a real daemon now; on regtest with no seeds and no
-    // --connect it must still fail honestly rather than pretend.
-    let output = cli().arg("run").output().unwrap();
+    // `run` is a real daemon: on regtest with no seeds it keeps
+    // redialing rather than exiting (Core never exits on zero peers),
+    // so the fail-fast check lives on `sync` — the bounded one-shot —
+    // which still reports honestly instead of pretending to sync.
+    let output = cli().arg("sync").output().unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no peer candidates"));
 }
