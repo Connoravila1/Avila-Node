@@ -282,3 +282,103 @@ fn torn_record_partial_tail() {
     }
     println!("torn partial record: {verdicts:?}");
 }
+
+// ---------------------------------------------------------------
+// Class 6 — torn compact swaps. The generation pair must heal from
+// whichever rename persisted, using the surviving .new file.
+// ---------------------------------------------------------------
+
+/// Stamps the idx header generation (`[56..64]`).
+fn stamp_idx_gen(d: &Path, file: &str, g: u64) {
+    write_at(&d.join(file), 56, &g.to_le_bytes());
+}
+/// Stamps the dat header generation (`[12..20]`).
+fn stamp_dat_gen(d: &Path, file: &str, g: u64) {
+    write_at(&d.join(file), 12, &g.to_le_bytes());
+}
+
+fn seeded_store(name: &str) -> PathBuf {
+    let d = dir(name);
+    let be = CoinsBackend::open_with_engine(&d, Engine::Hash).unwrap();
+    let ops: Vec<(u8, u32)> = (0..24).map(|n| (n, 0)).collect();
+    be.commit(&put(&ops, 42, 1), &[], 1).unwrap();
+    be.compact_coins().unwrap();
+    drop(be);
+    d
+}
+
+fn all_coins(be: &CoinsBackend, n: u8) -> (usize, usize) {
+    let mut ok = 0;
+    let mut miss = 0;
+    for i in 0..n {
+        match be.get(&op(i, 0)) {
+            Some(c) if c.out.value == 42 => ok += 1,
+            _ => miss += 1,
+        }
+    }
+    (ok, miss)
+}
+
+#[test]
+fn torn_compact_idx_won_heals_via_dat_new() {
+    let d = seeded_store("torn-idx-won");
+    // Crash: idx.new -> idx landed, dat.new -> dat did not.
+    // Live: idx gen 2, dat gen 1; coins.dat.new (gen 2) survives.
+    stamp_idx_gen(&d, "coins.idx", 2);
+    std::fs::copy(d.join("coins.dat"), d.join("coins.dat.new")).unwrap();
+    stamp_dat_gen(&d, "coins.dat.new", 2);
+
+    let be = CoinsBackend::open_with_engine(&d, Engine::Hash).unwrap();
+    let (ok, miss) = all_coins(&be, 24);
+    println!("torn compact (idx won): healed — {ok} ok, {miss} lost");
+    assert_eq!(miss, 0, "healed swap must keep every coin");
+    assert_eq!(ok, 24);
+    assert!(!d.join("coins.dat.new").exists());
+}
+
+#[test]
+fn torn_compact_dat_won_heals_via_idx_new() {
+    let d = seeded_store("torn-dat-won");
+    // Crash: dat.new -> dat landed, idx.new -> idx did not.
+    stamp_dat_gen(&d, "coins.dat", 2);
+    std::fs::copy(d.join("coins.idx"), d.join("coins.idx.new")).unwrap();
+    stamp_idx_gen(&d, "coins.idx.new", 2);
+
+    let be = CoinsBackend::open_with_engine(&d, Engine::Hash).unwrap();
+    let (ok, miss) = all_coins(&be, 24);
+    println!("torn compact (dat won): healed — {ok} ok, {miss} lost");
+    assert_eq!(miss, 0);
+    assert_eq!(ok, 24);
+    assert!(!d.join("coins.idx.new").exists());
+}
+
+#[test]
+fn torn_compact_no_rename_stays_consistent() {
+    let d = seeded_store("torn-none");
+    // Crash before either rename: stale .new files only.
+    std::fs::copy(d.join("coins.idx"), d.join("coins.idx.new")).unwrap();
+    std::fs::copy(d.join("coins.dat"), d.join("coins.dat.new")).unwrap();
+    stamp_idx_gen(&d, "coins.idx.new", 2);
+    stamp_dat_gen(&d, "coins.dat.new", 2);
+
+    let be = CoinsBackend::open_with_engine(&d, Engine::Hash).unwrap();
+    let (ok, miss) = all_coins(&be, 24);
+    assert_eq!((ok, miss), (24, 0));
+    assert!(!d.join("coins.idx.new").exists());
+    assert!(!d.join("coins.dat.new").exists());
+}
+
+#[test]
+fn torn_compact_without_new_file_errors() {
+    let d = seeded_store("torn-nolife");
+    // Worst case: generations mismatch AND no .new to heal from.
+    stamp_idx_gen(&d, "coins.idx", 2);
+
+    match CoinsBackend::open_with_engine(&d, Engine::Hash) {
+        Err(e) => {
+            println!("unhealable torn compact DETECTED: {e}");
+            assert!(e.to_string().contains("torn compact"));
+        }
+        Ok(_) => panic!("gen mismatch with no .new opened anyway"),
+    }
+}

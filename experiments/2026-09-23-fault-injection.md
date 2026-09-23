@@ -45,8 +45,12 @@ values.
 
 ## Honest caveats
 
-- `compact()` remains documented not-crash-safe (dat/idx renames
-  aren't atomic) — needs a dat-generation marker before production.
+- `compact()` — **closed in the same session**: both files of the
+  pair now carry a generation stamp (dat `[12..20]`, idx `[56..64]`);
+  the swap renames `.new` files stamped `gen+1`, and open completes
+  whichever rename the crash lost from the surviving `.new`. The one
+  remaining unhealable case — gen mismatch with no `.new` — errors
+  loudly instead of misreading.
 - File-level simulation, not process-level kills at phase
   boundaries — the same tear windows, but a real `kill -9` harness
   would be a stronger proof.

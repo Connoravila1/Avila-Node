@@ -585,7 +585,8 @@ impl CoinsBackend {
 
     /// Hash-engine maintenance: rewrite `coins.dat` in slot order —
     /// restores read locality and reclaims dead-append space. No-op on
-    /// the redb engine. Not crash-safe yet; hold the store quiescent.
+    /// the redb engine. Crash-safe via the generation-marked swap;
+    /// still a maintenance op — hold the store quiescent.
     ///
     /// # Errors
     /// `io::Error` on compaction failure (hash engine only).

@@ -253,6 +253,11 @@ pub struct HashStore {
     /// when no height has ever committed (fresh store / mid-import
     /// partial commits).
     tip: AtomicU64,
+    /// File-pair generation — dat header `[12..20]` and idx header
+    /// `[56..64]` carry the same value; `compact` bumps both. A
+    /// mismatch on open is a torn compact swap; the surviving `.new`
+    /// file completes it.
+    generation: AtomicU64,
     k0: u64,
     k1: u64,
     /// Live entry count, mirrored into the index header on flush.
@@ -286,6 +291,7 @@ impl HashStore {
             let mut dhdr = [0u8; DAT_HDR as usize];
             dhdr[..8].copy_from_slice(DAT_MAGIC);
             dhdr[8..12].copy_from_slice(&VERSION.to_le_bytes());
+            dhdr[12..20].copy_from_slice(&0u64.to_le_bytes());
             dat.write_all_at(&dhdr, 0)?;
             let k0 = random_seed();
             let k1 = random_seed();
@@ -303,6 +309,7 @@ impl HashStore {
             // the tip, a detectable corruption rather than a silent
             // MissingInput wedge.
             hdr[48..56].copy_from_slice(&u64::MAX.to_le_bytes());
+            hdr[56..64].copy_from_slice(&0u64.to_le_bytes());
             idx.write_all_at(&hdr, 0)?;
             // Sparse file: the slot array reads back as zeros = empty.
             idx.set_len(IDX_HDR + INIT_CAP * SLOT)?;
@@ -313,6 +320,7 @@ impl HashStore {
                 k0,
                 k1,
                 tip: AtomicU64::new(u64::MAX),
+                generation: AtomicU64::new(0),
                 count: AtomicU64::new(0),
                 inner: Mutex::new(Inner {
                     idx,
@@ -350,11 +358,15 @@ impl HashStore {
         let k0 = u64::from_le_bytes(hdr[32..40].try_into().unwrap());
         let k1 = u64::from_le_bytes(hdr[40..48].try_into().unwrap());
         let tip = u64::from_le_bytes(hdr[48..56].try_into().unwrap());
+        let idx_gen = u64::from_le_bytes(hdr[56..64].try_into().unwrap());
+        let dat_gen = u64::from_le_bytes(dhdr[12..20].try_into().unwrap());
+        let gen_ok = Self::reconcile_generations(dir, idx_gen, dat_gen)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             k0,
             k1,
             tip: AtomicU64::new(tip),
+            generation: AtomicU64::new(gen_ok),
             count: AtomicU64::new(count),
             inner: Mutex::new(Inner {
                 idx,
@@ -363,6 +375,65 @@ impl HashStore {
                 page: (u64::MAX, Box::new([0u8; 4096])),
             }),
         })
+    }
+
+    /// Reconciles the dat/idx generation pair on open: equal means a
+    /// consistent pair; a mismatch means a torn compact swap — the
+    /// side that already renamed has the newer generation, and the
+    /// still-present `.new` file for the other side (stamped with
+    /// that same generation) completes the swap. Stale `.new` files
+    /// from a compact that never reached the swap are discarded.
+    ///
+    /// # Errors
+    /// `io::Error` when the generations mismatch and no intact `.new`
+    /// file of the newer generation exists to finish the swap.
+    fn reconcile_generations(dir: &Path, idx_gen: u64, dat_gen: u64) -> io::Result<u64> {
+        let dnew = dir.join("coins.dat.new");
+        let inew = dir.join("coins.idx.new");
+        if idx_gen == dat_gen {
+            // Consistent pair — any .new/.grow leftovers predate the
+            // interrupted operation.
+            let _ = std::fs::remove_file(&dnew);
+            let _ = std::fs::remove_file(&inew);
+            let _ = std::fs::remove_file(dir.join("coins.idx.grow"));
+            return Ok(idx_gen);
+        }
+        // The newer generation committed at least one rename; finish
+        // the swap with the surviving .new file of the same gen.
+        let gen_hi = idx_gen.max(dat_gen);
+        let (need_path, want_off) = if idx_gen > dat_gen {
+            (&dnew, 12) // idx won the race: need the dat.new stamped `gen`
+        } else {
+            (&inew, 56) // dat won: need idx.new stamped `gen`
+        };
+        let mut b = [0u8; 8];
+        let stamped = std::fs::File::open(need_path)
+            .and_then(|f| {
+                use std::os::unix::fs::FileExt;
+                f.read_exact_at(&mut b, want_off)
+            })
+            .map(|()| u64::from_le_bytes(b));
+        match stamped {
+            Ok(g) if g == gen_hi => {
+                let live = if idx_gen > dat_gen {
+                    dir.join("coins.dat")
+                } else {
+                    dir.join("coins.idx")
+                };
+                std::fs::rename(need_path, &live)?;
+                // Persist the rename: fsync the directory entry.
+                if let Ok(d) = std::fs::File::open(dir) {
+                    let _ = d.sync_all();
+                }
+                Ok(gen_hi)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "coinsdb: torn compact (idx gen {idx_gen}, dat gen {dat_gen})                      and no intact .new file of gen {gen_hi} — resync or restore required"
+                ),
+            )),
+        }
     }
 
     /// Tip watermark — the highest height committed through
@@ -620,10 +691,11 @@ impl HashStore {
     /// appends (the log shrinks to live-set size). Same idea as LSM
     /// compaction, applied to the log the index points into.
     ///
-    /// NOT crash-safe yet: the dat/idx renames aren't atomic, so a
-    /// power loss mid-compact can leave the index pointing into a
-    /// wrong-generation log. Maintenance operation only — callers hold
-    /// the store quiescent. A dat-generation marker in the index
+    /// Crash-safe: both new files carry the same generation stamp;
+    /// either rename may persist alone, and `reconcile_generations`
+    /// finishes the swap from the surviving `.new` file on open.
+    /// Maintenance operation — callers hold the store quiescent.
+    /// A dat-generation marker in the index
     /// header is the planned fix.
     ///
     /// # Errors
@@ -641,8 +713,11 @@ impl HashStore {
             .create(true)
             .truncate(true)
             .open(&dtmp)?;
+        let gen_new = self.generation.load(Ordering::Relaxed) + 1;
         let mut dhdr = [0u8; DAT_HDR as usize];
         dhdr[..8].copy_from_slice(DAT_MAGIC);
+        dhdr[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        dhdr[12..20].copy_from_slice(&gen_new.to_le_bytes());
         ndat.write_all_at(&dhdr, 0)?;
         let nidx = std::fs::OpenOptions::new()
             .read(true)
@@ -678,17 +753,23 @@ impl HashStore {
             nidx.write_all_at(&buf, off)?;
             off += want as u64;
         }
-        // Index header — same cap/count, new generation implied by dat.
+        // Index header — same cap/count, new generation stamped.
         let mut hdr = [0u8; IDX_HDR as usize];
         inner.idx.read_exact_at(&mut hdr, 0)?;
+        hdr[56..64].copy_from_slice(&gen_new.to_le_bytes());
         nidx.write_all_at(&hdr, 0)?;
         ndat.sync_data()?;
         nidx.sync_data()?;
-        // Swap: dat first so a torn compact leaves old idx pointing at
-        // offsets that are at least still readable (old log is only
-        // replaced once — the torn case still needs the gen marker).
-        std::fs::rename(&dtmp, self.dir.join("coins.dat"))?;
+        // Generation-marked swap: either rename may persist alone on
+        // a crash — the pair's generations then mismatch, and
+        // `reconcile_generations` finishes the swap from the
+        // surviving .new file on next open.
         std::fs::rename(&itmp, self.dir.join("coins.idx"))?;
+        std::fs::rename(&dtmp, self.dir.join("coins.dat"))?;
+        self.generation.store(gen_new, Ordering::Relaxed);
+        if let Ok(d) = std::fs::File::open(&self.dir) {
+            let _ = d.sync_all();
+        }
         inner.dat = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -726,7 +807,7 @@ impl HashStore {
         while need * MAX_LOAD_DEN > new_cap * MAX_LOAD_NUM {
             new_cap *= 2;
         }
-        let tmp = self.dir.join("coins.idx.new");
+        let tmp = self.dir.join("coins.idx.grow");
         {
             let nidx = std::fs::OpenOptions::new()
                 .read(true)
