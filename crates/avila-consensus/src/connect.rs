@@ -160,6 +160,11 @@ pub struct UtxoSet {
     /// Coins live in `map` minus tombstones over lower-layer coins —
     /// tracks the map's net contribution so `len()` stays O(1).
     live_delta: i64,
+    /// Outpoints created since the last flush with no lower-layer
+    /// presence — "born in memory". A tombstone on a born key is a
+    /// delete of a key the backend never saw: pure waste, elided at
+    /// commit. Cleared on flush.
+    born: std::collections::HashSet<OutPoint>,
 }
 
 impl Default for UtxoSet {
@@ -171,6 +176,7 @@ impl Default for UtxoSet {
             map_bytes: 0,
             budget: DEFAULT_CACHE_BUDGET,
             live_delta: 0,
+            born: std::collections::HashSet::new(),
         }
     }
 }
@@ -354,6 +360,22 @@ impl UtxoSet {
         }
         self.map_bytes += entry_bytes(entry.as_ref());
         self.live_delta += i64::from(entry.is_some()) - i64::from(was_live);
+        // "Born this epoch" tracking: a `Some` insert whose key has no
+        // lower-layer presence and no live map entry. Tombstones on
+        // born keys are elided at commit — the backend never saw them.
+        // `Some`→`Some` overwrites leave `born` untouched (status
+        // already correct); tombstone→`Some` re-checks `lower_live` —
+        // a backend-resident key must NOT be born (its tombstone is
+        // real work).
+        if entry.is_some() {
+            let born_now = match self.map.get(&outpoint) {
+                Some(Some(_)) => false,
+                _ => !self.lower_live(&outpoint),
+            };
+            if born_now {
+                self.born.insert(outpoint);
+            }
+        }
         self.map.insert(outpoint, entry);
     }
 
@@ -466,6 +488,7 @@ impl UtxoSet {
             map_bytes: 0,
             budget: usize::MAX, // simulation never flushes
             live_delta: 0,
+            born: std::collections::HashSet::new(),
         }
     }
 
@@ -509,10 +532,18 @@ impl UtxoSet {
         let Some(be) = &self.backend else {
             return Ok(());
         };
+        // Tombstone elision: a `None` entry over a born key deletes a
+        // coin the backend never saw — drop it before commit instead
+        // of issuing a useless backend delete.
+        if !self.born.is_empty() {
+            let born = &self.born;
+            self.map.retain(|op, e| e.is_some() || !born.contains(op));
+        }
         be.commit(&self.map, new_undos, tip)?;
         self.map.clear();
         self.map_bytes = 0;
         self.live_delta = 0;
+        self.born.clear();
         Ok(())
     }
 
@@ -524,10 +555,15 @@ impl UtxoSet {
         let Some(be) = &self.backend else {
             return Ok(());
         };
+        if !self.born.is_empty() {
+            let born = &self.born;
+            self.map.retain(|op, e| e.is_some() || !born.contains(op));
+        }
         be.commit_partial(&self.map)?;
         self.map.clear();
         self.map_bytes = 0;
         self.live_delta = 0;
+        self.born.clear();
         Ok(())
     }
 }
@@ -541,6 +577,7 @@ impl Clone for UtxoSet {
             map_bytes: self.map_bytes,
             budget: self.budget,
             live_delta: self.live_delta,
+            born: self.born.clone(),
         }
     }
 }

@@ -328,6 +328,10 @@ pub struct CoinsBackend {
     /// Atomic so commits stay `&self` (the backend lives behind `Arc`
     /// inside `UtxoSet`; the sync loop is still the only writer).
     coins_len: AtomicU64,
+    /// Experiment counters — `(commits, coin puts, coin deletes)`
+    /// actually executed. Lets benchmarks measure how much churn the
+    /// write-back cache absorbs vs what reaches disk.
+    stats: std::sync::Mutex<(u64, u64, u64)>,
 }
 
 impl CoinsBackend {
@@ -494,7 +498,32 @@ impl CoinsBackend {
             format,
             hash,
             coins_len: AtomicU64::new(coins_len),
+            stats: std::sync::Mutex::new((0, 0, 0)),
         })
+    }
+
+    /// `(commits, coin puts, coin deletes)` executed since open —
+    /// experiment instrumentation.
+    #[must_use]
+    pub fn write_stats(&self) -> (u64, u64, u64) {
+        *self.stats.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn count_commit(&self, dirty: &HashMap<OutPoint, Option<Coin>>) {
+        let mut puts = 0u64;
+        let mut dels = 0u64;
+        for e in dirty.values() {
+            if e.is_some() {
+                puts += 1;
+            } else {
+                dels += 1;
+            }
+        }
+        if let Ok(mut s) = self.stats.lock() {
+            s.0 += 1;
+            s.1 += puts;
+            s.2 += dels;
+        }
     }
 
     /// The coins-table engine this database was created with.
@@ -614,6 +643,7 @@ impl CoinsBackend {
         new_undos: &[(u32, crate::hash::BlockHash, BlockUndo)],
         tip: Option<u32>,
     ) -> std::io::Result<()> {
+        self.count_commit(dirty);
         // Hash engine: coins land in the log+index first (fsynced),
         // then the bookkeeping tx — torn state always replays as
         // "commit the same delta again", which is idempotent.

@@ -116,6 +116,10 @@ acceptance claims but do not substitute for the P/Q benchmarks above.
   regress ~0.5× even after slot-order compaction — per-lookup page
   touches are structural; the inline-record format is the next
   experiment. Opt-in, redb stays default.
+- **Tombstone elision**: same-epoch create+spend pairs no longer issue
+  backend deletes — 20–25% fewer coins ops on synthetic churn
+  (`experiments/2026-09-23-net-effect-writes.md`). Consensus-neutral,
+  verified by the 501-block differential under the hash engine.
 - **BIP324 v2 transport**: live session against Core 29.4 —
   session ids byte-identical on both ends; v1 fallback on a
   v1-only peer matches Core's reconnect rule.
