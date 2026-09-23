@@ -17,9 +17,12 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 | 9 | 09-23 | mmap index reads (hashstore) | mmap kills the 2-syscall probe cost | **blocked — unsafe forbid** | workspace `-F unsafe-code`; page-cache fallback instead | same doc |
 | 10 | 09-23 | Windowed bulk scans | 1 MiB read windows for iter/rehash | **failed — bug caught** | `1 MiB % 48 ≠ 0` misaligned every slot past 1 MiB; fixed to whole-slot windows | same doc |
 
+| 11 | 09-23 | Real-disk 40M ingest | tmpfs numbers should hold on NVMe | **partial — caveat was real** | hash 1.9× ingest / 2.8× commits / −44% disk hold, but cold reads lose 0.4× (append-log scatters placement → no locality) | [hash-engine](2026-09-23-coinsdb-hash-engine.md) |
+
 ## Pending / running
 
-- Real-disk 40M ingest, both engines — kills the tmpfs caveat
-  (running).
+- Log-locality fix: compaction rewriting `coins.dat` in slot order, or
+  an index-resident read cache — the cold-read regression is the open
+  item (#11's finding).
 - ~170M-scale ingest — the full-depth proof.
 - Crash fault-injection on the hash commit ordering.

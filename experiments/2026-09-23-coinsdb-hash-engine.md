@@ -64,11 +64,25 @@ the unordered physical layout is invisible to them.
 | redb-compact | 198k/s | 129k/s | 86k/s | 7.5 GiB | 157k/s | 32 ms |
 | **hash** | **229k/s** | **188k/s** | **174k/s** | **4.2 GiB** | **396k/s** | **6 ms** |
 
-At 40M: hash is 2.0× ingest, 2.5× reads, 5.3× commits, −44% disk —
-and the gap *widens* with depth: redb falls 198→129→86k/s while hash
-falls gently (229→188→174k/s). Point reads flip sign between scales:
-hash loses 22% at 500k (cached tree beats two preads) but wins 2.5×
-at 20M+ (tree depth exceeds cache; the hash probe stays flat).
+At 40M on tmpfs: hash is 2.0× ingest, 2.5× reads, 5.3× commits,
+−44% disk — and the gap *widens* with depth: redb falls 198→129→
+86k/s while hash falls gently (229→188→174k/s).
+
+**Real-disk (NVMe) 40M** — the tmpfs numbers lie about reads:
+
+| engine | ingest | cold reads | 2k commit | dir |
+|---|---|---|---|---|
+| redb | 70k/s | **46k/s** | 59 ms | 7.5 GiB |
+| hash | **131k/s (1.9×)** | 18k/s (0.4×) | **21 ms (2.8×)** | **4.2 GiB** |
+
+Cold random reads **flip against** hash on real disk: the append log
+scatters records in insertion order — every random read is a separate
+cold page (~2 preads, no locality). redb's leaf pages pack hundreds of
+keys, so one cold page serves many lookups. The same property that
+makes the log's writes fast makes its reads scattered. Writes, commits,
+and size keep their wins; the read path needs locality — compaction
+that rewrites the log in slot order, or a read cache. That is the
+next experiment.
 
 Differential correctness: PASS — all 501 blocks, identical verdicts
 and byte-identical UTXO state at every height under the hash engine.
@@ -92,12 +106,11 @@ and byte-identical UTXO state at every height under the hash engine.
 
 ## Honest gaps
 
-- 40M ≈ a quarter of real scale (~170M) — the trend says hash's edge
-  widens further, but that's extrapolation, not measurement.
-- All numbers on tmpfs (page-cache speed). On real disk the cold-read
-  gap should widen *in hash's favor* — a B-tree descent costs log n
-  page touches vs ~2 for the hash probe — but unmeasured.
+- 40M ≈ a quarter of real scale (~170M) — the trend says hash's
+  write edge widens further; reads need the locality fix first.
 - Single runs per scale, ~611-read samples; no reps.
+- tmpfs vs NVMe divergence is real and measured — the cold-read
+  regression is the open item, not speculation.
 - Undo/meta still in redb — the hybrid is deliberate (atomic
   bookkeeping) but means the sidecar's write cost is shared.
 - Crash-path replay is designed-for, not fault-injected yet.
