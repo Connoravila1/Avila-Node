@@ -862,6 +862,13 @@ impl Chainstate {
     /// unverified — the pipeline's steady-state boundary inside
     /// `accept_block`.
     fn drain_pending_to(&mut self, depth: usize) -> Result<(), ConnectError> {
+        let _dt = std::time::Instant::now();
+        let r = self.drain_pending_inner(depth);
+        crate::connect::drain_tick(_dt);
+        r
+    }
+
+    fn drain_pending_inner(&mut self, depth: usize) -> Result<(), ConnectError> {
         while self.pending_scripts.len() > depth {
             let Some((hash, height, check)) = self.pending_scripts.pop_front() else {
                 break;

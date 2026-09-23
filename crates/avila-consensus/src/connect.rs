@@ -1009,9 +1009,14 @@ pub struct ConnectTiming {
     pub apply_ns: u64,
     pub script_ns: u64,
     pub bip30_ns: u64,
+    /// Speculative-drain waits inside `accept_block` — the script
+    /// pipeline's true cost under `enable_speculative_connect`
+    /// (connect_block returns before the wait; the wait lands here).
+    pub drain_ns: u64,
 }
 
-static TIMING: [AtomicU64; 6] = [
+static TIMING: [AtomicU64; 7] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -1022,6 +1027,13 @@ static TIMING: [AtomicU64; 6] = [
 
 fn tick(i: usize, start: std::time::Instant) {
     TIMING[i].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Speculative-drain timing — `chainstate::drain_pending_to` waits on
+/// script jobs that `connect_block` already returned past; its wait
+/// time lives in TIMING[6], not in `total_ns`.
+pub(crate) fn drain_tick(start: std::time::Instant) {
+    tick(6, start);
 }
 
 /// A block's outstanding script checks: workers decrement
@@ -1135,6 +1147,7 @@ pub fn connect_timing() -> ConnectTiming {
         apply_ns: TIMING[3].load(Ordering::Relaxed),
         script_ns: TIMING[4].load(Ordering::Relaxed),
         bip30_ns: TIMING[5].load(Ordering::Relaxed),
+        drain_ns: TIMING[6].load(Ordering::Relaxed),
     }
 }
 
