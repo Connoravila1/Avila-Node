@@ -112,9 +112,10 @@ acceptance claims but do not substitute for the P/Q benchmarks above.
   — the alternative UTXO store is consensus-identical on real blocks.
 - **Coins-engine experiment**: `experiments/2026-09-23-coinsdb-hash-engine.md`
   — hash-indexed `coins.idx`/`coins.dat` vs redb B-tree: block commits
-  +96%, 5M ingest +16%, datadir −50% at 5M; point reads −22% (no mmap
-  under the unsafe forbid) and iteration ~1.8× slower. Opt-in, redb stays
-  default.
+  +97%, datadir −44% at 40M; at scale hash wins 2.0× ingest / 2.5×
+  reads / 5.3× commits and the gap widens with depth (it loses only
+  below ~1M coins, where the cached tree beats two preads). Opt-in,
+  redb stays default.
 - **BIP324 v2 transport**: live session against Core 29.4 —
   session ids byte-identical on both ends; v1 fallback on a
   v1-only peer matches Core's reconnect rule.

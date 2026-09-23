@@ -57,12 +57,18 @@ the unordered physical layout is invisible to them.
 | redb-compact | 420k | 714k | 69 ms | 119 | 94.5 MiB |
 | **hash** | 342k | 557k | 124 ms | **234** | **63.4 MiB** |
 
-`snapshot_bench synthetic 5000000`, random-order ingest:
+`snapshot_bench synthetic`, random-order ingest — depth curve:
 
-| engine | import | datadir |
-|---|---|---|
-| redb-compact | 198k coins/s | 1.0 GiB |
-| **hash** | **229k coins/s (+16 %)** | **0.5 GiB (−50 %)** |
+| engine | 5M | 20M | 40M | 40M dir | 40M reads | 40M commit |
+|---|---|---|---|---|---|---|
+| redb-compact | 198k/s | 129k/s | 86k/s | 7.5 GiB | 157k/s | 32 ms |
+| **hash** | **229k/s** | **188k/s** | **174k/s** | **4.2 GiB** | **396k/s** | **6 ms** |
+
+At 40M: hash is 2.0× ingest, 2.5× reads, 5.3× commits, −44% disk —
+and the gap *widens* with depth: redb falls 198→129→86k/s while hash
+falls gently (229→188→174k/s). Point reads flip sign between scales:
+hash loses 22% at 500k (cached tree beats two preads) but wins 2.5×
+at 20M+ (tree depth exceeds cache; the hash probe stays flat).
 
 Differential correctness: PASS — all 501 blocks, identical verdicts
 and byte-identical UTXO state at every height under the hash engine.
@@ -71,13 +77,13 @@ and byte-identical UTXO state at every height under the hash engine.
 
 - **Commits: hash wins decisively (+97 %)** — a block's dirty set is
   a few thousand staged slot writes vs B-tree page churn.
-- **Ingest crossover**: hash loses at 500k (−20 %, per-key syscall
-  overhead beats tree-descent cost when the whole B-tree is cached)
-  but wins at 5M (+16 %) — depth grows the tree's cost while the
-  hash stays flat. The trend favors hash at real scale.
-- **Reads: hash still loses (−23 %)** — two `pread` syscalls vs
-  redb's zero-syscall mmap. The workspace `unsafe` forbid blocks
-  mmap; a per-crate exception would likely flip this.
+- **Ingest crossover, confirmed**: hash loses at 500k (−18 %) but
+  wins at 5M (+16 %), 20M (+45 %), 40M (+103 %) — depth grows the
+  tree's descent cost while the hash probe stays flat.
+- **Reads flip sign**: −22 % at 500k (whole tree fits redb's cache)
+  → **+152 % at 20M and 40M** (tree depth + size exceed cache → cold
+  descents per read; hash pays ~2 syscalls regardless). mmap under an
+  unsafe-exception would widen this further.
 - **Iteration: hash loses ~1.8×** — sequential whole-log sweep vs
   redb's page walk (was 5× when each record was a separate pread).
   Affects coinstats/dumps only.
@@ -86,8 +92,12 @@ and byte-identical UTXO state at every height under the hash engine.
 
 ## Honest gaps
 
-- No 170M-coin run yet — the win at 5M projects but isn't proven.
-- Read regression needs the mmap variant to settle.
+- 40M ≈ a quarter of real scale (~170M) — the trend says hash's edge
+  widens further, but that's extrapolation, not measurement.
+- All numbers on tmpfs (page-cache speed). On real disk the cold-read
+  gap should widen *in hash's favor* — a B-tree descent costs log n
+  page touches vs ~2 for the hash probe — but unmeasured.
+- Single runs per scale, ~611-read samples; no reps.
 - Undo/meta still in redb — the hybrid is deliberate (atomic
   bookkeeping) but means the sidecar's write cost is shared.
 - Crash-path replay is designed-for, not fault-injected yet.
