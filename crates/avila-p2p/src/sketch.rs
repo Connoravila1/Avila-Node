@@ -198,8 +198,10 @@ impl Sketch {
         }
         Some(Self {
             synd: bytes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect(),
         })
     }
@@ -340,6 +342,7 @@ fn find_roots(p: &[u32]) -> Vec<u32> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

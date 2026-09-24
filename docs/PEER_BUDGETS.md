@@ -46,13 +46,16 @@ is disconnected; no row may be bypassed by message ordering or rate.
 
 ## What's NOT bounded yet
 
-- CPU per peer during message dispatch — measured but not enforced
-  per-peer; a pathological message could cost disproportionate
-  validate work before the frame budget trips it.
+- ~~CPU per peer during message dispatch~~ — measured (`cpu_ns`,
+  `cpu_rate_ns` decayed per-second) AND enforced: a peer burning
+  >50% of total dispatch CPU at >200ms/s loses the tick's `poll()`
+  (socket backpressure slows it; `CpuThrottled` event; no disconnect
+  — the sync leader legitimately dominates during IBD). Exposed as
+  `cpu_ms`/`cpu_rate_ms` in `getpeerinfo`. Test:
+  `cpu_throttle_skips_dominant_peer_only`.
 - ~~Recon bisection depth~~ — sketch wire size capped at 2,048
   fields; rounds are bounded by the 2-sketch half-pool close.
 - ~~getcf* rate limiting~~ — 1 req/s + burst 20 token bucket;
   exhausted peers are silently unserved.
 
-These rows are the honest gaps — closing them is queue work, not a
-claim made before it exists.
+All rows bounded — the budget table is fully enforced.

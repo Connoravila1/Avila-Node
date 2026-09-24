@@ -38,10 +38,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use sha2::{Digest, Sha256};
+
 use crate::block::{Block, WITNESS_SCALE_FACTOR};
 use crate::chain::HeaderTree;
 use crate::check::{MAX_BLOCK_SIGOPS_COST, MAX_MONEY};
-use crate::hash::{BlockHash, Txid};
+use crate::hash::{BlockHash, Hash256, Txid};
 use crate::params::Params;
 use crate::script::{ScriptFlags, block_script_flags, count_witness_sig_ops};
 use crate::sigchecker::check_input_scripts;
@@ -171,6 +173,16 @@ pub struct UtxoSet {
     /// delete of a key the backend never saw: pure waste, elided at
     /// commit. Cleared on flush.
     born: std::collections::HashSet<OutPoint>,
+    /// SwiftSync mode: `Some` keeps the running tag aggregate —
+    /// `agg == Σ coin_tag(live)` across every mutation (experiment
+    /// #31; see `crate::swiftsync`).
+    swift: Option<crate::swiftsync::TagAgg>,
+    /// While `swift_hold` the cache never reports over-budget — the
+    /// whole sync window stays transient (the aggregate is only worth
+    /// anything if nothing flushes mid-window). Cleared at the
+    /// checkpoint by [`UtxoSet::release_swiftsync_hold`], after which
+    /// normal flushing resumes while tracking continues.
+    swift_hold: bool,
 }
 
 impl Default for UtxoSet {
@@ -184,6 +196,8 @@ impl Default for UtxoSet {
             budget: DEFAULT_CACHE_BUDGET,
             live_delta: 0,
             born: std::collections::HashSet::new(),
+            swift: None,
+            swift_hold: false,
         }
     }
 }
@@ -249,7 +263,102 @@ impl UtxoSet {
     /// should flush at the next block boundary.
     #[must_use]
     pub fn over_budget(&self) -> bool {
-        self.backend.is_some() && self.map_bytes > self.budget
+        // `swift_hold` keeps the whole window transient — the
+        // aggregate is only worth anything if nothing flushes
+        // mid-window.
+        self.backend.is_some() && !self.swift_hold && self.map_bytes > self.budget
+    }
+
+    /// Turns on SwiftSync tag tracking and holds the transient
+    /// window open (no flushes until [`Self::release_swiftsync_hold`]).
+    /// The aggregate starts at `Σ coin_tag(current set)` — free at
+    /// genesis (the intended IBD use), one materializing pass over a
+    /// non-empty set otherwise.
+    pub fn enable_swiftsync(&mut self) {
+        let mut agg = crate::swiftsync::TagAgg::default();
+        if !self.is_empty() {
+            for (op, c) in self.iter() {
+                agg.add(&crate::swiftsync::coin_tag(&op, &c));
+            }
+        }
+        self.swift = Some(agg);
+        self.swift_hold = true;
+    }
+
+    /// Ends the transient window: normal budget pressure + flushing
+    /// resume. The aggregate keeps tracking — flushes move the set,
+    /// not its contents, so the invariant survives.
+    pub fn release_swiftsync_hold(&mut self) {
+        self.swift_hold = false;
+    }
+
+    /// `true` while the transient window is held open — periodic
+    /// flush callers check this; an explicit flush still writes.
+    #[must_use]
+    pub fn swiftsync_holding(&self) -> bool {
+        self.swift_hold
+    }
+
+    /// `true` while SwiftSync tracking is on.
+    #[must_use]
+    pub fn swiftsync(&self) -> bool {
+        self.swift.is_some()
+    }
+
+    /// The running aggregate — `Σ coin_tag(live)` — `None` when
+    /// tracking is off.
+    #[must_use]
+    pub fn swiftsync_agg(&self) -> Option<crate::swiftsync::TagAgg> {
+        self.swift
+    }
+
+    /// Emits the producer-side hints artifact for the set at
+    /// `height`: the committed aggregate + the sorted survivor list.
+    /// Materializes the whole set — a checkpoint op, not per-block.
+    #[must_use]
+    pub fn emit_hints(&self, height: u32) -> crate::swiftsync::Hints {
+        let mut survivors: Vec<OutPoint> = self.iter().into_iter().map(|(op, _)| op).collect();
+        survivors.sort_by(|a, b| {
+            a.txid
+                .as_bytes()
+                .cmp(b.txid.as_bytes())
+                .then(a.vout.cmp(&b.vout))
+        });
+        let aggregate = self.swift.unwrap_or_else(|| {
+            let mut agg = crate::swiftsync::TagAgg::default();
+            for (op, c) in self.iter() {
+                agg.add(&crate::swiftsync::coin_tag(&op, &c));
+            }
+            agg
+        });
+        crate::swiftsync::Hints {
+            height,
+            aggregate,
+            survivors,
+        }
+    }
+
+    /// Verifies a producer's [`crate::swiftsync::Hints`] against this
+    /// set's own state. `Verified` means the file's committed
+    /// aggregate matches our running sum AND its survivor list is
+    /// exactly our live set. Wrong hints can only waste the
+    /// optimization — the caller writes its own set either way.
+    #[must_use]
+    pub fn verify_hints(&self, hints: &crate::swiftsync::Hints) -> crate::swiftsync::HintsVerdict {
+        let mine = self
+            .swift
+            .unwrap_or_else(|| self.emit_hints(hints.height).aggregate);
+        if mine != hints.aggregate {
+            return crate::swiftsync::HintsVerdict::AggregateMismatch;
+        }
+        let live: std::collections::HashSet<OutPoint> =
+            self.iter().into_iter().map(|(op, _)| op).collect();
+        if live.len() != hints.survivors.len()
+            || hints.survivors.iter().any(|op| !live.contains(op))
+        {
+            return crate::swiftsync::HintsVerdict::SurvivorMismatch;
+        }
+        crate::swiftsync::HintsVerdict::Verified
     }
 
     /// The number of tracked coins — lower layers plus the map's net
@@ -315,11 +424,7 @@ impl UtxoSet {
         if let Some(base) = &self.base {
             return base.have(outpoint);
         }
-        if self
-            .backend
-            .as_ref()
-            .is_some_and(|be| be.have(outpoint))
-        {
+        if self.backend.as_ref().is_some_and(|be| be.have(outpoint)) {
             return true;
         }
         self.snapshot
@@ -421,11 +526,38 @@ impl UtxoSet {
                 .is_some_and(|s| s.get(outpoint).is_some())
     }
 
+    /// Tagged mutation: adjusts the SwiftSync aggregate by the *set*
+    /// delta — subtract the coin the set showed before, add the new
+    /// one — then performs the write via [`Self::put_raw`].
+    fn put(&mut self, outpoint: OutPoint, entry: Option<Coin>) {
+        if self.swift.is_some() {
+            let old_tag = match self.map.get(&outpoint) {
+                Some(Some(c)) => Some(crate::swiftsync::coin_tag(&outpoint, c)),
+                Some(None) => None,
+                None => self
+                    .lower_get(&outpoint)
+                    .map(|c| crate::swiftsync::coin_tag(&outpoint, &c)),
+            };
+            let new_tag = entry
+                .as_ref()
+                .map(|c| crate::swiftsync::coin_tag(&outpoint, c));
+            if let Some(agg) = &mut self.swift {
+                if let Some(t) = &old_tag {
+                    agg.sub(t);
+                }
+                if let Some(t) = &new_tag {
+                    agg.add(t);
+                }
+            }
+        }
+        self.put_raw(outpoint, entry);
+    }
+
     /// Writes `entry` into `map`, keeping `live_delta` exact: the map's
     /// net contribution is `is_live − was_live`, where "was live" counts
     /// both an existing live map entry and a coin in a lower layer that
     /// this entry now shadows.
-    fn put(&mut self, outpoint: OutPoint, entry: Option<Coin>) {
+    fn put_raw(&mut self, outpoint: OutPoint, entry: Option<Coin>) {
         let was_live = match self.map.get(&outpoint) {
             Some(old) => old.is_some(),
             None => self.lower_live(&outpoint),
@@ -468,13 +600,19 @@ impl UtxoSet {
         if let Some(entry) = self.map.get_mut(outpoint) {
             self.map_bytes = self.map_bytes.saturating_sub(entry_bytes(entry.as_ref()));
             let taken = entry.take();
-            if taken.is_some() {
+            if let Some(c) = &taken {
                 self.live_delta -= 1;
+                if let Some(agg) = &mut self.swift {
+                    agg.sub(&crate::swiftsync::coin_tag(outpoint, c));
+                }
             }
             return taken;
         }
         let coin = self.lower_get(outpoint)?;
         self.live_delta -= 1;
+        if let Some(agg) = &mut self.swift {
+            agg.sub(&crate::swiftsync::coin_tag(outpoint, &coin));
+        }
         self.map_bytes += entry_bytes(None);
         self.map.insert(*outpoint, None);
         Some(coin)
@@ -490,12 +628,23 @@ impl UtxoSet {
     ///   being disconnected during rewind) — shadow it with a
     ///   tombstone so the removal reaches the backend on commit.
     fn remove_entry(&mut self, outpoint: &OutPoint) {
+        if self.swift.is_some() {
+            // The set delta is "remove the visible coin once" — the
+            // shadowed lower coin is not live, so it contributes
+            // nothing; the tombstone below stays untagged to avoid a
+            // double-sub on it.
+            if let Some(old) = self.get(outpoint)
+                && let Some(agg) = &mut self.swift
+            {
+                agg.sub(&crate::swiftsync::coin_tag(outpoint, &old));
+            }
+        }
         if let Some(old) = self.map.remove(outpoint) {
             self.map_bytes = self.map_bytes.saturating_sub(entry_bytes(old.as_ref()));
             self.live_delta -= i64::from(old.is_some()) - i64::from(self.lower_live(outpoint));
         }
         if self.lower_live(outpoint) {
-            self.put(*outpoint, None);
+            self.put_raw(*outpoint, None);
         }
     }
 
@@ -565,6 +714,8 @@ impl UtxoSet {
             budget: usize::MAX, // simulation never flushes
             live_delta: 0,
             born: std::collections::HashSet::new(),
+            swift: None,
+            swift_hold: false,
         }
     }
 
@@ -655,6 +806,8 @@ impl Clone for UtxoSet {
             budget: self.budget,
             live_delta: self.live_delta,
             born: self.born.clone(),
+            swift: self.swift,
+            swift_hold: self.swift_hold,
         }
     }
 }
@@ -727,6 +880,59 @@ pub struct ConnectContext<'a> {
     /// decides when to wait (`Chainstate`'s speculative pipeline waits
     /// a bounded window of blocks back, overlapping serial passes).
     pub script_pool: Option<&'a ScriptPool>,
+}
+
+/// A machine-checkable record of one block's connect — the
+/// verification-transparency ledger's per-block grain (queue #5).
+///
+/// The receipt states what connect *did*: which flags were enforced,
+/// how many input-script checks were performed (or queued), how many
+/// were skipped through the verified-script cache, and the exact UTXO
+/// transition applied, committed into [`BlockReceipt::delta_commitment`].
+/// Replaying the same block against the same parent state recomputes
+/// that commitment — the receipt is independently reproducible, never
+/// a claim the node asks anyone to take on faith.
+///
+/// `delta_commitment` is **not** a UTXO-set hash: it commits to the
+/// block's *delta* — per transaction, in block order, the txid, then
+/// each spent `(outpoint, coin)` in input order, then each created
+/// `(vout, output)` in output order — not to the resulting set. The
+/// stream is SHA-256 over fixed-width fields plus length-prefixed
+/// scripts, so framing is unambiguous.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockReceipt {
+    /// Connected height.
+    pub height: u32,
+    /// The block's hash.
+    pub hash: BlockHash,
+    /// The script flag word enforced (`ScriptFlags::bits()`).
+    pub script_flags: u32,
+    /// Transactions in the block, coinbase included.
+    pub txs: usize,
+    /// Sigop cost accounted against `MAX_BLOCK_SIGOPS_COST`.
+    pub sigops: u64,
+    /// Total transaction fees, satoshis.
+    pub fees: i64,
+    /// Whether input-script checking was requested at all
+    /// (`ConnectContext::script_checks` — `false` under assumevalid).
+    pub checks_enabled: bool,
+    /// Input-script checks queued for this block — already run when no
+    /// script pool is configured, possibly still pending when it is.
+    pub script_checks: usize,
+    /// Non-coinbase transactions skipped because the verified-script
+    /// cache already covered them under a superset flag set. Zero when
+    /// `checks_enabled` is false.
+    pub verified_hits: usize,
+    /// Coins consumed (non-coinbase inputs resolved and spent).
+    pub spent_coins: usize,
+    /// Coins created (spendable outputs added; `is_unspendable`
+    /// outputs excluded, matching `add_tx_outputs`).
+    pub created_coins: usize,
+    /// SHA-256 over the applied UTXO delta (see type docs).
+    pub delta_commitment: Hash256,
+    /// Wall time of the serial connect pass, nanoseconds — under a
+    /// script pool this excludes the deferred check wait.
+    pub wall_ns: u64,
 }
 
 /// A consensus or internal failure while connecting a block. Every
@@ -1175,7 +1381,7 @@ pub struct ScriptPool {
 
 impl ScriptPool {
     /// Spawns `workers` detached worker threads (same count rule as
-    /// [`run_script_checks`]: `available_parallelism`, capped by the
+    /// `run_script_checks`: `available_parallelism`, capped by the
     /// caller's queue depth).
     #[must_use]
     pub fn new(workers: usize) -> std::sync::Arc<Self> {
@@ -1272,16 +1478,39 @@ pub fn connect_block(
     utxo: &mut UtxoSet,
     ctx: &ConnectContext<'_>,
 ) -> Result<BlockUndo, ConnectError> {
-    let (undo, pending) = connect_block_inner(block, utxo, ctx)?;
-    if let Some(check) = pending {
-        if let Err(err) = check.wait() {
-            // Deferred check failed: undo the application, exactly as
-            // the inline drain's rollback does.
-            let _ = disconnect_block(block, utxo, &undo);
-            return Err(ConnectError::ScriptVerify(err));
-        }
+    let (undo, pending, _receipt) = connect_block_inner(block, utxo, ctx)?;
+    if let Some(check) = pending
+        && let Err(err) = check.wait()
+    {
+        // Deferred check failed: undo the application, exactly as
+        // the inline drain's rollback does.
+        let _ = disconnect_block(block, utxo, &undo);
+        return Err(ConnectError::ScriptVerify(err));
     }
     Ok(undo)
+}
+
+/// [`connect_block`] that additionally reports the per-block
+/// [`BlockReceipt`] — the verification-transparency ledger's
+/// per-block grain (queue #5).
+///
+/// Like [`connect_block_deferred`], a configured script pool means
+/// the returned checks may still be outstanding: the caller MUST
+/// `wait()` the [`BlockCheck`] before treating the block as validated,
+/// and the receipt's `script_checks` field reports how many checks
+/// were queued. When no pool is configured, checks ran inline and the
+/// returned `Option` is `None`.
+///
+/// # Errors
+///
+/// Same contract as [`connect_block`] — on failure the UTXO set is
+/// rolled back and no receipt is produced.
+pub fn connect_block_full(
+    block: &Block,
+    utxo: &mut UtxoSet,
+    ctx: &ConnectContext<'_>,
+) -> Result<(BlockUndo, Option<std::sync::Arc<BlockCheck>>, BlockReceipt), ConnectError> {
+    connect_block_inner(block, utxo, ctx)
 }
 
 /// `connect_block` through a [`ScriptPool`]: applies the block and
@@ -1295,7 +1524,7 @@ pub fn connect_block_deferred(
     utxo: &mut UtxoSet,
     ctx: &ConnectContext<'_>,
 ) -> Result<(BlockUndo, std::sync::Arc<BlockCheck>), ConnectError> {
-    let (undo, pending) = connect_block_inner(block, utxo, ctx)?;
+    let (undo, pending, _receipt) = connect_block_inner(block, utxo, ctx)?;
     let Some(check) = pending else {
         // Pool was absent — nothing outstanding; report an
         // already-complete handle so callers don't branch.
@@ -1309,7 +1538,7 @@ fn connect_block_inner(
     block: &Block,
     utxo: &mut UtxoSet,
     ctx: &ConnectContext<'_>,
-) -> Result<(BlockUndo, Option<std::sync::Arc<BlockCheck>>), ConnectError> {
+) -> Result<(BlockUndo, Option<std::sync::Arc<BlockCheck>>, BlockReceipt), ConnectError> {
     let t_total = std::time::Instant::now();
     let Some(node) = ctx.tree.get(&ctx.block_hash) else {
         return Err(ConnectError::UnknownBlock);
@@ -1357,6 +1586,16 @@ fn connect_block_inner(
     let mut script_jobs: Vec<(&Transaction, Vec<TxOut>)> = Vec::new();
     let mut owned_jobs: Vec<(Transaction, Vec<TxOut>)> = Vec::new();
 
+    // Receipt accumulation (queue #5): the delta stream commits, per
+    // transaction in block order — txid, spend count, each spent
+    // (outpoint, coin), create count, each created (vout, output) —
+    // exactly the transition applied. Only used when the connect
+    // succeeds; a failed block rolls back and produces no receipt.
+    let mut delta_hasher = Sha256::new();
+    let mut spent_coins = 0usize;
+    let mut created_coins = 0usize;
+    let mut scripts_queued = 0usize;
+
     let result = (|| -> Result<Option<std::sync::Arc<BlockCheck>>, ConnectError> {
         for (i, tx) in block.transactions.iter().enumerate() {
             let mut tx_undo = TxUndo::default();
@@ -1400,6 +1639,7 @@ fn connect_block_inner(
                 && !crate::sigchecker::scripts_verified(&tx.wtxid(), flags)
             {
                 let spent_outs: Vec<TxOut> = spent.iter().map(|c| c.out.clone()).collect();
+                scripts_queued += 1;
                 if ctx.script_pool.is_some() {
                     owned_jobs.push((tx.clone(), spent_outs));
                 } else {
@@ -1422,6 +1662,41 @@ fn connect_block_inner(
                 index: i,
                 undo: tx_undo,
             });
+            // Receipt delta stream — fixed-width fields plus
+            // length-prefixed scripts; see `BlockReceipt`'s docs for
+            // the exact framing.
+            delta_hasher.update(tx.txid().as_bytes());
+            delta_hasher.update((spent.len() as u32).to_le_bytes());
+            for (input, coin) in tx.inputs.iter().zip(spent.iter()) {
+                delta_hasher.update(input.previous_output.txid.as_bytes());
+                delta_hasher.update(input.previous_output.vout.to_le_bytes());
+                delta_hasher.update(coin.out.value.to_le_bytes());
+                delta_hasher.update(coin.height.to_le_bytes());
+                delta_hasher.update([u8::from(coin.coinbase)]);
+                let script = coin.out.script_pubkey.as_bytes();
+                delta_hasher.update((script.len() as u32).to_le_bytes());
+                delta_hasher.update(script);
+            }
+            spent_coins += spent.len();
+            let created = tx
+                .outputs
+                .iter()
+                .filter(|o| !o.script_pubkey.is_unspendable())
+                .count() as u32;
+            delta_hasher.update(created.to_le_bytes());
+            for (vout, out) in tx.outputs.iter().enumerate() {
+                if out.script_pubkey.is_unspendable() {
+                    continue;
+                }
+                delta_hasher.update((vout as u32).to_le_bytes());
+                delta_hasher.update(out.value.to_le_bytes());
+                delta_hasher.update(height.to_le_bytes());
+                delta_hasher.update([u8::from(tx.is_coinbase())]);
+                let script = out.script_pubkey.as_bytes();
+                delta_hasher.update((script.len() as u32).to_le_bytes());
+                delta_hasher.update(script);
+            }
+            created_coins += created as usize;
         }
         let Some(coinbase) = block.transactions.first() else {
             return Err(ConnectError::Internal("empty block reached connect_block"));
@@ -1462,12 +1737,35 @@ fn connect_block_inner(
     TIMING[0].fetch_add(1, Ordering::Relaxed);
     tick(1, t_total);
     match result {
-        Ok(pending) => Ok((
-            BlockUndo {
-                txs: applied.into_iter().map(|a| a.undo).collect(),
-            },
-            pending,
-        )),
+        Ok(pending) => {
+            let non_coinbase = block.transactions.len().saturating_sub(1);
+            let receipt = BlockReceipt {
+                height,
+                hash: ctx.block_hash,
+                script_flags: flags.bits(),
+                txs: block.transactions.len(),
+                sigops: sigops_cost,
+                fees,
+                checks_enabled: ctx.script_checks,
+                script_checks: scripts_queued,
+                verified_hits: if ctx.script_checks {
+                    non_coinbase.saturating_sub(scripts_queued)
+                } else {
+                    0
+                },
+                spent_coins,
+                created_coins,
+                delta_commitment: Hash256::from_bytes(delta_hasher.finalize().into()),
+                wall_ns: u64::try_from(t_total.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            };
+            Ok((
+                BlockUndo {
+                    txs: applied.into_iter().map(|a| a.undo).collect(),
+                },
+                pending,
+                receipt,
+            ))
+        }
         Err(error) => {
             rollback(block, utxo, applied);
             Err(error)
@@ -1880,12 +2178,10 @@ mod tests {
         assert!(!coin.coinbase);
     }
 
-
     /// The snapshot run sits below the backend: reads fall through,
     /// spends shadow with tombstones, `len` counts the base.
     #[test]
     fn snapshot_run_is_lowest_overlay_layer() {
-
         let dir = std::env::temp_dir().join(format!("avila-overlay-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("snap.dat");
@@ -2471,5 +2767,185 @@ mod tests {
         let same = coinbase(1, SUBSIDY);
         assert_eq!(same.txid(), cb1_txid);
         chain.extend(vec![same]).unwrap();
+    }
+
+    // -- swiftsync aggregate (#31) ----------------------------------------------
+
+    /// Independent recomputation of the running invariant — the
+    /// checker every mutation is asserted against.
+    fn tag_sum(set: &UtxoSet) -> crate::swiftsync::TagAgg {
+        let mut a = crate::swiftsync::TagAgg::default();
+        for (op, c) in set.iter() {
+            a.add(&crate::swiftsync::coin_tag(&op, &c));
+        }
+        a
+    }
+
+    fn swift_op(b: u8, vout: u32) -> OutPoint {
+        OutPoint {
+            txid: Txid::from_bytes([b; 32]),
+            vout,
+        }
+    }
+
+    fn swift_coin(v: i64, h: u32) -> Coin {
+        Coin {
+            out: TxOut {
+                value: v,
+                script_pubkey: Script::new(vec![0x51]),
+            },
+            height: h,
+            coinbase: false,
+        }
+    }
+
+    /// The load-bearing invariant: `agg == Σ coin_tag(live)` after
+    /// every mutation class — create, spend, recreate-over-tombstone,
+    /// live overwrite, lower-layer spend, shadow put, remove_entry,
+    /// and an overlay-commit adopt.
+    #[test]
+    fn swiftsync_agg_tracks_every_mutation() {
+        let mut set = UtxoSet::new();
+
+        // A lower layer holding two coins — exercises the
+        // tombstone-over-lower and shadow-put paths.
+        let mut lower = UtxoSet::new();
+        lower.insert_synthetic(swift_op(0x10, 0), swift_coin(1_000, 1));
+        lower.insert_synthetic(swift_op(0x11, 0), swift_coin(2_000, 1));
+        set.base = Some(Box::new(lower));
+
+        set.enable_swiftsync();
+        let assert_inv = |set: &UtxoSet| {
+            assert_eq!(
+                set.swiftsync_agg().unwrap(),
+                tag_sum(set),
+                "agg != Σ live tags"
+            );
+        };
+        assert_inv(&set);
+
+        // Create born coins, spend one, recreate it.
+        set.insert_synthetic(swift_op(0x20, 0), swift_coin(5_000, 2));
+        set.insert_synthetic(swift_op(0x21, 0), swift_coin(6_000, 2));
+        assert_inv(&set);
+        assert!(set.spend_coin(&swift_op(0x20, 0)).is_some());
+        assert_inv(&set);
+        set.insert_synthetic(swift_op(0x20, 0), swift_coin(7_000, 3));
+        assert_inv(&set);
+
+        // Overwrite a live entry (BIP30-class put over `Some`).
+        set.insert_synthetic(swift_op(0x21, 0), swift_coin(8_000, 3));
+        assert_inv(&set);
+
+        // Spend a lower-layer coin (tombstone over lower).
+        assert!(set.spend_coin(&swift_op(0x10, 0)).is_some());
+        assert_inv(&set);
+
+        // Shadow the other lower coin with a fresh write.
+        set.insert_synthetic(swift_op(0x11, 0), swift_coin(9_000, 4));
+        assert_inv(&set);
+
+        // remove_entry: born coin drop, then a shadowed coin whose
+        // lower half gets tombstoned.
+        set.remove_entry(&swift_op(0x20, 0));
+        assert_inv(&set);
+        set.remove_entry(&swift_op(0x11, 0));
+        assert_inv(&set);
+        assert!(!set.have(&swift_op(0x11, 0)));
+
+        // Overlay-commit: writes adopted via unoverlay note their tags.
+        let mut ov = set.overlay();
+        ov.insert_synthetic(swift_op(0x30, 0), swift_coin(3_000, 5));
+        ov.spend_coin(&swift_op(0x21, 0));
+        set.unoverlay(ov, true);
+        assert_inv(&set);
+        assert!(set.have(&swift_op(0x30, 0)));
+        assert!(!set.have(&swift_op(0x21, 0)));
+
+        // Discarded overlay: no tags leak.
+        let mut ov2 = set.overlay();
+        ov2.insert_synthetic(swift_op(0x31, 0), swift_coin(4_000, 5));
+        set.unoverlay(ov2, false);
+        assert_inv(&set);
+        assert!(!set.have(&swift_op(0x31, 0)));
+    }
+
+    /// The artifact round-trip: emit → encode → decode → verify; a
+    /// doctored file must fail the right check.
+    #[test]
+    fn swiftsync_hints_roundtrip_and_fraud() {
+        use crate::swiftsync::HintsVerdict;
+        let mut set = UtxoSet::new();
+        for i in 0..5u8 {
+            set.insert_synthetic(
+                swift_op(0x40 + i, 0),
+                swift_coin(1_000 * i64::from(i) + 1, 1),
+            );
+        }
+        set.spend_coin(&swift_op(0x40, 0));
+        set.enable_swiftsync();
+
+        let hints = set.emit_hints(42);
+        assert_eq!(set.verify_hints(&hints), HintsVerdict::Verified);
+
+        // encode→decode is lossless and still verifies.
+        let bytes = hints.encode();
+        let back = crate::swiftsync::Hints::decode(&bytes).unwrap();
+        assert_eq!(back.height, 42);
+        assert_eq!(back.aggregate, hints.aggregate);
+        assert_eq!(back.survivors, hints.survivors);
+        assert_eq!(set.verify_hints(&back), HintsVerdict::Verified);
+
+        // Dropped survivor: the set claim shrinks → SurvivorMismatch.
+        let mut bad = back.clone();
+        bad.survivors.pop();
+        assert_eq!(set.verify_hints(&bad), HintsVerdict::SurvivorMismatch);
+
+        // Fabricated aggregate: caught before set inspection.
+        let mut bad2 = back.clone();
+        bad2.aggregate.sub(&[1u8; 32]);
+        assert_eq!(set.verify_hints(&bad2), HintsVerdict::AggregateMismatch);
+
+        // Malformed files reject, not panic.
+        assert!(crate::swiftsync::Hints::decode(&[]).is_err());
+        assert!(crate::swiftsync::Hints::decode(&bytes[..47]).is_err());
+        let mut unsorted = bytes.clone();
+        // swap the last two survivor records' vout fields' order marker:
+        // simplest deterministic corruption — flip a byte inside the
+        // final outpoint so sort-order or length checks still hold but
+        // the content changes → SurvivorMismatch on verify.
+        let n = unsorted.len();
+        unsorted[n - 1] ^= 0xff;
+        let corrupt = crate::swiftsync::Hints::decode(&unsorted);
+        if let Ok(c) = corrupt {
+            assert_ne!(set.verify_hints(&c), HintsVerdict::Verified);
+        }
+    }
+
+    /// Never-flush semantics: with tracking on, `over_budget` stays
+    /// false under pressure — the whole window must stay transient
+    /// for the aggregate to mean anything.
+    #[test]
+    fn swiftsync_holds_the_window_transient() {
+        let dir = std::env::temp_dir().join(format!("avila-swift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut set = UtxoSet::new();
+        set.attach_backend(crate::coinsdb::CoinsBackend::open(&dir).unwrap());
+        set.set_budget(1); // every byte is over-budget
+        set.enable_swiftsync();
+        for i in 0..64u8 {
+            set.insert_synthetic(swift_op(i, 0), swift_coin(1_000, 1));
+        }
+        // The hold suppresses flush pressure entirely…
+        assert!(!set.over_budget());
+        assert_eq!(set.swiftsync_agg().unwrap(), tag_sum(&set));
+        // …and releasing it restores the normal budget signal.
+        set.release_swiftsync_hold();
+        assert!(set.over_budget());
+        // A real flush leaves the set — and therefore the aggregate —
+        // unchanged.
+        set.flush_to_backend(&[], 1).unwrap();
+        assert_eq!(set.swiftsync_agg().unwrap(), tag_sum(&set));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

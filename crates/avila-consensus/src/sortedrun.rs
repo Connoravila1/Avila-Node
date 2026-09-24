@@ -2,7 +2,7 @@
 //!
 //! `loadtxoutset`'s stream is already sorted by `(txid, vout)` — the
 //! same order [`crate::utxo_snapshot::outpoint_key`] produces (not
-//! [`crate::coinsdb::key_of`]: that one's vout is little-endian, fine
+//! `crate::coinsdb::key_of`: that one's vout is little-endian, fine
 //! for its use as an unordered hash/B-tree key but wrong for sorting
 //! once vout reaches 256) — so building the
 //! append to `base.run` in stream order while a sparse in-memory index
@@ -25,8 +25,8 @@ use crate::coinsdb::{self, CoinFormat};
 use crate::connect::Coin;
 use crate::transaction::OutPoint;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"AVRUN1\0\0";
@@ -169,9 +169,9 @@ impl SortedRun {
         if &hdr[..8] != MAGIC {
             return Err(io::Error::other("bad run magic"));
         }
-        let stride = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
-        let count = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
-        let index_off = u64::from_le_bytes(hdr[24..32].try_into().unwrap());
+        let stride = u32::from_le_bytes(hdr[12..16].try_into().unwrap_or_default());
+        let count = u64::from_le_bytes(hdr[16..24].try_into().unwrap_or_default());
+        let index_off = u64::from_le_bytes(hdr[24..32].try_into().unwrap_or_default());
         let index_len = (f.metadata()?.len() - index_off) / 44;
         let mut sparse = Vec::with_capacity(index_len as usize);
         let mut entry = [0u8; 44];
@@ -180,7 +180,10 @@ impl SortedRun {
             f.read_exact(&mut entry)?;
             let mut key = [0u8; 36];
             key.copy_from_slice(&entry[..36]);
-            sparse.push((key, u64::from_le_bytes(entry[36..44].try_into().unwrap())));
+            sparse.push((
+                key,
+                u64::from_le_bytes(entry[36..44].try_into().unwrap_or_default()),
+            ));
         }
         Ok(Self {
             f: std::sync::Mutex::new(f),
@@ -192,6 +195,12 @@ impl SortedRun {
 
     pub fn len(&self) -> u64 {
         self.count
+    }
+
+    /// `true` when the run holds no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
     }
 
     /// Point lookup: sparse binary search → one window read → scan.
@@ -221,7 +230,9 @@ impl SortedRun {
 
     fn scan_window(&self, off_lo: u64, off_hi: u64, key: &[u8; 36]) -> Option<Coin> {
         // Read enough bytes for `stride` records (~40KB typical).
-        let cap = (u64::from(self.stride) * 84).min(off_hi.saturating_sub(off_lo)).max(84);
+        let cap = (u64::from(self.stride) * 84)
+            .min(off_hi.saturating_sub(off_lo))
+            .max(84);
         let mut buf = vec![0u8; cap as usize];
         let f = self.f.lock().ok()?;
         if f.read_exact_at(&mut buf, off_lo).is_err() {
@@ -229,8 +240,9 @@ impl SortedRun {
         }
         let mut pos = 0usize;
         while pos + 40 <= buf.len() {
-            let k: &[u8; 36] = buf[pos..pos + 36].try_into().unwrap();
-            let len = u32::from_le_bytes(buf[pos + 36..pos + 40].try_into().unwrap()) as usize;
+            let k: &[u8; 36] = buf[pos..pos + 36].try_into().unwrap_or(&[0u8; 36]);
+            let len =
+                u32::from_le_bytes(buf[pos + 36..pos + 40].try_into().unwrap_or_default()) as usize;
             if pos + 40 + len > buf.len() {
                 break;
             }
@@ -264,11 +276,7 @@ pub struct SnapshotRun {
 }
 
 impl SnapshotRun {
-    pub fn from_index(
-        snap: File,
-        sparse: Vec<([u8; 36], u64)>,
-        count: u64,
-    ) -> Self {
+    pub fn from_index(snap: File, sparse: Vec<([u8; 36], u64)>, count: u64) -> Self {
         let file_len = snap.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
         Self {
             f: std::sync::Mutex::new(snap),
@@ -280,6 +288,12 @@ impl SnapshotRun {
 
     pub fn len(&self) -> u64 {
         self.count
+    }
+
+    /// `true` when the run holds no coins.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
     }
 
     /// Lookup: sparse binary search -> read a window starting at the
@@ -364,7 +378,7 @@ impl SnapshotRun {
             }
             let plen = match varints[2] {
                 0 | 1 => 20usize,
-                2 | 3 | 4 | 5 => 32usize,
+                2..=5 => 32usize,
                 x => (x - 6) as usize,
             };
             if pos + plen > n {
@@ -423,7 +437,7 @@ impl SnapshotRun {
                 "not a utxo snapshot (bad magic)",
             ));
         }
-        let mut coins_left = u64::from_le_bytes(hdr[43..51].try_into().unwrap());
+        let mut coins_left = u64::from_le_bytes(hdr[43..51].try_into().unwrap_or_default());
         let stride = stride.max(1) as u64;
 
         // Sliding 1 MiB window over the coin stream — sequential I/O,
@@ -433,7 +447,12 @@ impl SnapshotRun {
         let mut win_off = 51u64;
         let mut win_len = 0usize;
         let mut pos = 51u64;
-        let need = |p: u64, f: &File, buf: &mut Vec<u8>, win_off: &mut u64, win_len: &mut usize| -> io::Result<()> {
+        let need = |p: u64,
+                    f: &File,
+                    buf: &mut Vec<u8>,
+                    win_off: &mut u64,
+                    win_len: &mut usize|
+         -> io::Result<()> {
             if p < *win_off || p as usize + 256 > (*win_off as usize) + *win_len {
                 *win_off = p;
                 let n = (file_len - p).min(WIN as u64) as usize;
@@ -442,29 +461,51 @@ impl SnapshotRun {
             }
             Ok(())
         };
-        let byte_at = |p: u64, f: &File, buf: &mut Vec<u8>, win_off: &mut u64, win_len: &mut usize| -> io::Result<u8> {
+        let byte_at = |p: u64,
+                       f: &File,
+                       buf: &mut Vec<u8>,
+                       win_off: &mut u64,
+                       win_len: &mut usize|
+         -> io::Result<u8> {
             need(p, f, buf, win_off, win_len)?;
             Ok(buf[(p - *win_off) as usize])
         };
-        let read_cs = |p: &mut u64, f: &File, buf: &mut Vec<u8>, win_off: &mut u64, win_len: &mut usize| -> io::Result<u64> {
+        let read_cs = |p: &mut u64,
+                       f: &File,
+                       buf: &mut Vec<u8>,
+                       win_off: &mut u64,
+                       win_len: &mut usize|
+         -> io::Result<u64> {
             let c = byte_at(*p, f, buf, win_off, win_len)?;
             *p += 1;
             Ok(match c {
                 0xfd => {
                     need(*p, f, buf, win_off, win_len)?;
-                    let v = u16::from_le_bytes(buf[(*p - *win_off) as usize..(*p - *win_off) as usize + 2].try_into().unwrap()) as u64;
+                    let v = u16::from_le_bytes(
+                        buf[(*p - *win_off) as usize..(*p - *win_off) as usize + 2]
+                            .try_into()
+                            .unwrap_or_default(),
+                    ) as u64;
                     *p += 2;
                     v
                 }
                 0xfe => {
                     need(*p, f, buf, win_off, win_len)?;
-                    let v = u32::from_le_bytes(buf[(*p - *win_off) as usize..(*p - *win_off) as usize + 4].try_into().unwrap()) as u64;
+                    let v = u32::from_le_bytes(
+                        buf[(*p - *win_off) as usize..(*p - *win_off) as usize + 4]
+                            .try_into()
+                            .unwrap_or_default(),
+                    ) as u64;
                     *p += 4;
                     v
                 }
                 0xff => {
                     need(*p, f, buf, win_off, win_len)?;
-                    let v = u64::from_le_bytes(buf[(*p - *win_off) as usize..(*p - *win_off) as usize + 8].try_into().unwrap());
+                    let v = u64::from_le_bytes(
+                        buf[(*p - *win_off) as usize..(*p - *win_off) as usize + 8]
+                            .try_into()
+                            .unwrap_or_default(),
+                    );
                     *p += 8;
                     v
                 }
@@ -472,7 +513,12 @@ impl SnapshotRun {
             })
         };
         // Core VARINT: continuation adds 1 per level.
-        let read_varint = |p: &mut u64, f: &File, buf: &mut Vec<u8>, win_off: &mut u64, win_len: &mut usize| -> io::Result<u64> {
+        let read_varint = |p: &mut u64,
+                           f: &File,
+                           buf: &mut Vec<u8>,
+                           win_off: &mut u64,
+                           win_len: &mut usize|
+         -> io::Result<u64> {
             let mut v = 0u64;
             loop {
                 let c = byte_at(*p, f, buf, win_off, win_len)?;
@@ -513,7 +559,7 @@ impl SnapshotRun {
                 }
                 let plen = match varints[2] {
                     0 | 1 => 20u64,
-                    2 | 3 | 4 | 5 => 32u64,
+                    2..=5 => 32u64,
                     n => n - 6,
                 };
                 // `need` only guarantees 256B — large scripts need an
@@ -542,7 +588,9 @@ impl SnapshotRun {
                 let script = crate::utxo_snapshot::decompress_script(&mut cur, varints[2])?;
                 sink(
                     OutPoint {
-                        txid: crate::hash::Txid::from_bytes(first_key[..32].try_into().unwrap()),
+                        txid: crate::hash::Txid::from_bytes(
+                            first_key[..32].try_into().unwrap_or_default(),
+                        ),
                         vout,
                     },
                     Coin {
@@ -572,9 +620,10 @@ impl SnapshotRun {
     /// Sequential read from just past the 51-byte header.
     pub fn iter(&self) -> std::io::Result<Vec<(OutPoint, Coin)>> {
         use std::io::Seek;
-        let mut f = self.f.lock().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("snapshot lock: {e}"))
-        })?;
+        let mut f = self
+            .f
+            .lock()
+            .map_err(|e| io::Error::other(format!("snapshot lock: {e}")))?;
         f.seek(io::SeekFrom::Start(51))?;
         let mut out = Vec::with_capacity(self.count as usize);
         // Whole-set iteration, not activation validation — no height
@@ -585,11 +634,7 @@ impl SnapshotRun {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.0))?;
         Ok(out)
     }
-
-
 }
-
-
 
 /// Compact-size decode at buf[pos..] — returns value, advances pos.
 fn cs(buf: &[u8], pos: &mut usize) -> u64 {
@@ -597,17 +642,17 @@ fn cs(buf: &[u8], pos: &mut usize) -> u64 {
     *pos += 1;
     match c {
         0xfd => {
-            let v = u16::from_le_bytes(buf[*pos..*pos + 2].try_into().unwrap()) as u64;
+            let v = u16::from_le_bytes(buf[*pos..*pos + 2].try_into().unwrap_or_default()) as u64;
             *pos += 2;
             v
         }
         0xfe => {
-            let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap()) as u64;
+            let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap_or_default()) as u64;
             *pos += 4;
             v
         }
         0xff => {
-            let v = u64::from_le_bytes(buf[*pos..*pos + 8].try_into().unwrap());
+            let v = u64::from_le_bytes(buf[*pos..*pos + 8].try_into().unwrap_or_default());
             *pos += 8;
             v
         }

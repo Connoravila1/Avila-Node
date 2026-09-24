@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! G1 microbenchmarks for the consensus hot paths — plain `std::time`
 //! timings, no harness deps. Run:
 //!

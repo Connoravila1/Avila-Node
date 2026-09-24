@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Erlay (BIP-330) set-reconciliation spike on the pure-Rust sketch:
 //! one sketch exchange reconciles D differing tx short-ids — measure
 //! real bytes/D, decode success rates, and decode cost vs full-inv.
@@ -10,7 +13,10 @@ use std::time::Instant;
 fn main() {
     const SET: u32 = 40_000; // ~mempool size in short-ids
     println!("set={SET} 32-bit ids — one sketch exchange, one decode round\n");
-    println!("{:>6} {:>9} {:>9} {:>12} {:>6}", "D", "cap", "sketch B", "decode", "ok");
+    println!(
+        "{:>6} {:>9} {:>9} {:>12} {:>6}",
+        "D", "cap", "sketch B", "decode", "ok"
+    );
 
     for &d in &[0u32, 1, 4, 16, 64, 128, 256] {
         let cap = ((2 * d).max(8)) as usize;
@@ -47,15 +53,21 @@ fn main() {
         a.merge(&b);
         let t = Instant::now();
         let got = a.decode();
-        println!("  D={d}: {}B sketch -> decode {:?} ({} found)",
-            4 * d, t.elapsed(), got.map(|v| v.len()).unwrap_or(0));
+        println!(
+            "  D={d}: {}B sketch -> decode {:?} ({} found)",
+            4 * d,
+            t.elapsed(),
+            got.map(|v| v.len()).unwrap_or(0)
+        );
     }
 
     println!("\nvs full-inv of the same 40k mempool:");
     let inv_bytes = 40_000usize * 32;
     for &d in &[4u32, 16, 64, 128] {
         let sketch_bytes = 4 * 2 * d;
-        println!("  D={d}: sketch {sketch_bytes}B vs inv {inv_bytes}B — {:.0}x smaller",
-            inv_bytes / sketch_bytes as usize);
+        println!(
+            "  D={d}: sketch {sketch_bytes}B vs inv {inv_bytes}B — {:.0}x smaller",
+            inv_bytes / sketch_bytes as usize
+        );
     }
 }

@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Interop probe: connects to a listening Bitcoin peer over real TCP, runs
 //! the version handshake, then synchronizes headers-first — paging
 //! `getheaders`, feeding blocks via `inv`/`getdata`, and validating every

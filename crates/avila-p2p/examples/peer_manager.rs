@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! End-to-end PeerManager evidence: connect to a Bitcoin peer over real
 //! TCP and let the manager drive the whole sync — handshake, headers
 //! phase, and the per-tick download scheduler — into a consensus-
@@ -68,6 +71,17 @@ fn main() -> Result<(), String> {
                 NetEvent::Announced { peer, missing } => {
                     println!("peer {peer} announced {} blocks we lack", missing.len())
                 }
+                NetEvent::EclipseSuspected(signals) => {
+                    println!("eclipse indicators: {signals:?}")
+                }
+                NetEvent::ReconDivergence {
+                    peer, their_misses, ..
+                } => println!("peer {peer}: {their_misses} recon their-misses — filtered view?"),
+                NetEvent::CpuThrottled { peer, rate_ns } => {
+                    println!("peer {peer}: cpu-throttled at {rate_ns}ns/s")
+                }
+                NetEvent::ProxyUnreachable => println!("proxy unreachable — private route down"),
+                NetEvent::V2Downgraded { addr } => println!("{addr}: v2 attempt downgraded to v1"),
             }
         }
         let tip = cs.chain().len() as i64 - 1;

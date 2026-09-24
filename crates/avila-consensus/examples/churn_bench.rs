@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Write-amplification measurement: how much coin churn does the
 //! write-back cache absorb before it reaches the backend?
 //!

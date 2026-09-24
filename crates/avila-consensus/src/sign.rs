@@ -1505,6 +1505,55 @@ impl SignatureChecker for DummyChecker {
 /// provider's keys — and, per Core, a missing `txdata` still forces
 /// the dummy creator. `Real` failures collect `missing_*` into `out`;
 /// `finalize` keeps `sigdata.complete` so final scripts are written.
+/// `walletprocesspsbt`'s verification step (queue #36's enforcement):
+/// for every input, compare the PSBT's claimed `witness_utxo` against
+/// the node's *verified* UTXO set — a lying host cannot understate an
+/// input's value to inflate the apparent fee (the LSB-010 hardware-
+/// wallet attack class); we have the chain, so prevouts are facts,
+/// not claims. Missing `witness_utxo`s are filled from the set.
+/// Returns `(verified, unverified)` — unverified means the prevout
+/// is not in the UTXO set (spent or foreign), never silently trusted.
+///
+/// # Errors
+/// A `String` naming the offending input when a claim mismatches.
+pub fn verify_and_fill_prevouts(
+    utxo: &crate::connect::UtxoSet,
+    psbt: &mut Psbt,
+) -> Result<(usize, usize), String> {
+    let mut verified = 0usize;
+    let mut unverified = 0usize;
+    for i in 0..psbt.tx.inputs.len() {
+        let prevout = psbt.tx.inputs[i].previous_output;
+        let Some(coin) = utxo.get(&prevout) else {
+            unverified += 1;
+            continue;
+        };
+        match psbt.inputs[i].get(Psbt::IN_WITNESS_UTXO) {
+            Some(claimed) => {
+                let mut dec = crate::encode::Decoder::new(claimed);
+                let cv = dec.read_u64_le().unwrap_or(u64::MAX) as i64;
+                let cscript = dec.read_var_bytes().unwrap_or_default();
+                if cv != coin.out.value || cscript != coin.out.script_pubkey.as_bytes() {
+                    return Err(format!(
+                        "input {i}: PSBT prevout claims {cv} sats / script len {} but the verified UTXO set says {} sats / len {} — refusing to sign",
+                        cscript.len(),
+                        coin.out.value,
+                        coin.out.script_pubkey.as_bytes().len()
+                    ));
+                }
+                verified += 1;
+            }
+            None => {
+                let mut v = coin.out.value.to_le_bytes().to_vec();
+                crate::encode::write_var_bytes(&mut v, coin.out.script_pubkey.as_bytes());
+                psbt.inputs[i].set(vec![Psbt::IN_WITNESS_UTXO], v);
+                verified += 1;
+            }
+        }
+    }
+    Ok((verified, unverified))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn sign_psbt_input(
     provider: &FlatProvider,
@@ -3034,5 +3083,86 @@ mod tests {
             .insert([0x22; 20], (vec![0x03; 33], vec![0x30; 70]));
         dst.merge_signature_data(src2);
         assert!(dst.signatures.is_empty());
+    }
+
+    /// Queue #35/#36 end-to-end: a descriptor-derived provider signs a
+    /// PSBT only when its prevout claims match the verified UTXO set —
+    /// an understated claim (the LSB-010 fee-inflation attack) is a
+    /// hard reject, not a signature.
+    #[test]
+    fn descriptor_signer_verifies_prevouts_then_signs() {
+        use crate::descriptor::{DeriveCache, FlatProvider, parse_descriptors};
+        use crate::extended_key::ExtKey;
+
+        let params = crate::params::Network::Regtest.params();
+        const H: u32 = 0x8000_0000;
+        // The createdescriptorseed path: seed → master → m/84h/1h/0h.
+        let master = ExtKey::from_seed(&[42u8; 32], params.base58_ext_secret_prefix).unwrap();
+        let account = master
+            .derive(84 | H)
+            .and_then(|k| k.derive(1 | H))
+            .and_then(|k| k.derive(H))
+            .unwrap();
+        let fp = hex::encode(&master.fingerprint());
+        let body = format!("wpkh([{fp}/84h/1h/0h]{}/0/*)", account.encode());
+        let desc = format!("{body}#{}", crate::descriptor::descriptor_checksum(&body));
+        let (parsed, mut signing, _) = parse_descriptors(&desc, &params, true).unwrap();
+        // expand_priv — the secrets for derived keys land in the provider.
+        let mut expanded = FlatProvider::default();
+        let mut cache = DeriveCache::new();
+        let scripts = parsed[0]
+            .expand_into(0, &signing, &mut expanded, true, &mut cache)
+            .unwrap();
+        signing.keys.extend(expanded.keys);
+        signing.pubkeys.extend(expanded.pubkeys);
+        signing.origins.extend(expanded.origins);
+        let spk = scripts
+            .iter()
+            .find(|s| s.len() == 22 && s[0] == 0x00 && s[1] == 0x14)
+            .unwrap()
+            .clone();
+
+        // The verified UTXO set holds a 50_000-sat coin paying to it.
+        let mut utxo = crate::connect::UtxoSet::new();
+        let outpoint = OutPoint {
+            txid: crate::hash::Txid::from_bytes([0x22; 32]),
+            vout: 0,
+        };
+        utxo.insert_synthetic(
+            outpoint,
+            crate::connect::Coin {
+                out: TxOut {
+                    value: 50_000,
+                    script_pubkey: Script::new(spk.clone()),
+                },
+                height: 1,
+                coinbase: false,
+            },
+        );
+
+        // Honest claim → verified against the set, then a REAL signature.
+        let mut psbt = psbt_spending(&spk);
+        let (v, u) = verify_and_fill_prevouts(&utxo, &mut psbt).unwrap();
+        assert_eq!((v, u), (1, 0));
+        let txdata = precompute_psbt_data(&psbt);
+        assert!(sign_psbt_input(
+            &signing,
+            &mut psbt,
+            0,
+            Some(&txdata),
+            1,
+            false,
+            None,
+            true,
+        ));
+        assert!(finalize_and_extract_psbt(&mut psbt).is_some());
+
+        // Lying claim — 49_999 claimed where the set says 50_000 —
+        // the fee-inflation attack is refused outright.
+        let mut bad = psbt_spending(&spk);
+        let mut lie = 49_999i64.to_le_bytes().to_vec();
+        crate::encode::write_var_bytes(&mut lie, &spk);
+        bad.inputs[0].set(vec![Psbt::IN_WITNESS_UTXO], lie);
+        assert!(verify_and_fill_prevouts(&utxo, &mut bad).is_err());
     }
 }

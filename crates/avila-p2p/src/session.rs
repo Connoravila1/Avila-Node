@@ -209,6 +209,11 @@ pub struct PeerSession<S> {
     /// Decoy modulus — a decoy rides ~1-in-N sends (4 default; 1 in
     /// tests forces every send).
     decoy_rate: u64,
+    /// Fixed-size cells (queue #17): when ≥64, `flush` pads the send
+    /// queue to a multiple of this with decoy packets, so every socket
+    /// write is a uniform size and the wire byte-stream carries no
+    /// message-length histogram. v2 only — v1 has no decoy concept.
+    cell_bytes: usize,
 }
 
 impl<S: Read + Write> PeerSession<S> {
@@ -331,6 +336,7 @@ impl<S: Read + Write> PeerSession<S> {
                 u64::from_le_bytes(seed) | 1
             },
             decoy_rate: 4,
+            cell_bytes: 0,
             recon_salt,
         }
     }
@@ -470,7 +476,7 @@ impl<S: Read + Write> PeerSession<S> {
             self.decoy_rng ^= self.decoy_rng << 13;
             self.decoy_rng ^= self.decoy_rng >> 7;
             self.decoy_rng ^= self.decoy_rng << 17;
-            if self.decoy_rng % self.decoy_rate == 0 {
+            if self.decoy_rng.is_multiple_of(self.decoy_rate) {
                 let dlen = (self.decoy_rng % 2049) as usize;
                 let decoy = channel.encode_decoy(dlen);
                 self.send_buf.extend(decoy);
@@ -479,12 +485,42 @@ impl<S: Read + Write> PeerSession<S> {
         Ok(())
     }
 
+    /// Sets the fixed-cell size for outgoing traffic (0 disables).
+    /// See [`Self::flush`].
+    pub fn set_cell_bytes(&mut self, bytes: usize) {
+        self.cell_bytes = bytes;
+    }
+
     /// Writes as much of `send_buf` as the socket accepts; `WouldBlock`
     /// leaves the remainder queued.
+    ///
+    /// Fixed-cell mode (queue #17): before writing, the queue is
+    /// padded to a `cell_bytes` multiple with a decoy packet — every
+    /// emitted byte count is cell-aligned, so the observer-visible
+    /// write-size histogram is flat. A partial socket write can still
+    /// split a cell (the kernel's concern, not ours), and the mode is
+    /// v2-only since v1 has no ignorable packet type.
     ///
     /// # Errors
     /// Propagates real I/O failures.
     pub fn flush(&mut self) -> Result<(), SessionError> {
+        if self.cell_bytes >= 64
+            && !self.send_buf.is_empty()
+            && let Some(channel) = self.v2.as_mut()
+        {
+            let rem = self.send_buf.len() % self.cell_bytes;
+            if rem != 0 {
+                // Decoy packet total = dlen + EXPANSION (20); when the
+                // remainder is under that, overshoot to the next cell
+                // boundary instead — still aligned.
+                let mut fill = self.cell_bytes - rem;
+                if fill < crate::bip324::EXPANSION {
+                    fill += self.cell_bytes;
+                }
+                let decoy = channel.encode_decoy(fill - crate::bip324::EXPANSION);
+                self.send_buf.extend(decoy);
+            }
+        }
         while !self.send_buf.is_empty() {
             let n = match self.stream.write(self.send_buf.make_contiguous()) {
                 Ok(n) => n,
@@ -784,7 +820,10 @@ mod tests {
         let events = us.poll().unwrap();
         let sent = testpipe::drain(&mut peer_end, MAGIC);
         let names: Vec<&str> = sent.iter().map(|m| m.command_name()).collect();
-        assert_eq!(names, ["version", "wtxidrelay", "sendaddrv2", "sendrecon", "verack"]);
+        assert_eq!(
+            names,
+            ["version", "wtxidrelay", "sendaddrv2", "sendrecon", "verack"]
+        );
         assert!(matches!(
             events[0],
             SessionEvent::Message(Message::Version(_))
@@ -1044,5 +1083,66 @@ mod tests {
             bip324::Handshake::V1Fallback => {}
             _ => panic!("eof before any bytes not detected"),
         }
+    }
+
+    /// Fixed-size cells (queue #17): with `cell_bytes` set, every
+    /// flush emits a cell-aligned byte count — the wire stream's
+    /// write-size histogram is flat regardless of message sizes.
+    #[test]
+    fn cell_mode_pads_flushes_to_uniform_size() {
+        const CELL: usize = 1024;
+        let (mut a, mut b) = testpipe::pair();
+        let pending = bip324::start_handshake(&mut a).unwrap();
+        let _ch_b = bip324::respond_handshake(&mut b, MAGIC).unwrap();
+        let bip324::Handshake::V2(cipher_a, garbage_a) =
+            bip324::finish_handshake(&mut a, pending, MAGIC).unwrap()
+        else {
+            panic!("v1 fallback on a v2 peer");
+        };
+        let mut ch_a = bip324::V2Channel::new(cipher_a, garbage_a);
+        let tail = ch_a.handshake_tail();
+        a.write_all(&tail).unwrap();
+        // Handshake bytes (key exchange, garbage, tail) predate the
+        // app channel — drain them so only cell-padded writes count.
+        let mut sink = [0u8; 8192];
+        let mut drained = 0usize;
+        while let Ok(n) = b.read(&mut sink) {
+            if n == 0 {
+                break;
+            }
+            drained += n;
+        }
+        assert!(drained > 0, "handshake bytes never arrived");
+
+        // The session queues its v2 `version` at construction; cell
+        // mode then pads the whole queue on flush.
+        let mut us =
+            PeerSession::initiate_v2_channel(a, MAGIC, version(100), BUDGET, ch_a).unwrap();
+        us.set_cell_bytes(CELL);
+        us.flush().unwrap();
+        let n1 = b.read(&mut sink).expect("cell write");
+        assert_eq!(
+            n1 % CELL,
+            0,
+            "first flush emitted {n1} bytes — not cell-aligned"
+        );
+
+        // A small message still lands on the cell boundary.
+        us.send(&Message::Ping(42)).unwrap();
+        us.flush().unwrap();
+        let n2 = b.read(&mut sink).expect("cell write");
+        assert_eq!(
+            n2 % CELL,
+            0,
+            "post-message flush emitted {n2} bytes — not cell-aligned"
+        );
+
+        // Cell mode is inert on v1 (no decoy packet type exists).
+        let (v1, mut v1_peer) = testpipe::pair();
+        let mut s1 = PeerSession::initiate(v1, MAGIC, version(100), BUDGET).unwrap();
+        s1.set_cell_bytes(CELL);
+        s1.flush().unwrap();
+        let v1_n = v1_peer.read(&mut sink).expect("v1 write");
+        assert!(v1_n > 0 && v1_n < CELL, "v1 should stay unpadded");
     }
 }

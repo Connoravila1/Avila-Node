@@ -86,6 +86,308 @@ pub struct WatchedCoin {
     pub spent_by: Option<Txid>,
 }
 
+/// The resolved seed + its provenance — [`resolve_entropy`]'s output.
+pub struct ResolvedEntropy {
+    /// The 32-byte BIP32 seed.
+    pub seed: Vec<u8>,
+    /// "os" | "user" | "dice" | "mixed:os+user" | "mixed:os+dice".
+    pub provenance: String,
+    /// `sha256(raw entropy input)` — the commit-before-generate
+    /// record; re-rolling the same dice recomputes it, so provenance
+    /// is checkable, not just asserted.
+    pub commitment: String,
+    /// Non-fatal caveats (too-few rolls, skewed distribution).
+    pub warnings: Vec<String>,
+}
+
+/// `createdescriptorseed`'s entropy ceremony (queue #37): caller
+/// hex, Coldcard-convention dice rolls (SHA256 over the ASCII digits;
+/// ≥50 rolls for 128 bits, ≥99 for 256; a face over 30% of rolls is
+/// a skew warning), or the OS CSPRNG — `mix` XOR-folds OS entropy
+/// into the caller's, so no single bad source decides the seed.
+/// The commitment records `sha256(input)` *before* derivation.
+///
+/// # Errors
+/// Invalid hex, dice characters outside `1..=6`, or too little
+/// material (<16 bytes hex / <10 rolls) is a hard error.
+pub fn resolve_entropy(
+    entropy_hex: Option<&str>,
+    dice: Option<&str>,
+    mix: bool,
+) -> Result<ResolvedEntropy, String> {
+    let mut warnings = Vec::new();
+    let (mut seed, source, input_commit) = if let Some(rolls) = dice {
+        let rolls = rolls.trim();
+        if rolls.len() < 10 {
+            return Err(format!(
+                "dice entropy needs >=10 rolls ({} given)",
+                rolls.len()
+            ));
+        }
+        if rolls.len() < 50 {
+            warnings.push(format!(
+                "{} rolls is under the 128-bit floor (50 D6 rolls); use 99 for 256-bit",
+                rolls.len()
+            ));
+        } else if rolls.len() < 99 {
+            warnings.push(format!(
+                "{} rolls covers 128 bits; 99 rolls gives the full 256",
+                rolls.len()
+            ));
+        }
+        let mut faces = [0u32; 7];
+        let mut digits = String::with_capacity(rolls.len());
+        for ch in rolls.chars() {
+            if !('1'..='6').contains(&ch) {
+                return Err(format!("dice rolls must be digits 1-6 (got '{ch}')"));
+            }
+            faces[ch as usize - '0' as usize] += 1;
+            digits.push(ch);
+        }
+        if faces
+            .iter()
+            .any(|&c| (c as f64) > rolls.len() as f64 * 0.30)
+        {
+            warnings.push("skewed roll distribution (>30% one face) — biased dice?".into());
+        }
+        // Coldcard: SHA256 over the ASCII digits — cross-verifiable
+        // with the firmware's own derivation.
+        let raw = avila_consensus::hash::sha256(digits.as_bytes());
+        (raw.to_vec(), "dice", digits.as_bytes().to_vec())
+    } else if let Some(h) = entropy_hex {
+        let b = hex::decode(h.trim()).map_err(|e| format!("entropy must be hex: {e}"))?;
+        if b.len() < 16 {
+            return Err(format!("entropy must be >=16 bytes (got {})", b.len()));
+        }
+        let seed = if b.len() == 32 {
+            b.clone()
+        } else {
+            avila_consensus::hash::sha256(&b).to_vec()
+        };
+        (seed, "user", b)
+    } else {
+        let mut s = [0u8; 32];
+        getrandom::fill(&mut s).map_err(|e| format!("entropy source failed: {e}"))?;
+        (s.to_vec(), "os", s.to_vec())
+    };
+    let provenance = if mix && source != "os" {
+        let mut os = [0u8; 32];
+        getrandom::fill(&mut os).map_err(|e| format!("entropy source failed: {e}"))?;
+        for (a, b) in seed.iter_mut().zip(os.iter()) {
+            *a ^= b;
+        }
+        format!("mixed:os+{source}")
+    } else {
+        source.to_string()
+    };
+    Ok(ResolvedEntropy {
+        seed,
+        provenance,
+        commitment: hex::encode(&avila_consensus::hash::sha256(&input_commit)),
+        warnings,
+    })
+}
+
+/// Vault format: `AVLAVLT1` || argon2 params (m,t,p as u32 LE) ||
+/// salt(32) || nonce(12) || ciphertext+tag — argon2id passphrase KDF
+/// feeding ChaCha20Poly1305. The plaintext is the signer's private
+/// descriptors + provenance records (NOT the watch list — secrets
+/// never share a file with watch state).
+const VAULT_MAGIC: &[u8; 8] = b"AVLAVLT1";
+/// Argon2id params — memory-hard at wallet scale (64 MiB, 3 lanes,
+/// 2 passes): a stolen vault resists commodity GPU grinding far
+/// better than any iterated-hash KDF.
+const VAULT_ARGON_M: u32 = 65_536;
+const VAULT_ARGON_T: u32 = 2;
+const VAULT_ARGON_P: u32 = 3;
+
+/// What a vault carries — enough to rebuild `SignerState` from the
+/// private descriptors (derivation is deterministic; the seed is
+/// never stored separately).
+pub struct VaultContents {
+    /// The xprv descriptors (with checksums).
+    pub descs_private: Vec<String>,
+    /// Neutered watch descriptors (public — safe in any file).
+    pub descs_watch: Vec<String>,
+    /// "os" | "user" | "dice" | "mixed:…".
+    pub provenance: String,
+    /// `sha256(raw entropy input)` at creation time.
+    pub entropy_commitment: String,
+}
+
+/// Seal the signer's secrets under `passphrase` — argon2id KDF →
+/// ChaCha20Poly1305 AEAD over the private descriptors + provenance.
+///
+/// # Errors
+/// RNG or KDF failure — both are fatal for a vault write.
+pub fn vault_seal(signer: &SignerState, passphrase: &str) -> Result<Vec<u8>, String> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    let mut pt = Vec::new();
+    pt.push(signer.provenance.len() as u8);
+    pt.extend_from_slice(signer.provenance.as_bytes());
+    pt.push(signer.entropy_commitment.len() as u8);
+    pt.extend_from_slice(signer.entropy_commitment.as_bytes());
+    pt.extend_from_slice(&(signer.descs_private.len() as u32).to_le_bytes());
+    for d in &signer.descs_private {
+        pt.extend_from_slice(&(d.len() as u32).to_le_bytes());
+        pt.extend_from_slice(d.as_bytes());
+    }
+    pt.extend_from_slice(&(signer.descs_watch.len() as u32).to_le_bytes());
+    for d in &signer.descs_watch {
+        pt.extend_from_slice(&(d.len() as u32).to_le_bytes());
+        pt.extend_from_slice(d.as_bytes());
+    }
+    let mut salt = [0u8; 32];
+    let mut nonce = [0u8; 12];
+    getrandom::fill(&mut salt).map_err(|e| format!("rng failed: {e}"))?;
+    getrandom::fill(&mut nonce).map_err(|e| format!("rng failed: {e}"))?;
+    let argon = argon2::Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        argon2::Params::new(VAULT_ARGON_M, VAULT_ARGON_T, VAULT_ARGON_P, Some(32))
+            .map_err(|e| format!("argon2 params: {e}"))?,
+    );
+    let mut key = [0u8; 32];
+    argon
+        .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
+        .map_err(|e| format!("argon2: {e}"))?;
+    let cipher = chacha20poly1305::ChaCha20Poly1305::new(&key.into());
+    let ct = cipher
+        .encrypt(
+            (&nonce).into(),
+            chacha20poly1305::aead::Payload {
+                msg: &pt,
+                aad: VAULT_MAGIC,
+            },
+        )
+        .map_err(|_| "encrypt failed".to_string())?;
+    let mut out = VAULT_MAGIC.to_vec();
+    for v in [VAULT_ARGON_M, VAULT_ARGON_T, VAULT_ARGON_P] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Open a vault blob with `passphrase` — wrong passphrase or tampered
+/// ciphertext is an AEAD failure, not a wrong-password guess.
+///
+/// # Errors
+/// Bad magic, truncated blob, KDF or AEAD failure.
+pub fn vault_open(bytes: &[u8], passphrase: &str) -> Result<VaultContents, String> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    let hdr = 8 + 12 + 32 + 12; // magic + params + salt + nonce
+    if bytes.len() < hdr || &bytes[..8] != VAULT_MAGIC {
+        return Err("not an avila signer vault".into());
+    }
+    let param_u32 = |r: &[u8]| -> Result<u32, String> {
+        r.try_into()
+            .map(u32::from_le_bytes)
+            .map_err(|_| "vault header truncated".to_string())
+    };
+    let m = param_u32(&bytes[8..12])?;
+    let t = param_u32(&bytes[12..16])?;
+    let p = param_u32(&bytes[16..20])?;
+    let salt = &bytes[20..52];
+    let nonce = &bytes[52..64];
+    let ct = &bytes[64..];
+    let argon = argon2::Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        argon2::Params::new(m, t, p, Some(32))
+            .map_err(|e| format!("vault argon2 params unreasonable: {e}"))?,
+    );
+    let mut key = [0u8; 32];
+    argon
+        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .map_err(|e| format!("argon2: {e}"))?;
+    let cipher = chacha20poly1305::ChaCha20Poly1305::new(&key.into());
+    let pt = cipher
+        .decrypt(
+            nonce.into(),
+            chacha20poly1305::aead::Payload {
+                msg: ct,
+                aad: VAULT_MAGIC,
+            },
+        )
+        .map_err(|_| "vault open failed — wrong passphrase or corrupt vault".to_string())?;
+    /// Byte cursor over the decrypted plaintext — every read bounds-
+    /// checked; a truncated vault is an error, not a panic.
+    struct Cursor<'a> {
+        buf: &'a [u8],
+        at: usize,
+    }
+    impl Cursor<'_> {
+        fn take(&mut self, n: usize) -> Result<&[u8], String> {
+            if self.at + n > self.buf.len() {
+                return Err("vault plaintext truncated".into());
+            }
+            let r = &self.buf[self.at..self.at + n];
+            self.at += n;
+            Ok(r)
+        }
+        fn take_u32(&mut self) -> Result<usize, String> {
+            self.take(4)?
+                .try_into()
+                .map(u32::from_le_bytes)
+                .map(|v| v as usize)
+                .map_err(|_| "vault plaintext truncated".to_string())
+        }
+        fn read_strs(&mut self) -> Result<Vec<String>, String> {
+            let n = self.take_u32()?;
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                let dl = self.take_u32()?;
+                out.push(
+                    String::from_utf8(self.take(dl)?.to_vec())
+                        .map_err(|_| "bad desc".to_string())?,
+                );
+            }
+            Ok(out)
+        }
+    }
+    let mut cur = Cursor { buf: &pt, at: 0 };
+    let plen = cur.take(1)?[0] as usize;
+    let provenance =
+        String::from_utf8(cur.take(plen)?.to_vec()).map_err(|_| "bad provenance".to_string())?;
+    let clen = cur.take(1)?[0] as usize;
+    let entropy_commitment =
+        String::from_utf8(cur.take(clen)?.to_vec()).map_err(|_| "bad commitment".to_string())?;
+    let descs_private = cur.read_strs()?;
+    let descs_watch = cur.read_strs()?;
+    Ok(VaultContents {
+        descs_private,
+        descs_watch,
+        provenance,
+        entropy_commitment,
+    })
+}
+
+/// Opt-in signing material (queue #35): populated ONLY by
+/// `createdescriptorseed`/key import — the wallet stays watch-only
+/// (Core's `disable_private_keys` model) until the operator asks for
+/// a signer. Secrets are memory-resident ONLY: `watchlist.dat` never
+/// carries key material — a restart loses them until the encrypted
+/// vault lands; the operator's descriptor backup is the recovery.
+pub struct SignerState {
+    /// The signing provider — secrets + xprvs + expansion outputs.
+    pub provider: avila_consensus::descriptor::FlatProvider,
+    /// Private-material descriptor bodies — only surfaced by
+    /// explicitly-private RPCs, never logged.
+    pub descs_private: Vec<String>,
+    /// Neutered watch descriptors (public — safe in any file).
+    pub descs_watch: Vec<String>,
+    /// Seed entropy provenance: "os" (system CSPRNG), "user",
+    /// "dice", or "mixed:…" when OS entropy was XOR-folded in.
+    pub provenance: String,
+    /// `sha256(raw entropy input)` — commit-before-generate: the
+    /// record exists before derivation, so the seed's origin is
+    /// checkable rather than asserted (queue #37).
+    pub entropy_commitment: String,
+}
+
 /// The wallet — persistent across restarts via `watchlist.dat`.
 pub struct WatchWallet {
     /// `watchlist.dat` path — writes are atomic (tmp + rename).
@@ -113,6 +415,9 @@ pub struct WatchWallet {
     /// BIP352 silent-payments watches — detected alongside descriptor
     /// scripts; the coin's script is the tweaked taproot output.
     pub silents: Vec<avila_consensus::silent::SilentAddress>,
+    /// Opt-in signer (queue #35) — `None` until the operator creates
+    /// or imports key material; memory-only, never persisted.
+    pub signer: Option<SignerState>,
     /// Dirty flag — set by any mutation, cleared by [`Self::persist`].
     dirty: bool,
 }
@@ -132,6 +437,7 @@ impl WatchWallet {
             gaps: Vec::new(),
             scan_floor: 0,
             silents: Vec::new(),
+            signer: None,
             dirty: false,
         };
         if let Ok(text) = std::fs::read_to_string(&w.path) {
@@ -344,6 +650,31 @@ impl WatchWallet {
         self.dirty = true;
     }
 
+    /// Installs the opt-in signer — the wallet remains watch-only in
+    /// every other respect; this just means `walletprocesspsbt` has
+    /// keys to reach for.
+    pub fn enable_signing(&mut self, signer: SignerState) {
+        self.signer = Some(signer);
+    }
+
+    /// Drop the signer — `signerlock`; secrets leave memory with the
+    /// state (the vault holds the recoverable form).
+    pub fn disable_signing(&mut self) {
+        self.signer = None;
+    }
+
+    /// Whether the wallet holds signing keys (opt-in signer active).
+    #[must_use]
+    pub fn is_signer(&self) -> bool {
+        self.signer.is_some()
+    }
+
+    /// The signer's provider, when installed — callers use it to sign.
+    #[must_use]
+    pub fn signer(&self) -> Option<&SignerState> {
+        self.signer.as_ref()
+    }
+
     /// Rewind the scan to `height` (exclusive of it — blocks at
     /// `height` are rescanned) then advance to the tip. Existing
     /// descriptor scripts survive the rewind, so coins found below
@@ -404,6 +735,12 @@ impl WatchWallet {
             .iter()
             .filter(|(_, c)| c.spent_height.is_none())
             .map(|(&(txid, vout), c)| (OutPoint { txid, vout }, c))
+    }
+
+    /// The vault's path — sibling of `watchlist.dat`, same dir.
+    #[must_use]
+    pub fn vault_path(&self) -> PathBuf {
+        self.path.with_file_name("signervault.dat")
     }
 
     /// Persists when dirty — `watchlist.dat` via tmp+rename like the
@@ -477,6 +814,7 @@ impl WatchWallet {
             gaps: Vec::new(),
             scan_floor: 0,
             silents: Vec::new(),
+            signer: None,
             dirty: false,
         };
         scratch
@@ -999,5 +1337,84 @@ mod tests {
             !w.coins.contains_key(&(orphan_txid, 0)),
             "the orphaned block's coin must not be recorded as confirmed"
         );
+    }
+
+    /// Queue #37 — the entropy ceremony's provable surface: Coldcard-
+    /// convention dice derivation (SHA256 over ASCII digits), the
+    /// commit-before-generate record, and XOR mixing.
+    #[test]
+    fn resolve_entropy_dice_is_coldcard_compatible() {
+        // 50 ones — the 128-bit floor. Seed = SHA256("111…1").
+        let rolls = "1".repeat(50);
+        let r = resolve_entropy(None, Some(&rolls), false).unwrap();
+        assert_eq!(r.provenance, "dice");
+        let expect_seed = avila_consensus::hash::sha256(rolls.as_bytes()).to_vec();
+        assert_eq!(r.seed, expect_seed, "seed must be SHA256(rolls)");
+        // Commitment = sha256(raw input) — recomputable by anyone
+        // re-rolling the same dice.
+        assert_eq!(
+            r.commitment,
+            hex::encode(&avila_consensus::hash::sha256(rolls.as_bytes()))
+        );
+        assert!(r.warnings.iter().any(|w| w.contains("99")));
+        // Skewed distribution warns — all-one faces is maximal skew.
+        assert!(r.warnings.iter().any(|w| w.contains("skewed")));
+    }
+
+    #[test]
+    fn resolve_entropy_rejects_and_mixes() {
+        assert!(resolve_entropy(None, Some("111"), false).is_err()); // <10 rolls
+        assert!(resolve_entropy(None, Some("0000000000"), false).is_err()); // bad digits
+        assert!(resolve_entropy(Some("abcd"), None, false).is_err()); // <16 bytes
+        // Exactly-32 hex passes through raw; shorter folds via SHA256.
+        let raw32 = "ab".repeat(32);
+        let r = resolve_entropy(Some(&raw32), None, false).unwrap();
+        assert_eq!(r.seed, hex::decode(&raw32).unwrap());
+        assert_eq!(r.provenance, "user");
+        let short = "ab".repeat(16);
+        let r2 = resolve_entropy(Some(&short), None, false).unwrap();
+        assert_eq!(
+            r2.seed,
+            avila_consensus::hash::sha256(&hex::decode(&short).unwrap()).to_vec()
+        );
+        // Mixing XOR-folds OS entropy — provenance says so, and the
+        // seed differs from the unmixed derivation.
+        let rolls = "123456".repeat(17); // 102 rolls
+        let mixed = resolve_entropy(None, Some(&rolls), true).unwrap();
+        assert_eq!(mixed.provenance, "mixed:os+dice");
+        let plain = resolve_entropy(None, Some(&rolls), false).unwrap();
+        assert_ne!(mixed.seed, plain.seed);
+        // Commitment still binds to the user's input, not the OS half.
+        assert_eq!(mixed.commitment, plain.commitment);
+    }
+
+    /// Queue #35 — the vault roundtrips its contents, rejects the
+    /// wrong passphrase at the AEAD layer (no oracle), and rejects
+    /// tampered ciphertext.
+    #[test]
+    fn vault_seal_open_roundtrips_and_rejects() {
+        let signer = SignerState {
+            provider: avila_consensus::descriptor::FlatProvider::default(),
+            descs_private: vec!["wpkh(tprv8x/0/*)#testp".to_string()],
+            descs_watch: vec!["wpkh(tpub8x/0/*)#testw".to_string()],
+            provenance: "dice".to_string(),
+            entropy_commitment: "abc123".to_string(),
+        };
+        let blob = vault_seal(&signer, "correct horse").unwrap();
+        assert!(blob.starts_with(b"AVLAVLT1"));
+        let v = vault_open(&blob, "correct horse").unwrap();
+        assert_eq!(v.descs_private, signer.descs_private);
+        assert_eq!(v.descs_watch, signer.descs_watch);
+        assert_eq!(v.provenance, "dice");
+        assert_eq!(v.entropy_commitment, "abc123");
+        // Wrong passphrase → AEAD failure, not a hint.
+        assert!(vault_open(&blob, "wrong horse").is_err());
+        // Tampered ciphertext → AEAD failure.
+        let mut bad = blob.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        assert!(vault_open(&bad, "correct horse").is_err());
+        // Truncated blob → error, not panic.
+        assert!(vault_open(&blob[..40], "correct horse").is_err());
     }
 }

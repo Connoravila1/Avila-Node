@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Snapshot load at disk speed — see `avila_consensus::snapverify`.
 //!
 //! `scan <snapshot> <threads>` — parallel exact parse + sparse index.

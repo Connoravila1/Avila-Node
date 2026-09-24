@@ -34,6 +34,16 @@ pub struct SyncConfig {
     /// Optional SOCKS5 proxy for all outbound connections (Core's
     /// `-proxy`); DNS-seeded and explicit dials both route through it.
     pub proxy: Option<SocketAddr>,
+    /// Core's `-asmap=<file>`: a prefix→ASN map for outbound-dial
+    /// bucketing (the Erebus mitigation, queue #21). Text format —
+    /// one `a.b.c.d/plen asn` row per line; Core's bit-packed
+    /// `asmap.dat` parsing is open. Empty/absent = no bucketing.
+    pub asmap_path: Option<std::path::PathBuf>,
+    /// Fixed-size send cells in bytes (queue #17): pads every v2
+    /// link's outgoing queue to this multiple with decoy packets so
+    /// the wire write-size histogram is flat. 0 = Core's behavior
+    /// (natural sizes).
+    pub cell_bytes: usize,
     /// When set, the chainstate persists under this directory —
     /// re-running resumes from the stored snapshot instead of genesis.
     pub data_dir: Option<std::path::PathBuf>,
@@ -110,6 +120,8 @@ impl Default for SyncConfig {
             max_peers: 8,
             timeout: Duration::from_secs(120),
             proxy: None,
+            asmap_path: None,
+            cell_bytes: 0,
             data_dir: None,
             dbcache: None,
             cancel: None,
@@ -338,9 +350,32 @@ pub fn run(
     // sync. The value bounds post-crash replay depth, not correctness.
     let mut last_flush = resumed_height;
     let mut last_audit = resumed_height;
+    // SwiftSync transient window: holds the coins cache unflushed
+    // while `swift_hold` is set; released once the connected height
+    // reaches the header tip (IBD complete). Tracking continues —
+    // the aggregate stays live for emit/verify.
+    let mut swift_released = cs.swiftsync_agg().is_none();
     let mut audit_failures = 0usize;
     let mut mgr = PeerManager::new(cfg.max_peers);
     mgr.set_proxy(cfg.proxy);
+    mgr.set_cell_bytes(cfg.cell_bytes);
+    if let Some(path) = &cfg.asmap_path {
+        match avila_p2p::asmap::AsMap::load_file(path) {
+            Ok((map, skipped)) => {
+                println!(
+                    "ASMap loaded: {} prefixes{}",
+                    map.len(),
+                    if skipped > 0 {
+                        format!(" ({skipped} malformed lines skipped)")
+                    } else {
+                        String::new()
+                    }
+                );
+                mgr.set_asmap(map);
+            }
+            Err(e) => eprintln!("asmap: cannot read {}: {e} — bucketing off", path.display()),
+        }
+    }
     // The whole p2p time domain — dial-path ban checks, version
     // `timestamp`s, conntime/lastsend/lastrecv and the last_* peer
     // fields — reads the node clock, so `setmocktime` shifts them too.
@@ -383,7 +418,11 @@ pub fn run(
     }
     // `-connect` is exclusive in Core — naming peers suppresses DNS
     // seeding entirely (and `-connect=0` yields a fully offline node).
-    let seeded = if cfg.connect.is_empty() {
+    // Proxy mode also suppresses seeding: `resolve_seeds` is a LOCAL
+    // DNS lookup, which would leak the resolver to the operator's DNS
+    // even though every dial then rides the proxy — the same reason
+    // Core's `-onlynet=onion` never touches DNS seeds (queue #13).
+    let seeded = if cfg.connect.is_empty() && cfg.proxy.is_none() {
         mgr.seed_from_dns(params, unix_now())
     } else {
         0
@@ -519,7 +558,21 @@ pub fn run(
                 NetEvent::Connected { .. } => established_total += 1,
                 NetEvent::Disconnected { .. } => disconnects += 1,
                 NetEvent::EclipseSuspected(signals) => {
-                    eprintln!("eclipse indicators: {signals:?} — advisory only, cross-check routes");
+                    eprintln!(
+                        "eclipse indicators: {signals:?} — advisory only, cross-check routes"
+                    );
+                }
+                NetEvent::ReconDivergence {
+                    peer,
+                    rounds,
+                    their_misses,
+                    our_misses,
+                } => {
+                    eprintln!(
+                        "recon divergence: peer {peer} missed {their_misses} circulating txs \
+                         over {rounds} rounds (we missed {our_misses} from them) — \
+                         filtered view, advisory only"
+                    );
                 }
                 _ => {}
             }
@@ -532,7 +585,14 @@ pub fn run(
         // Periodic chainstate checkpoint — Core's `FlushStateToDisk`
         // cadence. A crash otherwise replays every blk file since the
         // last state.dat; bounding the interval bounds the replay.
-        if cfg.data_dir.is_some() && last_flush + FLUSH_INTERVAL <= connected {
+        // Skipped while the SwiftSync transient window is held — a
+        // mid-window flush would write the coins the scheme exists
+        // to skip (crash during the window replays it — the
+        // documented trade-off).
+        if cfg.data_dir.is_some()
+            && !cs.swiftsync_holding()
+            && last_flush + FLUSH_INTERVAL <= connected
+        {
             last_flush = connected;
             cs.flush().map_err(SyncError::Store)?;
         }
@@ -547,6 +607,31 @@ pub fn run(
             if bad > 0 {
                 eprintln!(
                     "self-audit: {bad} of 8 sampled blocks FAILED integrity checks                      ({audit_failures} cumulative) — storage may be corrupt"
+                );
+            }
+            // UTXO-replay audit (queue #15): a ~2-week window ending
+            // at the tip — every created coin is live-or-provably-
+            // spent and every undo-claimed dead coin is dead. The
+            // same rot class as the block audit, one layer deeper.
+            let from = connected.saturating_sub(2015).max(1);
+            if let Err(e) = cs.audit_utxo_segment(from, connected) {
+                audit_failures += 1;
+                eprintln!(
+                    "self-audit: UTXO segment {from}..{connected} FAILED ({e:?}) —                      coins state may be corrupt ({audit_failures} cumulative)"
+                );
+            }
+        }
+        // SwiftSync checkpoint: the transient window ends when the
+        // chain is fully connected — release the hold so normal
+        // budget pressure + flushing resume. The aggregate keeps
+        // tracking for emit/verify.
+        if !swift_released && connected >= cs.tree().tip().height {
+            swift_released = true;
+            cs.release_swiftsync_hold();
+            if let Some(agg) = cs.swiftsync_agg() {
+                eprintln!(
+                    "swiftsync: window closed at {connected} —                      aggregate {:x?} live, flushing resumes",
+                    &agg.to_bytes()[..8]
                 );
             }
         }

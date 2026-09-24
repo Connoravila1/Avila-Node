@@ -42,7 +42,7 @@
 //! A txid's value therefore predicts its byte position to within
 //! ~sqrt(N) groups, so [`ZeroScan`] answers lookups from the file with
 //! interpolation probes and no index build. Probe windows start at
-//! arbitrary offsets and find group boundaries with [`resync`]; those
+//! arbitrary offsets and find group boundaries with `resync`; those
 //! boundaries are statistical until a verification pass has run, so
 //! zero-scan answers belong to the optimistic window before the hash
 //! check completes.
@@ -172,7 +172,7 @@ impl ShaState {
         self.buf[56..].copy_from_slice(&bits.to_be_bytes());
         compress256(&mut self.h, &[self.buf]);
         let mut out = [0u8; 32];
-        for (c, w) in out.chunks_exact_mut(4).zip(self.h) {
+        for (c, w) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.h) {
             c.copy_from_slice(&w.to_be_bytes());
         }
         out
@@ -208,10 +208,11 @@ const O_DIRECT: Option<i32> = None;
 /// Opens `path` read-only, bypassing the page cache when `direct` and
 /// the filesystem allows it (tmpfs, for one, may refuse O_DIRECT).
 pub fn open_snapshot(path: &Path, direct: bool) -> io::Result<File> {
-    if direct && let Some(flag) = O_DIRECT {
-        if let Ok(f) = OpenOptions::new().read(true).custom_flags(flag).open(path) {
-            return Ok(f);
-        }
+    if direct
+        && let Some(flag) = O_DIRECT
+        && let Ok(f) = OpenOptions::new().read(true).custom_flags(flag).open(path)
+    {
+        return Ok(f);
     }
     File::open(path)
 }
@@ -701,7 +702,7 @@ fn uniform_codes(f: &File, base_height: u32) -> io::Result<bool> {
 }
 
 /// A resync candidate's first group. It may be a phantom — see
-/// [`resync`] — so only its end is used as a boundary.
+/// `resync` — so only its end is used as a boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Head {
     at: usize,
@@ -709,7 +710,7 @@ struct Head {
     len: usize,
 }
 
-/// What [`resync`] concluded about a window.
+/// What `resync` concluded about a window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sync {
     /// `at` is a group boundary: the end of `head`, or the known `end`
@@ -762,10 +763,10 @@ fn resync(
             }
             // Cheap first: the txid must fit the order before any coin
             // is parsed.
-            if let Some(t) = win.get(p..p + 32) {
-                if prev.is_some_and(|q| t <= &q[..]) || bounds.is_some_and(|(_, hi)| t >= &hi[..]) {
-                    continue 'cand;
-                }
+            if let Some(t) = win.get(p..p + 32)
+                && (prev.is_some_and(|q| t <= &q[..]) || bounds.is_some_and(|(_, hi)| t >= &hi[..]))
+            {
+                continue 'cand;
             }
             match group_shaped::<false, true>(&win[p..lim], base_height, &mut scratch, same_code) {
                 Ok(g) => {
@@ -879,7 +880,7 @@ fn read_window(f: &File, off: u64, len: usize) -> io::Result<(Vec<u8>, usize)> {
     Ok((v, at))
 }
 
-/// A group boundary at or after `at`, found by [`resync`] in a window
+/// A group boundary at or after `at`, found by `resync` in a window
 /// that grows until the earliest candidate is decided.
 fn boundary_near(
     f: &File,
@@ -1029,7 +1030,7 @@ fn check_end(
 /// Parses the whole file in `threads` contiguous regions at once.
 ///
 /// Phase 1 finds a candidate boundary near each nominal split with
-/// [`resync`] (one small read each); phase 2 parses every region from
+/// `resync` (one small read each); phase 2 parses every region from
 /// its candidate to the next one. A candidate counts only if the exact
 /// parse of the region before it ends on it; a region that fails that
 /// check is re-parsed from the proven end. By induction from the
@@ -1622,7 +1623,7 @@ const PROBE: usize = 32 << 10;
 
 /// Point lookups straight from the snapshot file — no index build.
 /// Txids are uniform, so a txid's value interpolates to its byte
-/// position; each probe reads [`PROBE`] bytes and narrows a bracket of
+/// position; each probe reads `PROBE` bytes and narrows a bracket of
 /// known group starts. An optional sample of boundaries (one read
 /// each, taken in parallel) shrinks the first probe's error.
 pub struct ZeroScan {

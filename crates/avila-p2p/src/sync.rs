@@ -589,10 +589,7 @@ impl PeerSync {
             // without a backlog the rest of a 100-inv announcement is
             // silently dropped and the chain stalls behind the tip.
             if want.len() >= free {
-                if is_block
-                    && self.pending_set.insert(hash)
-                    && !self.wanted.contains(&hash)
-                {
+                if is_block && self.pending_set.insert(hash) && !self.wanted.contains(&hash) {
                     self.pending_blocks.push_back(hash);
                 }
                 continue;
@@ -1367,13 +1364,17 @@ mod tests {
             })
             .collect();
         let req = sync.on_inv(&cs, None, &invs, 1024).expect("getdata");
-        let Message::GetData(want) = req else { panic!() };
+        let Message::GetData(want) = req else {
+            panic!()
+        };
         assert_eq!(want.len(), 16);
         assert_eq!(sync.pending_blocks.len(), 4);
         // Free a slot — the drain takes one more.
         sync.in_flight.pop_front();
         let req = sync.drain_pending(&cs, 1024).expect("drained getdata");
-        let Message::GetData(want) = req else { panic!() };
+        let Message::GetData(want) = req else {
+            panic!()
+        };
         assert_eq!(want.len(), 1);
         assert_eq!(want[0].hash, BlockHash::from_bytes([16; 32]));
         assert_eq!(sync.pending_blocks.len(), 3);

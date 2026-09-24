@@ -50,6 +50,7 @@ const RECON_FIRST_DELAY: Duration = Duration::from_secs(10);
 fn recon_pool(
     mempool: &avila_mempool::Mempool,
     salt: u64,
+    exclude: &std::collections::HashSet<avila_consensus::hash::Txid>,
 ) -> (
     Vec<u32>,
     std::collections::HashMap<u32, avila_consensus::hash::Txid>,
@@ -57,6 +58,12 @@ fn recon_pool(
     let mut ids = Vec::new();
     let mut map = std::collections::HashMap::new();
     for txid in mempool.txids() {
+        // Stem-pending txs stay out of the sketch until fluff — on a
+        // recon link the next scheduled round would leak them inside
+        // the stem delay and turn the hop decorative (queue #7).
+        if exclude.contains(&txid) {
+            continue;
+        }
         let id = crate::recon::short_id(salt, txid.as_bytes());
         ids.push(id);
         map.insert(id, txid);
@@ -154,12 +161,46 @@ pub enum NetEvent {
     TipAdvanced(u32),
     /// Eclipse indicators fired — advisory, not proof (queue #12).
     EclipseSuspected(Vec<EclipseSignal>),
+    /// A peer dominated dispatch CPU (>50% share, >200ms/s sustained)
+    /// and lost this tick's poll — backpressure throttling, not a
+    /// disconnect (queue #14).
+    /// With a proxy configured, outbound dials keep failing — the
+    /// private-mode route itself is down. Edge-triggered at 3
+    /// consecutive failures so one refused dial isn't noise.
+    ProxyUnreachable,
+    /// We attempted BIP324 but the peer only completed cleartext v1 —
+    /// a *forced downgrade* signal: a MITM can strip the v2 attempt
+    /// this way (BIP324 threat model). Telemetry, not a ban — v1
+    /// peers legitimately exist.
+    V2Downgraded {
+        /// The remote address that only completed v1.
+        addr: SocketAddr,
+    },
+    CpuThrottled {
+        /// The manager-assigned peer id.
+        peer: u64,
+        /// Its decayed dispatch rate this window, ns/s.
+        rate_ns: u64,
+    },
     /// A peer announced blocks we don't have (headers may need fetching).
     Announced {
         /// The peer id.
         peer: u64,
         /// Announced block hashes we lack.
         missing: Vec<BlockHash>,
+    },
+    /// A recon peer persistently misses the circulating tx set —
+    /// telemetry, not a verdict: heavy filtering and a slow-syncing
+    /// peer look alike from here (queue #19).
+    ReconDivergence {
+        /// The peer id.
+        peer: u64,
+        /// Completed reconciliation rounds at fire time.
+        rounds: u64,
+        /// Cumulative ids we held that their pool lacked.
+        their_misses: u64,
+        /// Cumulative ids they held that our pool lacked.
+        our_misses: u64,
     },
 }
 
@@ -222,6 +263,19 @@ struct PeerEntry<S> {
     cfilter_token_bucket: f64,
     /// Refill checkpoint for `cfilter_token_bucket`.
     cfilter_token_timestamp: Instant,
+    /// Cumulative nanoseconds spent inside `dispatch` on this peer's
+    /// events — the per-peer CPU accounting PEER_BUDGETS tracks.
+    cpu_ns: u64,
+    /// Dispatch nanos accrued in the current accounting window —
+    /// folded into `cpu_ewma_ns` once a second.
+    cpu_window_ns: u64,
+    /// Window start for `cpu_window_ns`.
+    cpu_window_start: Instant,
+    /// Exponentially-decayed per-second dispatch cost — the throttle
+    /// input: a peer saturating the poll loop's CPU budget loses its
+    /// next poll (socket backpressure slows it; no disconnect —
+    /// a sync leader legitimately dominates during IBD).
+    cpu_rate_ns: u64,
     /// `Peer::m_getaddr_recvd` — whether this peer has already been
     /// answered once; a later `getaddr` on the same connection is
     /// silently ignored.
@@ -245,6 +299,13 @@ struct PeerEntry<S> {
     /// signal worth surfacing (queue #19).
     pub recon_rounds: u64,
     pub recon_misses: u64,
+    /// Ids we held that the peer's pool lacked — the divergence half
+    /// of the diff. Persistently high = the peer isn't seeing the
+    /// circulating set.
+    pub recon_their_misses: u64,
+    /// The divergence alarm already fired for this connection — the
+    /// event is edge-triggered, not per-round.
+    recon_alarm_sent: bool,
     /// When the next initiated round may start.
     next_recon: Instant,
     /// An in-progress bisected close: our half-pools and the misses
@@ -286,6 +347,8 @@ struct ReconBisect {
     got_lo: bool,
     /// Misses accumulated across both halves.
     misses: Vec<u32>,
+    /// The peer's misses across both halves (the divergence signal).
+    their_misses: u64,
 }
 
 /// A read-only view of one connected peer — the manager's state is
@@ -355,10 +418,17 @@ pub struct PeerSnapshot {
     pub v2_session_id: Option<[u8; 32]>,
     /// BIP330 reconciliation negotiated on this link.
     pub recon: bool,
+    /// Cumulative ms spent dispatching this peer's messages.
+    pub cpu_ms: u64,
+    /// Decayed per-second dispatch cost, ms — the throttle input.
+    pub cpu_rate_ms: u64,
     /// Completed recon rounds on this link and the cumulative miss
     /// count — a persistently-wide diff is a censorship/eclipse signal.
     pub recon_rounds: u64,
     pub recon_misses: u64,
+    /// Cumulative ids we held that the peer's pool lacked — a
+    /// persistently-wide *their-side* diff is the filtering signal.
+    pub recon_their_misses: u64,
 }
 
 /// A bounded set of peers sharing one [`Chainstate`].
@@ -433,6 +503,11 @@ pub struct PeerManager<S> {
     /// When set, EVERY outbound connection routes through it; there
     /// is no clearnet fallback (fail-closed — queue #13).
     proxy: Option<SocketAddr>,
+    /// Consecutive failed dials under proxy mode — feeds the
+    /// `ProxyUnreachable` edge trigger; reset by any successful dial.
+    proxy_failures: u32,
+    /// Fixed-size send cells — 0 disables. See `set_cell_bytes`.
+    cell_bytes: usize,
     /// Last time the eclipse-signal check ran (paced to ~60s).
     eclipse_checked_at: Instant,
     /// Named event ring (queue #33): every NetEvent the tick produces
@@ -461,7 +536,9 @@ pub struct PeerManager<S> {
     /// Dials in flight — counted against outbound slots so a dead
     /// network can't queue unbounded workers, and deduplicated so the
     /// same address is never dialed twice at once.
-    pending_dials: std::collections::HashSet<SocketAddr>,
+    /// Outbound dials in flight, mapped to whether v2 was requested —
+    /// a landed v1 session after a v2 attempt is a forced downgrade.
+    pending_dials: std::collections::HashMap<SocketAddr, bool>,
     /// Nonces we've sent in our own `version` on outbound connections,
     /// live for as long as that connection is (Core's `CheckIncomingNonce`
     /// scans not-yet-`fSuccessfullyConnected` outbound `CNode`s instead;
@@ -546,11 +623,13 @@ impl<S: Read + Write> PeerManager<S> {
             event_ring: std::collections::VecDeque::with_capacity(1025),
             eclipse_checked_at: Instant::now(),
             proxy: None,
+            proxy_failures: 0,
+            cell_bytes: 0,
             bans: crate::banman::BanList::new(),
             banlist_path: None,
             dial_tx: dial_channel.0,
             dial_rx: dial_channel.1,
-            pending_dials: std::collections::HashSet::new(),
+            pending_dials: std::collections::HashMap::new(),
             outbound_nonces: std::collections::HashSet::new(),
             inbound_tx: inbound_channel.0,
             inbound_rx: inbound_channel.1,
@@ -681,8 +760,11 @@ impl<S: Read + Write> PeerManager<S> {
                     transport_protocol: peer.session.transport_protocol(),
                     v2_session_id: peer.session.v2_session_id(),
                     recon: peer.recon.is_some(),
+                    cpu_ms: peer.cpu_ns / 1_000_000,
+                    cpu_rate_ms: peer.cpu_rate_ns / 1_000_000,
                     recon_rounds: peer.recon_rounds,
                     recon_misses: peer.recon_misses,
+                    recon_their_misses: peer.recon_their_misses,
                 }
             })
             .collect();
@@ -804,6 +886,7 @@ impl<S: Read + Write> PeerManager<S> {
         let id = self.next_id;
         self.next_id += 1;
         session.set_clock(self.clock);
+        session.set_cell_bytes(self.cell_bytes);
         let now = Instant::now();
         // Self-connection detection (Core's `CheckIncomingNonce`):
         // remember the nonce on an outbound dial so a matching inbound
@@ -844,6 +927,10 @@ impl<S: Read + Write> PeerManager<S> {
                 addr_token_bucket: 1.0,
                 cfilter_token_bucket: CFILTER_TOKEN_BUCKET,
                 cfilter_token_timestamp: Instant::now(),
+                cpu_ns: 0,
+                cpu_window_ns: 0,
+                cpu_window_start: Instant::now(),
+                cpu_rate_ns: 0,
                 addr_token_timestamp: now,
                 getaddr_recvd: false,
                 recon: None,
@@ -851,6 +938,8 @@ impl<S: Read + Write> PeerManager<S> {
                 recon_map: std::collections::HashMap::new(),
                 recon_rounds: 0,
                 recon_misses: 0,
+                recon_their_misses: 0,
+                recon_alarm_sent: false,
                 next_recon: Instant::now(),
                 recon_bisect: None,
             },
@@ -874,6 +963,7 @@ impl<S: Read + Write> PeerManager<S> {
             headers_sync_deadline,
             mempool,
             outbound_nonces,
+            stem_pending,
             ..
         } = self;
         // Core's `m_num_preferred_download_peers - state.fPreferredDownload
@@ -882,6 +972,11 @@ impl<S: Read + Write> PeerManager<S> {
         // leadership to — never abandon our only source of headers just
         // because it's slow.
         let established_count = peers.values().filter(|p| p.session.established()).count();
+        let total_cpu_rate: u64 = peers.values().map(|p| p.cpu_rate_ns).sum();
+        // Stem-pending txids stay out of recon sketches this tick —
+        // a round would leak them inside the stem delay (queue #7).
+        let stem_exclude: std::collections::HashSet<_> =
+            stem_pending.iter().map(|(t, _, _)| *t).collect();
         let mut announce_tip: Option<u64> = None;
         // txid/wtxid to relay at end of tick, and the peer it came from.
         let mut announce_tx: Option<(
@@ -890,6 +985,18 @@ impl<S: Read + Write> PeerManager<S> {
             avila_consensus::hash::Wtxid,
         )> = None;
         for (&id, peer) in peers.iter_mut() {
+            // CPU throttle (PEER_BUDGETS): a peer burning >50% of
+            // total dispatch CPU at >200ms/s loses this tick's poll —
+            // socket backpressure slows it while others proceed. No
+            // disconnect: the sync leader legitimately dominates
+            // during IBD.
+            if peer.cpu_rate_ns > 200_000_000 && peer.cpu_rate_ns * 2 > total_cpu_rate {
+                events.push(NetEvent::CpuThrottled {
+                    peer: id,
+                    rate_ns: peer.cpu_rate_ns,
+                });
+                continue;
+            }
             if let Err(e) = peer.session.check_handshake_timeout() {
                 dead.push((id, DisconnectReason::Session(e.to_string())));
                 continue;
@@ -898,6 +1005,7 @@ impl<S: Read + Write> PeerManager<S> {
                 Ok(peer_events) => {
                     for event in peer_events {
                         peer.last_rx = Instant::now();
+                        let t0 = Instant::now();
                         Self::dispatch(
                             id,
                             peer,
@@ -915,10 +1023,26 @@ impl<S: Read + Write> PeerManager<S> {
                             &mut dead,
                             serve_filters,
                             outbound_nonces,
+                            &stem_exclude,
                         );
+                        // Per-peer CPU accounting (PEER_BUDGETS):
+                        // time inside dispatch lands on this peer's
+                        // cumulative + window counters.
+                        let spent = t0.elapsed().as_nanos() as u64;
+                        peer.cpu_ns += spent;
+                        peer.cpu_window_ns += spent;
                     }
                 }
                 Err(e) => dead.push((id, DisconnectReason::Session(e.to_string()))),
+            }
+            // Fold the window into the decayed per-second rate; a
+            // peer dominating dispatch CPU is skipped for a poll —
+            // socket backpressure throttles it, no disconnect (the
+            // sync leader legitimately dominates during IBD).
+            if peer.cpu_window_start.elapsed() >= Duration::from_secs(1) {
+                peer.cpu_rate_ns = peer.cpu_rate_ns / 2 + peer.cpu_window_ns;
+                peer.cpu_window_ns = 0;
+                peer.cpu_window_start = Instant::now();
             }
             // Periodic liveness ping.
             if peer.session.established() && peer.last_ping.elapsed() > PING_INTERVAL {
@@ -1043,8 +1167,7 @@ impl<S: Read + Write> PeerManager<S> {
             let mut groups: HashMap<[u8; 2], usize> = HashMap::new();
             for p in &outbound {
                 if let Some(r) = p.remote {
-                    groups.entry([r.ip[0], r.ip[1]]).or_default();
-                    *groups.get_mut(&[r.ip[0], r.ip[1]]).unwrap() += 1;
+                    *groups.entry([r.ip[0], r.ip[1]]).or_default() += 1;
                 }
             }
             if groups.len() == 1 {
@@ -1084,7 +1207,10 @@ impl<S: Read + Write> PeerManager<S> {
             .peers
             .iter()
             .filter(|(_, p)| {
-                !p.inbound && p.session.established() && p.session.peer().is_some_and(|i| i.relay)
+                !p.inbound
+                    && p.recon.is_none()
+                    && p.session.established()
+                    && p.session.peer().is_some_and(|i| i.relay)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -1150,6 +1276,17 @@ impl<S: Read + Write> PeerManager<S> {
         self.proxy = proxy;
     }
 
+    /// Fixed-size send cells (queue #17): pads every v2 session's
+    /// outgoing queue to a cell multiple with decoy packets so wire
+    /// write-sizes carry no message-length histogram. 0 disables;
+    /// applies to live sessions and every session `add`ed later.
+    pub fn set_cell_bytes(&mut self, bytes: usize) {
+        self.cell_bytes = bytes;
+        for peer in self.peers.values_mut() {
+            peer.session.set_cell_bytes(bytes);
+        }
+    }
+
     /// Loads an AS bucketing map — Erebus mitigation: outbound dialing
     /// deprioritizes ASNs already holding ≥2 slots.
     pub fn set_asmap(&mut self, map: crate::asmap::AsMap) {
@@ -1211,7 +1348,9 @@ impl<S: Read + Write> PeerManager<S> {
             }
             peer.next_recon = now + RECON_INTERVAL;
             let salt = link.our_salt ^ link.their_salt;
-            let (our_ids, our_map) = recon_pool(&self.mempool, salt);
+            let pending: std::collections::HashSet<_> =
+                self.stem_pending.iter().map(|(t, _, _)| *t).collect();
+            let (our_ids, our_map) = recon_pool(&self.mempool, salt, &pending);
             let capacity = (our_ids.len() / 64).clamp(8, 512);
             let (round, req) = crate::recon::ReconRound::open(&our_ids, capacity);
             peer.recon_round = Some(round);
@@ -1472,6 +1611,28 @@ impl<S: Read + Write> PeerManager<S> {
 
     /// One peer's event → replies and chainstate effects.
     #[allow(clippy::too_many_arguments)]
+    /// Queue #19's divergence alarm — edge-triggered: after enough
+    /// rounds, a peer missing much of the circulating set while never
+    /// feeding us much back is seeing a filtered view. Fires once per
+    /// connection; the counters themselves stay live for `getpeerinfo`.
+    fn recon_alarm_check(peer: &mut PeerEntry<S>, id: u64, events: &mut Vec<NetEvent>) {
+        if peer.recon_alarm_sent
+            || peer.recon_rounds < 10
+            || peer.recon_their_misses < 100
+            || peer.recon_their_misses < peer.recon_misses.saturating_mul(4)
+        {
+            return;
+        }
+        peer.recon_alarm_sent = true;
+        events.push(NetEvent::ReconDivergence {
+            peer: id,
+            rounds: peer.recon_rounds,
+            their_misses: peer.recon_their_misses,
+            our_misses: peer.recon_misses,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn dispatch(
         id: u64,
         peer: &mut PeerEntry<S>,
@@ -1493,6 +1654,7 @@ impl<S: Read + Write> PeerManager<S> {
         dead: &mut Vec<(u64, DisconnectReason)>,
         serve_filters: bool,
         outbound_nonces: &std::collections::HashSet<u64>,
+        stem_exclude: &std::collections::HashSet<avila_consensus::hash::Txid>,
     ) {
         match event {
             SessionEvent::Established => {
@@ -1747,7 +1909,7 @@ impl<S: Read + Write> PeerManager<S> {
                     return;
                 };
                 let salt = link.our_salt ^ link.their_salt;
-                let (our_ids, our_map) = recon_pool(mempool, salt);
+                let (our_ids, our_map) = recon_pool(mempool, salt, stem_exclude);
                 peer.recon_map = our_map;
                 if let Some((reply, outcome)) =
                     crate::recon::ReconRound::respond(&their_sketch, &our_ids)
@@ -1786,9 +1948,10 @@ impl<S: Read + Write> PeerManager<S> {
                         (&bs.hi, false)
                     };
                     if let Some(round) = peer.recon_round.as_ref()
-                        && let Some(misses) = round.close_bisected(&reply_sk, half)
+                        && let Some((misses, their_misses)) = round.close_bisected(&reply_sk, half)
                     {
                         bs.misses.extend(misses);
+                        bs.their_misses += their_misses.len() as u64;
                     }
                     if is_lo {
                         bs.got_lo = true;
@@ -1798,6 +1961,8 @@ impl<S: Read + Write> PeerManager<S> {
                         peer.recon_round = None;
                         peer.recon_rounds += 1;
                         peer.recon_misses += bs.misses.len() as u64;
+                        peer.recon_their_misses += bs.their_misses;
+                        Self::recon_alarm_check(peer, id, events);
                         if !bs.misses.is_empty() {
                             let _ = peer.session.send(&Message::ReconcilDiff {
                                 ask_parents: 0,
@@ -1807,19 +1972,20 @@ impl<S: Read + Write> PeerManager<S> {
                     }
                     return;
                 }
-                let (our_ids, _) = recon_pool(mempool, salt);
-                match peer.recon_round.take() {
-                    Some(round) => match round.close(&reply_sk, &our_ids) {
-                        Some(misses) if !misses.is_empty() => {
+                let (our_ids, _) = recon_pool(mempool, salt, stem_exclude);
+                if let Some(round) = peer.recon_round.take() {
+                    match round.close(&reply_sk, &our_ids) {
+                        Some((misses, their_misses)) => {
                             peer.recon_rounds += 1;
                             peer.recon_misses += misses.len() as u64;
-                            let _ = peer.session.send(&Message::ReconcilDiff {
-                                ask_parents: 0,
-                                short_ids: misses,
-                            });
-                        }
-                        Some(_) => {
-                            peer.recon_rounds += 1;
+                            peer.recon_their_misses += their_misses.len() as u64;
+                            Self::recon_alarm_check(peer, id, events);
+                            if !misses.is_empty() {
+                                let _ = peer.session.send(&Message::ReconcilDiff {
+                                    ask_parents: 0,
+                                    short_ids: misses,
+                                });
+                            }
                         }
                         // Over-capacity merge — ask the responder to
                         // bisect its pool; replies come back as two
@@ -1831,12 +1997,12 @@ impl<S: Read + Write> PeerManager<S> {
                                 hi,
                                 got_lo: false,
                                 misses: Vec::new(),
+                                their_misses: 0,
                             });
                             peer.recon_round = Some(round);
                             let _ = peer.session.send(&Message::ReqBisec);
                         }
-                    },
-                    None => {}
+                    }
                 }
             }
             SessionEvent::Message(Message::ReconcilDiff { short_ids, .. }) => {
@@ -1860,7 +2026,7 @@ impl<S: Read + Write> PeerManager<S> {
                     return;
                 };
                 let salt = link.our_salt ^ link.their_salt;
-                let (our_ids, _) = recon_pool(mempool, salt);
+                let (our_ids, _) = recon_pool(mempool, salt, stem_exclude);
                 let capacity = (our_ids.len() / 64).clamp(8, 512);
                 let (lo, hi) = crate::recon::bisect_reply(&our_ids, 31, capacity);
                 let _ = peer.session.send(&lo);
@@ -2429,8 +2595,33 @@ impl PeerManager<TcpStream> {
         // landed mid-dial still applies — Core rechecks IsBanned after
         // connect for the same reason.
         while let Ok((addr, result)) = self.dial_rx.try_recv() {
-            self.pending_dials.remove(&addr);
-            let Ok(session) = result else { continue };
+            let want_v2 = self.pending_dials.remove(&addr).unwrap_or(false);
+            let Ok(session) = result else {
+                // Proxy health (privacy matrix): a failed dial under
+                // proxy mode means the private route itself is down —
+                // surface it once after a sustained streak instead of
+                // leaving zero-peers unexplained.
+                if self.proxy.is_some() {
+                    self.proxy_failures += 1;
+                    if self.proxy_failures == 3 {
+                        if self.event_ring.len() >= 1024 {
+                            self.event_ring.pop_front();
+                        }
+                        self.event_ring.push_back(NetEvent::ProxyUnreachable);
+                    }
+                }
+                continue;
+            };
+            self.proxy_failures = 0;
+            // Forced-downgrade telemetry: v2 was requested but the
+            // session landed cleartext v1 — exactly what a transport-
+            // stripping MITM produces. Advisory, not a ban.
+            if want_v2 && session.transport_protocol() == "v1" {
+                if self.event_ring.len() >= 1024 {
+                    self.event_ring.pop_front();
+                }
+                self.event_ring.push_back(NetEvent::V2Downgraded { addr });
+            }
             let remote = addrman::net_addr_of(addr, 0);
             // A ban or a full peer set that landed mid-dial still
             // applies — Core rechecks IsBanned after connect.
@@ -2465,7 +2656,7 @@ impl PeerManager<TcpStream> {
                 // Don't stamp the backoff either, so a drop redials fast.
                 if socks
                     .iter()
-                    .any(|s| self.connected_to(*s) || self.pending_dials.contains(s))
+                    .any(|s| self.connected_to(*s) || self.pending_dials.contains_key(s))
                 {
                     continue;
                 }
@@ -2533,7 +2724,7 @@ impl PeerManager<TcpStream> {
             // `AlreadyConnectedTo`/`FindNode` check; the book may
             // still carry peers we established sessions with.
             let sock = addrman::socket_addr(&candidate);
-            if self.connected_to(sock) || self.pending_dials.contains(&sock) {
+            if self.connected_to(sock) || self.pending_dials.contains_key(&sock) {
                 continue;
             }
             // Automatic outbounds use the `-v2transport` setting —
@@ -2561,7 +2752,7 @@ impl PeerManager<TcpStream> {
         start_height: i32,
         dialed: &mut Vec<SocketAddr>,
     ) {
-        if !self.pending_dials.insert(addr) {
+        if self.pending_dials.insert(addr, use_v2).is_some() {
             return; // already in flight
         }
         dialed.push(addr);
@@ -2604,11 +2795,8 @@ fn dial_via(
     version: Version,
     want_v2: bool,
 ) -> DialOutcome {
-    let stream = crate::proxy::socks5_connect(
-        &proxy,
-        &crate::proxy::SocksTarget::Ip(addr),
-        DIAL_TIMEOUT,
-    )?;
+    let stream =
+        crate::proxy::socks5_connect(&proxy, &crate::proxy::SocksTarget::Ip(addr), DIAL_TIMEOUT)?;
     stream.set_nodelay(true)?;
     if want_v2 {
         stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
@@ -3088,7 +3276,7 @@ mod tests {
             mgr.tick(&mut cs, NOW);
         }
         // Both back-due — each opens its own round.
-        for (_, peer) in mgr.peers.iter_mut() {
+        for peer in mgr.peers.values_mut() {
             peer.next_recon = Instant::now() - Duration::from_secs(1);
         }
         mgr.tick(&mut cs, NOW);
@@ -4333,6 +4521,46 @@ mod tests {
         assert_eq!(mgr.len(), 0, "no peer may land through a dead proxy");
     }
 
+    /// Retry cell (privacy matrix): after a dead-proxy dial fails,
+    /// the NEXT maintain round must retry THROUGH the proxy again —
+    /// every attempt arrives at the SOCKS5 endpoint, never clearnet.
+    #[test]
+    fn proxy_retries_also_ride_the_proxy() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_saw = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let saw = proxy_saw.clone();
+        std::thread::spawn(move || {
+            while let Ok((mut s, _)) = proxy_listener.accept() {
+                saw.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 8];
+                let _ = s.read(&mut buf);
+            }
+        });
+        let mut mgr = PeerManager::new(4);
+        mgr.set_proxy(Some(proxy_addr));
+        let candidate: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+        mgr.addrbook().add_many(
+            std::iter::once((crate::addrman::net_addr_of(candidate, 0), NOW)),
+            NOW,
+        );
+        let mut cs = regtest();
+        // Two maintain rounds = a retry after the first failure.
+        for _ in 0..2 {
+            let _ = mgr.maintain_outbounds(MAGIC, 0);
+            std::thread::sleep(Duration::from_millis(300));
+            mgr.tick(&mut cs, NOW);
+        }
+        assert!(
+            proxy_saw.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the retry must also arrive at the proxy — {} attempt(s) seen",
+            proxy_saw.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(mgr.len(), 0);
+    }
+
     /// Self-eclipse field test (queue #22): the lab attack — every
     /// outbound slot held by a coordinated attacker, all in one /16,
     /// all claiming a higher chain, our tip stale. The detector must
@@ -4353,10 +4581,8 @@ mod tests {
                 BUDGET,
             )
             .expect("session");
-            let remote = crate::addrman::net_addr_of(
-                format!("203.0.113.{i}:8333").parse().unwrap(),
-                0,
-            );
+            let remote =
+                crate::addrman::net_addr_of(format!("203.0.113.{i}:8333").parse().unwrap(), 0);
             let id = mgr.add_outbound_to(session, remote).expect("slot");
             ends.push((peer_end, id));
         }
@@ -4511,5 +4737,188 @@ mod tests {
         let msgs_b = testpipe::drain(&mut b, MAGIC);
         assert!(inv(&msgs_a) + inv(&msgs_b) >= 1, "fluff announce went out");
         assert!(mgr.stem_pending.is_empty());
+    }
+
+    /// Queue #19: the divergence alarm fires once, only past every
+    /// threshold — rounds, absolute their-side misses, and dominance
+    /// over our-side misses.
+    #[test]
+    fn recon_divergence_alarm_is_edge_triggered() {
+        let (mut mgr, _peer_end, id) = managed_peer();
+        let mut events = Vec::new();
+        {
+            let peer = mgr.peers.get_mut(&id).unwrap();
+            // Just short of the round count — wide diff alone is silent.
+            peer.recon_rounds = 9;
+            peer.recon_their_misses = 999;
+            PeerManager::<End>::recon_alarm_check(peer, id, &mut events);
+            assert!(events.is_empty());
+            // A balanced diff isn't censorship either — their misses
+            // must dominate ours 4:1.
+            peer.recon_rounds = 10;
+            peer.recon_their_misses = 120;
+            peer.recon_misses = 40;
+            PeerManager::<End>::recon_alarm_check(peer, id, &mut events);
+            assert!(events.is_empty());
+            // Every threshold crossed — fires once.
+            peer.recon_their_misses = 400;
+            peer.recon_misses = 50;
+            PeerManager::<End>::recon_alarm_check(peer, id, &mut events);
+        }
+        assert!(
+            matches!(
+                events[0],
+                NetEvent::ReconDivergence {
+                    peer: p,
+                    rounds: 10,
+                    their_misses: 400,
+                    our_misses: 50,
+                } if p == id
+            ),
+            "{events:?}"
+        );
+        {
+            let peer = mgr.peers.get_mut(&id).unwrap();
+            peer.recon_their_misses = 10_000;
+            PeerManager::<End>::recon_alarm_check(peer, id, &mut events);
+        }
+        assert_eq!(events.len(), 1, "edge-triggered — no refire");
+    }
+
+    /// PEER_BUDGETS CPU accounting (queue #14): a peer burning >50%
+    /// of total dispatch CPU at >200ms/s loses its poll — the
+    /// `CpuThrottled` event fires and its buffered input waits,
+    /// while a quiet peer is still served.
+    #[test]
+    fn cpu_throttle_skips_dominant_peer_only() {
+        let (mut mgr, mut a, ida) = managed_peer();
+        let mut cs = crate::testchain::regtest();
+        handshake(&mut mgr, &mut a, &mut cs);
+        testpipe::drain(&mut a, MAGIC);
+        let (mut b, _idb) = add_peer(&mut mgr);
+        handshake_peer(&mut mgr, &mut b, &mut cs);
+        testpipe::drain(&mut b, MAGIC);
+
+        // Peer A dominated last window: 500ms/s, >50% of the total.
+        mgr.peers.get_mut(&ida).unwrap().cpu_rate_ns = 500_000_000;
+
+        // A pings us — the throttled peer's poll is skipped, so the
+        // ping sits unread and no pong comes back.
+        testpipe::inject(&mut a, MAGIC, &Message::Ping(7));
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                NetEvent::CpuThrottled { peer, .. } if *peer == ida
+            )),
+            "dominant peer must fire CpuThrottled: {events:?}"
+        );
+        let sent_a = testpipe::drain(&mut a, MAGIC);
+        assert!(
+            !sent_a.iter().any(|m| matches!(m, Message::Pong(7))),
+            "throttled peer must not be served: {sent_a:?}"
+        );
+
+        // Peer B stayed quiet — its ping is answered normally.
+        testpipe::inject(&mut b, MAGIC, &Message::Ping(9));
+        mgr.tick(&mut cs, NOW);
+        let sent_b = testpipe::drain(&mut b, MAGIC);
+        assert!(
+            sent_b.iter().any(|m| matches!(m, Message::Pong(9))),
+            "quiet peer must still be served: {sent_b:?}"
+        );
+    }
+
+    /// Stem on recon links (queue #7): a locally-originated tx in its
+    /// stem delay must not leak through the recon sketch — a round
+    /// inside the delay would defeat the hop. And a recon peer is
+    /// never inv'd (BIP-330 carries it).
+    #[test]
+    fn stem_pending_stays_out_of_recon_sketch() {
+        use avila_consensus::transaction::{OutPoint, Script, TxIn, TxOut, Witness};
+        use avila_consensus::{script, transaction::Transaction};
+
+        let (mut mgr, mut a, ida) = managed_peer();
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 101);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        // Peer A: plain relay link. Peer B: negotiates recon.
+        handshake(&mut mgr, &mut a, &mut cs);
+        testpipe::drain(&mut a, MAGIC);
+        let (mut b, idb) = add_peer(&mut mgr);
+        mgr.tick(&mut cs, NOW);
+        let _ = testpipe::drain(&mut b, MAGIC);
+        testpipe::inject(&mut b, MAGIC, &Message::Version(peer_version(600)));
+        testpipe::inject(
+            &mut b,
+            MAGIC,
+            &Message::SendRecon(crate::message::SendRecon {
+                is_sender: true,
+                is_responder: true,
+                version: crate::recon::RECON_VERSION,
+                salt: 0x66,
+            }),
+        );
+        mgr.tick(&mut cs, NOW);
+        testpipe::inject(&mut b, MAGIC, &Message::Verack);
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut b, MAGIC);
+        assert!(
+            mgr.peers.get(&idb).is_some_and(|p| p.recon.is_some()),
+            "peer B must be a recon link"
+        );
+
+        // Locally-originated tx in the pool → stem announce.
+        let op = OutPoint {
+            txid: blocks[0].transactions[0].txid(),
+            vout: 0,
+        };
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: op,
+                script_sig: Script::new(vec![]),
+                sequence: 0xffff_ffff,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 4_999_000_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let txid = tx.txid();
+        let wtxid = tx.wtxid();
+        mgr.mempool().set_require_standard(false);
+        mgr.mempool().accept_tx(tx, &cs, NOW).unwrap();
+        mgr.stem_announce(txid, wtxid);
+        mgr.tick(&mut cs, NOW); // flush send_bufs
+
+        // The stem inv can land only on the non-recon link A — never B.
+        let sent_b = testpipe::drain(&mut b, MAGIC);
+        assert!(
+            !sent_b.iter().any(|m| matches!(m, Message::Inv(_))),
+            "recon link must never get a stem inv: {sent_b:?}"
+        );
+
+        // While stem-pending, the tx is absent from the sketch ids.
+        let salt = 0xAAu64 ^ 0x66u64; // our_salt ^ their_salt (test salts)
+        let pending: std::collections::HashSet<_> =
+            mgr.stem_pending.iter().map(|(t, _, _)| *t).collect();
+        assert!(pending.contains(&txid), "tx must be stem-pending");
+        let (ids, _) = recon_pool(mgr.mempool_ref(), salt, &pending);
+        let short = crate::recon::short_id(salt, txid.as_bytes());
+        assert!(
+            !ids.contains(&short),
+            "pending tx must stay out of the sketch"
+        );
+
+        // After fluff, it's back in the sketch set.
+        let empty: std::collections::HashSet<_> = Default::default();
+        let (ids, _) = recon_pool(mgr.mempool_ref(), salt, &empty);
+        assert!(ids.contains(&short), "fluffed tx must reconcile");
+        let _ = ida;
     }
 }

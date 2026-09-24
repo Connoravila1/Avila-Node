@@ -38,7 +38,7 @@ use crate::block::Block;
 use crate::chain::{ChainError, HeaderTree, InsertStatus};
 use crate::check::{self, BlockContext, BlockRuleError, ContextualBlockError, RuleError};
 use crate::coinstats::{self, CoinStats, CoinStatsHashType};
-use crate::connect::{self, BlockUndo, Coin, ConnectContext, ConnectError, UtxoSet};
+use crate::connect::{self, BlockReceipt, BlockUndo, Coin, ConnectContext, ConnectError, UtxoSet};
 use crate::hash::{BlockHash, Txid};
 use crate::header::BlockHeader;
 use crate::params::Params;
@@ -179,6 +179,15 @@ pub enum AuditFailure {
     WitnessMismatch,
     /// Stored header isn't in the tree.
     NoNode,
+    /// An undo record claims a coin was spent, yet it's live — the
+    /// spend never landed or the set drifted (queue #15).
+    SpentCoinLive,
+    /// A live coin's value/script disagrees with the block output
+    /// that created it (queue #15).
+    CoinMismatch,
+    /// A created coin is neither live nor provably spent by a later
+    /// block's undo — a reorg could not restore it (queue #15).
+    UndoMissing,
 }
 
 /// re-downloading *or* re-validating.
@@ -260,6 +269,11 @@ pub struct Chainstate {
     /// [`Self::drain_scripts`] before flushes, snapshots, reorgs.
     pending_scripts:
         std::collections::VecDeque<(BlockHash, u32, std::sync::Arc<connect::BlockCheck>)>,
+    /// Per-block verification receipts, oldest → newest (queue #5).
+    /// A journal of connect *events*, not a view of the active chain:
+    /// a height can appear twice when a reorg replaced it — both
+    /// receipts are true events. Bounded by [`Self::RECEIPT_CAP`].
+    receipts: std::collections::VecDeque<BlockReceipt>,
 }
 
 /// The background validation replay beneath an active snapshot — a
@@ -895,7 +909,38 @@ impl Chainstate {
             disconnected: Vec::new(),
             script_pool: None,
             pending_scripts: std::collections::VecDeque::new(),
+            receipts: std::collections::VecDeque::new(),
         }
+    }
+
+    /// Receipts retained — one difficulty period, matching the window
+    /// an operator is most likely to interrogate.
+    const RECEIPT_CAP: usize = 2016;
+
+    /// Appends a connect receipt, evicting the oldest at capacity.
+    fn note_receipt(&mut self, receipt: BlockReceipt) {
+        if self.receipts.len() >= Self::RECEIPT_CAP {
+            self.receipts.pop_front();
+        }
+        self.receipts.push_back(receipt);
+    }
+
+    /// The most recent `n` per-block verification receipts, newest
+    /// first (queue #5). The ring is a journal of connect events:
+    /// under a script pool a receipt's `script_checks` count may still
+    /// be in flight (it reports how many were queued), and a reorg can
+    /// leave two receipts at one height — both are true events.
+    #[must_use]
+    pub fn recent_receipts(&self, n: usize) -> Vec<BlockReceipt> {
+        self.receipts.iter().rev().take(n).cloned().collect()
+    }
+
+    /// The most recent connect receipt recorded at `height`, if still
+    /// in the ring — after a reorg this is the winning branch's
+    /// receipt; the evicted branch's stays visible until capacity.
+    #[must_use]
+    pub fn receipt_at(&self, height: u32) -> Option<&BlockReceipt> {
+        self.receipts.iter().rev().find(|r| r.height == height)
     }
 
     /// Turns on speculative connect: script checks run on a persistent
@@ -1173,7 +1218,8 @@ impl Chainstate {
         &self,
         meta: &crate::utxo_snapshot::SnapshotMetadata,
         mempool_nonempty: bool,
-    ) -> Result<(BlockHash, u32, crate::params::AssumeutxoData), crate::utxo_snapshot::SnapshotError> {
+    ) -> Result<(BlockHash, u32, crate::params::AssumeutxoData), crate::utxo_snapshot::SnapshotError>
+    {
         use crate::utxo_snapshot::SnapshotError;
         let params = *self.tree.params();
         let base = meta.base_blockhash;
@@ -1325,8 +1371,7 @@ impl Chainstate {
         mempool_nonempty: bool,
     ) -> Result<u32, crate::utxo_snapshot::SnapshotError> {
         use crate::utxo_snapshot::SnapshotError;
-        let (base, base_height, au) =
-            self.check_snapshot_activation(meta, mempool_nonempty)?;
+        let (base, base_height, au) = self.check_snapshot_activation(meta, mempool_nonempty)?;
 
         // Single sequential pass — `index_with` builds the sparse
         // group index AND streams every decoded coin to the
@@ -1377,9 +1422,12 @@ impl Chainstate {
         // Persist where the overlay file lives — `restore` re-attaches
         // it by sidecar path so a restart never re-imports.
         if let Some(store) = &self.store {
-            let canon = std::path::absolute(path.as_ref())
-                .unwrap_or_else(|_| path.as_ref().to_path_buf());
-            if let Err(e) = std::fs::write(store.dir().join("snapshot.path"), canon.to_string_lossy().as_bytes()) {
+            let canon =
+                std::path::absolute(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
+            if let Err(e) = std::fs::write(
+                store.dir().join("snapshot.path"),
+                canon.to_string_lossy().as_bytes(),
+            ) {
                 return Err(SnapshotError(format!("snapshot path record: {e}")));
             }
         }
@@ -1399,8 +1447,7 @@ impl Chainstate {
         mempool_nonempty: bool,
     ) -> Result<u32, crate::utxo_snapshot::SnapshotError> {
         use crate::utxo_snapshot::SnapshotError;
-        let (base, base_height, _au) =
-            self.check_snapshot_activation(meta, mempool_nonempty)?;
+        let (base, base_height, _au) = self.check_snapshot_activation(meta, mempool_nonempty)?;
         let au_by_height = _au;
 
         let mut loaded = UtxoSet::new();
@@ -1737,11 +1784,9 @@ impl Chainstate {
         if snapshot_base.is_some() {
             let sidecar = store_dir.join("snapshot.path");
             if let Ok(path) = std::fs::read_to_string(&sidecar) {
-                let run = crate::sortedrun::SnapshotRun::index(
-                    std::path::Path::new(path.trim()),
-                    65_536,
-                )
-                .map_err(|e| corrupt(&format!("snapshot file re-attach: {e}")))?;
+                let run =
+                    crate::sortedrun::SnapshotRun::index(std::path::Path::new(path.trim()), 65_536)
+                        .map_err(|e| corrupt(&format!("snapshot file re-attach: {e}")))?;
                 self.utxo.attach_snapshot(run);
             }
         }
@@ -1812,6 +1857,93 @@ impl Chainstate {
                 .ok_or(AuditFailure::WitnessMismatch)?;
             if block.expected_witness_commitment() != Some(committed) {
                 return Err(AuditFailure::WitnessMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    /// UTXO-replay audit (queue #15) over the connected segment
+    /// `from..=to` (`to` clamped to the tip): the reorg-safety
+    /// invariant checked against the live set — every coin an undo
+    /// record claims was spent is actually dead, every live coin the
+    /// segment created matches the block's output data, and when the
+    /// segment reaches the tip, every non-live created coin is
+    /// provably spent (present in some undo). A failed check is
+    /// storage rot a reorg would turn into state corruption — the
+    /// block-integrity audit can't see it.
+    ///
+    /// Segments ending below the tip can't prove the created-nonlive
+    /// half (a later block may legitimately spend the coin) — that
+    /// half only asserts when `to == tip`.
+    pub fn audit_utxo_segment(&self, from: u32, to: u32) -> Result<(), AuditFailure> {
+        let tip = self.chain.len() as u32 - 1;
+        if from == 0 || from > to {
+            return Err(AuditFailure::NoNode);
+        }
+        let to = to.min(tip);
+        // Outpoints provably spent inside the segment — undo `spent`
+        // entries pair with the block's inputs by position.
+        let mut spent: HashSet<crate::transaction::OutPoint> = HashSet::new();
+        for h in from..=to {
+            let hash = &self.chain[h as usize];
+            let Some(block) = self.body(hash) else {
+                continue;
+            };
+            let Some(undo) = self.undo(h) else {
+                continue;
+            };
+            for (tx, tu) in block.transactions.iter().zip(&undo.txs) {
+                for (input, coin) in tx.inputs.iter().zip(&tu.spent) {
+                    let _ = coin;
+                    spent.insert(input.previous_output);
+                    // Spend-consistency: nothing an undo claims dead
+                    // may be live on the active chain.
+                    if self.utxo.get(&input.previous_output).is_some() {
+                        return Err(AuditFailure::SpentCoinLive);
+                    }
+                }
+                for (op, _) in &tu.overwritten {
+                    spent.insert(*op);
+                }
+            }
+        }
+        // Created-coin integrity: live coins must match the block's
+        // output; non-live ones must be provably spent — but only
+        // when the segment reaches the tip (later spends are
+        // otherwise unverifiable from this window).
+        for h in from..=to {
+            let hash = &self.chain[h as usize];
+            let Some(block) = self.body(hash) else {
+                continue;
+            };
+            for tx in &block.transactions {
+                let txid = tx.txid();
+                for (vout, out) in tx.outputs.iter().enumerate() {
+                    let op = crate::transaction::OutPoint {
+                        txid,
+                        vout: vout as u32,
+                    };
+                    match self.utxo.get(&op) {
+                        Some(coin) => {
+                            if coin.out.value != out.value
+                                || coin.out.script_pubkey.as_bytes() != out.script_pubkey.as_bytes()
+                            {
+                                return Err(AuditFailure::CoinMismatch);
+                            }
+                        }
+                        None => {
+                            // Provably-unspendable outputs never enter
+                            // the set (they're spendable in the block
+                            // but skipped at `put`) — not a spend.
+                            if !out.script_pubkey.is_unspendable()
+                                && !spent.contains(&op)
+                                && to == tip
+                            {
+                                return Err(AuditFailure::UndoMissing);
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -1999,8 +2131,55 @@ impl Chainstate {
         let backend = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open(dir)?);
         self.utxo.attach_shared(backend.clone());
         self.utxo.set_budget(cache_bytes);
+        // `AVILA_SWIFTSYNC=1` — transient-IBD mode: tag aggregate
+        // tracks every mutation and the window never flushes (the
+        // measured 67% write elision; RAM cost ~682MiB at signet
+        // scale — see `crate::swiftsync`).
+        if std::env::var("AVILA_SWIFTSYNC").as_deref() == Ok("1") {
+            self.utxo.enable_swiftsync();
+        }
         self.coins_backend = Some(backend);
         Ok(())
+    }
+
+    /// Turns on SwiftSync tracking on the coins view — see
+    /// [`UtxoSet::enable_swiftsync`].
+    pub fn enable_swiftsync(&mut self) {
+        self.utxo.enable_swiftsync();
+    }
+
+    /// Ends the transient window — normal flushing resumes; the
+    /// aggregate keeps tracking.
+    pub fn release_swiftsync_hold(&mut self) {
+        self.utxo.release_swiftsync_hold();
+    }
+
+    /// `true` while the SwiftSync transient window is held open —
+    /// periodic flushes must defer or the elision is defeated.
+    /// Explicit flushes (shutdown, checkpoint) still write.
+    #[must_use]
+    pub fn swiftsync_holding(&self) -> bool {
+        self.utxo.swiftsync_holding()
+    }
+
+    /// The running coin-tag aggregate, `None` when tracking is off.
+    #[must_use]
+    pub fn swiftsync_agg(&self) -> Option<crate::swiftsync::TagAgg> {
+        self.utxo.swiftsync_agg()
+    }
+
+    /// Emits the producer-side hints artifact for the set at
+    /// `height` — see [`UtxoSet::emit_hints`].
+    #[must_use]
+    pub fn emit_hints(&self, height: u32) -> crate::swiftsync::Hints {
+        self.utxo.emit_hints(height)
+    }
+
+    /// Verifies a peer's hints file against the live set — see
+    /// [`UtxoSet::verify_hints`].
+    #[must_use]
+    pub fn verify_hints(&self, hints: &crate::swiftsync::Hints) -> crate::swiftsync::HintsVerdict {
+        self.utxo.verify_hints(hints)
     }
 
     /// Commits the dirty coins cache plus the in-memory undo tail to
@@ -2432,14 +2611,8 @@ impl Chainstate {
                 script_checks: self.script_checks(&hash, &params),
                 script_pool: self.script_pool.as_deref(),
             };
-            let connected = if ctx.script_pool.is_some() {
-                connect::connect_block_deferred(block, &mut self.utxo, &ctx)
-                    .map(|(undo, check)| (undo, Some(check)))
-            } else {
-                connect::connect_block(block, &mut self.utxo, &ctx).map(|undo| (undo, None))
-            };
-            match connected {
-                Ok((undo, check)) => {
+            match connect::connect_block_full(block, &mut self.utxo, &ctx) {
+                Ok((undo, check, receipt)) => {
                     if let Some(index) = &mut self.filterindex {
                         index.append(height, block, &undo);
                     }
@@ -2449,6 +2622,7 @@ impl Chainstate {
                     self.chain.push(hash);
                     self.undos.push(undo);
                     self.connected = hash;
+                    self.note_receipt(receipt);
                     self.tree.note_connected(&hash);
                     if let Some(check) = check {
                         // Pipeline window: leave this block's checks
@@ -2602,13 +2776,14 @@ impl Chainstate {
         // every disconnect/connect writes only to the overlay's dirty
         // map. Any failure path restores `self.utxo` via `unoverlay`.
         let mut sim = self.utxo.overlay();
-        let new_undos = match self.simulate_branch(&mut sim, fork_height, &branch_hashes, params) {
-            Ok(undos) => undos,
-            Err(err) => {
-                self.utxo.unoverlay(sim, false);
-                return Err(err);
-            }
-        };
+        let (new_undos, new_receipts) =
+            match self.simulate_branch(&mut sim, fork_height, &branch_hashes, params) {
+                Ok(parts) => parts,
+                Err(err) => {
+                    self.utxo.unoverlay(sim, false);
+                    return Err(err);
+                }
+            };
         self.utxo.unoverlay(sim, true);
 
         // Commit. `disconnected` records whether any connected block was rolled
@@ -2665,6 +2840,9 @@ impl Chainstate {
             }
         }
         self.chain.extend(branch_hashes);
+        for receipt in new_receipts {
+            self.note_receipt(receipt);
+        }
         // Undos for heights at/below the backend watermark can't sit in
         // the tail — they're committed now, atomically with the coin
         // delta, so backend undo records always describe the committed
@@ -2774,16 +2952,16 @@ impl Chainstate {
 
     /// Runs a candidate branch against an overlay UTXO set: disconnect
     /// the active chain to `fork_height`, then connect `branch_hashes`.
-    /// Returns the new branch's undo records. `sim` must be the overlay
-    /// produced by `self.utxo.overlay()` — the caller restores it via
-    /// `unoverlay` on both outcomes.
+    /// Returns the new branch's undo records and per-block receipts.
+    /// `sim` must be the overlay produced by `self.utxo.overlay()` —
+    /// the caller restores it via `unoverlay` on both outcomes.
     fn simulate_branch(
         &mut self,
         sim: &mut UtxoSet,
         fork_height: u32,
         branch_hashes: &[BlockHash],
         params: &Params,
-    ) -> Result<Vec<BlockUndo>, ConnectError> {
+    ) -> Result<(Vec<BlockUndo>, Vec<BlockReceipt>), ConnectError> {
         for height in (fork_height + 1..self.chain.len() as u32).rev() {
             let block_hash = self.chain[height as usize];
             let Some(block) = self.body(&block_hash) else {
@@ -2796,6 +2974,7 @@ impl Chainstate {
                 .map_err(|_| ConnectError::Internal("disconnect undo inconsistent"))?;
         }
         let mut new_undos = Vec::with_capacity(branch_hashes.len());
+        let mut new_receipts = Vec::with_capacity(branch_hashes.len());
         for branch_hash in branch_hashes {
             let Some(block) = self.body(branch_hash) else {
                 return Err(ConnectError::Internal("missing branch block body"));
@@ -2807,9 +2986,14 @@ impl Chainstate {
                 script_checks: self.script_checks(branch_hash, params),
                 script_pool: None,
             };
-            match connect::connect_block(&block, sim, &ctx) {
-                Ok(undo) => {
+            match connect::connect_block_full(&block, sim, &ctx) {
+                Ok((undo, check, receipt)) => {
+                    debug_assert!(
+                        check.is_none(),
+                        "simulate_branch runs without a script pool"
+                    );
                     new_undos.push(undo);
+                    new_receipts.push(receipt);
                 }
                 Err(err) => {
                     // The branch wins on work but this block is invalid: mark
@@ -2833,7 +3017,7 @@ impl Chainstate {
         for branch_hash in branch_hashes {
             self.tree.note_connected(branch_hash);
         }
-        Ok(new_undos)
+        Ok((new_undos, new_receipts))
     }
 
     /// `preciousblock` — marks `hash` as the equal-work tie winner and
@@ -3016,7 +3200,9 @@ impl Chainstate {
                 break;
             }
             while bg.pending.len() >= MAX_PENDING {
-                let (h, check) = bg.pending.pop_front().unwrap();
+                let Some((h, check)) = bg.pending.pop_front() else {
+                    break;
+                };
                 if let Err(e) = check.wait() {
                     failed = Some(ConnectError::ScriptVerify(e));
                     let _ = h;
@@ -3039,10 +3225,13 @@ impl Chainstate {
                 script_checks: self.script_checks(&hash, &params),
                 script_pool: pool.as_deref(),
             };
-            match connect::connect_block_deferred(&block, &mut bg.utxo, &ctx) {
-                Ok((_undo, check)) => {
-                    bg.pending.push_back((h, check));
+            match connect::connect_block_full(&block, &mut bg.utxo, &ctx) {
+                Ok((_undo, check, receipt)) => {
+                    if let Some(check) = check {
+                        bg.pending.push_back((h, check));
+                    }
                     bg.next += 1;
+                    self.note_receipt(receipt);
                 }
                 Err(e) => {
                     failed = Some(e);
@@ -4823,7 +5012,8 @@ mod tests {
         assert!(dir2.join("snapshot.path").exists());
         // Whole-set consumers see the merged view — dumptxoutset and
         // gettxoutsetinfo iterate through the file layer.
-        let all: std::collections::HashSet<_> = cs3.utxo().iter().into_iter().map(|(o, _)| o).collect();
+        let all: std::collections::HashSet<_> =
+            cs3.utxo().iter().into_iter().map(|(o, _)| o).collect();
         for (op, _) in &coins {
             assert!(all.contains(op), "iter() missed base coin {op:?}");
         }
@@ -5616,5 +5806,267 @@ mod tests {
         }
         let bogus = BlockHash::from_bytes([0xAB; 32]);
         assert_eq!(cs.audit_block(&bogus), Err(AuditFailure::NoNode));
+    }
+
+    /// Per-block receipts (queue #5): the journal records what each
+    /// connect did — flags, checks, coin counts, the delta commitment.
+    #[test]
+    fn receipt_records_what_connect_did() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        let mut parent = genesis_header();
+        for h in 1..=3u32 {
+            let b = block_on(&parent, vec![coinbase_tx(h, subsidy(h))], &params);
+            let hash = b.block_hash();
+            cs.accept_block(&b, NOW).unwrap();
+            let r = cs.receipt_at(h).expect("receipt recorded");
+            assert_eq!(r.height, h);
+            assert_eq!(r.hash, hash);
+            assert_eq!(r.txs, 1);
+            assert_eq!(r.fees, 0);
+            assert_eq!(r.spent_coins, 0);
+            assert_eq!(r.created_coins, 1);
+            assert_eq!(r.script_checks, 0);
+            assert_eq!(r.verified_hits, 0);
+            assert!(r.checks_enabled);
+            assert!(!r.delta_commitment.is_zero());
+            assert!(r.wall_ns > 0);
+            parent = b.header;
+        }
+        // Newest-first ordering for the journal view.
+        let recent = cs.recent_receipts(10);
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].height, 3);
+        assert_eq!(recent[2].height, 1);
+    }
+
+    /// The delta commitment is a pure function of (block, parent
+    /// state): an identical replay on a fresh chainstate recomputes
+    /// it; a different transition produces a different commitment.
+    #[test]
+    fn receipt_commitment_is_replayable_and_sensitive() {
+        let params = params();
+        let b1 = block_on(&genesis_header(), vec![coinbase_tx(1, subsidy(1))], &params);
+        let mut a = Chainstate::new(&params);
+        let mut b = Chainstate::new(&params);
+        a.accept_block(&b1, NOW).unwrap();
+        b.accept_block(&b1, NOW).unwrap();
+        assert_eq!(
+            a.receipt_at(1).unwrap().delta_commitment,
+            b.receipt_at(1).unwrap().delta_commitment,
+        );
+        // A different delta — the tagged coinbase pays the same value
+        // but has a different txid, so the commitment must differ.
+        let alt = block_on(
+            &genesis_header(),
+            vec![tagged_coinbase(1, subsidy(1), script::OP_EQUAL)],
+            &params,
+        );
+        let mut c = Chainstate::new(&params);
+        c.accept_block(&alt, NOW).unwrap();
+        assert_ne!(
+            a.receipt_at(1).unwrap().delta_commitment,
+            c.receipt_at(1).unwrap().delta_commitment,
+        );
+    }
+
+    /// Spends and fees land in the receipt: a matured coinbase spent
+    /// with change counts one spend, two creates, and the fee.
+    #[test]
+    fn receipt_counts_spends_and_fees() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        let mut parent = genesis_header();
+        // Mature the height-1 coinbase (100-deep maturity).
+        for h in 1..=101u32 {
+            let b = block_on(&parent, vec![coinbase_tx(h, subsidy(h))], &params);
+            cs.accept_block(&b, NOW).unwrap();
+            parent = b.header;
+        }
+        let funding = OutPoint {
+            txid: cs.body(&cs.chain()[1]).unwrap().transactions[0].txid(),
+            vout: 0,
+        };
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: funding,
+                script_sig: Script::new(vec![]),
+                sequence: SEQUENCE_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: vec![
+                TxOut {
+                    value: subsidy(1) - 1000,
+                    script_pubkey: Script::new(vec![script::OP_1]),
+                },
+                TxOut {
+                    value: 0,
+                    script_pubkey: Script::new(vec![script::OP_RETURN]),
+                },
+            ],
+            lock_time: 0,
+        };
+        let b = block_on(
+            &parent,
+            vec![coinbase_tx(102, subsidy(102) + 1000), spend],
+            &params,
+        );
+        cs.accept_block(&b, NOW).unwrap();
+        let r = cs.receipt_at(102).unwrap();
+        assert_eq!(r.txs, 2);
+        assert_eq!(r.spent_coins, 1);
+        // OP_RETURN output is unspendable — only the change becomes a coin.
+        assert_eq!(r.created_coins, 2);
+        assert_eq!(r.fees, 1000);
+    }
+
+    /// A reorg journals both branches: each height's most recent
+    /// receipt is the winner's, and the evicted branch's receipts
+    /// remain in the ring as the events they were.
+    #[test]
+    fn receipts_journal_both_sides_of_a_reorg() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        let a1 = block_on(&genesis_header(), vec![coinbase_tx(1, subsidy(1))], &params);
+        let a2 = block_on(&a1.header, vec![coinbase_tx(2, subsidy(2))], &params);
+        cs.accept_block(&a1, NOW).unwrap();
+        cs.accept_block(&a2, NOW).unwrap();
+        let a1_commitment = cs.receipt_at(1).unwrap().delta_commitment;
+
+        let b1 = block_on(
+            &genesis_header(),
+            vec![tagged_coinbase(1, subsidy(1), script::OP_EQUAL)],
+            &params,
+        );
+        let b2 = block_on(
+            &b1.header,
+            vec![tagged_coinbase(2, subsidy(2), script::OP_EQUAL)],
+            &params,
+        );
+        let b3 = block_on(
+            &b2.header,
+            vec![tagged_coinbase(3, subsidy(3), script::OP_EQUAL)],
+            &params,
+        );
+        cs.accept_block(&b1, NOW).unwrap();
+        cs.accept_block(&b2, NOW).unwrap();
+        assert_eq!(
+            cs.accept_block(&b3, NOW),
+            Ok(Acceptance::Connected {
+                height: 3,
+                reorged: true
+            })
+        );
+        // The winner's receipts now answer height lookups.
+        assert_eq!(cs.receipt_at(1).unwrap().hash, b1.block_hash());
+        assert_ne!(cs.receipt_at(1).unwrap().delta_commitment, a1_commitment);
+        // And the evicted branch's receipts are still in the journal —
+        // five connects happened in total.
+        let all = cs.recent_receipts(10);
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].hash, b3.block_hash());
+        assert!(all.iter().any(|r| r.hash == a2.block_hash()));
+    }
+
+    /// #31 end-to-end: real block connects keep `agg == Σ tags(live)`,
+    /// and the emitted hints verify against the same set.
+    #[test]
+    fn swiftsync_agg_tracks_real_connects() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        cs.enable_swiftsync();
+        let sum = |cs: &Chainstate| {
+            let mut a = crate::swiftsync::TagAgg::default();
+            for (op, c) in cs.utxo().iter() {
+                a.add(&crate::swiftsync::coin_tag(&op, &c));
+            }
+            a
+        };
+        assert_eq!(cs.swiftsync_agg().unwrap(), sum(&cs));
+
+        // 105 coinbases — mature at h>101.
+        let mut parent = genesis_header();
+        let mut mature = None;
+        for height in 1..=105u32 {
+            let block = block_on(&parent, vec![coinbase_tx(height, subsidy(height))], &params);
+            if height == 1 {
+                mature = Some(block.transactions[0].txid());
+            }
+            parent = block.header;
+            cs.accept_block(&block, NOW).unwrap();
+            assert_eq!(
+                cs.swiftsync_agg().unwrap(),
+                sum(&cs),
+                "agg drifted at height {height}"
+            );
+        }
+
+        // A block spending the height-1 coinbase — real spend path.
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: mature.unwrap(),
+                    vout: 0,
+                },
+                script_sig: Script::new(vec![]),
+                sequence: SEQUENCE_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: subsidy(1) - 1000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let block = block_on(
+            &parent,
+            vec![coinbase_tx(106, subsidy(106)), spend],
+            &params,
+        );
+        cs.accept_block(&block, NOW).unwrap();
+        assert_eq!(cs.swiftsync_agg().unwrap(), sum(&cs));
+
+        // The emitted artifact verifies; a tampered claim does not.
+        let hints = cs.emit_hints(106);
+        assert_eq!(
+            cs.verify_hints(&hints),
+            crate::swiftsync::HintsVerdict::Verified
+        );
+        let mut bad = hints.clone();
+        bad.survivors.pop();
+        assert_eq!(
+            cs.verify_hints(&bad),
+            crate::swiftsync::HintsVerdict::SurvivorMismatch
+        );
+    }
+
+    /// UTXO-replay audit (queue #15): a healthy chain audits clean;
+    /// erasing a live coin (simulated storage rot) is caught as an
+    /// undo violation.
+    #[test]
+    fn audit_utxo_segment_catches_drift() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        for b in spend_chain(120, &params) {
+            cs.accept_block(&b, NOW).unwrap();
+        }
+        // Full range + a mid-segment window both audit clean —
+        // mid-segment skips only the created-nonlive half (later
+        // spends are legitimately unknown to it).
+        assert_eq!(cs.audit_utxo_segment(1, 120), Ok(()));
+        assert_eq!(cs.audit_utxo_segment(50, 100), Ok(()));
+        assert_eq!(cs.audit_utxo_segment(0, 10), Err(AuditFailure::NoNode));
+
+        // Rot: remove a still-live coin — nothing in any undo covers
+        // its disappearance, so the audit must flag it.
+        let live_op = cs.utxo().iter().first().expect("live coin").0;
+        cs.utxo_mut().spend_coin(&live_op).expect("was live");
+        assert_eq!(
+            cs.audit_utxo_segment(1, 120),
+            Err(AuditFailure::UndoMissing),
+            "a vanished live coin is storage rot the audit must catch"
+        );
     }
 }

@@ -906,6 +906,85 @@ fn reply_obj(result: Value, error: Option<(i64, String)>, id: &Option<Value>, v2
 /// queue until the missing bodies arrive or the deadline passes.
 /// `method` is carried on the query only so a panic inside `f` can be
 /// logged by name — it plays no role in dispatch itself.
+/// Build the signer provider from private descriptors — parse each
+/// xprv root, then expand a bounded lookahead collecting derived
+/// secrets + origins (descriptor.rs's `ExpandPrivate`). Shared by
+/// `createdescriptorseed` and `signerload`.
+fn signer_provider_from_descs(
+    descs_private: &[String],
+    params: &avila_consensus::params::Params,
+) -> Result<avila_consensus::descriptor::FlatProvider, String> {
+    let mut signing = avila_consensus::descriptor::FlatProvider::default();
+    let mut expanded = avila_consensus::descriptor::FlatProvider::default();
+    for d in descs_private {
+        let (parsed, p, _) = parse_descriptors(d, params, true)?;
+        signing.keys.extend(p.keys);
+        signing.xprvs.extend(p.xprvs);
+        let mut cache = avila_consensus::descriptor::DeriveCache::new();
+        for pos in 0..64u32 {
+            let _ = parsed[0].expand_into(pos, &signing, &mut expanded, true, &mut cache);
+        }
+    }
+    signing.keys.extend(expanded.keys);
+    signing.pubkeys.extend(expanded.pubkeys);
+    signing.origins.extend(expanded.origins);
+    signing.scripts.extend(expanded.scripts);
+    signing.tr_trees.extend(expanded.tr_trees);
+    Ok(signing)
+}
+
+/// Core's `BroadcastTransaction` tail — mempool admission +
+/// unbroadcast/broadcast-pool marking + stem-hopped relay announce.
+/// Shared by `sendrawtransaction` (after its caller policy bounds) and
+/// `sendtoaddress`.
+fn admit_and_relay(
+    cs: &mut Chainstate,
+    mgr: &mut PeerManager<TcpStream>,
+    tx: Transaction,
+    bytes: Vec<u8>,
+) -> Result<Value, (i64, String)> {
+    let txid = tx.txid();
+    let wtxid = tx.wtxid();
+    if mgr.mempool_ref().entry(&txid).is_some() {
+        return Ok(json!(txid.to_string()));
+    }
+    let now = crate::time::time() as u32;
+    match mgr.mempool().accept_tx(tx, cs, now) {
+        Ok(_) => {
+            // Admitted — relay an inv to every tx-accepting
+            // peer (Core's RelayTransaction path), track it
+            // as unbroadcast until a peer's getdata
+            // acknowledges the announcement, and protect it
+            // in the broadcast pool so a fee-spike eviction
+            // can't make the operator's own tx vanish
+            // (Core issue #30471).
+            mgr.mempool().mark_unbroadcast(&txid);
+            mgr.mempool().mark_broadcast(txid, bytes, now);
+            // Origin privacy: locally submitted txs take a
+            // single stem hop before general announce —
+            // observers see us relay, not originate.
+            mgr.stem_announce(txid, wtxid);
+            Ok(json!(txid.to_string()))
+        }
+        Err(avila_mempool::MempoolReject::AlreadyKnown) => {
+            mgr.mempool().mark_unbroadcast(&txid);
+            mgr.mempool().mark_broadcast(txid, bytes, now);
+            Ok(json!(txid.to_string()))
+        }
+        // Consensus and input failures carry Core's
+        // state.Invalid reason strings via `reason()`;
+        // policy rejects already Display as Core strings.
+        Err(reject) => Err((
+            RPC_VERIFY_REJECTED,
+            match &reject {
+                avila_mempool::MempoolReject::Consensus(e) => e.reason().to_string(),
+                avila_mempool::MempoolReject::Inputs(e) => e.reason().into_owned(),
+                _ => reject.to_string(),
+            },
+        )),
+    }
+}
+
 fn chain_query_deferred(
     method: &str,
     queries: Option<&QuerySender>,
@@ -4302,7 +4381,10 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
     ),
     (
         "listtransactions",
-        &[("count", Some("number"), false), ("skip", Some("number"), false)],
+        &[
+            ("count", Some("number"), false),
+            ("skip", Some("number"), false),
+        ],
         "listtransactions ( count skip )\n\nWatch-wallet history — receives and spends per tracked coin, newest first.\n",
     ),
     (
@@ -4574,6 +4656,26 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         &[("txid", Some("string"), true)],
         GETMEMPOOLENTRY_HELP,
     ),
+    (
+        "getblockreceipt",
+        &[("height", Some("number"), true)],
+        "getblockreceipt height\n\nThe per-block verification receipt recorded when this node connected the block at `height`: flags enforced, script checks performed or cache-skipped, fee/sigop totals, and the SHA-256 commitment to the exact UTXO delta applied — replayable evidence, not a trust-me claim.\n\nArguments:\n1. height  (number, required) Block height. Receipts are retained for the last 2016 connected blocks.\n\nResult:\n{ \"height\": n, \"hash\": \"hex\", \"script_flags\": n, \"txs\": n, \"sigops\": n, \"fees\": btc, \"checks_enabled\": bool, \"script_checks\": n, \"verified_hits\": n, \"spent_coins\": n, \"created_coins\": n, \"delta_commitment\": \"hex\", \"wall_ns\": n }\n",
+    ),
+    (
+        "getblockreceipts",
+        &[("count", Some("number"), false)],
+        "getblockreceipts ( count )\n\nRecent per-block verification receipts, newest first — what this node actually checked when it connected each block.\n\nArguments:\n1. count  (number, optional, default=10, max=2016) How many receipts to return.\n\nResult:\n[ { \"height\": n, \"hash\": \"hex\", \"script_flags\": n, \"txs\": n, \"sigops\": n, \"fees\": btc, \"checks_enabled\": bool, \"script_checks\": n, \"verified_hits\": n, \"spent_coins\": n, \"created_coins\": n, \"delta_commitment\": \"hex\", \"wall_ns\": n }, ... ]\n",
+    ),
+    (
+        "emitswiftsynchints",
+        &[("path", Some("string"), true)],
+        "emitswiftsynchints \"path\"\n\nWrite the SwiftSync hints artifact for the current UTXO set — the committed tag aggregate plus the sorted survivor outpoints.\n\nArguments:\n1. path  (string, required) Output file path.\n\nResult:\n{ \"height\": n, \"survivors\": n, \"aggregate\": \"hex\", \"bytes\": n }\n",
+    ),
+    (
+        "verifyswiftsynchints",
+        &[("path", Some("string"), true)],
+        "verifyswiftsynchints \"path\"\n\nVerify a SwiftSync hints file against this node's own UTXO set: committed aggregate equality plus survivor-set equality. A wrong file only wastes the optimization — the node writes its own live set either way.\n\nArguments:\n1. path  (string, required) Hints file path.\n\nResult:\n\"verified\" | \"aggregate_mismatch\" | \"survivor_mismatch\"\n",
+    ),
     ("getmempoolinfo", &[], GETMEMPOOLINFO_HELP),
     (
         "getevents",
@@ -4586,9 +4688,14 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         "getmempoolblocks ( nblocks )\n\nProjects the mempool into virtual blocks by modified-feerate order — the mempool.space 'next blocks' view, native.\n\nArguments:\n1. nblocks  (number, optional, default=8, max=64) How many projected blocks to return.\n\nResult:\n[ { \"block\": n, \"txs\": n, \"vsize\": n, \"totalfee\": btc, \"minfeerate\": btc/kvB, \"medianfeerate\": btc/kvB, \"maxfeerate\": btc/kvB }, ... ]\n",
     ),
     (
+        "getmempoolhistory",
+        &[("count", Some("number"), false)],
+        "getmempoolhistory ( count )\n\nRecent mempool removal events, newest first — the transaction lifecycle view: what confirmed, what was RBF-replaced (and by which tx), what the capacity trim evicted, what expired.\n\nArguments:\n1. count  (number, optional, default=64, max=4096) How many events to return.\n\nResult:\n[ { \"txid\": \"hex\", \"cause\": \"confirmed|block-conflict|replaced|evicted|expired|reorg-drop|removed\", \"replaced_by\": \"hex\"|null, \"fee\": btc, \"vsize\": n, \"admitted_at\": n, \"removed_at\": n, \"height\": n }, ... ]\n",
+    ),
+    (
         "getpinningrisk",
         &[("margin", Some("number"), false)],
-        "getpinningrisk ( margin )\n\nLists mempool transactions whose descendant package is at or near the descendant cap (BIP-431 pinning surface — such a tx cannot be CPFP-bumped).\n\nArguments:\n1. margin  (number, optional, default=5) Flag txs within this many descendants of the cap.\n\nResult:\n[ { \"txid\": \"hex\", \"descendants\": n }, ... ]\n",
+        "getpinningrisk ( margin )\n\nLists mempool transactions whose descendant package is at or near the descendant cap (BIP-431 pinning surface — such a tx cannot be CPFP-bumped). With a wallet loaded, \"mine\" marks entries that pay a watched script or spend a wallet coin — those are alerts, not just telemetry.\n\nArguments:\n1. margin  (number, optional, default=5) Flag txs within this many descendants of the cap.\n\nResult:\n[ { \"txid\": \"hex\", \"descendants\": n, \"mine\": bool }, ... ]\n",
     ),
     ("getmininginfo", &[], GETMININGINFO_HELP),
     ("getnettotals", &[], GETNETTOTALS_HELP),
@@ -5368,9 +5475,116 @@ pub(crate) fn dispatch(
         }),
         // Avila-specific (no Core equivalent): the node's own
         // verification coverage — verified vs proven vs assumed heights.
+        "getblockreceipts" => {
+            let n = param(params, 0, "count")
+                .and_then(Value::as_u64)
+                .map_or(10, |v| v.min(2016) as usize);
+            chain_query(method, queries, move |cs, _| {
+                Ok(json!(
+                    cs.recent_receipts(n)
+                        .iter()
+                        .map(|r| json!({
+                            "height": r.height,
+                            "hash": r.hash.to_string(),
+                            "script_flags": r.script_flags,
+                            "txs": r.txs,
+                            "sigops": r.sigops,
+                            "fees": value_from_amount(r.fees),
+                            "checks_enabled": r.checks_enabled,
+                            "script_checks": r.script_checks,
+                            "verified_hits": r.verified_hits,
+                            "spent_coins": r.spent_coins,
+                            "created_coins": r.created_coins,
+                            "delta_commitment": r.delta_commitment.to_string(),
+                            "wall_ns": r.wall_ns,
+                        }))
+                        .collect::<Vec<_>>()
+                ))
+            })
+        }
+        "getblockreceipt" => {
+            let height = param(params, 0, "height").and_then(Value::as_u64);
+            chain_query(method, queries, move |cs, _| {
+                let Some(height) = height else {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "getblockreceipt requires a height".to_string(),
+                    ));
+                };
+                match cs.receipt_at(height as u32) {
+                    Some(r) => Ok(json!({
+                        "height": r.height,
+                        "hash": r.hash.to_string(),
+                        "script_flags": r.script_flags,
+                        "txs": r.txs,
+                        "sigops": r.sigops,
+                        "fees": value_from_amount(r.fees),
+                        "checks_enabled": r.checks_enabled,
+                        "script_checks": r.script_checks,
+                        "verified_hits": r.verified_hits,
+                        "spent_coins": r.spent_coins,
+                        "created_coins": r.created_coins,
+                        "delta_commitment": r.delta_commitment.to_string(),
+                        "wall_ns": r.wall_ns,
+                    })),
+                    None => Err((
+                        RPC_INVALID_PARAMETER,
+                        format!("no receipt retained at height {height}"),
+                    )),
+                }
+            })
+        }
+        "emitswiftsynchints" => {
+            let path = param(params, 0, "path")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            chain_query(method, queries, move |cs, _| {
+                let Some(path) = path else {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "emitswiftsynchints requires a path".to_string(),
+                    ));
+                };
+                let height = (cs.chain().len() - 1) as u32;
+                let hints = cs.emit_hints(height);
+                let bytes = hints.encode();
+                let len = bytes.len();
+                std::fs::write(&path, bytes)
+                    .map_err(|e| (RPC_MISC_ERROR, format!("write hints to {path}: {e}")))?;
+                Ok(json!({
+                    "height": hints.height,
+                    "survivors": hints.survivors.len(),
+                    "aggregate": hex::encode(&hints.aggregate.to_bytes()),
+                    "bytes": len,
+                }))
+            })
+        }
+        "verifyswiftsynchints" => {
+            let path = param(params, 0, "path")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            chain_query(method, queries, move |cs, _| {
+                let Some(path) = path else {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "verifyswiftsynchints requires a path".to_string(),
+                    ));
+                };
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| (RPC_MISC_ERROR, format!("read hints {path}: {e}")))?;
+                let hints = avila_consensus::swiftsync::Hints::decode(&bytes)
+                    .map_err(|e| (RPC_INVALID_PARAMETER, format!("bad hints: {e}")))?;
+                use avila_consensus::swiftsync::HintsVerdict::*;
+                Ok(json!(match cs.verify_hints(&hints) {
+                    Verified => "verified",
+                    AggregateMismatch => "aggregate_mismatch",
+                    SurvivorMismatch => "survivor_mismatch",
+                }))
+            })
+        }
         "getvalidationreport" => chain_query(method, queries, |cs, _| {
             let r = cs.validation_report();
-            let snapshot = r.snapshot.map(|s| {
+            let snapshot = r.snapshot.clone().map(|s| {
                 json!({
                     "base_height": s.base_height,
                     "base_hash": s.base_hash,
@@ -5381,10 +5595,41 @@ pub(crate) fn dispatch(
                     "verified": s.verified,
                 })
             });
+            // Astra's acceptance criterion: the operator must be able
+            // to distinguish fully-verified / pending / snapshot-assumed
+            // history at a glance — one `coverage` block, plain words.
+            let coverage = match &r.snapshot {
+                None => json!({
+                    "state": "full_validation",
+                    "verified_ranges": [[0, r.connected_height]],
+                    "pending_replay": [],
+                    "snapshot_assumed": null,
+                    "plain": "every block up to the connected tip was fully validated — no assumptions",
+                }),
+                Some(s) if s.verified => json!({
+                    "state": "snapshot_replay_complete",
+                    "verified_ranges": [[0, r.connected_height]],
+                    "pending_replay": [],
+                    "snapshot_assumed": null,
+                    "plain": format!("snapshot base {} verified against its commitment AND the full history behind it has been replayed — equivalent to full validation", s.base_height),
+                }),
+                Some(s) => json!({
+                    "state": "snapshot_replaying",
+                    "verified_ranges": [[1, s.replayed_height], [s.base_height + 1, r.connected_height]],
+                    "pending_replay": [[s.replayed_height + 1, s.base_height]],
+                    "snapshot_assumed": {
+                        "range": [1, s.base_height],
+                        "commitment": s.expected_utxo_hash,
+                        "meaning": "UTXO set at this height verified against the chainparams-pinned hash_serialized_3 commitment; the transaction history BEHIND it is being replayed in the background",
+                    },
+                    "plain": format!("snapshot at {} commitment-verified; heights {}..={} not yet historically replayed", s.base_height, s.replayed_height + 1, s.base_height),
+                }),
+            };
             Ok(json!({
                 "connected_height": r.connected_height,
                 "header_height": r.header_height,
                 "verified_fraction": r.verified_fraction,
+                "coverage": coverage,
                 "snapshot": snapshot,
             }))
         }),
@@ -6794,6 +7039,12 @@ pub(crate) fn dispatch(
                             // or eclipse signal (queue #19).
                             "recon_rounds": p.recon_rounds,
                             "recon_misses": p.recon_misses,
+                            "recon_their_misses": p.recon_their_misses,
+                            // Per-peer dispatch CPU (PEER_BUDGETS):
+                            // cumulative ms and the decayed per-second
+                            // rate — the throttle input.
+                            "cpu_ms": p.cpu_ms,
+                            "cpu_rate_ms": p.cpu_rate_ms,
                             // Core: hex of the BIP324 session id on v2,
                             // "" on v1.
                             "session_id": p
@@ -6883,6 +7134,7 @@ pub(crate) fn dispatch(
             // BTC-denominated fields like Core's: our counters are
             // satoshis, so convert through `ValueFromAmount`.
             let relay = pool.min_relay_fee();
+            let lc = pool.lifecycle_stats();
             Ok(json!({
                 "loaded": true,
                 "size": pool.len(),
@@ -6901,19 +7153,73 @@ pub(crate) fn dispatch(
                 // Full-RBF matches deployed Core's -mempoolfullrbf=1:
                 // replacements no longer need BIP125 signaling.
                 "fullrbf": pool.full_rbf(),
+                // Transaction-lifecycle ledger (queue #32): cumulative
+                // admission verdicts and per-cause removal counters.
+                "lifecycle": {
+                    "accepted": lc.accepted,
+                    "rejected": lc.rejected,
+                    "parked_orphans": lc.parked_orphans,
+                    "orphans_expired": lc.orphans_expired,
+                    "replacements": lc.replacements,
+                    "confirmed": lc.confirmed,
+                    "block_conflicts": lc.block_conflicts,
+                    "replaced": lc.replaced,
+                    "evicted": lc.evicted,
+                    "expired": lc.expired,
+                    "reorg_dropped": lc.reorg_dropped,
+                    "explicit": lc.explicit,
+                },
+                // Shadow-ruleset observatory (queue #8): admissions
+                // scored under a stricter Knots-style policy — the
+                // live policy-drift signal. Never gates acceptance.
+                "shadow": {
+                    "evaluated": pool.shadow_stats().evaluated,
+                    "divergent": pool.shadow_stats().divergent_total(),
+                    "by_reason": pool.shadow_stats().divergent,
+                },
             }))
         }),
         "getpinningrisk" => {
             let margin = param(params, 0, "margin")
                 .and_then(Value::as_u64)
                 .map_or(5, |v| v as usize);
+            // Queue #16's wallet join: a flagged tx the wallet cares
+            // about (pays a watched script, or spends a wallet coin)
+            // is a pinning *alert*, not just telemetry.
+            let wallet = wallet.cloned();
             chain_query(method, queries, move |_, mgr| {
-                Ok(json!(mgr
-                    .mempool_ref()
-                    .pinning_risk(margin)
-                    .into_iter()
-                    .map(|(txid, n)| json!({"txid": txid.to_string(), "descendants": n}))
-                    .collect::<Vec<_>>()))
+                let pool = mgr.mempool_ref();
+                let w = wallet.as_ref().map(|w| match w.lock() {
+                    Ok(w) => w,
+                    Err(p) => p.into_inner(),
+                });
+                Ok(json!(
+                    pool.pinning_risk(margin)
+                        .into_iter()
+                        .map(|(txid, n)| {
+                            let mine = w.as_ref().is_some_and(|w| {
+                                pool.get(&txid).is_some_and(|tx| {
+                                    tx.outputs
+                                        .iter()
+                                        .any(|o| w.scripts.contains_key(o.script_pubkey.as_bytes()))
+                                        || tx.inputs.iter().any(|i| {
+                                            w.coins
+                                                .get(&(
+                                                    i.previous_output.txid,
+                                                    i.previous_output.vout,
+                                                ))
+                                                .is_some_and(|c| c.spent_height.is_none())
+                                        })
+                                })
+                            });
+                            json!({
+                                "txid": txid.to_string(),
+                                "descendants": n,
+                                "mine": mine,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                ))
             })
         }
         "getmempoolblocks" => {
@@ -6921,21 +7227,60 @@ pub(crate) fn dispatch(
                 .and_then(Value::as_u64)
                 .map_or(8, |v| v.min(64) as usize);
             chain_query(method, queries, move |_, mgr| {
-                Ok(json!(mgr
-                    .mempool_ref()
-                    .block_projection(n)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, b)| json!({
-                        "block": i + 1,
-                        "txs": b.tx_count,
-                        "vsize": b.vsize,
-                        "totalfee": value_from_amount(b.total_fees),
-                        "minfeerate": value_from_amount(b.min_feerate),
-                        "medianfeerate": value_from_amount(b.median_feerate),
-                        "maxfeerate": value_from_amount(b.max_feerate),
-                    }))
-                    .collect::<Vec<_>>()))
+                Ok(json!(
+                    mgr.mempool_ref()
+                        .block_projection(n)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, b)| json!({
+                            "block": i + 1,
+                            "txs": b.tx_count,
+                            "vsize": b.vsize,
+                            "totalfee": value_from_amount(b.total_fees),
+                            "minfeerate": value_from_amount(b.min_feerate),
+                            "medianfeerate": value_from_amount(b.median_feerate),
+                            "maxfeerate": value_from_amount(b.max_feerate),
+                        }))
+                        .collect::<Vec<_>>()
+                ))
+            })
+        }
+        "getmempoolhistory" => {
+            let n = param(params, 0, "count")
+                .and_then(Value::as_u64)
+                .map_or(64, |v| v.min(4096) as usize);
+            chain_query(method, queries, move |_, mgr| {
+                Ok(json!(
+                    mgr.mempool_ref()
+                        .lifecycle_events(n)
+                        .into_iter()
+                        .map(|e| {
+                            let (cause, replaced_by) = match e.cause {
+                                avila_mempool::RemovalCause::Confirmed => ("confirmed", None),
+                                avila_mempool::RemovalCause::BlockConflict => {
+                                    ("block-conflict", None)
+                                }
+                                avila_mempool::RemovalCause::Replaced { by } => {
+                                    ("replaced", Some(by.to_string()))
+                                }
+                                avila_mempool::RemovalCause::Evicted => ("evicted", None),
+                                avila_mempool::RemovalCause::Expired => ("expired", None),
+                                avila_mempool::RemovalCause::ReorgDrop => ("reorg-drop", None),
+                                avila_mempool::RemovalCause::Explicit => ("removed", None),
+                            };
+                            json!({
+                                "txid": e.txid.to_string(),
+                                "cause": cause,
+                                "replaced_by": replaced_by,
+                                "fee": value_from_amount(e.fee),
+                                "vsize": e.vsize,
+                                "admitted_at": e.admitted_at,
+                                "removed_at": e.removed_at,
+                                "height": e.removed_height,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                ))
             })
         }
         "getevents" => {
@@ -6971,6 +7316,30 @@ pub(crate) fn dispatch(
                         avila_p2p::manager::NetEvent::EclipseSuspected(signals) => json!({
                             "event": "eclipse_suspected",
                             "signals": signals.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>(),
+                        }),
+                        avila_p2p::manager::NetEvent::ReconDivergence {
+                            peer,
+                            rounds,
+                            their_misses,
+                            our_misses,
+                        } => json!({
+                            "event": "recon_divergence",
+                            "peer": peer,
+                            "rounds": rounds,
+                            "their_misses": their_misses,
+                            "our_misses": our_misses,
+                        }),
+                        avila_p2p::manager::NetEvent::ProxyUnreachable => json!({
+                            "event": "proxy_unreachable",
+                        }),
+                        avila_p2p::manager::NetEvent::V2Downgraded { addr } => json!({
+                            "event": "v2_downgraded",
+                            "addr": addr.to_string(),
+                        }),
+                        avila_p2p::manager::NetEvent::CpuThrottled { peer, rate_ns } => json!({
+                            "event": "cpu_throttled",
+                            "peer": peer,
+                            "rate_ns": rate_ns,
                         }),
                     })
                     .collect();
@@ -7196,7 +7565,6 @@ pub(crate) fn dispatch(
                     }
                 };
                 let txid = tx.txid();
-                let wtxid = tx.wtxid();
                 let pool = mgr.mempool_ref();
                 // Core's BroadcastTransaction: an already-pooled txid is
                 // a silent success — resubmitting is idempotent.
@@ -7242,41 +7610,7 @@ pub(crate) fn dispatch(
                             .into(),
                     ));
                 }
-                let now = crate::time::time() as u32;
-                match mgr.mempool().accept_tx(tx, cs, now) {
-                    Ok(_) => {
-                        // Admitted — relay an inv to every tx-accepting
-                        // peer (Core's RelayTransaction path), track it
-                        // as unbroadcast until a peer's getdata
-                        // acknowledges the announcement, and protect it
-                        // in the broadcast pool so a fee-spike eviction
-                        // can't make the operator's own tx vanish
-                        // (Core issue #30471).
-                        mgr.mempool().mark_unbroadcast(&txid);
-                        mgr.mempool().mark_broadcast(txid, bytes.clone(), now);
-                        // Origin privacy: locally submitted txs take a
-                        // single stem hop before general announce —
-                        // observers see us relay, not originate.
-                        mgr.stem_announce(txid, wtxid);
-                        Ok(json!(txid.to_string()))
-                    }
-                    Err(avila_mempool::MempoolReject::AlreadyKnown) => {
-                        mgr.mempool().mark_unbroadcast(&txid);
-                        mgr.mempool().mark_broadcast(txid, bytes.clone(), now);
-                        Ok(json!(txid.to_string()))
-                    }
-                    // Consensus and input failures carry Core's
-                    // state.Invalid reason strings via `reason()`;
-                    // policy rejects already Display as Core strings.
-                    Err(reject) => Err((
-                        RPC_VERIFY_REJECTED,
-                        match &reject {
-                            avila_mempool::MempoolReject::Consensus(e) => e.reason().to_string(),
-                            avila_mempool::MempoolReject::Inputs(e) => e.reason().into_owned(),
-                            _ => reject.to_string(),
-                        },
-                    )),
-                }
+                admit_and_relay(cs, mgr, tx, bytes)
             })
         }
         "submitpackage" => {
@@ -10139,6 +10473,629 @@ pub(crate) fn dispatch(
             })
         }
         // Core's `listdescriptors` — the imported descriptor table.
+        // Wallet address generation — the next index of the active
+        // external ranged descriptor (Core's next_index cursor).
+        "getnewaddress" => {
+            let wallet = wallet.cloned();
+            chain_query_deferred(method, queries, move |cs, _| {
+                let Some(wallet) = wallet else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    )));
+                };
+                let mut w = match wallet.lock() {
+                    Ok(w) => w,
+                    Err(_) => {
+                        return QueryReply::Now(Err((
+                            RPC_MISC_ERROR,
+                            "wallet lock poisoned".into(),
+                        )));
+                    }
+                };
+                // The external active ranged descriptor — the
+                // createdescriptorseed ext desc or an imported one.
+                let params = cs.tree().params();
+                let Some(idx) = w
+                    .descs
+                    .iter()
+                    .position(|d| d.active && !d.internal && d.range.1 >= d.range.0)
+                else {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        "no active external descriptor — import one or run createdescriptorseed"
+                            .into(),
+                    )));
+                };
+                let d = &w.descs[idx];
+                let pos = d.next_index;
+                if pos > d.range.1 {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        format!("descriptor range exhausted at {}", d.range.1),
+                    )));
+                }
+                let desc_text = d.desc.clone();
+                let (parsed, provider, _) = match parse_descriptors(&desc_text, params, true) {
+                    Ok(v) => v,
+                    Err(e) => return QueryReply::Now(Err((RPC_INVALID_ADDRESS_OR_KEY, e))),
+                };
+                let Some(scripts) = parsed[0].expand(pos, &provider) else {
+                    return QueryReply::Now(Err((RPC_WALLET_ERROR, "derivation failed".into())));
+                };
+                // The canonical output script for this descriptor
+                // (wpkh's expansion is one scriptPubKey).
+                let Some(addr) = scripts.iter().find_map(|s| {
+                    avila_consensus::address::script_address(
+                        &avila_consensus::transaction::Script::new(s.clone()),
+                        params,
+                    )
+                }) else {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        "no addressable script".into(),
+                    )));
+                };
+                w.descs[idx].next_index = pos + 1;
+                QueryReply::Now(Ok(json!(addr)))
+            })
+        }
+
+        // Avila-specific (no Core equivalent): create a descriptor
+        // seed — BIP32 master key from OS CSPRNG or caller-supplied
+        // entropy (queue #35/#37). Installs the opt-in signer AND
+        // registers the neutered (xpub) descriptors for watching —
+        // the wallet sees its own coins; secrets stay memory-only.
+        "createdescriptorseed" => {
+            let entropy_arg = param(params, 0, "entropy")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let dice_arg = param(params, 1, "dice")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let mix_arg = param(params, 2, "mix")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let wallet = wallet.cloned();
+            chain_query_deferred(method, queries, move |cs, _| {
+                let Some(wallet) = wallet else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    )));
+                };
+                let params = cs.tree().params();
+                // The entropy ceremony (queue #37): hex, dice rolls
+                // (Coldcard convention), or OS CSPRNG — `mix` XOR-folds
+                // OS entropy in so no single bad source decides.
+                let resolved = match crate::watch::resolve_entropy(
+                    entropy_arg.as_deref(),
+                    dice_arg.as_deref(),
+                    mix_arg,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => return QueryReply::Now(Err((RPC_INVALID_PARAMETER, e))),
+                };
+                let seed = resolved.seed.clone();
+                let provenance = resolved.provenance.clone();
+                let Some(master) = avila_consensus::extended_key::ExtKey::from_seed(
+                    &seed,
+                    params.base58_ext_secret_prefix,
+                ) else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "master key derivation failed".into(),
+                    )));
+                };
+                // BIP84 account: m/84h/coinh/0h (coin type 0 mainnet,
+                // 1 everywhere else — SLIP-44).
+                const H: u32 = 0x8000_0000;
+                let coin: u32 = match params.network {
+                    avila_consensus::params::Network::Mainnet => 0,
+                    _ => 1,
+                };
+                let Some(account) = master
+                    .derive(84 | H)
+                    .and_then(|k| k.derive(coin | H))
+                    .and_then(|k| k.derive(H))
+                else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "account derivation failed".into(),
+                    )));
+                };
+                let fp = hex::encode(&master.fingerprint());
+                let origin = format!("{fp}/84h/{coin}h/0h");
+                let xprv = account.encode();
+                let Some(xpub) = account.neuter(params.base58_ext_pubkey_prefix) else {
+                    return QueryReply::Now(Err((RPC_MISC_ERROR, "neuter failed".into())));
+                };
+                let xpub = xpub.encode();
+                // Descriptors carry their checksums (Core's wire form).
+                let with_sum = |body: String| {
+                    format!(
+                        "{body}#{}",
+                        avila_consensus::descriptor::descriptor_checksum(&body)
+                    )
+                };
+                let priv_descs = [
+                    with_sum(format!("wpkh([{origin}]{xprv}/0/*)")),
+                    with_sum(format!("wpkh([{origin}]{xprv}/1/*)")),
+                ];
+                let watch_descs = [
+                    (with_sum(format!("wpkh([{origin}]{xpub}/0/*)")), false),
+                    (with_sum(format!("wpkh([{origin}]{xpub}/1/*)")), true),
+                ];
+                let signing = match signer_provider_from_descs(&priv_descs, params) {
+                    Ok(s) => s,
+                    Err(e) => return QueryReply::Now(Err((RPC_INVALID_ADDRESS_OR_KEY, e))),
+                };
+
+                let mut w = match wallet.lock() {
+                    Ok(w) => w,
+                    Err(_) => {
+                        return QueryReply::Now(Err((
+                            RPC_MISC_ERROR,
+                            "wallet lock poisoned".into(),
+                        )));
+                    }
+                };
+                // Track the neutered variants through the real import
+                // path — the wallet sees its own coins; the private
+                // versions never touch the watch side.
+                for (d, internal) in &watch_descs {
+                    let req = json!({
+                        "desc": d,
+                        "timestamp": "now",
+                        "active": true,
+                        "internal": internal,
+                        "range": [0, 999],
+                    });
+                    if let Err((code, msg, _)) = import_one_descriptor(&mut w, cs, &req) {
+                        return QueryReply::Now(Err((code, msg)));
+                    }
+                }
+                w.enable_signing(crate::watch::SignerState {
+                    provider: signing,
+                    descs_private: priv_descs.to_vec(),
+                    descs_watch: watch_descs.iter().map(|(d, _)| d.clone()).collect(),
+                    provenance: provenance.clone(),
+                    entropy_commitment: resolved.commitment.clone(),
+                });
+                QueryReply::Now(Ok(json!({
+                    "master_fingerprint": fp,
+                    "xprv": master.encode(),
+                    "descriptors": watch_descs.iter().map(|(d, _)| d.clone()).collect::<Vec<_>>(),
+                    "entropy_source": provenance,
+                    "entropy_commitment": resolved.commitment,
+                    "warnings": resolved.warnings,
+                    "warning": "memory-only signer — restart clears key material; back up via signerexport or the xprv above",
+                })))
+            })
+        }
+
+        // Opt-in spending (queue #35): construct, verify, sign, and
+        // broadcast a payment from the wallet's own coins — the whole
+        // path stays local; the tx takes the same stem hop as any
+        // local broadcast.
+        "sendtoaddress" => {
+            let address = param(params, 0, "address")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let amount_arg = param(params, 1, "amount").cloned();
+            let wallet = wallet.cloned();
+            chain_query_deferred(method, queries, move |cs, mgr| {
+                let Some(wallet) = wallet else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    )));
+                };
+                let (Some(address), Some(amount_arg)) = (address, amount_arg) else {
+                    return QueryReply::Now(Err((
+                        RPC_INVALID_PARAMETER,
+                        "sendtoaddress requires address and amount".into(),
+                    )));
+                };
+                let params = cs.tree().params();
+                let Some(dest) = avila_consensus::address::address_to_script(&address, params)
+                else {
+                    return QueryReply::Now(Err((
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        "Invalid Bitcoin address".into(),
+                    )));
+                };
+                let amount = match amount_from_value(&amount_arg) {
+                    Ok(a) if a > 0 => a,
+                    _ => {
+                        return QueryReply::Now(Err((
+                            RPC_INVALID_PARAMETER,
+                            "Invalid amount".into(),
+                        )));
+                    }
+                };
+                let mut w = match wallet.lock() {
+                    Ok(w) => w,
+                    Err(_) => {
+                        return QueryReply::Now(Err((
+                            RPC_MISC_ERROR,
+                            "wallet lock poisoned".into(),
+                        )));
+                    }
+                };
+                let Some(signer_descs) = w.signer().map(|s| s.descs_private.clone()) else {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        "wallet has no signing keys".into(),
+                    )));
+                };
+                let _ = signer_descs;
+                // Coin selection v1 (queue #38 owns the privacy-aware
+                // version): largest-first accumulation — honest and
+                // simple, and our txs already announce via stem.
+                w.advance(cs);
+                let feerate = mgr.mempool_ref().estimate_fee(6).unwrap_or(1000); // sat/kvB; 1 sat/vB floor
+                // p2wpkh in ≈68 vB, out ≈31 vB, overhead ≈11.
+                let mut chosen: Vec<(OutPoint, i64)> = Vec::new();
+                let mut coins: Vec<_> = w.unspent().map(|(op, c)| (op, c.value)).collect();
+                coins.sort_by_key(|c| std::cmp::Reverse(c.1));
+                // Overhead + dest + change — count the change output
+                // up front (Core's conservative estimate; overpays a
+                // hair when no change results).
+                let mut est_vsize = 11i64 + 62;
+                for (op, v) in coins {
+                    chosen.push((op, v));
+                    est_vsize += 68;
+                    let fee = (feerate * est_vsize) / 1000;
+                    let total: i64 = chosen.iter().map(|(_, v)| v).sum();
+                    if total >= amount + fee {
+                        break;
+                    }
+                }
+                let total: i64 = chosen.iter().map(|(_, v)| v).sum();
+                let fee = (feerate * est_vsize) / 1000;
+                if total < amount + fee {
+                    return QueryReply::Now(Err((RPC_WALLET_ERROR, "Insufficient funds".into())));
+                }
+                // Change above dust goes to the internal descriptor's
+                // next index (Core's change-addr convention).
+                let change_value = total - amount - fee;
+                let mut outputs = vec![TxOut {
+                    value: amount,
+                    script_pubkey: dest,
+                }];
+                if change_value > 546 {
+                    let Some(idx) = w
+                        .descs
+                        .iter()
+                        .position(|d| d.active && d.internal && d.range.1 >= d.range.0)
+                    else {
+                        return QueryReply::Now(Err((
+                            RPC_WALLET_ERROR,
+                            "no internal descriptor for change".into(),
+                        )));
+                    };
+                    let d = &w.descs[idx];
+                    let pos = d.next_index;
+                    let desc_text = d.desc.clone();
+                    let (parsed, provider, _) = match parse_descriptors(&desc_text, params, true) {
+                        Ok(v) => v,
+                        Err(e) => return QueryReply::Now(Err((RPC_INVALID_ADDRESS_OR_KEY, e))),
+                    };
+                    let Some(scripts) = parsed[0].expand(pos, &provider) else {
+                        return QueryReply::Now(Err((
+                            RPC_WALLET_ERROR,
+                            "change derivation failed".into(),
+                        )));
+                    };
+                    let Some(change_spk) = scripts
+                        .iter()
+                        .find(|s| s.len() == 22 && s[0] == 0x00 && s[1] == 0x14)
+                    else {
+                        return QueryReply::Now(Err((
+                            RPC_WALLET_ERROR,
+                            "no wpkh change script".into(),
+                        )));
+                    };
+                    outputs.push(TxOut {
+                        value: change_value,
+                        script_pubkey: Script::new(change_spk.clone()),
+                    });
+                    w.descs[idx].next_index = pos + 1;
+                }
+                // Fingerprint-matched to Core's wallet: version 2,
+                // RBF-signalling sequence, anti-fee-sniping locktime,
+                // random output ordering.
+                let inputs: Vec<TxIn> = chosen
+                    .iter()
+                    .map(|(op, _)| TxIn {
+                        previous_output: *op,
+                        script_sig: Script::new(Vec::new()),
+                        sequence: 0xffff_fffd,
+                        witness: Witness::default(),
+                    })
+                    .collect();
+                // BIP69-style ordering is NOT used — Core shuffles;
+                // match the dominant fingerprint (queue #38 measures).
+                let mut order: Vec<usize> = (0..outputs.len()).collect();
+                if outputs.len() == 2 {
+                    let mut b = [0u8; 1];
+                    let _ = getrandom::fill(&mut b);
+                    if b[0] & 1 == 1 {
+                        order.swap(0, 1);
+                    }
+                }
+                let outputs: Vec<TxOut> = order.iter().map(|&i| outputs[i].clone()).collect();
+                let tx = Transaction {
+                    version: 2,
+                    inputs,
+                    outputs,
+                    lock_time: cs.chain().len().saturating_sub(1) as u32,
+                };
+                // Sign: PSBT → verified prevouts → Creator::Real → finalize.
+                let mut psbt = avila_consensus::psbt::Psbt::from_unsigned_tx(tx);
+                let signer_provider = match w.signer() {
+                    Some(s) => s.provider.clone(),
+                    None => {
+                        return QueryReply::Now(Err((
+                            RPC_WALLET_ERROR,
+                            "wallet has no signing keys".into(),
+                        )));
+                    }
+                };
+                let (verified, unverified) =
+                    match avila_consensus::sign::verify_and_fill_prevouts(cs.utxo(), &mut psbt) {
+                        Ok(v) => v,
+                        Err(msg) => return QueryReply::Now(Err((RPC_VERIFY_ERROR, msg))),
+                    };
+                if unverified > 0 {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        format!("{unverified} input(s) not in the verified UTXO set"),
+                    )));
+                }
+                let _ = verified;
+                let txdata = avila_consensus::sign::precompute_psbt_data(&psbt);
+                let mut complete = true;
+                for i in 0..psbt.tx.inputs.len() {
+                    complete &= avila_consensus::sign::sign_psbt_input(
+                        &signer_provider,
+                        &mut psbt,
+                        i,
+                        Some(&txdata),
+                        1,
+                        false,
+                        None,
+                        true,
+                    );
+                }
+                if !complete {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        "signing incomplete — missing keys for some inputs".into(),
+                    )));
+                }
+                let Some(final_tx) = avila_consensus::sign::finalize_and_extract_psbt(&mut psbt)
+                else {
+                    return QueryReply::Now(Err((RPC_WALLET_ERROR, "finalization failed".into())));
+                };
+                let bytes = final_tx.encode();
+                QueryReply::Now(admit_and_relay(cs, mgr, final_tx, bytes))
+            })
+        }
+
+        // Opt-in signing (queue #35): sign a PSBT with the wallet's
+        // keys — every prevout claim verified against the node's own
+        // verified UTXO set, not trusted from the PSBT (the LSB-010
+        // fee-attack class solved structurally).
+        "walletprocesspsbt" => {
+            let psbt_b64 = param(params, 0, "psbt")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let wallet = wallet.cloned();
+            chain_query_deferred(method, queries, move |cs, _| {
+                let Some(wallet) = wallet else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    )));
+                };
+                let Some(psbt_b64) = psbt_b64 else {
+                    return QueryReply::Now(Err((
+                        RPC_INVALID_PARAMETER,
+                        "walletprocesspsbt requires a base64 psbt".into(),
+                    )));
+                };
+                let w = match wallet.lock() {
+                    Ok(w) => w,
+                    Err(_) => {
+                        return QueryReply::Now(Err((
+                            RPC_MISC_ERROR,
+                            "wallet lock poisoned".into(),
+                        )));
+                    }
+                };
+                let Some(signer) = w.signer() else {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        "wallet has no signing keys — run createdescriptorseed or import private material".into(),
+                    )));
+                };
+                let Some(bytes) = base64_decode_strict(psbt_b64.trim()) else {
+                    return QueryReply::Now(Err((
+                        RPC_DESERIALIZATION_ERROR,
+                        "psbt decode failed: invalid base64".into(),
+                    )));
+                };
+                let mut psbt = match avila_consensus::psbt::Psbt::decode(&bytes) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return QueryReply::Now(Err((
+                            RPC_DESERIALIZATION_ERROR,
+                            format!("psbt decode failed: {}", e.core_message()),
+                        )));
+                    }
+                };
+                // UTXO-verified prevouts: where our verified set has
+                // the coin, the PSBT's claimed value/script MUST match
+                // it exactly — a lying host can't claim a lower
+                // amount (the hardware-wallet fee attack). Where it
+                // doesn't (spent or foreign prevout) we can't verify —
+                // counted separately, never silently trusted.
+                let (verified, unverified) =
+                    match avila_consensus::sign::verify_and_fill_prevouts(cs.utxo(), &mut psbt) {
+                        Ok(v) => v,
+                        Err(msg) => return QueryReply::Now(Err((RPC_VERIFY_ERROR, msg))),
+                    };
+                let txdata = avila_consensus::sign::precompute_psbt_data(&psbt);
+                let mut complete = true;
+                for i in 0..psbt.tx.inputs.len() {
+                    complete &= avila_consensus::sign::sign_psbt_input(
+                        &signer.provider,
+                        &mut psbt,
+                        i,
+                        Some(&txdata),
+                        1,     // SIGHASH_ALL
+                        false, // real signatures, not the dummy creator
+                        None,
+                        false,
+                    );
+                }
+                QueryReply::Now(Ok(json!({
+                    "psbt": base64_encode(&psbt.encode()),
+                    "complete": complete,
+                    "inputs_verified": verified,
+                    "inputs_unverified": unverified,
+                })))
+            })
+        }
+
+        // Signer persistence (queue #35): the vault holds the private
+        // descriptors + provenance under argon2id → ChaCha20Poly1305.
+        // Secrets never share a file with watch state; the vault path
+        // is a sibling of watchlist.dat.
+        "signerexport" => {
+            let passphrase = param(params, 0, "passphrase")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let wallet = wallet.cloned();
+            chain_query(method, queries, move |_, _| {
+                let Some(wallet) = wallet else {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    ));
+                };
+                let Some(passphrase) = passphrase.filter(|p| !p.is_empty()) else {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "signerexport requires a non-empty passphrase".into(),
+                    ));
+                };
+                let w = wallet
+                    .lock()
+                    .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                let Some(signer) = w.signer() else {
+                    return Err((RPC_WALLET_ERROR, "wallet has no signing keys".into()));
+                };
+                let blob = crate::watch::vault_seal(signer, &passphrase)
+                    .map_err(|e| (RPC_WALLET_ERROR, e))?;
+                let path = w.vault_path();
+                // Atomic write, like watchlist.dat.
+                let tmp = path.with_extension("tmp");
+                std::fs::write(&tmp, &blob)
+                    .and_then(|_| std::fs::rename(&tmp, &path))
+                    .map_err(|e| (RPC_WALLET_ERROR, format!("vault write failed: {e}")))?;
+                Ok(json!({
+                    "path": path.display().to_string(),
+                    "descs": signer.descs_private.len(),
+                }))
+            })
+        }
+
+        "signerload" => {
+            let passphrase = param(params, 0, "passphrase")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let wallet = wallet.cloned();
+            chain_query(method, queries, move |cs, _| {
+                let Some(wallet) = wallet else {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    ));
+                };
+                let Some(passphrase) = passphrase else {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "signerload requires a passphrase".into(),
+                    ));
+                };
+                let mut w = wallet
+                    .lock()
+                    .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                if w.signer().is_some() {
+                    return Err((
+                        RPC_WALLET_ERROR,
+                        "signer already loaded — signerlock first".into(),
+                    ));
+                }
+                let path = w.vault_path();
+                let blob = std::fs::read(&path)
+                    .map_err(|e| (RPC_WALLET_ERROR, format!("vault read failed: {e}")))?;
+                let vault = crate::watch::vault_open(&blob, &passphrase)
+                    .map_err(|e| (RPC_WALLET_ERROR, e))?;
+                let params = cs.tree().params();
+                let provider = signer_provider_from_descs(&vault.descs_private, params)
+                    .map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
+                // Re-import the neutered watch descs — idempotent if
+                // they're already tracked (import rejects exact dups).
+                let mut imported = 0usize;
+                for d in &vault.descs_watch {
+                    let req = json!({
+                        "desc": d,
+                        "timestamp": "now",
+                        "active": true,
+                        "internal": d.contains("/1/*"),
+                        "range": [0, 999],
+                    });
+                    if import_one_descriptor(&mut w, cs, &req).is_ok() {
+                        imported += 1;
+                    }
+                }
+                w.enable_signing(crate::watch::SignerState {
+                    provider,
+                    descs_private: vault.descs_private,
+                    descs_watch: vault.descs_watch,
+                    provenance: vault.provenance,
+                    entropy_commitment: vault.entropy_commitment.clone(),
+                });
+                Ok(json!({
+                    "loaded": true,
+                    "descs_imported": imported,
+                    "entropy_commitment": vault.entropy_commitment,
+                }))
+            })
+        }
+
+        "signerlock" => {
+            let wallet = wallet.cloned();
+            chain_query(method, queries, move |_, _| {
+                let Some(wallet) = wallet else {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    ));
+                };
+                let mut w = wallet
+                    .lock()
+                    .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                let had = w.signer().is_some();
+                w.disable_signing();
+                Ok(json!({ "locked": had }))
+            })
+        }
+
         "listdescriptors" => {
             let wallet = wallet.cloned();
             chain_query(method, queries, move |_, _| {
@@ -10596,6 +11553,11 @@ pub(crate) fn dispatch(
                         "height": w.chain.len() as i64 - 1,
                     },
                     "private_keys_enabled": false,
+                    // Opt-in signer (queue #35) — watch-only default
+                    // unchanged; when a signer is installed the wallet
+                    // can sign via walletprocesspsbt.
+                    "signing": w.is_signer(),
+                    "entropy_source": w.signer().map(|sg| sg.provenance.clone()),
                 }))
             })
         }
@@ -10643,11 +11605,7 @@ pub(crate) fn dispatch(
                         }));
                     }
                 }
-                rows.sort_by_key(|r| {
-                    std::cmp::Reverse(
-                        r["blockheight"].as_i64().unwrap_or(0),
-                    )
-                });
+                rows.sort_by_key(|r| std::cmp::Reverse(r["blockheight"].as_i64().unwrap_or(0)));
                 let skip = skip.max(0) as usize;
                 let out: Vec<Value> = rows
                     .into_iter()
@@ -12686,7 +13644,7 @@ mod tests {
         let (r, e) = snap_dispatch("getblockcount", &Value::Null, &snap);
         assert_eq!(r, json!(120));
         assert!(e.is_none());
-        let (_, e) = snap_dispatch("sendtoaddress", &Value::Null, &snap);
+        let (_, e) = snap_dispatch("bumpfee", &Value::Null, &snap);
         assert_eq!(e.unwrap().0, RPC_METHOD_NOT_FOUND);
         let (r, _) = snap_dispatch("uptime", &Value::Null, &snap);
         assert_eq!(r, json!(42));

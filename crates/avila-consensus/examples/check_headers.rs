@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Reference-adapter helper: feed raw concatenated 80-byte headers through
 //! [`HeaderTree`] and print one verdict per header for comparison against the
 //! reference daemon's `submitheader` RPC (see `tools/check_headers_core.py`).

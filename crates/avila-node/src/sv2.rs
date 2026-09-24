@@ -135,7 +135,7 @@ fn merkle_path(txids: &[[u8; 32]]) -> Vec<[u8; 32]> {
 }
 
 /// Serves the Sv2 TP protocol on `addr`. Plaintext framing; refuses to
-/// bind a non-loopback address unless [`ALLOW_NONLOOPBACK_ENV`] opts
+/// bind a non-loopback address unless `ALLOW_NONLOOPBACK_ENV` opts
 /// in, since plaintext is only legal for loopback until Noise lands
 /// (see the module doc).
 ///

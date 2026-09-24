@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Live network evidence: resolve a DNS seed, handshake real Bitcoin
 //! peers, and validate actual headers — and optionally blocks — through
 //! `Chainstate`. Works on any network with DNS seeds.
@@ -68,7 +71,19 @@ fn main() -> Result<(), String> {
                 NetEvent::Disconnected { peer, reason } => {
                     println!("peer {peer} gone: {reason:?}")
                 }
-                NetEvent::Announced { .. } | NetEvent::TipAdvanced(_) => {}
+                NetEvent::EclipseSuspected(signals) => {
+                    println!("eclipse indicators: {signals:?}")
+                }
+                NetEvent::ReconDivergence {
+                    peer, their_misses, ..
+                } => println!("peer {peer}: {their_misses} recon their-misses — filtered view?"),
+                NetEvent::CpuThrottled { peer, rate_ns } => {
+                    println!("peer {peer}: cpu-throttled at {rate_ns}ns/s")
+                }
+                NetEvent::Announced { .. }
+                | NetEvent::TipAdvanced(_)
+                | NetEvent::ProxyUnreachable
+                | NetEvent::V2Downgraded { .. } => {}
             }
         }
         let indexed = cs.tree().len() - 1;

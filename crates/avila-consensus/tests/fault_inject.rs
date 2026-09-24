@@ -11,8 +11,12 @@
 //!      appends), then index slots, then the header count
 //!   2. `sync` — fsync dat then idx
 //!   3. redb write tx — undo records + `meta` (tip, coins_len)
+//!
 //! A crash between 2 and 3 leaves hash coins ahead of the persisted
 //! tip; a crash inside 1 leaves torn records/slots.
+
+// Fault-injection asserts on outcomes — panics are the test mechanism.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use avila_consensus::coinsdb::{CoinsBackend, Engine};
 use avila_consensus::connect::Coin;
