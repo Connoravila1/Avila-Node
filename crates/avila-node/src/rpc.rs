@@ -10143,7 +10143,11 @@ pub(crate) fn dispatch(
                     .collect();
                 let mut out = Vec::new();
                 let mut total = 0i64;
-                for (op, coin) in w.unspent() {
+                // Core's AvailableCoins: minimumSumAmount stops the
+                // scan once the running total reaches it — it's an
+                // early-exit budget, not a "the wallet must hold at
+                // least this much" precondition the RPC enforces.
+                'unspent: for (op, coin) in w.unspent() {
                     // `tip` here is the chain *count* — confs of a
                     // height-h coin = tip_height - h + 1 = count - h.
                     let confs = tip.saturating_sub(coin.height);
@@ -10167,9 +10171,12 @@ pub(crate) fn dispatch(
                         continue;
                     }
                     out.push(listunspent_entry(&w, op, coin, confs, address));
+                    if min_sum > 0 && total >= min_sum {
+                        break 'unspent;
+                    }
                 }
-                if include_unsafe && minconf == 0 {
-                    for tx in &mempool_txs {
+                if include_unsafe && minconf == 0 && !(min_sum > 0 && total >= min_sum) {
+                    'mempool: for tx in &mempool_txs {
                         let txid = tx.txid();
                         for (vout, txout) in tx.outputs.iter().enumerate() {
                             let Some(&(desc_idx, _)) =
@@ -10223,12 +10230,15 @@ pub(crate) fn dispatch(
                             j["safe"] = json!(false);
                             total += txout.value;
                             out.push(j);
+                            if min_sum > 0 && total >= min_sum {
+                                break 'mempool;
+                            }
                         }
                     }
                 }
-                if min_sum > 0 && total < min_sum {
-                    return Err((RPC_INVALID_PARAMETER, "Insufficient funds".into()));
-                }
+                // No "Insufficient funds" here — Core's listunspent
+                // never checks minimumSumAmount against what it found,
+                // it only uses it to stop scanning early once met.
                 let _ = w.persist();
                 Ok(Value::Array(out))
             })
@@ -14094,6 +14104,91 @@ mod tests {
             None,
         );
         assert_eq!(hex_neg, hex_zero);
+    }
+
+    /// `listunspent`'s `minimumSumAmount`: Core's `AvailableCoins`
+    /// uses it only to stop scanning early once the running total
+    /// reaches it — never as a "must hold at least this much"
+    /// precondition the RPC enforces.
+    #[test]
+    fn listunspent_minimum_sum_amount_stops_early_and_never_errors() {
+        let params = Network::Regtest.params();
+        let queries = query_server(Chainstate::new(&params));
+        let snap = snap();
+        let addr = "bcrt1q9mc2hc2f6x2lsxh7xnuu3fdjj628hvjatzgxcr";
+        let script = avila_consensus::address::address_to_script(addr, &params)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+
+        let wallet_path = std::env::temp_dir().join(format!(
+            "avila-rpc-listunspent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut w = crate::watch::WatchWallet::open(wallet_path);
+        w.track(
+            crate::watch::TrackedDesc {
+                desc: "addr(bcrt1q9mc2hc2f6x2lsxh7xnuu3fdjj628hvjatzgxcr)#x".into(),
+                timestamp: 0,
+                active: false,
+                internal: false,
+                label: String::new(),
+                next_index: 0,
+                range: (0, 0),
+                scripts: std::collections::HashMap::from([(script, 0)]),
+            },
+            0,
+        );
+        let wallet: SharedWallet = Arc::new(Mutex::new(w));
+
+        // Three coinbase blocks — 50 BTC each on regtest.
+        let (_, e) = dispatch(
+            "generatetoaddress",
+            &json!([3, addr]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+
+        // A minimumSumAmount comfortably under a single coin's value
+        // stops the scan after the first qualifying coin instead of
+        // collecting all three.
+        let (r, e) = dispatch(
+            "listunspent",
+            &json!([0, 9_999_999, [], true, {"minimumSumAmount": "1.0"}]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            Some(&wallet),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r.as_array().unwrap().len(), 1, "{r}");
+
+        // A minimumSumAmount no confirmed coin set could ever reach
+        // must still just return what's there — never Core's absent
+        // "Insufficient funds" error.
+        let (r, e) = dispatch(
+            "listunspent",
+            &json!([0, 9_999_999, [], true, {"minimumSumAmount": "1000000"}]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            Some(&wallet),
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r.as_array().unwrap().len(), 3, "{r}");
     }
 
     /// `decoderawtransaction` — the regtest genesis coinbase decodes
