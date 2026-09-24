@@ -44,6 +44,11 @@ pub const DEFAULT_MAX_BYTES: usize = 300_000_000;
 /// any input below `0xfffffffe` opts the tx into replacement.
 const RBF_SEQUENCE_THRESHOLD: u32 = 0xffff_fffe;
 
+/// BIP125 rule 5's `MAX_REPLACEMENT_CANDIDATES` (Core's
+/// `policy/rbf.h`) — a replacement may not evict more than this many
+/// entries in total, counting every conflict's in-pool descendants.
+pub const MAX_REPLACEMENT_CANDIDATES: usize = 100;
+
 /// A pooled transaction with the policy facts admission computed.
 #[derive(Clone, Debug)]
 pub struct MempoolEntry {
@@ -128,6 +133,11 @@ pub enum MempoolReject {
     /// that never confirmed.
     #[error("bad-txns-spends-conflicting-tx")]
     SpendsConflict,
+    /// BIP125 rule 5: replacing this tx's conflicts would evict more
+    /// than [`MAX_REPLACEMENT_CANDIDATES`] entries (conflicts plus
+    /// their descendants) — Core's `GetEntriesForConflicts`.
+    #[error("too many potential replacements")]
+    TooManyReplacements,
 }
 
 /// Core's `DEFAULT_ANCESTOR_LIMIT` — a candidate may not bring its
@@ -658,6 +668,20 @@ impl Mempool {
             ) {
                 return steps;
             }
+            if !push(
+                &mut steps,
+                "replacement-candidates",
+                if replaced.len() > MAX_REPLACEMENT_CANDIDATES {
+                    Err(format!(
+                        "too many potential replacements: {} > {MAX_REPLACEMENT_CANDIDATES}",
+                        replaced.len()
+                    ))
+                } else {
+                    Ok(format!("{} entries would be evicted", replaced.len()))
+                },
+            ) {
+                return steps;
+            }
         }
 
         let ancestor_vsize: usize = ancestors
@@ -885,15 +909,26 @@ impl Mempool {
         let vsize = tx.weight().div_ceil(4);
         let ancestors = self.ancestors_of(&tx);
 
-        // Core's `EntriesAndTxidsDisjoint`: a tx that both conflicts with
-        // a pooled entry and descends from it (directly, or through one
-        // of that entry's own in-pool descendants) is invalid — step 10
-        // below evicts the whole replaced set out from under it, leaving
-        // an ancestor reference that can never resolve.
         if !conflicts.is_empty() {
             let replaced = self.set_being_replaced(&conflicts);
+
+            // Core's `EntriesAndTxidsDisjoint`: a tx that both conflicts
+            // with a pooled entry and descends from it (directly, or
+            // through one of that entry's own in-pool descendants) is
+            // invalid — step 10 below evicts the whole replaced set out
+            // from under it, leaving an ancestor reference that can
+            // never resolve.
             if ancestors.iter().any(|a| replaced.contains(a)) {
                 return Err(MempoolReject::SpendsConflict);
+            }
+
+            // BIP125 rule 5 (Core's `GetEntriesForConflicts`,
+            // `MAX_REPLACEMENT_CANDIDATES`): cap how many entries a
+            // single replacement may evict, counting descendants —
+            // otherwise one low-fee input could force evicting an
+            // unbounded cluster.
+            if replaced.len() > MAX_REPLACEMENT_CANDIDATES {
+                return Err(MempoolReject::TooManyReplacements);
             }
         }
 
@@ -1736,6 +1771,58 @@ mod tests {
         }
     }
 
+    /// A tx spending every outpoint in `ops` into one output.
+    fn spend_many(ops: &[OutPoint], value: i64, sequence: u32) -> Transaction {
+        Transaction {
+            version: 2,
+            inputs: ops
+                .iter()
+                .map(|&previous_output| TxIn {
+                    previous_output,
+                    script_sig: Script::new(vec![]),
+                    sequence,
+                    witness: Witness::default(),
+                })
+                .collect(),
+            outputs: vec![TxOut {
+                value,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        }
+    }
+
+    /// Builds and pools a linear chain rooted at `op`: one root spending
+    /// `op`, then `extra` further txs each spending the previous one's
+    /// sole output — `1 + extra` pooled entries in total. Returns the
+    /// root's txid.
+    fn accept_chain(
+        pool: &mut Mempool,
+        cs: &Chainstate,
+        op: OutPoint,
+        extra: usize,
+        base_value: i64,
+    ) -> Txid {
+        let root = spend_tx(op, base_value, SEQ_RBF);
+        let root_id = root.txid();
+        pool.accept_tx(root, cs, NOW).unwrap();
+        let mut prev = OutPoint {
+            txid: root_id,
+            vout: 0,
+        };
+        let mut value = base_value;
+        for _ in 0..extra {
+            value -= 1_000;
+            let tx = spend_tx(prev, value, SEQ_FINAL);
+            prev = OutPoint {
+                txid: tx.txid(),
+                vout: 0,
+            };
+            pool.accept_tx(tx, cs, NOW).unwrap();
+        }
+        root_id
+    }
+
     fn mature_outpoint(blocks: &[Block], h: usize) -> OutPoint {
         OutPoint {
             txid: blocks[h - 1].transactions[0].txid(),
@@ -1869,6 +1956,33 @@ mod tests {
         );
         // The rejected replacement must not have taken its conflict with it.
         assert!(pool.get(&p_id).is_some());
+    }
+
+    #[test]
+    fn rbf_rejects_past_max_replacement_candidates() {
+        // BIP125 rule 5 (Core's GetEntriesForConflicts,
+        // MAX_REPLACEMENT_CANDIDATES = 100): five independent 25-entry
+        // chains (each at the ANCESTOR_LIMIT/DESCENDANT_LIMIT boundary)
+        // give 125 entries a single tx could evict by double-spending
+        // each chain's root input — past the rule-5 cap.
+        let (cs, blocks) = chainstate_at(105);
+        let mut pool = Mempool::new();
+        let mut roots_ops = Vec::new();
+        for h in 1..=5 {
+            let op = mature_outpoint(&blocks, h);
+            accept_chain(&mut pool, &cs, op, 24, 4_999_000_000);
+            roots_ops.push(op);
+        }
+        assert_eq!(pool.len(), 125, "5 chains of 25 entries each");
+
+        // `x` double-spends every chain root's input (a direct conflict
+        // with each root) without spending any pooled output itself.
+        let x = spend_many(&roots_ops, 20_000_000_000, SEQ_RBF);
+        assert_eq!(
+            pool.accept_tx(x, &cs, NOW),
+            Err(MempoolReject::TooManyReplacements)
+        );
+        assert_eq!(pool.len(), 125, "rejected replacement evicts nothing");
     }
 
     #[test]
