@@ -167,27 +167,34 @@ fn gr_decode(r: &mut BitReader<'_>, p: u8) -> Option<u64> {
 /// The element set a basic filter commits — Core's
 /// `BasicFilterElements`: every non-OP_RETURN, non-empty output
 /// scriptPubKey in the block, plus every non-empty scriptPubKey the
-/// undo data shows spent.
+/// undo data shows spent, deduplicated. Core collects into a
+/// `std::set<Element>`, so a repeated scriptPubKey (very common —
+/// change addresses, exchange hot wallets) contributes exactly one
+/// member; counting or hashing duplicates would desync `N`, the
+/// Golomb-Rice stream, and therefore the filter header from the rest
+/// of the network. `BTreeSet` also reproduces `std::set`'s
+/// lexicographic byte order, though only the dedup matters here since
+/// [`build_basic`] re-sorts by hash anyway.
 pub fn basic_elements(block: &Block, undo: &BlockUndo) -> Vec<Vec<u8>> {
-    let mut elements = Vec::new();
+    let mut elements = std::collections::BTreeSet::new();
     for tx in &block.transactions {
         for out in &tx.outputs {
             let s = out.script_pubkey.as_bytes();
             if s.first() == Some(&OP_RETURN) || s.is_empty() {
                 continue;
             }
-            elements.push(s.to_vec());
+            elements.insert(s.to_vec());
         }
     }
     for tx_undo in &undo.txs {
         for coin in &tx_undo.spent {
             let s = coin.out.script_pubkey.as_bytes();
             if !s.is_empty() {
-                elements.push(s.to_vec());
+                elements.insert(s.to_vec());
             }
         }
     }
-    elements
+    elements.into_iter().collect()
 }
 
 /// Builds the serialized basic filter for `block` — the CompactSize `N`
@@ -316,5 +323,76 @@ mod tests {
             .to_vec();
         assert_eq!(filter_match_any(&filter, &hash, &[member]), Some(true));
         assert_eq!(filter_match_any(&filter, &hash, &[vec![0x51]]), Some(false));
+    }
+
+    /// A minimal one-transaction block paying `output_scripts`, for
+    /// exercising [`basic_elements`] without a real serialized block.
+    fn test_block(output_scripts: &[Vec<u8>]) -> Block {
+        let outputs = output_scripts
+            .iter()
+            .map(|s| crate::transaction::TxOut {
+                value: 1_000,
+                script_pubkey: crate::transaction::Script::new(s.clone()),
+            })
+            .collect();
+        Block {
+            header: crate::header::BlockHeader {
+                version: 1,
+                prev_block_hash: BlockHash::from_bytes([0; 32]),
+                merkle_root: crate::hash::MerkleRoot::from_bytes([0; 32]),
+                time: 0,
+                bits: crate::arith::CompactTarget(0x207f_ffff),
+                nonce: 0,
+            },
+            transactions: vec![crate::transaction::Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs,
+                lock_time: 0,
+            }],
+        }
+    }
+
+    /// Two outputs paying the identical script — Core's
+    /// `BasicFilterElements` collects into a `std::set<Element>`, so a
+    /// repeated scriptPubKey (very common: change addresses, exchange
+    /// hot wallets) must count as exactly one member. Before the fix,
+    /// `N` (the leading CompactSize) and every hash after it diverged
+    /// from Core for any such block.
+    #[test]
+    fn basic_elements_deduplicates_repeated_scripts() {
+        let mut script_a = vec![0x00, 0x14];
+        script_a.extend_from_slice(&[0xaa; 20]);
+        let mut script_b = vec![0x00, 0x14];
+        script_b.extend_from_slice(&[0xbb; 20]);
+
+        let dup_block = test_block(&[script_a.clone(), script_a.clone()]);
+        assert_eq!(basic_elements(&dup_block, &BlockUndo::default()).len(), 1);
+        // CompactSize N=1 encodes as the single byte 0x01.
+        assert_eq!(build_basic(&dup_block, &BlockUndo::default())[0], 0x01);
+
+        // Two genuinely different scripts are still both kept.
+        let distinct_block = test_block(&[script_a.clone(), script_b.clone()]);
+        assert_eq!(
+            basic_elements(&distinct_block, &BlockUndo::default()).len(),
+            2
+        );
+
+        // A duplicate split between a new output and an undo-recorded
+        // spent coin is still just one element.
+        let mut undo = BlockUndo::default();
+        undo.txs.push(crate::connect::TxUndo {
+            spent: vec![crate::connect::Coin {
+                out: crate::transaction::TxOut {
+                    value: 500,
+                    script_pubkey: crate::transaction::Script::new(script_a.clone()),
+                },
+                height: 1,
+                coinbase: false,
+            }],
+            ..Default::default()
+        });
+        let single_block = test_block(&[script_a.clone()]);
+        assert_eq!(basic_elements(&single_block, &undo).len(), 1);
     }
 }
