@@ -10893,6 +10893,40 @@ pub(crate) fn dispatch(
             })
         }
 
+        // Queue #38: wallet-fingerprint self-measurement — score a tx
+        // against the published identification heuristics and report
+        // which wallet profile it resembles.
+        "fingerprintcheck" => {
+            let raw = param(params, 0, "hex")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            chain_query(method, queries, move |cs, _| {
+                let Some(raw) = raw else {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "fingerprintcheck requires a hex transaction".into(),
+                    ));
+                };
+                let bytes = hex::decode(&raw)
+                    .map_err(|e| (RPC_DESERIALIZATION_ERROR, format!("hex: {e}")))?;
+                let tx = Transaction::decode(&bytes)
+                    .map_err(|_| (RPC_DESERIALIZATION_ERROR, "TX decode failed".to_string()))?;
+                let height = cs.chain().len().saturating_sub(1) as u32;
+                let fp = crate::txfp::analyze(&tx, height);
+                Ok(json!({
+                    "signals": fp.signals.iter().map(|s| json!({
+                        "name": s.name,
+                        "value": s.value,
+                        "profile_hint": s.profile_hint,
+                    })).collect::<Vec<_>>(),
+                    "profile_scores": fp.profile_scores.iter().map(|(n, hit, of)| json!({
+                        "profile": n, "matched": hit, "of": of,
+                    })).collect::<Vec<_>>(),
+                    "best_match": fp.best_match,
+                }))
+            })
+        }
+
         // Queue #35: build a funded PSBT — Core's walletcreatefundedpsbt
         // shape (outputs object + options). Works on the WATCH wallet
         // too: the output is for external signers, so signing keys

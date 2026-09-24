@@ -331,7 +331,15 @@ first measurement that would kill or confirm it.
     derivation convention and mixing. Open: BIP39 mnemonic rendering
     of the seed, encrypted-at-rest vault, entropy-input file source.
 
-38. **Fingerprint self-measurement.** Run the published wallet-
+38. **Fingerprint self-measurement.** (shipped) `txfp::analyze` scores
+    a tx against the published heuristics — BIP69 ordering, anti-fee-
+    sniping nLockTime, RBF sequence value, low-R grinding, version,
+    round-payment detectability — and reports the profile it matches.
+    `fingerprintcheck` exposes it over RPC. Verified: our sendtoaddress
+    construction scores `core` (the mimicry target); a sorted/zero-
+    locktime fixture scores `electrum-like`. Open: feed per-spend
+    scores back into wallet responses; cluster-level analysis needs
+    graph context a single tx lacks. Run the published wallet-
     fingerprint taxonomy (BIP69 ordering, anti-fee-sniping nLockTime,
     nSequence value, low-R grinding, coin-selection shape, change
     position — ~50% single-tx identification accuracy in the

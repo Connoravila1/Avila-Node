@@ -15,6 +15,7 @@ pub mod rpc;
 pub mod sv2;
 pub mod sync;
 pub mod time;
+pub mod txfp;
 pub mod watch;
 
 use avila_core::{CAPABILITIES, Lifecycle, NodeSnapshot, ValidatedConfig};
