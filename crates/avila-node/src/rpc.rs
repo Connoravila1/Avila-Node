@@ -61,6 +61,10 @@ type QueryFn = Box<dyn FnOnce(&mut Chainstate, &mut PeerManager<TcpStream>) -> Q
 pub struct ChainQuery {
     run: QueryFn,
     reply: mpsc::Sender<Result<Value, (i64, String)>>,
+    /// The RPC method this query was built for, when it came from
+    /// `dispatch` — `None` for non-RPC consumers (Electrum, Sv2).
+    /// Read by the sync loop to name the method in a panic log line.
+    method: Option<String>,
 }
 
 impl ChainQuery {
@@ -77,9 +81,16 @@ impl ChainQuery {
             Self {
                 run: Box::new(move |cs, mgr| QueryReply::Now(f(cs, mgr))),
                 reply,
+                method: None,
             },
             rx,
         )
+    }
+
+    /// The originating RPC method, if this query was built by
+    /// `dispatch` — for logging only.
+    pub(crate) fn method(&self) -> Option<&str> {
+        self.method.as_deref()
     }
 
     /// Executes the query
@@ -811,7 +822,10 @@ fn reply_obj(result: Value, error: Option<(i64, String)>, id: &Option<Value>, v2
 /// `chain_query` whose closure may defer the reply for block
 /// reacquisition — `Defer` parks the query on the sync loop's rescan
 /// queue until the missing bodies arrive or the deadline passes.
+/// `method` is carried on the query only so a panic inside `f` can be
+/// logged by name — it plays no role in dispatch itself.
 fn chain_query_deferred(
+    method: &str,
     queries: Option<&QuerySender>,
     f: impl FnOnce(&mut Chainstate, &mut PeerManager<TcpStream>) -> QueryReply + Send + 'static,
 ) -> (Value, Option<(i64, String)>) {
@@ -829,6 +843,7 @@ fn chain_query_deferred(
         .send(ChainQuery {
             run: Box::new(f),
             reply: reply_tx,
+            method: Some(method.to_string()),
         })
         .is_err()
     {
@@ -840,7 +855,20 @@ fn chain_query_deferred(
     match reply_rx.recv_timeout(QUERY_TIMEOUT) {
         Ok(Ok(value)) => (value, None),
         Ok(Err(err)) => (Value::Null, Some(err)),
-        Err(_) => (
+        // The sender is dropped without ever sending when the sync
+        // loop's `catch_unwind` around `ChainQuery::answer` caught a
+        // panic inside `f` (see `sync::run`) — that disconnects
+        // `reply_rx` immediately, distinct from a live query that's
+        // just slow. Surface it as an internal error instead of
+        // reusing the timeout message.
+        Err(mpsc::RecvTimeoutError::Disconnected) => (
+            Value::Null,
+            Some((
+                RPC_INTERNAL_ERROR,
+                "internal error: chain query handler panicked".into(),
+            )),
+        ),
+        Err(mpsc::RecvTimeoutError::Timeout) => (
             Value::Null,
             Some((RPC_MISC_ERROR, "chain query timed out".into())),
         ),
@@ -848,12 +876,13 @@ fn chain_query_deferred(
 }
 
 fn chain_query(
+    method: &str,
     queries: Option<&QuerySender>,
     f: impl FnOnce(&mut Chainstate, &mut PeerManager<TcpStream>) -> Result<Value, (i64, String)>
     + Send
     + 'static,
 ) -> (Value, Option<(i64, String)>) {
-    chain_query_deferred(queries, move |cs, mgr| QueryReply::Now(f(cs, mgr)))
+    chain_query_deferred(method, queries, move |cs, mgr| QueryReply::Now(f(cs, mgr)))
 }
 
 /// The cap on parked `waitforblock*` predicates — a flood of wait calls
@@ -2240,6 +2269,7 @@ fn wait_timeout_ms(v: Option<&Value>) -> Result<i64, (i64, String)> {
 /// passes, or the loop shuts down. The answer is always the live tip
 /// (Core returns the current block on timeout or exit).
 fn block_wait(
+    method: &str,
     queries: Option<&QuerySender>,
     waiters: Option<&Arc<BlockWaiters>>,
     timeout_ms: i64,
@@ -2248,11 +2278,11 @@ fn block_wait(
     let Some(waiters) = waiters else {
         // No sync loop is feeding waiters — answer the current tip,
         // the same shape a zero-length timeout returns.
-        return chain_query(queries, |cs, _| Ok(wait_tip_result(cs)));
+        return chain_query(method, queries, |cs, _| Ok(wait_tip_result(cs)));
     };
     let (wake_tx, wake_rx) = mpsc::sync_channel(1);
     let registry = Arc::clone(waiters);
-    let (reg, reg_err) = chain_query(queries, move |cs, _mgr| {
+    let (reg, reg_err) = chain_query(method, queries, move |cs, _mgr| {
         let satisfied =
             check(cs) || !registry.register(Box::new(move |cs2, _mp| check(cs2)), wake_tx);
         Ok(json!({"tip": wait_tip_result(cs), "waiting": !satisfied}))
@@ -2280,7 +2310,7 @@ fn block_wait(
     if waiters.is_shutdown() {
         return (start_tip, None);
     }
-    let (tip, err) = chain_query(queries, |cs, _| Ok(wait_tip_result(cs)));
+    let (tip, err) = chain_query(method, queries, |cs, _| Ok(wait_tip_result(cs)));
     if tip.is_null() {
         (start_tip, None)
     } else {
@@ -5001,7 +5031,7 @@ pub(crate) fn dispatch(
                 .unwrap_or(Value::Null),
             None,
         ),
-        "getdifficulty" => chain_query(queries, |cs, _mgr| {
+        "getdifficulty" => chain_query(method, queries, |cs, _mgr| {
             let tip = cs.tip_hash();
             let node = cs.tree().get(&tip);
             Ok(node
@@ -5060,7 +5090,9 @@ pub(crate) fn dispatch(
             };
             // Core applies no range gate on either value — VerifyDB
             // clamps depth to the tip and level < 0 checks nothing.
-            chain_query(queries, move |cs, _| Ok(json!(cs.verify_tip(level, depth))))
+            chain_query(method, queries, move |cs, _| {
+                Ok(json!(cs.verify_tip(level, depth)))
+            })
         }
         "pruneblockchain" => {
             // No prune mode exists — Core's exact refusal.
@@ -5072,7 +5104,7 @@ pub(crate) fn dispatch(
                 )),
             )
         }
-        "getblockchaininfo" => chain_query(queries, |cs, _mgr| {
+        "getblockchaininfo" => chain_query(method, queries, |cs, _mgr| {
             let tip = cs.tip_hash();
             let connected = cs.chain().len().saturating_sub(1) as u32;
             let best_header = cs.tree().tip();
@@ -5120,7 +5152,7 @@ pub(crate) fn dispatch(
                 "warnings": [],
             }))
         }),
-        "getchainstates" => chain_query(queries, |cs, _| {
+        "getchainstates" => chain_query(method, queries, |cs, _| {
             // Core's `getchainstates`: chainstates ordered by work,
             // most-work last. An unverified snapshot reports two
             // entries — the background-validation replay first
@@ -5184,7 +5216,7 @@ pub(crate) fn dispatch(
                 return help_error(GETDEPLOYMENTINFO_HELP);
             }
             let sel = param(params, 0, "blockhash").cloned();
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let node = match sel {
                     None | Some(Value::Null) => {
                         let tip = cs.tip_hash();
@@ -5235,7 +5267,7 @@ pub(crate) fn dispatch(
                 return missing_params("address");
             };
             let addr = addr.to_owned();
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 match validate_address(&addr, cs.tree().params()) {
                     Ok(info) => {
                         // Core re-encodes the destination (canonical
@@ -5294,7 +5326,7 @@ pub(crate) fn dispatch(
                 arr[1].as_str().unwrap_or_default().to_owned(),
                 arr[2].as_str().unwrap_or_default().to_owned(),
             );
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let params = cs.tree().params();
                 let Some(script) = avila_consensus::address::address_to_script(&addr, params)
                 else {
@@ -5337,7 +5369,7 @@ pub(crate) fn dispatch(
                 arr[0].as_str().unwrap_or_default().to_owned(),
                 arr[1].as_str().unwrap_or_default().to_owned(),
             );
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let Some((key, compressed)) = avila_consensus::message::decode_secret(
                     &wif,
                     cs.tree().params().base58_secret_prefix,
@@ -5365,7 +5397,7 @@ pub(crate) fn dispatch(
                 );
             };
             let script = Script::new(bytes);
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 Ok(decodescript_json(&script, cs.tree().params()))
             })
         }
@@ -5428,7 +5460,7 @@ pub(crate) fn dispatch(
                     Some((RPC_DESERIALIZATION_ERROR, "TX decode failed".into())),
                 );
             };
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 Ok(tx_json(&tx, cs.tree().params(), false))
             })
         }
@@ -5468,7 +5500,7 @@ pub(crate) fn dispatch(
                     );
                 }
             };
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let params_ref = cs.tree().params();
                 Ok(psbt_json(&psbt, params_ref))
             })
@@ -5477,7 +5509,7 @@ pub(crate) fn dispatch(
             let Some(height) = param(params, 0, "height").and_then(Value::as_u64) else {
                 return missing_params("height");
             };
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 cs.chain()
                     .get(height as usize)
                     .map(|h| json!(h.to_string()))
@@ -5494,7 +5526,7 @@ pub(crate) fn dispatch(
             let verbose = param(params, 1, "verbose")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let Some(node) = cs.tree().get(&hash) else {
                     return Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into()));
                 };
@@ -5518,7 +5550,7 @@ pub(crate) fn dispatch(
             let verbosity = param(params, 1, "verbosity")
                 .and_then(Value::as_u64)
                 .unwrap_or(1);
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let Some(node) = cs.tree().get(&hash) else {
                     return Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into()));
                 };
@@ -5576,7 +5608,7 @@ pub(crate) fn dispatch(
                         .collect()
                 });
             let selector = selector.clone();
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 // ParseHashOrHeight: a number walks the active chain, a
                 // string is a block hash known to the header tree.
                 let node = match &selector {
@@ -5680,7 +5712,7 @@ pub(crate) fn dispatch(
             let include_mempool = param(params, 2, "include_mempool")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let outpoint = OutPoint {
                     txid,
                     vout: vout as u32,
@@ -5846,7 +5878,7 @@ pub(crate) fn dispatch(
                 };
                 outpoints.push((OutPoint { txid, vout }, txid.to_string(), u64::from(vout)));
             }
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let _ = cs;
                 Ok(json!(
                     outpoints
@@ -5946,7 +5978,7 @@ pub(crate) fn dispatch(
                     );
                 }
             };
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 // Block selection — Core: explicit hash, else the first
                 // txid with an unspent vout 0 (AccessByTxid), else the
                 // txindex's containing block.
@@ -6117,7 +6149,7 @@ pub(crate) fn dispatch(
                     );
                 }
             };
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let mut d = avila_consensus::encode::Decoder::new(&bytes);
                 // Classic: header ‖ txn. Witness form: i32 version
                 // (-2/-1) ‖ header ‖ txn ‖ gentx ‖ (wtxid_tree | bool).
@@ -6343,7 +6375,7 @@ pub(crate) fn dispatch(
                 Some(v) if !v.is_null() => Some(v.as_str().unwrap_or_default().to_string()),
                 _ => None,
             };
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let mut out = serde_json::Map::new();
                 let best = cs.chain().len() as u32 - 1;
                 if cs.txindex_enabled() && filter.as_deref().is_none_or(|f| f == "txindex") {
@@ -6382,7 +6414,7 @@ pub(crate) fn dispatch(
             let block_hash = param(params, 2, "blockhash")
                 .and_then(Value::as_str)
                 .and_then(|s| s.parse::<BlockHash>().ok());
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 // Core's lookup order: mempool first, then the named
                 // block or the txindex; a plain txid without either is
                 // the documented -5. The genesis coinbase is refused on
@@ -6470,7 +6502,7 @@ pub(crate) fn dispatch(
         // Core's savemempool — writes mempool.dat under the chainstate
         // dir and returns its path; without a store there is nowhere
         // persistent to write, which is an honest -1 misc error.
-        "savemempool" => chain_query(queries, |_cs, mgr| {
+        "savemempool" => chain_query(method, queries, |_cs, mgr| {
             let Some(store) = _cs.store() else {
                 return Err((RPC_MISC_ERROR, "no data directory configured".into()));
             };
@@ -6494,7 +6526,7 @@ pub(crate) fn dispatch(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 // Relative paths resolve against the network datadir
                 // (Core's AbsPathJoin); without a store, the arg is
                 // used as given.
@@ -6523,7 +6555,7 @@ pub(crate) fn dispatch(
                 }
             })
         }
-        "getpeerinfo" => chain_query(queries, |cs, mgr| {
+        "getpeerinfo" => chain_query(method, queries, |cs, mgr| {
             Ok(Value::Array(
                 mgr.peer_snapshots()
                     .iter()
@@ -6629,7 +6661,7 @@ pub(crate) fn dispatch(
                     .collect(),
             ))
         }),
-        "getmempoolinfo" => chain_query(queries, |_, mgr| {
+        "getmempoolinfo" => chain_query(method, queries, |_, mgr| {
             let pool = mgr.mempool_ref();
             let bytes = pool.total_tx_bytes();
             // BTC-denominated fields like Core's: our counters are
@@ -6655,7 +6687,7 @@ pub(crate) fn dispatch(
                 "fullrbf": pool.full_rbf(),
             }))
         }),
-        "getchaintips" => chain_query(queries, |cs, _| {
+        "getchaintips" => chain_query(method, queries, |cs, _| {
             // A tip is an indexed node no other node points at as
             // parent — the same shape Core's setBlockIndexCandidates
             // walk produces.
@@ -6709,7 +6741,7 @@ pub(crate) fn dispatch(
             let verbose = param(params, 0, "verbose")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            chain_query(queries, move |_, mgr| {
+            chain_query(method, queries, move |_, mgr| {
                 let pool = mgr.mempool_ref();
                 if verbose {
                     let map: serde_json::Map<String, Value> = pool
@@ -6742,7 +6774,7 @@ pub(crate) fn dispatch(
                 .unwrap_or(false);
             // `method` borrows the request — own it for the 'static closure.
             let which = method.to_string();
-            chain_query(queries, move |_, mgr| {
+            chain_query(method, queries, move |_, mgr| {
                 let pool = mgr.mempool_ref();
                 let Some(entry) = pool.entry(&txid) else {
                     return Err((
@@ -6774,7 +6806,7 @@ pub(crate) fn dispatch(
             if raws.is_empty() {
                 return missing_params("rawtxs");
             }
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let mut out = Vec::with_capacity(raws.len());
                 for raw in raws {
                     let Ok(bytes) = hex::decode(&raw) else {
@@ -6847,7 +6879,7 @@ pub(crate) fn dispatch(
             // "TX decode failed. Make sure the tx has at least one
             // input." (decoderawtransaction keeps the bare wording).
             let bytes = hex::decode(raw).unwrap_or_default();
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let tx = match Transaction::decode(&bytes) {
                     Ok(tx) => tx,
                     Err(_) => {
@@ -7048,7 +7080,7 @@ pub(crate) fn dispatch(
                     );
                 }
             }
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 // CheckPackage's remaining package-wide rules, reached
                 // only after the topology throw above and only for
                 // multi-tx packages: intra-package input conflicts,
@@ -7243,7 +7275,7 @@ pub(crate) fn dispatch(
                     Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
                 );
             };
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 if !cs.tree().contains(&hash) {
                     return Err((RPC_MISC_ERROR, "Block header missing".into()));
                 }
@@ -7293,7 +7325,9 @@ pub(crate) fn dispatch(
             };
             // Core fires when the block gains BLOCK_HAVE_DATA — body in
             // the store or the parked map, connected or not.
-            block_wait(queries, waiters, timeout, move |cs| cs.have_body(&hash))
+            block_wait(method, queries, waiters, timeout, move |cs| {
+                cs.have_body(&hash)
+            })
         }
         "waitforblockheight" => {
             let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -7326,7 +7360,7 @@ pub(crate) fn dispatch(
                 Ok(t) => t,
                 Err(e) => return (Value::Null, Some(e)),
             };
-            block_wait(queries, waiters, timeout, move |cs| {
+            block_wait(method, queries, waiters, timeout, move |cs| {
                 cs.chain().len() as i64 > height as i64
             })
         }
@@ -7352,7 +7386,7 @@ pub(crate) fn dispatch(
             };
             // The tip the call started from — Core's `block` snapshot at
             // WaitStart; the waiter fires on the first *different* tip.
-            let (start, start_err) = chain_query(queries, |cs, _| Ok(wait_tip_result(cs)));
+            let (start, start_err) = chain_query(method, queries, |cs, _| Ok(wait_tip_result(cs)));
             if let Some(err) = start_err {
                 return (Value::Null, Some(err));
             }
@@ -7361,7 +7395,7 @@ pub(crate) fn dispatch(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            block_wait(queries, waiters, timeout, move |cs| {
+            block_wait(method, queries, waiters, timeout, move |cs| {
                 cs.chain().last().map(ToString::to_string).as_deref() != Some(start_hash.as_str())
             })
         }
@@ -7421,7 +7455,7 @@ pub(crate) fn dispatch(
             let rbf: Option<bool> = arr.get(3).and_then(Value::as_bool);
             let inputs = arr[0].clone();
             let outputs = arr[1].clone();
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let tx = build_raw_tx(&inputs, &outputs, locktime, rbf, cs.tree().params())?;
                 Ok(json!(hex::encode(&tx.encode())))
             })
@@ -7477,7 +7511,7 @@ pub(crate) fn dispatch(
             let rbf: Option<bool> = arr.get(3).and_then(Value::as_bool);
             let inputs = arr[0].clone();
             let outputs = arr[1].clone();
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let tx = build_raw_tx(&inputs, &outputs, locktime, rbf, cs.tree().params())?;
                 Ok(json!(base64_encode(
                     &avila_consensus::psbt::Psbt::from_unsigned_tx(tx).encode()
@@ -7929,7 +7963,7 @@ pub(crate) fn dispatch(
             let descs_arg = param(params, 1, "descriptors")
                 .cloned()
                 .unwrap_or(Value::Null);
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 // `HidingSigningProvider(provider, hide_secret=true,
                 // hide_origin=false)`, `sighash_type=SIGHASH_ALL`,
                 // `finalize=false`.
@@ -8070,7 +8104,7 @@ pub(crate) fn dispatch(
             let finalize = param(params, 4, "finalize")
                 .map(|v| v.is_null() || v.as_bool().unwrap_or(false))
                 .unwrap_or(true);
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 process_psbt(
                     &mut psbt,
                     &descs_arg,
@@ -8137,7 +8171,7 @@ pub(crate) fn dispatch(
             let sighash_arg = param(params, 3, "sighashtype")
                 .cloned()
                 .unwrap_or(Value::Null);
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let prefix = cs.tree().params().base58_secret_prefix;
                 let mut provider = avila_consensus::descriptor::FlatProvider::default();
                 for k in privkeys.as_array().map(Vec::as_slice).unwrap_or(&[]) {
@@ -8272,7 +8306,7 @@ pub(crate) fn dispatch(
                 );
             }
             let mut merged = variants[0].clone();
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let pool = mgr.mempool_ref();
                 for i in 0..merged.inputs.len() {
                     let op = merged.inputs[i].previous_output;
@@ -8421,7 +8455,7 @@ pub(crate) fn dispatch(
                         .collect()
                 })
                 .unwrap_or_default();
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let params = cs.tree().params();
                 // AddAndGetMultisigDestination — bounds before build.
                 if required < 1 {
@@ -8563,7 +8597,7 @@ pub(crate) fn dispatch(
                 );
             }
             let desc_text = arr[0].as_str().unwrap_or_default().to_owned();
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let params = cs.tree().params();
                 let (descs, provider, _checksum) =
                     match avila_consensus::descriptor::parse_descriptors(&desc_text, params, false)
@@ -8617,7 +8651,7 @@ pub(crate) fn dispatch(
             }
             let desc_text = arr[0].as_str().unwrap_or_default().to_owned();
             let range_arg = arr.get(1).cloned();
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let params = cs.tree().params();
                 let range_err = |msg: &str| (RPC_INVALID_PARAMETER, msg.to_string());
                 let (mut lo, mut hi) = (0i64, 0i64);
@@ -8734,7 +8768,7 @@ pub(crate) fn dispatch(
                     )),
                 );
             }
-            chain_query(queries, move |_cs, mgr| {
+            chain_query(method, queries, move |_cs, mgr| {
                 mgr.mempool().prioritise(&txid, fee_delta);
                 Ok(json!(true))
             })
@@ -8747,7 +8781,7 @@ pub(crate) fn dispatch(
             if !arr.is_empty() {
                 return help_error(GETPRIORITISEDTRANSACTIONS_HELP);
             }
-            chain_query(queries, |_cs, mgr| {
+            chain_query(method, queries, |_cs, mgr| {
                 let pool = mgr.mempool();
                 let mut deltas: Vec<(&Txid, &i64)> = pool.deltas().iter().collect();
                 deltas.sort_by_key(|(txid, _)| *txid.as_bytes());
@@ -8782,7 +8816,7 @@ pub(crate) fn dispatch(
                     Some((RPC_DESERIALIZATION_ERROR, "Block decode failed".into())),
                 );
             };
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let block = match avila_consensus::block::Block::decode(&bytes) {
                     Ok(b) => b,
                     Err(_) => {
@@ -8843,7 +8877,7 @@ pub(crate) fn dispatch(
                     )),
                 );
             };
-            chain_query(queries, move |cs, _mgr| {
+            chain_query(method, queries, move |cs, _mgr| {
                 let Ok(header) = avila_consensus::header::BlockHeader::decode(&bytes) else {
                     return Err((
                         RPC_DESERIALIZATION_ERROR,
@@ -8880,18 +8914,20 @@ pub(crate) fn dispatch(
                 Ok(h) => h,
                 Err(e) => return (Value::Null, Some(e)),
             };
-            chain_query(queries, move |cs, mgr| match cs.precious_block(&hash) {
-                Ok(true) => {
-                    // A precious branch can displace the active tip —
-                    // refill the mempool from the rolled-back blocks.
-                    let now = crate::time::time() as u32;
-                    let gone = cs.take_disconnected();
-                    mgr.mempool()
-                        .refill_from_disconnected(&gone, cs, now, true, usize::MAX);
-                    Ok(Value::Null)
+            chain_query(method, queries, move |cs, mgr| {
+                match cs.precious_block(&hash) {
+                    Ok(true) => {
+                        // A precious branch can displace the active tip —
+                        // refill the mempool from the rolled-back blocks.
+                        let now = crate::time::time() as u32;
+                        let gone = cs.take_disconnected();
+                        mgr.mempool()
+                            .refill_from_disconnected(&gone, cs, now, true, usize::MAX);
+                        Ok(Value::Null)
+                    }
+                    Ok(false) => Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into())),
+                    Err(_) => Err((RPC_MISC_ERROR, "preciousblock revalidation failed".into())),
                 }
-                Ok(false) => Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into())),
-                Err(_) => Err((RPC_MISC_ERROR, "preciousblock revalidation failed".into())),
             })
         }
         "invalidateblock" | "reconsiderblock" => {
@@ -8917,7 +8953,7 @@ pub(crate) fn dispatch(
                 Ok(h) => h,
                 Err(e) => return (Value::Null, Some(e)),
             };
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let now = crate::time::time() as u32;
                 if is_invalidate {
                     match cs.invalidate_block(&hash) {
@@ -8995,7 +9031,7 @@ pub(crate) fn dispatch(
                 _ => unreachable!(),
             };
             let raw_nblocks = arr.first().cloned();
-            chain_query(queries, move |cs, _mgr| {
+            chain_query(method, queries, move |cs, _mgr| {
                 // Core resolves the block before reading nblocks —
                 // an unknown hash reports -5 ahead of a -1 int error.
                 if hash.is_some_and(|h| !cs.tree().contains(&h)) {
@@ -9100,7 +9136,7 @@ pub(crate) fn dispatch(
                     )),
                 );
             }
-            chain_query(queries, move |cs, _mgr| {
+            chain_query(method, queries, move |cs, _mgr| {
                 let s = cs.coin_stats(hash_type);
                 let mut o = serde_json::Map::new();
                 o.insert("height".into(), s.height.into());
@@ -9149,7 +9185,7 @@ pub(crate) fn dispatch(
                 .unwrap_or_default()
                 .to_string();
             let rollback_opt = params.get(2).and_then(|o| o.get("rollback")).cloned();
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let tip_hash = cs.tip_hash();
                 // Target resolution happens before any file handling —
                 // Core's order (ParseHashOrHeight, then AbsPathJoin).
@@ -9285,7 +9321,7 @@ pub(crate) fn dispatch(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let Some(store) = cs.store() else {
                     return Err((RPC_MISC_ERROR, "no data directory configured".into()));
                 };
@@ -9345,7 +9381,7 @@ pub(crate) fn dispatch(
                     Some((RPC_INVALID_ADDRESS_OR_KEY, "Unknown filtertype".into())),
                 );
             }
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 if !cs.blockfilterindex_enabled() {
                     return Err((
                         RPC_MISC_ERROR,
@@ -9415,7 +9451,7 @@ pub(crate) fn dispatch(
                     let scanobjects = params.get(1).cloned().unwrap_or(Value::Null);
                     let start_v = params.get(2).cloned().unwrap_or(Value::Null);
                     let stop_v = params.get(3).cloned().unwrap_or(Value::Null);
-                    chain_query(queries, move |cs, _| {
+                    chain_query(method, queries, move |cs, _| {
                         if !cs.blockfilterindex_enabled() {
                             return Err((
                                 RPC_MISC_ERROR,
@@ -9524,7 +9560,7 @@ pub(crate) fn dispatch(
             let scanobjects = params.get(1).cloned().unwrap_or(Value::Null);
             let include_mempool = params.get(2).and_then(Value::as_bool).unwrap_or(true);
             let hashes = hashes.clone();
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let params = cs.tree().params();
                 // Hashes resolve against the header tree first, then
                 // must sit on the active chain — Core's `Contains`
@@ -9695,7 +9731,7 @@ pub(crate) fn dispatch(
             }
             let requests = arr[0].clone();
             let wallet = wallet.cloned();
-            chain_query_deferred(queries, move |cs, _| {
+            chain_query_deferred(method, queries, move |cs, _| {
                 let Some(wallet) = wallet else {
                     return QueryReply::Now(Err((
                         RPC_MISC_ERROR,
@@ -9778,7 +9814,7 @@ pub(crate) fn dispatch(
         // Core's `listdescriptors` — the imported descriptor table.
         "listdescriptors" => {
             let wallet = wallet.cloned();
-            chain_query(queries, move |_, _| {
+            chain_query(method, queries, move |_, _| {
                 let Some(wallet) = wallet else {
                     return Err((
                         RPC_MISC_ERROR,
@@ -9820,7 +9856,7 @@ pub(crate) fn dispatch(
             let start = arr.first().and_then(Value::as_i64).unwrap_or(0);
             let stop = arr.get(1).and_then(Value::as_i64);
             let wallet = wallet.cloned();
-            chain_query_deferred(queries, move |cs, _| {
+            chain_query_deferred(method, queries, move |cs, _| {
                 let Some(wallet) = wallet else {
                     return QueryReply::Now(Err((
                         RPC_MISC_ERROR,
@@ -9910,7 +9946,7 @@ pub(crate) fn dispatch(
             let include_unsafe = arr.get(3).and_then(Value::as_bool).unwrap_or(true);
             let query_options = arr.get(4).cloned().unwrap_or(Value::Null);
             let wallet = wallet.cloned();
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let Some(wallet) = wallet else {
                     return Err((
                         RPC_MISC_ERROR,
@@ -10066,7 +10102,7 @@ pub(crate) fn dispatch(
             };
             let dest = dest.to_string();
             let wallet = wallet.cloned();
-            chain_query(queries, move |_cs, _mgr| {
+            chain_query(method, queries, move |_cs, _mgr| {
                 let Some(wallet) = wallet else {
                     return Err((
                         RPC_MISC_ERROR,
@@ -10099,7 +10135,7 @@ pub(crate) fn dispatch(
             };
             let file = file.to_string();
             let wallet = wallet.cloned();
-            chain_query(queries, move |_cs, _mgr| {
+            chain_query(method, queries, move |_cs, _mgr| {
                 let Some(wallet) = wallet else {
                     return Err((
                         RPC_MISC_ERROR,
@@ -10122,7 +10158,7 @@ pub(crate) fn dispatch(
         // the `watchonly` member is ever populated.
         "getbalances" => {
             let wallet = wallet.cloned();
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let Some(wallet) = wallet else {
                     return Err((
                         RPC_MISC_ERROR,
@@ -10200,7 +10236,7 @@ pub(crate) fn dispatch(
             let minconf = arr.first().and_then(Value::as_i64).unwrap_or(1);
             let include_empty = arr.get(1).and_then(Value::as_bool).unwrap_or(false);
             let wallet = wallet.cloned();
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let Some(wallet) = wallet else {
                     return Err((
                         RPC_MISC_ERROR,
@@ -10375,7 +10411,7 @@ pub(crate) fn dispatch(
                     }
                     let scanobjects = arr[1].clone();
                     let scan = Arc::clone(scan);
-                    chain_query(queries, move |cs, _mgr| {
+                    chain_query(method, queries, move |cs, _mgr| {
                         let params = cs.tree().params();
                         // EvalDescriptorStringOrObject per scan object:
                         // expand every position, collect the script set
@@ -10495,7 +10531,7 @@ pub(crate) fn dispatch(
             let maxtries = param(params, 2, "maxtries")
                 .and_then(Value::as_u64)
                 .unwrap_or(1_000_000);
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let params = *cs.tree().params();
                 let Some(script) = avila_consensus::address::address_to_script(&address, &params)
                 else {
@@ -10564,7 +10600,7 @@ pub(crate) fn dispatch(
                 None => 1_000_000,
             };
             let desc_text = arr[1].as_str().unwrap_or_default().to_owned();
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let params = *cs.tree().params();
                 let (descs, provider, _) = match avila_consensus::descriptor::parse_descriptors(
                     &desc_text, &params, false,
@@ -10633,7 +10669,7 @@ pub(crate) fn dispatch(
                 .filter_map(Value::as_str)
                 .map(str::to_owned)
                 .collect();
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 let params = *cs.tree().params();
                 let script = avila_consensus::descriptor::output_to_script(&output, &params)
                     .map_err(|_| {
@@ -10688,7 +10724,7 @@ pub(crate) fn dispatch(
                 Ok(json!({ "hash": hash }))
             })
         }
-        "getblocktemplate" => chain_query(queries, |cs, mgr| {
+        "getblocktemplate" => chain_query(method, queries, |cs, mgr| {
             let now = crate::time::time() as u32;
             // No wallet exists — the coinbase pays Core's default
             // `OP_TRUE` anyone-can-spend script (what Core's
@@ -10871,7 +10907,7 @@ pub(crate) fn dispatch(
             // orphan pool tracks more than txids — v0 emits the same
             // list for every accepted verbosity.
             let _ = verbosity;
-            chain_query(queries, |_, mgr| {
+            chain_query(method, queries, |_, mgr| {
                 Ok(json!(
                     mgr.mempool_ref()
                         .orphan_txids()
@@ -10881,7 +10917,7 @@ pub(crate) fn dispatch(
                 ))
             })
         }
-        "getmininginfo" => chain_query(queries, |cs, mgr| {
+        "getmininginfo" => chain_query(method, queries, |cs, mgr| {
             // Core's getmininginfo reports on the connected tip
             // (ActiveTip), not the best header.
             let tip = cs.tip_hash();
@@ -10997,7 +11033,7 @@ pub(crate) fn dispatch(
                     }
                 },
             };
-            chain_query(queries, move |cs, _| {
+            chain_query(method, queries, move |cs, _| {
                 let tip_h = cs.chain().len() as i64 - 1;
                 if height < -1 || height > tip_h {
                     return Err((
@@ -11012,7 +11048,7 @@ pub(crate) fn dispatch(
             if params.as_array().is_some_and(|a| !a.is_empty()) {
                 return help_error(GETNETTOTALS_HELP);
             }
-            chain_query(queries, |_, mgr| {
+            chain_query(method, queries, |_, mgr| {
                 let (sent, recv) = mgr.net_totals();
                 let timemillis = crate::time::time_millis() as u64;
                 // `uploadtarget` mirrors `-maxuploadtarget=0`
@@ -11036,7 +11072,7 @@ pub(crate) fn dispatch(
             if params.as_array().is_some_and(|a| !a.is_empty()) {
                 return help_error(PING_HELP);
             }
-            chain_query(queries, |_, mgr| {
+            chain_query(method, queries, |_, mgr| {
                 mgr.ping_all();
                 Ok(Value::Null)
             })
@@ -11080,7 +11116,7 @@ pub(crate) fn dispatch(
             // Extract owned values — the query closure must be 'static.
             let address_s = address.as_str().map(str::to_string);
             let nodeid_v = nodeid.as_i64();
-            chain_query(queries, move |_, mgr| {
+            chain_query(method, queries, move |_, mgr| {
                 let success = if let Some(addr) = &address_s {
                     if addr.contains('/') {
                         match parse_subnet(addr) {
@@ -11187,7 +11223,7 @@ pub(crate) fn dispatch(
                     Err(e) => return (Value::Null, Some(e)),
                 }
             }
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 // Core: requesting v2 on a `-v2transport=0` node is a
                 // parameter error, not a silent downgrade.
                 if want_v2 == Some(true) && !mgr.v2transport() {
@@ -11243,7 +11279,7 @@ pub(crate) fn dispatch(
             // Optional `node` filter — a name absent from the
             // added-nodes list is -24, like Core.
             let filter = params.get(0).and_then(Value::as_str).map(str::to_string);
-            chain_query(queries, move |_, mgr| {
+            chain_query(method, queries, move |_, mgr| {
                 let all = mgr.added_node_info();
                 if let Some(f) = &filter {
                     let Some(entry) = all.iter().find(|(n, _)| n == f) else {
@@ -11267,7 +11303,7 @@ pub(crate) fn dispatch(
             let Some(v) = arr.first().cloned() else {
                 return help_error(SETMOCKTIME_HELP);
             };
-            chain_query(queries, move |cs, _mgr| {
+            chain_query(method, queries, move |cs, _mgr| {
                 if cs.tree().params().network != avila_consensus::params::Network::Regtest {
                     return Err((
                         RPC_MISC_ERROR,
@@ -11295,7 +11331,7 @@ pub(crate) fn dispatch(
             let Some(v) = arr.first().cloned() else {
                 return help_error(MOCKSCHEDULER_HELP);
             };
-            chain_query(queries, move |cs, mgr| {
+            chain_query(method, queries, move |cs, mgr| {
                 if cs.tree().params().network != avila_consensus::params::Network::Regtest {
                     return Err((
                         RPC_MISC_ERROR,
@@ -11329,7 +11365,7 @@ pub(crate) fn dispatch(
                     );
                 }
             };
-            chain_query(queries, move |_, mgr| {
+            chain_query(method, queries, move |_, mgr| {
                 mgr.set_network_active(state);
                 Ok(json!(state))
             })
@@ -11402,7 +11438,7 @@ pub(crate) fn dispatch(
                 },
             };
             let absolute = arr.get(3).and_then(Value::as_bool).unwrap_or(false);
-            chain_query(queries, move |_, mgr| {
+            chain_query(method, queries, move |_, mgr| {
                 let now = epoch_secs();
                 match command.as_str() {
                     "add" => {
@@ -11451,7 +11487,7 @@ pub(crate) fn dispatch(
             if params.as_array().is_some_and(|a| !a.is_empty()) {
                 return help_error(LISTBANNED_HELP);
             }
-            chain_query(queries, |_, mgr| {
+            chain_query(method, queries, |_, mgr| {
                 let now = epoch_secs();
                 let rows: Vec<Value> = mgr
                     .banned_list(now)
@@ -11473,7 +11509,7 @@ pub(crate) fn dispatch(
             if params.as_array().is_some_and(|a| !a.is_empty()) {
                 return help_error(CLEARBANNED_HELP);
             }
-            chain_query(queries, |_, mgr| {
+            chain_query(method, queries, |_, mgr| {
                 mgr.clear_bans();
                 Ok(Value::Null)
             })
@@ -11484,7 +11520,7 @@ pub(crate) fn dispatch(
             }
             // Owned copies — the query closure must be 'static.
             let method_name = method.to_string();
-            chain_query(queries, move |cs, _mgr| {
+            chain_query(method, queries, move |cs, _mgr| {
                 // Core reports the configured debug log path — the
                 // chainstate store dir is our per-network datadir.
                 // `absolute` (not `canonicalize`): the file need not
@@ -11669,7 +11705,7 @@ pub(crate) fn dispatch(
                     }
                 }
             };
-            chain_query(queries, move |_, mgr| {
+            chain_query(method, queries, move |_, mgr| {
                 let entries = mgr.addr_book().entries(count as usize, network);
                 Ok(Value::Array(
                     entries
@@ -11695,7 +11731,7 @@ pub(crate) fn dispatch(
             if params.as_array().is_some_and(|a| !a.is_empty()) {
                 return help_error(GETADDRMANINFO_HELP);
             }
-            chain_query(queries, |_, mgr| {
+            chain_query(method, queries, |_, mgr| {
                 let counts = mgr.addr_book().network_counts();
                 let mut new_total = 0usize;
                 let mut tried_total = 0usize;
@@ -11785,7 +11821,7 @@ pub(crate) fn dispatch(
                 }
                 Some(v) => v.as_bool().unwrap_or(false),
             };
-            chain_query(queries, move |_, mgr| {
+            chain_query(method, queries, move |_, mgr| {
                 let mut obj = serde_json::Map::new();
                 match addr_str.parse::<std::net::IpAddr>() {
                     Ok(ip) => {
@@ -11818,7 +11854,7 @@ pub(crate) fn dispatch(
         // No ZMQ support — Core built without it returns the empty
         // notification list, not an error.
         "getzmqnotifications" => (json!([]), None),
-        "getnetworkinfo" => chain_query(queries, |_cs, mgr| {
+        "getnetworkinfo" => chain_query(method, queries, |_cs, mgr| {
             let snaps = mgr.peer_snapshots();
             let inbound = snaps.iter().filter(|p| p.inbound).count();
             // What we offer the network — NODE_NETWORK | NODE_WITNESS,
@@ -11952,7 +11988,7 @@ pub(crate) fn dispatch(
                     );
                 }
             }
-            chain_query(queries, move |_, mgr| {
+            chain_query(method, queries, move |_, mgr| {
                 match mgr.mempool_ref().estimate_fee(target) {
                     // Core reports feerate in BTC/kvB; our estimator
                     // stores sat/kvB.
@@ -12189,7 +12225,9 @@ mod tests {
     }
 
     /// Serves queries on a background thread over a real regtest
-    /// chainstate — the same plumbing the sync loop runs.
+    /// chainstate — the same plumbing the sync loop runs, including
+    /// `sync::run`'s `catch_unwind` isolation so a panicking query
+    /// can't stop this thread from answering the next one.
     fn query_server(cs: Chainstate) -> QuerySender {
         let (tx, rx) = mpsc::channel::<ChainQuery>();
         let mut mgr: PeerManager<TcpStream> = PeerManager::new(8);
@@ -12197,10 +12235,45 @@ mod tests {
         let mut rescans = std::collections::VecDeque::new();
         thread::spawn(move || {
             while let Ok(q) = rx.recv() {
-                q.answer(&mut cs, &mut mgr, &mut rescans);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    q.answer(&mut cs, &mut mgr, &mut rescans)
+                }));
             }
         });
         tx
+    }
+
+    /// A query closure panicking (e.g. `validateaddress` on malformed
+    /// UTF-8 once did) must not wedge the sync loop's query channel —
+    /// the caller sees an internal error and the very next query is
+    /// still answered from a live thread.
+    #[test]
+    fn a_panicking_query_does_not_stall_the_loop() {
+        let cs = Chainstate::new(&Network::Regtest.params());
+        let queries = query_server(cs);
+
+        let (r, e) = chain_query(
+            "boomtest",
+            Some(&queries),
+            |_cs, _mgr| -> Result<Value, (i64, String)> { panic!("boom") },
+        );
+        assert!(r.is_null());
+        assert_eq!(e.unwrap().0, RPC_INTERNAL_ERROR);
+
+        // The background thread is still alive and answering.
+        let snap = snap();
+        let (r, e) = dispatch(
+            "getblockhash",
+            &json!([0]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r.as_str().unwrap().len(), 64);
     }
 
     #[test]

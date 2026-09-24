@@ -201,6 +201,19 @@ fn unix_now() -> u32 {
     crate::time::time() as u32
 }
 
+/// Best-effort text for a `catch_unwind` payload — `panic!`'s two
+/// common shapes (`&'static str`, `String`); anything else (a custom
+/// payload type) falls back to a fixed message rather than failing.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 /// Runs headers-first sync until `cfg.target_height` connects or
 /// `cfg.timeout` elapses. `progress` is invoked after each tick with a
 /// live snapshot.
@@ -476,7 +489,36 @@ pub fn run(
         {
             for _ in 0..64 {
                 match rx.try_recv() {
-                    Ok(q) => q.answer(&mut cs, &mut mgr, &mut rescans),
+                    Ok(q) => {
+                        // A query closure runs arbitrary RPC-handler
+                        // code (e.g. address parsing) against live
+                        // state; a bug there (an out-of-bounds string
+                        // slice on non-ASCII input has done it) must
+                        // not take the whole sync loop down with it —
+                        // every chain RPC would die along with block
+                        // sync. `catch_unwind` isolates the panic to
+                        // this one query: it's logged, `q`'s reply
+                        // sender is dropped as part of the unwind so
+                        // its caller gets RPC_INTERNAL_ERROR instead
+                        // of hanging (see `chain_query_deferred`), and
+                        // the loop keeps ticking. `cs`/`mgr` could in
+                        // principle retain a partially-applied
+                        // mutation from the aborted closure — the same
+                        // residual risk any `catch_unwind` carries —
+                        // but that's strictly better than the crash
+                        // this replaces.
+                        let method = q.method().unwrap_or("<unknown>").to_string();
+                        if let Err(payload) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                q.answer(&mut cs, &mut mgr, &mut rescans)
+                            }))
+                        {
+                            eprintln!(
+                                "chain query panicked (method={method}): {}",
+                                panic_message(&payload)
+                            );
+                        }
+                    }
                     Err(_) => break,
                 }
             }
