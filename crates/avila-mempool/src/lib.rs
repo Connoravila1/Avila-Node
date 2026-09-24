@@ -2941,6 +2941,7 @@ mod tests {
         let tx2 = spend_tx(op, 4_998_000_000, SEQ_FINAL);
         pool.accept_tx(tx1, &cs, NOW).unwrap();
         assert_eq!(pool.accept_tx(tx2, &cs, NOW), Err(MempoolReject::Conflict));
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -2960,6 +2961,7 @@ mod tests {
         assert_eq!(pool.accept_tx(tx2, &cs, NOW), Ok(id2));
         assert!(pool.get(&id1).is_none(), "conflict evicted");
         assert!(pool.get(&id2).is_some());
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -2975,6 +2977,7 @@ mod tests {
         let tx2 = spend_tx(op, 4_999_999_000, SEQ_FINAL);
         pool.accept_tx(tx1, &cs, NOW).unwrap();
         assert_eq!(pool.accept_tx(tx2, &cs, NOW), Err(MempoolReject::Conflict));
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -3009,6 +3012,7 @@ mod tests {
         );
         // The rejected replacement must not have taken its conflict with it.
         assert!(pool.get(&p_id).is_some());
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -3037,6 +3041,7 @@ mod tests {
             Err(MempoolReject::TooManyReplacements)
         );
         assert_eq!(pool.len(), 125, "rejected replacement evicts nothing");
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -3071,6 +3076,7 @@ mod tests {
             Err(MempoolReject::MempoolMinFeeNotMet)
         );
         assert!(pool.pool_bytes + 8 <= cap);
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -3117,6 +3123,75 @@ mod tests {
         );
         assert!(pool.get(&c_id).is_some(), "rich child untouched");
         assert!(pool.get(&d_id).is_some());
+        pool.assert_descendant_totals_consistent();
+    }
+
+    #[test]
+    fn eviction_at_pool_scale_avoids_descendant_walks() {
+        // Regression for the O(n) full-pool scan `worst_by_descendant_
+        // score` used to do (recomputing a descendant walk for both
+        // sides of every comparison): fill a pool with a few thousand
+        // independent entries, force roughly a thousand evictions, and
+        // confirm eviction never falls back to a full descendant walk
+        // (`descendant_txids`/`descendants_of`) — those calls are
+        // counted, not timed, since wall-clock assertions are flaky.
+        let (mut cs, blocks) = chainstate_at(101);
+        let params = Network::Regtest.params();
+
+        // One fan-out tx, confirmed in its own block, turns one mature
+        // coinbase into thousands of independent, already-confirmed
+        // UTXOs — spending any of them creates no mempool ancestry at
+        // all, avoiding the need to actually mine thousands of blocks.
+        let fan_count = 3_000u32;
+        let fan = fan_tx(mature_outpoint(&blocks, 1), fan_count, 1_000_000);
+        let fan_id = fan.txid();
+        let b102 = block_with(&blocks[100].header, 102, fan, &params);
+        cs.accept_block(&b102, NOW).unwrap();
+
+        let mut pool = permissive_pool();
+        let cap = 2_000usize;
+        pool.set_max_entries(cap);
+        for i in 0..cap as u32 {
+            // Ascending fee (1,000..2,999) — ordinary admissions, no
+            // eviction yet.
+            let tx = spend_tx(
+                OutPoint {
+                    txid: fan_id,
+                    vout: i,
+                },
+                1_000_000 - (1_000 + i as i64),
+                SEQ_FINAL,
+            );
+            pool.accept_tx(tx, &cs, NOW).unwrap();
+        }
+        assert_eq!(pool.len(), cap);
+        assert_eq!(
+            pool.descendant_walk_count(),
+            0,
+            "standalone admissions below capacity must never walk descendants"
+        );
+
+        // ~1,000 more, each far pricier than anything pooled so far,
+        // forcing one eviction apiece.
+        let evictions = 1_000u32;
+        for i in 0..evictions {
+            let tx = spend_tx(
+                OutPoint {
+                    txid: fan_id,
+                    vout: cap as u32 + i,
+                },
+                1_000_000 - (500_000 + i as i64),
+                SEQ_FINAL,
+            );
+            pool.accept_tx(tx, &cs, NOW).unwrap();
+        }
+        assert_eq!(pool.len(), cap, "pool stays pinned at capacity");
+        assert_eq!(
+            pool.descendant_walk_count(),
+            0,
+            "eviction at pool scale must stay off the O(n) descendant-walk path"
+        );
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -3168,6 +3243,7 @@ mod tests {
         let much_later = NOW + 30 * 24 * 60 * 60;
         assert_eq!(pool.min_mempool_fee(much_later), 0);
         assert!(pool.accept_tx(mid, &cs, much_later).is_ok());
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -3205,6 +3281,7 @@ mod tests {
         assert_eq!(pool.expire(expired_at), 2);
         assert!(pool.get(&parent_id).is_none());
         assert!(pool.get(&child_id).is_none());
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -3220,6 +3297,7 @@ mod tests {
             pool.accept_tx(tx, &cs, NOW),
             Err(MempoolReject::TrucViolation("version=3 tx is too big"))
         );
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -3249,6 +3327,7 @@ mod tests {
                 "version=3 child tx is too big"
             ))
         );
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -3275,6 +3354,7 @@ mod tests {
                 "non-version=3 tx cannot spend from version=3 tx"
             ))
         );
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -3300,6 +3380,7 @@ mod tests {
                 "version=3 tx cannot spend from non-version=3 tx"
             ))
         );
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -3342,6 +3423,7 @@ mod tests {
         assert!(pool.get(&child1_id).is_none(), "sibling evicted");
         assert!(pool.get(&child2_id).is_some());
         assert!(pool.get(&parent_id).is_some());
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -3383,6 +3465,7 @@ mod tests {
                 "tx would have too many ancestors"
             ))
         );
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -3399,6 +3482,7 @@ mod tests {
         assert_eq!(pool.accept_tx(tx2, &cs, NOW), Ok(id2));
         assert!(pool.get(&id1).is_none(), "conflict evicted");
         assert!(pool.get(&id2).is_some());
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -3498,6 +3582,7 @@ mod tests {
         cs.accept_block(&block, NOW + 200).unwrap();
         pool.on_block_connected(&block, 102);
         assert!(pool.is_empty());
+        pool.assert_descendant_totals_consistent();
     }
 
     /// A tx spending `op` and fanning out to `n` outputs (descendant
@@ -3964,6 +4049,7 @@ mod tests {
         assert!(!pool.deltas.contains_key(&txid));
         pool.prioritise(&txid, 7);
         assert_eq!(pool.deltas.get(&txid), Some(&7));
+        pool.assert_descendant_totals_consistent();
     }
 
     #[test]
@@ -4032,6 +4118,7 @@ mod tests {
             1
         );
         assert!(pool.get(&spend_txid).is_some());
+        pool.assert_descendant_totals_consistent();
     }
 
     /// A resurrected tx whose input the new chain spent drops — and
@@ -4079,6 +4166,7 @@ mod tests {
         assert!(pool.get(&losing_txid).is_none());
         assert!(pool.get(&child_txid).is_none());
         assert!(pool.is_empty());
+        pool.assert_descendant_totals_consistent();
     }
 
     /// `invalidateblock` semantics: only the first `max_blocks`
@@ -4116,5 +4204,6 @@ mod tests {
         assert_eq!(pool.len(), 10);
         assert!(pool.get(&txs[11]).is_some());
         assert!(pool.get(&txs[0]).is_none());
+        pool.assert_descendant_totals_consistent();
     }
 }
