@@ -27,6 +27,8 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 
 | 32 | 09-24 | Parallel ECDSA advice with bounded recovery | Does the replay gain survive eight workers, bad hints and durable state? | **qualified offline prototype; not enabled in production** | 3 repeats: mainnet Script CPU 25.05 → 19.29 s (−23.0%), elapsed 19.80 → 16.43 s (−17.0%); complete regtest CPU −7.2% RAM / −5.3% disk+reopen. All-corrupt advice retries 7,351/183,782 checks in 8 bounded groups, +2.5% CPU vs ordinary. 93 replay runs + 10 additional checks; invalid-spend rollback and UTXO hashes pass; 479 unit tests pass, 2 existing ignores. Tradeoffs: sampled summed RSS 59 → 180 MiB; framed sidecar 3.57 MB; two-pass preparation 54.38 s. Full mainnet IBD unmeasured. | [parallel-replay](2026-09-24-ecdsa-parallel-replay.md) |
 
+| 36 | 09-24 | Differential fuzzing vs Knots | Do random block mutations diverge verdicts? | **working — 1080 mutations, 0 consensus divergences** | `tools/diff_fuzz.py`: seeded mutations (merkle/tx/witness/truncate/count) on ~125 real regtest blocks through both submitblock. One strictness class documented: header-identical mutations → Core dup-shortcircuits, Avila strict-decodes first. Ordering, not consensus. | [diff-fuzz](2026-09-24-diff-fuzzing.md) |
+
 | 35 | 09-24 | Erlay recon — pure-Rust minisketch | Is the sketch primitive tractable without C++ FFI? | **adopt (primitive) — works + measured** | `p2p/sketch.rs`: GF(2^32) syndromes + BM + trace-split decode, 5 tests incl over-capacity rejection. 512B sketch reconciles what 1.28MB inv sends (~2500x, D=64); decode quadratic — cap+rate-limit needed (DoS surface). BIP-330 msg layer + short-ids remain; interop = intra-Avila first. | [erlay-sketch](2026-09-24-erlay-sketch.md) |
 
 | 34 | 09-24 | Address-index cost model | What does the Electrum-style index cost? | **measured — build ~free, serve needs disk-backing** | Spend fixture: connect delta ~0% (8.56s vs 8.64s); scindex.dat ~38B/entry. In-mem by_script map ~46B/entry → ~200GB at mainnet — the query layer needs hashstore backing (bounded refactor, already designed). | [addr-index](2026-09-24-address-index-cost.md) |
@@ -111,7 +113,7 @@ first measurement that would kill or confirm it.
    monitored property rather than a claim. First step: fuzz harness on the
    existing diff fixture generator, seeded corpus from past bugs.
 
-4. **Utreexo research program.** BIPs 181-183 now have assigned numbers;
+3. **Utreexo research program.** BIPs 181-183 now have assigned numbers;
    rustreexo 0.6.0 exists. Validate blocks against accumulator + proofs —
    ~KB of state vs 12GB UTXO set. Months, not days; needs bridge-node
    proof supply. First step: rustreexo spike — add/delete/prove round-trip
