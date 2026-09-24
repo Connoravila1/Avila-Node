@@ -26,6 +26,7 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 
 
 | 62 | 09-24 | Recon-diff divergence alarm | Does the censorship signal separate from normal sync lag? | **adopted — queue #19 closed** | `ReconRound::close` now returns both diff directions — our misses AND `their_misses` (ids we hold that their pool lacked, previously decoded-then-discarded). Alarm: edge-triggered `NetEvent::ReconDivergence` at ≥10 rounds, ≥100 their-misses, ≥4:1 dominance over our misses — wide-but-balanced diffs (slow sync) don't fire. `recon_their_misses` in getpeerinfo; `recon_divergence` events in getevents + stderr log. Test proves edge-trigger, below-threshold silence both ways. | — |
+| 65 | 09-24 | Shadow-ruleset observatory | Can policy drift be measured live without gating? | **adopted — queue #8 mempool side shipped** | Every `accept_tx` also scores `shadow_standard` — a Knots-style strict envelope (42B datacarrier total, single nulldata output, no bare multisig) — recorded in `ShadowStats`, surfaced as `getmempoolinfo.shadow` {evaluated, divergent, by_reason}. Never gates: a divergence is a counter, not a verdict. Tests: datacarrier/bare-multisig/2-output cases diverge under shadow while the pool still accepts; strict-vs-ours unit coverage. Block-level shadowing stays open. | — |
 | 64 | 09-24 | Stem relay on recon links | Does the stem delay survive BIP-330's set-sync model? | **adopted — queue #7 closed** | Two fixes: stem inv candidates now exclude recon links (an inv to one breaks the model), and `recon_pool` filters stem-pending txids out of the sketch — a scheduled round would otherwise carry the tx to the recon peer inside the 2-15s delay, making the hop decorative. Test: recon peer gets no inv, pending txid absent from sketch ids, present again after fluff. | — |
 | 63 | 09-24 | ASMap text-map loader + --asmap wiring | Can operator-supplied maps drive bucketing end-to-end? | **adopted — queue #21 usable** | `AsMap::load_file` parses `a.b.c.d/plen asn` rows (`#` comments, malformed lines counted not fatal — a partial map buckets, a wrong one misleads silently). `--asmap <path>` on `run`/`sync` → `SyncConfig.asmap_path` → `mgr.set_asmap` at startup. Core's bit-packed kartograf `asmap.dat` parsing stays the open remainder. Test: rows parse, longest-prefix wins through the loader, bad lines counted. | — |
 | 62 | 09-24 | Per-peer dispatch CPU accounting | Can per-peer CPU be measured AND enforced without disconnecting the sync leader? | **adopted — last PEER_BUDGETS row closed** | `cpu_ns` cumulative + `cpu_rate_ns` decayed-per-second on every `dispatch` call; enforcement = skip the dominant peer's `poll()` when >50% share at >200ms/s — socket backpressure throttles it, no disconnect (IBD leader dominance is legitimate). `cpu_ms`/`cpu_rate_ms` in `getpeerinfo`; `CpuThrottled` NetEvent via `getevents`. Test: dominant peer's buffered ping goes unanswered while a quiet peer is served. | — |
@@ -121,7 +122,7 @@ first measurement that would kill or confirm it.
    First step: attach `SnapshotRun` in place + wire snapverify (bounds
    already verified) + persist the anchor.
 
-2. **Verified-artifact distribution format.** Replay + parallel-verify
+2. ~~**Verified-artifact distribution format.**~~ **spec done — `docs/ARTIFACT_BUNDLE.md` (committed d4e2640).** Replay + parallel-verify
    are proven (astra's ecdsa-parallel-replay); the open item is the
    artifact spec — one reproducible bundle (snapshot + index +
    midstates + sig-hints) anyone can generate and verify against
@@ -155,7 +156,7 @@ first measurement that would kill or confirm it.
    tx joins the reconciliation pool. Honest limits: propagation
    latency, known Dandelion deanonymization attacks.
 
-8. **Shadow-ruleset observatory.** Read-only evaluation of every block
+8. ~~**Shadow-ruleset observatory.**~~ **mempool side done — #65 (block-level open).** Read-only evaluation of every block
    under alternate rulesets (Knots policy, proposed softforks) — a
    continuous consensus-drift monitor. Must never gate acceptance.
 

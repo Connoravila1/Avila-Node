@@ -150,6 +150,61 @@ pub fn is_standard_tx(
     Ok(())
 }
 
+/// The shadow-ruleset observatory (queue #8): evaluate a tx under a
+/// STRICTER relay policy than ours — the Knots-style standardness
+/// envelope — and report the first divergence. Never gates: this runs
+/// after admission and only feeds counters. The point is a live
+/// consensus/policy-drift signal — "how much of today's pool would a
+/// stricter node reject".
+///
+/// Parameters (Knots defaults where they differ):
+/// - `-datacarriersize` = 42 bytes total (ours: `MAX_OP_RETURN_RELAY`)
+/// - at most ONE nulldata output (Knots' datacarrier accounting is
+///   per-output-strict)
+/// - `-permitbaremultisig` = 0 (ours: on)
+/// - everything else identical to [`is_standard_tx`]
+pub fn shadow_standard(tx: &Transaction, dust_relay_fee: i64) -> Result<(), &'static str> {
+    if tx.version < TX_MIN_STANDARD_VERSION || tx.version > TX_MAX_STANDARD_VERSION {
+        return Err("shadow:version");
+    }
+    for input in &tx.inputs {
+        if input.script_sig.as_bytes().len() > MAX_STANDARD_SCRIPTSIG_SIZE {
+            return Err("shadow:scriptsig-size");
+        }
+        if !input.script_sig.is_push_only() {
+            return Err("shadow:scriptsig-not-pushonly");
+        }
+    }
+    let mut nulldata_seen = false;
+    let mut datacarrier_bytes_left: i64 = 42;
+    for output in &tx.outputs {
+        let t = output.script_pubkey.classify();
+        if !is_standard_script_type(&t) {
+            return Err("shadow:scriptpubkey");
+        }
+        match t {
+            ScriptType::NullData => {
+                if nulldata_seen {
+                    return Err("shadow:datacarrier-count");
+                }
+                nulldata_seen = true;
+                let size = output.script_pubkey.as_bytes().len() as i64;
+                if size > datacarrier_bytes_left {
+                    return Err("shadow:datacarrier");
+                }
+                datacarrier_bytes_left -= size;
+            }
+            // Shadow policy: bare multisig is nonstandard to relay.
+            ScriptType::Multisig { .. } => return Err("shadow:bare-multisig"),
+            _ => {}
+        }
+    }
+    if dust_outputs(tx, dust_relay_fee).len() > MAX_DUST_OUTPUTS_PER_TX {
+        return Err("shadow:dust");
+    }
+    Ok(())
+}
+
 /// Core's `AreInputsStandard`, with BIP54's `CheckSigopsBIP54` folded in
 /// (as Core itself does). `spent` are the resolved previous outputs,
 /// parallel to `tx.inputs`.

@@ -7059,6 +7059,14 @@ pub(crate) fn dispatch(
                     "reorg_dropped": lc.reorg_dropped,
                     "explicit": lc.explicit,
                 },
+                // Shadow-ruleset observatory (queue #8): admissions
+                // scored under a stricter Knots-style policy — the
+                // live policy-drift signal. Never gates acceptance.
+                "shadow": {
+                    "evaluated": pool.shadow_stats().evaluated,
+                    "divergent": pool.shadow_stats().divergent_total(),
+                    "by_reason": pool.shadow_stats().divergent,
+                },
             }))
         }),
         "getpinningrisk" => {

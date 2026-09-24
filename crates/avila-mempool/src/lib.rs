@@ -477,6 +477,29 @@ pub struct LifecycleStats {
     pub explicit: u64,
 }
 
+/// The shadow-ruleset observatory (queue #8): every admission is also
+/// scored under a STRICTER relay policy (Knots-style — 42B single
+/// nulldata, no bare multisig). Never gates — a "rejection" here is a
+/// counter, not a verdict; the pool keeps its own rules. The counters
+/// are the live policy-drift signal: how much of today's traffic a
+/// stricter node would refuse.
+#[derive(Debug, Default, Clone)]
+pub struct ShadowStats {
+    /// Admissions scored under the shadow ruleset.
+    pub evaluated: u64,
+    /// Accepted txs the shadow ruleset would reject, by first
+    /// divergence reason.
+    pub divergent: std::collections::BTreeMap<String, u64>,
+}
+
+impl ShadowStats {
+    /// Total shadow-divergent admissions.
+    #[must_use]
+    pub fn divergent_total(&self) -> u64 {
+        self.divergent.values().sum()
+    }
+}
+
 /// A bounded policy pool over the live UTXO set.
 pub struct Mempool {
     /// txid → entry.
@@ -582,6 +605,8 @@ pub struct Mempool {
     /// [`LIFECYCLE_RING_CAP`] deep — the `getmempoolhistory` backing
     /// store. Ephemeral: not persisted to `mempool.dat`.
     lifecycle_ring: std::collections::VecDeque<LifecycleEvent>,
+    /// Shadow-ruleset counters — see [`ShadowStats`].
+    shadow: ShadowStats,
 }
 
 impl Mempool {
@@ -615,6 +640,7 @@ impl Mempool {
             deltas: HashMap::new(),
             unbroadcast: HashSet::new(),
             lifecycle: LifecycleStats::default(),
+            shadow: ShadowStats::default(),
             lifecycle_ring: std::collections::VecDeque::new(),
             broadcast: std::collections::HashMap::new(),
             broadcast_bytes: 0,
@@ -1418,9 +1444,19 @@ impl Mempool {
         // Lifecycle admission counters — one per outermost verdict.
         // `InputsMissingOrSpent` always follows a `park_orphan`, so it
         // counts under `parked_orphans`, not `rejected`.
+        // Shadow-ruleset eval (queue #8) runs on the tx BEFORE the
+        // move into `accept_tx_inner` — cheap, and the score is only
+        // recorded when the admission actually succeeds.
+        let shadow_verdict = crate::policy::shadow_standard(&tx, self.dust_relay_fee);
         let result = self.accept_tx_inner(tx, cs, now);
         match &result {
-            Ok(_) => self.lifecycle.accepted += 1,
+            Ok(_) => {
+                self.lifecycle.accepted += 1;
+                self.shadow.evaluated += 1;
+                if let Err(reason) = shadow_verdict {
+                    *self.shadow.divergent.entry(reason.to_string()).or_insert(0) += 1;
+                }
+            }
             Err(MempoolReject::InputsMissingOrSpent) => self.lifecycle.parked_orphans += 1,
             Err(_) => self.lifecycle.rejected += 1,
         }
@@ -2551,6 +2587,13 @@ impl Mempool {
     #[must_use]
     pub fn unbroadcast_count(&self) -> usize {
         self.unbroadcast.len()
+    }
+
+    /// The shadow-ruleset counters (`getmempoolinfo`'s `shadow`
+    /// object — the policy-drift observatory, queue #8).
+    #[must_use]
+    pub fn shadow_stats(&self) -> &ShadowStats {
+        &self.shadow
     }
 
     /// Cumulative lifecycle counters — `getmempoolinfo`'s `lifecycle`
@@ -5179,5 +5222,119 @@ mod tests {
         assert_eq!(events[0].txid, id);
         assert_eq!(events[0].cause, RemovalCause::Explicit);
         assert_eq!(pool.lifecycle_stats().explicit, 1);
+    }
+
+    /// Shadow-ruleset observatory (queue #8): accepted txs are still
+    /// scored under the stricter Knots-style envelope — counted,
+    /// never gated. (The fixture chain's coinbase outputs aren't
+    /// standard-typed, so the pool runs permissive; `shadow_standard`
+    /// itself gets the strict-vs-ours unit assertions below.)
+    #[test]
+    fn shadow_observatory_scores_divergence_without_gating() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+
+        // 62-byte OP_RETURN output — over the shadow's 42B cap.
+        // (spend_tx's OP_1 output isn't a standard type — swap it.)
+        let mut tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let mut p2wpkh = vec![0x00, 20];
+        p2wpkh.extend([7u8; 20]);
+        tx.outputs[0].script_pubkey = Script::new(p2wpkh);
+        let mut nulldata = vec![script::OP_RETURN, 60];
+        nulldata.extend([0u8; 60]);
+        tx.outputs.push(TxOut {
+            value: 0,
+            script_pubkey: Script::new(nulldata),
+        });
+        pool.accept_tx(tx, &cs, NOW).expect("accepted");
+
+        // 1-of-1 bare multisig output — the shadow refuses it.
+        let mut msig = vec![script::OP_1, 33];
+        msig.extend([2u8; 33]);
+        msig.extend([script::OP_1, script::OP_CHECKMULTISIG]);
+        let mut tx2 = spend_tx(mature_outpoint(&blocks, 2), 4_999_000_000, SEQ_FINAL);
+        tx2.outputs[0].script_pubkey = Script::new(msig);
+        pool.accept_tx(tx2, &cs, NOW).expect("accepted");
+
+        let st = pool.shadow_stats();
+        assert_eq!(st.evaluated, 2);
+        assert_eq!(st.divergent.get("shadow:datacarrier"), Some(&1), "{st:?}");
+        assert_eq!(st.divergent.get("shadow:bare-multisig"), Some(&1), "{st:?}");
+        // And the pool held both — the observatory never gates.
+        assert_eq!(pool.len(), 2);
+    }
+
+    /// `shadow_standard` vs `is_standard_tx` on standard-shaped txs —
+    /// the strictness deltas directly.
+    #[test]
+    fn shadow_standard_is_strictly_stricter() {
+        let mk = |out_scripts: Vec<Vec<u8>>| Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::ZERO,
+                    vout: 0,
+                },
+                script_sig: Script::new(vec![]),
+                sequence: SEQ_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: out_scripts
+                .into_iter()
+                .map(|b| TxOut {
+                    value: 1_000,
+                    script_pubkey: Script::new(b),
+                })
+                .collect(),
+            lock_time: 0,
+        };
+        let ours = |tx: &Transaction| {
+            crate::policy::is_standard_tx(
+                tx,
+                Some(crate::policy::MAX_OP_RETURN_RELAY),
+                true,
+                crate::policy::DUST_RELAY_TX_FEE,
+            )
+        };
+        let shadow =
+            |tx: &Transaction| crate::policy::shadow_standard(tx, crate::policy::DUST_RELAY_TX_FEE);
+
+        // 62B OP_RETURN: ours accepts (budget >> 42), shadow refuses.
+        let mut nulldata = vec![script::OP_RETURN, 60];
+        nulldata.extend([0u8; 60]);
+        let tx = mk(vec![
+            vec![
+                0x00, 0x14, 0x11, 0x22, 0x33, 0x44, 0x11, 0x22, 0x33, 0x44, 0x11, 0x22, 0x33, 0x44,
+                0x11, 0x22, 0x33, 0x44, 0x11, 0x22, 0x33, 0x44,
+            ],
+            nulldata,
+        ]);
+        assert!(ours(&tx).is_ok());
+        assert_eq!(shadow(&tx), Err("shadow:datacarrier"));
+
+        // Two small OP_RETURNs: ours accepts, shadow refuses (count>1).
+        let small = |n: u8| {
+            let mut v = vec![script::OP_RETURN, n];
+            v.extend(vec![0u8; n as usize]);
+            v
+        };
+        let tx = mk(vec![small(2), small(2)]);
+        assert!(ours(&tx).is_ok());
+        assert_eq!(shadow(&tx), Err("shadow:datacarrier-count"));
+
+        // Bare 1-of-1 multisig: ours accepts, shadow refuses.
+        let mut msig = vec![script::OP_1, 33];
+        msig.extend([2u8; 33]);
+        msig.extend([script::OP_1, script::OP_CHECKMULTISIG]);
+        let tx = mk(vec![msig]);
+        assert!(ours(&tx).is_ok());
+        assert_eq!(shadow(&tx), Err("shadow:bare-multisig"));
+
+        // A plain P2WPKH tx: both accept — no false divergence.
+        let tx = mk(vec![vec![
+            0x00, 0x14, 0x11, 0x22, 0x33, 0x44, 0x11, 0x22, 0x33, 0x44, 0x11, 0x22, 0x33, 0x44,
+            0x11, 0x22, 0x33, 0x44, 0x11, 0x22, 0x33, 0x44,
+        ]]);
+        assert!(ours(&tx).is_ok() && shadow(&tx).is_ok());
     }
 }
