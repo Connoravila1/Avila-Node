@@ -2581,10 +2581,6 @@ impl Chainstate {
             };
             match connect::connect_block(&block, sim, &ctx) {
                 Ok(undo) => {
-                    // `ConnectTip` stamps nChainTx as each block lands —
-                    // kept even if a later branch block fails the whole
-                    // activation (those blocks genuinely connected).
-                    self.tree.note_connected(branch_hash);
                     new_undos.push(undo);
                 }
                 Err(err) => {
@@ -2595,6 +2591,19 @@ impl Chainstate {
                     return Err(err);
                 }
             }
+        }
+        // `ConnectTip`'s nChainTx bookkeeping only applies once the
+        // branch is actually adopted. Deferred to here (rather than
+        // stamped per-block inside the loop above, as each simulated
+        // connect landed) so a branch block that only "connected" for
+        // a simulation this function's caller goes on to discard — a
+        // later block in the *same* branch failing above — never gets
+        // a stale n_chain_tx from an attempt that never took effect.
+        // `maybe_reorg`, the only caller, commits the overlay
+        // unconditionally once `simulate_branch` returns `Ok`, so
+        // every hash reaching this point really is being adopted.
+        for branch_hash in branch_hashes {
+            self.tree.note_connected(branch_hash);
         }
         Ok(new_undos)
     }
@@ -3468,6 +3477,10 @@ mod tests {
         assert_eq!(cs.tip_hash(), a2.block_hash());
         assert_eq!(cs.chain().len(), 3);
         assert!(cs.tree().is_failed(&b2.block_hash()));
+        // b1 "connected" inside the discarded simulation (only b2 failed),
+        // but the whole branch never activated — its n_chain_tx must stay
+        // unknown (0), not the stamp a genuinely-adopted block would get.
+        assert_eq!(cs.tree().get(&b1.block_hash()).unwrap().n_chain_tx, 0);
         let b4 = block_on(
             &b3.header,
             vec![tagged_coinbase(4, subsidy(4), script::OP_HASH160)],
