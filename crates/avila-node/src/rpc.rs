@@ -12977,8 +12977,8 @@ mod tests {
         });
         assert!(e.is_none(), "{e:?}");
         let hex_data = hex_data.as_str().unwrap().to_string();
-        let mut block = avila_consensus::block::Block::decode(&hex::decode(&hex_data).unwrap())
-            .expect("decodes back");
+        let mut block =
+            avila_consensus::block::Block::decode(&hex::decode(&hex_data).unwrap()).unwrap();
 
         // A genuinely valid proposal on the tip: null.
         let (r, e) = dispatch(
