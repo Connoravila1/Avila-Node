@@ -88,6 +88,14 @@ pub struct MempoolEntry {
     /// Serialized size — computed once at admission; `pool_bytes`
     /// accounting and eviction reuse it instead of re-encoding.
     pub size: usize,
+    /// Core's `GetModFeesWithDescendants` — this entry's own
+    /// `modified_fee()` plus every current in-pool descendant's,
+    /// maintained incrementally by [`Mempool::adjust_descendant_totals`]
+    /// rather than walked fresh on each read.
+    pub fees_with_descendants: i64,
+    /// Core's `GetSizeWithDescendants` — the `vsize` counterpart of
+    /// `fees_with_descendants`.
+    pub size_with_descendants: usize,
 }
 
 impl MempoolEntry {
@@ -95,6 +103,36 @@ impl MempoolEntry {
     #[must_use]
     pub fn modified_fee(&self) -> i64 {
         self.fee.saturating_add(self.fee_delta)
+    }
+}
+
+/// [`Mempool::score_index`]'s sort key — Core's descendant-score
+/// comparator (`CompareTxMemPoolEntryByDescendantScore`) inlined into
+/// an `Ord` newtype so a `BTreeSet` can carry it directly, giving
+/// `O(log n)` eviction instead of a full-pool scan. Orders by ascending
+/// feerate (`fee`/`size`, compared by `i128` cross-multiplication — no
+/// floats, no precision loss), ties broken by txid for a total order
+/// (Core breaks ties by entry time; txid is simpler and just as
+/// deterministic, and a real feerate tie between two entries is
+/// vanishingly unlikely to matter which side of it loses).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ScoreKey {
+    fee: i64,
+    size: usize,
+    txid: Txid,
+}
+
+impl PartialOrd for ScoreKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoreKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let lhs = (self.fee as i128) * (other.size as i128);
+        let rhs = (other.fee as i128) * (self.size as i128);
+        lhs.cmp(&rhs).then_with(|| self.txid.cmp(&other.txid))
     }
 }
 
@@ -362,6 +400,20 @@ pub struct Mempool {
     /// Core's `-mempoolexpiry` in seconds — a pooled entry older than
     /// this is swept regardless of fee.
     mempool_expiry_secs: u32,
+    /// Ordered by [`ScoreKey`] (Core's `descendant_score_index`) — the
+    /// eviction cursor for the capacity trim. Kept in sync with every
+    /// entry's [`Self::effective_score`] on each insertion and removal
+    /// (via [`Self::adjust_descendant_totals`]/[`Self::resync_score_index`])
+    /// so eviction is an `O(log n)` `BTreeSet::first()` instead of a
+    /// full-pool scan.
+    score_index: std::collections::BTreeSet<ScoreKey>,
+    /// Test-only instrumentation: counts calls to the full descendant
+    /// walks ([`Self::descendant_txids`]/[`Self::descendants_of`]) so
+    /// tests can assert eviction at pool scale stays off that path
+    /// (bounded by ancestor-set size, not pool size) rather than timing
+    /// wall-clock, which would be flaky.
+    #[cfg(test)]
+    descendant_walk_count: std::cell::Cell<u64>,
     /// Confirmation observations from connected blocks.
     estimator: FeeEstimator,
     /// `prioritisetransaction` accumulations by txid — Core's
@@ -401,6 +453,9 @@ impl Mempool {
             last_rolling_fee_update: 0,
             block_since_rolling_fee_bump: false,
             mempool_expiry_secs: DEFAULT_MEMPOOL_EXPIRY_SECS,
+            score_index: std::collections::BTreeSet::new(),
+            #[cfg(test)]
+            descendant_walk_count: std::cell::Cell::new(0),
             estimator: FeeEstimator::new(),
             deltas: HashMap::new(),
             unbroadcast: HashSet::new(),
@@ -1170,8 +1225,7 @@ impl Mempool {
                 ))
             } else {
                 match self.worst_by_descendant_score() {
-                    Some(worst_id) => {
-                        let (worst_fee, worst_size) = self.descendant_score(&worst_id);
+                    Some((worst_id, worst_fee, worst_size)) => {
                         if (fee as i128) * (worst_size as i128)
                             > (worst_fee as i128) * (vsize as i128)
                         {
@@ -1497,10 +1551,9 @@ impl Mempool {
         // mark — Core's `maxFeeRateRemoved`, not each individual removal.
         let mut removed_high: Option<(i64, usize)> = None;
         while self.map.len() >= self.max_entries || self.pool_bytes + tx_size > self.max_bytes {
-            let Some(worst_id) = self.worst_by_descendant_score() else {
+            let Some((worst_id, worst_fee, worst_size)) = self.worst_by_descendant_score() else {
                 return Err(MempoolReject::Full);
             };
-            let (worst_fee, worst_size) = self.descendant_score(&worst_id);
             if (fee as i128) * (worst_size as i128) <= (worst_fee as i128) * (vsize as i128) {
                 return Err(MempoolReject::Full);
             }
@@ -1556,8 +1609,23 @@ impl Mempool {
                 // arrived applies now (Core reads mapDeltas at
                 // admission into the entry's nFeeDelta).
                 fee_delta: self.deltas.get(&txid).copied().unwrap_or(0),
+                // No descendants yet — just itself, until an ancestor
+                // propagation step below (for some *other*, later tx)
+                // or a future child's own admission adds to this.
+                fees_with_descendants: modified_fee,
+                size_with_descendants: vsize,
             },
         );
+        // This entry's own score-index row, then propagate its
+        // (fee, vsize) into every one of its own in-pool ancestors'
+        // descendant aggregates — Core's `UpdateAncestorsOf` at
+        // admission. `ancestors` (step 3.5) is bounded by
+        // `ANCESTOR_LIMIT` (25), so this is a handful of `O(log n)`
+        // `BTreeSet` operations, not a walk over the whole pool.
+        self.resync_score_index(txid, None);
+        for ancestor in ancestors {
+            self.adjust_descendant_totals(ancestor, modified_fee, vsize as i64);
+        }
         // Newly pooled outputs may un-orphan parked children — Core's
         // ProcessOrphanTx recursion. Repeat until no orphan resolves:
         // each accepted orphan can itself be a parent.
@@ -1641,6 +1709,9 @@ impl Mempool {
     /// `getmempooldescendants`.
     #[must_use]
     pub fn descendant_txids(&self, txid: &Txid) -> HashSet<Txid> {
+        #[cfg(test)]
+        self.descendant_walk_count
+            .set(self.descendant_walk_count.get() + 1);
         let mut descendants = HashSet::new();
         let mut stack = vec![*txid];
         while let Some(id) = stack.pop() {
@@ -1675,6 +1746,9 @@ impl Mempool {
 
     /// All in-pool descendants of a pooled tx, as `(count, total vsize)`.
     fn descendants_of(&self, txid: &Txid) -> (usize, usize) {
+        #[cfg(test)]
+        self.descendant_walk_count
+            .set(self.descendant_walk_count.get() + 1);
         let mut descendants = HashSet::new();
         let mut stack = vec![*txid];
         while let Some(id) = stack.pop() {
@@ -1699,38 +1773,33 @@ impl Mempool {
 
     /// `(fee, vsize)` of `txid` together with every one of its current
     /// in-pool descendants — Core's `GetModFeesWithDescendants`/
-    /// `GetSizeWithDescendants`. Missing/unpooled `txid` reports as
-    /// `(0, 1)` (a harmless, never-winning score; `1` avoids a zero
-    /// denominator in rate comparisons).
+    /// `GetSizeWithDescendants`, read straight off
+    /// [`MempoolEntry::fees_with_descendants`]/`size_with_descendants`
+    /// rather than walked fresh: those fields are maintained
+    /// incrementally by [`Self::adjust_descendant_totals`] on every
+    /// insertion, removal, and `prioritise` call, so this is `O(1)`.
+    /// Missing/unpooled `txid` reports as `(0, 1)` (a harmless,
+    /// never-winning score; `1` avoids a zero denominator in rate
+    /// comparisons).
     fn cluster_totals(&self, txid: &Txid) -> (i64, usize) {
-        let Some(entry) = self.map.get(txid) else {
-            return (0, 1);
-        };
-        let mut totals = (entry.modified_fee(), entry.vsize);
-        for id in self.descendant_txids(txid) {
-            if let Some(e) = self.map.get(&id) {
-                totals.0 = totals.0.saturating_add(e.modified_fee());
-                totals.1 = totals.1.saturating_add(e.vsize);
-            }
-        }
-        totals
+        self.map.get(txid).map_or((0, 1), |e| {
+            (e.fees_with_descendants, e.size_with_descendants)
+        })
     }
 
     /// Core's `CompareTxMemPoolEntryByDescendantScore`'s per-entry score
     /// (its `GetModFeeAndSize`): whichever is the higher feerate of the
-    /// entry's own `(fee, vsize)` and its [`Self::cluster_totals`] (self
-    /// plus every current in-pool descendant). A low-fee parent with a
-    /// rich descendant is scored at the descendants' rate rather than
-    /// its own, so trimming can't take the rich descendant down just to
-    /// evict a merely-mediocre parent. Returns a `(fee, size)` pair
-    /// rather than a ratio — callers compare two scores by cross-
-    /// multiplication instead of floating point.
-    fn descendant_score(&self, txid: &Txid) -> (i64, usize) {
-        let Some(entry) = self.map.get(txid) else {
-            return (0, 1);
-        };
+    /// entry's own `(fee, vsize)` and its `(fees_with_descendants,
+    /// size_with_descendants)` (self plus every current in-pool
+    /// descendant). A low-fee parent with a rich descendant is scored at
+    /// the descendants' rate rather than its own, so trimming can't take
+    /// the rich descendant down just to evict a merely-mediocre parent.
+    /// Returns a `(fee, size)` pair rather than a ratio — callers
+    /// compare two scores by cross-multiplication instead of floating
+    /// point. `O(1)`: both halves are already-maintained fields.
+    fn effective_score(entry: &MempoolEntry) -> (i64, usize) {
         let own = (entry.modified_fee(), entry.vsize);
-        let with_descendants = self.cluster_totals(txid);
+        let with_descendants = (entry.fees_with_descendants, entry.size_with_descendants);
         // `with_descendants` rate > `own` rate, cross-multiplied to
         // avoid floating point (Core's `f1`/`f2` comparison in doubles).
         if (with_descendants.0 as i128) * (own.1 as i128)
@@ -1742,22 +1811,104 @@ impl Mempool {
         }
     }
 
-    /// The lowest-scoring pooled entry by [`Self::descendant_score`] —
-    /// the eviction cursor for the capacity trim (Core's `TrimToSize`,
-    /// driven off its `descendant_score_index`). Ties break on txid so
-    /// the choice is deterministic. `O(n)` over the pool: only walked
-    /// when a candidate is admitted at capacity, not on every lookup —
-    /// Core's own index is `O(log n)` per removal, but a plain scan
-    /// avoids keeping a relationship-dependent score continuously
-    /// up to date as unrelated entries come and go.
-    fn worst_by_descendant_score(&self) -> Option<Txid> {
-        self.map.keys().copied().min_by(|&a, &b| {
-            let (fa, sa) = self.descendant_score(&a);
-            let (fb, sb) = self.descendant_score(&b);
-            ((fa as i128) * (sb as i128))
-                .cmp(&((fb as i128) * (sa as i128)))
-                .then_with(|| a.cmp(&b))
-        })
+    /// Removes `txid`'s stale [`ScoreKey`] row (`before`, its score
+    /// prior to whatever just changed) and inserts its current one —
+    /// Core's `descendant_score_index` kept in sync the way
+    /// `UpdateAncestorsOf`/`UpdateForRemoveFromMempool` do, an `O(log
+    /// n)` pair of `BTreeSet` operations. `before` is `None` for a
+    /// brand-new entry with no prior row. A missing/removed `txid`
+    /// leaves nothing reinserted, matching a pure removal.
+    fn resync_score_index(&mut self, txid: Txid, before: Option<(i64, usize)>) {
+        if let Some((fee, size)) = before {
+            self.score_index.remove(&ScoreKey { fee, size, txid });
+        }
+        if let Some(entry) = self.map.get(&txid) {
+            let (fee, size) = Self::effective_score(entry);
+            self.score_index.insert(ScoreKey { fee, size, txid });
+        }
+    }
+
+    /// Applies `(fee_delta, size_delta)` to `txid`'s own descendant
+    /// aggregates and resyncs its [`ScoreKey`] row. The single-entry
+    /// step insertion, removal, and `prioritise` each replay across an
+    /// ancestor set (Core's `UpdateAncestorsOf`, `UpdateForRemoveFrom
+    /// Mempool`, and `PrioritiseTransaction`'s own bookkeeping) — every
+    /// in-pool ancestor of a tx that just joined, left, or was
+    /// re-prioritised needs the same shift applied to its own
+    /// aggregates, since that tx counts as one of *its* descendants too.
+    fn adjust_descendant_totals(&mut self, txid: Txid, fee_delta: i64, size_delta: i64) {
+        let Some(entry) = self.map.get(&txid) else {
+            return;
+        };
+        let before = Self::effective_score(entry);
+        if let Some(entry) = self.map.get_mut(&txid) {
+            entry.fees_with_descendants = entry.fees_with_descendants.saturating_add(fee_delta);
+            entry.size_with_descendants = (entry.size_with_descendants as i64)
+                .saturating_add(size_delta)
+                .max(0) as usize;
+        }
+        self.resync_score_index(txid, Some(before));
+    }
+
+    /// The lowest-scoring pooled entry by [`Self::effective_score`] and
+    /// its score — the eviction cursor for the capacity trim (Core's
+    /// `TrimToSize`, driven off `descendant_score_index`). `O(log n)`:
+    /// [`Self::score_index`] is a `BTreeSet` ordered by exactly this
+    /// score (ties on txid), kept in sync by
+    /// [`Self::adjust_descendant_totals`]/[`Self::resync_score_index`]
+    /// on every insertion and removal rather than scanned fresh here.
+    fn worst_by_descendant_score(&self) -> Option<(Txid, i64, usize)> {
+        self.score_index.first().map(|k| (k.txid, k.fee, k.size))
+    }
+
+    /// Test-only: the number of full descendant walks
+    /// ([`Self::descendant_txids`]/[`Self::descendants_of`]) performed
+    /// so far — used to assert that eviction at pool scale stays off
+    /// that path.
+    #[cfg(test)]
+    pub(crate) fn descendant_walk_count(&self) -> u64 {
+        self.descendant_walk_count.get()
+    }
+
+    /// Test-only consistency check: recomputes every pooled entry's
+    /// `fees_with_descendants`/`size_with_descendants` from scratch (a
+    /// full walk, deliberately independent of the incremental
+    /// bookkeeping under test) and its [`Self::effective_score`], and
+    /// asserts both match what [`Self::adjust_descendant_totals`] /
+    /// [`Self::resync_score_index`] left cached — including that
+    /// `score_index` has exactly one row per pooled entry and no more.
+    /// Panics on the first mismatch found.
+    #[cfg(test)]
+    pub(crate) fn assert_descendant_totals_consistent(&self) {
+        for (txid, entry) in &self.map {
+            let mut fee = entry.modified_fee();
+            let mut size = entry.vsize;
+            for id in self.descendant_txids(txid) {
+                if let Some(e) = self.map.get(&id) {
+                    fee = fee.saturating_add(e.modified_fee());
+                    size = size.saturating_add(e.vsize);
+                }
+            }
+            assert_eq!(
+                (entry.fees_with_descendants, entry.size_with_descendants),
+                (fee, size),
+                "descendant totals diverged for {txid}"
+            );
+            let (score_fee, score_size) = Self::effective_score(entry);
+            assert!(
+                self.score_index.contains(&ScoreKey {
+                    fee: score_fee,
+                    size: score_size,
+                    txid: *txid,
+                }),
+                "score index missing/stale row for {txid}"
+            );
+        }
+        assert_eq!(
+            self.map.len(),
+            self.score_index.len(),
+            "score index size diverged from pool size"
+        );
     }
 
     /// Parks a tx whose inputs don't resolve, bounded and expiring —
@@ -1963,6 +2114,23 @@ impl Mempool {
         for input in &entry.tx.inputs {
             self.spends.remove(&input.previous_output);
         }
+        // Drop this entry's own score-index row and unwind its
+        // (fee, vsize) out of every remaining ancestor's descendant
+        // aggregates — Core's `UpdateForRemoveFromMempool`, the reverse
+        // of the admission-time propagation below. Every removal path
+        // (eviction, RBF/TRUC-sibling replacement, block-connect,
+        // expiry, a failed reorg re-add) funnels through here or through
+        // `remove_recursive`'s child-before-parent calls into here, so
+        // this one spot keeps every path's aggregates correct.
+        let (fee, size) = Self::effective_score(&entry);
+        self.score_index.remove(&ScoreKey {
+            fee,
+            size,
+            txid: *txid,
+        });
+        for ancestor in self.ancestors_of(&entry.tx) {
+            self.adjust_descendant_totals(ancestor, -entry.modified_fee(), -(entry.vsize as i64));
+        }
         Some(entry)
     }
 
@@ -2064,13 +2232,36 @@ impl Mempool {
     /// `mapDeltas` slot and stores the accumulated value on the entry
     /// (Core's `UpdateFeeDelta` sets, doesn't add). Unknown txids are
     /// remembered for admission; the RPC reports success either way.
-    /// Ancestor/descendant fee stats pick the delta up automatically —
-    /// they're summed from each entry's `modified_fee()` at query time.
+    /// For a pooled tx, `delta` also replays through its own and every
+    /// in-pool ancestor's `fees_with_descendants` — those are cached
+    /// aggregates now (see [`Self::adjust_descendant_totals`]), not
+    /// summed fresh at query time, so a change here has to be pushed
+    /// rather than picked up automatically.
     pub fn prioritise(&mut self, txid: &Txid, delta: i64) {
         let slot = self.deltas.entry(*txid).or_insert(0);
         *slot = slot.saturating_add(delta);
+        let new_delta = *slot;
+        let Some(entry) = self.map.get(txid) else {
+            return;
+        };
+        // Snapshot this entry's score *before* touching `fee_delta` —
+        // `adjust_descendant_totals` normally brackets its own before/
+        // after around a single field change, but here `fee_delta` and
+        // `fees_with_descendants` must move together (both reflect the
+        // same modified-fee shift), so this entry's own row is resynced
+        // once, directly, rather than through that helper.
+        let before = Self::effective_score(entry);
+        let ancestors = self.ancestors_of(&entry.tx);
         if let Some(e) = self.map.get_mut(txid) {
-            e.fee_delta = *slot;
+            e.fee_delta = new_delta;
+            e.fees_with_descendants = e.fees_with_descendants.saturating_add(delta);
+        }
+        self.resync_score_index(*txid, Some(before));
+        // Every ancestor has this tx as one of its descendants, so its
+        // `fees_with_descendants` shifts by the same `delta` — Core
+        // folds this into `PrioritiseTransaction`'s own bookkeeping too.
+        for ancestor in ancestors {
+            self.adjust_descendant_totals(ancestor, delta, 0);
         }
     }
 
