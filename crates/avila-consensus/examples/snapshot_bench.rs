@@ -433,7 +433,10 @@ fn main() {
                         refill(&mut buf, &mut pos, &mut len, &mut r);
                     }
                     let vout = cs!() as u32;
-                    key[32..].copy_from_slice(&vout.to_le_bytes());
+                    // Big-endian: this key feeds RunBuilder::push_wire,
+                    // whose ordering (and binary search on read back)
+                    // needs byte order == numeric vout order.
+                    key[32..].copy_from_slice(&vout.to_be_bytes());
                     let body_start = pos;
                     // Scan 3 MSB-chained varints; only size_id's value is needed.
                     let mut varints = [0u64; 3];
@@ -601,7 +604,10 @@ fn main() {
                         refill(&mut buf, &mut pos, &mut len, &mut r);
                     }
                     let vout = cs!() as u32;
-                    key[32..].copy_from_slice(&vout.to_le_bytes());
+                    // Big-endian: this key feeds RunBuilder::push_wire,
+                    // whose ordering (and binary search on read back)
+                    // needs byte order == numeric vout order.
+                    key[32..].copy_from_slice(&vout.to_be_bytes());
                     let body_start = pos;
                     let mut varints = [0u64; 3];
                     for v in varints.iter_mut() {
@@ -754,7 +760,9 @@ fn main() {
                 // Peek the group's first vout to complete its first key.
                 let save = pos;
                 let v0 = cs!() as u32;
-                first_key[32..].copy_from_slice(&v0.to_le_bytes());
+                // Big-endian to match SnapshotRun::get's query key —
+                // see the RunBuilder/SortedRun key fix above.
+                first_key[32..].copy_from_slice(&v0.to_be_bytes());
                 if groups.is_multiple_of(256) {
                     sparse.push((first_key, group_off));
                 }

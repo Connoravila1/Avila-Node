@@ -112,6 +112,17 @@ impl Engine {
 }
 
 /// outpoint → 36-byte key (wire byte order: txid || vout LE).
+///
+/// Little-endian `vout` means this key's byte order isn't numeric vout
+/// order past 255 (256 sorts before 1) — fine here, because this key is
+/// only ever used as a redb/hash-table lookup key (a bijection is all
+/// either needs), never scanned or binary-searched in order. Contrast
+/// [`crate::utxo_snapshot::outpoint_key`], the *sort* key `write_snapshot`
+/// and the sorted-run builders use, which is big-endian for exactly that
+/// reason. Don't change this encoding: it's baked into every on-disk
+/// `coinsdb.redb`, `coins.idx`/`coins.dat`, and undo record already
+/// written (see [`encode_undo`]) — changing it would strand existing
+/// databases.
 pub(crate) fn key_of(op: &OutPoint) -> [u8; 36] {
     let mut k = [0u8; 36];
     k[..32].copy_from_slice(op.txid.as_bytes());

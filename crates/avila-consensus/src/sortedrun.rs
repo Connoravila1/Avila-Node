@@ -1,8 +1,10 @@
 //! An immutable sorted run of coins — the bulk-load path for snapshots.
 //!
 //! `loadtxoutset`'s stream is already sorted by `(txid, vout)` — the
-//! same order [`crate::coinsdb::key_of`] produces — so building the
-//! base layer is a *sequential write*, not an index insert: records
+//! same order [`crate::utxo_snapshot::outpoint_key`] produces (not
+//! [`crate::coinsdb::key_of`]: that one's vout is little-endian, fine
+//! for its use as an unordered hash/B-tree key but wrong for sorting
+//! once vout reaches 256) — so building the
 //! append to `base.run` in stream order while a sparse in-memory index
 //! records every `STRIDE`-th key. That turns a 20-minute B-tree ingest
 //! into a bounded sequential write — the whole point of the format.
@@ -77,7 +79,7 @@ impl RunBuilder {
     /// the snapshot stream guarantees it; anything else is a format
     /// bug worth failing loudly on.
     pub fn push(&mut self, op: &OutPoint, coin: &Coin) -> io::Result<()> {
-        let key = coinsdb::key_of(op);
+        let key = crate::utxo_snapshot::outpoint_key(op);
         if let Some(prev) = self.last_key {
             debug_assert!(key > prev, "sorted-run keys must ascend");
         }
@@ -179,7 +181,7 @@ impl SortedRun {
 
     /// Point lookup: sparse binary search → one window read → scan.
     pub fn get(&self, op: &OutPoint) -> Option<Coin> {
-        self.get_key(&coinsdb::key_of(op))
+        self.get_key(&crate::utxo_snapshot::outpoint_key(op))
     }
 
     /// Lookup by raw `key_of` bytes — for callers already holding a key.
@@ -268,7 +270,7 @@ impl SnapshotRun {
     /// scan from the group start. Groups are small (~1-2 outs), so the
     /// window covers stride+margin coins worth of bytes.
     pub fn get(&self, op: &OutPoint) -> Option<Coin> {
-        let key = crate::coinsdb::key_of(op);
+        let key = crate::utxo_snapshot::outpoint_key(op);
         let lo_idx = match self.sparse.binary_search_by(|(k, _)| k.cmp(&key)) {
             Ok(i) => i,
             Err(0) => return None,
@@ -374,6 +376,7 @@ fn cs(buf: &[u8], pos: &mut usize) -> u64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::transaction::{Script, TxOut};
@@ -419,6 +422,49 @@ mod tests {
         }
         assert!(run.get(&op(200, 0)).is_none());
         assert!(run.get(&op(50, 1)).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Before the big-endian fix, `outpoint_key`'s little-endian vout
+    /// made vout 256 sort *before* vout 1 for the same txid — the
+    /// opposite of Core's real cursor order, and enough to trip
+    /// `push`'s ascending-keys check on any real transaction with more
+    /// than 256 surviving outputs.
+    #[test]
+    fn vout_past_256_sorts_and_looks_up_correctly() {
+        let dir = std::env::temp_dir().join(format!("srun-vout256-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("base.run");
+
+        // Enough surrounding filler that the special pair sits in the
+        // middle of a realistically-sized run (a 2-record file makes
+        // `scan_window`'s tail-window read run past EOF — a distinct,
+        // pre-existing sizing quirk unrelated to key ordering).
+        let txid = op(50, 0).txid;
+        let low = OutPoint { txid, vout: 1 };
+        let high = OutPoint { txid, vout: 256 };
+
+        let mut b = RunBuilder::create_with_stride(&path, 4).unwrap();
+        for i in 0..50u64 {
+            b.push(&op(i, 0), &coin(i as i64)).unwrap();
+        }
+        // Real snapshot order: numerically ascending vout within a
+        // txid group. Before the fix this second push would be
+        // rejected as a descending key (256's little-endian bytes sort
+        // before 1's).
+        b.push(&low, &coin(111)).unwrap();
+        b.push(&high, &coin(222)).unwrap();
+        for i in 51..100u64 {
+            b.push(&op(i, 0), &coin(i as i64)).unwrap();
+        }
+        b.finish().unwrap();
+
+        let run = SortedRun::open(&path).unwrap();
+        assert_eq!(run.get(&low).expect("vout 1").out.value, 111);
+        assert_eq!(run.get(&high).expect("vout 256").out.value, 222);
+        assert_eq!(run.get(&op(49, 0)).expect("filler before").out.value, 49);
+        assert_eq!(run.get(&op(51, 0)).expect("filler after").out.value, 51);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

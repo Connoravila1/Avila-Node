@@ -103,12 +103,18 @@ pub fn write_coin(out: &mut Vec<u8>, coin: &Coin) {
 }
 
 /// One [`OutPoint`] in Core's coins-DB cursor order — the byte-wise sort of
-/// the serialized `COutPoint` key (`txid` raw internal bytes, then `vout`
-/// little-endian).
+/// the serialized `COutPoint` key: `txid` raw internal bytes, then `vout`
+/// *numerically* ascending. Unlike [`crate::coinsdb::key_of`] (an
+/// unordered hash/B-tree key, so any fixed encoding works and little-endian
+/// is what's on disk already), this key's whole purpose is byte order —
+/// callers sort by it — so `vout` is big-endian: byte-lexicographic order
+/// on a big-endian fixed-width integer is numeric order, which
+/// little-endian is not once `vout >= 256` (e.g. 256's LE bytes sort
+/// before 1's).
 pub fn outpoint_key(o: &OutPoint) -> [u8; 36] {
     let mut k = [0u8; 36];
     k[..32].copy_from_slice(o.txid.as_bytes());
-    k[32..].copy_from_slice(&o.vout.to_le_bytes());
+    k[32..].copy_from_slice(&o.vout.to_be_bytes());
     k
 }
 
@@ -694,6 +700,17 @@ mod tests {
         assert_eq!(got[0].1.out.value, 5_000);
         assert_eq!(got[0].1.out.script_pubkey.as_bytes(), script.as_bytes());
         assert_eq!(got[0].1.height, 100);
+    }
+
+    /// `outpoint_key`'s whole job is byte order matching numeric vout
+    /// order (unlike `coinsdb::key_of`, which only needs to be a
+    /// bijection) — vout 256 must sort after vout 1 for the same txid.
+    #[test]
+    fn outpoint_key_orders_vout_numerically_past_256() {
+        let txid = crate::hash::Txid::from_bytes([3u8; 32]);
+        let low = outpoint_key(&OutPoint { txid, vout: 1 });
+        let high = outpoint_key(&OutPoint { txid, vout: 256 });
+        assert!(low < high, "vout 1 must sort before vout 256");
     }
 
     /// Core's `ReadVarInt<uint32_t>` (used for `Coin::code` and
