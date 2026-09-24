@@ -229,6 +229,16 @@ fn signature_encoding_flags() {
     sig.extend_from_slice(&SECP256K1_ORDER); // S = n exactly
     sig.push(0x01);
     assert_eq!(check_signature_encoding(&sig, low_s), Ok(()));
+    // R >= n hits the same quirk, even with a genuinely high S: the lax
+    // DER parser shares one overflow flag between R and S, so R = n
+    // zeroes the whole (R, S) pair — a zeroed S is trivially low.
+    let mut sig = vec![0x30, 69, 0x02, 33, 0x00];
+    sig.extend_from_slice(&SECP256K1_ORDER); // R = n exactly (overflows)
+    sig.extend_from_slice(&[0x02, 32]);
+    sig.extend_from_slice(&high_s); // S is genuinely > n/2, not overflowing
+    sig.push(0x01);
+    assert!(is_valid_signature_encoding(&sig));
+    assert_eq!(check_signature_encoding(&sig, low_s), Ok(()));
 }
 
 // ---------------------------------------------------------------------------

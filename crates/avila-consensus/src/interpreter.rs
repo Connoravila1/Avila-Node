@@ -635,14 +635,16 @@ const SECP256K1_HALF_ORDER: [u8; 32] = [
 /// `CPubKey::CheckLowS` — is the S component of a strict-DER signature (no
 /// sighash byte) at most `n/2`?
 ///
-/// Core delegates to libsecp256k1's `signature_parse_der` +
-/// `signature_normalize`. `parse_der` treats an S value `>= n` as a scalar
-/// overflow and zeroes the whole signature, which then reads as already
-/// normalized — so `S >= n` reports *low* here. The explicit `s >= n` branch
-/// reproduces that quirk.
+/// Core delegates to libsecp256k1's lax DER parser (`ecdsa_signature_parse_der_lax`)
+/// + `signature_normalize`. The lax parser shares one `overflow` flag between R
+/// and S: if *either* component's raw bytes don't fit in 32 bytes, or the
+/// resulting 32-byte scalar is `>= n`, the whole 64-byte (R, S) buffer is
+/// zeroed rather than rejected — R's overflow zeroes S right along with it.
+/// A zeroed S is trivially `<= n/2`, so an overflow in *either* component
+/// reports *low* here, not just an overflowing S.
 fn check_low_s(sig_der: &[u8]) -> bool {
     // Caller guarantees is_valid_signature_encoding held for sig_der||hashtype;
-    // re-derive S's slice from the DER layout.
+    // re-derive R's and S's slices from the DER layout.
     if sig_der.len() < 8 || sig_der[0] != 0x30 {
         return false;
     }
@@ -654,6 +656,7 @@ fn check_low_s(sig_der: &[u8]) -> bool {
     if len_r + len_s + 6 != sig_der.len() {
         return false;
     }
+    let r_bytes = &sig_der[4..4 + len_r];
     let s_bytes = &sig_der[6 + len_r..6 + len_r + len_s];
     // Big-endian compare of the DER integer against a 32-byte bound. A
     // DER-positive integer longer than 32 bytes exceeds any such bound.
@@ -665,9 +668,12 @@ fn check_low_s(sig_der: &[u8]) -> bool {
         padded[32 - bytes.len()..].copy_from_slice(bytes);
         padded.as_slice().cmp(bound.as_slice())
     }
-    if cmp_be256(s_bytes, &SECP256K1_ORDER) != std::cmp::Ordering::Less {
-        // Scalar overflow: libsecp256k1's parse_der zeroes the signature, which
-        // then reads as already-normalized (low) — reproduce that.
+    if cmp_be256(r_bytes, &SECP256K1_ORDER) != std::cmp::Ordering::Less
+        || cmp_be256(s_bytes, &SECP256K1_ORDER) != std::cmp::Ordering::Less
+    {
+        // Scalar overflow in R or S: libsecp256k1's lax parser zeroes the
+        // whole signature, which then reads as already-normalized (low) —
+        // reproduce that for either component, not just S.
         return true;
     }
     cmp_be256(s_bytes, &SECP256K1_HALF_ORDER) != std::cmp::Ordering::Greater
