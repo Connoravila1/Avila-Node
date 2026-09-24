@@ -6911,21 +6911,36 @@ pub(crate) fn dispatch(
             let Some(raw) = param(params, 0, "hexstring").and_then(Value::as_str) else {
                 return missing_params("hexstring");
             };
-            let maxfeerate = param(params, 1, "maxfeerate")
-                .and_then(Value::as_f64)
-                .unwrap_or(DEFAULT_MAX_RAW_TX_FEE_RATE);
-            if maxfeerate < 0.0 {
+            // Core's ParseFeeRate/AmountFromValue: number or string —
+            // `Value::as_f64` alone silently treats a string amount as
+            // "not a number" and falls back to the default, which is
+            // how a caller's real limit went unenforced. -3 on
+            // unparseable/negative/out-of-range, -8 once at or past
+            // 1 BTC/kvB — the same helper and message submitpackage
+            // already uses above.
+            let maxfeerate_sats = match param(params, 1, "maxfeerate").filter(|v| !v.is_null()) {
+                Some(v) => match amount_from_value(v) {
+                    Ok(a) => a,
+                    Err(e) => return (Value::Null, Some(e)),
+                },
+                None => (DEFAULT_MAX_RAW_TX_FEE_RATE * 100_000_000.0) as i64,
+            };
+            if maxfeerate_sats >= 100_000_000 {
                 return (
                     Value::Null,
                     Some((
                         RPC_INVALID_PARAMETER,
-                        "Invalid parameter, maxfeerate cannot be negative".into(),
+                        "Fee rates larger than or equal to 1BTC/kvB are not accepted".into(),
                     )),
                 );
             }
-            let maxburnamount = param(params, 2, "maxburnamount")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
+            let maxburn_sats = match param(params, 2, "maxburnamount").filter(|v| !v.is_null()) {
+                Some(v) => match amount_from_value(v) {
+                    Ok(a) => a,
+                    Err(e) => return (Value::Null, Some(e)),
+                },
+                None => 0,
+            };
             // Core's sendrawtransaction decode failures all read
             // "TX decode failed. Make sure the tx has at least one
             // input." (decoderawtransaction keeps the bare wording).
@@ -6957,16 +6972,15 @@ pub(crate) fn dispatch(
                     .iter()
                     .map(|i| pool.resolve(cs, &i.previous_output).map(|c| c.out.value))
                     .sum();
-                if maxfeerate > 0.0
+                if maxfeerate_sats > 0
                     && let Some(input_sum) = input_sum
                 {
                     let output_sum: i64 = tx.outputs.iter().map(|o| o.value).sum();
                     let fee = input_sum - output_sum;
-                    let vsize = tx.weight().div_ceil(4).max(1);
-                    // Core: max_tx_fee = maxfeerate.GetFee(vsize) — an
-                    // absolute sats bound derived from the rate.
-                    let max_tx_fee = (maxfeerate * 100_000_000.0 * vsize as f64 / 1000.0) as i64;
-                    if fee > max_tx_fee {
+                    let vsize = tx.weight().div_ceil(4).max(1) as i64;
+                    // Core: fee/vsize > maxfeerate/1000, cross-multiplied
+                    // to avoid the division's rounding.
+                    if fee * 1000 > maxfeerate_sats * vsize {
                         return Err((
                             RPC_VERIFY_ERROR,
                             "Fee exceeds maximum configured by user \
@@ -6981,8 +6995,7 @@ pub(crate) fn dispatch(
                     .filter(|o| o.script_pubkey.is_unspendable())
                     .map(|o| o.value)
                     .sum();
-                let max_burn_sat = (maxburnamount * 100_000_000.0) as i64;
-                if burned > max_burn_sat {
+                if burned > maxburn_sats {
                     return Err((
                         RPC_VERIFY_ERROR,
                         "Unspendable output exceeds maximum configured by user \
@@ -12811,6 +12824,8 @@ mod tests {
             None,
         );
         assert_eq!(e.unwrap(), (RPC_MISC_ERROR, SENDRAWTRANSACTION_HELP.into()));
+        // Negative amounts are AmountFromValue's own "out of range",
+        // not a bespoke "cannot be negative" message.
         let (_, e) = dispatch(
             "sendrawtransaction",
             &json!(["00", -1]),
@@ -12821,7 +12836,63 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        assert_eq!(e.unwrap(), (RPC_TYPE_ERROR, "Amount out of range".into()));
+        // A feerate at/past 1 BTC/kvB is rejected before decoding too,
+        // with submitpackage's exact wording.
+        let (_, e) = dispatch(
+            "sendrawtransaction",
+            &json!(["00", 1]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_INVALID_PARAMETER,
+                "Fee rates larger than or equal to 1BTC/kvB are not accepted".into()
+            )
+        );
+        // A JSON *string* amount must parse the same as a number
+        // (Value::as_f64 alone silently dropped it to the default) —
+        // "0.05" clears validation and fails on the bogus hex instead.
+        let (_, e) = dispatch(
+            "sendrawtransaction",
+            &json!(["00", "0.05"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
+        // Same string/negative handling for maxburnamount.
+        let (_, e) = dispatch(
+            "sendrawtransaction",
+            &json!(["00", Value::Null, "0.01"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
+        let (_, e) = dispatch(
+            "sendrawtransaction",
+            &json!(["00", Value::Null, -1]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(e.unwrap(), (RPC_TYPE_ERROR, "Amount out of range".into()));
 
         // Not-hex and non-tx hex are deserialization errors.
         let (_, e) = dispatch(
