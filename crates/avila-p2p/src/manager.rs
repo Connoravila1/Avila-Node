@@ -170,6 +170,22 @@ struct PeerEntry<S> {
     recon_map: std::collections::HashMap<u32, avila_consensus::hash::Txid>,
     /// When the next initiated round may start.
     next_recon: Instant,
+    /// An in-progress bisected close: our half-pools and the misses
+    /// collected so far — `lo` is consumed by the first `sketch`, `hi`
+    /// by the second (fixed reply order).
+    recon_bisect: Option<ReconBisect>,
+}
+
+/// Pending bisected-round state — see [`crate::recon::bisect`].
+struct ReconBisect {
+    /// Our pool's lo half (bit 31 clear).
+    lo: Vec<u32>,
+    /// Our pool's hi half (bit 31 set).
+    hi: Vec<u32>,
+    /// Whether the lo-half sketch was already decoded.
+    got_lo: bool,
+    /// Misses accumulated across both halves.
+    misses: Vec<u32>,
 }
 
 /// A read-only view of one connected peer — the manager's state is
@@ -637,6 +653,7 @@ impl<S: Read + Write> PeerManager<S> {
                 recon_round: None,
                 recon_map: std::collections::HashMap::new(),
                 next_recon: Instant::now(),
+                recon_bisect: None,
             },
         );
         Some(id)
@@ -1280,15 +1297,60 @@ impl<S: Read + Write> PeerManager<S> {
                     return;
                 };
                 let salt = link.our_salt ^ link.their_salt;
+                // Bisected close: each reply sketch decodes against our
+                // matching half (lo first, fixed order).
+                if let Some(mut bs) = peer.recon_bisect.take() {
+                    let (half, is_lo) = if !bs.got_lo {
+                        (&bs.lo, true)
+                    } else {
+                        (&bs.hi, false)
+                    };
+                    if let Some(round) = peer.recon_round.as_ref()
+                        && let Some(misses) = round.close_bisected(&reply_sk, half)
+                    {
+                        bs.misses.extend(misses);
+                    }
+                    if is_lo {
+                        bs.got_lo = true;
+                        peer.recon_bisect = Some(bs);
+                    } else {
+                        // Both halves done — one diff ask for the lot.
+                        peer.recon_round = None;
+                        if !bs.misses.is_empty() {
+                            let _ = peer.session.send(&Message::ReconcilDiff {
+                                ask_parents: 0,
+                                short_ids: bs.misses,
+                            });
+                        }
+                    }
+                    return;
+                }
                 let (our_ids, _) = recon_pool(mempool, salt);
-                if let Some(round) = peer.recon_round.take()
-                    && let Some(misses) = round.close(&reply_sk, &our_ids)
-                    && !misses.is_empty()
-                {
-                    let _ = peer.session.send(&Message::ReconcilDiff {
-                        ask_parents: 0,
-                        short_ids: misses,
-                    });
+                match peer.recon_round.take() {
+                    Some(round) => match round.close(&reply_sk, &our_ids) {
+                        Some(misses) if !misses.is_empty() => {
+                            let _ = peer.session.send(&Message::ReconcilDiff {
+                                ask_parents: 0,
+                                short_ids: misses,
+                            });
+                        }
+                        Some(_) => {}
+                        // Over-capacity merge — ask the responder to
+                        // bisect its pool; replies come back as two
+                        // `sketch` messages.
+                        None => {
+                            let (lo, hi) = crate::recon::bisect(&our_ids, 31);
+                            peer.recon_bisect = Some(ReconBisect {
+                                lo,
+                                hi,
+                                got_lo: false,
+                                misses: Vec::new(),
+                            });
+                            peer.recon_round = Some(round);
+                            let _ = peer.session.send(&Message::ReqBisec);
+                        }
+                    },
+                    None => {}
                 }
             }
             SessionEvent::Message(Message::ReconcilDiff { short_ids, .. }) => {
@@ -1303,9 +1365,24 @@ impl<S: Read + Write> PeerManager<S> {
                     }
                 }
             }
-            SessionEvent::Message(Message::ReqBisec | Message::SendRecon(_)) => {
-                // Bisection fallback and late renegotiation are ignored
-                // for now — a failed round simply retries next interval.
+            SessionEvent::Message(Message::ReqBisec) => {
+                // Split our pool at bit 31 and reply with two
+                // half-capacity sketches — each half's difference is
+                // half as wide, and failed halves bisect again on the
+                // initiator's side.
+                let Some(link) = peer.recon else {
+                    return;
+                };
+                let salt = link.our_salt ^ link.their_salt;
+                let (our_ids, _) = recon_pool(mempool, salt);
+                let capacity = (our_ids.len() / 64).clamp(8, 512);
+                let (lo, hi) = crate::recon::bisect_reply(&our_ids, 31, capacity);
+                let _ = peer.session.send(&lo);
+                let _ = peer.session.send(&hi);
+            }
+            SessionEvent::Message(Message::SendRecon(_)) => {
+                // Late renegotiation is ignored — caps were fixed at
+                // handshake.
             }
             SessionEvent::Message(Message::Mempool) => {
                 // BIP35: advertise the whole pool. wtxid entries for

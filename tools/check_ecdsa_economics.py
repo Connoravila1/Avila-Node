@@ -210,6 +210,13 @@ def main():
                 raise ValueError('a claimed false must be checked normally without speculative failure')
 
     if not args.only or 'extras' in args.only:
+        # Keep this suite independently runnable without the broader attack sweep.
+        callback_attack = out / 'cases-bad-parity.hints'
+        if not callback_attack.exists():
+            items = frames((built / 'cases.hints').read_bytes())
+            hints = decode(items[0][1])
+            hints[0][0] ^= 1
+            callback_attack.write_bytes(encode([(items[0][0], body(hints))]))
         run('missing-stream', sidecar=out / 'missing.hints')
         row = run('worker-exit', worker=Path('/bin/false'))
         if not row['retry_groups'] or not row['worker_errors']:
@@ -218,7 +225,7 @@ def main():
         row = run('one-record-batches', batch=1)
         if row['retry_groups']:
             raise ValueError('healthy callback flush')
-        if not run('one-record-failure', batch=1, sidecar=out / 'cases-bad-parity.hints')['retry_groups']:
+        if not run('one-record-failure', batch=1, sidecar=callback_attack)['retry_groups']:
             raise ValueError('callback failure did not retry')
         tiny = run('tiny-bypass', minimum=64)
         if tiny['hinted'] or tiny['workers'] or tiny['ordinary'] != 10:
