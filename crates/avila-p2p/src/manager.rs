@@ -1783,6 +1783,57 @@ fn v1_version_prefix(magic: [u8; 4]) -> [u8; 16] {
     p
 }
 
+/// How long to sleep between unproductive probe peeks — bounds the
+/// worker to a handful of wakeups a second instead of spinning.
+const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Peeks `stream` until its first bytes resolve the v1-vs-v2 transport
+/// question or `deadline` passes.
+///
+/// `TcpStream::peek` mirrors `recv(MSG_PEEK)`: it returns as soon as
+/// *any* queued bytes are available, not once the full buffer is
+/// filled, and an idle connection with data already queued keeps
+/// returning that same data immediately on every call. A bare retry
+/// loop around it therefore either spins at 100% CPU forever on a peer
+/// that sends a few matching prefix bytes and then goes quiet, or —
+/// since an empty peek trivially equals an empty prefix slice — spins
+/// forever on `Ok(0)` once the peer hangs up. Both are bounded here:
+/// EOF is reported immediately as a disconnect, and an inconclusive
+/// peek backs off for [`PROBE_POLL_INTERVAL`] before trying again,
+/// itself bounded by `deadline` — a real peer's 16-byte prefix arrives
+/// in a single write, so this only ever iterates for a pathological one.
+///
+/// Returns the bytes peeked so far — `probe[..n]` is meaningful,
+/// `probe[n..]` is only guaranteed zero when the break was `n < 16`
+/// (never a full v1-prefix match, since it already disagrees with
+/// `want` inside `probe[..n]`).
+fn probe_transport_prefix(
+    stream: &TcpStream,
+    want: [u8; 16],
+    deadline: Instant,
+) -> std::io::Result<[u8; 16]> {
+    let mut probe = [0u8; 16];
+    loop {
+        let n = stream.peek(&mut probe)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "peer closed before completing the transport probe",
+            ));
+        }
+        if n >= 16 || probe[..n] != want[..n] {
+            return Ok(probe);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "transport probe did not resolve within the handshake timeout",
+            ));
+        }
+        std::thread::sleep(PROBE_POLL_INTERVAL);
+    }
+}
+
 /// Responder side of a fresh inbound connection: peek at the first
 /// bytes to pick the transport, run the matching handshake (blocking,
 /// bounded by `HANDSHAKE_TIMEOUT` on the socket), then return a
@@ -1806,16 +1857,8 @@ fn accept_one(
         ));
     }
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    // Peek until the full discriminator arrives — TCP may fragment the
-    // peer's first write.
-    let mut probe = [0u8; 16];
     let want = v1_version_prefix(magic);
-    loop {
-        let n = stream.peek(&mut probe)?;
-        if n >= 16 || probe[..n] != want[..n] {
-            break;
-        }
-    }
+    let probe = probe_transport_prefix(&stream, want, Instant::now() + HANDSHAKE_TIMEOUT)?;
     if probe == want {
         stream.set_read_timeout(None)?;
         stream.set_nonblocking(true)?;
@@ -2724,6 +2767,66 @@ mod tests {
         assert!(protocols.contains(&"v2"));
         assert!(protocols.contains(&"v1"));
     }
+
+    /// A peer that connects and hangs up without sending anything must
+    /// be reported as a prompt error, not spin `peek` forever on `Ok(0)`
+    /// (an empty peek trivially "equals" an empty prefix slice).
+    #[test]
+    fn transport_probe_reports_eof_promptly() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let laddr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(laddr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        drop(client); // hang up with zero bytes sent
+
+        let want = v1_version_prefix(MAGIC);
+        let started = Instant::now();
+        let err = probe_transport_prefix(&server, want, started + Duration::from_secs(30))
+            .expect_err("EOF must surface as an error, not a spin");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        // Reported immediately — nowhere near the 30s deadline given.
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A peer that sends a few bytes of the public v1 prefix and then
+    /// goes quiet (whether it closed with those bytes still unread, or
+    /// just stalled — `peek` cannot tell the two apart, since it never
+    /// consumes what it sees) must be bounded by the deadline instead of
+    /// spinning: each unproductive peek backs off, so the probe resolves
+    /// once `deadline` passes rather than immediately or never.
+    #[test]
+    fn transport_probe_bounds_a_stalled_partial_prefix_to_the_deadline() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let laddr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(laddr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+
+        let want = v1_version_prefix(MAGIC);
+        client.write_all(&want[..3]).unwrap(); // 3 matching bytes...
+        client.flush().unwrap();
+        drop(client); // ...then the peer is gone for good.
+
+        let deadline_from_now = Duration::from_millis(150);
+        let started = Instant::now();
+        let err = probe_transport_prefix(&server, want, started + deadline_from_now)
+            .expect_err("a stalled partial match must time out, not match or spin forever");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        // Bounded on both sides: it waited roughly the deadline (not an
+        // instant spin) and didn't run substantially past it either
+        // (not stuck retrying beyond the bound).
+        let elapsed = started.elapsed();
+        assert!(elapsed >= deadline_from_now);
+        assert!(elapsed < deadline_from_now + Duration::from_secs(2));
+    }
+
     /// The scheduler: `run_due_tasks` fires jobs whose `next_run`
     /// passed on the mockable clock; `scheduler_forward` compresses
     /// time for `mockscheduler`.
