@@ -8,7 +8,7 @@
 
 use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
 
-use crate::hash::tagged_hash;
+use crate::hash::{hash160, tagged_hash};
 use crate::transaction::{OutPoint, Transaction};
 
 /// A watched silent-payments address — the scan private key plus the
@@ -77,10 +77,28 @@ fn input_pubkey(txin: &crate::transaction::TxIn, prevout: &[u8]) -> Option<Publi
         let x = XOnlyPublicKey::from_slice(&prevout[2..34]).ok()?;
         return Some(x.public_key(secp256k1::Parity::Even));
     }
-    // p2wpkh / p2sh-p2wpkh: the compressed key is witness[1].
-    if (prevout.len() == 22 && prevout[0] == 0x00 && prevout[1] == 0x14)
-        || (prevout.len() == 23 && prevout[0] == 0xa9 && prevout[1] == 0x14)
-    {
+    // p2wpkh: the compressed key is witness[1].
+    if prevout.len() == 22 && prevout[0] == 0x00 && prevout[1] == 0x14 {
+        return txin
+            .witness
+            .items()
+            .get(1)
+            .and_then(|w| PublicKey::from_slice(w).ok());
+    }
+    // p2sh-p2wpkh: BIP352 requires the P2SH to actually wrap a P2WPKH
+    // redeem script, not just look P2SH-shaped — the scriptSig must be
+    // exactly one minimal push of `OP_0 <20-byte-hash>` whose hash160
+    // matches the P2SH script hash (Core's own malleation check for
+    // the segwit-in-P2SH substitution requires that same exact
+    // minimal-push scriptSig, so every confirmed P2SH-P2WPKH spend has
+    // this shape). Any other P2SH — multisig, P2SH-P2WSH, ... — is
+    // ineligible and must be skipped, not guessed at.
+    if prevout.len() == 23 && prevout[0] == 0xa9 && prevout[1] == 0x14 && prevout[22] == 0x87 {
+        let ss = txin.script_sig.as_bytes();
+        let is_p2wpkh_redeem = ss.len() == 23 && ss[0] == 0x16 && ss[1] == 0x00 && ss[2] == 0x14;
+        if !is_p2wpkh_redeem || hash160(&ss[1..23]) != prevout[2..22] {
+            return None;
+        }
         return txin
             .witness
             .items()
@@ -627,5 +645,68 @@ mod tests {
             .unwrap_or_else(|_| unreachable!())
             .public_key(secp256k1::Parity::Even);
         assert_eq!(input_pubkey(&txin, &prevout), Some(expect));
+    }
+
+    /// BIP352 requires the P2SH to actually wrap a P2WPKH redeem
+    /// script: scriptSig must be exactly one minimal push of
+    /// `OP_0 <20-byte-hash>` whose hash160 matches the P2SH script
+    /// hash. A P2SH output that merely looks 23-byte P2SH-shaped —
+    /// wrapping some other script — must be skipped, not guessed at.
+    #[test]
+    fn input_pubkey_rejects_non_p2wpkh_p2sh() {
+        let redeem = vec![0x51]; // an arbitrary, non-P2WPKH redeem script
+        let redeem_hash = hash160(&redeem);
+        let mut prevout = vec![0xa9, 0x14];
+        prevout.extend_from_slice(&redeem_hash);
+        prevout.push(0x87);
+        let mut script_sig = vec![redeem.len() as u8];
+        script_sig.extend_from_slice(&redeem);
+        let txin = dummy_txin(
+            script_sig,
+            Witness::new(vec![vec![0x30; 72], vec![0x02; 33]]),
+        );
+        assert_eq!(input_pubkey(&txin, &prevout), None);
+    }
+
+    /// Right shape (`OP_0 <20 bytes>`, minimally pushed) but the wrong
+    /// hash — BIP352 requires the hash to actually match, not just the
+    /// redeem script's form.
+    #[test]
+    fn input_pubkey_rejects_p2wpkh_shaped_redeem_with_wrong_hash() {
+        let mut redeem = vec![0x00, 0x14];
+        redeem.extend_from_slice(&[0x22; 20]);
+        let mut prevout = vec![0xa9, 0x14];
+        prevout.extend_from_slice(&[0x99; 20]); // unrelated hash
+        prevout.push(0x87);
+        let mut script_sig = vec![0x16];
+        script_sig.extend_from_slice(&redeem);
+        let txin = dummy_txin(
+            script_sig,
+            Witness::new(vec![vec![0x30; 72], vec![0x02; 33]]),
+        );
+        assert_eq!(input_pubkey(&txin, &prevout), None);
+    }
+
+    /// A genuine P2SH-P2WPKH spend is still detected: minimal push of
+    /// `OP_0 <20-byte-hash>` whose hash160 matches the P2SH hash.
+    #[test]
+    fn input_pubkey_accepts_genuine_p2sh_p2wpkh() {
+        let secp = Secp256k1::new();
+        let a_priv = SecretKey::from_slice(&[0x11; 32]).unwrap_or_else(|_| unreachable!());
+        let a_pub = PublicKey::from_secret_key(&secp, &a_priv);
+        let pkh = hash160(&a_pub.serialize());
+        let mut redeem = vec![0x00, 0x14];
+        redeem.extend_from_slice(&pkh);
+        let redeem_hash = hash160(&redeem);
+        let mut prevout = vec![0xa9, 0x14];
+        prevout.extend_from_slice(&redeem_hash);
+        prevout.push(0x87);
+        let mut script_sig = vec![0x16];
+        script_sig.extend_from_slice(&redeem);
+        let txin = dummy_txin(
+            script_sig,
+            Witness::new(vec![vec![0x30; 72], a_pub.serialize().to_vec()]),
+        );
+        assert_eq!(input_pubkey(&txin, &prevout), Some(a_pub));
     }
 }
