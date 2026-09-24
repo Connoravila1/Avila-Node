@@ -149,6 +149,38 @@ configuration sizes require explicit limits. Preserve provenance and redaction
 boundaries in any diagnostic export. Never treat a majority of implementations
 as an automatic rule for resolving a consensus disagreement.
 
+### Untrusted-advice invariants (acceleration must never become dependency)
+
+Several fast paths accept *untrusted* auxiliary data — a prepared snapshot
+index, SHA-256 midstate hints, signature-verification hints. These are
+permitted under a strict rule: advice may accelerate verification; it may
+never *become* the verification. Every hint channel must satisfy:
+
+- **False acceptance impossible.** A wrong hint can only cause false
+  rejection or wasted work, never acceptance of wrong data. The correctness
+  anchor stays a consensus-pinned value (e.g. `hash_serialized`) or the
+  object's own validity — never a publisher's identity or signature.
+- **The slow path is first-class, permanently.** A node ignoring all advice
+  must reach identical correctness by pure local verification, and that path
+  stays exercised in tests. A hint path that becomes the only tested path
+  is a hidden dependency.
+- **Anyone can produce the artifacts.** Hints are derivable from public data
+  by any holder of it — no secret inputs, no publisher-only capability. The
+  generator ships in the repository with an open format specification.
+- **Reproducible outputs.** Two producers building from the same input emit
+  the identical root/digest, so operators can cross-check producers and a
+  lying publisher is publicly detectable.
+- **No availability dependence.** Missing, corrupt, or throttled advice
+  degrades to ordinary verification — never stalls, crashes, or alters what
+  the node accepts. Worst case is the unassisted path's speed.
+- **Provenance ≠ correctness.** Publisher signatures may mark origin but
+  carry no correctness weight; verification anchors to consensus values.
+
+The failure mode these rules prevent is soft centralization: bundles that
+become de-facto required because the slow path bit-rots or only one party
+can produce them. A hint that changes *what* the node accepts — rather than
+*how fast* it checks — is out of bounds by definition.
+
 ## Dependency and state policy
 
 Pin the toolchain and commit the application lockfile. Keep native GUI features
