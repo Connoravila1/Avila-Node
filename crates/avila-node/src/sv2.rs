@@ -20,10 +20,11 @@ use std::thread;
 use std::time::Duration;
 
 use avila_consensus::block::Block;
+use avila_consensus::encode::write_var_bytes;
 use avila_consensus::hash::BlockHash;
 use avila_consensus::header::BlockHeader;
 use avila_consensus::hex;
-use avila_consensus::transaction::Transaction;
+use avila_consensus::transaction::{Transaction, TxOut};
 
 use crate::rpc::QuerySender;
 
@@ -69,6 +70,21 @@ fn le32(b: &[u8], off: usize) -> Option<u32> {
 }
 fn le64(b: &[u8], off: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b.get(off..off + 8)?.try_into().ok()?))
+}
+
+/// Serializes `outs` as concatenated `CTxOut`s — `value` (i64 LE) then
+/// the scriptPubKey as a CompactSize length prefix plus bytes — the
+/// plain Bitcoin encoding `NewTemplate.coinbase_tx_outputs` carries
+/// (sv2-spec, Template Distribution, `NewTemplate`). A raw one-byte
+/// length instead of CompactSize would silently truncate/corrupt the
+/// framing for any script of 253 bytes or more.
+fn encode_tp_outputs(outs: &[TxOut]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for out in outs {
+        buf.extend_from_slice(&out.value.to_le_bytes());
+        write_var_bytes(&mut buf, out.script_pubkey.as_bytes());
+    }
+    buf
 }
 
 /// The coinbase's merkle path — sibling hashes from leaf to root.
@@ -358,13 +374,7 @@ fn push_templates(
         // which must NOT be handed to the client (it already claims
         // subsidy+fees in `value_remaining`).
         let tp_outs = &coinbase.outputs[1.min(coinbase.outputs.len())..];
-        let mut tp_outputs = Vec::new();
-        for out in tp_outs {
-            // CTxOut serialization: value i64 + compactSize scriptlen + script.
-            tp_outputs.extend_from_slice(&out.value.to_le_bytes());
-            tp_outputs.push(out.script_pubkey.as_bytes().len() as u8);
-            tp_outputs.extend_from_slice(out.script_pubkey.as_bytes());
-        }
+        let tp_outputs = encode_tp_outputs(tp_outs);
         let mut nt = Vec::with_capacity(256);
         nt.extend_from_slice(&id.to_le_bytes());
         nt.push(1); // future_template
@@ -441,4 +451,49 @@ fn push_templates(
     );
     *next_id += 1;
     send(stream, MSG_NEW_TEMPLATE, &nt).is_ok() && send(stream, MSG_SET_NEW_PREV_HASH, &snp).is_ok()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use avila_consensus::transaction::Script;
+
+    /// The Sv2 spec's `NewTemplate.coinbase_tx_outputs` is plain
+    /// Bitcoin `CTxOut` serialization: a script of 253 bytes or more
+    /// must switch to the `0xfd` CompactSize prefix, not wrap a raw
+    /// byte length.
+    #[test]
+    fn encode_tp_outputs_uses_compact_size_for_long_scripts() {
+        let long_script = vec![0xabu8; 300];
+        let outs = vec![TxOut {
+            value: 12_345,
+            script_pubkey: Script::new(long_script.clone()),
+        }];
+        let buf = encode_tp_outputs(&outs);
+        // value (8) + CompactSize prefix (0xfd + u16 LE = 3 bytes) + script (300).
+        assert_eq!(buf.len(), 8 + 3 + 300);
+        assert_eq!(&buf[0..8], &12_345i64.to_le_bytes());
+        assert_eq!(
+            buf[8], 0xfd,
+            "a 300-byte script needs the 0xfd CompactSize prefix"
+        );
+        assert_eq!(u16::from_le_bytes([buf[9], buf[10]]), 300);
+        assert_eq!(&buf[11..], &long_script[..]);
+    }
+
+    /// The common case (a short script) still uses the single-byte
+    /// CompactSize form — no regression there.
+    #[test]
+    fn encode_tp_outputs_uses_single_byte_for_short_scripts() {
+        let script = vec![0x51u8; 5];
+        let outs = vec![TxOut {
+            value: 1,
+            script_pubkey: Script::new(script.clone()),
+        }];
+        let buf = encode_tp_outputs(&outs);
+        assert_eq!(buf.len(), 8 + 1 + 5);
+        assert_eq!(buf[8], 5);
+        assert_eq!(&buf[9..], &script[..]);
+    }
 }
