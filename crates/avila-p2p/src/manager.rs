@@ -213,6 +213,12 @@ struct PeerEntry<S> {
     /// Our pool's short-id -> txid map for the last open/answer — how a
     /// `reconcildiff` ask resolves to a body we can send.
     recon_map: std::collections::HashMap<u32, avila_consensus::hash::Txid>,
+    /// Recon telemetry — completed rounds and cumulative misses each
+    /// round produced. A peer whose diff stays persistently wide
+    /// (missing most of our pool every round) is an eclipse/censorship
+    /// signal worth surfacing (queue #19).
+    pub recon_rounds: u64,
+    pub recon_misses: u64,
     /// When the next initiated round may start.
     next_recon: Instant,
     /// An in-progress bisected close: our half-pools and the misses
@@ -300,6 +306,10 @@ pub struct PeerSnapshot {
     pub v2_session_id: Option<[u8; 32]>,
     /// BIP330 reconciliation negotiated on this link.
     pub recon: bool,
+    /// Completed recon rounds on this link and the cumulative miss
+    /// count — a persistently-wide diff is a censorship/eclipse signal.
+    pub recon_rounds: u64,
+    pub recon_misses: u64,
 }
 
 /// A bounded set of peers sharing one [`Chainstate`].
@@ -589,6 +599,8 @@ impl<S: Read + Write> PeerManager<S> {
                     transport_protocol: peer.session.transport_protocol(),
                     v2_session_id: peer.session.v2_session_id(),
                     recon: peer.recon.is_some(),
+                    recon_rounds: peer.recon_rounds,
+                    recon_misses: peer.recon_misses,
                 }
             })
             .collect();
@@ -753,6 +765,8 @@ impl<S: Read + Write> PeerManager<S> {
                 recon: None,
                 recon_round: None,
                 recon_map: std::collections::HashMap::new(),
+                recon_rounds: 0,
+                recon_misses: 0,
                 next_recon: Instant::now(),
                 recon_bisect: None,
             },
@@ -1528,6 +1542,8 @@ impl<S: Read + Write> PeerManager<S> {
                     } else {
                         // Both halves done — one diff ask for the lot.
                         peer.recon_round = None;
+                        peer.recon_rounds += 1;
+                        peer.recon_misses += bs.misses.len() as u64;
                         if !bs.misses.is_empty() {
                             let _ = peer.session.send(&Message::ReconcilDiff {
                                 ask_parents: 0,
@@ -1541,12 +1557,16 @@ impl<S: Read + Write> PeerManager<S> {
                 match peer.recon_round.take() {
                     Some(round) => match round.close(&reply_sk, &our_ids) {
                         Some(misses) if !misses.is_empty() => {
+                            peer.recon_rounds += 1;
+                            peer.recon_misses += misses.len() as u64;
                             let _ = peer.session.send(&Message::ReconcilDiff {
                                 ask_parents: 0,
                                 short_ids: misses,
                             });
                         }
-                        Some(_) => {}
+                        Some(_) => {
+                            peer.recon_rounds += 1;
+                        }
                         // Over-capacity merge — ask the responder to
                         // bisect its pool; replies come back as two
                         // `sketch` messages.

@@ -6768,6 +6768,12 @@ pub(crate) fn dispatch(
                             // BIP330: whether this link negotiated
                             // transaction reconciliation.
                             "recon": p.recon,
+                            // Recon telemetry — rounds run and the
+                            // cumulative diff size; a peer persistently
+                            // missing most of our pool is a censorship
+                            // or eclipse signal (queue #19).
+                            "recon_rounds": p.recon_rounds,
+                            "recon_misses": p.recon_misses,
                             // Core: hex of the BIP324 session id on v2,
                             // "" on v1.
                             "session_id": p

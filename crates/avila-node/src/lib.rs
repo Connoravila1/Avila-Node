@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Coordinator shared by the headless executable and egui application.
 //!
 //! Full-node startup currently fails explicitly: persistent services are not
