@@ -572,6 +572,7 @@ fn handle(
     let mut content_length = 0usize;
     let mut read_bytes = request_line.len();
     let mut authorization = String::new();
+    let mut expect_continue = false;
     loop {
         if !arm_deadline(&stream) {
             return;
@@ -600,6 +601,11 @@ fn handle(
                     // this slice keeps the credential's original case;
                     // trim drops the space after the colon.
                     authorization = trimmed[trimmed.len() - rest.len()..].trim().to_string();
+                }
+                if let Some(rest) = lower.strip_prefix("expect:")
+                    && rest.trim() == "100-continue"
+                {
+                    expect_continue = true;
                 }
                 if trimmed.is_empty() {
                     break;
@@ -634,6 +640,15 @@ fn handle(
     };
     if content_length == 0 || content_length > MAX_REQUEST {
         return;
+    }
+    // A client that sent `Expect: 100-continue` is waiting for this
+    // before it starts streaming the body — auth and the
+    // content-length bound above have already had their say, so
+    // there's nothing left that would turn into a different final
+    // status before the body is even read.
+    if expect_continue {
+        let _ = write!(stream, "HTTP/1.1 100 Continue\r\n\r\n");
+        let _ = stream.flush();
     }
     if !arm_deadline(&stream) {
         return;
@@ -12511,6 +12526,50 @@ mod tests {
         );
         let resp = writer.join().unwrap();
         assert!(resp.is_empty(), "server sent a reply to a malformed line");
+    }
+
+    /// `Expect: 100-continue` gets the interim response before the
+    /// server reads the body — a client honoring it waits for exactly
+    /// this before streaming a (possibly large) request body.
+    #[test]
+    fn expect_100_continue_gets_an_interim_response_before_the_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status: SharedStatus = Arc::new(RwLock::new(snap()));
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle(stream, &status, None, None, None, None, None, None);
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}"#;
+        write!(
+            client,
+            "POST / HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nExpect: 100-continue\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        client.flush().unwrap();
+
+        // The interim response must arrive before the body is sent —
+        // reading here would block (and this test would time out) if
+        // the server were instead waiting on the body first.
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).unwrap();
+        let interim = String::from_utf8_lossy(&buf[..n]);
+        assert!(interim.starts_with("HTTP/1.1 100 Continue"), "{interim}");
+
+        client.write_all(body).unwrap();
+        client.flush().unwrap();
+
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).unwrap();
+        let resp = String::from_utf8_lossy(&resp);
+        assert!(resp.contains("\"result\":120"), "{resp}");
+        server.join().unwrap();
     }
 
     #[test]
