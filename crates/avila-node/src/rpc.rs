@@ -150,6 +150,13 @@ const MAX_REQUEST: usize = 64 * 1024;
 /// How long a chain query may wait for the sync loop to answer.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Wall-clock ceiling on reading a request's line, headers, and body —
+/// a fixed deadline, not merely the per-`read` socket timeout `handle`
+/// also sets. A per-call timeout alone lets a client trickle a byte
+/// every few seconds and never trip it, holding one of the 64
+/// connection slots open indefinitely while making no real progress.
+const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Spawns the RPC listener on its own thread. `status` is read per
 /// request — answers reflect the most recent sync tick, not a live
 /// call into the validator. `queries`, when present, reaches the live
@@ -510,16 +517,48 @@ fn handle(
     stop: Option<&Arc<AtomicBool>>,
     auth: Option<&RpcAuth>,
 ) {
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    // A fixed wall-clock ceiling for the line/header/body read phase —
+    // re-armed as this call's `set_read_timeout` before every blocking
+    // read below, shrunk to whatever remains of it. A single 10s
+    // per-read timeout can't do this alone: a client trickling in a
+    // byte every few seconds never lets any one read time out, yet
+    // never finishes the request either, holding this connection's
+    // slot open indefinitely.
+    let deadline = Instant::now() + REQUEST_READ_DEADLINE;
+    let arm_deadline = |stream: &TcpStream| -> bool {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        stream.set_read_timeout(Some(remaining)).is_ok()
+    };
+    if !arm_deadline(&stream) {
+        return;
+    }
     let Ok(read_half) = stream.try_clone() else {
         return;
     };
     let mut reader = BufReader::new(read_half);
     // Request line ("POST / HTTP/1.1") then headers until the blank
     // line, all bounded. Non-POST gets Core's 405 before auth.
+    //
+    // Each `read_line` below is capped with `Read::take` to whatever
+    // remains of the MAX_REQUEST budget: plain `BufRead::read_line`
+    // has no size limit of its own and keeps buffering as long as no
+    // `\n` shows up, so an unterminated line (a multi-hundred-KiB
+    // request line with no newline, say) would be read into memory in
+    // full — pre-auth — before the old post-hoc `read_bytes >
+    // MAX_REQUEST` check ever ran.
     let mut request_line = String::new();
-    match reader.read_line(&mut request_line) {
+    match reader
+        .by_ref()
+        .take(MAX_REQUEST as u64)
+        .read_line(&mut request_line)
+    {
         Ok(0) | Err(_) => return,
+        // Hit the cap (or the peer vanished mid-line) without ever
+        // seeing a newline — too long either way.
+        Ok(_) if !request_line.ends_with('\n') => return,
         Ok(_) => {}
     }
     if !request_line.starts_with("POST ") {
@@ -534,12 +573,21 @@ fn handle(
     let mut read_bytes = request_line.len();
     let mut authorization = String::new();
     loop {
+        if !arm_deadline(&stream) {
+            return;
+        }
         let mut line = String::new();
-        match reader.read_line(&mut line) {
+        let budget = MAX_REQUEST.saturating_sub(read_bytes) as u64;
+        if budget == 0 {
+            return;
+        }
+        match reader.by_ref().take(budget).read_line(&mut line) {
             Ok(0) | Err(_) => return,
             Ok(n) => {
                 read_bytes += n;
-                if read_bytes > MAX_REQUEST {
+                if !line.ends_with('\n') {
+                    // Same "too long" case as the request line, scoped
+                    // to what's left of the header budget.
                     return;
                 }
                 let trimmed = line.trim_end();
@@ -585,6 +633,9 @@ fn handle(
         }
     };
     if content_length == 0 || content_length > MAX_REQUEST {
+        return;
+    }
+    if !arm_deadline(&stream) {
         return;
     }
     let mut body = vec![0u8; content_length];
@@ -12213,6 +12264,49 @@ mod tests {
         assert!(credentials_match(&expected, &expected));
         assert!(!credentials_match("Basic d3Jvbmc=", &expected));
         assert!(!credentials_match("", &expected));
+    }
+
+    /// A request line with no `\n` anywhere near it used to be buffered
+    /// by plain `BufRead::read_line` in full — pre-auth, with no size
+    /// check until after the whole thing landed in memory — and only
+    /// gave up once the 10s per-read timeout separately expired. The
+    /// `Read::take` cap must reject it (almost) immediately instead,
+    /// well before that timeout, regardless of how much more an
+    /// attacker keeps sending.
+    #[test]
+    fn oversized_request_line_is_rejected_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status: SharedStatus = Arc::new(RwLock::new(snap()));
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle(stream, &status, None, None, None, None, None, None);
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        // Well past MAX_REQUEST, and not a single `\n` in it.
+        let junk = vec![b'A'; MAX_REQUEST + 4096];
+        let writer = thread::spawn(move || {
+            let _ = client.write_all(&junk);
+            let mut resp = Vec::new();
+            // The server closing its side is the observable outcome —
+            // it must not sit waiting for a newline that never comes.
+            let _ = client.read_to_end(&mut resp);
+            resp
+        });
+
+        let start = Instant::now();
+        server.join().unwrap();
+        // Generously below REQUEST_READ_DEADLINE (10s): a cap that
+        // merely fell back on the per-read timeout would still pass a
+        // 10s bound, but wouldn't prove the byte cap itself fired.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "oversized line took {:?} to reject — the byte cap doesn't look like it fired",
+            start.elapsed()
+        );
+        let resp = writer.join().unwrap();
+        assert!(resp.is_empty(), "server sent a reply to a malformed line");
     }
 
     #[test]
