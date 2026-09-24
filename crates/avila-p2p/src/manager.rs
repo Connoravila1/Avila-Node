@@ -2740,6 +2740,9 @@ mod tests {
         use avila_consensus::{script, transaction::Transaction};
 
         let (mut mgr, mut peer_a, _id_a) = managed_peer();
+        // The regtest fixture spends and pays OP_TRUE — nonstandard, as
+        // under Core, so opt out like `-acceptnonstdtxn=1`.
+        mgr.mempool().set_require_standard(false);
         let mut cs = regtest();
         // 101 blocks so the h1 coinbase is mature for a mempool spend.
         let blocks = chain_blocks(&cs, 101);
@@ -2809,6 +2812,9 @@ mod tests {
         use avila_consensus::{script, transaction::Transaction};
 
         let (mut mgr, mut peer_a, _id_a) = managed_peer();
+        // The regtest fixture spends and pays OP_TRUE — nonstandard, as
+        // under Core, so opt out like `-acceptnonstdtxn=1`.
+        mgr.mempool().set_require_standard(false);
         let mut cs = regtest();
         let blocks = chain_blocks(&cs, 101);
         for b in &blocks {

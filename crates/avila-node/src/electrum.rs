@@ -1413,6 +1413,9 @@ mod tests {
             lock_time: 0,
         };
         let (q, rx2) = crate::rpc::ChainQuery::new(move |cs, mgr| {
+            // The fixture spends an OP_TRUE coinbase — nonstandard, as
+            // under Core, so opt out like `-acceptnonstdtxn=1`.
+            mgr.mempool().set_require_standard(false);
             mgr.mempool()
                 .accept_tx(mtx, cs, 1_700_000_100)
                 .unwrap_or_else(|e| panic!("mature coinbase spend must accept: {e:?}"));
@@ -1716,6 +1719,9 @@ mod tests {
             lock_time: 0,
         };
         let (q, rx2) = crate::rpc::ChainQuery::new(move |cs, mgr| {
+            // The fixture spends an OP_TRUE coinbase — nonstandard, as
+            // under Core, so opt out like `-acceptnonstdtxn=1`.
+            mgr.mempool().set_require_standard(false);
             mgr.mempool()
                 .accept_tx(mtx, cs, 1_700_000_100)
                 .unwrap_or_else(|e| panic!("mature coinbase spend must accept: {e:?}"));
