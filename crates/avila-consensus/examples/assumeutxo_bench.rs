@@ -126,6 +126,31 @@ fn main() {
         t0.elapsed().as_secs_f64()
     );
 
+    // ---- C2: same activation through the zero-copy overlay --------
+    let mut dst2 = Chainstate::new(&p2);
+    for b in &blocks {
+        dst2.accept_header(&b.header, now()).unwrap();
+    }
+    let t0 = Instant::now();
+    let meta2 = read_metadata(
+        &mut std::io::BufReader::new(std::fs::File::open(&snap_path).unwrap()),
+        p2.message_start,
+    )
+    .unwrap();
+    let base_h2 = dst2
+        .activate_snapshot_overlay(&snap_path, &meta2, false)
+        .unwrap();
+    let overlay_t = t0.elapsed();
+    assert_eq!(base_h2, base_h);
+    // Same coins resolve — the file itself serves them.
+    assert_eq!(dst2.utxo().len(), dst.utxo().len());
+    println!(
+        "C2. overlay activate: {:.2}s ({:.0}x vs import) — usable in headers+{:.2}s",
+        overlay_t.as_secs_f64(),
+        load_t.as_secs_f64() / overlay_t.as_secs_f64().max(1e-3),
+        headers_t.as_secs_f64() + overlay_t.as_secs_f64()
+    );
+
     // ---- D: background validation -> fully verified ---------------
     let t0 = Instant::now();
     loop {

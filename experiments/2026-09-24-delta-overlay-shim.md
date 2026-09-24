@@ -60,7 +60,20 @@ Verified: the same fixture file lands identical state through both
 paths — every snapshot coin resolves through the file, mutable-layer
 writes shadow correctly.
 
-Remaining honest boundary: **restart persistence** — the attached run
-must re-open on resume (path recorded in `state.dat`?). And a real
-170M-file validation still needs a real snapshot (no Core-format
-mainnet dump on disk).
+**Restart persistence landed too**: `snapshot.path` sidecar records the
+file; `restore` re-indexes + re-attaches; `state.dat` persists only the
+mutable delta (`iter_delta`), while `UtxoSet::iter` now merges the
+snapshot layer for `dumptxoutset`/`gettxoutsetinfo` consumers.
+
+Bench note (`assumeutxo_bench`, 625-blk fixture, 13k coins): overlay
+activation 0.19s vs import 0.03s — *slower* at this scale (two file
+passes vs one in-memory load; all noise at 13k coins). The win isn't
+activation latency — it's zero duplication: the import path copies
+every coin into coinsdb (at mainnet, ~13GB written); the overlay keeps
+the file as the read-only base forever. At 170M coins the materialized
+path also needs the set in memory for `coinstats::compute` — the
+streaming hash keeps it bounded.
+
+Remaining: single-pass hash+index fusion (the index walk could emit
+decoded coins for the hasher), and a real 170M-file validation — no
+Core-format mainnet dump on disk.
