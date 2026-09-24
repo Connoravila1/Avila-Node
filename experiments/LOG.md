@@ -25,6 +25,7 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 | 16 | 09-23 | Crash fault-injection on hash engine | Commit ordering survives torn writes | **2 findings, both fixed** | torn records decoded to wrong-but-valid coins (silent corruption) → +4B keyed record tag, tears now misses; coins-ahead-of-tip tear invisible → index-header watermark, open errors loudly. File-level sim; compact() still unsafe | [fault-inject](2026-09-23-fault-injection.md) |
 
 
+| 59 | 09-24 | Process sandboxing (minimal) | Can the node take a real OS-level defense without new risk? | **adopted — no_new_privs always-on** | `prctl(PR_SET_NO_NEW_PRIVS)` at sync start via the `prctl` crate (workspace forbids unsafe). A wire-parser compromise lands in a process that can never escalate via setuid/file caps — and the node never execve()s, so it costs nothing. seccomp syscall filtering and Landlock datadir scoping stay open (bigger dep surface). | — |
 | 58 | 09-24 | Fail-closed proof (unit) | Can "no clearnet when proxied" be tested, not assumed? | **yes — test shipped** | Mock SOCKS5 listener records connections; a routable candidate + refused proxy greeting yields: proxy saw the dial, zero peers established. A clearnet bypass would be observable as "proxy saw nothing". The 24h live packet-capture artifact stays open. | — |
 | 57 | 09-24 | Fail-closed proxy | Does `-proxy` actually cover all outbound traffic? | **fixed a real leak** | `SyncConfig.proxy` covered only `--connect` peers — `maintain_outbounds`' dial worker connected clearnet regardless, and `seed_from_dns` resolved locally. Now every automatic dial routes through the SOCKS5 proxy (no clearnet fallback — a dead proxy = no peers, not a leak) and DNS seeding is skipped under proxy (Core's `-onlynet=onion` model). | — |
 | 56 | 09-24 | Per-peer budget contract | Are the adversarial limits a published, tested spec? | **adopted — doc** | `docs/PEER_BUDGETS.md` enumerates every per-peer resource bound with enforcement point and proving test; the honest gaps are named at the bottom (per-peer CPU dispatch, recon bisection cap, getcf* rate limiting). | [PEER_BUDGETS.md](../docs/PEER_BUDGETS.md) |
@@ -158,7 +159,7 @@ first measurement that would kill or confirm it.
 10. **Multi-route sync.** Disjoint transports cross-checking headers —
     eclipse detection by construction.
 
-11. **Process-level sandboxing.** seccomp/capability separation: the
+11. **Process-level sandboxing.** (minimal shipped — #59 no_new_privs always-on; seccomp/Landlock stay open) seccomp/capability separation: the
     P2P stack can't write the datadir, the validator can't open
     sockets, RPC gets its own boundary. Nobody ships OS-level
     containment in a node. Measurable: publish the syscall whitelist,

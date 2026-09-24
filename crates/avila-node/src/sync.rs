@@ -220,6 +220,17 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// Runs headers-first sync until `cfg.target_height` connects or
 /// `cfg.timeout` elapses. `progress` is invoked after each tick with a
 /// live snapshot.
+/// Process sandboxing — Linux `PR_SET_NO_NEW_PRIVS`: the process and
+/// anything it could ever spawn are barred from privilege escalation
+/// via setuid binaries or file capabilities. A wire-parser compromise
+/// lands in a process that cannot escalate. Non-Linux: no-op.
+fn sandbox_self() {
+    #[cfg(target_os = "linux")]
+    if let Err(e) = prctl::set_no_new_privileges(true) {
+        eprintln!("sandbox: no_new_privs failed ({e:?}) — continuing unsandboxed");
+    }
+}
+
 /// How often (in newly connected blocks) the self-audit samples the
 /// stored chain — every ~2 weeks of mainnet history, or a cheap
 /// interval during IBD.
@@ -255,6 +266,12 @@ pub fn run(
     cfg: &SyncConfig,
     mut progress: impl FnMut(&SyncProgress),
 ) -> Result<SyncReport, SyncError> {
+    // Process-level sandboxing (queue #11): `no_new_privs` before any
+    // network work — a compromised process can never gain privileges
+    // through execve of a setuid/file-capability binary. The node
+    // never execve()s anything, so this is free defense-in-depth.
+    // Finer-grained seccomp/Landlock filtering stays open.
+    sandbox_self();
     let mut cs = match &cfg.data_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir).map_err(SyncError::Store)?;
