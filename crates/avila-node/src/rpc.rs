@@ -11300,6 +11300,17 @@ pub(crate) fn dispatch(
                     Err(e) => return (Value::Null, Some(e)),
                 }
             }
+            // OpenNetworkConnection resolves and dials async in Core;
+            // here the chain query runs on the sync loop's single
+            // thread, so a DNS lookup inside that closure would freeze
+            // block sync and every other query, Electrum, and Sv2
+            // request for as long as the lookup takes. Resolve here,
+            // on this connection's own RPC handler thread, and hand
+            // the query only the already-resolved address.
+            let resolved = (command == "onetry")
+                .then(|| node.as_str().to_socket_addrs().ok())
+                .flatten()
+                .and_then(|mut addrs| addrs.next());
             chain_query(method, queries, move |cs, mgr| {
                 // Core: requesting v2 on a `-v2transport=0` node is a
                 // parameter error, not a silent downgrade.
@@ -11311,11 +11322,7 @@ pub(crate) fn dispatch(
                 }
                 let use_v2 = want_v2.unwrap_or_else(|| mgr.v2transport());
                 if command == "onetry" {
-                    // OpenNetworkConnection resolves and dials async —
-                    // we queue the same bounded attempt.
-                    if let Ok(addrs) = node.as_str().to_socket_addrs()
-                        && let Some(sock) = addrs.into_iter().next()
-                    {
+                    if let Some(sock) = resolved {
                         let _ = mgr.connect(
                             sock,
                             cs.tree().params().message_start,
@@ -14352,6 +14359,38 @@ mod tests {
             None,
         );
         assert!(e.is_none(), "{e:?}");
+
+        // onetry resolves the address on this thread before ever
+        // queuing the chain query (a DNS lookup inside the query
+        // closure would stall the sync loop) — a literal address
+        // needs no real lookup and still queues the connect attempt.
+        let (r, e) = dispatch(
+            "addnode",
+            &json!(["127.0.0.1:1", "onetry"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, Value::Null);
+        // Unparseable/unresolvable is Core's silent no-op, not an
+        // error, whether the resolve happens before or during the
+        // query.
+        let (r, e) = dispatch(
+            "addnode",
+            &json!(["256.256.256.256:8333", "onetry"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, Value::Null);
 
         // setnetworkactive: returns the post-set state; toggling with
         // no peers is a no-op; non-bool → -3; missing → -1.
