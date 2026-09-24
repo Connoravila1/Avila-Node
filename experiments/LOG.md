@@ -25,6 +25,7 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 | 16 | 09-23 | Crash fault-injection on hash engine | Commit ordering survives torn writes | **2 findings, both fixed** | torn records decoded to wrong-but-valid coins (silent corruption) → +4B keyed record tag, tears now misses; coins-ahead-of-tip tear invisible → index-header watermark, open errors loudly. File-level sim; compact() still unsafe | [fault-inject](2026-09-23-fault-injection.md) |
 
 
+| 47 | 09-24 | Transport hardening triplet | Can cheap defenses close documented leaks? | **adopted ×3** | Non-deterministic inbound eviction (Springer evict-and-fill needs steerable picks — now uniform-random among unprotected); V2 decoy injection (~1-in-4 sends carry random-length IGNORE packets, spec-legal, receivers drop silently — fuzzes the length histogram the 2025 analysis classified commands from); recon-diff telemetry (per-peer rounds+misses in getpeerinfo — persistently-wide diff = censorship signal). | — |
 | 46 | 09-24 | Pinning red-team + oracle | Do the documented BIP-431 attacks land, and can we detect them? | **both attacks work; oracle detects** | Descendant-limit pin: 25 junk descendants off the attacker's output → victim's own-output CPFP rejected `PackageLimits` (counterfactual bump accepted clean). Rule-3 pin: 64-output low-feerate conflict prices out a high-feerate small bump → `Conflict`. Oracle: `pinning_risk()` + `getpinningrisk` RPC flags txs within margin of the descendant cap — the test asserts it catches the attack. Generic detection shipped; wallet-labeling waits on #29. | — |
 | 45 | 09-24 | Broadcast pool (Core #30471) | Can own-txs survive fee-spike eviction? | **adopted** | `sendrawtransaction` entries persist outside `map` (300kB cap, oldest-evicted); a 60s `rebroadcast_pass` re-admits + re-announces with 60s→4h exponential backoff; entries drop when inputs confirm-spend elsewhere (UTXO-resolved dead check); persists through a mempool.dat tail section. The "my tx silently vanished" class is closed. | — |
 | 44 | 09-24 | SwiftSync write-elision churn measurement | How much UTXO write load dies within a sync window? | **confirmed — pursue prototype** | 183,884 real signet blocks parsed: 63.3% of all created coins are spent within the window — never needed on disk. Median coin lifetime 2 blocks; 47% of spends same-block; 88% within 1000. The aggregate+hints path would eliminate ~2/3 of coin writes. Caveat: signet churn ≠ mainnet; attacks write tail, not the ~95% script-verification bulk. | [swiftsync](2026-09-24-swiftsync-write-elision.md) |
@@ -178,7 +179,7 @@ first measurement that would kill or confirm it.
     The node tells you when you're under attack; nobody ships this.
     Real value for LN operators.
 
-17. **V2 traffic padding.** The 2025 v2-transport analysis showed
+17. ~~**V2 traffic padding.**~~ **done — #47 (decoy injection; fixed-size cells still open).** The 2025 v2-transport analysis showed
     BIP324 encrypts content but leaks message *shape* via TCP payload
     lengths. BIP324's decoy/garbage mechanism exists for exactly this —
     nobody uses it. Experiment: fixed-size send cells + decoy traffic;
@@ -190,12 +191,12 @@ first measurement that would kill or confirm it.
     randomized delay, then normal recon fluff. No stempool, no
     unvalidated relay, most of the origin-privacy benefit.
 
-19. **Recon-diff censorship telemetry.** Every recon round already
+19. ~~**Recon-diff censorship telemetry.**~~ **done — #47 (counters in getpeerinfo; alarm thresholds open).** Every recon round already
     computes the per-peer pool diff — surface it. A peer persistently
     missing a large share of your mempool is a censorship/eclipse
     signal. Security telemetry at zero protocol cost.
 
-20. **Non-deterministic inbound eviction.** The evict-and-fill attack
+20. ~~**Non-deterministic inbound eviction.**~~ **done — #47.** The evict-and-fill attack
     (82-97% linkage accuracy) exploits predictable eviction; randomize
     it. Small, bounded.
 
