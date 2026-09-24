@@ -59,6 +59,59 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 - Inline small records into the slot (wide-slot variant) — the 2-page
   touch per read is structural; only colocating record with index
   slot cuts it to 1.
-- ~170M-scale ingest — the full-depth proof.
-- Crash fault-injection on the hash commit ordering (incl. the
-  compact() rename torn-write gap).
+
+## Queued candidates (proposed, not started)
+
+Listed in rough priority; each entry has the hypothesis and the cheapest
+first measurement that would kill or confirm it.
+
+1. **Speculative block pre-validation.** Mempool contents predict the next
+   block (~90% overlap; compact-block sketches confirm). Pre-validate the
+   predicted block so real connect is mostly cache hits → faster block
+   accept/relay. First step: measure actual mempool↔block overlap on a
+   fixture + count connect-phase script work that hits the verified cache.
+   Bounded; reuses the spec engine and verified-tx cache.
+
+2. **Verification-transparency ledger.** A node that reports its own trust
+   state: "verified N% of history; heights a..b assumed under commitment X;
+   this output checked under flag-set F." Nobody ships inspectable trust.
+   Mostly surfacing what ConnectTiming/assumeutxo state already record.
+   First step: define the typed coverage record + a `getvalidationinfo`-style
+   RPC emitting it on the fixture node.
+
+3. **Live network sync.** The credibility gate — fixtures have carried all
+   claims so far. First step: signet/testnet headers+blocks against real
+   peers; measure tip-follow latency and peer misbehavior handling.
+
+4. **Delta overlay integration for SnapshotRun.** The ~90s-to-usable path
+   is bench-proven; making it real needs reads to fall through to the
+   indexed snapshot file with spends/inserts in the mutable layer, plus
+   `activate_snapshot` streaming (no 170M materialization — OOMs at scale).
+   First step: `UtxoSet` read-path shim + diff-test vs current backend.
+
+5. **ECDSA advice on real history.** #27's kernel win (1.8-2.3×) is
+   synthetic. First step: extract real sig-check traces from a historical
+   segment and replay them through the advice machinery — tests sighash
+   variants, codeseparator, and edge script forms the kernel bench skipped.
+
+6. **Built-in address index / electrum-style serving (profile).** Point a
+   wallet at your own node, no external indexer. Controversial storage cost
+   is exactly what profiles are for — opt-in distro, consensus untouched.
+   First step: cost model — index size + write overhead on the fixture.
+
+7. **Erlay-style tx reconciliation (BIP-330).** ~44% relay-bandwidth
+   savings; Core hasn't shipped it (simplified recon-only variant is in
+   Warnet testing upstream). Interop is the open question — today ~no peers
+   speak it. First step: implement BIP-330 recon-only message handling and
+   measure reconciliation rounds between two Avila nodes.
+
+8. **Differential fuzzing vs Core/Knots.** Continuous random-block/tx
+   generation with byte-exact comparison — turns "compatible" into a
+   monitored property rather than a claim. First step: fuzz harness on the
+   existing diff fixture generator, seeded corpus from past bugs.
+
+9. **Utreexo research program.** BIPs 181-183 now have assigned numbers;
+   rustreexo 0.6.0 exists. Validate blocks against accumulator + proofs —
+   ~KB of state vs 12GB UTXO set. Months, not days; needs bridge-node
+   proof supply. First step: rustreexo spike — add/delete/prove round-trip
+   on the fixture's UTXO set, costed against CoinsBackend.
