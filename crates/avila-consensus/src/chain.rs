@@ -181,6 +181,12 @@ pub struct HeaderTree {
     /// the insertion-time ancestor walk). Children of a failed block are rejected at
     /// [`HeaderTree::insert`] — Core rejects them the same way, at `AcceptBlockHeader`.
     invalid: HashSet<BlockHash>,
+    /// Parent → direct children, maintained incrementally by [`HeaderTree::insert`] —
+    /// the equivalent of walking `mapBlockIndex` by `pprev`, kept as a standing index so
+    /// callers (the `m_blocks_unlinked`-style scan in [`crate::chainstate`]) never need a
+    /// full-tree scan to find a header's children. Nodes are never removed from `nodes`,
+    /// so entries here are never removed either.
+    children: HashMap<BlockHash, Vec<BlockHash>>,
 }
 
 impl HeaderTree {
@@ -207,6 +213,7 @@ impl HeaderTree {
             nodes,
             tip: hash,
             invalid: HashSet::new(),
+            children: HashMap::new(),
         }
     }
 
@@ -636,12 +643,25 @@ impl HeaderTree {
             n_chain_tx: 0, // unknown until ConnectTip — Core's nChainTx
         };
         self.nodes.insert(hash, node);
+        self.children
+            .entry(header.prev_block_hash)
+            .or_default()
+            .push(hash);
         if chainwork > self.tip().chainwork {
             self.tip = hash;
         }
         Ok(InsertStatus::Added {
             height: node.height,
         })
+    }
+
+    /// `hash`'s direct children in the tree: every already-inserted
+    /// header whose `prev_block_hash` is `hash`. Backed by a standing
+    /// index maintained in [`HeaderTree::insert`], not a scan. Empty
+    /// when `hash` isn't in the tree or has no known children.
+    #[must_use]
+    pub(crate) fn children(&self, hash: &BlockHash) -> &[BlockHash] {
+        self.children.get(hash).map_or(&[], |v| v.as_slice())
     }
 
     /// Up to `MEDIAN_TIME_SPAN` header times ending at (and including) `node`, newest first,
