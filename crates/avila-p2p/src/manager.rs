@@ -2374,6 +2374,77 @@ mod tests {
     }
 
     #[test]
+    fn two_recon_peers_open_independent_rounds() {
+        // Two links negotiate recon with different salts — each round
+        // runs on its own schedule and its own salted sketch.
+        let (us_a, peer_a) = testpipe::pair();
+        let (us_b, peer_b) = testpipe::pair();
+        let mut pa = peer_a;
+        let mut pb = peer_b;
+        let sa = PeerSession::initiate(
+            us_a,
+            MAGIC,
+            build_version(1, 0, NetAddr::unspecified(), i64::from(NOW)),
+            BUDGET,
+        )
+        .expect("session a");
+        let sb = PeerSession::initiate(
+            us_b,
+            MAGIC,
+            build_version(1, 0, NetAddr::unspecified(), i64::from(NOW)),
+            BUDGET,
+        )
+        .expect("session b");
+        let mut mgr = PeerManager::new(8);
+        let mut cs = regtest();
+        mgr.add_outbound(sa).unwrap();
+        mgr.add_outbound(sb).unwrap();
+        mgr.tick(&mut cs, NOW);
+        let _ = testpipe::drain(&mut pa, MAGIC);
+        let _ = testpipe::drain(&mut pb, MAGIC);
+        for (p, salt) in [(&mut pa, 0x11u64), (&mut pb, 0x22u64)] {
+            testpipe::inject(p, MAGIC, &Message::Version(peer_version(600)));
+            testpipe::inject(
+                p,
+                MAGIC,
+                &Message::SendRecon(crate::message::SendRecon {
+                    is_sender: true,
+                    is_responder: true,
+                    version: crate::recon::RECON_VERSION,
+                    salt,
+                }),
+            );
+            mgr.tick(&mut cs, NOW);
+            testpipe::inject(p, MAGIC, &Message::Verack);
+            mgr.tick(&mut cs, NOW);
+        }
+        // Both back-due — each opens its own round.
+        for (_, peer) in mgr.peers.iter_mut() {
+            peer.next_recon = Instant::now() - Duration::from_secs(1);
+        }
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let sent_a = testpipe::drain(&mut pa, MAGIC);
+        let sent_b = testpipe::drain(&mut pb, MAGIC);
+        assert!(
+            sent_a.iter().any(|m| matches!(m, Message::ReqRecon(_))),
+            "peer a got no round: {sent_a:?}"
+        );
+        assert!(
+            sent_b.iter().any(|m| matches!(m, Message::ReqRecon(_))),
+            "peer b got no round: {sent_b:?}"
+        );
+        // The salts differ — the recon state must be per-peer, not shared.
+        let salts: Vec<u64> = mgr
+            .peers
+            .values()
+            .filter_map(|p| p.recon.as_ref().map(|r| r.their_salt))
+            .collect();
+        assert_eq!(salts.len(), 2);
+        assert!(salts.contains(&0x11) && salts.contains(&0x22), "{salts:?}");
+    }
+
+    #[test]
     fn peer_eof_disconnects() {
         let (mut mgr, mut peer, id) = managed_peer();
         let mut cs = regtest();
