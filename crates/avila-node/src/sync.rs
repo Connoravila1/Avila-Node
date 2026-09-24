@@ -539,10 +539,24 @@ pub fn run(
                     && let Ok(mut w) = job.wallet.lock()
                 {
                     for h in arrived {
-                        if let Some(hash) = job.pending.remove(&h)
+                        if let Some(hash) = job.pending.get(&h).copied()
                             && let Some(b) = cs.body(&hash)
                         {
-                            w.scan_gap_height(&cs, &b, h, hash);
+                            // `scan_gap_height` reports whether it
+                            // actually scanned this height — `false`
+                            // means the captured hash was reorged away
+                            // between being queued and its body
+                            // arriving, so this must not count as
+                            // done. Re-target the height at the active
+                            // chain's current hash there instead of
+                            // marking a block scanned that never was;
+                            // `rescanblockchain` would otherwise report
+                            // completion having silently skipped it.
+                            if w.scan_gap_height(&cs, &b, h, hash) {
+                                job.pending.remove(&h);
+                            } else if let Some(current) = cs.chain().get(h as usize).copied() {
+                                job.pending.insert(h, current);
+                            }
                         }
                     }
                     let _ = w.persist();
