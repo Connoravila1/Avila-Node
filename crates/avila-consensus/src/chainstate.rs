@@ -4411,7 +4411,7 @@ mod tests {
         // via its recorded path and keeps serving the base coins.
         cs2.flush().unwrap();
         drop(cs2);
-        let mut cs3 = Chainstate::with_store(&dir2, &p, NOW).unwrap();
+        let cs3 = Chainstate::with_store(&dir2, &p, NOW).unwrap();
         assert_eq!(cs3.tip_hash(), base_hash);
         assert_eq!(cs3.snapshot_base(), Some(2));
         for (op, coin) in &coins {

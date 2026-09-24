@@ -43,7 +43,7 @@ fn main() {
     forest.modify(&leaves, &[]).expect("forest build");
     println!("forest build: {n} leaves in {:?} ({:.0}/s)",
         t.elapsed(), n as f64 / t.elapsed().as_secs_f64());
-    let forest_bytes = 0usize;
+    let _forest_bytes = 0usize;
 
     // Light node: Stump = roots only — the entire state it stores.
     let mut stump = Stump::<BitcoinNodeHash>::new();
