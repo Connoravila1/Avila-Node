@@ -38,10 +38,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use sha2::{Digest, Sha256};
+
 use crate::block::{Block, WITNESS_SCALE_FACTOR};
 use crate::chain::HeaderTree;
 use crate::check::{MAX_BLOCK_SIGOPS_COST, MAX_MONEY};
-use crate::hash::{BlockHash, Txid};
+use crate::hash::{BlockHash, Hash256, Txid};
 use crate::params::Params;
 use crate::script::{ScriptFlags, block_script_flags, count_witness_sig_ops};
 use crate::sigchecker::check_input_scripts;
@@ -315,11 +317,7 @@ impl UtxoSet {
         if let Some(base) = &self.base {
             return base.have(outpoint);
         }
-        if self
-            .backend
-            .as_ref()
-            .is_some_and(|be| be.have(outpoint))
-        {
+        if self.backend.as_ref().is_some_and(|be| be.have(outpoint)) {
             return true;
         }
         self.snapshot
@@ -727,6 +725,59 @@ pub struct ConnectContext<'a> {
     /// decides when to wait (`Chainstate`'s speculative pipeline waits
     /// a bounded window of blocks back, overlapping serial passes).
     pub script_pool: Option<&'a ScriptPool>,
+}
+
+/// A machine-checkable record of one block's connect — the
+/// verification-transparency ledger's per-block grain (queue #5).
+///
+/// The receipt states what connect *did*: which flags were enforced,
+/// how many input-script checks were performed (or queued), how many
+/// were skipped through the verified-script cache, and the exact UTXO
+/// transition applied, committed into [`BlockReceipt::delta_commitment`].
+/// Replaying the same block against the same parent state recomputes
+/// that commitment — the receipt is independently reproducible, never
+/// a claim the node asks anyone to take on faith.
+///
+/// `delta_commitment` is **not** a UTXO-set hash: it commits to the
+/// block's *delta* — per transaction, in block order, the txid, then
+/// each spent `(outpoint, coin)` in input order, then each created
+/// `(vout, output)` in output order — not to the resulting set. The
+/// stream is SHA-256 over fixed-width fields plus length-prefixed
+/// scripts, so framing is unambiguous.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockReceipt {
+    /// Connected height.
+    pub height: u32,
+    /// The block's hash.
+    pub hash: BlockHash,
+    /// The script flag word enforced (`ScriptFlags::bits()`).
+    pub script_flags: u32,
+    /// Transactions in the block, coinbase included.
+    pub txs: usize,
+    /// Sigop cost accounted against `MAX_BLOCK_SIGOPS_COST`.
+    pub sigops: u64,
+    /// Total transaction fees, satoshis.
+    pub fees: i64,
+    /// Whether input-script checking was requested at all
+    /// (`ConnectContext::script_checks` — `false` under assumevalid).
+    pub checks_enabled: bool,
+    /// Input-script checks queued for this block — already run when no
+    /// script pool is configured, possibly still pending when it is.
+    pub script_checks: usize,
+    /// Non-coinbase transactions skipped because the verified-script
+    /// cache already covered them under a superset flag set. Zero when
+    /// `checks_enabled` is false.
+    pub verified_hits: usize,
+    /// Coins consumed (non-coinbase inputs resolved and spent).
+    pub spent_coins: usize,
+    /// Coins created (spendable outputs added; `is_unspendable`
+    /// outputs excluded, matching `add_tx_outputs`).
+    pub created_coins: usize,
+    /// SHA-256 over the applied UTXO delta (see type docs).
+    pub delta_commitment: Hash256,
+    /// Wall time of the serial connect pass, nanoseconds — under a
+    /// script pool this excludes the deferred check wait.
+    pub wall_ns: u64,
 }
 
 /// A consensus or internal failure while connecting a block. Every
@@ -1272,7 +1323,7 @@ pub fn connect_block(
     utxo: &mut UtxoSet,
     ctx: &ConnectContext<'_>,
 ) -> Result<BlockUndo, ConnectError> {
-    let (undo, pending) = connect_block_inner(block, utxo, ctx)?;
+    let (undo, pending, _receipt) = connect_block_inner(block, utxo, ctx)?;
     if let Some(check) = pending {
         if let Err(err) = check.wait() {
             // Deferred check failed: undo the application, exactly as
@@ -1282,6 +1333,29 @@ pub fn connect_block(
         }
     }
     Ok(undo)
+}
+
+/// [`connect_block`] that additionally reports the per-block
+/// [`BlockReceipt`] — the verification-transparency ledger's
+/// per-block grain (queue #5).
+///
+/// Like [`connect_block_deferred`], a configured script pool means
+/// the returned checks may still be outstanding: the caller MUST
+/// `wait()` the [`BlockCheck`] before treating the block as validated,
+/// and the receipt's `script_checks` field reports how many checks
+/// were queued. When no pool is configured, checks ran inline and the
+/// returned `Option` is `None`.
+///
+/// # Errors
+///
+/// Same contract as [`connect_block`] — on failure the UTXO set is
+/// rolled back and no receipt is produced.
+pub fn connect_block_full(
+    block: &Block,
+    utxo: &mut UtxoSet,
+    ctx: &ConnectContext<'_>,
+) -> Result<(BlockUndo, Option<std::sync::Arc<BlockCheck>>, BlockReceipt), ConnectError> {
+    connect_block_inner(block, utxo, ctx)
 }
 
 /// `connect_block` through a [`ScriptPool`]: applies the block and
@@ -1295,7 +1369,7 @@ pub fn connect_block_deferred(
     utxo: &mut UtxoSet,
     ctx: &ConnectContext<'_>,
 ) -> Result<(BlockUndo, std::sync::Arc<BlockCheck>), ConnectError> {
-    let (undo, pending) = connect_block_inner(block, utxo, ctx)?;
+    let (undo, pending, _receipt) = connect_block_inner(block, utxo, ctx)?;
     let Some(check) = pending else {
         // Pool was absent — nothing outstanding; report an
         // already-complete handle so callers don't branch.
@@ -1309,7 +1383,7 @@ fn connect_block_inner(
     block: &Block,
     utxo: &mut UtxoSet,
     ctx: &ConnectContext<'_>,
-) -> Result<(BlockUndo, Option<std::sync::Arc<BlockCheck>>), ConnectError> {
+) -> Result<(BlockUndo, Option<std::sync::Arc<BlockCheck>>, BlockReceipt), ConnectError> {
     let t_total = std::time::Instant::now();
     let Some(node) = ctx.tree.get(&ctx.block_hash) else {
         return Err(ConnectError::UnknownBlock);
@@ -1357,6 +1431,16 @@ fn connect_block_inner(
     let mut script_jobs: Vec<(&Transaction, Vec<TxOut>)> = Vec::new();
     let mut owned_jobs: Vec<(Transaction, Vec<TxOut>)> = Vec::new();
 
+    // Receipt accumulation (queue #5): the delta stream commits, per
+    // transaction in block order — txid, spend count, each spent
+    // (outpoint, coin), create count, each created (vout, output) —
+    // exactly the transition applied. Only used when the connect
+    // succeeds; a failed block rolls back and produces no receipt.
+    let mut delta_hasher = Sha256::new();
+    let mut spent_coins = 0usize;
+    let mut created_coins = 0usize;
+    let mut scripts_queued = 0usize;
+
     let result = (|| -> Result<Option<std::sync::Arc<BlockCheck>>, ConnectError> {
         for (i, tx) in block.transactions.iter().enumerate() {
             let mut tx_undo = TxUndo::default();
@@ -1400,6 +1484,7 @@ fn connect_block_inner(
                 && !crate::sigchecker::scripts_verified(&tx.wtxid(), flags)
             {
                 let spent_outs: Vec<TxOut> = spent.iter().map(|c| c.out.clone()).collect();
+                scripts_queued += 1;
                 if ctx.script_pool.is_some() {
                     owned_jobs.push((tx.clone(), spent_outs));
                 } else {
@@ -1422,6 +1507,41 @@ fn connect_block_inner(
                 index: i,
                 undo: tx_undo,
             });
+            // Receipt delta stream — fixed-width fields plus
+            // length-prefixed scripts; see `BlockReceipt`'s docs for
+            // the exact framing.
+            delta_hasher.update(tx.txid().as_bytes());
+            delta_hasher.update((spent.len() as u32).to_le_bytes());
+            for (input, coin) in tx.inputs.iter().zip(spent.iter()) {
+                delta_hasher.update(input.previous_output.txid.as_bytes());
+                delta_hasher.update(input.previous_output.vout.to_le_bytes());
+                delta_hasher.update(coin.out.value.to_le_bytes());
+                delta_hasher.update(coin.height.to_le_bytes());
+                delta_hasher.update([u8::from(coin.coinbase)]);
+                let script = coin.out.script_pubkey.as_bytes();
+                delta_hasher.update((script.len() as u32).to_le_bytes());
+                delta_hasher.update(script);
+            }
+            spent_coins += spent.len();
+            let created = tx
+                .outputs
+                .iter()
+                .filter(|o| !o.script_pubkey.is_unspendable())
+                .count() as u32;
+            delta_hasher.update(created.to_le_bytes());
+            for (vout, out) in tx.outputs.iter().enumerate() {
+                if out.script_pubkey.is_unspendable() {
+                    continue;
+                }
+                delta_hasher.update((vout as u32).to_le_bytes());
+                delta_hasher.update(out.value.to_le_bytes());
+                delta_hasher.update(height.to_le_bytes());
+                delta_hasher.update([u8::from(tx.is_coinbase())]);
+                let script = out.script_pubkey.as_bytes();
+                delta_hasher.update((script.len() as u32).to_le_bytes());
+                delta_hasher.update(script);
+            }
+            created_coins += created as usize;
         }
         let Some(coinbase) = block.transactions.first() else {
             return Err(ConnectError::Internal("empty block reached connect_block"));
@@ -1462,12 +1582,35 @@ fn connect_block_inner(
     TIMING[0].fetch_add(1, Ordering::Relaxed);
     tick(1, t_total);
     match result {
-        Ok(pending) => Ok((
-            BlockUndo {
-                txs: applied.into_iter().map(|a| a.undo).collect(),
-            },
-            pending,
-        )),
+        Ok(pending) => {
+            let non_coinbase = block.transactions.len().saturating_sub(1);
+            let receipt = BlockReceipt {
+                height,
+                hash: ctx.block_hash,
+                script_flags: flags.bits(),
+                txs: block.transactions.len(),
+                sigops: sigops_cost,
+                fees,
+                checks_enabled: ctx.script_checks,
+                script_checks: scripts_queued,
+                verified_hits: if ctx.script_checks {
+                    non_coinbase.saturating_sub(scripts_queued)
+                } else {
+                    0
+                },
+                spent_coins,
+                created_coins,
+                delta_commitment: Hash256::from_bytes(delta_hasher.finalize().into()),
+                wall_ns: u64::try_from(t_total.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            };
+            Ok((
+                BlockUndo {
+                    txs: applied.into_iter().map(|a| a.undo).collect(),
+                },
+                pending,
+                receipt,
+            ))
+        }
         Err(error) => {
             rollback(block, utxo, applied);
             Err(error)
@@ -1880,12 +2023,10 @@ mod tests {
         assert!(!coin.coinbase);
     }
 
-
     /// The snapshot run sits below the backend: reads fall through,
     /// spends shadow with tombstones, `len` counts the base.
     #[test]
     fn snapshot_run_is_lowest_overlay_layer() {
-
         let dir = std::env::temp_dir().join(format!("avila-overlay-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("snap.dat");

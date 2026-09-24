@@ -4577,6 +4577,16 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         &[("txid", Some("string"), true)],
         GETMEMPOOLENTRY_HELP,
     ),
+    (
+        "getblockreceipt",
+        &[("height", Some("number"), true)],
+        "getblockreceipt height\n\nThe per-block verification receipt recorded when this node connected the block at `height`: flags enforced, script checks performed or cache-skipped, fee/sigop totals, and the SHA-256 commitment to the exact UTXO delta applied — replayable evidence, not a trust-me claim.\n\nArguments:\n1. height  (number, required) Block height. Receipts are retained for the last 2016 connected blocks.\n\nResult:\n{ \"height\": n, \"hash\": \"hex\", \"script_flags\": n, \"txs\": n, \"sigops\": n, \"fees\": btc, \"checks_enabled\": bool, \"script_checks\": n, \"verified_hits\": n, \"spent_coins\": n, \"created_coins\": n, \"delta_commitment\": \"hex\", \"wall_ns\": n }\n",
+    ),
+    (
+        "getblockreceipts",
+        &[("count", Some("number"), false)],
+        "getblockreceipts ( count )\n\nRecent per-block verification receipts, newest first — what this node actually checked when it connected each block.\n\nArguments:\n1. count  (number, optional, default=10, max=2016) How many receipts to return.\n\nResult:\n[ { \"height\": n, \"hash\": \"hex\", \"script_flags\": n, \"txs\": n, \"sigops\": n, \"fees\": btc, \"checks_enabled\": bool, \"script_checks\": n, \"verified_hits\": n, \"spent_coins\": n, \"created_coins\": n, \"delta_commitment\": \"hex\", \"wall_ns\": n }, ... ]\n",
+    ),
     ("getmempoolinfo", &[], GETMEMPOOLINFO_HELP),
     (
         "getevents",
@@ -5376,6 +5386,65 @@ pub(crate) fn dispatch(
         }),
         // Avila-specific (no Core equivalent): the node's own
         // verification coverage — verified vs proven vs assumed heights.
+        "getblockreceipts" => {
+            let n = param(params, 0, "count")
+                .and_then(Value::as_u64)
+                .map_or(10, |v| v.min(2016) as usize);
+            chain_query(method, queries, move |cs, _| {
+                Ok(json!(
+                    cs.recent_receipts(n)
+                        .iter()
+                        .map(|r| json!({
+                            "height": r.height,
+                            "hash": r.hash.to_string(),
+                            "script_flags": r.script_flags,
+                            "txs": r.txs,
+                            "sigops": r.sigops,
+                            "fees": value_from_amount(r.fees),
+                            "checks_enabled": r.checks_enabled,
+                            "script_checks": r.script_checks,
+                            "verified_hits": r.verified_hits,
+                            "spent_coins": r.spent_coins,
+                            "created_coins": r.created_coins,
+                            "delta_commitment": r.delta_commitment.to_string(),
+                            "wall_ns": r.wall_ns,
+                        }))
+                        .collect::<Vec<_>>()
+                ))
+            })
+        }
+        "getblockreceipt" => {
+            let height = param(params, 0, "height").and_then(Value::as_u64);
+            chain_query(method, queries, move |cs, _| {
+                let Some(height) = height else {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "getblockreceipt requires a height".to_string(),
+                    ));
+                };
+                match cs.receipt_at(height as u32) {
+                    Some(r) => Ok(json!({
+                        "height": r.height,
+                        "hash": r.hash.to_string(),
+                        "script_flags": r.script_flags,
+                        "txs": r.txs,
+                        "sigops": r.sigops,
+                        "fees": value_from_amount(r.fees),
+                        "checks_enabled": r.checks_enabled,
+                        "script_checks": r.script_checks,
+                        "verified_hits": r.verified_hits,
+                        "spent_coins": r.spent_coins,
+                        "created_coins": r.created_coins,
+                        "delta_commitment": r.delta_commitment.to_string(),
+                        "wall_ns": r.wall_ns,
+                    })),
+                    None => Err((
+                        RPC_INVALID_PARAMETER,
+                        format!("no receipt retained at height {height}"),
+                    )),
+                }
+            })
+        }
         "getvalidationreport" => chain_query(method, queries, |cs, _| {
             let r = cs.validation_report();
             let snapshot = r.snapshot.map(|s| {
