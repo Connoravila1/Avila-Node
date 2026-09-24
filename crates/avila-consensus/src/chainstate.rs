@@ -806,6 +806,21 @@ impl ScripthashIndex {
     }
 }
 
+// Nodes visited by `Chainstate::best_bodied_descendant`'s forward
+// walk — test-only instrumentation proving the walk costs work
+// proportional to the descendants actually reachable through the
+// header tree's children index, not the size of the whole tree (see
+// `chainstate::tests::extend_path_with_no_bodied_descendant_is_o1`).
+//
+// Thread-local, not a shared atomic: `cargo test` runs different
+// `#[test]` functions concurrently on different threads, and a global
+// counter would pick up unrelated tests' `accept_block` calls running
+// at the same time. Each test's own thread sees only its own count.
+#[cfg(test)]
+thread_local! {
+    static NODES_VISITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl Chainstate {
     /// A chainstate at genesis on `params`' network — the state Core reaches at
     /// startup with an empty datadir (the genesis is in the block index and is
@@ -2474,62 +2489,72 @@ impl Chainstate {
     /// only once its own ancestor chain back to the active chain is
     /// fully bodied (Core's `ReceivedBlockTransactions` gating on
     /// `pindex->pprev->HaveNumChainTxs()`); returns `None` while an
-    /// ancestor is still missing a body — the caller falls back to
-    /// treating `hash` alone as the candidate, which is what the
-    /// existing insufficient-work/missing-body checks in
-    /// [`Chainstate::maybe_reorg`] already report as `Parked`.
+    /// ancestor is still missing a body, or already failed — the
+    /// caller falls back to treating `hash` alone as the candidate,
+    /// which is what the existing insufficient-work/missing-body
+    /// checks in [`Chainstate::maybe_reorg`] already report as
+    /// `Parked`.
     ///
     /// Once `hash`'s ancestor chain is complete, any already-bodied
     /// descendant of `hash` is newly linked too (Core's
     /// `m_blocks_unlinked` forward walk) — delegates to
     /// [`Chainstate::best_bodied_descendant`] to find the best of them.
-    fn newly_linked_candidate(&mut self, hash: BlockHash) -> Option<BlockHash> {
-        let chain_set: HashSet<BlockHash> = self.chain.iter().copied().collect();
+    ///
+    /// `O(depth from hash to the fork)`: active-chain membership is a
+    /// single indexed lookup (`self.chain` is a `Vec` keyed by height,
+    /// not a `HashSet` rebuilt from the whole chain on every call —
+    /// most body arrivals during IBD with a download window don't
+    /// extend the tip), and each step's own failed flag is an O(1) set
+    /// lookup, not the O(depth) `ancestor_is_invalid` walk.
+    fn newly_linked_candidate(&self, hash: BlockHash) -> Option<BlockHash> {
         let mut cursor = hash;
-        while !chain_set.contains(&cursor) {
-            if !self.have_body(&cursor) {
+        loop {
+            let node = self.tree.get(&cursor)?;
+            if self.chain.get(node.height as usize) == Some(&cursor) {
+                break; // reached the active chain — the ancestor path is complete
+            }
+            if !self.have_body(&cursor) || self.tree.is_failed(&cursor) {
                 return None;
             }
-            cursor = self.tree.get(&cursor)?.header.prev_block_hash;
+            cursor = node.header.prev_block_hash;
         }
         Some(self.best_bodied_descendant(hash))
     }
 
     /// Assuming `hash`'s own ancestor chain back to the active chain is
-    /// already fully bodied — true by construction for the connected
-    /// tip itself, and established by
+    /// already fully bodied and not failed — true by construction for
+    /// the connected tip itself, and established step-by-step by
     /// [`Chainstate::newly_linked_candidate`] otherwise — walks
-    /// `hash`'s descendants in the header tree and returns the
-    /// greatest-chainwork node reached whose own body is present and
-    /// whose branch carries no failed block. Returns `hash` itself when
-    /// it has no such descendant.
+    /// `hash`'s descendants through the header tree's children index
+    /// and returns the greatest-chainwork node reached whose own body
+    /// is present and which isn't itself flagged failed. Returns
+    /// `hash` itself when it has no such descendant.
     ///
-    /// A failed node's entire subtree is skipped: every descendant of a
-    /// failed block is normally unreachable (rejected at header
-    /// insertion, `bad-prevblk`) — the sole exception is a header
-    /// already accepted into the tree before its ancestor later failed
-    /// a connect attempt, which this walk's `ancestor_is_invalid` check
-    /// catches instead.
+    /// A failed node's entire subtree is skipped by construction, not
+    /// by an ancestor walk: every descendant is only reachable by
+    /// first visiting it as a child of its parent, so checking each
+    /// visited node's own failed flag (O(1)) before descending into
+    /// *its* children is enough to keep the whole subtree unreached —
+    /// this never calls the O(depth) `ancestor_is_invalid`.
     ///
-    /// `O(nodes)` to index parent→children once, then `O(subtree)` to
-    /// walk it — this runs only on an out-of-order body arrival, not
-    /// the common per-block path Core's `m_blocks_unlinked` multimap
-    /// exists to make cheap.
-    fn best_bodied_descendant(&mut self, hash: BlockHash) -> BlockHash {
-        let Some(start) = self.tree.get(&hash).copied() else {
+    /// `O(descendants actually walked)`, not `O(tree size)`: the
+    /// children index is a standing structure
+    /// ([`crate::chain::HeaderTree::children`], maintained
+    /// incrementally by `insert`), not rebuilt here. In the common
+    /// case — no already-bodied child waiting — this costs exactly
+    /// `O(children of hash)`, which is why the extend path in
+    /// `accept_block` can call this after every connected block
+    /// without it becoming an `O(headers)` scan.
+    fn best_bodied_descendant(&self, hash: BlockHash) -> BlockHash {
+        let Some(start) = self.tree.get(&hash) else {
             return hash;
         };
-        let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
-        for (h, node) in self.tree.nodes() {
-            children
-                .entry(node.header.prev_block_hash)
-                .or_default()
-                .push(*h);
-        }
         let mut best = (start.chainwork, hash);
-        let mut stack = children.remove(&hash).unwrap_or_default();
+        let mut stack: Vec<BlockHash> = self.tree.children(&hash).to_vec();
         while let Some(h) = stack.pop() {
-            if !self.have_body(&h) || self.tree.ancestor_is_invalid(h) {
+            #[cfg(test)]
+            NODES_VISITED.with(|c| c.set(c.get() + 1));
+            if self.tree.is_failed(&h) || !self.have_body(&h) {
                 continue;
             }
             if let Some(node) = self.tree.get(&h)
@@ -2537,9 +2562,7 @@ impl Chainstate {
             {
                 best = (node.chainwork, h);
             }
-            if let Some(kids) = children.remove(&h) {
-                stack.extend(kids);
-            }
+            stack.extend_from_slice(self.tree.children(&h));
         }
         best.1
     }
@@ -3390,6 +3413,125 @@ mod tests {
         );
         assert_eq!(cs.tip_hash(), t2.block_hash());
         assert_eq!(cs.chain().len(), 4);
+    }
+
+    /// The extend path's `best_bodied_descendant` call after every
+    /// connected block must cost `O(children of the new tip)`, not
+    /// `O(headers in the tree)` — a persistent, unrelated side branch
+    /// with thousands of headers must not move the needle. This is a
+    /// direct regression test for the earlier (reverted-in-review)
+    /// version of this fix, which rebuilt a parent→children map over
+    /// every header on every call — ~935k mainnet headers, every
+    /// block, for the whole of IBD.
+    #[test]
+    fn extend_path_with_no_bodied_descendant_is_o1() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+
+        // A long, wholly unrelated side branch: headers only (no
+        // bodies ever submitted), forking at genesis. Never touched by
+        // the extend path under test below.
+        let mut parent = genesis_header();
+        for h in 1..=3_000u32 {
+            let block = block_on(&parent, vec![tagged_coinbase(h, subsidy(h), 0xAA)], &params);
+            cs.accept_header(&block.header, NOW).unwrap();
+            parent = block.header;
+        }
+
+        // The real chain: a1's header (and a2's, one already-announced
+        // but bodyless child) are known before a1's body arrives —
+        // realistic headers-first sync.
+        let a1 = block_on(&genesis_header(), vec![coinbase_tx(1, subsidy(1))], &params);
+        let a2 = block_on(&a1.header, vec![coinbase_tx(2, subsidy(2))], &params);
+        cs.accept_header(&a1.header, NOW).unwrap();
+        cs.accept_header(&a2.header, NOW).unwrap();
+
+        NODES_VISITED.with(|c| c.set(0));
+        assert_eq!(
+            cs.accept_block(&a1, NOW),
+            Ok(Acceptance::Connected {
+                height: 1,
+                reorged: false
+            })
+        );
+        let visited = NODES_VISITED.with(|c| c.get());
+        // a2 (a1's one known child) is visited and stops there — its
+        // body was never submitted. Nowhere near the 3,000 side-branch
+        // headers a full-tree scan would have touched.
+        assert!(visited <= 4, "expected O(1) nodes visited, got {visited}");
+    }
+
+    /// A minimal deterministic PRNG (xorshift64*) — avoids pulling in
+    /// the `rand` crate (not a dependency of this crate) for one
+    /// shuffle in one test.
+    struct Xorshift64(u64);
+    impl Xorshift64 {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        /// A uniform-enough index in `0..len` for shuffling purposes.
+        fn gen_index(&mut self, len: usize) -> usize {
+            (self.next_u64() % len as u64) as usize
+        }
+    }
+
+    /// An IBD-like shuffle: every header for a ~300-block chain arrives
+    /// first (as real headers-first sync does), then bodies arrive in
+    /// shuffled order within a sliding window — never more than 16
+    /// blocks' worth of already-announced-but-undelivered bodies open
+    /// at once, matching a bounded parallel-download window. Every
+    /// block must end up connected exactly once, and the tip must land
+    /// on the last block — proving the out-of-order activation logic
+    /// (and its `HeaderTree::children`-indexed cost) handles realistic,
+    /// sustained reordering, not just the two-and-three-block cases
+    /// above.
+    #[test]
+    fn ibd_like_shuffled_body_delivery_connects_every_block() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        const N: usize = 300;
+        const WINDOW: usize = 16;
+
+        let blocks = spend_chain(N as u32, &params);
+        for block in &blocks {
+            cs.accept_header(&block.header, NOW).unwrap();
+        }
+
+        // Build the delivery order: a sliding window of up to WINDOW
+        // undelivered indices is kept open, refilled from the next
+        // not-yet-opened index as entries are picked out of it — so
+        // any given block's body is delivered somewhere between
+        // immediately and WINDOW-1 other deliveries after it was first
+        // eligible, never later.
+        let mut rng = Xorshift64(0xC0FFEE);
+        let mut pending: Vec<usize> = Vec::with_capacity(WINDOW);
+        let mut next_to_open = 0usize;
+        let mut order = Vec::with_capacity(N);
+        while order.len() < N {
+            while pending.len() < WINDOW && next_to_open < N {
+                pending.push(next_to_open);
+                next_to_open += 1;
+            }
+            let pick = rng.gen_index(pending.len());
+            order.push(pending.remove(pick));
+        }
+        assert_eq!(order.len(), N);
+
+        for &idx in &order {
+            cs.accept_block(&blocks[idx], NOW)
+                .unwrap_or_else(|e| panic!("block {idx}: {e:?}"));
+        }
+
+        assert_eq!(cs.tip_hash(), blocks[N - 1].block_hash());
+        assert_eq!(cs.chain().len(), N + 1);
+        for (i, block) in blocks.iter().enumerate() {
+            assert_eq!(cs.chain()[i + 1], block.block_hash(), "height {}", i + 1);
+        }
     }
 
     #[test]
