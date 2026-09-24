@@ -25,6 +25,7 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 | 16 | 09-23 | Crash fault-injection on hash engine | Commit ordering survives torn writes | **2 findings, both fixed** | torn records decoded to wrong-but-valid coins (silent corruption) → +4B keyed record tag, tears now misses; coins-ahead-of-tip tear invisible → index-header watermark, open errors loudly. File-level sim; compact() still unsafe | [fault-inject](2026-09-23-fault-injection.md) |
 
 
+| 43 | 09-24 | Repeated-key aggregation in advised ECDSA | Can duplicate public-key terms remove more arithmetic from #40? | **additional CPU win; elapsed benefit inconclusive** | Same 24-block Script replay: ordinary 25.274 CPU s → previous advice 19.133 → repeated-key worker 16.705 (another −12.7%; −33.9% vs ordinary). Historical arithmetic kernel −21.9%; unique-key control +0.3%, within variation. Regtest gains little. 27 kernel + 33 replay comparisons, 95 boundary/protocol checks, and native sanitizer suites pass; same verdict/UTXO hashes and invalid-spend rollback. Same hints and Rust binary; production unchanged, full mainnet IBD unmeasured. | [repeated-keys](2026-09-24-ecdsa-repeated-keys.md) |
 | 42 | 09-24 | BIP-330 tx delivery live + two real sync bugs | Does set reconciliation carry a real transaction end-to-end? | **verified live; bugs fixed** | Two regtest nodes over BIP324-v2: tx mined into A's pool reached B's via sketch diff → reconcildiff ask (33B) → body (430B) → B's mempool — **zero inv announcements** (tx-invs suppressed on recon links). Live run flushed two real bugs: inv bursts >16-slot window were consumed-and-forgotten (fixed: `pending_blocks` drain), and restore was O(n²) via `ancestor_is_invalid` walking to genesis per header on a clean chain (fixed: O(1) early return; 66k headers went 3:45min → instant). | [erlay-sketch](2026-09-24-erlay-sketch.md) |
 | 41 | 09-24 | Zero-copy assumeutxo activation (overlay) | Can `loadtxoutset` activate without importing 170M coins? | **adopted — single-pass, persists** | `activate_snapshot_overlay`: `index_with` builds the sparse index AND streams decoded coins to the commitment hasher in one sequential read; `SnapshotRun` attaches as the lowest UtxoSet layer. Fixture (13k coins): 0.01s single-pass vs 0.03s import; the win is zero duplication + bounded memory, not small-scale latency. `snapshot.path` sidecar re-attaches on resume; `state.dat` carries the delta only (`iter_delta`); `UtxoSet::iter` merges the layer for dump/stats consumers. Resume test: drop+reopen resolves all base coins. | [delta-overlay](2026-09-24-delta-overlay-shim.md) |
 | 40 | 09-24 | Compact ECDSA advice and verification-time production | Can portable advice be small, streaming and cheaper to supply? | **qualified offline experiment; production unchanged** | Mainnet stream 3.57 MB → 146 KB (24.42× smaller); recipient CPU −23.7%. Production + packing 51.35 → 29.13 CPU s (−43.3%); 64-job producer groups improve elapsed. 129 comparison runs + 9 scheduling runs + 133 checks pass; 482 unit tests pass, 2 existing ignores. One already-validating producer + one recipient repays added CPU at sample medians. Full mainnet IBD and online exporter unmeasured. | [advice-economics](2026-09-24-ecdsa-advice-economics.md) |
@@ -198,3 +199,43 @@ first measurement that would kill or confirm it.
 21. **ASMap bucketing.** Core's deployed Erebus countermeasure —
     bucket peers by ASN (Kartograf-reproducible maps) instead of /16.
     A parity gap; well-specified, bounded.
+
+22. **Self-eclipse field test.** Build the attack: attacker nodes that
+    monopolize all our outbound slots in a lab topology. Hypothesis:
+    detection signals (header stall, peer homogeneity, route
+    uniformity) fire within bounded time. Kill condition: our own
+    eclipse goes undetected — learn it now. Nobody publishes eclipse
+    experiments on their own node; even a negative result is tooling.
+
+23. **Pinning red-team.** Implement BIP-431's documented pinning
+    attacks as tools (descendant-limit saturation, rule-3 pinning,
+    package-limit pinning), run against our mempool on regtest.
+    Hypothesis: oracle catches all documented classes with bounded
+    false positives. Kill: pinning is indistinguishable from
+    legitimate high-descendant usage — the signal isn't separable.
+
+24. **Continuous dual-engine lockstep.** We already have two coins
+    engines (redb + hashstore) — run both permanently on live traffic,
+    divergence = halt. Continuous consensus-equivalence as a running
+    property. Kill: second-engine overhead impractical at steady state
+    — measure it.
+
+25. **The privacy proof artifact.** Private mode + 24h full outbound
+    packet capture. Hypothesis: zero non-Tor bytes escape. Kill:
+    anything leaks (DNS, NTP, stray v1) — publish exactly where.
+
+26. **First-spy simulation.** Implement the first-spy timing estimator
+    from the Dandelion literature; run against our relay with/without
+    selfish-stem. Hypothesis: stem measurably moves detection
+    probability. Kill: stem-length-1 doesn't move the needle — learn
+    the number before building the real thing.
+
+27. **Self-fuzzing canary.** The node continuously feeds mutated
+    recent blocks back through its own strict decode path — a standing
+    red team inside the node. Kill: generated mutations aren't
+    interesting enough to catch what a test suite misses.
+
+28. **Adversarial live-wire suite.** Hostile peers at max rate —
+    malformed messages, floods, slowloris — measure per-peer budgets
+    hold under sustained attack. Kill: a hostile peer can starve
+    honest peers — find the hole now.
