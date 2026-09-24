@@ -193,3 +193,40 @@ fn migrate_rollback_refuses_a_locked_datadir_even_with_force() {
     drop(lock_file);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn migrate_reports_truncated_index_files_instead_of_panicking() {
+    let root = scratch_dir("migrate-truncated-index");
+    let config = write_config(&root);
+    let live = root.join("data").join("regtest");
+    std::fs::create_dir_all(&live).unwrap();
+    // The correct 4-byte "cflt" magic, but only one byte of the u32
+    // version that should follow it — this used to panic slicing
+    // raw[4..8] on the short file instead of reporting it.
+    std::fs::write(live.join("cfilters.dat"), b"cflt\x01").unwrap();
+
+    let output = cli()
+        .args(["--config", config.to_str().unwrap(), "migrate"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "migrate_report panicked instead of reporting it: {stderr}"
+    );
+    assert_ne!(
+        output.status.code(),
+        Some(101),
+        "101 is Rust's uncaught-panic exit code: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("cfilters.dat: INCOMPATIBLE — truncated"),
+        "{stdout}"
+    );
+    // Still reported as incompatible, so the command fails — just not
+    // by crashing.
+    assert!(!output.status.success());
+
+    let _ = std::fs::remove_dir_all(&root);
+}

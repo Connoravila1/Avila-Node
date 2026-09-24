@@ -313,6 +313,13 @@ fn migrate_report(dir: &Path, network: avila_core::Network) -> Vec<(String, File
             out.push((name.into(), FileStatus::Bad("foreign magic".into())));
             continue;
         }
+        // The magic alone passing left a file 4-7 bytes long (magic
+        // present, u32 version cut off) to `raw[magic_b.len()..+4]`
+        // below, which panicked instead of reporting a bad file.
+        if raw.len() < magic_b.len() + ver_len {
+            out.push((name.into(), FileStatus::Bad("truncated".into())));
+            continue;
+        }
         let v = if ver_len == 0 {
             want // the version byte IS the magic suffix
         } else {
