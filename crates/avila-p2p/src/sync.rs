@@ -55,7 +55,7 @@ pub const BLOCK_STALLING_TIMEOUT: Duration = Duration::from_secs(2);
 pub const HEADERS_RESPONSE_TIME: Duration = Duration::from_secs(120);
 
 /// What [`PeerSync::on_headers`] reports.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct HeadersOutcome {
     /// Headers newly indexed by this page.
     pub added: usize,
@@ -65,6 +65,17 @@ pub struct HeadersOutcome {
     pub continuation: Option<Message>,
     /// Indexed blocks whose bodies we don't have — candidates for `getdata`.
     pub fetchable: Vec<BlockHash>,
+    /// This peer's low-work sync just ended without ever proving enough
+    /// work — aborted (bad continuity, an impossible difficulty
+    /// transition, a commitment mismatch, or the peer-length bound), or
+    /// it simply ran out of chain below the anti-DoS threshold. Not
+    /// misbehavior on its own, but if this peer currently holds headers
+    /// leadership the caller should release it immediately rather than
+    /// wait for a timeout, so another peer gets a chance to page
+    /// instead. Never set alongside a non-empty `continuation`, and
+    /// never set when a low-work sync completed successfully (that
+    /// peer just proved a good chain — it stays leader).
+    pub give_up_leadership: bool,
 }
 
 /// What [`PeerSync::on_block`] reports.
@@ -133,6 +144,25 @@ pub enum FilterReply {
     Ignore,
     /// The request violates BIP157 — disconnect the peer.
     Disconnect(&'static str),
+}
+
+/// Core's `IsAncestorOfBestHeaderOrTip`: whether `hash` is already known
+/// and is an ancestor-or-self of our best header, or sits on our active
+/// (connected) chain. A headers batch whose last header satisfies this
+/// needs no anti-DoS gating — Core skips `TryLowWorkHeadersSync` for
+/// exactly this, since accepting it again (or no-op'ing on it) teaches
+/// us nothing we don't already have.
+fn is_ancestor_of_best_header_or_tip(cs: &Chainstate, hash: &BlockHash) -> bool {
+    let Some(node) = cs.tree().get(hash) else {
+        return false;
+    };
+    if cs.tree().is_ancestor(node, cs.tree().tip()) {
+        return true;
+    }
+    // `cs.chain()` is height-indexed (index == height), so this is the
+    // O(1) equivalent of Core's `ActiveChain().Contains(header)` rather
+    // than a linear scan.
+    cs.chain().get(node.height as usize) == Some(hash)
 }
 
 impl PeerSync {
@@ -263,12 +293,7 @@ impl PeerSync {
             // sync in progress (Core: a bare reply means the peer
             // suddenly has nothing more, e.g. it reorged onto our chain).
             self.headers_sync = None;
-            return Ok(HeadersOutcome {
-                added: 0,
-                known: 0,
-                continuation: None,
-                fetchable: Vec::new(),
-            });
+            return Ok(HeadersOutcome::default());
         }
 
         let params = *cs.tree().params();
@@ -293,11 +318,24 @@ impl PeerSync {
             return Err(SyncError::DiscontinuousHeaders);
         }
 
+        // Core's `IsAncestorOfBestHeaderOrTip`: a batch whose last header
+        // is already known and sits on our best-header chain or our
+        // active chain can't teach us anything new — skip the anti-DoS
+        // gate rather than start a pointless presync over data we
+        // already have (e.g. a peer re-announcing our own tip).
+        let Some(last) = headers.last() else {
+            // Checked non-empty above; defended rather than panicking.
+            return Ok(HeadersOutcome::default());
+        };
+        let already_known_enough = is_ancestor_of_best_header_or_tip(cs, &last.hash());
+
         // Anti-DoS gate (Core's `TryLowWorkHeadersSync`): a headers batch
         // that doesn't carry enough claimed work must never reach
         // `accept_header` directly, or a cheap low-difficulty chain could
         // grow the header tree without bound.
-        if let Some(outcome) = self.try_low_work_headers_sync(cs, &params, headers, now) {
+        if !already_known_enough
+            && let Some(outcome) = self.try_low_work_headers_sync(cs, &params, headers, now)
+        {
             return Ok(outcome);
         }
 
@@ -312,6 +350,7 @@ impl PeerSync {
             known,
             continuation,
             fetchable,
+            give_up_leadership: false,
         })
     }
 
@@ -379,12 +418,13 @@ impl PeerSync {
         if headers.len() as u64 != MAX_HEADERS_RESULTS {
             // Short low-work batch: the peer has nothing more to give
             // and never proved sufficient work — ignore it outright
-            // (Core logs "Ignoring low-work chain" and does nothing).
+            // (Core logs "Ignoring low-work chain" and does nothing). If
+            // this peer is currently leading headers sync, it just
+            // showed it can't: release leadership so another peer gets
+            // a chance instead of freezing sync on this one.
             return Some(HeadersOutcome {
-                added: 0,
-                known: 0,
-                continuation: None,
-                fetchable: Vec::new(),
+                give_up_leadership: true,
+                ..HeadersOutcome::default()
             });
         }
         let sync_params = HeadersSyncParams::for_network(params.network);
@@ -395,7 +435,8 @@ impl PeerSync {
         // already under way, on a later call.
         debug_assert!(result.pow_validated_headers.is_empty());
         let continuation = self.next_low_work_request(cs, &state, result.request_more);
-        if !state.is_final() {
+        let is_final = state.is_final();
+        if !is_final {
             self.headers_sync = Some(state);
         }
         Some(HeadersOutcome {
@@ -403,6 +444,11 @@ impl PeerSync {
             known: 0,
             continuation,
             fetchable: Vec::new(),
+            // The only way a brand-new presync's very first call can
+            // finalize is by failing outright on this page (a
+            // successful completion needs REDOWNLOAD, which can't have
+            // started yet) — give up leadership in that case too.
+            give_up_leadership: is_final,
         })
     }
 
@@ -422,34 +468,59 @@ impl PeerSync {
     ) -> Result<HeadersOutcome, SyncError> {
         let Some(mut state) = self.headers_sync.take() else {
             // Only called when `headers_sync.is_some()`; defended anyway.
-            return Ok(HeadersOutcome {
-                added: 0,
-                known: 0,
-                continuation: None,
-                fetchable: Vec::new(),
-            });
+            return Ok(HeadersOutcome::default());
         };
         let full_page = headers.len() as u64 == MAX_HEADERS_RESULTS;
         let result = state.process_next_headers(headers, full_page);
-        let continuation = self.next_low_work_request(cs, &state, result.request_more);
-        if !state.is_final() {
+        let sync_continuation = self.next_low_work_request(cs, &state, result.request_more);
+        let is_final = state.is_final();
+        if !is_final {
             self.headers_sync = Some(state);
         }
+
         if !result.success {
+            // Abandoned (bad continuity relative to where the sync left
+            // off, an impossible difficulty transition, a commitment
+            // mismatch, or the peer-length bound) — not misbehavior on
+            // its own; give up on this peer's low-work chain and
+            // release leadership so another peer can take over paging.
             return Ok(HeadersOutcome {
-                added: 0,
-                known: 0,
-                continuation: None,
-                fetchable: Vec::new(),
+                give_up_leadership: true,
+                ..HeadersOutcome::default()
             });
         }
+
         let (added, known, fetchable) =
             self.accept_headers(cs, &result.pow_validated_headers, now)?;
+
+        let continuation = if sync_continuation.is_none() && full_page {
+            // Core's `ProcessHeadersMessage`: `nCount` is the *received*
+            // message's size, captured before any swap with released
+            // headers, and `!have_headers_sync` — the sync just
+            // finished (successfully, since we're past the
+            // `!result.success` check above) — so a full wire page
+            // still triggers the ordinary "peer may have more" fetch,
+            // via our new best-header locator, exactly as if this had
+            // never been a low-work batch at all.
+            Some(self.request_headers(cs))
+        } else {
+            sync_continuation
+        };
+        // Reached only when `result.success`. `is_final` here means
+        // either REDOWNLOAD released everything (`continuation` above
+        // already covers keeping the peer as leader) or the sync ended
+        // on a non-full page without ever proving enough work (Core's
+        // "declining to serve us that full chain again" / a presync
+        // whose whole chain came up short) — in that second case
+        // `continuation` stays `None`, and this peer should give up
+        // leadership too.
+        let give_up_leadership = is_final && continuation.is_none();
         Ok(HeadersOutcome {
             added,
             known,
             continuation,
             fetchable,
+            give_up_leadership,
         })
     }
 
