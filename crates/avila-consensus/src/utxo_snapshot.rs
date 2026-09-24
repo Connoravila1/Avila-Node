@@ -320,7 +320,9 @@ pub(crate) fn decompress_amount(mut x: u64) -> u64 {
         x + 1
     };
     while e > 0 {
-        n *= 10;
+        // Malicious input can drive the exponent past u64 — saturate
+        // (the caller's MAX_MONEY range-check rejects it downstream).
+        n = n.saturating_mul(10);
         e -= 1;
     }
     n

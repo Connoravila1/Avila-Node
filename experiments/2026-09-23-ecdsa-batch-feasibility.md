@@ -1,5 +1,14 @@
 # Feasibility spike: batch ECDSA verification
 
+**Scope correction:** the original assessment below concerns signatures without
+auxiliary nonce-point data. Its claim that point-based batching is inapplicable
+to historical signatures was too broad: untrusted out-of-band advice can supply
+the missing point without changing the original signature or block. The
+[native advice experiment](2026-09-23-ibd-ecdsa-advice.md) measures that separate,
+probabilistic verification profile and its helper/fallback costs. The failed
+k256/SP implementation did not prove a universal ECDSA cost floor. Original
+analysis is retained below for provenance.
+
 **Date:** 2026-09-23 · **Status:** FEASIBLE-BUT-BOUNDED — ~2×
 ceiling at batch ≤9, novel crypto, high implementation risk
 **Motivation:** scripts are ~92% of sync wall; ECDSA dominates the

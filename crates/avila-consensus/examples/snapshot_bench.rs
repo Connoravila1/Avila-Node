@@ -442,7 +442,9 @@ fn main() {
                             let c = buf[pos];
                             *v = (*v << 7) | u64::from(c & 0x7f);
                             pos += 1;
-                            if c & 0x80 == 0 {
+                            if c & 0x80 != 0 {
+                                *v += 1; // Core VARINT: +1 per continuation
+                            } else {
                                 break;
                             }
                         }
@@ -607,7 +609,9 @@ fn main() {
                             let c = buf[pos];
                             *v = (*v << 7) | u64::from(c & 0x7f);
                             pos += 1;
-                            if c & 0x80 == 0 {
+                            if c & 0x80 != 0 {
+                                *v += 1; // Core VARINT: +1 per continuation
+                            } else {
                                 break;
                             }
                         }
@@ -767,7 +771,9 @@ fn main() {
                             let c = buf[pos];
                             *v = (*v << 7) | u64::from(c & 0x7f);
                             pos += 1;
-                            if c & 0x80 == 0 {
+                            if c & 0x80 != 0 {
+                                *v += 1; // Core VARINT: +1 per continuation
+                            } else {
                                 break;
                             }
                         }
