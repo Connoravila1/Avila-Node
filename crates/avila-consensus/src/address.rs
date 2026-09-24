@@ -232,7 +232,10 @@ pub fn witness_decode(s: &str) -> Option<(String, u8, Vec<u8>)> {
         return None;
     }
     let sep = lower.rfind('1')?;
-    if sep == 0 || lower.len() - sep - 1 < 6 || lower.len() > 90 {
+    // The data part needs a version symbol plus the 6-symbol checksum;
+    // exactly 6 leaves no room for a version and would underflow the
+    // 5→8 regroup range below (`values[1..values.len() - 6]`).
+    if sep == 0 || lower.len() - sep - 1 < 7 || lower.len() > 90 {
         return None;
     }
     let hrp = &lower[..sep];
@@ -468,7 +471,13 @@ pub fn validate_address(s: &str, params: &Params) -> Result<AddressInfo, DestErr
     }
 
     let (got_hrp, values, enc) = bech32_decode_full(s)?;
-    if values.is_empty() {
+    // `values` still carries its 6-symbol checksum tail (unlike Core's
+    // post-strip `dec.data`), so "empty" here means length <= 6: no
+    // version symbol survives once the checksum is accounted for. Core
+    // hits the same `dec.data.empty()` check for this case; without it,
+    // the 5→8 regroup range below (`values[1..values.len() - 6]`)
+    // underflows to a start-after-end slice and panics.
+    if values.len() <= 6 {
         return Err(("Empty Bech32 data section".into(), vec![]));
     }
     if got_hrp != *hrp {
@@ -693,5 +702,30 @@ mod tests {
         }
         // OP_RETURN carries no address.
         assert_eq!(script_address(&Script::new(vec![0x6a]), &params), None);
+    }
+
+    /// A bech32 data part of exactly 6 symbols is pure checksum with no
+    /// version symbol; the 5→8 regroup used to slice
+    /// `values[1..values.len() - 6]` as `[1..0]` and panic instead of
+    /// rejecting the string.
+    #[test]
+    fn witness_decode_rejects_checksum_only_data_part() {
+        assert_eq!(witness_decode("br1qv2gva"), None);
+    }
+
+    #[test]
+    fn address_to_script_rejects_checksum_only_bech32_data() {
+        let params = Network::Regtest.params();
+        assert_eq!(address_to_script("br1qv2gva", &params), None);
+    }
+
+    #[test]
+    fn validate_address_rejects_checksum_only_bech32_data() {
+        // Same panic, reached through `validate_address`'s own copy of
+        // the 5→8 regroup slice.
+        let regtest = Network::Regtest.params();
+        assert!(validate_address("bcrt1tyddyu", &regtest).is_err());
+        let testnet4 = Network::Testnet4.params();
+        assert!(validate_address("tb1dclvmr", &testnet4).is_err());
     }
 }
