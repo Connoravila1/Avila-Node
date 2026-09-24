@@ -216,6 +216,12 @@ pub struct PeerManager<S> {
     /// Aggregate bound on block reservations across all peers —
     /// defaults to [`MAX_BLOCKS_IN_TRANSIT_TOTAL`].
     max_in_flight_total: usize,
+    /// Height-sorted `(height, hash)` fetch index for the fill pass —
+    /// rebuilt only when the header set grows, so each tick scans the
+    /// unfetched suffix instead of re-sorting the whole index per peer.
+    fetch_index: Vec<(u32, avila_consensus::hash::BlockHash)>,
+    /// Header count `fetch_index` was built at.
+    fetch_index_headers: usize,
     /// Gossiped peer addresses — discovery lives here.
     addrbook: AddrBook,
     /// The transaction pool — policy layer owned here so `tx` intake,
@@ -319,6 +325,8 @@ impl<S: Read + Write> PeerManager<S> {
             max_peers,
             headers_leader: None,
             max_in_flight_total: MAX_BLOCKS_IN_TRANSIT_TOTAL,
+            fetch_index: Vec::new(),
+            fetch_index_headers: usize::MAX,
             addrbook: AddrBook::new(),
             mempool: avila_mempool::Mempool::new(),
             closed_bytes_sent: 0,
@@ -856,7 +864,46 @@ impl<S: Read + Write> PeerManager<S> {
             .values()
             .flat_map(|p| p.sync.reserved_hashes().copied())
             .collect();
+        // Height-sorted fetch index — rebuilt once per header-set growth
+        // (pages arrive in ~2000-header chunks), not once per peer per
+        // tick: the previous per-peer `headers_by_height` collected and
+        // sorted the entire index for every fill, which was the dominant
+        // block-fetch cost once the header set grew large.
+        let header_count = cs.tree().len();
+        if header_count != self.fetch_index_headers {
+            self.fetch_index = cs
+                .tree()
+                .headers_by_height()
+                .iter()
+                .map(|h| {
+                    let hash = h.hash();
+                    (
+                        cs.tree().get(&hash).map(|n| n.height).unwrap_or(0),
+                        hash,
+                    )
+                })
+                .collect();
+            self.fetch_index_headers = header_count;
+        }
+        // One shared scan: unfetched candidates above the connected
+        // frontier (connected heights have bodies by definition), each
+        // peer taking a slice until the aggregate budget binds.
+        let frontier = cs.chain().len() as u32;
+        let start = self
+            .fetch_index
+            .partition_point(|(h, _)| *h < frontier);
+        let want_total = self.max_in_flight_total.saturating_sub(reserved.len());
+        let candidates: Vec<BlockHash> = self.fetch_index[start..]
+            .iter()
+            .map(|(_, h)| *h)
+            .filter(|h| !cs.have_body(h) && !reserved.contains(h))
+            .take(want_total)
+            .collect();
+        let mut next = 0usize;
         for peer in self.peers.values_mut() {
+            if next >= candidates.len() {
+                break;
+            }
             if !peer.session.established()
                 || peer.sync.stalled()
                 || peer.sync.in_flight() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER
@@ -864,26 +911,14 @@ impl<S: Read + Write> PeerManager<S> {
                 reserved.extend(peer.sync.reserved_hashes().copied());
                 continue;
             }
-            if reserved.len() >= self.max_in_flight_total {
-                break;
-            }
-            let unfetched: Vec<BlockHash> = cs
-                .tree()
-                .headers_by_height()
-                .iter()
-                .map(|h| h.hash())
-                .filter(|h| !cs.have_body(h) && !reserved.contains(h))
-                .take(
-                    crate::sync::MAX_BLOCKS_IN_TRANSIT_PER_PEER
-                        .min(self.max_in_flight_total - reserved.len()),
-                )
-                .collect();
-            if unfetched.is_empty() {
-                break;
-            }
-            if let Some(req) = peer.sync.want_blocks_excluding(cs, &unfetched, &reserved) {
+            let take = crate::sync::MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                .saturating_sub(peer.sync.in_flight())
+                .min(candidates.len() - next);
+            let unfetched = &candidates[next..next + take];
+            if let Some(req) = peer.sync.want_blocks_excluding(cs, unfetched, &reserved) {
                 let _ = peer.session.send(&req);
             }
+            next += take;
             reserved.extend(peer.sync.reserved_hashes().copied());
         }
     }
