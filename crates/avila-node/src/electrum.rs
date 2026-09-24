@@ -32,9 +32,9 @@
 //! the operator's choice.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -74,6 +74,28 @@ struct ConnState {
     writer: Mutex<TcpStream>,
 }
 
+/// Hard cap on concurrent Electrum connections. A loopback-by-default
+/// personal/family node has no business serving unbounded clients;
+/// past this the accept loop drops new sockets instead of spawning
+/// unbounded threads (two per connection: reader + notification pump).
+/// A conservative default, not a protocol value — worth exposing as a
+/// CLI flag if operators need more.
+const MAX_CONNECTIONS: usize = 64;
+
+/// Cap on one JSON-RPC request line's accumulated length before its
+/// terminating newline arrives. Generous for any real request (the
+/// largest is a `blockchain.transaction.broadcast`'s raw-tx hex), but
+/// bounded: without it, a client that never sends `\n` — trickling
+/// bytes slowly enough to keep beating the per-read timeout — can grow
+/// the connection's buffer without limit.
+const MAX_LINE_LEN: usize = 1024 * 1024;
+
+/// Cap on a blocking write to the client. Pairs with the read
+/// timeout: without it, a peer that stops reading its socket can wedge
+/// `send()` forever while it holds the connection's locks, starving
+/// the reader and pump threads that share them.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Runs the Electrum server on `addr` until `cancel` flips. Returns
 /// the listener's join handle.
 ///
@@ -90,22 +112,47 @@ pub fn serve(
     // Nonblocking accept so `cancel` polls between connections.
     listener.set_nonblocking(true)?;
     Ok(thread::spawn(move || {
-        while !cancel.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((stream, _peer)) => {
-                    let queries = queries.clone();
-                    let waiters = waiters.clone();
-                    let status = status.clone();
-                    let cancel = cancel.clone();
-                    thread::spawn(move || handle(stream, queries, waiters, status, cancel));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(_) => thread::sleep(Duration::from_millis(50)),
-            }
-        }
+        accept_loop(listener, queries, waiters, status, cancel);
     }))
+}
+
+/// The listener's accept loop — split out from [`serve`] so tests can
+/// drive it against a listener bound to an OS-chosen port (`serve`
+/// itself never hands the bound address back to the caller).
+fn accept_loop(
+    listener: TcpListener,
+    queries: QuerySender,
+    waiters: Arc<BlockWaiters>,
+    status: SharedStatus,
+    cancel: Arc<AtomicBool>,
+) {
+    let conns = Arc::new(AtomicUsize::new(0));
+    while !cancel.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _peer)) => {
+                if conns.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                    // Over the cap — drop the socket rather than spawn
+                    // another unbounded pair of threads.
+                    drop(stream);
+                    continue;
+                }
+                conns.fetch_add(1, Ordering::Relaxed);
+                let queries = queries.clone();
+                let waiters = waiters.clone();
+                let status = status.clone();
+                let cancel = cancel.clone();
+                let conns = conns.clone();
+                thread::spawn(move || {
+                    handle(stream, queries, waiters, status, cancel);
+                    conns.fetch_sub(1, Ordering::Relaxed);
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => thread::sleep(Duration::from_millis(50)),
+        }
+    }
 }
 
 /// The Electrum status hash for a history: `SHA256` over the
@@ -205,6 +252,9 @@ fn handle(
     let Ok(writer) = stream.try_clone() else {
         return;
     };
+    // A client that stops reading must not be able to wedge `send()`
+    // (and the connection-wide locks it holds while writing) forever.
+    let _ = writer.set_write_timeout(Some(WRITE_TIMEOUT));
     let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(64);
     let state = Arc::new(Mutex::new(ConnState {
         subs: HashMap::new(),
@@ -240,26 +290,37 @@ fn handle(
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        // Bound this attempt to what's left of the line's budget — a
+        // fresh `Take` each iteration so a client trickling bytes just
+        // under the read timeout (never actually erroring) still can't
+        // grow `line` past MAX_LINE_LEN within a single call.
+        let remaining = MAX_LINE_LEN.saturating_sub(line.len()) as u64;
+        match reader.by_ref().take(remaining).read_line(&mut line) {
+            Ok(_) if line.ends_with('\n') => {}
+            Ok(_) => break, // EOF mid-line, or the line hit MAX_LINE_LEN
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 // Idle read window — the subscription lifetime is the
-                // connection's, so keep waiting.
+                // connection's, so keep waiting. Any partial line
+                // already read stays put (and still capped) for the
+                // next attempt.
+                continue;
             }
             Err(_) => break,
-            Ok(_) => {}
         }
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        if line.trim().is_empty() {
+        let this_line = std::mem::take(&mut line);
+        if this_line.trim().is_empty() {
             continue;
         }
-        let req: Value = match serde_json::from_str(line.trim()) {
+        let req: Value = match serde_json::from_str(this_line.trim()) {
             Ok(v) => v,
             Err(_) => {
                 send(&state, &reply_err(&Value::Null, -32700, "parse error"));
@@ -1326,5 +1387,108 @@ mod tests {
         let wire = "8b01df4e368ea28f8dc0423bcf7a4923e3a12d307c875e47a0cfbf90b5c39161";
         assert_eq!(format_scripthash(&raw), wire);
         assert_eq!(parse_scripthash(wire), Some(raw));
+    }
+
+    fn empty_status() -> SharedStatus {
+        Arc::new(RwLock::new(SyncProgress {
+            peers: 0,
+            connected_height: 0,
+            header_height: 0,
+            in_flight: 0,
+            established_total: 0,
+            disconnects: 0,
+            recent: Vec::new(),
+            peer_details: Vec::new(),
+            mempool: (0, 0, None),
+            elapsed_secs: 0,
+        }))
+    }
+
+    /// A client that never sends a newline must not be able to grow
+    /// the connection's line buffer without bound — past
+    /// `MAX_LINE_LEN` the server disconnects rather than keep reading.
+    #[test]
+    fn oversized_line_disconnects() {
+        let (qtx, _qrx) = mpsc::channel::<crate::rpc::ChainQuery>();
+        let waiters = Arc::new(BlockWaiters::new());
+        let status = empty_status();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (qtx2, waiters2, status2, cancel2) =
+            (qtx.clone(), waiters.clone(), status.clone(), cancel.clone());
+        thread::spawn(move || {
+            while !cancel2.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((s, _)) => {
+                        let q = qtx2.clone();
+                        let w = waiters2.clone();
+                        let st = status2.clone();
+                        let c = cancel2.clone();
+                        thread::spawn(move || handle(s, q, w, st, c));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut conn = TcpStream::connect(addr).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        // One line, never terminated by `\n` — well past MAX_LINE_LEN.
+        conn.write_all(&vec![b'a'; MAX_LINE_LEN + 4096]).unwrap();
+        let mut buf = [0u8; 1];
+        let n = conn.read(&mut buf).unwrap_or(0);
+        assert_eq!(n, 0, "server must disconnect an oversized line");
+        cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// The accept loop must not spawn unbounded per-connection thread
+    /// pairs — past `MAX_CONNECTIONS` a new socket is dropped outright
+    /// rather than served.
+    #[test]
+    fn accept_loop_enforces_connection_cap() {
+        let (qtx, _qrx) = mpsc::channel::<crate::rpc::ChainQuery>();
+        let waiters = Arc::new(BlockWaiters::new());
+        let status = empty_status();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let cancel2 = cancel.clone();
+        thread::spawn(move || accept_loop(listener, qtx, waiters, status, cancel2));
+
+        // Open MAX_CONNECTIONS + a few more — every one past the cap
+        // must be closed immediately (a read on it hits EOF) instead
+        // of served.
+        let mut conns: Vec<TcpStream> = (0..MAX_CONNECTIONS + 4)
+            .map(|_| TcpStream::connect(addr).unwrap())
+            .collect();
+        thread::sleep(Duration::from_millis(500));
+
+        let mut accepted = 0;
+        let mut rejected = 0;
+        for conn in &mut conns {
+            conn.set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let mut buf = [0u8; 1];
+            match conn.read(&mut buf) {
+                Ok(0) => rejected += 1,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    accepted += 1;
+                }
+                other => panic!("unexpected read result: {other:?}"),
+            }
+        }
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(rejected, 4, "accepted={accepted} rejected={rejected}");
+        assert_eq!(accepted, MAX_CONNECTIONS);
     }
 }
