@@ -10,7 +10,7 @@ pub mod settings;
 use crate::session::Session;
 use crate::theme::Palette;
 use crate::widgets::{self, Kind};
-use eframe::egui::Ui;
+use eframe::egui::{TextureHandle, Ui};
 
 /// How long the new-block pulse runs, seconds.
 const PULSE_SECS: f64 = 1.6;
@@ -19,6 +19,8 @@ pub struct Scene<'a> {
     pub pal: Palette,
     pub session: &'a Session,
     pub network: avila_core::Network,
+    /// The logo's swirl, for marks that stand for this node.
+    pub swirl: Option<&'a TextureHandle>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

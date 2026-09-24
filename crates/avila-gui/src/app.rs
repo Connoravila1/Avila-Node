@@ -1,6 +1,7 @@
 //! The window: the brand rail, the status line, and the current page.
 
 use crate::capture::Capture;
+use crate::constellation::Constellation;
 use crate::pages::{self, Action, Scene};
 use crate::prefs::{Prefs, ThemeChoice};
 use crate::rail::{self, Page};
@@ -26,6 +27,9 @@ pub struct App {
     swirl: Option<TextureHandle>,
     capture: Option<Capture>,
     autostart: bool,
+    /// The peer whose panel is open on the Peers page.
+    selected_peer: Option<u64>,
+    sky: Constellation,
 }
 
 impl App {
@@ -69,6 +73,8 @@ impl App {
             swirl: brand::swirl_texture(ctx),
             capture: Capture::from_env(),
             autostart,
+            selected_peer: None,
+            sky: Constellation::default(),
         }
     }
 
@@ -192,8 +198,19 @@ impl eframe::App for App {
             self.start();
         }
         self.session.poll();
-        if let Some(capture) = &mut self.capture {
-            capture.drive(&ctx, &mut self.page);
+        let mut pose_scroll = None;
+        if let Some(pose) = self.capture.as_mut().and_then(|c| c.drive(&ctx)) {
+            pose_scroll = Some(pose.scroll);
+            self.page = pose.page;
+            self.prefs.scale = pose.scale;
+            if pose.select_peer && self.selected_peer.is_none() {
+                self.selected_peer = self
+                    .session
+                    .view
+                    .as_ref()
+                    .and_then(|v| v.established().find(|p| p.session_id.is_some()))
+                    .map(|p| p.id);
+            }
         }
         self.shortcuts(&ctx);
         let pal = Palette::of(&ctx);
@@ -237,49 +254,61 @@ impl eframe::App for App {
                     top.top() + 0.5,
                     Stroke::new(1.0, pal.hairline),
                 );
-                ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        Frame::new()
-                            .inner_margin(Margin {
-                                left: 32,
-                                right: 32,
-                                top: 26,
-                                bottom: 40,
-                            })
-                            .show(ui, |ui| {
-                                let scene = Scene {
-                                    pal,
-                                    session: &self.session,
-                                    network,
-                                };
-                                let page_action = match self.page {
-                                    Page::Overview => pages::overview::show(ui, &scene),
-                                    Page::Chain => pages::chain::show(ui, &scene),
-                                    Page::Peers => pages::peers::show(ui, &scene),
-                                    Page::Activity => {
-                                        pages::activity::show(ui, &scene, &mut self.filter)
-                                    }
-                                    Page::Settings => {
-                                        let before = self.prefs;
-                                        let a = pages::settings::show(
-                                            ui,
-                                            &scene,
-                                            &mut self.run,
-                                            &mut self.prefs,
-                                            &self.node,
-                                        );
-                                        if self.prefs != before {
-                                            self.prefs.apply(ui.ctx());
-                                        }
-                                        a
-                                    }
-                                };
-                                if page_action.is_some() {
-                                    action = page_action;
+                let mut scroll = ScrollArea::vertical().auto_shrink([false, false]);
+                if let Some(y) = pose_scroll {
+                    scroll = scroll.vertical_scroll_offset(y);
+                }
+                scroll.show(ui, |ui| {
+                    Frame::new()
+                        .inner_margin(Margin {
+                            left: 32,
+                            right: 32,
+                            top: 26,
+                            bottom: 40,
+                        })
+                        .show(ui, |ui| {
+                            let scene = Scene {
+                                pal,
+                                session: &self.session,
+                                network,
+                                swirl: self.swirl.as_ref(),
+                            };
+                            let page_action = match self.page {
+                                Page::Overview => {
+                                    pages::overview::show(ui, &scene, &mut self.prefs.scale)
                                 }
-                            });
-                    });
+                                Page::Chain => {
+                                    pages::chain::show(ui, &scene, &mut self.prefs.scale)
+                                }
+                                Page::Peers => pages::peers::show(
+                                    ui,
+                                    &scene,
+                                    &mut self.selected_peer,
+                                    &mut self.sky,
+                                ),
+                                Page::Activity => {
+                                    pages::activity::show(ui, &scene, &mut self.filter)
+                                }
+                                Page::Settings => {
+                                    let before = self.prefs;
+                                    let a = pages::settings::show(
+                                        ui,
+                                        &scene,
+                                        &mut self.run,
+                                        &mut self.prefs,
+                                        &self.node,
+                                    );
+                                    if self.prefs != before {
+                                        self.prefs.apply(ui.ctx());
+                                    }
+                                    a
+                                }
+                            };
+                            if page_action.is_some() {
+                                action = page_action;
+                            }
+                        });
+                });
             });
 
         match action {
@@ -293,10 +322,12 @@ impl eframe::App for App {
             pal,
             session: &self.session,
             network,
+            swirl: None,
         }
         .pulse()
         .is_some();
-        if self.capture.is_some() || pulsing {
+        let settling = self.page == Page::Peers && self.sky.animating();
+        if self.capture.is_some() || pulsing || settling {
             ctx.request_repaint();
         } else if self.session.running() {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -306,7 +337,10 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        self.prefs.save(storage);
+        // A capture run poses the app; it mustn't overwrite real choices.
+        if self.capture.is_none() {
+            self.prefs.save(storage);
+        }
     }
 
     fn persist_egui_memory(&self) -> bool {

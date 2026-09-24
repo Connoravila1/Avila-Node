@@ -4,17 +4,30 @@
 //! `--demo` for reproducible content.
 
 use crate::rail::Page;
+use crate::ribbon::Scale;
 use eframe::egui::{self, ColorImage, Context, Event, Theme, UserData, ViewportCommand};
 use std::path::PathBuf;
 
 /// Frames to let layout, fonts and textures settle before each shot.
 const SETTLE: u32 = 14;
 
+/// How the app should be posed for one shot.
+#[derive(Clone, Copy, Debug)]
+pub struct Pose {
+    pub page: Page,
+    pub scale: Scale,
+    /// Open the first peer's panel.
+    pub select_peer: bool,
+    /// Scroll the page down this far.
+    pub scroll: f32,
+}
+
 #[derive(Clone, Copy)]
 struct Shot {
     theme: Theme,
-    page: Page,
+    pose: Pose,
     size: [f32; 2],
+    name: &'static str,
 }
 
 pub struct Capture {
@@ -30,27 +43,67 @@ impl Capture {
     pub fn from_env() -> Option<Self> {
         let dir = PathBuf::from(std::env::var_os("AVILA_GUI_CAPTURE")?);
         std::fs::create_dir_all(&dir).ok()?;
+        const FULL: [f32; 2] = [1120.0, 760.0];
+        // The smallest window the app allows.
+        const SMALL: [f32; 2] = [760.0, 480.0];
+        let pose = |page| Pose {
+            page,
+            scale: Scale::Blocks,
+            select_peer: false,
+            scroll: 0.0,
+        };
         let mut shots = Vec::new();
         for theme in [Theme::Light, Theme::Dark] {
             for page in Page::ALL {
                 shots.push(Shot {
                     theme,
-                    page,
-                    size: [1120.0, 760.0],
+                    pose: pose(page),
+                    size: FULL,
+                    name: "",
                 });
             }
         }
-        // The smallest window the app allows.
-        shots.push(Shot {
-            theme: Theme::Dark,
-            page: Page::Overview,
-            size: [760.0, 480.0],
-        });
-        shots.push(Shot {
-            theme: Theme::Light,
-            page: Page::Peers,
-            size: [760.0, 480.0],
-        });
+        let by_work = |page| Pose {
+            scale: Scale::Work,
+            ..pose(page)
+        };
+        let picked = Pose {
+            select_peer: true,
+            ..pose(Page::Peers)
+        };
+        for (theme, pose, size, name) in [
+            (Theme::Light, by_work(Page::Overview), FULL, "-work"),
+            (Theme::Dark, by_work(Page::Chain), FULL, "-work"),
+            (Theme::Light, picked, FULL, "-selected"),
+            (Theme::Dark, picked, FULL, "-selected"),
+            (
+                Theme::Light,
+                Pose {
+                    scroll: 620.0,
+                    ..pose(Page::Chain)
+                },
+                FULL,
+                "-lower",
+            ),
+            (
+                Theme::Dark,
+                Pose {
+                    scroll: 420.0,
+                    ..picked
+                },
+                FULL,
+                "-selected-lower",
+            ),
+            (Theme::Dark, pose(Page::Overview), SMALL, "-small"),
+            (Theme::Light, pose(Page::Peers), SMALL, "-small"),
+        ] {
+            shots.push(Shot {
+                theme,
+                pose,
+                size,
+                name,
+            });
+        }
         Some(Self {
             dir,
             shots,
@@ -60,9 +113,10 @@ impl Capture {
         })
     }
 
-    /// Runs at the top of every frame: saves a shot that arrived, poses
-    /// the app for the next one, and asks for it once things settle.
-    pub fn drive(&mut self, ctx: &Context, page: &mut Page) {
+    /// Runs at the top of every frame: saves a shot that arrived, says how
+    /// to pose the app for the next one, and asks for it once things
+    /// settle. `None` once every shot is taken (the window then closes).
+    pub fn drive(&mut self, ctx: &Context) -> Option<Pose> {
         let arrived = ctx.input(|i| {
             i.events.iter().find_map(|e| match e {
                 Event::Screenshot { image, .. } => Some(image.clone()),
@@ -79,8 +133,8 @@ impl Capture {
                 } else {
                     "light"
                 },
-                shot.page.label().to_lowercase(),
-                if shot.size[0] < 1000.0 { "-small" } else { "" },
+                shot.pose.page.label().to_lowercase(),
+                shot.name,
             );
             if let Err(e) = std::fs::write(self.dir.join(&name), png(&image)) {
                 eprintln!("capture: couldn't write {name}: {e}");
@@ -91,7 +145,7 @@ impl Capture {
         }
         let Some(shot) = self.shots.get(self.next).copied() else {
             ctx.send_viewport_cmd(ViewportCommand::Close);
-            return;
+            return None;
         };
         if self.wait == SETTLE {
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(
@@ -99,7 +153,6 @@ impl Capture {
                 shot.size[1],
             )));
         }
-        *page = shot.page;
         ctx.set_theme(shot.theme);
         if !self.requested {
             if self.wait == 0 {
@@ -110,6 +163,7 @@ impl Capture {
             }
         }
         ctx.request_repaint();
+        Some(shot.pose)
     }
 }
 

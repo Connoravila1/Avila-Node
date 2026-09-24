@@ -2,6 +2,8 @@
 //! types, so a real run and the `--demo` preview feed the same code.
 
 use avila_node::sync::SyncProgress;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
 pub struct NodeView {
@@ -19,6 +21,10 @@ pub struct NodeView {
     pub fee_rate_sat_kvb: Option<i64>,
     pub uptime_secs: u64,
     pub trust: TrustView,
+    /// Work and time along the best header chain.
+    pub curve: ChainCurve,
+    /// The block this node's mempool would build next.
+    pub next_block: Option<NextBlockView>,
 }
 
 /// What the node has verified versus what it is assuming — the typed
@@ -58,10 +64,20 @@ pub struct PeerView {
     /// BIP330 (Erlay) reconciliation negotiated.
     pub recon: bool,
     pub ping_ms: Option<f64>,
+    pub ping_min_ms: Option<f64>,
     pub blocks_served: usize,
     pub connected_secs: u64,
     pub bytes_sent: u64,
     pub bytes_recv: u64,
+    /// The BIP324 session id in `getpeerinfo`'s byte order (Core prints
+    /// it as a uint256, reversed); `None` on v1.
+    pub session_id: Option<[u8; 32]>,
+    /// Bytes by what they were for.
+    pub traffic: Traffic,
+    /// Height of the last block this peer delivered that connected.
+    pub last_block: Option<u32>,
+    /// Service bits from its `version` message.
+    pub services: u64,
 }
 
 impl From<&SyncProgress> for NodeView {
@@ -88,10 +104,21 @@ impl From<&SyncProgress> for NodeView {
                     v2: s.transport_protocol == "v2",
                     recon: s.recon,
                     ping_ms: s.ping_last_secs.map(|t| t * 1000.0),
+                    ping_min_ms: s.ping_min_secs.map(|t| t * 1000.0),
                     blocks_served: s.blocks_received,
                     connected_secs: s.connected_secs,
                     bytes_sent: s.telemetry.bytes_sent,
                     bytes_recv: s.telemetry.bytes_recv,
+                    session_id: s.v2_session_id.map(|mut id| {
+                        id.reverse();
+                        id
+                    }),
+                    traffic: Traffic::from_counts(
+                        &s.telemetry.recv_by_msg,
+                        &s.telemetry.sent_by_msg,
+                    ),
+                    last_block: u32::try_from(s.synced_block_height).ok(),
+                    services: s.services.unwrap_or(0),
                 })
                 .collect(),
             mempool_txs: p.mempool.0,
@@ -110,6 +137,8 @@ impl From<&SyncProgress> for NodeView {
                 }),
                 verified_fraction: v.verified_fraction,
             },
+            curve: ChainCurve::default(),
+            next_block: None,
         }
     }
 }
@@ -159,6 +188,225 @@ impl NodeView {
         pings.sort_by(f64::total_cmp);
         Some(pings[pings.len() / 2])
     }
+}
+
+// ---------------------------------------------------------------------
+// Traffic by purpose
+// ---------------------------------------------------------------------
+
+/// What a connection's bytes were for, grouped from P2P command names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Purpose {
+    Blocks,
+    Headers,
+    Transactions,
+    Announcements,
+    Reconciliation,
+    Addresses,
+    Upkeep,
+}
+
+impl Purpose {
+    pub const COUNT: usize = 7;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Blocks,
+        Self::Headers,
+        Self::Transactions,
+        Self::Announcements,
+        Self::Reconciliation,
+        Self::Addresses,
+        Self::Upkeep,
+    ];
+
+    #[must_use]
+    pub fn of(command: &str) -> Self {
+        match command {
+            "block" | "cmpctblock" | "blocktxn" | "getblocktxn" | "getblocks" | "merkleblock"
+            | "cfilter" | "cfheaders" | "cfcheckpt" | "getcfilters" | "getcfheaders"
+            | "getcfcheckpt" => Self::Blocks,
+            "headers" | "getheaders" | "sendheaders" => Self::Headers,
+            "tx" => Self::Transactions,
+            "inv" | "getdata" | "notfound" | "mempool" => Self::Announcements,
+            "sendtxrcncl" | "reqrecon" | "sketch" | "reqsketchext" | "reconcildiff" => {
+                Self::Reconciliation
+            }
+            "addr" | "addrv2" | "getaddr" | "sendaddrv2" => Self::Addresses,
+            _ => Self::Upkeep,
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Blocks => "Blocks",
+            Self::Headers => "Headers",
+            Self::Transactions => "Transactions",
+            Self::Announcements => "Announcements",
+            Self::Reconciliation => "Erlay",
+            Self::Addresses => "Addresses",
+            Self::Upkeep => "Upkeep",
+        }
+    }
+}
+
+/// A connection's bytes, received and sent, by [`Purpose`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Traffic {
+    pub recv: [u64; Purpose::COUNT],
+    pub sent: [u64; Purpose::COUNT],
+}
+
+impl Traffic {
+    #[must_use]
+    pub fn from_counts(recv: &HashMap<String, u64>, sent: &HashMap<String, u64>) -> Self {
+        let mut t = Self::default();
+        for (cmd, n) in recv {
+            t.recv[Purpose::of(cmd) as usize] += n;
+        }
+        for (cmd, n) in sent {
+            t.sent[Purpose::of(cmd) as usize] += n;
+        }
+        t
+    }
+
+    #[must_use]
+    pub fn total_recv(&self) -> u64 {
+        self.recv.iter().sum()
+    }
+
+    #[must_use]
+    pub fn total_sent(&self) -> u64 {
+        self.sent.iter().sum()
+    }
+}
+
+/// Service bits worth naming, in the order they're shown.
+#[must_use]
+pub fn services(bits: u64) -> Vec<&'static str> {
+    [
+        (1, "Full blocks"),
+        (1 << 10, "Recent blocks"),
+        (1 << 3, "Segwit"),
+        (1 << 6, "Block filters"),
+        (1 << 11, "v2 transport"),
+        (1 << 2, "Bloom filters"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| bits & bit != 0)
+    .map(|(_, name)| name)
+    .collect()
+}
+
+// ---------------------------------------------------------------------
+// The chain's work and time
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CurvePoint {
+    pub height: u32,
+    /// Cumulative chainwork through this header.
+    pub work: f64,
+    /// Header timestamp, unix seconds.
+    pub time: u32,
+}
+
+/// Work and time along the best header chain, sampled at difficulty
+/// period boundaries plus the tip. Within a period every block carries
+/// the same work, so interpolating between samples is exact for work
+/// (and close for time).
+#[derive(Clone, Debug, Default)]
+pub struct ChainCurve {
+    points: Arc<[CurvePoint]>,
+}
+
+impl ChainCurve {
+    #[must_use]
+    pub fn new(mut points: Vec<CurvePoint>) -> Self {
+        points.sort_by_key(|p| p.height);
+        points.dedup_by_key(|p| p.height);
+        Self {
+            points: points.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+
+    #[must_use]
+    pub fn tip(&self) -> Option<CurvePoint> {
+        self.points.last().copied()
+    }
+
+    /// Cumulative work at `height`, interpolated; clamped to the samples.
+    #[must_use]
+    pub fn work_at(&self, height: u32) -> Option<f64> {
+        self.at(height, |p| p.work)
+    }
+
+    /// Header time at `height`, interpolated; clamped to the samples.
+    #[must_use]
+    pub fn time_at(&self, height: u32) -> Option<f64> {
+        self.at(height, |p| f64::from(p.time))
+    }
+
+    fn at(&self, height: u32, field: impl Fn(&CurvePoint) -> f64) -> Option<f64> {
+        let pts = &self.points;
+        let first = pts.first()?;
+        let i = pts.partition_point(|p| p.height <= height);
+        if i == 0 {
+            return Some(field(first));
+        }
+        let a = &pts[i - 1];
+        let Some(b) = pts.get(i) else {
+            return Some(field(a));
+        };
+        let f = f64::from(height - a.height) / f64::from(b.height - a.height);
+        Some(field(a) + (field(b) - field(a)) * f)
+    }
+
+    /// The height the chain had reached at unix time `t`, interpolated.
+    #[must_use]
+    pub fn height_at_time(&self, t: f64) -> Option<f64> {
+        let pts = &self.points;
+        let i = pts.partition_point(|p| f64::from(p.time) <= t);
+        if i == 0 || i == pts.len() {
+            return None;
+        }
+        let (a, b) = (&pts[i - 1], &pts[i]);
+        let span = f64::from(b.time) - f64::from(a.time);
+        if span <= 0.0 {
+            return Some(f64::from(a.height));
+        }
+        let f = (t - f64::from(a.time)) / span;
+        Some(f64::from(a.height) + f64::from(b.height - a.height) * f)
+    }
+
+    /// The first header of the current difficulty period, if sampled.
+    #[must_use]
+    pub fn period_start(&self, interval: u32) -> Option<CurvePoint> {
+        let tip = self.tip()?;
+        let start = tip.height - tip.height % interval.max(1);
+        self.points
+            .iter()
+            .rev()
+            .find(|p| p.height == start)
+            .copied()
+    }
+}
+
+/// The block this node's mempool would build next.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NextBlockView {
+    pub height: u32,
+    pub tx_count: usize,
+    /// Weight units, coinbase included.
+    pub weight: usize,
+    pub fees: i64,
+    pub subsidy: i64,
+    /// `(cumulative vsize, sat/vB)`, highest fee rate first.
+    pub steps: Arc<[(u32, f64)]>,
 }
 
 // ---------------------------------------------------------------------
@@ -234,6 +482,25 @@ pub fn fee_rate(sat_kvb: i64) -> String {
     }
 }
 
+/// Satoshis as bitcoin: `3.125 BTC`, `0.0213 BTC`.
+#[must_use]
+pub fn btc(sats: i64) -> String {
+    let v = sats as f64 / 1e8;
+    // Whole-coin amounts exactly (a subsidy is 1.5625, not 1.563);
+    // fractions of a coin to four places.
+    let s = if v.abs() >= 1.0 {
+        format!("{v:.8}")
+    } else {
+        format!("{v:.4}")
+    };
+    let s = if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+    } else {
+        s
+    };
+    format!("{s} BTC")
+}
+
 #[must_use]
 pub fn percent(fraction: f64) -> String {
     let p = (fraction * 100.0).clamp(0.0, 100.0);
@@ -250,6 +517,71 @@ pub fn percent(fraction: f64) -> String {
 #[must_use]
 pub fn work_zeros(hash: &str) -> usize {
     hash.chars().take_while(|c| *c == '0').count()
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Unix seconds at the start of January 1 of `year`, UTC.
+#[must_use]
+pub fn year_start(year: i64) -> i64 {
+    days_from_civil(year, 1, 1) * 86_400
+}
+
+/// `(year, month 1–12)` of a unix time, UTC.
+#[must_use]
+pub fn year_month(unix: i64) -> (i64, u32) {
+    let z = unix.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m as u32)
+}
+
+/// `Mar 2028`.
+#[must_use]
+pub fn month_year(unix: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (y, m) = year_month(unix);
+    format!("{} {y}", MONTHS[(m as usize).saturating_sub(1) % 12])
+}
+
+#[cfg(test)]
+pub(crate) fn test_peer(id: u64) -> PeerView {
+    PeerView {
+        id,
+        addr: None,
+        inbound: false,
+        established: true,
+        agent: None,
+        their_height: None,
+        v2: true,
+        recon: false,
+        ping_ms: None,
+        ping_min_ms: None,
+        blocks_served: 0,
+        connected_secs: 0,
+        bytes_sent: 0,
+        bytes_recv: 0,
+        session_id: None,
+        traffic: Traffic::default(),
+        last_block: None,
+        services: 0,
+    }
 }
 
 #[cfg(test)]
@@ -285,6 +617,70 @@ mod tests {
         assert_eq!(percent(1.0), "100%");
         assert_eq!(percent(0.6589), "65.9%");
         assert_eq!(work_zeros("0000000000000000000108970acb"), 19);
+        assert_eq!(btc(312_500_000), "3.125 BTC");
+        assert_eq!(btc(156_250_000), "1.5625 BTC");
+        assert_eq!(btc(2_130_000), "0.0213 BTC");
+        assert_eq!(btc(0), "0 BTC");
+    }
+
+    #[test]
+    fn calendar_math_round_trips() {
+        assert_eq!(year_start(1970), 0);
+        assert_eq!(year_start(2009), 1_230_768_000);
+        // The genesis block's timestamp.
+        assert_eq!(year_month(1_231_006_505), (2009, 1));
+        assert_eq!(month_year(1_709_251_200), "Mar 2024");
+        assert_eq!(year_month(year_start(2028) - 1), (2027, 12));
+    }
+
+    #[test]
+    fn curves_interpolate_within_periods() {
+        let c = ChainCurve::new(vec![
+            CurvePoint {
+                height: 2016,
+                work: 20.0,
+                time: 2_000,
+            },
+            CurvePoint {
+                height: 0,
+                work: 0.0,
+                time: 0,
+            },
+            CurvePoint {
+                height: 3016,
+                work: 30.0,
+                time: 3_000,
+            },
+        ]);
+        assert_eq!(c.work_at(1008), Some(10.0));
+        assert_eq!(c.work_at(5000), Some(30.0));
+        assert_eq!(c.time_at(2516), Some(2_500.0));
+        assert_eq!(c.height_at_time(1_000.0), Some(1008.0));
+        assert_eq!(c.height_at_time(9_000.0), None);
+        assert_eq!(c.period_start(2016).map(|p| p.height), Some(2016));
+        assert!(ChainCurve::default().work_at(5).is_none());
+    }
+
+    #[test]
+    fn traffic_groups_commands_by_purpose() {
+        let recv: HashMap<String, u64> = [
+            ("block".into(), 900),
+            ("inv".into(), 40),
+            ("sketch".into(), 5),
+            ("ping".into(), 1),
+        ]
+        .into();
+        let sent: HashMap<String, u64> = [("getdata".into(), 30), ("addrv2".into(), 7)].into();
+        let t = Traffic::from_counts(&recv, &sent);
+        assert_eq!(t.recv[Purpose::Blocks as usize], 900);
+        assert_eq!(t.recv[Purpose::Reconciliation as usize], 5);
+        assert_eq!(t.sent[Purpose::Announcements as usize], 30);
+        assert_eq!(t.total_recv(), 946);
+        assert_eq!(t.total_sent(), 37);
+        assert_eq!(
+            services(1 | 8 | 2048),
+            vec!["Full blocks", "Segwit", "v2 transport"]
+        );
     }
 
     #[test]
@@ -299,19 +695,8 @@ mod tests {
         assert!(!v.caught_up());
         v.headers = 100;
         v.peers.push(PeerView {
-            id: 1,
-            addr: None,
-            inbound: false,
-            established: true,
-            agent: None,
             their_height: Some(120),
-            v2: true,
-            recon: false,
-            ping_ms: None,
-            blocks_served: 0,
-            connected_secs: 0,
-            bytes_sent: 0,
-            bytes_recv: 0,
+            ..test_peer(1)
         });
         assert!(!v.caught_up());
     }

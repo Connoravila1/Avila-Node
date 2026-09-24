@@ -2,18 +2,22 @@
 //! machine proven, what is it assuming, and is it alive?
 
 use super::{Action, Scene, start_offer};
-use crate::model::{NodeView, fee_rate, percent, span, thousands};
-use crate::ribbon::{self, Coverage, Options};
+use crate::model::{
+    ChainCurve, NextBlockView, NodeView, btc, fee_rate, percent, span, thousands, year_month,
+};
+use crate::ribbon::{self, Coverage, Options, Ruler, Scale};
 use crate::session::{Ended, Phase};
 use crate::theme::{self, body, font, mono};
 use crate::widgets;
-use eframe::egui::{Align, Align2, Layout, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
+use eframe::egui::{
+    Align, Align2, Layout, Mesh, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui, pos2, vec2,
+};
 
-pub fn show(ui: &mut Ui, s: &Scene) -> Option<Action> {
+pub fn show(ui: &mut Ui, s: &Scene, scale: &mut Scale) -> Option<Action> {
     let Some(view) = &s.session.view else {
         return idle(ui, s);
     };
-    hero(ui, s, view);
+    hero(ui, s, view, scale);
     ui.add_space(30.0);
     readouts(ui, s, view);
     ui.add_space(30.0);
@@ -45,63 +49,91 @@ fn idle(ui: &mut Ui, s: &Scene) -> Option<Action> {
     ribbon::show(
         ui,
         &crate::model::TrustView::default(),
+        &ChainCurve::default(),
         &Options {
             band: 40.0,
             halvings: false,
+            years: false,
+            scale: Scale::Blocks,
             pulse: None,
         },
     );
     action
 }
 
-fn hero(ui: &mut Ui, s: &Scene, v: &NodeView) {
+fn hero(ui: &mut Ui, s: &Scene, v: &NodeView, scale: &mut Scale) {
     let pal = s.pal;
     let cov = Coverage::of(&v.trust);
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 92.0), Sense::hover());
-    let p = ui.painter();
-    let label = font(theme::MEDIUM, 13.0);
-    let figure = font(theme::DISPLAY, 62.0);
-    p.text(
-        rect.left_top(),
-        Align2::LEFT_TOP,
-        "Proven by this machine",
-        label.clone(),
-        pal.muted,
-    );
-    p.text(
-        rect.left_top() + vec2(-3.0, 14.0),
-        Align2::LEFT_TOP,
-        percent(cov.proven_share()),
-        figure.clone(),
-        pal.signal_text,
-    );
-    p.text(
-        rect.right_top(),
-        Align2::RIGHT_TOP,
-        "Validated tip",
-        label,
-        pal.muted,
-    );
-    p.text(
-        rect.right_top() + vec2(2.0, 14.0),
-        Align2::RIGHT_TOP,
-        thousands(v.connected.into()),
-        figure,
-        pal.text,
-    );
-    ui.add_space(4.0);
+    let ruler = Ruler::new(cov.top, *scale, &v.curve);
+    let label = |ui: &mut Ui, text: &str| {
+        ui.label(
+            RichText::new(text)
+                .font(font(theme::MEDIUM, 13.0))
+                .color(pal.muted),
+        );
+    };
+    let w = ui.available_width();
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.allocate_ui_with_layout(vec2(w * 0.6, 0.0), Layout::top_down(Align::Min), |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            label(ui, "Proven by this machine");
+            let unit = if ruler.by_work() {
+                "of the work"
+            } else {
+                "of the blocks"
+            };
+            widgets::figure_in(
+                ui,
+                &percent(cov.proven_share(&ruler)),
+                unit,
+                62.0,
+                pal.signal_text,
+            );
+        });
+        ui.allocate_ui_with_layout(
+            vec2(ui.available_width(), 0.0),
+            Layout::top_down(Align::Max),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                label(ui, "Validated tip");
+                widgets::figure(ui, &thousands(v.connected.into()), "", 62.0);
+            },
+        );
+    });
+    ui.add_space(6.0);
     ribbon::show(
         ui,
         &v.trust,
+        &v.curve,
         &Options {
             band: 40.0,
             halvings: false,
+            years: false,
+            scale: *scale,
             pulse: s.pulse(),
         },
     );
-    ribbon::legend(ui, &v.trust);
-    ui.add_space(4.0);
-    ui.label(RichText::new(summary(s, v)).size(14.0).color(pal.muted));
+    ui.horizontal(|ui| {
+        let toggle = 200.0;
+        ui.allocate_ui_with_layout(
+            vec2((ui.available_width() - toggle).max(0.0), 34.0),
+            Layout::left_to_right(Align::Center),
+            |ui| ribbon::legend(ui, &v.trust, &ruler),
+        );
+        if !v.curve.is_empty() {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ribbon::scale_toggle(ui, scale);
+            });
+        }
+    });
+    ui.add_space(6.0);
+    let text = if ruler.by_work() {
+        summary_by_work(v, &cov, &ruler)
+    } else {
+        summary(s, v)
+    };
+    ui.label(RichText::new(text).size(14.0).color(pal.muted));
 }
 
 /// The ribbon in one plain sentence.
@@ -149,6 +181,37 @@ fn summary(s: &Scene, v: &NodeView) -> String {
     }
 }
 
+/// The same picture weighed by proof-of-work, where recent years count
+/// for far more than early ones.
+fn summary_by_work(v: &NodeView, cov: &Coverage, ruler: &Ruler) -> String {
+    let year = |h: u32| {
+        v.curve
+            .time_at(h)
+            .map(|t| year_month(t as i64).0.to_string())
+    };
+    if let Some(stretch) = cov.assumed {
+        let when = match (year(stretch.from), year(stretch.to)) {
+            (Some(a), Some(b)) if a != b => format!(" (mined {a}–{b})"),
+            (Some(a), _) => format!(" (mined in {a})"),
+            _ => String::new(),
+        };
+        return format!(
+            "Weighed by work, the stretch taken from the snapshot{when} carries {} of the chain’s proof-of-work, because mining got so much harder. The work in every header is checked either way; what’s still assumed is that those blocks’ transactions were valid.",
+            percent(cov.assumed_share(ruler)),
+        );
+    }
+    if cov.pending.is_some() {
+        return format!(
+            "Weighed by work, the blocks verified so far carry {} of the chain’s proof-of-work; the heavier, recent years are still ahead.",
+            percent(cov.proven_share(ruler)),
+        );
+    }
+    format!(
+        "Weighed by work, too, all of it: every block from genesis to {} was verified on this machine.",
+        thousands(v.connected.into())
+    )
+}
+
 fn readouts(ui: &mut Ui, s: &Scene, v: &NodeView) {
     widgets::hairline(ui);
     ui.add_space(16.0);
@@ -170,7 +233,7 @@ fn column(ui: &mut Ui, w: f32, add: impl FnOnce(&mut Ui)) {
     });
 }
 
-fn figure(ui: &mut Ui, _s: &Scene, value: &str, unit: &str) {
+fn figure(ui: &mut Ui, value: &str, unit: &str) {
     widgets::figure(ui, value, unit, 38.0);
 }
 
@@ -182,10 +245,10 @@ fn last_block(ui: &mut Ui, s: &Scene, v: &NodeView, w: f32) {
     widgets::label(ui, "Last block");
     let pace = s.session.per_min(|x| x.connected);
     match (v.caught_up(), pace, s.session.seen_ago(v.connected)) {
-        (false, Some(p), _) if p >= 1.0 => figure(ui, s, &thousands(p as u64), "blocks a minute"),
-        (_, _, Some(ago)) if ago < 5.0 => figure(ui, s, "Just now", ""),
-        (_, _, Some(ago)) => figure(ui, s, &span(ago as u64), "ago"),
-        _ => figure(ui, s, "—", ""),
+        (false, Some(p), _) if p >= 1.0 => figure(ui, &thousands(p as u64), "blocks a minute"),
+        (_, _, Some(ago)) if ago < 5.0 => figure(ui, "Just now", ""),
+        (_, _, Some(ago)) => figure(ui, &span(ago as u64), "ago"),
+        _ => figure(ui, "—", ""),
     }
     if let Some(hash) = v.tip_hash() {
         let zeros = crate::model::work_zeros(hash);
@@ -206,7 +269,7 @@ fn peers(ui: &mut Ui, s: &Scene, v: &NodeView, w: f32) {
     widgets::label(ui, "Peers");
     let est: Vec<_> = v.established().collect();
     let n = est.len();
-    figure(ui, s, &n.to_string(), if n == 1 { "peer" } else { "peers" });
+    figure(ui, &n.to_string(), if n == 1 { "peer" } else { "peers" });
     let v2 = est.iter().filter(|p| p.v2).count();
     let recon = est.iter().filter(|p| p.recon).count();
     let inbound = est.iter().filter(|p| p.inbound).count();
@@ -230,7 +293,7 @@ fn peers(ui: &mut Ui, s: &Scene, v: &NodeView, w: f32) {
 
 fn mempool(ui: &mut Ui, s: &Scene, v: &NodeView, w: f32) {
     widgets::label(ui, "Mempool");
-    figure(ui, s, &thousands(v.mempool_txs as u64), "transactions");
+    figure(ui, &thousands(v.mempool_txs as u64), "transactions");
     match v.fee_rate_sat_kvb {
         Some(f) => note(
             ui,
@@ -239,22 +302,104 @@ fn mempool(ui: &mut Ui, s: &Scene, v: &NodeView, w: f32) {
         ),
         None => note(ui, s, "No fee estimate yet"),
     }
-    note(
-        ui,
-        s,
-        &format!(
-            "{} orphan{} waiting for parents",
-            v.orphans,
-            if v.orphans == 1 { "" } else { "s" }
-        ),
+    match &v.next_block {
+        Some(b) => {
+            note(
+                ui,
+                s,
+                &format!(
+                    "Next block: {} transactions, {} in fees",
+                    thousands(b.tx_count as u64),
+                    btc(b.fees)
+                ),
+            );
+            ui.add_space(8.0);
+            staircase(ui, s, b, vec2(w, 44.0));
+        }
+        None => {
+            note(
+                ui,
+                s,
+                &format!(
+                    "{} orphan{} waiting for parents",
+                    v.orphans,
+                    if v.orphans == 1 { "" } else { "s" }
+                ),
+            );
+            ui.add_space(8.0);
+            widgets::sparkline(
+                ui,
+                &s.session.series(|x| x.mempool as f64),
+                vec2(w, 44.0),
+                s.pal.muted,
+            );
+        }
+    }
+}
+
+/// The next block's fee rates, highest first, across its capacity — a
+/// staircase on a log scale, since a few eager payers outbid the rest
+/// many times over.
+fn staircase(ui: &mut Ui, s: &Scene, b: &NextBlockView, size: eframe::egui::Vec2) {
+    let pal = s.pal;
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    let p = ui.painter();
+    p.hline(
+        rect.x_range(),
+        rect.bottom() - 0.5,
+        Stroke::new(1.0, pal.hairline),
     );
-    ui.add_space(8.0);
-    widgets::sparkline(
-        ui,
-        &s.session.series(|x| x.mempool as f64),
-        vec2(w, 44.0),
-        s.pal.muted,
+    let (Some(first), Some(last)) = (b.steps.first(), b.steps.last()) else {
+        return;
+    };
+    let (hi, lo) = (first.1.max(0.1), last.1.max(0.1));
+    let (lhi, llo) = (hi.ln(), lo.ln());
+    let inner = rect.shrink2(vec2(0.0, 3.0));
+    let capacity = 1_000_000.0;
+    let x = |vb: u32| inner.left() + inner.width() * (f64::from(vb) / capacity).min(1.0) as f32;
+    let y = |rate: f64| {
+        let f = if lhi > llo {
+            ((rate.max(0.1).ln() - llo) / (lhi - llo)) as f32
+        } else {
+            0.5
+        };
+        inner.bottom() - f * inner.height()
+    };
+    let mut points: Vec<Pos2> = Vec::with_capacity(b.steps.len() * 2);
+    let mut from = inner.left();
+    for (vb, rate) in b.steps.iter() {
+        let to = x(*vb);
+        points.push(pos2(from, y(*rate)));
+        points.push(pos2(to, y(*rate)));
+        from = to;
+    }
+    let mut area = Mesh::default();
+    let fill = pal.muted.gamma_multiply(if pal.dark { 0.16 } else { 0.12 });
+    for (i, pt) in points.iter().enumerate() {
+        area.colored_vertex(*pt, fill);
+        area.colored_vertex(pos2(pt.x, rect.bottom()), fill.gamma_multiply(0.3));
+        if i > 0 {
+            let k = (i * 2) as u32;
+            area.add_triangle(k - 2, k - 1, k);
+            area.add_triangle(k - 1, k, k + 1);
+        }
+    }
+    p.add(Shape::mesh(area));
+    p.add(Shape::line(points, Stroke::new(1.4, pal.muted)));
+    p.text(
+        rect.right_top(),
+        Align2::RIGHT_TOP,
+        format!("{hi:.0} → {lo:.1} sat/vB"),
+        mono(10.0),
+        pal.faint,
     );
+    resp.on_hover_text(format!(
+        "The block this node would build next, fee rates highest first: {} transactions, {} weight units, {} in fees plus a {} subsidy.",
+        thousands(b.tx_count as u64),
+        thousands(b.weight as u64),
+        btc(b.fees),
+        btc(b.subsidy)
+    ));
 }
 
 /// The newest blocks as a strip of tape, oldest fading at the left.

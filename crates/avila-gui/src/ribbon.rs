@@ -6,14 +6,21 @@
 //! It follows `getvalidationreport` exactly: blocks above a snapshot's
 //! base were connected normally and count as proven, as do the heights
 //! the replay has reached; only the unreplayed prefix is assumed.
+//!
+//! The ruler is either blocks or proof-of-work. By work, each stretch is
+//! as wide as the work its blocks carry — and since mining has grown so
+//! much harder, the recent years dominate.
 
-use crate::model::{TrustView, thousands};
+use crate::model::{ChainCurve, TrustView, percent, thousands, year_month, year_start};
 use crate::theme::{Palette, mono};
-use crate::widgets::{end_radius, hatch};
+use crate::widgets::{self, end_radius, hatch};
 use eframe::egui::{Color32, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use serde::{Deserialize, Serialize};
 
 const HALVING: u32 = 210_000;
 const RADIUS: u8 = 5;
+/// Room above the band for the year ruler.
+const YEAR_ROW: f32 = 20.0;
 
 /// Heights `(from, to]`: `to - from` blocks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,14 +102,68 @@ impl Coverage {
         self.pending.map_or(0, Span::blocks)
     }
 
-    /// The proven share of the whole known chain, headers included.
+    /// The proven share of the whole known chain, measured by `ruler`.
     #[must_use]
-    pub fn proven_share(&self) -> f64 {
+    pub fn proven_share(&self, ruler: &Ruler) -> f64 {
+        self.proven.iter().map(|s| ruler.width(*s)).sum()
+    }
+
+    #[must_use]
+    pub fn assumed_share(&self, ruler: &Ruler) -> f64 {
+        self.assumed.map_or(0.0, |s| ruler.width(s))
+    }
+
+    #[must_use]
+    pub fn pending_share(&self, ruler: &Ruler) -> f64 {
+        self.pending.map_or(0.0, |s| ruler.width(s))
+    }
+}
+
+/// How the ribbon measures the chain.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum Scale {
+    #[default]
+    Blocks,
+    Work,
+}
+
+/// Maps heights onto `0..=1` along the ribbon.
+pub struct Ruler<'a> {
+    top: u32,
+    curve: Option<(&'a ChainCurve, f64)>,
+}
+
+impl<'a> Ruler<'a> {
+    /// By work only when the curve can measure it; blocks otherwise.
+    #[must_use]
+    pub fn new(top: u32, scale: Scale, curve: &'a ChainCurve) -> Self {
+        let curve = (scale == Scale::Work)
+            .then(|| curve.work_at(top).map(|total| (curve, total)))
+            .flatten()
+            .filter(|(_, total)| *total > 0.0);
+        Self { top, curve }
+    }
+
+    #[must_use]
+    pub fn by_work(&self) -> bool {
+        self.curve.is_some()
+    }
+
+    #[must_use]
+    pub fn at(&self, height: u32) -> f64 {
         if self.top == 0 {
-            0.0
-        } else {
-            f64::from(self.proven_blocks()) / f64::from(self.top)
+            return 0.0;
         }
+        match self.curve {
+            Some((curve, total)) => curve.work_at(height).map_or(0.0, |w| w / total),
+            None => f64::from(height) / f64::from(self.top),
+        }
+        .clamp(0.0, 1.0)
+    }
+
+    #[must_use]
+    pub fn width(&self, span: Span) -> f64 {
+        self.at(span.to) - self.at(span.from)
     }
 }
 
@@ -111,18 +172,29 @@ pub struct Options {
     pub band: f32,
     /// Label the halvings under the band (they are always notched).
     pub halvings: bool,
+    /// A calendar ruler above the band.
+    pub years: bool,
+    pub scale: Scale,
     /// Progress `0..1` of the new-block pulse at the tip, if one is running.
     pub pulse: Option<f32>,
 }
 
-pub fn show(ui: &mut Ui, trust: &TrustView, opts: &Options) -> Response {
+pub fn show(ui: &mut Ui, trust: &TrustView, curve: &ChainCurve, opts: &Options) -> Response {
     let pal = Palette::of(ui.ctx());
     let cov = Coverage::of(trust);
+    let ruler = Ruler::new(cov.top, opts.scale, curve);
     let width = ui.available_width();
+    let years_row = if opts.years && !curve.is_empty() {
+        YEAR_ROW
+    } else {
+        0.0
+    };
     let axis_rows = 2.0 * 17.0;
-    let (rect, resp) =
-        ui.allocate_exact_size(vec2(width, opts.band + 12.0 + axis_rows), Sense::hover());
-    let band = Rect::from_min_size(rect.min, vec2(width, opts.band));
+    let (rect, resp) = ui.allocate_exact_size(
+        vec2(width, years_row + opts.band + 12.0 + axis_rows),
+        Sense::hover(),
+    );
+    let band = Rect::from_min_size(rect.min + vec2(0.0, years_row), vec2(width, opts.band));
     let p = ui.painter();
     p.rect(
         band,
@@ -134,7 +206,7 @@ pub fn show(ui: &mut Ui, trust: &TrustView, opts: &Options) -> Response {
     if cov.top == 0 {
         return resp;
     }
-    let x = |h: u32| band.left() + band.width() * (f64::from(h) / f64::from(cov.top)) as f32;
+    let x = |h: u32| band.left() + band.width() * ruler.at(h) as f32;
     // A segment's rect, at least `min` wide so a sliver stays visible.
     let seg = |span: Span, min: f32| {
         let (mut l, mut r) = (x(span.from), x(span.to));
@@ -197,9 +269,13 @@ pub fn show(ui: &mut Ui, trust: &TrustView, opts: &Options) -> Response {
             Stroke::new(0.5 + 2.0 * fade, pal.signal.gamma_multiply(fade)),
         );
     }
+    if years_row > 0.0 {
+        year_ruler(ui, curve, band, &x, &pal);
+    }
 
     // Axis labels: two rows under the band, placed by priority, skipped
     // when there's no room rather than overlapping.
+    let p = ui.painter();
     let mut marks: Vec<(f32, String, Color32, Option<bool>)> = vec![
         (band.left(), "genesis".into(), pal.muted, Some(false)),
         (
@@ -264,13 +340,51 @@ pub fn show(ui: &mut Ui, trust: &TrustView, opts: &Options) -> Response {
     resp
 }
 
-/// Swatches with counts, for whichever states the chain is in.
-pub fn legend(ui: &mut Ui, trust: &TrustView) {
+/// Years along the top edge, wherever there's room for them.
+fn year_ruler(ui: &Ui, curve: &ChainCurve, band: Rect, x: &dyn Fn(u32) -> f32, pal: &Palette) {
+    let (Some(first), Some(tip)) = (curve.time_at(0), curve.tip()) else {
+        return;
+    };
+    let p = ui.painter();
+    let (from, _) = year_month(first as i64);
+    let (to, _) = year_month(i64::from(tip.time));
+    let mut last_right = f32::NEG_INFINITY;
+    for year in from + 1..=to {
+        let Some(h) = curve.height_at_time(year_start(year) as f64) else {
+            continue;
+        };
+        let mx = x(h.round() as u32);
+        let galley = p.layout_no_wrap(year.to_string(), mono(10.5), pal.faint);
+        let left = mx - galley.size().x / 2.0;
+        if left < last_right + 10.0 || left + galley.size().x > band.right() {
+            continue;
+        }
+        p.vline(
+            mx,
+            (band.top() - 5.0)..=(band.top() - 1.0),
+            Stroke::new(1.0, pal.hairline),
+        );
+        let top = band.top() - YEAR_ROW;
+        last_right = left + galley.size().x;
+        p.galley(pos2(left, top), galley, pal.faint);
+    }
+}
+
+/// Swatches with measures, for whichever states the chain is in: block
+/// counts by blocks, shares of the chain's work by work.
+pub fn legend(ui: &mut Ui, trust: &TrustView, ruler: &Ruler) {
     let pal = Palette::of(ui.ctx());
     let cov = Coverage::of(trust);
+    let measure = |blocks: u32, share: f64| {
+        if ruler.by_work() {
+            percent(share)
+        } else {
+            thousands(blocks.into())
+        }
+    };
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 7.0;
-        let item = |ui: &mut Ui, kind: u8, text: &str, count: u32| {
+        let item = |ui: &mut Ui, kind: u8, text: &str, value: String| {
             let (r, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
             let p = ui.painter();
             match kind {
@@ -292,21 +406,41 @@ pub fn legend(ui: &mut Ui, trust: &TrustView) {
                 }
             }
             ui.label(RichText::new(text).size(13.0).color(pal.text));
-            ui.label(
-                RichText::new(thousands(count.into()))
-                    .font(mono(12.5))
-                    .color(pal.muted),
-            );
+            ui.label(RichText::new(value).font(mono(12.5)).color(pal.muted));
             ui.add_space(16.0);
         };
-        item(ui, 0, "Proven here", cov.proven_blocks());
+        item(
+            ui,
+            0,
+            "Proven here",
+            measure(cov.proven_blocks(), cov.proven_share(ruler)),
+        );
         if cov.assumed_blocks() > 0 {
-            item(ui, 1, "Assumed from the snapshot", cov.assumed_blocks());
+            item(
+                ui,
+                1,
+                "Assumed from the snapshot",
+                measure(cov.assumed_blocks(), cov.assumed_share(ruler)),
+            );
         }
         if cov.pending_blocks() > 0 {
-            item(ui, 2, "Headers only", cov.pending_blocks());
+            item(
+                ui,
+                2,
+                "Headers only",
+                measure(cov.pending_blocks(), cov.pending_share(ruler)),
+            );
         }
     });
+}
+
+/// Blocks or work: the ribbon's ruler.
+pub fn scale_toggle(ui: &mut Ui, scale: &mut Scale) -> bool {
+    widgets::segmented(
+        ui,
+        scale,
+        &[(Scale::Blocks, "By blocks"), (Scale::Work, "By work")],
+    )
 }
 
 /// A thin progress bar in the ribbon's own language.
@@ -326,7 +460,7 @@ pub fn replay_bar(ui: &mut Ui, done: u32, of: u32, width: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SnapshotView;
+    use crate::model::{CurvePoint, SnapshotView};
 
     fn trust(connected: u32, headers: u32, snapshot: Option<(u32, u32, bool)>) -> TrustView {
         TrustView {
@@ -356,12 +490,14 @@ mod tests {
 
     #[test]
     fn a_proven_snapshot_or_none_is_all_proven() {
+        let flat = ChainCurve::default();
         for snap in [None, Some((910_000, 910_000, true))] {
             let c = Coverage::of(&trust(935_184, 935_184, snap));
             assert_eq!(c.proven_blocks(), 935_184);
             assert_eq!(c.assumed, None);
             assert_eq!(c.pending, None);
-            assert!((c.proven_share() - 1.0).abs() < 1e-12);
+            let ruler = Ruler::new(c.top, Scale::Blocks, &flat);
+            assert!((c.proven_share(&ruler) - 1.0).abs() < 1e-12);
         }
     }
 
@@ -382,6 +518,41 @@ mod tests {
                 to: 935_186
             })
         );
-        assert_eq!(Coverage::of(&trust(0, 0, None)).proven_share(), 0.0);
+        let flat = ChainCurve::default();
+        let empty = Coverage::of(&trust(0, 0, None));
+        assert_eq!(
+            empty.proven_share(&Ruler::new(0, Scale::Blocks, &flat)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn the_work_ruler_weighs_heavy_blocks_more() {
+        // Blocks 0..100 carry 1 each, 100..200 carry 9 each.
+        let curve = ChainCurve::new(vec![
+            CurvePoint {
+                height: 0,
+                work: 0.0,
+                time: 0,
+            },
+            CurvePoint {
+                height: 100,
+                work: 100.0,
+                time: 100,
+            },
+            CurvePoint {
+                height: 200,
+                work: 1_000.0,
+                time: 200,
+            },
+        ]);
+        let c = Coverage::of(&trust(100, 200, None));
+        let blocks = Ruler::new(c.top, Scale::Blocks, &curve);
+        let work = Ruler::new(c.top, Scale::Work, &curve);
+        assert!(work.by_work() && !blocks.by_work());
+        assert!((c.proven_share(&blocks) - 0.5).abs() < 1e-12);
+        assert!((c.proven_share(&work) - 0.1).abs() < 1e-12);
+        // Without a curve, "by work" falls back to blocks.
+        assert!(!Ruler::new(c.top, Scale::Work, &ChainCurve::default()).by_work());
     }
 }

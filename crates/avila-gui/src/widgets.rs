@@ -206,6 +206,12 @@ fn focus_ring(ui: &Ui, resp: &Response, rect: Rect, radius: u8) {
 /// A reading like `3 h 12 min ago` or `23,266 transactions`: numerals in
 /// the display face, words small beside them, all on one baseline.
 pub fn figure(ui: &mut Ui, value: &str, unit: &str, size: f32) -> Response {
+    let ink = Palette::of(ui.ctx()).text;
+    figure_in(ui, value, unit, size, ink)
+}
+
+/// [`figure`] with its numerals in `ink`.
+pub fn figure_in(ui: &mut Ui, value: &str, unit: &str, size: f32, ink: Color32) -> Response {
     let pal = Palette::of(ui.ctx());
     let numeral = |c: char| c.is_ascii_digit() || ",.%—".contains(c);
     let any_numeral = value.chars().any(numeral);
@@ -224,7 +230,7 @@ pub fn figure(ui: &mut Ui, value: &str, unit: &str, size: f32) -> Response {
         .into_iter()
         .map(|(text, big)| {
             let (f, color) = if big {
-                (font(theme::DISPLAY, size), pal.text)
+                (font(theme::DISPLAY, size), ink)
             } else {
                 (
                     egui::FontId::proportional((size * 0.4).max(13.0)),
@@ -396,11 +402,19 @@ pub fn table_header(ui: &mut Ui, cols: &[Col]) -> Vec<egui::Rangef> {
     ranges
 }
 
-/// A table row, with a hairline under it.
-pub fn table_row(ui: &mut Ui, height: f32) -> Rect {
+/// A clickable table row with a hairline under it; the selected row
+/// carries a mark at its left edge.
+pub fn table_row(ui: &mut Ui, height: f32, selected: bool) -> (Rect, Response) {
     let pal = Palette::of(ui.ctx());
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
-    if resp.hovered() {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
+    if selected {
+        ui.painter().rect_filled(rect, 0, pal.well);
+        ui.painter().vline(
+            rect.left() + 1.0,
+            rect.y_range(),
+            Stroke::new(2.0, pal.text),
+        );
+    } else if resp.hovered() {
         ui.painter()
             .rect_filled(rect, 0, pal.well.gamma_multiply(0.6));
     }
@@ -409,7 +423,7 @@ pub fn table_row(ui: &mut Ui, height: f32) -> Rect {
         rect.bottom() - 0.5,
         Stroke::new(1.0, pal.hairline.gamma_multiply(0.6)),
     );
-    rect
+    (rect, resp.on_hover_cursor(CursorIcon::PointingHand))
 }
 
 /// Single-line text that fits `width`, elided with an ellipsis.

@@ -1,7 +1,9 @@
 mod app;
 mod brand;
 mod capture;
+mod constellation;
 mod demo;
+mod fingerprint;
 mod model;
 mod pages;
 mod prefs;

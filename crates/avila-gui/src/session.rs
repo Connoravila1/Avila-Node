@@ -290,14 +290,7 @@ impl Session {
             self.sim = Some(sim);
             return;
         }
-        use avila_consensus::params::Network as Net;
-        let params = match network {
-            avila_core::Network::Mainnet => Net::Mainnet,
-            avila_core::Network::Testnet4 => Net::Testnet4,
-            avila_core::Network::Signet => Net::Signet,
-            avila_core::Network::Regtest => Net::Regtest,
-        }
-        .params();
+        let params = params(network);
         let cancel = Arc::new(AtomicBool::new(false));
         let cfg = SyncConfig {
             connect: settings.connect_addrs(),
@@ -623,6 +616,19 @@ impl Session {
     pub fn series(&self, field: impl Fn(&Sample) -> f64) -> Vec<f64> {
         self.history.iter().map(field).collect()
     }
+}
+
+/// Consensus parameters for `network`.
+#[must_use]
+pub fn params(network: avila_core::Network) -> avila_consensus::params::Params {
+    use avila_consensus::params::Network as Net;
+    match network {
+        avila_core::Network::Mainnet => Net::Mainnet,
+        avila_core::Network::Testnet4 => Net::Testnet4,
+        avila_core::Network::Signet => Net::Signet,
+        avila_core::Network::Regtest => Net::Regtest,
+    }
+    .params()
 }
 
 /// What a person would call a peer: its address, else its software.

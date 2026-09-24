@@ -1,10 +1,14 @@
 //! `--demo`: a simulated mainnet node, for previewing every screen
 //! without touching the network. Everything it shows is invented except
-//! the snapshot parameters, and the interface labels it wherever it
-//! appears. The state is a pure function of time since the simulated
-//! launch, so screenshots are reproducible.
+//! the snapshot parameters (and the difficulty history is approximate),
+//! and the interface labels it wherever it appears. The state is a pure
+//! function of time since the simulated launch, so screenshots are
+//! reproducible.
 
-use crate::model::{NodeView, PeerView, SnapshotView, TrustView};
+use crate::model::{
+    ChainCurve, CurvePoint, NextBlockView, NodeView, PeerView, Purpose, SnapshotView, Traffic,
+    TrustView,
+};
 
 /// Mainnet's assumeutxo snapshot at 910,000, as pinned in chainparams.
 const BASE: u32 = 910_000;
@@ -22,6 +26,7 @@ const REPLAY_PER_SEC: f64 = 250.0;
 const BLOCK_MEAN: f64 = 28.0;
 /// A block's body lands this long after its header.
 const BODY_LAG: f64 = 1.4;
+const PERIOD: u32 = 2016;
 const AGENTS: [&str; 6] = [
     "/Satoshi:29.0.0/",
     "/Satoshi:28.1.0/",
@@ -29,6 +34,45 @@ const AGENTS: [&str; 6] = [
     "/Satoshi:27.1.0/",
     "/Satoshi:29.1.0/",
     "/Satoshi:26.2.0/",
+];
+
+/// Approximate mainnet difficulty at a few heights; between them the
+/// simulation interpolates geometrically.
+const DIFFICULTY: [(u32, f64); 20] = [
+    (0, 1.0),
+    (50_000, 1.0e3),
+    (100_000, 1.45e4),
+    (150_000, 1.47e6),
+    (200_000, 2.86e6),
+    (250_000, 5.0e7),
+    (300_000, 8.85e9),
+    (350_000, 4.94e10),
+    (400_000, 1.63e11),
+    (450_000, 3.37e11),
+    (500_000, 1.87e12),
+    (550_000, 7.18e12),
+    (600_000, 1.30e13),
+    (650_000, 1.93e13),
+    (700_000, 1.84e13),
+    (750_000, 2.84e13),
+    (800_000, 5.39e13),
+    (850_000, 8.37e13),
+    (900_000, 1.26e14),
+    (940_000, 1.44e14),
+];
+
+/// Approximate block timestamps at a few heights; linear between.
+const TIMES: [(u32, u32); 10] = [
+    (0, 1_231_006_505),
+    (100_000, 1_293_623_863),
+    (200_000, 1_348_310_759),
+    (300_000, 1_399_703_554),
+    (400_000, 1_456_417_484),
+    (500_000, 1_513_622_125),
+    (600_000, 1_571_443_461),
+    (700_000, 1_631_333_672),
+    (800_000, 1_690_168_629),
+    (900_000, 1_747_800_000),
 ];
 
 /// SplitMix64: cheap, well-mixed, deterministic.
@@ -44,18 +88,43 @@ fn unit(x: u64) -> f64 {
     (mix(x) >> 11) as f64 / (1_u64 << 53) as f64
 }
 
+fn difficulty(height: u32) -> f64 {
+    let i = DIFFICULTY.partition_point(|(h, _)| *h <= height);
+    let (h0, d0) = DIFFICULTY[i.saturating_sub(1)];
+    let Some(&(h1, d1)) = DIFFICULTY.get(i) else {
+        return d0;
+    };
+    let f = f64::from(height - h0) / f64::from(h1 - h0);
+    (d0.ln() + (d1.ln() - d0.ln()) * f).exp()
+}
+
+/// Header time: the table up to 900,000, then just under ten minutes a
+/// block (hashrate still climbing), whatever the preview's own pace.
+fn header_time(height: u32) -> u32 {
+    let i = TIMES.partition_point(|(h, _)| *h <= height);
+    let (h0, t0) = TIMES[i.saturating_sub(1)];
+    match TIMES.get(i) {
+        Some(&(h1, t1)) => {
+            t0 + ((u64::from(t1 - t0) * u64::from(height - h0)) / u64::from(h1 - h0)) as u32
+        }
+        None => t0 + (height - h0) * 588,
+    }
+}
+
 pub struct Demo {
     /// Session time of the simulated launch.
     start: f64,
     /// Header arrival times, seconds after launch.
     arrivals: Vec<f64>,
+    /// Chainwork and time at every period boundary up to the far future.
+    boundaries: Vec<CurvePoint>,
 }
 
 impl Demo {
     #[must_use]
     pub fn new(start: f64) -> Self {
         let mut t = 0.0;
-        let arrivals = (0..8192_u64)
+        let arrivals: Vec<f64> = (0..8192_u64)
             .map(|i| {
                 // Exponential gaps, clipped so no gap is absurd.
                 let u = unit(i ^ 0xB10C).clamp(0.05, 0.95);
@@ -63,16 +132,59 @@ impl Demo {
                 t
             })
             .collect();
-        Self { start, arrivals }
+        let last = LAUNCH_HEADERS + arrivals.len() as u32;
+        let mut work = 0.0;
+        let mut boundaries = Vec::new();
+        let mut h = 0;
+        while h <= last {
+            boundaries.push(CurvePoint {
+                height: h,
+                work,
+                time: header_time(h),
+            });
+            // Each period's blocks all carry that period's difficulty.
+            work += f64::from(PERIOD) * difficulty(h) * 4_294_967_296.0;
+            h += PERIOD;
+        }
+        Self {
+            start,
+            arrivals,
+            boundaries,
+        }
     }
 
     fn headers_at(&self, e: f64) -> u32 {
         LAUNCH_HEADERS + self.arrivals.partition_point(|a| *a <= e) as u32
     }
 
+    fn arrived_at(&self, height: u32) -> Option<f64> {
+        let i = height.checked_sub(LAUNCH_HEADERS + 1)?;
+        self.arrivals.get(i as usize).copied()
+    }
+
     fn last_arrival(&self, e: f64) -> f64 {
         let n = self.arrivals.partition_point(|a| *a <= e);
         n.checked_sub(1).map_or(0.0, |i| self.arrivals[i])
+    }
+
+    fn curve(&self, headers: u32) -> ChainCurve {
+        let mut points: Vec<CurvePoint> = self
+            .boundaries
+            .iter()
+            .take_while(|p| p.height <= headers)
+            .copied()
+            .collect();
+        if let Some(last) = points.last().copied()
+            && last.height < headers
+        {
+            points.push(CurvePoint {
+                height: headers,
+                work: last.work
+                    + f64::from(headers - last.height) * difficulty(last.height) * 4_294_967_296.0,
+                time: header_time(headers),
+            });
+        }
+        ChainCurve::new(points)
     }
 
     #[must_use]
@@ -85,7 +197,7 @@ impl Demo {
 
         let peers: Vec<PeerView> = seats(e)
             .into_iter()
-            .map(|seat| self.peer(seat, e))
+            .map(|seat| self.peer(seat, e, connected))
             .collect();
         let replayed = (REPLAY_FROM + (e * REPLAY_PER_SEC) as u32).min(BASE);
         let since_block = e - self.last_arrival(e);
@@ -116,26 +228,35 @@ impl Demo {
                 // replay reached, is proven.
                 verified_fraction: f64::from(connected - BASE + replayed) / f64::from(connected),
             },
+            curve: self.curve(headers),
+            next_block: Some(next_block(connected + 1, e, since_block)),
         }
     }
 
-    fn peer(&self, seat: Seat, e: f64) -> PeerView {
+    /// Which long-lived outbound peer delivered block `height` first.
+    fn deliverer(height: u32) -> u64 {
+        1 + mix(u64::from(height) ^ 0xDE11) % 6
+    }
+
+    fn peer(&self, seat: Seat, e: f64, connected: u32) -> PeerView {
         let id = seat.id;
         let r = |k: u64| mix(id.wrapping_mul(0x1F3D) ^ k);
         // Erlay needs both sides to run it: here, other copies of this node.
         let recon = id % 5 == 2;
+        let v2 = recon || !id.is_multiple_of(3);
         let port = if seat.inbound {
             40_000 + r(9) % 20_000
         } else {
             8333
         };
-        // Distinct last octets for every seat (29 is coprime to 240).
-        let octet = 10 + (id * 29) % 240;
-        let addr = match r(1) % 4 {
-            0 => format!("203.0.113.{octet}:{port}"),
-            1 => format!("198.51.100.{octet}:{port}"),
-            2 => format!("192.0.2.{octet}:{port}"),
-            _ => format!("[2001:db8:{:x}::{:x}]:{port}", r(2) % 0xffff, r(3) % 0xffff),
+        // Addresses from the shared address space (100.64.0.0/10), which
+        // belongs to no one on the internet: every outbound peer in its
+        // own /16, and the two inbound peers sharing one.
+        let group = if seat.inbound { 87 } else { 64 + (id * 7) % 64 };
+        let addr = if id == 4 {
+            format!("[2001:db8:{:x}::{:x}]:{port}", r(2) % 0xffff, r(3) % 0xffff)
+        } else {
+            format!("100.{group}.{}.{}:{port}", r(2) % 256, 1 + r(3) % 254)
         };
         let agent = if recon {
             "/Avila:0.1.0/"
@@ -148,6 +269,18 @@ impl Demo {
         let blocks = (age / BLOCK_MEAN) as usize + if id <= 6 { 7 } else { 0 };
         let rate_in = 1_500.0 + (r(7) % 22_000) as f64;
         let rate_out = 900.0 + (r(8) % 9_000) as f64;
+        let bytes_recv = (rate_in * age) as u64 + blocks as u64 * 1_650_000;
+        let bytes_sent = (rate_out * age) as u64;
+        let last_block = (connected.saturating_sub(60)..=connected).rev().find(|h| {
+            Self::deliverer(*h) == id && self.arrived_at(*h).is_none_or(|at| at >= seat.joined)
+        });
+        let session_id = v2.then(|| {
+            let mut b = [0_u8; 32];
+            for (i, chunk) in b.chunks_mut(8).enumerate() {
+                chunk.copy_from_slice(&mix(id ^ (0x5E55 << 8) ^ i as u64).to_le_bytes());
+            }
+            b
+        });
         PeerView {
             id,
             addr: Some(addr),
@@ -155,14 +288,105 @@ impl Demo {
             established: true,
             agent: Some(agent.into()),
             their_height: Some(self.headers_at(seat.joined.max(0.0)) as i32),
-            v2: recon || !id.is_multiple_of(3),
+            v2,
             recon,
             ping_ms: Some(ping),
+            ping_min_ms: Some(base_ping * 0.9),
             blocks_served: blocks,
             connected_secs: age as u64,
-            bytes_sent: (rate_out * age) as u64,
-            bytes_recv: (rate_in * age) as u64 + blocks as u64 * 1_650_000,
+            bytes_sent,
+            bytes_recv,
+            session_id,
+            traffic: traffic(bytes_recv, bytes_sent, recon, seat.inbound),
+            last_block: if seat.inbound { None } else { last_block },
+            services: 1 | 8 | 1024 | if v2 { 2048 } else { 0 } | if id % 4 == 1 { 64 } else { 0 },
         }
+    }
+}
+
+/// Splits a connection's totals by purpose in plausible proportions. An
+/// Erlay link announces far less and reconciles instead.
+fn traffic(recv: u64, sent: u64, recon: bool, inbound: bool) -> Traffic {
+    use Purpose as P;
+    let recv_share: [(P, f64); 6] = if recon {
+        [
+            (P::Blocks, 0.80),
+            (P::Headers, 0.01),
+            (P::Transactions, 0.15),
+            (P::Announcements, 0.012),
+            (P::Reconciliation, 0.018),
+            (P::Addresses, 0.004),
+        ]
+    } else {
+        [
+            (P::Blocks, 0.78),
+            (P::Headers, 0.01),
+            (P::Transactions, 0.14),
+            (P::Announcements, 0.055),
+            (P::Reconciliation, 0.0),
+            (P::Addresses, 0.004),
+        ]
+    };
+    let serving = if inbound { 0.40 } else { 0.04 };
+    let sent_share: [(P, f64); 6] = if recon {
+        [
+            (P::Blocks, serving),
+            (P::Headers, 0.03),
+            (P::Transactions, 0.55 - serving),
+            (P::Announcements, 0.12),
+            (P::Reconciliation, 0.08),
+            (P::Addresses, 0.01),
+        ]
+    } else {
+        [
+            (P::Blocks, serving),
+            (P::Headers, 0.03),
+            (P::Transactions, 0.45 - serving),
+            (P::Announcements, 0.40),
+            (P::Reconciliation, 0.0),
+            (P::Addresses, 0.01),
+        ]
+    };
+    let split = |total: u64, shares: &[(P, f64); 6]| {
+        let mut out = [0_u64; Purpose::COUNT];
+        for (p, s) in shares {
+            out[*p as usize] = (total as f64 * s) as u64;
+        }
+        let assigned: u64 = out.iter().sum();
+        out[P::Upkeep as usize] = total.saturating_sub(assigned);
+        out
+    };
+    Traffic {
+        recv: split(recv, &recv_share),
+        sent: split(sent, &sent_share),
+    }
+}
+
+/// The block the simulated mempool would build: a fee staircase that
+/// drops fast from the eager few to the long patient tail.
+fn next_block(height: u32, e: f64, since_block: f64) -> NextBlockView {
+    let top = 38.0 + 10.0 * (e / 97.0).sin() + since_block.min(120.0) * 0.08;
+    let floor = 1.3 + 0.3 * (e / 211.0).sin();
+    let full = 997_800.0;
+    let n = 96;
+    let mut steps = Vec::with_capacity(n);
+    let mut fees = 0.0;
+    let mut prev = 0.0;
+    for i in 0..n {
+        let x = (i + 1) as f64 / n as f64;
+        let rate = floor + (top - floor) * (1.0 - x + 0.5 / n as f64).powi(8);
+        let vsize = full * x;
+        fees += rate * (vsize - prev);
+        prev = vsize;
+        steps.push((vsize as u32, rate));
+    }
+    NextBlockView {
+        height,
+        tx_count: 3_180 + (e as usize / 13) % 240,
+        weight: (full * 4.0) as usize + 1_000,
+        fees: fees as i64,
+        subsidy: 312_500_000,
+        steps: steps.into(),
     }
 }
 
@@ -273,8 +497,39 @@ mod tests {
         };
         assert!(ids(600.0).len() >= 9);
         assert_ne!(ids(600.0), ids(800.0));
-        assert!(demo.view_at(600.0).peers.iter().any(|p| p.recon));
-        assert!(demo.view_at(600.0).peers.iter().any(|p| !p.v2));
+        let v = demo.view_at(600.0);
+        assert!(v.peers.iter().any(|p| p.recon));
+        assert!(v.peers.iter().any(|p| !p.v2));
+        // Someone delivered the tip, and traffic adds up.
+        assert!(v.peers.iter().any(|p| p.last_block == Some(v.connected)));
+        for p in &v.peers {
+            assert_eq!(p.traffic.total_recv(), p.bytes_recv);
+            assert_eq!(p.traffic.total_sent(), p.bytes_sent);
+            assert_eq!(p.session_id.is_some(), p.v2);
+        }
+    }
+
+    #[test]
+    fn work_concentrates_in_recent_blocks() {
+        let demo = Demo::new(0.0);
+        let v = demo.view_at(600.0);
+        let total = v.curve.work_at(v.headers).expect("curve");
+        let before_2020 = v.curve.work_at(612_000).expect("curve");
+        // Two-thirds of the blocks, a small share of the work.
+        assert!(before_2020 / total < 0.1, "{}", before_2020 / total);
+        let year = crate::model::year_month(v.curve.time_at(612_000).expect("time") as i64).0;
+        assert_eq!(year, 2020);
+    }
+
+    #[test]
+    fn next_block_is_a_descending_staircase() {
+        let b = next_block(935_185, 600.0, 30.0);
+        assert!(
+            b.steps
+                .windows(2)
+                .all(|w| w[0].1 >= w[1].1 && w[0].0 < w[1].0)
+        );
+        assert!(b.fees > 1_000_000 && b.fees < 20_000_000, "{}", b.fees);
     }
 
     #[test]

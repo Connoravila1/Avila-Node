@@ -1,5 +1,6 @@
 //! What the interface remembers between launches: appearance only.
 
+use crate::ribbon::Scale;
 use clap::ValueEnum;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,9 @@ pub struct Prefs {
     pub theme: ThemeChoice,
     /// Interface scale, one of [`Prefs::SIZES`].
     pub size: f32,
+    /// How the Trust Ribbon measures the chain.
+    #[serde(default)]
+    pub scale: Scale,
 }
 
 impl Default for Prefs {
@@ -28,6 +32,7 @@ impl Default for Prefs {
         Self {
             theme: ThemeChoice::System,
             size: 1.0,
+            scale: Scale::Blocks,
         }
     }
 }
@@ -98,17 +103,25 @@ mod tests {
         let prefs = Prefs {
             theme: ThemeChoice::Dark,
             size: 1.12,
+            scale: Scale::Work,
         };
         prefs.save(&mut storage);
         assert_eq!(
             Prefs::load(Some(&storage)),
             Prefs {
                 theme: ThemeChoice::Dark,
-                size: 1.15
+                size: 1.15,
+                scale: Scale::Work,
             }
         );
         assert_eq!(storage.0.len(), 1);
         assert_eq!(Prefs::load(None), Prefs::default());
+        // Prefs saved before the ribbon had a scale still load.
+        storage
+            .0
+            .insert(KEY.into(), "(theme:light,size:1.0)".into());
+        assert_eq!(Prefs::load(Some(&storage)).scale, Scale::Blocks);
+        assert_eq!(Prefs::load(Some(&storage)).theme, ThemeChoice::Light);
         storage.0.insert(KEY.into(), "not json".into());
         assert_eq!(Prefs::load(Some(&storage)), Prefs::default());
     }
