@@ -1137,30 +1137,33 @@ impl Chainstate {
     /// # Errors
     ///
     /// `SnapshotError` with Core's exact messages.
-    pub fn activate_snapshot<R: std::io::Read>(
-        &mut self,
-        r: &mut R,
+    /// [`Self::activate_snapshot`] and [`Self::activate_snapshot_overlay`]
+    /// share the same `ActivateSnapshot` guard sequence: table lookup,
+    /// header membership, best-chain containment, mempool emptiness,
+    /// and the work comparison.
+    fn check_snapshot_activation(
+        &self,
         meta: &crate::utxo_snapshot::SnapshotMetadata,
         mempool_nonempty: bool,
-    ) -> Result<u32, crate::utxo_snapshot::SnapshotError> {
+    ) -> Result<(BlockHash, u32, crate::params::AssumeutxoData), crate::utxo_snapshot::SnapshotError> {
         use crate::utxo_snapshot::SnapshotError;
         let params = *self.tree.params();
         let base = meta.base_blockhash;
         let base_display = base.to_string();
 
-        // ActivateSnapshot's checks, in order.
         if self.snapshot_base.is_some() {
             return Err(SnapshotError(
                 "Can't activate a snapshot-based chainstate more than once".to_string(),
             ));
         }
-        let Some(au_data) = params.assumeutxo_data.iter().find(|d| {
+        let known_base = params.assumeutxo_data.iter().any(|d| {
             std::str::FromStr::from_str(d.blockhash)
                 .ok()
                 .as_ref()
                 .map(|h: &BlockHash| h.as_bytes() == base.as_bytes())
                 .unwrap_or(false)
-        }) else {
+        });
+        if !known_base {
             let heights = params
                 .assumeutxo_data
                 .iter()
@@ -1170,7 +1173,7 @@ impl Chainstate {
             return Err(SnapshotError(format!(
                 "assumeutxo block hash in snapshot metadata not recognized (hash: {base_display}). The following snapshot heights are available: {heights}"
             )));
-        };
+        }
         let Some(start) = self.tree.get(&base) else {
             return Err(SnapshotError(format!(
                 "The base block header ({base_display}) must appear in the headers chain. Make sure all headers are syncing, and call loadtxoutset again"
@@ -1200,9 +1203,6 @@ impl Chainstate {
             ));
         }
 
-        // PopulateAndValidateSnapshot: the height-keyed table lookup is
-        // a duplicate of the blockhash one here (the table is keyed on
-        // both consistently), then the work comparison Core repeats.
         let Some(au_by_height) = params
             .assumeutxo_data
             .iter()
@@ -1222,6 +1222,152 @@ impl Chainstate {
                 "Work does not exceed active chainstate".to_string(),
             ));
         }
+        Ok((base, base_height, *au_by_height))
+    }
+
+    /// The post-verification commit shared by both activation paths:
+    /// adopt `utxo` as the working set, re-anchor the connected chain
+    /// at the snapshot base, arm background validation, and flush.
+    fn commit_activated_snapshot(
+        &mut self,
+        utxo: UtxoSet,
+        base: BlockHash,
+        base_height: u32,
+        au_n_chain_tx: u64,
+    ) -> Result<(), crate::utxo_snapshot::SnapshotError> {
+        use crate::utxo_snapshot::SnapshotError;
+        let params = *self.tree.params();
+        let mut chain = Vec::with_capacity(base_height as usize + 1);
+        let mut cursor = base;
+        loop {
+            chain.push(cursor);
+            if cursor == params.genesis_header.hash() {
+                break;
+            }
+            cursor = self
+                .tree
+                .get(&cursor)
+                .map(|n| n.header.prev_block_hash)
+                .ok_or_else(|| {
+                    SnapshotError("snapshot base header chain is incomplete".to_string())
+                })?;
+        }
+        chain.reverse();
+        self.utxo = utxo;
+        self.chain = chain;
+        self.undos = if self.coins_backend.is_some() {
+            Vec::new()
+        } else {
+            vec![BlockUndo::default(); base_height as usize]
+        };
+        self.connected = base;
+        self.snapshot_base = Some(base_height);
+        self.background = Some(BackgroundValidation {
+            utxo: UtxoSet::new(),
+            next: 1,
+            pool: None,
+            pending: std::collections::VecDeque::new(),
+        });
+        self.snapshot_verified = false;
+        self.precious = None;
+        self.tree.apply_tx_meta(&base, 0, au_n_chain_tx);
+        if let Some(index) = &mut self.filterindex {
+            index.reset_to_snapshot();
+        }
+        if let Some(index) = &mut self.scripthashindex {
+            index.reset_to_snapshot();
+        }
+        if self.store.is_some() {
+            self.flush()
+                .map_err(|e| SnapshotError(format!("snapshot flush: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Overlay activation — the differentiated path: stream the
+    /// Core-format snapshot file once to verify `AssumeutxoHash` (no
+    /// materialization — `coinstats::compute` collects the whole set),
+    /// index it in place, and attach it as the UtxoSet's lowest read
+    /// layer. Zero imported bytes; the file stays the canonical
+    /// read-only base forever.
+    pub fn activate_snapshot_overlay(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+        meta: &crate::utxo_snapshot::SnapshotMetadata,
+        mempool_nonempty: bool,
+    ) -> Result<u32, crate::utxo_snapshot::SnapshotError> {
+        use crate::utxo_snapshot::SnapshotError;
+        let (base, base_height, au) =
+            self.check_snapshot_activation(meta, mempool_nonempty)?;
+
+        // Verify pass — one sequential read feeding the commitment
+        // hasher in file order (the file's cursor order IS the
+        // hash_serialized order; a mis-ordered file just won't match).
+        let mut file = std::fs::File::open(&path).map_err(|e| {
+            SnapshotError(format!("snapshot open {}: {e}", path.as_ref().display()))
+        })?;
+        // The coins stream starts after the metadata header — the
+        // indexer parses it itself, the hasher must skip it.
+        let params = *self.tree.params();
+        let _ = crate::utxo_snapshot::read_metadata(&mut file, params.message_start)
+            .map_err(|e| SnapshotError(format!("snapshot header: {e:?}")))?;
+        let stats = crate::coinstats::compute_streaming(
+            {
+                let (tx, rx) = std::sync::mpsc::sync_channel(4096);
+                let count = meta.coins_count;
+                let bh = base_height;
+                std::thread::spawn(move || {
+                    let _ = crate::utxo_snapshot::read_coins(&mut file, count, bh, |op, coin| {
+                        let _ = tx.send((op, coin));
+                    });
+                });
+                rx.into_iter()
+            },
+            i64::from(base_height),
+            base,
+            crate::coinstats::CoinStatsHashType::HashSerialized,
+        );
+        let got = stats
+            .hash_serialized
+            .map(|h| crate::hash::format_display_hex(h.as_bytes()))
+            .unwrap_or_default();
+        if got != au.hash_serialized {
+            return Err(SnapshotError(format!(
+                "Bad snapshot content hash: expected {}, got {got}",
+                au.hash_serialized
+            )));
+        }
+        debug_assert_eq!(stats.txouts, meta.coins_count);
+
+        // Index pass — second sequential read building the sparse
+        // group index, then attach as the immutable lowest layer.
+        let run = crate::sortedrun::SnapshotRun::index(
+            path.as_ref(),
+            // Sparse-index stride — a group every ~64K records keeps
+            // lookups within a short scan of the target.
+            65_536,
+        )
+        .map_err(|e| SnapshotError(format!("snapshot index: {e}")))?;
+
+        let mut utxo = UtxoSet::new();
+        if let Some(be) = &self.coins_backend {
+            utxo.attach_shared(be.clone());
+        }
+        utxo.attach_snapshot(run);
+        self.commit_activated_snapshot(utxo, base, base_height, au.n_chain_tx)?;
+        Ok(base_height)
+    }
+
+    pub fn activate_snapshot<R: std::io::Read>(
+        &mut self,
+        r: &mut R,
+        meta: &crate::utxo_snapshot::SnapshotMetadata,
+        mempool_nonempty: bool,
+    ) -> Result<u32, crate::utxo_snapshot::SnapshotError> {
+        use crate::utxo_snapshot::SnapshotError;
+        let (base, base_height, _au) =
+            self.check_snapshot_activation(meta, mempool_nonempty)?;
+        let au_by_height = _au;
 
         let mut loaded = UtxoSet::new();
         if let Some(be) = &self.coins_backend {
@@ -1273,68 +1419,7 @@ impl Chainstate {
             )));
         }
 
-        // Commit: the connected chain becomes the header chain through
-        // the base. Undo slots below it are empty placeholders — those
-        // blocks were never connected here, and the reorg guard keeps
-        // them from ever being "disconnected".
-        let mut chain = Vec::with_capacity(base_height as usize + 1);
-        let mut cursor = base;
-        loop {
-            chain.push(cursor);
-            if cursor == params.genesis_header.hash() {
-                break;
-            }
-            cursor = self
-                .tree
-                .get(&cursor)
-                .map(|n| n.header.prev_block_hash)
-                .ok_or_else(|| {
-                    SnapshotError("snapshot base header chain is incomplete".to_string())
-                })?;
-        }
-        chain.reverse();
-        self.utxo = loaded;
-        self.chain = chain;
-        // Below the base no undo exists anywhere. Memory mode keeps the
-        // `chain.len() - 1` invariant with empty placeholders; backend
-        // mode leaves the tail empty — committed undos live in coinsdb.
-        self.undos = if self.coins_backend.is_some() {
-            Vec::new()
-        } else {
-            vec![BlockUndo::default(); base_height as usize]
-        };
-        self.connected = base;
-        self.snapshot_base = Some(base_height);
-        // Core creates the ibd chainstate at activation — background
-        // validation replays `1..=base` from stored bodies and checks
-        // the recomputed hash before the assumed prefix is trusted.
-        self.background = Some(BackgroundValidation {
-            utxo: UtxoSet::new(),
-            next: 1,
-            pool: None,
-            pending: std::collections::VecDeque::new(),
-        });
-        self.snapshot_verified = false;
-        self.precious = None;
-        self.tree.apply_tx_meta(&base, 0, au_data.n_chain_tx);
-        // The filter index belongs to the connected chain — every
-        // pre-base height entry is now stale, and the first post-base
-        // append chains its header off nothing (Core's snapshot
-        // chainstate starts with an empty index).
-        if let Some(index) = &mut self.filterindex {
-            index.reset_to_snapshot();
-        }
-        if let Some(index) = &mut self.scripthashindex {
-            index.reset_to_snapshot();
-        }
-        // The assumed state must be durable before the call returns —
-        // a crash otherwise resumes the pre-snapshot `state.dat` while
-        // blk files may already hold post-base bodies (Core flushes
-        // the snapshot chainstate on activation).
-        if self.store.is_some() {
-            self.flush()
-                .map_err(|e| SnapshotError(format!("snapshot flush: {e}")))?;
-        }
+        self.commit_activated_snapshot(loaded, base, base_height, au_by_height.n_chain_tx)?;
         Ok(base_height)
     }
 
@@ -4259,6 +4344,35 @@ mod tests {
             let got = cs.utxo().iter().into_iter().find(|(o, _)| *o == *op);
             assert_eq!(got, Some((*op, coin.clone())));
         }
+
+        // Overlay activation of the same file — the zero-copy path must
+        // land the identical state.
+        let dir2 = store_dir("assumeutxo-overlay");
+        let snap_path = dir2.join("snap.dat");
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(&snap_path, &snap).unwrap();
+        let mut cs2 = Chainstate::with_store(&dir2, &p, NOW).unwrap();
+        for b in &blocks {
+            cs2.tree.insert(&b.header, NOW).unwrap();
+        }
+        let h2 = cs2
+            .activate_snapshot_overlay(&snap_path, &meta, false)
+            .unwrap();
+        assert_eq!(h2, 2);
+        assert_eq!(cs2.tip_hash(), base_hash);
+        assert_eq!(cs2.snapshot_base(), Some(2));
+        // Every snapshot coin resolves through the overlay — no import
+        // happened, the file itself serves reads.
+        for (op, coin) in &coins {
+            assert_eq!(cs2.utxo().get(op), Some(coin.clone()));
+        }
+        // And a fresh post-snapshot coin lands in the mutable layer on
+        // top, not in the file.
+        let probe = OutPoint {
+            txid: Txid::from_bytes([0xAB; 32]),
+            vout: 0,
+        };
+        assert!(cs2.utxo().get(&probe).is_none());
 
         // A second load is refused exactly like Core's double activate.
         let mut cursor = std::io::Cursor::new(&snap);

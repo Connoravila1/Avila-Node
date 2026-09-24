@@ -88,6 +88,28 @@ pub fn compute(
     // `Txid`'s `Ord` is exactly that lexicographic order.
     let mut entries: Vec<(OutPoint, Coin)> = utxo.iter();
     entries.sort_by_key(|(op, _)| (op.txid, op.vout));
+    compute_ordered(entries.iter().map(|(op, c)| (*op, c.clone())), height, best_block, hash_type)
+}
+
+/// The same statistics over coins yielded in already-sorted cursor
+/// order — streaming variant: the snapshot file's on-disk order is the
+/// hash order, so activation can verify the commitment without
+/// materializing the set.
+pub fn compute_streaming(
+    entries: impl Iterator<Item = (OutPoint, Coin)>,
+    height: i64,
+    best_block: BlockHash,
+    hash_type: CoinStatsHashType,
+) -> CoinStats {
+    compute_ordered(entries, height, best_block, hash_type)
+}
+
+fn compute_ordered(
+    entries: impl Iterator<Item = (OutPoint, Coin)>,
+    height: i64,
+    best_block: BlockHash,
+    hash_type: CoinStatsHashType,
+) -> CoinStats {
 
     let mut stats = CoinStats {
         height,
@@ -104,26 +126,26 @@ pub fn compute(
     // One reused serialization buffer — bounded by one coin's encoding.
     let mut buf = Vec::new();
     let mut prev_txid = None;
-    for (op, coin) in &entries {
+    for (op, coin) in entries {
         if prev_txid != Some(op.txid) {
             stats.transactions += 1;
             prev_txid = Some(op.txid);
         }
         stats.txouts += 1;
         stats.bogo_size += bogo_size(coin.out.script_pubkey.as_bytes().len());
-        stats.disk_size += coin_ser_size(coin);
+        stats.disk_size += coin_ser_size(&coin);
         stats.total_amount = stats
             .total_amount
             .and_then(|total| total.checked_add(coin.out.value));
         match hash_type {
             CoinStatsHashType::HashSerialized => {
                 buf.clear();
-                tx_out_ser(&mut buf, op, coin);
+                tx_out_ser(&mut buf, &op, &coin);
                 sha.update(&buf);
             }
             CoinStatsHashType::MuHash => {
                 buf.clear();
-                tx_out_ser(&mut buf, op, coin);
+                tx_out_ser(&mut buf, &op, &coin);
                 mu.insert(&buf);
             }
             CoinStatsHashType::None => {}

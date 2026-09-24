@@ -9339,7 +9339,10 @@ pub(crate) fn dispatch(
                         )
                     })?;
                 let base_height = cs
-                    .activate_snapshot(&mut reader, &meta, !mgr.mempool_ref().is_empty())
+                    // Overlay path: the file streams through the
+                    // commitment check and then serves reads in place —
+                    // no import, no materialization, no 12GB rewrite.
+                    .activate_snapshot_overlay(&path, &meta, !mgr.mempool_ref().is_empty())
                     .map_err(|e| {
                         (
                             RPC_INTERNAL_ERROR,
