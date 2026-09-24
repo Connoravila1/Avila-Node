@@ -268,3 +268,7 @@ an online exporter without the packing-map limit, and independent review of the
 cryptographic and consensus boundary. The experiment does not enable the new
 verifier in a production node. Its worker protocol also still lacks an internal
 hang deadline; the lab harness uses external timeouts.
+
+Follow-up: [repeated public-key aggregation](2026-09-24-ecdsa-repeated-keys.md)
+reduces mainnet-sample recipient CPU another 12.7% with the same advice and Rust
+replay binary. The added elapsed-time benefit remains inconclusive.

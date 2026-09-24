@@ -1,4 +1,5 @@
 ecdsa_advice.c uses libsecp256k1 and adapts its individual verification tail.
+ecdsa_coalesced_worker.c includes that harness and the same vendored arithmetic.
 The original libsecp256k1 copyright and permission notice follows:
 
 Copyright (c) 2013 Pieter Wuille
