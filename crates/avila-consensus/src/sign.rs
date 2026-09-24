@@ -1516,16 +1516,40 @@ impl SignatureChecker for DummyChecker {
 ///
 /// # Errors
 /// A `String` naming the offending input when a claim mismatches.
+/// Per-input result of [`verify_and_fill_prevouts`] — the signing
+/// receipt's data: what the input claimed vs. what the verified UTXO
+/// set holds, and whether the set could speak for it at all.
+#[derive(Debug, Clone)]
+pub struct PrevoutCheck {
+    /// The input's outpoint.
+    pub outpoint: crate::transaction::OutPoint,
+    /// Authoritative value — the verified UTXO set's, never the
+    /// PSBT's claim.
+    pub value_sats: i64,
+    /// Authoritative scriptPubKey length.
+    pub script_len: usize,
+    /// What the PSBT claimed, if it carried a `witness_utxo`.
+    pub claimed_sats: Option<i64>,
+    /// "verified" (claim matched the set) | "filled" (we supplied the
+    /// prevout) | "unverified" (not in the set — never trusted).
+    pub status: &'static str,
+}
+
 pub fn verify_and_fill_prevouts(
     utxo: &crate::connect::UtxoSet,
     psbt: &mut Psbt,
-) -> Result<(usize, usize), String> {
-    let mut verified = 0usize;
-    let mut unverified = 0usize;
+) -> Result<Vec<PrevoutCheck>, String> {
+    let mut checks = Vec::with_capacity(psbt.tx.inputs.len());
     for i in 0..psbt.tx.inputs.len() {
         let prevout = psbt.tx.inputs[i].previous_output;
         let Some(coin) = utxo.get(&prevout) else {
-            unverified += 1;
+            checks.push(PrevoutCheck {
+                outpoint: prevout,
+                value_sats: 0,
+                script_len: 0,
+                claimed_sats: None,
+                status: "unverified",
+            });
             continue;
         };
         match psbt.inputs[i].get(Psbt::IN_WITNESS_UTXO) {
@@ -1541,17 +1565,29 @@ pub fn verify_and_fill_prevouts(
                         coin.out.script_pubkey.as_bytes().len()
                     ));
                 }
-                verified += 1;
+                checks.push(PrevoutCheck {
+                    outpoint: prevout,
+                    value_sats: coin.out.value,
+                    script_len: coin.out.script_pubkey.as_bytes().len(),
+                    claimed_sats: Some(cv),
+                    status: "verified",
+                });
             }
             None => {
                 let mut v = coin.out.value.to_le_bytes().to_vec();
                 crate::encode::write_var_bytes(&mut v, coin.out.script_pubkey.as_bytes());
                 psbt.inputs[i].set(vec![Psbt::IN_WITNESS_UTXO], v);
-                verified += 1;
+                checks.push(PrevoutCheck {
+                    outpoint: prevout,
+                    value_sats: coin.out.value,
+                    script_len: coin.out.script_pubkey.as_bytes().len(),
+                    claimed_sats: None,
+                    status: "filled",
+                });
             }
         }
     }
-    Ok((verified, unverified))
+    Ok(checks)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3142,8 +3178,10 @@ mod tests {
 
         // Honest claim → verified against the set, then a REAL signature.
         let mut psbt = psbt_spending(&spk);
-        let (v, u) = verify_and_fill_prevouts(&utxo, &mut psbt).unwrap();
-        assert_eq!((v, u), (1, 0));
+        let checks = verify_and_fill_prevouts(&utxo, &mut psbt).unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, "verified");
+        assert_eq!(checks[0].claimed_sats, Some(50_000));
         let txdata = precompute_psbt_data(&psbt);
         assert!(sign_psbt_input(
             &signing,

@@ -1005,6 +1005,23 @@ fn fund_spend(
     Ok((tx, fee, change_pos))
 }
 
+/// The signing receipt's JSON — per-input: the outpoint, the verified
+/// set's authoritative value, what the PSBT claimed, and the check
+/// outcome. A receipt says what was actually verified (queue #36).
+fn prevout_receipts(checks: &[avila_consensus::sign::PrevoutCheck]) -> Vec<Value> {
+    checks
+        .iter()
+        .map(|c| {
+            json!({
+                "outpoint": format!("{}:{}", c.outpoint.txid, c.outpoint.vout),
+                "value_sats": c.value_sats,
+                "claimed_sats": c.claimed_sats,
+                "status": c.status,
+            })
+        })
+        .collect()
+}
+
 /// Build the signer provider from private descriptors — parse each
 /// xprv root, then expand a bounded lookahead collecting derived
 /// secrets + origins (descriptor.rs's `ExpandPrivate`). Shared by
@@ -10852,18 +10869,18 @@ pub(crate) fn dispatch(
                         )));
                     }
                 };
-                let (verified, unverified) =
+                let checks =
                     match avila_consensus::sign::verify_and_fill_prevouts(cs.utxo(), &mut psbt) {
                         Ok(v) => v,
                         Err(msg) => return QueryReply::Now(Err((RPC_VERIFY_ERROR, msg))),
                     };
+                let unverified = checks.iter().filter(|c| c.status == "unverified").count();
                 if unverified > 0 {
                     return QueryReply::Now(Err((
                         RPC_WALLET_ERROR,
                         format!("{unverified} input(s) not in the verified UTXO set"),
                     )));
                 }
-                let _ = verified;
                 let txdata = avila_consensus::sign::precompute_psbt_data(&psbt);
                 let mut complete = true;
                 for i in 0..psbt.tx.inputs.len() {
@@ -11006,11 +11023,12 @@ pub(crate) fn dispatch(
                 let mut psbt = avila_consensus::psbt::Psbt::from_unsigned_tx(tx);
                 // Fill witness_utxo from the verified set so external
                 // signers see checked prevouts, not attacker claims.
-                let (verified, unverified) =
+                let checks =
                     match avila_consensus::sign::verify_and_fill_prevouts(cs.utxo(), &mut psbt) {
                         Ok(v) => v,
                         Err(msg) => return QueryReply::Now(Err((RPC_VERIFY_ERROR, msg))),
                     };
+                let unverified = checks.iter().filter(|c| c.status == "unverified").count();
                 if unverified > 0 {
                     return QueryReply::Now(Err((
                         RPC_WALLET_ERROR,
@@ -11021,7 +11039,8 @@ pub(crate) fn dispatch(
                     "psbt": base64_encode(&psbt.encode()),
                     "fee": Value::from(fee as f64 / 100_000_000.0),
                     "changepos": change_pos.map(|c| json!(c)).unwrap_or(Value::from(-1)),
-                    "inputs_verified": verified,
+                    "inputs_verified": checks.iter().filter(|c| c.status != "unverified").count(),
+                    "prevout_receipts": prevout_receipts(&checks),
                 })))
             })
         }
@@ -11084,11 +11103,13 @@ pub(crate) fn dispatch(
                 // amount (the hardware-wallet fee attack). Where it
                 // doesn't (spent or foreign prevout) we can't verify —
                 // counted separately, never silently trusted.
-                let (verified, unverified) =
+                let checks =
                     match avila_consensus::sign::verify_and_fill_prevouts(cs.utxo(), &mut psbt) {
                         Ok(v) => v,
                         Err(msg) => return QueryReply::Now(Err((RPC_VERIFY_ERROR, msg))),
                     };
+                let verified = checks.iter().filter(|c| c.status != "unverified").count();
+                let unverified = checks.iter().filter(|c| c.status == "unverified").count();
                 let txdata = avila_consensus::sign::precompute_psbt_data(&psbt);
                 let mut complete = true;
                 for i in 0..psbt.tx.inputs.len() {
@@ -11108,6 +11129,7 @@ pub(crate) fn dispatch(
                     "complete": complete,
                     "inputs_verified": verified,
                     "inputs_unverified": unverified,
+                    "prevout_receipts": prevout_receipts(&checks),
                 })))
             })
         }
