@@ -95,3 +95,34 @@ mainnet scale. Design note for the prototype: the hints file is
 untrusted survivor data — wrong hints just fail the aggregate check
 at the checkpoint and fall back to the normal path. Nothing about
 consensus is skipped.
+
+---
+
+## Pass 2 — aggregate mechanics proven on the real chain (09-24, later run)
+
+`swiftsync_bench` replays the node's own 229,113-block signet main
+chain (70 side-branch blocks excluded by header indexing) maintaining
+only a 256-bit wrapping-sum tag aggregate + a transient tag map:
+
+- **22,445,304 coins created; 15,041,867 spent in-window;
+  7,403,437 survivors** — **67.0% of creates never need disk** (the
+  earlier 63.3% was Python-scan noise from out-of-order/orphan frames;
+  chain-ordered replay is the honest number)
+- **`created − spent == Σ survivor tags`, exactly**, over the whole
+  chain — the multiset-hash math holds with zero drift at real scale
+- **Fraud check fires**: dropping one survivor from the hinted claim
+  breaks the equality — a lying hints file is detected at the
+  checkpoint
+- **Cost**: transient map peaks at 7.45M entries ≈ **682 MiB** at
+  signet scale (mainnet IBD would need ~10-20× that — the known
+  trade-off; Core's design hits the same wall)
+- **Hints artifact**: 36 B/survivor outpoint list + aggregate
+  commitment + height — **267 MB** for this chain. A consumer
+  recomputes tags from its own transient coins and checks the
+  commitment before trusting a single entry.
+
+The scheme's three load-bearing claims all verified on real data:
+the aggregate is exact, fraud is detectable, and the write win is
+2/3 of coin ops. The remaining build is the sync-path integration
+(hints producer RPC + consumer mode that keeps coins transient until
+checkpoint).
