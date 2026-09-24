@@ -93,16 +93,21 @@ mod tests {
     #[test]
     fn longest_prefix_wins() {
         let m = AsMap::from_entries(vec![
-            Prefix { net: 0x0a00_0000, plen: 8, asn: 1 },   // 10/8
-            Prefix { net: 0x0a01_0000, plen: 16, asn: 2 },  // 10.1/16
+            Prefix {
+                net: 0x0a00_0000,
+                plen: 8,
+                asn: 1,
+            }, // 10/8
+            Prefix {
+                net: 0x0a01_0000,
+                plen: 16,
+                asn: 2,
+            }, // 10.1/16
         ]);
         let a = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
         let b = IpAddr::V4(Ipv4Addr::new(10, 9, 0, 1));
         assert_eq!(m.asn(&a), Some(2));
         assert_eq!(m.asn(&b), Some(1));
-        assert_eq!(
-            m.asn(&IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
-            None
-        );
+        assert_eq!(m.asn(&IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))), None);
     }
 }

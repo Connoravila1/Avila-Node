@@ -50,7 +50,10 @@ const RECON_FIRST_DELAY: Duration = Duration::from_secs(10);
 fn recon_pool(
     mempool: &avila_mempool::Mempool,
     salt: u64,
-) -> (Vec<u32>, std::collections::HashMap<u32, avila_consensus::hash::Txid>) {
+) -> (
+    Vec<u32>,
+    std::collections::HashMap<u32, avila_consensus::hash::Txid>,
+) {
     let mut ids = Vec::new();
     let mut map = std::collections::HashMap::new();
     for txid in mempool.txids() {
@@ -85,6 +88,10 @@ const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
 /// exactly that reply); nothing in this crate sends `getaddr` yet, so
 /// only the passive refill applies today.
 const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1000.0;
+/// BIP157 serving is cheap per request but unbounded spam costs disk
+/// reads — one filter request/second sustained, burst 20.
+const CFILTER_RATE_PER_SECOND: f64 = 1.0;
+const CFILTER_TOKEN_BUCKET: f64 = 20.0;
 
 /// Core's `HEADERS_DOWNLOAD_TIMEOUT_BASE` — the fixed floor of the
 /// overall deadline the headers-sync leader has to catch us up, on top
@@ -209,6 +216,12 @@ struct PeerEntry<S> {
     /// `Peer::m_addr_token_timestamp` — when the bucket was last
     /// refilled, so the refill amount is `elapsed * rate`.
     addr_token_timestamp: Instant,
+    /// Compact-filter request budget — `getcf*` requests spend one
+    /// token each; an empty bucket is silently unserved (legal
+    /// requests, so no disconnect — just no disk reads).
+    cfilter_token_bucket: f64,
+    /// Refill checkpoint for `cfilter_token_bucket`.
+    cfilter_token_timestamp: Instant,
     /// `Peer::m_getaddr_recvd` — whether this peer has already been
     /// answered once; a later `getaddr` on the same connection is
     /// silently ignored.
@@ -238,6 +251,29 @@ struct PeerEntry<S> {
     /// collected so far — `lo` is consumed by the first `sketch`, `hi`
     /// by the second (fixed reply order).
     recon_bisect: Option<ReconBisect>,
+}
+
+impl<S> PeerEntry<S> {
+    /// Spends one compact-filter token — refills at
+    /// [`CFILTER_RATE_PER_SECOND`] up to [`CFILTER_TOKEN_BUCKET`].
+    /// `false` means the request is dropped unserved (legal traffic,
+    /// never a ban reason — the peer just doesn't get disk reads for
+    /// free forever).
+    fn cfilter_allow(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now
+            .saturating_duration_since(self.cfilter_token_timestamp)
+            .as_secs_f64();
+        self.cfilter_token_bucket = (self.cfilter_token_bucket + elapsed * CFILTER_RATE_PER_SECOND)
+            .min(CFILTER_TOKEN_BUCKET);
+        self.cfilter_token_timestamp = now;
+        if self.cfilter_token_bucket >= 1.0 {
+            self.cfilter_token_bucket -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Pending bisected-round state — see [`crate::recon::bisect`].
@@ -386,7 +422,11 @@ pub struct PeerManager<S> {
     /// broadcasting to all at once. Entries: (txid, wtxid, fluff_at).
     /// Weaker than full Dandelion (single hop, no protocol change) —
     /// the point is plausible-deniability routing for our own txs.
-    stem_pending: Vec<(avila_consensus::hash::Txid, avila_consensus::hash::Wtxid, Instant)>,
+    stem_pending: Vec<(
+        avila_consensus::hash::Txid,
+        avila_consensus::hash::Wtxid,
+        Instant,
+    )>,
     /// Whether locally-submitted txs take the stem path — default on.
     stem_relay: bool,
     /// Last time the eclipse-signal check ran (paced to ~60s).
@@ -797,6 +837,8 @@ impl<S: Read + Write> PeerManager<S> {
                 // by us asking it for addresses or by waiting out the
                 // slow passive refill.
                 addr_token_bucket: 1.0,
+                cfilter_token_bucket: CFILTER_TOKEN_BUCKET,
+                cfilter_token_timestamp: Instant::now(),
                 addr_token_timestamp: now,
                 getaddr_recvd: false,
                 recon: None,
@@ -972,10 +1014,12 @@ impl<S: Read + Write> PeerManager<S> {
     /// disjoint routes (#10) is the escalation path.
     pub fn eclipse_signals(&self, cs: &Chainstate, now: u32) -> Vec<EclipseSignal> {
         let mut out = Vec::new();
-        let established: Vec<&PeerEntry<S>> =
-            self.peers.values().filter(|p| p.session.established()).collect();
-        let outbound: Vec<&&PeerEntry<S>> =
-            established.iter().filter(|p| !p.inbound).collect();
+        let established: Vec<&PeerEntry<S>> = self
+            .peers
+            .values()
+            .filter(|p| p.session.established())
+            .collect();
+        let outbound: Vec<&&PeerEntry<S>> = established.iter().filter(|p| !p.inbound).collect();
 
         // TipStale: stale tip + everyone claims more.
         let tip_time = cs.tree().tip().header.time;
@@ -984,9 +1028,7 @@ impl<S: Read + Write> PeerManager<S> {
         let all_claim_more = established.len() >= 4
             && established
                 .iter()
-                .all(|p| {
-                    p.session.peer().map(|i| i.start_height).unwrap_or(0) > our_height
-                });
+                .all(|p| p.session.peer().map(|i| i.start_height).unwrap_or(0) > our_height);
         if stale && all_claim_more {
             out.push(EclipseSignal::TipStale);
         }
@@ -1037,9 +1079,7 @@ impl<S: Read + Write> PeerManager<S> {
             .peers
             .iter()
             .filter(|(_, p)| {
-                !p.inbound
-                    && p.session.established()
-                    && p.session.peer().is_some_and(|i| i.relay)
+                !p.inbound && p.session.established() && p.session.peer().is_some_and(|i| i.relay)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -1049,15 +1089,23 @@ impl<S: Read + Write> PeerManager<S> {
             return;
         };
         if let Some(peer) = self.peers.get_mut(&hop) {
-            let (inv_type, hash) =
-                if peer.session.peer().is_some_and(|i| i.wtxid_relay) {
-                    (crate::message::InvType::Wtx, BlockHash::from_bytes(*wtxid.as_bytes()))
-                } else {
-                    (crate::message::InvType::Tx, BlockHash::from_bytes(*txid.as_bytes()))
-                };
-            let _ = peer.session.send(&Message::Inv(vec![
-                crate::message::InvVector { inv_type, hash },
-            ]));
+            let (inv_type, hash) = if peer.session.peer().is_some_and(|i| i.wtxid_relay) {
+                (
+                    crate::message::InvType::Wtx,
+                    BlockHash::from_bytes(*wtxid.as_bytes()),
+                )
+            } else {
+                (
+                    crate::message::InvType::Tx,
+                    BlockHash::from_bytes(*txid.as_bytes()),
+                )
+            };
+            let _ = peer
+                .session
+                .send(&Message::Inv(vec![crate::message::InvVector {
+                    inv_type,
+                    hash,
+                }]));
         }
         // Fluff after a randomized 2–15s delay — the Dandelion stem
         // phase compressed to one hop.
@@ -1125,9 +1173,7 @@ impl<S: Read + Write> PeerManager<S> {
                     // tx means it was confirmed-spent or never existed.
                     let dead = tx.inputs.iter().any(|i| {
                         self.mempool.resolve(cs, &i.previous_output).is_none()
-                            && !self
-                                .mempool
-                                .is_broadcast_pending(&i.previous_output.txid)
+                            && !self.mempool.is_broadcast_pending(&i.previous_output.txid)
                     });
                     if dead {
                         self.mempool.unmark_broadcast(&txid);
@@ -1148,10 +1194,7 @@ impl<S: Read + Write> PeerManager<S> {
             let Some(link) = peer.recon else {
                 continue;
             };
-            if !link.they_respond
-                || !peer.session.established()
-                || now < peer.next_recon
-            {
+            if !link.they_respond || !peer.session.established() || now < peer.next_recon {
                 continue;
             }
             peer.next_recon = now + RECON_INTERVAL;
@@ -1362,10 +1405,7 @@ impl<S: Read + Write> PeerManager<S> {
                 .iter()
                 .map(|h| {
                     let hash = h.hash();
-                    (
-                        cs.tree().get(&hash).map(|n| n.height).unwrap_or(0),
-                        hash,
-                    )
+                    (cs.tree().get(&hash).map(|n| n.height).unwrap_or(0), hash)
                 })
                 .collect();
             self.fetch_index_headers = header_count;
@@ -1374,9 +1414,7 @@ impl<S: Read + Write> PeerManager<S> {
         // frontier (connected heights have bodies by definition), each
         // peer taking a slice until the aggregate budget binds.
         let frontier = cs.chain().len() as u32;
-        let start = self
-            .fetch_index
-            .partition_point(|(h, _)| *h < frontier);
+        let start = self.fetch_index.partition_point(|(h, _)| *h < frontier);
         let want_total = self.max_in_flight_total.saturating_sub(reserved.len());
         let candidates: Vec<BlockHash> = self.fetch_index[start..]
             .iter()
@@ -1608,47 +1646,53 @@ impl<S: Read + Write> PeerManager<S> {
                 let _ = peer.session.send(&reply);
             }
             SessionEvent::Message(Message::GetCFilters(req)) => {
-                match PeerSync::serve_getcfilters(cs, serve_filters, &req) {
-                    crate::sync::FilterReply::Serve(msgs) => {
-                        for m in msgs {
-                            if peer.session.send(&m).is_err() {
-                                break;
+                if peer.cfilter_allow() {
+                    match PeerSync::serve_getcfilters(cs, serve_filters, &req) {
+                        crate::sync::FilterReply::Serve(msgs) => {
+                            for m in msgs {
+                                if peer.session.send(&m).is_err() {
+                                    break;
+                                }
                             }
                         }
-                    }
-                    crate::sync::FilterReply::Ignore => {}
-                    crate::sync::FilterReply::Disconnect(reason) => {
-                        dead.push((id, DisconnectReason::Misbehavior(reason.into())));
+                        crate::sync::FilterReply::Ignore => {}
+                        crate::sync::FilterReply::Disconnect(reason) => {
+                            dead.push((id, DisconnectReason::Misbehavior(reason.into())));
+                        }
                     }
                 }
             }
             SessionEvent::Message(Message::GetCFHeaders(req)) => {
-                match PeerSync::serve_getcfheaders(cs, serve_filters, &req) {
-                    crate::sync::FilterReply::Serve(msgs) => {
-                        for m in msgs {
-                            if peer.session.send(&m).is_err() {
-                                break;
+                if peer.cfilter_allow() {
+                    match PeerSync::serve_getcfheaders(cs, serve_filters, &req) {
+                        crate::sync::FilterReply::Serve(msgs) => {
+                            for m in msgs {
+                                if peer.session.send(&m).is_err() {
+                                    break;
+                                }
                             }
                         }
-                    }
-                    crate::sync::FilterReply::Ignore => {}
-                    crate::sync::FilterReply::Disconnect(reason) => {
-                        dead.push((id, DisconnectReason::Misbehavior(reason.into())));
+                        crate::sync::FilterReply::Ignore => {}
+                        crate::sync::FilterReply::Disconnect(reason) => {
+                            dead.push((id, DisconnectReason::Misbehavior(reason.into())));
+                        }
                     }
                 }
             }
             SessionEvent::Message(Message::GetCFCheckpt(req)) => {
-                match PeerSync::serve_getcfcheckpt(cs, serve_filters, &req) {
-                    crate::sync::FilterReply::Serve(msgs) => {
-                        for m in msgs {
-                            if peer.session.send(&m).is_err() {
-                                break;
+                if peer.cfilter_allow() {
+                    match PeerSync::serve_getcfcheckpt(cs, serve_filters, &req) {
+                        crate::sync::FilterReply::Serve(msgs) => {
+                            for m in msgs {
+                                if peer.session.send(&m).is_err() {
+                                    break;
+                                }
                             }
                         }
-                    }
-                    crate::sync::FilterReply::Ignore => {}
-                    crate::sync::FilterReply::Disconnect(reason) => {
-                        dead.push((id, DisconnectReason::Misbehavior(reason.into())));
+                        crate::sync::FilterReply::Ignore => {}
+                        crate::sync::FilterReply::Disconnect(reason) => {
+                            dead.push((id, DisconnectReason::Misbehavior(reason.into())));
+                        }
                     }
                 }
             }
@@ -2445,10 +2489,12 @@ impl PeerManager<TcpStream> {
             self.peers
                 .values()
                 .filter(|p| !p.inbound)
-                .filter_map(|p| p.remote.and_then(|r| {
-                    let ip = std::net::IpAddr::from(r.ip);
-                    self.asmap.asn(&ip)
-                }))
+                .filter_map(|p| {
+                    p.remote.and_then(|r| {
+                        let ip = std::net::IpAddr::from(r.ip);
+                        self.asmap.asn(&ip)
+                    })
+                })
                 .fold(HashMap::new(), |mut m, asn| {
                     *m.entry(asn).or_default() += 1;
                     m
@@ -2870,28 +2916,34 @@ mod tests {
         events.extend(mgr.tick(&mut cs, NOW));
         testpipe::inject(&mut peer, MAGIC, &Message::Verack);
         events.extend(mgr.tick(&mut cs, NOW));
-        assert!(events.iter().any(|e| matches!(e, NetEvent::Connected { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, NetEvent::Connected { .. }))
+        );
 
         // Peer opens a round over its own 3-id pool; ours is empty.
         let mut sk = crate::sketch::Sketch::new(8);
         for id in [7u32, 8, 9] {
             sk.add(id);
         }
-        testpipe::inject(
-            &mut peer,
-            MAGIC,
-            &Message::ReqRecon(sk.serialize()),
-        );
+        testpipe::inject(&mut peer, MAGIC, &Message::ReqRecon(sk.serialize()));
         mgr.tick(&mut cs, NOW);
         mgr.tick(&mut cs, NOW);
         let sent = testpipe::drain(&mut peer, MAGIC);
-        assert!(sent.iter().any(|m| matches!(m, Message::Sketch(_))), "{sent:?}");
+        assert!(
+            sent.iter().any(|m| matches!(m, Message::Sketch(_))),
+            "{sent:?}"
+        );
         let rd = sent.iter().find_map(|m| match m {
             Message::ReconcilDiff { short_ids, .. } => Some(short_ids.clone()),
             _ => None,
         });
         assert_eq!(
-            rd.map(|mut v| { v.sort(); v }),
+            rd.map(|mut v| {
+                v.sort();
+                v
+            }),
             Some(vec![7, 8, 9]),
             "{sent:?}"
         );
@@ -2925,7 +2977,10 @@ mod tests {
         mgr.tick(&mut cs, NOW);
         mgr.tick(&mut cs, NOW);
         let sent = testpipe::drain(&mut peer, MAGIC);
-        assert!(sent.iter().any(|m| matches!(m, Message::ReqRecon(_))), "{sent:?}");
+        assert!(
+            sent.iter().any(|m| matches!(m, Message::ReqRecon(_))),
+            "{sent:?}"
+        );
     }
 
     #[test]
@@ -4215,7 +4270,9 @@ mod tests {
 
         // 1. Garbage flood: 100KB of random bytes — decode fails, peer
         //    is dropped.
-        let garbage: Vec<u8> = (0..100_000u32).map(|i| i.wrapping_mul(2654435761) as u8).collect();
+        let garbage: Vec<u8> = (0..100_000u32)
+            .map(|i| i.wrapping_mul(2654435761) as u8)
+            .collect();
         a.write_all(&garbage).unwrap();
         let events = mgr.tick(&mut cs, NOW);
         assert!(
@@ -4278,10 +4335,12 @@ mod tests {
         let msgs_b = testpipe::drain(&mut b, MAGIC);
         let inv = |msgs: &[Message]| {
             msgs.iter()
-                .filter(|m| matches!(m, Message::Inv(v) if v.iter().any(|iv| {
-                    iv.inv_type == crate::message::InvType::Wtx
-                        || iv.inv_type == crate::message::InvType::Tx
-                })))
+                .filter(|m| {
+                    matches!(m, Message::Inv(v) if v.iter().any(|iv| {
+                        iv.inv_type == crate::message::InvType::Wtx
+                            || iv.inv_type == crate::message::InvType::Tx
+                    }))
+                })
                 .count()
         };
         assert_eq!(
@@ -4297,10 +4356,7 @@ mod tests {
         mgr.tick(&mut cs, NOW); // next tick flushes to the wire
         let msgs_a = testpipe::drain(&mut a, MAGIC);
         let msgs_b = testpipe::drain(&mut b, MAGIC);
-        assert!(
-            inv(&msgs_a) + inv(&msgs_b) >= 1,
-            "fluff announce went out"
-        );
+        assert!(inv(&msgs_a) + inv(&msgs_b) >= 1, "fluff announce went out");
         assert!(mgr.stem_pending.is_empty());
     }
 }
