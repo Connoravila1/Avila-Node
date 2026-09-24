@@ -2468,6 +2468,119 @@ mod tests {
         );
     }
 
+    /// A short low-work batch that proves this peer's chain can't ever
+    /// clear the anti-DoS floor must release headers leadership right
+    /// away — not misbehavior, not a disconnect, but no reason to keep
+    /// waiting on this peer either. Without this, sync would freeze
+    /// until one of the (much longer) timeouts eventually fired.
+    #[test]
+    fn abandoned_low_work_sync_releases_leadership_immediately() {
+        let (mut mgr, mut peer, id) = managed_peer();
+        let mut params = avila_consensus::params::Network::Regtest.params();
+        // Unreachable by any batch this test could send.
+        params.minimum_chain_work =
+            avila_consensus::arith::Work(avila_consensus::arith::U256::from_u64(50_000));
+        let seed = avila_consensus::chainstate::Chainstate::new(&params);
+        let blocks = chain_blocks(&seed, 5); // far short of a full page
+        let headers: Vec<avila_consensus::header::BlockHeader> =
+            blocks.iter().map(|b| b.header).collect();
+        let mut cs = avila_consensus::chainstate::Chainstate::new(&params);
+        handshake(&mut mgr, &mut peer, &mut cs);
+        mgr.tick(&mut cs, NOW); // settle the Established-time getheaders
+        testpipe::drain(&mut peer, MAGIC);
+        assert_eq!(mgr.headers_leader, Some(id));
+
+        testpipe::inject(&mut peer, MAGIC, &Message::Headers(headers));
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, NetEvent::Disconnected { .. })),
+            "a low-work batch is not misbehavior on its own: {events:?}"
+        );
+        // With only one peer, releasing leadership is immediately
+        // followed (same tick) by `fill_queues` reassigning it right
+        // back — so `headers_leader` alone can't distinguish "released
+        // and reassigned" from "never released" (both leave it
+        // `Some(id)`). What *does* distinguish them: a released slot
+        // gets a fresh `getheaders` queued by `fill_queues`'s leaderless
+        // branch; a stuck one sends nothing further at all.
+        assert_eq!(mgr.headers_leader, Some(id));
+        mgr.tick(&mut cs, NOW); // flush that fresh getheaders onto the wire
+        let sent = testpipe::drain(&mut peer, MAGIC);
+        assert!(
+            sent.iter().any(|m| matches!(m, Message::GetHeaders(_))),
+            "leadership must be released and immediately reassigned, not stuck: {sent:?}"
+        );
+    }
+
+    /// Core's overall sync-peer download timeout: a leader that keeps
+    /// answering every single request promptly (so the per-request
+    /// `HEADERS_RESPONSE_TIME` timeout never fires) but never actually
+    /// finishes catching us up must still eventually lose leadership,
+    /// as long as another established peer is available to take over.
+    #[test]
+    fn stalled_headers_leader_times_out_even_while_still_responsive() {
+        let (mut mgr, mut peer_a, id_a) = managed_peer();
+        // regtest's genesis (2011) is always far more than 24h behind
+        // `NOW`, so this chain is never "caught up" for the timeout's
+        // purposes — matching a real node mid-IBD.
+        let mut cs = regtest();
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer_a, MAGIC);
+        assert_eq!(mgr.headers_leader, Some(id_a));
+
+        // A second established peer so there's somewhere to hand
+        // leadership to.
+        let (mut peer_b, id_b) = add_peer(&mut mgr);
+        handshake_peer(&mut mgr, &mut peer_b, &mut cs);
+        testpipe::drain(&mut peer_b, MAGIC);
+
+        // Force A's overall deadline into the past, as if
+        // HEADERS_DOWNLOAD_TIMEOUT_BASE had elapsed with A never
+        // catching us up — regardless of how promptly it might have
+        // been answering individual getheaders the whole time.
+        mgr.headers_sync_deadline = Some(Instant::now() - Duration::from_secs(1));
+
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                NetEvent::Disconnected {
+                    peer,
+                    reason: DisconnectReason::Stalled
+                } if *peer == id_a
+            )),
+            "{events:?}"
+        );
+        assert_eq!(mgr.headers_leader, Some(id_b), "leadership must pass to B");
+    }
+
+    /// The overall sync-peer timeout must never fire with no other
+    /// established peer available — Core's "we have bigger problems if
+    /// we can't get any outbound peers" guard.
+    #[test]
+    fn stalled_headers_leader_is_kept_when_no_other_peer_exists() {
+        let (mut mgr, mut peer_a, id_a) = managed_peer();
+        let mut cs = regtest();
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer_a, MAGIC);
+        assert_eq!(mgr.headers_leader, Some(id_a));
+
+        mgr.headers_sync_deadline = Some(Instant::now() - Duration::from_secs(1));
+
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, NetEvent::Disconnected { .. })),
+            "the only peer must not be dropped for stalling: {events:?}"
+        );
+        assert_eq!(mgr.headers_leader, Some(id_a));
+    }
+
     #[test]
     fn peer_is_served_headers() {
         let (mut mgr, mut peer, _id) = managed_peer();

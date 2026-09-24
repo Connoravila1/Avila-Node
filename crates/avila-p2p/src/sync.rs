@@ -1113,6 +1113,146 @@ mod tests {
         assert_eq!(cs.tree().tip().height as usize, headers.len());
     }
 
+    /// Core's `IsAncestorOfBestHeaderOrTip`: re-announcing a header we
+    /// already have, that's part of our best-header chain, must never
+    /// start a presync — even with a threshold no single page could
+    /// otherwise clear.
+    #[test]
+    fn known_header_on_best_chain_skips_the_anti_dos_gate() {
+        use avila_consensus::arith::{U256, Work};
+        use avila_consensus::chainstate::Chainstate;
+
+        let mut params = Network::Regtest.params();
+        params.minimum_chain_work = Work(U256::from_u64(u64::MAX)); // unreachable by any batch
+        let mut cs = Chainstate::new(&params);
+        let blocks = chain_blocks(&cs, 5);
+        for b in &blocks {
+            cs.accept_header(&b.header, NOW).unwrap();
+        }
+        let mut sync = PeerSync::new();
+
+        // Re-announcing the whole known chain (a `headers` reply to an
+        // ordinary getheaders, or an unsolicited re-advertisement) must
+        // be accepted normally — `known` counts every one of them —
+        // rather than diverted into a presync that could never succeed.
+        let headers: Vec<BlockHeader> = blocks.iter().map(|b| b.header).collect();
+        let out = sync.on_headers(&mut cs, &headers, NOW).unwrap();
+        assert_eq!(out.known, headers.len());
+        assert_eq!(out.added, 0);
+        assert!(!out.give_up_leadership);
+    }
+
+    /// Realistic end-to-end regression on real mainnet data. A peer's
+    /// claimed work clears the anti-DoS floor only partway through a
+    /// 4000-header chain, so the whole chain must be presynced and then
+    /// redownloaded before anything lands in the tree. This specifically
+    /// pins the "keep paging after a completed low-work sync" fix: the
+    /// redownload crosses the floor on a full wire page (heights
+    /// 2001..=4000), and completing on a full page must still trigger an
+    /// ordinary continuation — without it, sync would simply stop at
+    /// height 4000 and never pick up the real remaining headers.
+    #[test]
+    fn mainnet_fixture_presync_redownload_then_ordinary_continuation() {
+        use avila_consensus::arith::{U256, Work};
+        use avila_consensus::chainstate::Chainstate;
+
+        const MAINNET_HEADERS: &[u8] =
+            include_bytes!("../../../fixtures/mainnet-headers-000000-004031.bin");
+        let raw: Vec<BlockHeader> = MAINNET_HEADERS
+            .as_chunks::<{ BlockHeader::SIZE }>()
+            .0
+            .iter()
+            .map(|chunk| BlockHeader::decode(chunk).unwrap())
+            .collect();
+        assert_eq!(raw.len(), 4032, "genesis plus 4031 real headers");
+        // `raw[0]` is the genesis header itself — already seeded by
+        // `Chainstate::new`, so only `raw[1..]` are ever fed on the wire.
+        let headers = &raw[1..];
+        assert_eq!(headers.len(), 4031);
+        let page1 = &headers[..2000]; // heights 1..=2000
+        let page2 = &headers[2000..4000]; // heights 2001..=4000
+        let page3 = &headers[4000..]; // heights 4001..=4031
+        assert_eq!(page3.len(), 31);
+
+        let base_params = Network::Mainnet.params();
+
+        // The real cumulative work through heights 2000 and 4000, summed
+        // directly from each header's own claimed bits — exactly how
+        // `HeaderNode::chainwork` itself accumulates, but without paying
+        // for a 4000-deep `HeaderTree::insert` (whose ancestor-validity
+        // walk back to genesis on every call makes actually building a
+        // reference tree here needlessly expensive for what's simple
+        // arithmetic over already-known-real header data).
+        let genesis_work = Work::from_compact(base_params.genesis_header.bits);
+        let work_at_2000 = page1.iter().fold(genesis_work, |acc, h| {
+            acc.checked_add(Work::from_compact(h.bits)).unwrap()
+        });
+        let work_at_4000 = page2.iter().fold(work_at_2000, |acc, h| {
+            acc.checked_add(Work::from_compact(h.bits)).unwrap()
+        });
+        assert!(
+            work_at_2000 < work_at_4000,
+            "mainnet's first retarget (height 2016) must raise cumulative work"
+        );
+
+        let mut params = base_params;
+        // Strictly between the two: page 1 alone can never clear it, but
+        // page 1 + page 2 together do.
+        params.minimum_chain_work = work_at_2000.checked_add(Work(U256::ONE)).unwrap();
+        assert!(params.minimum_chain_work <= work_at_4000);
+
+        let mut cs = Chainstate::new(&params);
+        let mut sync = PeerSync::new();
+
+        // Presync page 1: below the floor on its own.
+        let out = sync.on_headers(&mut cs, page1, NOW).unwrap();
+        assert_eq!((out.added, out.known), (0, 0));
+        assert!(out.continuation.is_some());
+        assert_eq!(cs.tree().len(), 1, "nothing stored during presync");
+
+        // Presync page 2: the chain's claimed work now clears the floor
+        // mid-page, promoting presync to redownload.
+        let out = sync.on_headers(&mut cs, page2, NOW).unwrap();
+        assert_eq!((out.added, out.known), (0, 0));
+        assert!(out.continuation.is_some());
+        assert_eq!(
+            cs.tree().len(),
+            1,
+            "still nothing stored — redownload hasn't verified anything yet"
+        );
+
+        // Redownload page 1: re-verifies against presync's commitments;
+        // buffered, not released yet.
+        let out = sync.on_headers(&mut cs, page1, NOW).unwrap();
+        assert_eq!((out.added, out.known), (0, 0));
+        assert!(out.continuation.is_some());
+        assert_eq!(cs.tree().len(), 1);
+
+        // Redownload page 2: crosses the floor again mid-page, releasing
+        // the whole verified chain (heights 1..=4000). The regression
+        // this test pins: since this wire page was itself full, an
+        // ordinary continuation must follow.
+        let out = sync.on_headers(&mut cs, page2, NOW).unwrap();
+        assert_eq!(out.added, 4000);
+        assert_eq!(cs.tree().len(), 4001);
+        assert_eq!(cs.tree().tip().height, 4000);
+        assert!(
+            out.continuation.is_some(),
+            "completing a low-work sync on a full page must keep paging ordinarily, \
+             or header sync stops dead at the minimum-chainwork height"
+        );
+        assert!(!out.give_up_leadership);
+
+        // The peer answers that ordinary continuation with the real
+        // remaining headers — accepted through the normal path (already
+        // proven work, no low-work sync involved).
+        let out = sync.on_headers(&mut cs, page3, NOW).unwrap();
+        assert_eq!(out.added, 31);
+        assert!(out.continuation.is_none(), "a non-full page ends the sync");
+        assert_eq!(cs.tree().tip().height, 4031);
+        assert_eq!(cs.tree().len(), 4032);
+    }
+
     #[test]
     fn discontinuous_headers_are_misbehavior() {
         let mut cs = regtest();
