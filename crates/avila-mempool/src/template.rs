@@ -137,9 +137,11 @@ impl Mempool {
         // Core's `BlockAssembler::addPackageTxs`: ancestor-feerate
         // package selection. Each entry's `ancestor_score` uses
         // `GetModFeeAndSize` — the smaller of the tx's own modified
-        // feerate and its in-pool ancestor package's feerate.
-        let flags = avila_consensus::script::block_script_flags(cs.tree().params(), height, &tip);
-        let (package, tx_sigops) = self.select_package_txs(cs, height, mtp, flags);
+        // feerate and its in-pool ancestor package's feerate. Every
+        // entry's sigop-adjusted vsize was already computed once at
+        // admission (`MempoolEntry::vsize`/`sigops`), so selection no
+        // longer needs the script flags to re-derive it.
+        let (package, tx_sigops) = self.select_package_txs(height, mtp);
         let chosen: Vec<&crate::MempoolEntry> =
             package.iter().filter_map(|id| self.entry(id)).collect();
         let fees: i64 = chosen.iter().map(|e| e.fee).sum();
@@ -226,18 +228,10 @@ impl Mempool {
     /// in the block, `UpdatePackagesForAdded` subtracts the included
     /// ancestors' stats from each descendant's score — the descendant
     /// is then re-ranked on what remains unmined.
-    fn select_package_txs(
-        &self,
-        cs: &avila_consensus::chainstate::Chainstate,
-        height: u32,
-        mtp: u32,
-        flags: avila_consensus::script::ScriptFlags,
-    ) -> (Vec<Txid>, u64) {
+    fn select_package_txs(&self, height: u32, mtp: u32) -> (Vec<Txid>, u64) {
         use avila_consensus::block::WITNESS_SCALE_FACTOR;
         use avila_consensus::check::is_final_tx;
 
-        /// `policy::nBytesPerSigOp` — legacy sigop cost granularity.
-        const BYTES_PER_SIGOP: u64 = 20;
         /// Core's `-blockmintxfee` default (0 sat/kvB): no floor.
         const BLOCK_MIN_FEE_SAT_PER_KVB: i64 = 0;
         /// Core's `MAX_CONSECUTIVE_FAILURES` — give up once the block
@@ -342,22 +336,23 @@ impl Mempool {
             sigops_wa: u64,
         }
 
-        // Snapshot every entry's facts once — the pool is frozen for
-        // the duration of selection.
+        // Snapshot every entry's facts once — the pool is frozen for the
+        // duration of selection. `tx_size`/`sigops` are the entry's own
+        // cached admission-time values (fix for the mempool/template
+        // vsize split: one `GetVirtualTransactionSize` per entry, stored
+        // once, read everywhere) rather than recomputed here — matching
+        // Core, which never revisits `CTxMemPoolEntry::nTxWeight`/
+        // `sigOpCost` after admission either.
         let mut facts: HashMap<Txid, Facts> = HashMap::with_capacity(self.entries().count());
         for e in self.entries() {
             let txid = e.tx.txid();
-            let sigops = self.real_sigop_cost(cs, &e.tx, flags);
             let weight = e.tx.weight() as u64;
-            let tx_size = weight
-                .max(sigops * BYTES_PER_SIGOP)
-                .div_ceil(WITNESS_SCALE_FACTOR as u64);
             facts.insert(
                 txid,
                 Facts {
-                    tx_size,
+                    tx_size: e.vsize as u64,
                     weight,
-                    sigops,
+                    sigops: e.sigops,
                     mod_fee: e.modified_fee(),
                     ancestors: HashSet::new(),
                     count_wa: 0,

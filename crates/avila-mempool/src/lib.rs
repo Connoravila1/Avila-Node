@@ -61,8 +61,16 @@ pub struct MempoolEntry {
     pub tx: Transaction,
     /// `value_in - value_out` in satoshis.
     pub fee: i64,
-    /// Virtual size (weight/4) used for fee-rate and eviction scoring.
+    /// Core's `GetVirtualTransactionSize(weight, sigops, 20)` —
+    /// `max(weight, sigops * 20).div_ceil(4)` — computed once at
+    /// admission and used everywhere a size is needed: fee-rate and
+    /// eviction scoring, ancestor/descendant package totals, the
+    /// min-relay-fee and capacity checks.
     pub vsize: usize,
+    /// Sigop cost — Core's `GetTransactionSigOpCost` (legacy × 4, plus
+    /// P2SH and witness sigops resolved against this entry's inputs).
+    /// The basis for `vsize` above and the per-tx sigop cap.
+    pub sigops: u64,
     /// Arrival time (caller-supplied).
     pub time: u32,
     /// The chain height when first pooled — the estimator's clock for
@@ -643,6 +651,28 @@ impl Mempool {
             return steps;
         }
 
+        // Sigop cost and the one true vsize — same computation and
+        // ordering as `accept_tx`'s step 2.5; every later size-based
+        // gate below reads this `vsize` back rather than `tx.weight()`.
+        let tip = cs.tip_hash();
+        let next_height = cs.tree().tip().height + 1;
+        let flags = standard_script_flags(cs, next_height, &tip);
+        let sigop_cost = self.real_sigop_cost(cs, tx, flags);
+        if !push(
+            &mut steps,
+            "sigop-cap",
+            if sigop_cost > MAX_STANDARD_TX_SIGOPS_COST {
+                Err(format!(
+                    "bad-txns-too-many-sigops: {sigop_cost} > {MAX_STANDARD_TX_SIGOPS_COST}"
+                ))
+            } else {
+                Ok(format!("{sigop_cost} <= {MAX_STANDARD_TX_SIGOPS_COST}"))
+            },
+        ) {
+            return steps;
+        }
+        let vsize = virtual_size(tx.weight(), sigop_cost);
+
         if !push(
             &mut steps,
             "bip125-signal",
@@ -662,7 +692,6 @@ impl Mempool {
             return steps;
         }
 
-        let vsize = tx.weight().div_ceil(4);
         let ancestors = self.ancestors_of(tx);
 
         if !conflicts.is_empty() {
@@ -746,8 +775,7 @@ impl Mempool {
             return steps;
         }
 
-        let tip = cs.tip_hash();
-        let next_height = cs.tree().tip().height + 1;
+        // `tip`/`next_height` were already computed above (sigop-cap).
         let mut overlay = UtxoSet::new();
         for (input, coin) in tx.inputs.iter().zip(spent.iter()) {
             overlay.insert_synthetic(input.previous_output, coin.clone());
@@ -762,22 +790,6 @@ impl Mempool {
                 return steps;
             }
         };
-
-        let flags = standard_script_flags(cs, next_height, &tip);
-        let sigop_cost = self.real_sigop_cost(cs, tx, flags);
-        if !push(
-            &mut steps,
-            "sigop-cap",
-            if sigop_cost > MAX_STANDARD_TX_SIGOPS_COST {
-                Err(format!(
-                    "bad-txns-too-many-sigops: {sigop_cost} > {MAX_STANDARD_TX_SIGOPS_COST}"
-                ))
-            } else {
-                Ok(format!("{sigop_cost} <= {MAX_STANDARD_TX_SIGOPS_COST}"))
-            },
-        ) {
-            return steps;
-        }
 
         if !conflicts.is_empty() {
             let conflict_fees: i64 = conflicts
@@ -914,6 +926,23 @@ impl Mempool {
             }
         }
 
+        // 2.5 Sigop cost and the one true vsize for this entry — Core's
+        //    `GetTransactionSigOpCost` and `GetVirtualTransactionSize`
+        //    (`max(weight, sigops * bytes_per_sigop) / 4`). Computed once
+        //    and used for every size-based decision below, the stored
+        //    entry, and every later ancestor/descendant/eviction
+        //    calculation that reads it back off the entry. Also enforces
+        //    the per-tx sigop cap (Core's PreChecks,
+        //    `MAX_STANDARD_TX_SIGOPS_COST`) independent of byte size.
+        let tip = cs.tip_hash();
+        let next_height = cs.tree().tip().height + 1;
+        let flags = standard_script_flags(cs, next_height, &tip);
+        let sigop_cost = self.real_sigop_cost(cs, &tx, flags);
+        if sigop_cost > MAX_STANDARD_TX_SIGOPS_COST {
+            return Err(MempoolReject::TooManySigops);
+        }
+        let vsize = virtual_size(tx.weight(), sigop_cost);
+
         // 3. BIP125: with full-RBF off, a conflicted spend may only
         //    proceed if every conflict signals replaceability and the
         //    bump is large enough — checked after the fee is known
@@ -931,7 +960,6 @@ impl Mempool {
         //    candidate's in-pool ancestor set (count and total vsize)
         //    is bounded, and no ancestor's descendant set may overflow
         //    by accepting it.
-        let vsize = tx.weight().div_ceil(4);
         let ancestors = self.ancestors_of(&tx);
 
         if !conflicts.is_empty() {
@@ -977,23 +1005,13 @@ impl Mempool {
 
         // 4. Consensus input checks against an overlay containing exactly
         //    this tx's resolved coins — identical logic to block connect.
-        let tip = cs.tip_hash();
-        let next_height = cs.tree().tip().height + 1;
+        //    `tip`/`next_height` were already computed at step 2.5.
         let mut overlay = UtxoSet::new();
         for (input, coin) in tx.inputs.iter().zip(spent.iter()) {
             overlay.insert_synthetic(input.previous_output, coin.clone());
         }
         let (_, fee) =
             check_tx_inputs(&tx, &overlay, next_height).map_err(MempoolReject::Inputs)?;
-
-        // 4.5 Per-tx sigop cap (Core's PreChecks, `GetTransactionSigOpCost`
-        //    vs `MAX_STANDARD_TX_SIGOPS_COST`): a handful of expensive
-        //    inputs can burn CPU wildly out of proportion to a tx's size,
-        //    so it's capped independent of the byte/weight limits.
-        let flags = standard_script_flags(cs, next_height, &tip);
-        if self.real_sigop_cost(cs, &tx, flags) > MAX_STANDARD_TX_SIGOPS_COST {
-            return Err(MempoolReject::TooManySigops);
-        }
 
         // 5. BIP125 fee rule: replacement must pay the conflicts' fees
         //    plus incremental relay for its own size.
@@ -1024,7 +1042,7 @@ impl Mempool {
         // 7. Script checks: consensus flags at the next height plus
         //    Core's standardness set (policy — a tx failing only these
         //    is still block-valid, just not relayed). `flags` was
-        //    already computed for the sigop cap above (4.5).
+        //    already computed for the sigop cap and vsize above (2.5).
         let spent_outs: Vec<_> = spent.iter().map(|c| c.out.clone()).collect();
         check_input_scripts(&tx, &spent_outs, flags).map_err(MempoolReject::ScriptVerify)?;
         avila_consensus::sigchecker::mark_scripts_verified(tx.txid(), flags);
@@ -1073,6 +1091,7 @@ impl Mempool {
                 tx,
                 fee,
                 vsize,
+                sigops: sigop_cost,
                 time: now,
                 first_seen_height: cs.tree().tip().height,
                 // A prioritisetransaction delta recorded before the tx
@@ -1657,6 +1676,21 @@ impl Default for Mempool {
     }
 }
 
+/// Core's `GetVirtualTransactionSize(weight, sigop_cost, bytes_per_sigop)`
+/// with Core's default `bytes_per_sigop` (`DEFAULT_BYTES_PER_SIGOP`, 20):
+/// `max(weight, sigops * 20)` rounded up to vbytes. A sigop-heavy tx is
+/// billed as if it were as big as its sigop cost demands, even when its
+/// byte weight is small — the one vsize every size-based mempool and
+/// template decision should read back off the entry rather than
+/// recomputing from `tx.weight()` alone.
+pub(crate) fn virtual_size(weight: usize, sigop_cost: u64) -> usize {
+    /// Core's `DEFAULT_BYTES_PER_SIGOP`.
+    const BYTES_PER_SIGOP: u64 = 20;
+    let sigop_weight =
+        usize::try_from(sigop_cost.saturating_mul(BYTES_PER_SIGOP)).unwrap_or(usize::MAX);
+    weight.max(sigop_weight).div_ceil(4)
+}
+
 /// Core's `STANDARD_SCRIPT_VERIFY_FLAGS`: the mandatory consensus set at
 /// `next_height` plus the standardness flags — policy-only tightenings a
 /// block may still violate without being invalid.
@@ -1917,6 +1951,31 @@ mod tests {
             pool.accept_tx(tx, &cs, NOW),
             Err(MempoolReject::TooManySigops)
         );
+    }
+
+    #[test]
+    fn vsize_is_sigop_adjusted_not_just_weight() {
+        // Core's `GetVirtualTransactionSize`: a sigop-heavy but
+        // byte-light tx is billed at `sigops * 20` bytes-equivalent
+        // once that exceeds its real weight, not `weight / 4` alone —
+        // and every gate (here, min-relay-fee) must read that adjusted
+        // size, not re-derive its own from `tx.weight()`. 100 bare
+        // OP_CHECKMULTISIG opcodes cost 100*20*4 = 8,000 sigop cost
+        // (safely under the 16,000 per-tx cap) — 8,000*20 = 160,000
+        // weight-equivalent bytes, vastly more than this ~640 WU tx's
+        // real weight (~40,000 vB vs. ~160 vB). A 2,000 sat fee clears
+        // min-relay under the old, weight-only vsize but not the
+        // correct, sigop-adjusted one.
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let mut tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_998_000, SEQ_FINAL);
+        tx.outputs[0].script_pubkey = Script::new(vec![script::OP_CHECKMULTISIG; 100]);
+        let txid = tx.txid();
+        assert_eq!(
+            pool.accept_tx(tx, &cs, NOW),
+            Err(MempoolReject::MinRelayFee)
+        );
+        assert!(pool.get(&txid).is_none());
     }
 
     #[test]
