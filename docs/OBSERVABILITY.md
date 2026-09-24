@@ -20,6 +20,7 @@ ring, not a journal; consumers that need every event must poll.
 | `announced` | `peer`, `missing` | A peer announced blocks we lack — the fetch frontier moved. |
 | `eclipse_suspected` | `signals` | Advisory eclipse indicators fired — see below. |
 | `recon_divergence` | `peer`, `rounds`, `their_misses`, `our_misses` | A recon peer persistently lacks txs we hold — censorship/filtered-view signal (queue #19). Edge-triggered: fires once per sustained streak, not per round. |
+| `proxy_unreachable` | — | With `--proxy` set, 3 consecutive outbound dials failed — the private route itself is down. Edge-triggered. |
 | `cpu_throttled` | `peer`, `rate_ns` | A peer dominated dispatch CPU (>50% share at >200 ms/s) and lost a tick's poll — backpressure, not a ban (queue #14). |
 
 ### Eclipse signals (`eclipse_suspected.signals`)

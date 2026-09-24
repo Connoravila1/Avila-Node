@@ -164,6 +164,10 @@ pub enum NetEvent {
     /// A peer dominated dispatch CPU (>50% share, >200ms/s sustained)
     /// and lost this tick's poll — backpressure throttling, not a
     /// disconnect (queue #14).
+    /// With a proxy configured, outbound dials keep failing — the
+    /// private-mode route itself is down. Edge-triggered at 3
+    /// consecutive failures so one refused dial isn't noise.
+    ProxyUnreachable,
     CpuThrottled {
         /// The manager-assigned peer id.
         peer: u64,
@@ -491,6 +495,9 @@ pub struct PeerManager<S> {
     /// When set, EVERY outbound connection routes through it; there
     /// is no clearnet fallback (fail-closed — queue #13).
     proxy: Option<SocketAddr>,
+    /// Consecutive failed dials under proxy mode — feeds the
+    /// `ProxyUnreachable` edge trigger; reset by any successful dial.
+    proxy_failures: u32,
     /// Fixed-size send cells — 0 disables. See `set_cell_bytes`.
     cell_bytes: usize,
     /// Last time the eclipse-signal check ran (paced to ~60s).
@@ -606,6 +613,7 @@ impl<S: Read + Write> PeerManager<S> {
             event_ring: std::collections::VecDeque::with_capacity(1025),
             eclipse_checked_at: Instant::now(),
             proxy: None,
+            proxy_failures: 0,
             cell_bytes: 0,
             bans: crate::banman::BanList::new(),
             banlist_path: None,
@@ -2578,7 +2586,23 @@ impl PeerManager<TcpStream> {
         // connect for the same reason.
         while let Ok((addr, result)) = self.dial_rx.try_recv() {
             self.pending_dials.remove(&addr);
-            let Ok(session) = result else { continue };
+            let Ok(session) = result else {
+                // Proxy health (privacy matrix): a failed dial under
+                // proxy mode means the private route itself is down —
+                // surface it once after a sustained streak instead of
+                // leaving zero-peers unexplained.
+                if self.proxy.is_some() {
+                    self.proxy_failures += 1;
+                    if self.proxy_failures == 3 {
+                        if self.event_ring.len() >= 1024 {
+                            self.event_ring.pop_front();
+                        }
+                        self.event_ring.push_back(NetEvent::ProxyUnreachable);
+                    }
+                }
+                continue;
+            };
+            self.proxy_failures = 0;
             let remote = addrman::net_addr_of(addr, 0);
             // A ban or a full peer set that landed mid-dial still
             // applies — Core rechecks IsBanned after connect.
@@ -4476,6 +4500,46 @@ mod tests {
             "the dial must have arrived at the proxy — a clearnet bypass is a leak"
         );
         assert_eq!(mgr.len(), 0, "no peer may land through a dead proxy");
+    }
+
+    /// Retry cell (privacy matrix): after a dead-proxy dial fails,
+    /// the NEXT maintain round must retry THROUGH the proxy again —
+    /// every attempt arrives at the SOCKS5 endpoint, never clearnet.
+    #[test]
+    fn proxy_retries_also_ride_the_proxy() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_saw = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let saw = proxy_saw.clone();
+        std::thread::spawn(move || {
+            while let Ok((mut s, _)) = proxy_listener.accept() {
+                saw.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 8];
+                let _ = s.read(&mut buf);
+            }
+        });
+        let mut mgr = PeerManager::new(4);
+        mgr.set_proxy(Some(proxy_addr));
+        let candidate: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+        mgr.addrbook().add_many(
+            std::iter::once((crate::addrman::net_addr_of(candidate, 0), NOW)),
+            NOW,
+        );
+        let mut cs = regtest();
+        // Two maintain rounds = a retry after the first failure.
+        for _ in 0..2 {
+            let _ = mgr.maintain_outbounds(MAGIC, 0);
+            std::thread::sleep(Duration::from_millis(300));
+            mgr.tick(&mut cs, NOW);
+        }
+        assert!(
+            proxy_saw.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the retry must also arrive at the proxy — {} attempt(s) seen",
+            proxy_saw.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(mgr.len(), 0);
     }
 
     /// Self-eclipse field test (queue #22): the lab attack — every

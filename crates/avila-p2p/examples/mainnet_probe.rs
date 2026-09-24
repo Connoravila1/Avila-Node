@@ -80,7 +80,9 @@ fn main() -> Result<(), String> {
                 NetEvent::CpuThrottled { peer, rate_ns } => {
                     println!("peer {peer}: cpu-throttled at {rate_ns}ns/s")
                 }
-                NetEvent::Announced { .. } | NetEvent::TipAdvanced(_) => {}
+                NetEvent::Announced { .. }
+                | NetEvent::TipAdvanced(_)
+                | NetEvent::ProxyUnreachable => {}
             }
         }
         let indexed = cs.tree().len() - 1;

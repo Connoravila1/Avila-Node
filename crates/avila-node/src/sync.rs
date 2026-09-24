@@ -386,7 +386,11 @@ pub fn run(
     }
     // `-connect` is exclusive in Core — naming peers suppresses DNS
     // seeding entirely (and `-connect=0` yields a fully offline node).
-    let seeded = if cfg.connect.is_empty() {
+    // Proxy mode also suppresses seeding: `resolve_seeds` is a LOCAL
+    // DNS lookup, which would leak the resolver to the operator's DNS
+    // even though every dial then rides the proxy — the same reason
+    // Core's `-onlynet=onion` never touches DNS seeds (queue #13).
+    let seeded = if cfg.connect.is_empty() && cfg.proxy.is_none() {
         mgr.seed_from_dns(params, unix_now())
     } else {
         0

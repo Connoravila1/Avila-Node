@@ -80,6 +80,7 @@ fn main() -> Result<(), String> {
                 NetEvent::CpuThrottled { peer, rate_ns } => {
                     println!("peer {peer}: cpu-throttled at {rate_ns}ns/s")
                 }
+                NetEvent::ProxyUnreachable => println!("proxy unreachable — private route down"),
             }
         }
         let tip = cs.chain().len() as i64 - 1;

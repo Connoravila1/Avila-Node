@@ -7219,6 +7219,9 @@ pub(crate) fn dispatch(
                             "their_misses": their_misses,
                             "our_misses": our_misses,
                         }),
+                        avila_p2p::manager::NetEvent::ProxyUnreachable => json!({
+                            "event": "proxy_unreachable",
+                        }),
                         avila_p2p::manager::NetEvent::CpuThrottled { peer, rate_ns } => json!({
                             "event": "cpu_throttled",
                             "peer": peer,
