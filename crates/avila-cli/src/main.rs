@@ -440,6 +440,12 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     peer_details: Vec::new(),
                     mempool: (0, 0, None),
                     elapsed_secs: 0,
+                    validation: avila_consensus::chainstate::ValidationReport {
+                        connected_height: 0,
+                        header_height: 0,
+                        snapshot: None,
+                        verified_fraction: 1.0,
+                    },
                 }));
             let (query_tx, query_rx) = std::sync::mpsc::channel();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

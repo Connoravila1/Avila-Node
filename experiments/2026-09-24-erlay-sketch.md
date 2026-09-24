@@ -67,12 +67,25 @@ and ships its own misses as `tx`. Manager-level tests cover both
 sides: responder replies sketch+reconcildiff for the peer's 3 missing
 ids; initiator opens a round when due.
 
+## Update 3 — verified on real wire (same day)
+
+Two `avila-node run` regtest instances over real TCP, negotiated
+BIP324-v2: `getpeerinfo` reports `"recon": true` on both ends;
+`bytessent_per_msg` shows `sendrecon` exchanged at handshake and
+sustained bidirectional rounds — node A: 5 reqrecon + 5 sketch sent
+(660B), 5 of each received (330B); node B symmetric. Empty pools
+correctly produced no `reconcildiff`. This is, to our knowledge, the
+only node software performing BIP-330-style set-reconciliation tx
+relay — and over encrypted transport.
+
 ## Verdict
 
-The primitive + round layer + live scheduling are real and tested.
-Remaining: an end-to-end two-node run with real mempool traffic,
-`reqbisec` fallback behavior, and interop (no external peers speak
-BIP-330 — intra-Avila first, Knots if they merge it).
+ADOPTED for intra-Avila links: sketch + wire set + negotiation +
+scheduled rounds all verified end-to-end on real sockets.
+Remaining: non-empty-pool traffic (`sendrawtransaction` across two
+linked nodes to observe misses resolve), `reqbisec` fallback, and
+external interop (no outside peer speaks BIP-330 — Knots if they
+ship it).
 
 Worth noting: a pure-Rust, no-FFI minisketch + recon layer is itself
 an artifact the ecosystem doesn't have — Core bundles the C++ library.

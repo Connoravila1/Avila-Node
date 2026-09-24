@@ -120,6 +120,7 @@ def main():
         print(label, flush=True)
         kind, corpus = (name, Path('/dev/null')) if name in ('cases', 'rare') else (
             ('scripts', args.historical_corpus.resolve()) if name == 'mainnet' else
+            ('chain', Path(__file__).resolve().parents[1] / 'fixtures/mainnet-blocks-000000-000500.dat') if name == 'early' else
             ('rollback' if name == 'rollback' else 'chain', Path('/tmp/spend-fixture.dat')))
         if minimum is None:
             minimum = 0 if name in ('cases', 'rare', 'rollback') else 64
@@ -240,7 +241,23 @@ def main():
             run('asan-stream', worker=args.checked_worker.resolve(), batch=1)
             run('asan-produce', mode=args.producer_mode, sidecar=out / 'asan-produce.advice', worker=args.checked_worker.resolve())
         run('producer-one-record-batches', mode=args.producer_mode, sidecar=out / 'producer-one.advice', batch=1)
+        if not run('stream-invalid-spend-rollback', name='rollback', sidecar=built / 'regtest.hints')['retry_groups']:
+            raise ValueError('invalid hinted spend must reject and restore the prefix')
         run('producer-invalid-spend-rollback', name='rollback', mode=args.producer_mode, sidecar=out / 'producer-rollback.advice')
+        for name in ['early', 'regtest']:
+            source = (built / f'{name}.hints').read_bytes()
+            start = time.perf_counter()
+            before = time.process_time()
+            # No reader change is needed: absent frames already select ordinary checks.
+            sparse = encode([(k, v) for k, v in frames(source) if any(decode(v))])
+            elapsed, cpu_seconds = time.perf_counter() - start, time.process_time() - before
+            path = out / f'{name}-sparse.hints'
+            path.write_bytes(sparse)
+            row = run(f'{name}-sparse', name=name, sidecar=path)
+            row.update(dense_bytes=len(source), sparse_bytes=len(sparse), sparsify_wall_seconds=elapsed,
+                       sparsify_cpu_seconds=cpu_seconds, sparse_sha256=digest(path))
+            if row['retry_groups'] or row['stream_rejected']:
+                raise ValueError('omitting hintless frames must preserve ordinary fallback')
         if args.rare_cases:
             trace, reference = out / 'rare.trace', out / 'rare.advice'
             run('rare-capture', name='rare', mode='capture', sidecar=trace)
@@ -266,6 +283,10 @@ def main():
             truncated.write_bytes(encode([(items[0][0], items[0][1][:-1])]))
             if not run('rare-truncated-escape', name='rare', sidecar=truncated)['stream_rejected']:
                 raise ValueError('truncated rare escape must fall back')
+            if args.checked_worker:
+                run('asan-rare-stream', name='rare', sidecar=packed, worker=args.checked_worker.resolve(), batch=1)
+                run('asan-rare-produce', name='rare', mode=args.producer_mode,
+                    sidecar=out / 'asan-rare.advice', worker=args.checked_worker.resolve())
     for mode in ['baseline', 'candidate', 'stream', args.producer_mode]:
         if args.only and 'memory' not in args.only:
             continue
