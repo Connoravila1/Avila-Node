@@ -6968,6 +6968,10 @@ pub(crate) fn dispatch(
                             "peer": peer,
                             "missing": missing.len(),
                         }),
+                        avila_p2p::manager::NetEvent::EclipseSuspected(signals) => json!({
+                            "event": "eclipse_suspected",
+                            "signals": signals.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>(),
+                        }),
                     })
                     .collect();
                 Ok(json!(events))

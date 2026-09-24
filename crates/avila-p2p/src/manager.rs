@@ -104,6 +104,17 @@ const HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER: Duration = Duration::from_millis(1);
 /// applies" window: `m_best_header->Time() > now - 24h`.
 const RECENT_HEADER_WINDOW_SECS: u32 = 24 * 60 * 60;
 
+/// An eclipse indicator — advisory, not proof (queue #12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EclipseSignal {
+    /// Tip >24h stale while ≥4 peers all claim a higher height.
+    TipStale,
+    /// Every outbound peer shares one /16 net group.
+    DiversityCollapse,
+    /// All established peers are inbound — outbound slots empty.
+    AllInbound,
+}
+
 /// What one peer's removal meant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DisconnectReason {
@@ -134,6 +145,8 @@ pub enum NetEvent {
     },
     /// Our connected tip advanced — `(new height)`.
     TipAdvanced(u32),
+    /// Eclipse indicators fired — advisory, not proof (queue #12).
+    EclipseSuspected(Vec<EclipseSignal>),
     /// A peer announced blocks we don't have (headers may need fetching).
     Announced {
         /// The peer id.
@@ -376,6 +389,8 @@ pub struct PeerManager<S> {
     stem_pending: Vec<(avila_consensus::hash::Txid, avila_consensus::hash::Wtxid, Instant)>,
     /// Whether locally-submitted txs take the stem path — default on.
     stem_relay: bool,
+    /// Last time the eclipse-signal check ran (paced to ~60s).
+    eclipse_checked_at: Instant,
     /// Named event ring (queue #33): every NetEvent the tick produces
     /// also lands here, capped — the operator-facing "what is the node
     /// doing" stream that Core #34901 asked for.
@@ -485,6 +500,7 @@ impl<S: Read + Write> PeerManager<S> {
             stem_relay: true,
             asmap: crate::asmap::AsMap::empty(),
             event_ring: std::collections::VecDeque::with_capacity(1025),
+            eclipse_checked_at: Instant::now(),
             bans: crate::banman::BanList::new(),
             banlist_path: None,
             dial_tx: dial_channel.0,
@@ -919,6 +935,14 @@ impl<S: Read + Write> PeerManager<S> {
         self.recon_pass();
         self.rebroadcast_pass(cs, now);
         self.stem_fluff_pass();
+        // Eclipse-signal check — paced ~60s; advisory indicators only.
+        if self.eclipse_checked_at.elapsed() >= Duration::from_secs(60) {
+            self.eclipse_checked_at = Instant::now();
+            let signals = self.eclipse_signals(cs, now);
+            if !signals.is_empty() {
+                events.push(NetEvent::EclipseSuspected(signals));
+            }
+        }
         for e in &events {
             if self.event_ring.len() >= 1024 {
                 self.event_ring.pop_front();
@@ -931,6 +955,61 @@ impl<S: Read + Write> PeerManager<S> {
     /// The bounded event ring — newest `NetEvent`s first.
     pub fn recent_events(&self) -> &std::collections::VecDeque<NetEvent> {
         &self.event_ring
+    }
+
+    /// Eclipse indicators (queue #12) — signatures, not proof:
+    ///
+    /// * `TipStale`: our tip is >24h old while ≥4 established peers
+    ///   all claim a higher `start_height` — everyone is ahead of us
+    ///   but nobody's delivering. On a healthy link that's impossible.
+    /// * `DiversityCollapse`: ≥4 outbound peers and every one lives in
+    ///   the same /16 — the outbound set has no route diversity.
+    /// * `AllInbound`: ≥4 established peers and all are inbound —
+    ///   every outbound slot has failed or been starved, the classic
+    ///   eclipse precondition.
+    ///
+    /// Indicators only — an eclipse alarm is advisory. Cross-checking
+    /// disjoint routes (#10) is the escalation path.
+    pub fn eclipse_signals(&self, cs: &Chainstate, now: u32) -> Vec<EclipseSignal> {
+        let mut out = Vec::new();
+        let established: Vec<&PeerEntry<S>> =
+            self.peers.values().filter(|p| p.session.established()).collect();
+        let outbound: Vec<&&PeerEntry<S>> =
+            established.iter().filter(|p| !p.inbound).collect();
+
+        // TipStale: stale tip + everyone claims more.
+        let tip_time = cs.tree().tip().header.time;
+        let stale = tip_time < now.saturating_sub(RECENT_HEADER_WINDOW_SECS);
+        let our_height = cs.chain().len() as i32 - 1;
+        let all_claim_more = established.len() >= 4
+            && established
+                .iter()
+                .all(|p| {
+                    p.session.peer().map(|i| i.start_height).unwrap_or(0) > our_height
+                });
+        if stale && all_claim_more {
+            out.push(EclipseSignal::TipStale);
+        }
+
+        // DiversityCollapse: outbound set concentrated in one /16.
+        if outbound.len() >= 4 {
+            let mut groups: HashMap<[u8; 2], usize> = HashMap::new();
+            for p in &outbound {
+                if let Some(r) = p.remote {
+                    groups.entry([r.ip[0], r.ip[1]]).or_default();
+                    *groups.get_mut(&[r.ip[0], r.ip[1]]).unwrap() += 1;
+                }
+            }
+            if groups.len() == 1 {
+                out.push(EclipseSignal::DiversityCollapse);
+            }
+        }
+
+        // AllInbound: every established peer dialed us.
+        if established.len() >= 4 && outbound.is_empty() {
+            out.push(EclipseSignal::AllInbound);
+        }
+        out
     }
 
     /// Announces a locally submitted transaction via a single stem
@@ -4094,6 +4173,32 @@ mod tests {
         // mockscheduler 3600 — forward fires it once (not 60×).
         mgr.scheduler_forward(3600);
         assert_eq!(RAN.load(Ordering::Relaxed), 2);
+    }
+
+    /// Eclipse detector (queue #12): four inbound-only established
+    /// peers trips `AllInbound`; a healthy mixed set stays quiet.
+    #[test]
+    fn eclipse_detector_flags_all_inbound() {
+        let mut mgr = PeerManager::new(16);
+        let mut cs = regtest();
+        let mut ends = Vec::new();
+        for _ in 0..4 {
+            let (end, id) = add_inbound_peer(&mut mgr).unwrap();
+            ends.push((end, id));
+        }
+        // Complete the handshake on each: our side sends version,
+        // they answer version+verack.
+        for (end, _id) in &mut ends {
+            testpipe::inject(end, MAGIC, &Message::Version(peer_version(600)));
+            testpipe::inject(end, MAGIC, &Message::Verack);
+        }
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let signals = mgr.eclipse_signals(&cs, NOW);
+        assert!(
+            signals.contains(&EclipseSignal::AllInbound),
+            "four inbound-only peers should trip AllInbound: {signals:?}"
+        );
     }
 
     /// Adversarial live-wire (queue #28): hostile inputs hit the wire

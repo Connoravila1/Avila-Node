@@ -25,6 +25,7 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 | 16 | 09-23 | Crash fault-injection on hash engine | Commit ordering survives torn writes | **2 findings, both fixed** | torn records decoded to wrong-but-valid coins (silent corruption) → +4B keyed record tag, tears now misses; coins-ahead-of-tip tear invisible → index-header watermark, open errors loudly. File-level sim; compact() still unsafe | [fault-inject](2026-09-23-fault-injection.md) |
 
 
+| 55 | 09-24 | Eclipse indicators | Can the node notice it's being eclipsed? | **adopted (indicators)** | `eclipse_signals`: TipStale (>24h-old tip while ≥4 peers all claim higher), DiversityCollapse (all outbound in one /16), AllInbound (every established peer dialed us). Fires `NetEvent::EclipseSuspected` once/minute; sync logs it, `getevents` exposes it. Indicators, not proof — disjoint-route cross-check (#10) is the escalation. | — |
 | 54 | 09-24 | Continuous self-audit | Can the node re-prove stored blocks cheaply? | **adopted** | `audit_block` re-verifies a stored block's internal proofs (decode + merkle root + witness commitment — no historical UTXO needed); the sync loop samples 8 random heights per 2016 connected blocks, seeded so an adversary can't predict which regions are checked. Loud failure line + cumulative counter. Live UTXO-replay auditing stays open (needs undo-walk). | — |
 | 53 | 09-24 | Sovereign wallet stack completion | What does the watch-wallet surface still lack? | **mostly built; history RPCs closed it** | `getwalletinfo` (descriptors, scan floor, gaps) + `listtransactions` (synthesized receive/send history from per-coin lifecycle) — the stack already had importdescriptors/listdescriptors/listunspent/getbalances/rescanblockchain/deriveaddresses/listreceivedbyaddress + Electrum server + silent-payments watches. The "one binary replaces the EPS/bwt stack" claim is now actually checkable. | — |
 | 52 | 09-24 | Named observability surface | Can the node stream "what it's doing" natively? | **adopted (ring-level)** | `getevents` RPC over a capped 1024-entry `NetEvent` ring in the manager — connects, disconnects, tip advances, announcements, newest first. The `chain_query` channel carries it; mempool/consensus event classes extend it next. ASMap bucketing machinery also landed (#21): ASN-aware outbound dial deprioritization, kartograf-format parsing open. | — |
@@ -160,7 +161,7 @@ first measurement that would kill or confirm it.
     containment in a node. Measurable: publish the syscall whitelist,
     test what a compromised wire parser can actually reach.
 
-12. **Eclipse detection (not just resistance).** Watch the signatures —
+12. ~~**Eclipse detection (not just resistance).**~~ **done — #55 (indicators shipped; disjoint-route cross-check open).** Watch the signatures —
     stalled header progress, suspiciously-uniform peer agreement,
     work plateau — and cross-check disjoint routes to prove it. Lab
     experiment: mount a real eclipse, measure detection time.
