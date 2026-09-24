@@ -357,6 +357,13 @@ fn put_inv_vector(out: &mut Vec<u8>, inv: &InvVector) {
 /// The maximum `inv`-vector size — Core's `MAX_INV_SZ` (net_processing).
 const MAX_INV_SZ: u64 = 50_000;
 
+/// Core's `MAX_ADDR_TO_SEND` — also the cap net_processing enforces on
+/// an *incoming* `addr`/`addrv2`: a message naming more entries than
+/// this is misbehavior (Core disconnects rather than processing any of
+/// them). Rejecting it here at decode time produces the same outcome —
+/// the peer is dropped before a single entry is looked at.
+const MAX_ADDR_TO_SEND: u64 = 1_000;
+
 fn get_inv_list(d: &mut Decoder, command: &str) -> Result<Vec<InvVector>, PayloadError> {
     let count = d.read_compact_size().map_err(|e| payload_err(command, e))?;
     if count > MAX_INV_SZ {
@@ -579,10 +586,10 @@ impl Message {
             "feefilter" => Self::FeeFilter(d.read_u64_le().map_err(|e| payload_err(name, e))?),
             "addr" => {
                 let count = d.read_compact_size().map_err(|e| payload_err(name, e))?;
-                if count > MAX_INV_SZ * 20 {
+                if count > MAX_ADDR_TO_SEND {
                     return Err(payload_err(
                         name,
-                        format!("addr count {count} exceeds bound"),
+                        format!("addr count {count} exceeds MAX_ADDR_TO_SEND"),
                     ));
                 }
                 let mut v = Vec::with_capacity(d.bounded_capacity(count, 30));
@@ -595,10 +602,10 @@ impl Message {
             }
             "addrv2" => {
                 let count = d.read_compact_size().map_err(|e| payload_err(name, e))?;
-                if count > MAX_INV_SZ * 20 {
+                if count > MAX_ADDR_TO_SEND {
                     return Err(payload_err(
                         name,
-                        format!("addrv2 count {count} exceeds bound"),
+                        format!("addrv2 count {count} exceeds MAX_ADDR_TO_SEND"),
                     ));
                 }
                 let mut v = Vec::with_capacity(d.bounded_capacity(count, 8));
@@ -979,6 +986,20 @@ mod tests {
         };
         let msg = Message::Addr(vec![entry]);
         assert_eq!(round_trip(&msg), msg);
+    }
+
+    #[test]
+    fn addr_count_is_bounded() {
+        let mut payload = Vec::new();
+        write_compact_size(&mut payload, MAX_ADDR_TO_SEND + 1);
+        assert!(Message::decode(&cmd("addr"), &payload).is_err());
+    }
+
+    #[test]
+    fn addrv2_count_is_bounded() {
+        let mut payload = Vec::new();
+        write_compact_size(&mut payload, MAX_ADDR_TO_SEND + 1);
+        assert!(Message::decode(&cmd("addrv2"), &payload).is_err());
     }
 
     #[test]

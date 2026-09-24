@@ -9,7 +9,7 @@
 //! influence proportional to the share of *recent* addresses they feed
 //! us — and nothing here is consensus-critical.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use std::net::ToSocketAddrs;
@@ -56,6 +56,13 @@ pub struct AddrBook {
     table: HashMap<AddrKey, AddrInfo>,
     /// Monotonic intake counter → deterministic "newest first" order.
     seq: HashMap<AddrKey, u64>,
+    /// `(last_seen, seq, key)` for every entry in `table`, kept in sync
+    /// on every insert/update/removal so the oldest entry is always
+    /// `order`'s first element — O(log n) eviction instead of the O(n)
+    /// full-table scan `evict_oldest` used to do on every insert once
+    /// the table is full. `seq` breaks ties the same way it always did
+    /// (oldest-inserted first among equal `last_seen`).
+    order: BTreeSet<(u32, u64, AddrKey)>,
     next_seq: u64,
     cap: usize,
 }
@@ -73,6 +80,7 @@ impl AddrBook {
         Self {
             table: HashMap::new(),
             seq: HashMap::new(),
+            order: BTreeSet::new(),
             next_seq: 0,
             cap,
         }
@@ -104,20 +112,32 @@ impl AddrBook {
             // Refresh recency and union services (Core's AddSingle does
             // `nServices |= addr.nServices` even when nothing new is
             // inserted) — but don't reset tried/attempts.
-            e.last_seen = seen.min(now).max(e.last_seen);
+            let new_last_seen = seen.min(now).max(e.last_seen);
+            if new_last_seen != e.last_seen {
+                // Existing entries keep their original `seq` forever, so
+                // this is the same tuple `order` already holds save for
+                // `last_seen` — swap it rather than a stale scan.
+                let entry_seq = self.seq.get(&key).copied().unwrap_or(0);
+                self.order.remove(&(e.last_seen, entry_seq, key));
+                self.order.insert((new_last_seen, entry_seq, key));
+            }
+            e.last_seen = new_last_seen;
             e.addr.services |= addr.services;
             return false;
         }
         if self.table.len() >= self.cap {
             self.evict_oldest();
         }
-        self.seq.insert(key, self.next_seq);
+        let seq = self.next_seq;
+        self.seq.insert(key, seq);
         self.next_seq += 1;
+        let last_seen = seen.min(now);
+        self.order.insert((last_seen, seq, key));
         self.table.insert(
             key,
             AddrInfo {
                 addr,
-                last_seen: seen.min(now),
+                last_seen,
                 tried: false,
                 attempts: 0,
             },
@@ -149,8 +169,11 @@ impl AddrBook {
 
     /// Drops the entry (e.g. the peer proved unreachable or hostile).
     pub fn forget(&mut self, addr: &NetAddr) {
-        self.table.remove(&key_of(addr));
-        self.seq.remove(&key_of(addr));
+        let key = key_of(addr);
+        if let Some(e) = self.table.remove(&key) {
+            let seq = self.seq.remove(&key).unwrap_or(0);
+            self.order.remove(&(e.last_seen, seq, key));
+        }
     }
 
     /// Picks the next outbound candidate: fewest attempts first, then
@@ -280,13 +303,16 @@ impl AddrBook {
             let addr = NetAddr { services, ip, port };
             let key = key_of(&addr);
             if network_of(&addr) != Network::Unroutable && !self.table.contains_key(&key) {
-                self.seq.insert(key, self.next_seq);
+                let seq = self.next_seq;
+                self.seq.insert(key, seq);
                 self.next_seq += 1;
+                let last_seen = last_seen.min(now);
+                self.order.insert((last_seen, seq, key));
                 self.table.insert(
                     key,
                     AddrInfo {
                         addr,
-                        last_seen: last_seen.min(now),
+                        last_seen,
                         tried,
                         attempts,
                     },
@@ -297,16 +323,13 @@ impl AddrBook {
         Ok(self.table.len())
     }
 
-    /// Oldest-seen entries go first when the cap binds.
+    /// Oldest-seen entries go first when the cap binds — O(log n) via
+    /// `order`'s first element, rather than scanning the whole table.
     fn evict_oldest(&mut self) {
-        if let Some(victim) = self
-            .table
-            .iter()
-            .min_by_key(|(k, e)| (e.last_seen, self.seq.get(*k).copied().unwrap_or(u64::MAX)))
-            .map(|(k, _)| *k)
-        {
-            self.table.remove(&victim);
-            self.seq.remove(&victim);
+        if let Some(&victim) = self.order.iter().next() {
+            self.order.remove(&victim);
+            self.table.remove(&victim.2);
+            self.seq.remove(&victim.2);
         }
     }
 }
@@ -530,6 +553,32 @@ mod tests {
         assert_eq!(book.len(), 2);
         assert!(!book.table.contains_key(&key_of(&addr(1, 8333))));
         assert_eq!(book.select(), Some(addr(3, 8333)));
+    }
+
+    /// A re-gossiped entry's recency bump must actually reorder it in
+    /// the eviction queue, not just the table — pins the BTreeSet swap
+    /// `add` does on an update (the whole point of tracking eviction
+    /// order separately instead of rescanning the table each time).
+    #[test]
+    fn eviction_respects_last_seen_after_a_recency_bump() {
+        let mut book = AddrBook::with_cap(2);
+        book.add(addr(1, 8333), 100, 200); // oldest by insertion and last_seen
+        book.add(addr(2, 8333), 100, 200); // same last_seen, later seq
+        // Bump addr(1)'s recency past addr(2)'s.
+        book.add(addr(1, 8333), 190, 200);
+        // The table is full; the *new* oldest (addr 2) must be evicted,
+        // not addr(1) despite it having the smaller original seq.
+        book.add(addr(3, 8333), 150, 200);
+        assert_eq!(book.len(), 2);
+        assert!(
+            book.table.contains_key(&key_of(&addr(1, 8333))),
+            "the recently bumped entry must survive"
+        );
+        assert!(
+            !book.table.contains_key(&key_of(&addr(2, 8333))),
+            "the entry that is now oldest must be evicted"
+        );
+        assert!(book.table.contains_key(&key_of(&addr(3, 8333))));
     }
 
     #[test]

@@ -49,6 +49,17 @@ pub const SEND_BUDGET_PER_PEER: usize = 8 << 20;
 /// the connection-level liveness floor (Core pings at 2-minute intervals).
 pub const PING_INTERVAL: Duration = Duration::from_secs(120);
 
+/// Core's `MAX_ADDR_RATE_PER_SECOND` — the steady-state rate the
+/// per-peer address-processing token bucket refills at.
+const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
+
+/// Core's `MAX_ADDR_PROCESSING_TOKEN_BUCKET` — the passive refill's
+/// ceiling. A peer we've just asked `getaddr` can still push the
+/// bucket above this via a one-time bonus (Core bypasses the cap for
+/// exactly that reply); nothing in this crate sends `getaddr` yet, so
+/// only the passive refill applies today.
+const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1000.0;
+
 /// What one peer's removal meant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DisconnectReason {
@@ -132,9 +143,15 @@ struct PeerEntry<S> {
     synced_block_height: i64,
     /// Address entries accepted from this peer (`addr_processed`).
     addr_processed: u64,
-    /// Address entries dropped by the rate limiter
-    /// (`addr_rate_limited`) — zero until a limiter exists.
+    /// Address entries dropped by the rate limiter (`addr_rate_limited`).
     addr_rate_limited: u64,
+    /// `Peer::m_addr_token_bucket` — spendable address-processing
+    /// tokens; one is spent per `addr`/`addrv2` entry, refilled at
+    /// [`MAX_ADDR_RATE_PER_SECOND`] up to [`MAX_ADDR_PROCESSING_TOKEN_BUCKET`].
+    addr_token_bucket: f64,
+    /// `Peer::m_addr_token_timestamp` — when the bucket was last
+    /// refilled, so the refill amount is `elapsed * rate`.
+    addr_token_timestamp: Instant,
 }
 
 /// A read-only view of one connected peer — the manager's state is
@@ -587,6 +604,12 @@ impl<S: Read + Write> PeerManager<S> {
                 synced_block_height: -1,
                 addr_processed: 0,
                 addr_rate_limited: 0,
+                // Core's `Peer` default-inits the bucket to 1.0, not the
+                // 1000-token ceiling — a peer earns burst capacity only
+                // by us asking it for addresses or by waiting out the
+                // slow passive refill.
+                addr_token_bucket: 1.0,
+                addr_token_timestamp: now,
             },
         );
         Some(id)
@@ -1172,17 +1195,12 @@ impl<S: Read + Write> PeerManager<S> {
                 let _ = peer.session.send(&Message::AddrV2(entries));
             }
             SessionEvent::Message(Message::Addr(entries)) => {
-                peer.addr_processed += entries.len() as u64;
-                addrbook.add_many(entries.iter().map(|e| (e.addr, e.time)), now);
+                Self::process_addr(peer, addrbook, &entries, now, |e| Some((e.addr, e.time)));
             }
             SessionEvent::Message(Message::AddrV2(entries)) => {
-                peer.addr_processed += entries.len() as u64;
-                addrbook.add_many(
-                    entries
-                        .iter()
-                        .filter_map(|e| net_addr_of_v2(e).map(|a| (a, e.time))),
-                    now,
-                );
+                Self::process_addr(peer, addrbook, &entries, now, |e| {
+                    net_addr_of_v2(e).map(|a| (a, e.time))
+                });
             }
             SessionEvent::Message(Message::Pong(nonce)) => {
                 if let Some((expected, sent_at)) = peer.ping_outstanding
@@ -1196,6 +1214,49 @@ impl<S: Read + Write> PeerManager<S> {
             }
             SessionEvent::Message(_) => {}
         }
+    }
+
+    /// `addr`/`addrv2` intake: rate-limits how many entries from one
+    /// message we're willing to process (net_processing's per-peer
+    /// token bucket) before handing survivors to the address book. One
+    /// token is spent per *wire* entry regardless of whether `parse`
+    /// can turn it into a storable [`NetAddr`] — matching Core, which
+    /// spends the token before deciding an entry isn't useful. The
+    /// oversized-message case (`> MAX_ADDR_TO_SEND`) is already rejected
+    /// at decode time ([`crate::message`]), so every count reaching here
+    /// is legal; this only bounds the *rate*, not the burst size of a
+    /// single legal message.
+    fn process_addr<T>(
+        peer: &mut PeerEntry<S>,
+        addrbook: &mut AddrBook,
+        entries: &[T],
+        now_wall: u32,
+        parse: impl Fn(&T) -> Option<(NetAddr, u32)>,
+    ) {
+        let now = Instant::now();
+        if peer.addr_token_bucket < MAX_ADDR_PROCESSING_TOKEN_BUCKET {
+            // Don't refill past the ceiling — a peer that never sends
+            // addr traffic shouldn't accrue an ever-growing reserve.
+            let elapsed = now
+                .saturating_duration_since(peer.addr_token_timestamp)
+                .as_secs_f64();
+            peer.addr_token_bucket = (peer.addr_token_bucket + elapsed * MAX_ADDR_RATE_PER_SECOND)
+                .min(MAX_ADDR_PROCESSING_TOKEN_BUCKET);
+        }
+        peer.addr_token_timestamp = now;
+        let mut accepted = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if peer.addr_token_bucket < 1.0 {
+                peer.addr_rate_limited += 1;
+                continue;
+            }
+            peer.addr_token_bucket -= 1.0;
+            peer.addr_processed += 1;
+            if let Some(pair) = parse(entry) {
+                accepted.push(pair);
+            }
+        }
+        addrbook.add_many(accepted.into_iter(), now_wall);
     }
 
     /// Total in-flight block requests across all peers.
@@ -2672,19 +2733,55 @@ mod tests {
         handshake(&mut mgr, &mut peer, &mut cs);
         testpipe::drain(&mut peer, MAGIC);
 
-        let gossip = vec![
-            AddrEntry {
-                time: NOW - 10,
-                addr: addrman::net_addr_of("93.184.216.34:18444".parse().unwrap(), NODE_NETWORK),
-            },
-            AddrEntry {
-                time: NOW - 5,
-                addr: addrman::net_addr_of("93.184.216.35:18445".parse().unwrap(), NODE_NETWORK),
-            },
-        ];
+        // A single entry: Core's address-processing token bucket starts
+        // at 1.0 (see `addr_processing_is_rate_limited` for the
+        // multi-entry, rate-limited case), so one entry always clears it.
+        let gossip = vec![AddrEntry {
+            time: NOW - 10,
+            addr: addrman::net_addr_of("93.184.216.34:18444".parse().unwrap(), NODE_NETWORK),
+        }];
         testpipe::inject(&mut peer, MAGIC, &Message::Addr(gossip));
         mgr.tick(&mut cs, NOW);
-        assert_eq!(mgr.addr_book().len(), 2);
+        assert_eq!(mgr.addr_book().len(), 1);
+    }
+
+    /// Core's per-peer address-processing token bucket
+    /// (`MAX_ADDR_RATE_PER_SECOND`/`MAX_ADDR_PROCESSING_TOKEN_BUCKET`):
+    /// a freshly connected peer starts with exactly one token, so a
+    /// message bundling several unsolicited addresses only has the
+    /// first one processed — the rest are rate-limited, not stored, and
+    /// counted separately from what was processed.
+    #[test]
+    fn addr_processing_is_rate_limited() {
+        let (mut mgr, mut peer, id) = managed_peer();
+        let mut cs = regtest();
+        handshake(&mut mgr, &mut peer, &mut cs);
+        testpipe::drain(&mut peer, MAGIC);
+
+        let gossip: Vec<AddrEntry> = (0..5)
+            .map(|i| AddrEntry {
+                time: NOW - 10,
+                addr: addrman::net_addr_of(
+                    format!("93.184.216.{}:18444", 40 + i).parse().unwrap(),
+                    NODE_NETWORK,
+                ),
+            })
+            .collect();
+        testpipe::inject(&mut peer, MAGIC, &Message::Addr(gossip));
+        mgr.tick(&mut cs, NOW);
+
+        assert_eq!(
+            mgr.addr_book().len(),
+            1,
+            "only the first entry affords a token"
+        );
+        let snap = mgr
+            .peer_snapshots()
+            .into_iter()
+            .find(|p| p.id == id)
+            .unwrap();
+        assert_eq!(snap.addr_processed, 1);
+        assert_eq!(snap.addr_rate_limited, 4);
     }
 
     #[test]
