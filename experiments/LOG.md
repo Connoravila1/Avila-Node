@@ -27,6 +27,8 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 
 | 32 | 09-24 | Parallel ECDSA advice with bounded recovery | Does the replay gain survive eight workers, bad hints and durable state? | **qualified offline prototype; not enabled in production** | 3 repeats: mainnet Script CPU 25.05 → 19.29 s (−23.0%), elapsed 19.80 → 16.43 s (−17.0%); complete regtest CPU −7.2% RAM / −5.3% disk+reopen. All-corrupt advice retries 7,351/183,782 checks in 8 bounded groups, +2.5% CPU vs ordinary. 93 replay runs + 10 additional checks; invalid-spend rollback and UTXO hashes pass; 479 unit tests pass, 2 existing ignores. Tradeoffs: sampled summed RSS 59 → 180 MiB; framed sidecar 3.57 MB; two-pass preparation 54.38 s. Full mainnet IBD unmeasured. | [parallel-replay](2026-09-24-ecdsa-parallel-replay.md) |
 
+| 35 | 09-24 | Erlay recon — pure-Rust minisketch | Is the sketch primitive tractable without C++ FFI? | **adopt (primitive) — works + measured** | `p2p/sketch.rs`: GF(2^32) syndromes + BM + trace-split decode, 5 tests incl over-capacity rejection. 512B sketch reconciles what 1.28MB inv sends (~2500x, D=64); decode quadratic — cap+rate-limit needed (DoS surface). BIP-330 msg layer + short-ids remain; interop = intra-Avila first. | [erlay-sketch](2026-09-24-erlay-sketch.md) |
+
 | 34 | 09-24 | Address-index cost model | What does the Electrum-style index cost? | **measured — build ~free, serve needs disk-backing** | Spend fixture: connect delta ~0% (8.56s vs 8.64s); scindex.dat ~38B/entry. In-mem by_script map ~46B/entry → ~200GB at mainnet — the query layer needs hashstore backing (bounded refactor, already designed). | [addr-index](2026-09-24-address-index-cost.md) |
 
 | 32 | 09-24 | Live network sync (signet) | Can the node sync against real peers? | **works — fetch scheduling is the limiter** | Signet, DNS-seeded: 208 blocks connected in 15.4s; resumed run reached 1124 blocks/66k headers in 640s (~1.7 blk/s — in-flight stays 0-96, scheduler conservative; validation never the bottleneck). Resume works. Mainnet-scale unproven. | [live-signet](2026-09-24-live-signet-sync.md) |
@@ -104,12 +106,12 @@ first measurement that would kill or confirm it.
    speak it. First step: implement BIP-330 recon-only message handling and
    measure reconciliation rounds between two Avila nodes.
 
-4. **Differential fuzzing vs Core/Knots.** Continuous random-block/tx
+3. **Differential fuzzing vs Core/Knots.** Continuous random-block/tx
    generation with byte-exact comparison — turns "compatible" into a
    monitored property rather than a claim. First step: fuzz harness on the
    existing diff fixture generator, seeded corpus from past bugs.
 
-5. **Utreexo research program.** BIPs 181-183 now have assigned numbers;
+4. **Utreexo research program.** BIPs 181-183 now have assigned numbers;
    rustreexo 0.6.0 exists. Validate blocks against accumulator + proofs —
    ~KB of state vs 12GB UTXO set. Months, not days; needs bridge-node
    proof supply. First step: rustreexo spike — add/delete/prove round-trip
