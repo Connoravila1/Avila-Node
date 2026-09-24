@@ -292,6 +292,13 @@ impl UtxoSet {
         self.swift_hold = false;
     }
 
+    /// `true` while the transient window is held open — periodic
+    /// flush callers check this; an explicit flush still writes.
+    #[must_use]
+    pub fn swiftsync_holding(&self) -> bool {
+        self.swift_hold
+    }
+
     /// `true` while SwiftSync tracking is on.
     #[must_use]
     pub fn swiftsync(&self) -> bool {

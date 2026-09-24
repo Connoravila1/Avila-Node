@@ -504,7 +504,14 @@ pub fn run(
         // Periodic chainstate checkpoint — Core's `FlushStateToDisk`
         // cadence. A crash otherwise replays every blk file since the
         // last state.dat; bounding the interval bounds the replay.
-        if cfg.data_dir.is_some() && last_flush + FLUSH_INTERVAL <= connected {
+        // Skipped while the SwiftSync transient window is held — a
+        // mid-window flush would write the coins the scheme exists
+        // to skip (crash during the window replays it — the
+        // documented trade-off).
+        if cfg.data_dir.is_some()
+            && !cs.swiftsync_holding()
+            && last_flush + FLUSH_INTERVAL <= connected
+        {
             last_flush = connected;
             cs.flush().map_err(SyncError::Store)?;
         }

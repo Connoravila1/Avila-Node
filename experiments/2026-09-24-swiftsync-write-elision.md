@@ -179,3 +179,33 @@ Still open: the never-keep-full-coins variant that would shrink the
 transient map (the 682MiB-at-signet cost — for mainnet IBD this
 design needs a spool or a smaller per-coin footprint), and a live
 end-to-end run where two nodes exchange a real hints file.
+
+---
+
+## Live-run finding — the transient map is the binding constraint (09-24)
+
+Ran the real signet node (`AVILA_SWIFTSYNC=1`, synced 7.4M-coin set):
+
+- **Enable-on-nonempty-set cost: ~6 minutes at 100% CPU + ~3.5GB RSS**
+  — `iter()` walks all of redb, hashes every coin. One-time, but real.
+- The node then re-entered IBD (94k blocks behind the new tip) with
+  `swift_hold` keeping every new coin transient — RSS kept climbing
+  and the box (30GB, ~12GB already pinned by tmpfs data) hit a device
+  memory alert. Run stopped.
+- A periodic-flush gap was found and fixed in the same pass: the sync
+  loop's `FLUSH_INTERVAL` checkpoint called `cs.flush()`
+  unconditionally — mid-window writes would have silently defeated
+  the elision. Now gated on `cs.swiftsync_holding()`; explicit
+  flushes (shutdown/checkpoint) still write.
+
+Honest read: at signet scale the win is real (67% write elision,
+exact aggregate, fraud detection) but **the transient set is the
+cost** — ~96B/entry × live-set size held in RAM for the whole
+window. For mainnet IBD (~170M coins) that is ~16GB before growth —
+the same wall Core's SwiftSync hits. The design needs either a
+committed-checkpoint cadence (smaller windows — checkpoint every N
+blocks against the running aggregate, not just at tip) or the
+leaner per-entry representation (the map stores full `Coin`s; a
+swiftsync window only needs enough to validate spends — value +
+script, which it already has — so the saving would come from
+not-yet-spent hints driving *creation* elision, a bigger rewrite).

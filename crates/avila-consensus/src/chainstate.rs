@@ -2058,6 +2058,14 @@ impl Chainstate {
         self.utxo.release_swiftsync_hold();
     }
 
+    /// `true` while the SwiftSync transient window is held open —
+    /// periodic flushes must defer or the elision is defeated.
+    /// Explicit flushes (shutdown, checkpoint) still write.
+    #[must_use]
+    pub fn swiftsync_holding(&self) -> bool {
+        self.utxo.swiftsync_holding()
+    }
+
     /// The running coin-tag aggregate, `None` when tracking is off.
     #[must_use]
     pub fn swiftsync_agg(&self) -> Option<crate::swiftsync::TagAgg> {
