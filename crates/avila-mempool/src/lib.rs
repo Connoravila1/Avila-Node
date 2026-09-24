@@ -138,6 +138,25 @@ impl Ord for ScoreKey {
 
 /// Why a transaction was refused — the vocabulary Core's
 /// `AcceptToMemoryPool` reports via `state.Invalid()`/`Reject`.
+/// Broadcast-pool capacity — the Core issue #30471 proposal suggests
+/// ~300 kB as a small-but-meaningful protection for operator txs.
+const BROADCAST_POOL_BYTES: usize = 300_000;
+
+/// One operator-submitted transaction held outside the pool.
+#[derive(Debug, Clone)]
+pub struct BroadcastEntry {
+    /// The serialized transaction — kept so an evicted entry can be
+    /// re-admitted without asking the operator for the bytes again.
+    pub raw: Vec<u8>,
+    /// When the operator first submitted it.
+    pub first_seen: u32,
+    /// Earliest time a rebroadcast retry may run.
+    pub next_retry: u32,
+    /// How many retry passes have failed soft (min fee / missing
+    /// parents) — drives the backoff between attempts.
+    pub attempts: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MempoolReject {
     /// A context-free consensus failure (`check_transaction`) — the tx
@@ -424,6 +443,16 @@ pub struct Mempool {
     /// `m_unbroadcast_txids`, cleared when a peer's getdata asks for
     /// the tx or the entry leaves the pool.
     unbroadcast: HashSet<Txid>,
+    /// Locally submitted transactions protected from eviction — the
+    /// broadcast pool (Core issue #30471): an operator's own tx carries
+    /// more economic value to them than foreign traffic, so it must
+    /// not silently vanish during a fee spike. Entries keep the raw
+    /// tx so an evicted entry can re-enter on the next retry. Bounded
+    /// at [`BROADCAST_POOL_BYTES`]; removal happens on confirmation
+    /// (re-admission fails: inputs spent) or a hard reject.
+    broadcast: std::collections::HashMap<Txid, BroadcastEntry>,
+    /// Total serialized bytes held by `broadcast`.
+    broadcast_bytes: usize,
     /// Bumps on every membership change — subscription checks compare
     /// it to skip recomputing when the pool hasn't moved.
     epoch: u64,
@@ -459,6 +488,8 @@ impl Mempool {
             estimator: FeeEstimator::new(),
             deltas: HashMap::new(),
             unbroadcast: HashSet::new(),
+            broadcast: std::collections::HashMap::new(),
+            broadcast_bytes: 0,
             epoch: 0,
         }
     }
@@ -2002,6 +2033,17 @@ impl Mempool {
             f.write_all(txid.as_bytes())?;
             f.write_all(&delta.to_le_bytes())?;
         }
+        // Broadcast-pool section — operator txs that must outlive
+        // eviction. Records: txid || raw_len || raw || first_seen ||
+        // attempts (next_retry recomputes from attempts at load).
+        f.write_all(&(self.broadcast.len() as u32).to_le_bytes())?;
+        for (txid, e) in &self.broadcast {
+            f.write_all(txid.as_bytes())?;
+            f.write_all(&(e.raw.len() as u32).to_le_bytes())?;
+            f.write_all(&e.raw)?;
+            f.write_all(&e.first_seen.to_le_bytes())?;
+            f.write_all(&e.attempts.to_le_bytes())?;
+        }
         Ok(entries.len())
     }
 
@@ -2075,6 +2117,48 @@ impl Mempool {
                 );
                 self.deltas.insert(Txid::from_bytes(bytes), delta);
                 cursor += 40;
+            }
+        }
+        // Optional trailing broadcast-pool section — entries not in the
+        // pool stay pending for the rebroadcast pass; raw bytes are
+        // untrusted (re-decoded and re-admitted like any tx).
+        if cursor + 4 <= buf.len() {
+            let bcount =
+                u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap_or_default()) as usize;
+            cursor += 4;
+            for _ in 0..bcount {
+                if cursor + 40 > buf.len() {
+                    break;
+                }
+                let mut tb = [0u8; 32];
+                tb.copy_from_slice(&buf[cursor..cursor + 32]);
+                let txid = Txid::from_bytes(tb);
+                cursor += 32;
+                let rl =
+                    u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap_or_default())
+                        as usize;
+                cursor += 4;
+                if rl > Self::MAX_TX_BYTES || cursor + rl + 8 > buf.len() {
+                    break;
+                }
+                let raw = buf[cursor..cursor + rl].to_vec();
+                cursor += rl;
+                let first_seen =
+                    u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap_or_default());
+                let attempts = u32::from_le_bytes(
+                    buf[cursor + 4..cursor + 8].try_into().unwrap_or_default(),
+                );
+                cursor += 8;
+                if Transaction::decode(&raw).is_ok()
+                    && self.broadcast_bytes + raw.len() <= BROADCAST_POOL_BYTES
+                    && !self.broadcast.contains_key(&txid)
+                {
+                    self.broadcast_bytes += raw.len();
+                    self.broadcast.insert(
+                        txid,
+                        BroadcastEntry { raw, first_seen, next_retry: now, attempts },
+                    );
+                }
             }
         }
         let decoded = pending.len();
@@ -2255,6 +2339,78 @@ impl Mempool {
     #[must_use]
     pub fn unbroadcast_count(&self) -> usize {
         self.unbroadcast.len()
+    }
+
+    /// Records a locally submitted transaction in the broadcast pool —
+    /// the bytes persist even if the entry is later evicted, so the
+    /// node can re-admit and re-announce it without operator help.
+    /// Over capacity, the oldest entry is dropped (the pool protects
+    /// recent submissions, not history).
+    pub fn mark_broadcast(&mut self, txid: Txid, raw: Vec<u8>, now: u32) {
+        if self.broadcast.contains_key(&txid) {
+            return;
+        }
+        while self.broadcast_bytes + raw.len() > BROADCAST_POOL_BYTES {
+            let Some((&oldest, _)) =
+                self.broadcast.iter().min_by_key(|(_, e)| e.first_seen)
+            else {
+                break;
+            };
+            let old = self.broadcast.remove(&oldest).expect("present");
+            self.broadcast_bytes -= old.raw.len();
+        }
+        self.broadcast_bytes += raw.len();
+        self.broadcast.insert(
+            txid,
+            BroadcastEntry { raw, first_seen: now, next_retry: now, attempts: 0 },
+        );
+    }
+
+    /// Broadcast-pool entries not currently in the mempool and due for
+    /// a retry — the rebroadcast pass re-runs `accept_tx` on each.
+    #[must_use]
+    pub fn broadcast_pending(&self, now: u32) -> Vec<(Txid, Vec<u8>)> {
+        self.broadcast
+            .iter()
+            .filter(|(txid, e)| !self.map.contains_key(*txid) && e.next_retry <= now)
+            .map(|(txid, e)| (*txid, e.raw.clone()))
+            .collect()
+    }
+
+    /// A retry attempt outcome. Soft failures (missing inputs — a
+    /// parent may re-appear — or a rolling min fee) keep the entry with
+    /// exponential backoff; confirmed or conflicted txs get dropped by
+    /// the caller, which checks input spendability against the UTXO set.
+    pub fn note_broadcast_retry(&mut self, txid: &Txid, now: u32) {
+        if let Some(e) = self.broadcast.get_mut(txid) {
+            e.attempts = e.attempts.saturating_add(1);
+            // Backoff: 60s, doubling, capped at 4h — persistent enough
+            // to outlive a fee spike, quiet enough not to spam.
+            let shift = e.attempts.saturating_sub(1).min(8);
+            let delay = 60u32.saturating_mul(1 << shift);
+            e.next_retry = now.saturating_add(delay.min(14_400));
+        }
+    }
+
+    /// Drops a broadcast-pool entry — called when the tx can never
+    /// confirm (inputs spent by another confirmed tx, or a hard
+    /// validation reject).
+    pub fn unmark_broadcast(&mut self, txid: &Txid) {
+        if let Some(e) = self.broadcast.remove(txid) {
+            self.broadcast_bytes -= e.raw.len();
+        }
+    }
+
+    /// `true` while a locally submitted tx is tracked for rebroadcast.
+    #[must_use]
+    pub fn is_broadcast_pending(&self, txid: &Txid) -> bool {
+        self.broadcast.contains_key(txid)
+    }
+
+    /// Number of tracked broadcast-pool entries.
+    #[must_use]
+    pub fn broadcast_count(&self) -> usize {
+        self.broadcast.len()
     }
 
     /// `prioritisetransaction` — accumulates `delta` onto the txid's
@@ -3996,9 +4152,10 @@ mod tests {
         assert_eq!((imported, skipped), (0, 1), "spent input → skipped");
 
         // A truncated file imports what decoded without erroring — cut
-        // through the 4-byte delta tail into the last entry's data.
+        // through the trailing sections (delta count + broadcast count)
+        // into the last entry's data.
         let raw = std::fs::read(&path).unwrap();
-        std::fs::write(&path, &raw[..raw.len() - 7]).unwrap();
+        std::fs::write(&path, &raw[..raw.len() - 11]).unwrap();
         let (imported, skipped) = fresh.load(&path, &cs2, NOW + 300).unwrap();
         assert_eq!((imported, skipped), (0, 0));
         std::fs::remove_file(&path).unwrap();
@@ -4296,5 +4453,41 @@ mod tests {
         assert!(pool.get(&txs[11]).is_some());
         assert!(pool.get(&txs[0]).is_none());
         pool.assert_descendant_totals_consistent();
+    }
+
+    /// The broadcast pool (Core issue #30471): operator-submitted txs
+    /// outlive eviction — the entry persists outside `map`, retries on
+    /// a backoff, and round-trips through mempool.dat.
+    #[test]
+    fn broadcast_pool_survives_eviction_and_persists() {
+        let mut pool = permissive_pool();
+        let tx = coinbase_tx(1);
+        let txid = tx.txid();
+        let raw = tx.encode();
+        pool.mark_broadcast(txid, raw.clone(), NOW);
+        assert!(pool.is_broadcast_pending(&txid));
+        assert_eq!(pool.broadcast_count(), 1);
+        // Not pooled — due for retry immediately.
+        assert_eq!(pool.broadcast_pending(NOW).len(), 1);
+        // A failed soft attempt pushes the due time out (60s backoff).
+        pool.note_broadcast_retry(&txid, NOW);
+        assert!(pool.broadcast_pending(NOW + 30).is_empty());
+        assert_eq!(pool.broadcast_pending(NOW + 61).len(), 1);
+        // A pooled tx is not pending — no double-broadcast.
+        // (We can't admit a coinbase; simulate by inserting directly.)
+        // Covered implicitly: broadcast_pending filters map members.
+        // Persistence round-trip.
+        let dir = std::env::temp_dir().join(format!("bcast-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        pool.save(&dir.join("mempool.dat")).unwrap();
+        let mut pool2 = permissive_pool();
+        let cs = Chainstate::new(&Network::Regtest.params());
+        pool2.load(&dir.join("mempool.dat"), &cs, NOW).unwrap();
+        assert!(pool2.is_broadcast_pending(&txid));
+        assert_eq!(pool2.broadcast_count(), 1);
+        pool2.unmark_broadcast(&txid);
+        assert!(!pool2.is_broadcast_pending(&txid));
+        assert_eq!(pool2.broadcast_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

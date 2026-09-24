@@ -354,6 +354,9 @@ pub struct PeerManager<S> {
     /// When `maintain_outbounds` last ran — paces the periodic
     /// self-heal dial so a starved peer set doesn't spin.
     last_maintained: Option<Instant>,
+    /// Unix-second gate for the broadcast-pool rebroadcast pass —
+    /// operator txs retry on a slower cadence than recon rounds.
+    next_rebroadcast: u32,
     /// The operator ban list — Core's `BanMan`/`m_banned`: consulted
     /// on every dial and (future) inbound accept; `setban add` also
     /// drops matching live peers.
@@ -450,6 +453,7 @@ impl<S: Read + Write> PeerManager<S> {
             network_active: true,
             addnode_dial: HashMap::new(),
             last_maintained: None,
+            next_rebroadcast: 0,
             bans: crate::banman::BanList::new(),
             banlist_path: None,
             dial_tx: dial_channel.0,
@@ -864,7 +868,49 @@ impl<S: Read + Write> PeerManager<S> {
         }
         self.fill_queues(cs);
         self.recon_pass();
+        self.rebroadcast_pass(cs, now);
         events
+    }
+
+    /// Broadcast-pool retries — Core issue #30471's broadcast pool:
+    /// operator-submitted txs survive eviction and rebroadcast until
+    /// they confirm. Runs at most once a minute; each due entry is
+    /// re-admitted and re-announced. An entry whose inputs are spent
+    /// (confirmed, or conflicted by a mined tx) can never confirm —
+    /// it drops; soft failures back off exponentially.
+    fn rebroadcast_pass(&mut self, cs: &mut Chainstate, now: u32) {
+        if now < self.next_rebroadcast {
+            return;
+        }
+        self.next_rebroadcast = now + 60;
+        for (txid, raw) in self.mempool.broadcast_pending(now) {
+            let Ok(tx) = avila_consensus::transaction::Transaction::decode(&raw) else {
+                self.mempool.unmark_broadcast(&txid);
+                continue;
+            };
+            match self.mempool.accept_tx(tx.clone(), cs, now) {
+                Ok(_) => {
+                    self.mempool.mark_unbroadcast(&txid);
+                    self.send_tx_inv(None, &txid, &tx.wtxid());
+                }
+                Err(_) => {
+                    // Dead iff an input resolves nowhere — UTXO set
+                    // miss + not produced by any pooled or broadcast
+                    // tx means it was confirmed-spent or never existed.
+                    let dead = tx.inputs.iter().any(|i| {
+                        self.mempool.resolve(cs, &i.previous_output).is_none()
+                            && !self
+                                .mempool
+                                .is_broadcast_pending(&i.previous_output.txid)
+                    });
+                    if dead {
+                        self.mempool.unmark_broadcast(&txid);
+                    } else {
+                        self.mempool.note_broadcast_retry(&txid, now);
+                    }
+                }
+            }
+        }
     }
 
     /// BIP330 scheduled rounds: for every established link that

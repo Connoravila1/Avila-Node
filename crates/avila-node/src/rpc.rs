@@ -7141,15 +7141,20 @@ pub(crate) fn dispatch(
                 match mgr.mempool().accept_tx(tx, cs, now) {
                     Ok(_) => {
                         // Admitted — relay an inv to every tx-accepting
-                        // peer (Core's RelayTransaction path) and track
-                        // it as unbroadcast until a peer's getdata
-                        // acknowledges the announcement.
+                        // peer (Core's RelayTransaction path), track it
+                        // as unbroadcast until a peer's getdata
+                        // acknowledges the announcement, and protect it
+                        // in the broadcast pool so a fee-spike eviction
+                        // can't make the operator's own tx vanish
+                        // (Core issue #30471).
                         mgr.mempool().mark_unbroadcast(&txid);
+                        mgr.mempool().mark_broadcast(txid, bytes.clone(), now);
                         mgr.announce_tx(txid, wtxid);
                         Ok(json!(txid.to_string()))
                     }
                     Err(avila_mempool::MempoolReject::AlreadyKnown) => {
                         mgr.mempool().mark_unbroadcast(&txid);
+                        mgr.mempool().mark_broadcast(txid, bytes.clone(), now);
                         Ok(json!(txid.to_string()))
                     }
                     // Consensus and input failures carry Core's
