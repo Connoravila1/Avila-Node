@@ -376,6 +376,10 @@ pub struct PeerManager<S> {
     stem_pending: Vec<(avila_consensus::hash::Txid, avila_consensus::hash::Wtxid, Instant)>,
     /// Whether locally-submitted txs take the stem path — default on.
     stem_relay: bool,
+    /// Erebus mitigation (queue #21): when loaded, outbound dialing
+    /// deprioritizes candidates whose ASN already holds ≥2 outbound
+    /// slots — a single transit network can't fill the peer set.
+    asmap: crate::asmap::AsMap,
     /// The operator ban list — Core's `BanMan`/`m_banned`: consulted
     /// on every dial and (future) inbound accept; `setban add` also
     /// drops matching live peers.
@@ -475,6 +479,7 @@ impl<S: Read + Write> PeerManager<S> {
             next_rebroadcast: 0,
             stem_pending: Vec::new(),
             stem_relay: true,
+            asmap: crate::asmap::AsMap::empty(),
             bans: crate::banman::BanList::new(),
             banlist_path: None,
             dial_tx: dial_channel.0,
@@ -988,6 +993,12 @@ impl<S: Read + Write> PeerManager<S> {
     /// Whether locally submitted txs take the stem path.
     pub fn set_stem_relay(&mut self, on: bool) {
         self.stem_relay = on;
+    }
+
+    /// Loads an AS bucketing map — Erebus mitigation: outbound dialing
+    /// deprioritizes ASNs already holding ≥2 slots.
+    pub fn set_asmap(&mut self, map: crate::asmap::AsMap) {
+        self.asmap = map;
     }
 
     /// Broadcast-pool retries — Core issue #30471's broadcast pool:
@@ -2330,6 +2341,24 @@ impl PeerManager<TcpStream> {
         // can't starve or spin the loop.
         let probes_left = self.addrbook.len();
         let mut tried = 0usize;
+        // ASMap bucketing: count the outbound slots each ASN already
+        // holds; a candidate in a saturated ASN is skipped (the probe
+        // budget bounds retries, so the book still makes progress).
+        let asn_counts: HashMap<u32, usize> = if self.asmap.is_empty() {
+            HashMap::new()
+        } else {
+            self.peers
+                .values()
+                .filter(|p| !p.inbound)
+                .filter_map(|p| p.remote.and_then(|r| {
+                    let ip = std::net::IpAddr::from(r.ip);
+                    self.asmap.asn(&ip)
+                }))
+                .fold(HashMap::new(), |mut m, asn| {
+                    *m.entry(asn).or_default() += 1;
+                    m
+                })
+        };
         while self.outbound_open()
             && tried < probes_left
             && let Some(candidate) = self.addrbook.select()
@@ -2338,6 +2367,14 @@ impl PeerManager<TcpStream> {
             self.addrbook.mark_attempt(&candidate);
             if self.is_banned(&candidate.ip, now) {
                 continue; // banned candidates aren't dialed
+            }
+            if !self.asmap.is_empty() {
+                let ip = std::net::IpAddr::from(candidate.ip);
+                if let Some(asn) = self.asmap.asn(&ip)
+                    && asn_counts.get(&asn).copied().unwrap_or(0) >= 2
+                {
+                    continue; // this ASN already holds its share
+                }
             }
             // Already connected or dialing — Core's
             // `AlreadyConnectedTo`/`FindNode` check; the book may
@@ -4075,7 +4112,7 @@ mod tests {
         testpipe::drain(&mut b, MAGIC);
         let mut huge = Vec::new();
         huge.extend_from_slice(&MAGIC);
-        huge.extend_from_slice(b"block       ");
+        huge.extend_from_slice(b"block\0\0\0\0\0\0\0");
         huge.extend_from_slice(&(5_000_000u32).to_le_bytes()); // >4MB
         huge.extend_from_slice(&[0u8; 4]); // checksum
         huge.extend_from_slice(&[0xAA; 1024]); // partial payload
