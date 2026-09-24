@@ -784,7 +784,10 @@ mod tests {
         let events = us.poll().unwrap();
         let sent = testpipe::drain(&mut peer_end, MAGIC);
         let names: Vec<&str> = sent.iter().map(|m| m.command_name()).collect();
-        assert_eq!(names, ["version", "wtxidrelay", "sendaddrv2", "sendrecon", "verack"]);
+        assert_eq!(
+            names,
+            ["version", "wtxidrelay", "sendaddrv2", "sendrecon", "verack"]
+        );
         assert!(matches!(
             events[0],
             SessionEvent::Message(Message::Version(_))

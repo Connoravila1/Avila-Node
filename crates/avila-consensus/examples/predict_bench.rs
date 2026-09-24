@@ -33,7 +33,9 @@ fn now() -> u32 {
 fn main() {
     let mut args = std::env::args().skip(1);
     let fixture = args.next().unwrap_or_else(|| {
-        eprintln!("usage: predict_bench <fixture.dat> <baseline|verified|verified+prefetch> [--spec]");
+        eprintln!(
+            "usage: predict_bench <fixture.dat> <baseline|verified|verified+prefetch> [--spec]"
+        );
         std::process::exit(2);
     });
     let mode = args.next().unwrap_or_else(|| "baseline".into());
@@ -91,7 +93,7 @@ fn main() {
                 .union(ScriptFlags::MINIMALIF)
                 .union(ScriptFlags::NULLFAIL)
                 .union(ScriptFlags::WITNESS_PUBKEYTYPE);
-            
+
             for tx in &block.transactions {
                 if !tx.is_coinbase() {
                     mark_scripts_verified(tx.wtxid(), flags);

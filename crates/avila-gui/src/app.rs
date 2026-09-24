@@ -629,19 +629,14 @@ impl AvilaApp {
         match &v.snapshot {
             None => {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        mono(format!("{:.1}%", v.verified_fraction * 100.0))
-                            .color(OK),
-                    );
+                    ui.label(mono(format!("{:.1}%", v.verified_fraction * 100.0)).color(OK));
                     ui.label(muted("of history fully verified — no assumptions"));
                 });
             }
             Some(snap) => {
                 ui.horizontal_wrapped(|ui| {
                     let proven = snap.replayed_height >= snap.base_height;
-                    ui.label(
-                        mono(format!("heights 1-{}", snap.base_height)).color(WARN),
-                    );
+                    ui.label(mono(format!("heights 1-{}", snap.base_height)).color(WARN));
                     ui.label(muted(if proven {
                         "snapshot-assumed — replay complete, commitment matched"
                     } else {
@@ -706,10 +701,11 @@ impl AvilaApp {
                         ui.label(muted(agent));
                     });
                     row.col(|ui| {
-                        ui.label(
-                            mono(if p.recon { "330" } else { "—" })
-                                .color(if p.recon { ACCENT } else { MUTED }),
-                        )
+                        ui.label(mono(if p.recon { "330" } else { "—" }).color(if p.recon {
+                            ACCENT
+                        } else {
+                            MUTED
+                        }))
                         .on_hover_text(if p.recon {
                             "BIP-330 set reconciliation active on this link"
                         } else {

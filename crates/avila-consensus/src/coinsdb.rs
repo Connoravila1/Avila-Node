@@ -738,7 +738,9 @@ impl CoinsBackend {
         new_undos: &[(u32, crate::hash::BlockHash, BlockUndo)],
         tip: Option<u32>,
     ) -> std::io::Result<()> {
-        let Some(shadow) = &self.shadow else { return Ok(()) };
+        let Some(shadow) = &self.shadow else {
+            return Ok(());
+        };
         shadow.commit_inner(dirty, new_undos, tip)?;
         if self.coins_len() != shadow.coins_len() {
             return Err(std::io::Error::other(format!(

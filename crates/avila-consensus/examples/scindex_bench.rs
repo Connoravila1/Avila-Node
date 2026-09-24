@@ -15,7 +15,11 @@ fn now() -> u32 {
         .as_secs() as u32
 }
 
-fn run(fixture: &[u8], params: &avila_consensus::params::Params, index: bool) -> (f64, u64, usize, usize) {
+fn run(
+    fixture: &[u8],
+    params: &avila_consensus::params::Params,
+    index: bool,
+) -> (f64, u64, usize, usize) {
     let dir = std::env::temp_dir().join(format!(
         "avila-scindex-{}-{}",
         std::process::id(),
@@ -63,9 +67,18 @@ fn main() {
     };
     let (w0, _, _, _) = run(&raw, &params, false);
     let (w1, log_bytes, scripts, entries) = run(&raw, &params, true);
-    println!("index off: {w0:.2}s   on: {w1:.2}s   (+{:.1}%)", (w1 / w0 - 1.0) * 100.0);
-    println!("scindex.dat: {log_bytes} bytes  | {scripts} unique scripts, {entries} history entries");
+    println!(
+        "index off: {w0:.2}s   on: {w1:.2}s   (+{:.1}%)",
+        (w1 / w0 - 1.0) * 100.0
+    );
+    println!(
+        "scindex.dat: {log_bytes} bytes  | {scripts} unique scripts, {entries} history entries"
+    );
     if entries > 0 {
-        println!("~{:.0} bytes/log-entry, ~{:.0} in-mem bytes/entry est.", log_bytes as f64 / entries as f64, 42.0);
+        println!(
+            "~{:.0} bytes/log-entry, ~{:.0} in-mem bytes/entry est.",
+            log_bytes as f64 / entries as f64,
+            42.0
+        );
     }
 }

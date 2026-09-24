@@ -93,7 +93,12 @@ pub fn compute(
     // `Txid`'s `Ord` is exactly that lexicographic order.
     let mut entries: Vec<(OutPoint, Coin)> = utxo.iter();
     entries.sort_by_key(|(op, _)| (op.txid, op.vout));
-    compute_ordered(entries.iter().map(|(op, c)| (*op, c.clone())), height, best_block, hash_type)
+    compute_ordered(
+        entries.iter().map(|(op, c)| (*op, c.clone())),
+        height,
+        best_block,
+        hash_type,
+    )
 }
 
 /// The same statistics over coins yielded in already-sorted cursor
@@ -115,7 +120,6 @@ fn compute_ordered(
     best_block: BlockHash,
     hash_type: CoinStatsHashType,
 ) -> CoinStats {
-
     let mut stats = CoinStats {
         height,
         best_block,

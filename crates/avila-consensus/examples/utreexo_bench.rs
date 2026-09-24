@@ -41,19 +41,27 @@ fn main() {
         leaves.push(leaf_of(&key, &body));
     }
     forest.modify(&leaves, &[]).expect("forest build");
-    println!("forest build: {n} leaves in {:?} ({:.0}/s)",
-        t.elapsed(), n as f64 / t.elapsed().as_secs_f64());
+    println!(
+        "forest build: {n} leaves in {:?} ({:.0}/s)",
+        t.elapsed(),
+        n as f64 / t.elapsed().as_secs_f64()
+    );
     let _forest_bytes = 0usize;
 
     // Light node: Stump = roots only — the entire state it stores.
     let mut stump = Stump::<BitcoinNodeHash>::new();
-    let (new_stump, _ud) = stump.modify(&leaves, &[], &Default::default()).expect("stump build");
+    let (new_stump, _ud) = stump
+        .modify(&leaves, &[], &Default::default())
+        .expect("stump build");
     stump = new_stump;
     let mut stump_bytes = Vec::new();
     let _ = stump.serialize(&mut stump_bytes);
-    println!("stump state: {} bytes for {n} leaves ({:.0}x smaller than ~{}MB utxo set)",
-        stump_bytes.len(), (n * 50) as f64 / stump_bytes.len() as f64, n * 50 / 1_000_000);
-
+    println!(
+        "stump state: {} bytes for {n} leaves ({:.0}x smaller than ~{}MB utxo set)",
+        stump_bytes.len(),
+        (n * 50) as f64 / stump_bytes.len() as f64,
+        n * 50 / 1_000_000
+    );
 
     // Proof: a spend of k coins = proof of their leaves — disjoint
     // ranges per k since spent leaves can't be proven again.
@@ -77,8 +85,12 @@ fn main() {
         forest.modify(&[new_leaf], &targets).expect("forest spend");
         let (s2, _ud2) = stump.modify(&[new_leaf], &targets, &proof).expect("spend");
         stump = s2;
-        println!("spend k={k}: proof {}B in {:?} | verify {:?} ok={ok}",
-            pbytes.len(), prove_t, verify_t);
+        println!(
+            "spend k={k}: proof {}B in {:?} | verify {:?} ok={ok}",
+            pbytes.len(),
+            prove_t,
+            verify_t
+        );
     }
 
     // Throughput: a block-ish batch of 2000 spends.
@@ -93,6 +105,11 @@ fn main() {
     let (s2, _ud) = stump.modify(&[], &targets, &proof).expect("batch apply");
     stump = s2;
     forest.modify(&[], &targets).expect("forest batch");
-    println!("\nblock-batch k={k}: proof {}B gen {:?} | verify+apply {:?} ({:.0} leaves/s)",
-        pbytes.len(), prove_t, t.elapsed(), k as f64 / t.elapsed().as_secs_f64());
+    println!(
+        "\nblock-batch k={k}: proof {}B gen {:?} | verify+apply {:?} ({:.0} leaves/s)",
+        pbytes.len(),
+        prove_t,
+        t.elapsed(),
+        k as f64 / t.elapsed().as_secs_f64()
+    );
 }

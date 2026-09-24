@@ -222,7 +222,9 @@ fn main() {
         // `decode <path>` — stream-decode only: isolates wire format +
         // decompression cost from backend insert cost.
         "decode" => {
-            let path = args.next().unwrap_or_else(|| "/tmp/mainnet-utxo.dat".into());
+            let path = args
+                .next()
+                .unwrap_or_else(|| "/tmp/mainnet-utxo.dat".into());
             base_height = args.next().map(|x| x.parse().unwrap()).unwrap_or(935_000);
             let f = std::fs::File::open(&path).unwrap();
             let mut r = std::io::BufReader::with_capacity(1 << 24, f);
@@ -238,7 +240,8 @@ fn main() {
             let el = t.elapsed();
             println!(
                 "decode-only: {count} coins ({bytes} script bytes) in {:.0?} — {:.0} coins/s",
-                el, count as f64 / el.as_secs_f64()
+                el,
+                count as f64 / el.as_secs_f64()
             );
             return;
         }
@@ -378,18 +381,22 @@ fn main() {
             // Compact [pos..len] to the front and refill. Only called
             // between coins — a coin's parse never straddles once we
             // guarantee a min margin up front.
-            let mut refill = |buf: &mut Vec<u8>, pos: &mut usize, len: &mut usize, r: &mut std::io::BufReader<std::fs::File>| {
-                buf.copy_within(*pos..*len, 0);
-                *len -= *pos;
-                *pos = 0;
-                while *len < buf.len() {
-                    let n = r.read(&mut buf[*len..]).unwrap();
-                    if n == 0 {
-                        break;
+            let mut refill =
+                |buf: &mut Vec<u8>,
+                 pos: &mut usize,
+                 len: &mut usize,
+                 r: &mut std::io::BufReader<std::fs::File>| {
+                    buf.copy_within(*pos..*len, 0);
+                    *len -= *pos;
+                    *pos = 0;
+                    while *len < buf.len() {
+                        let n = r.read(&mut buf[*len..]).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        *len += n;
                     }
-                    *len += n;
-                }
-            };
+                };
             let margin = 1 << 18; // 256KB — max sane coin body margin
             refill(&mut buf, &mut pos, &mut len, &mut r);
             let mut coins_left = meta.coins_count;
@@ -402,12 +409,14 @@ fn main() {
                     pos += 1;
                     match c {
                         0xfd => {
-                            let v = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as u64;
+                            let v =
+                                u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as u64;
                             pos += 2;
                             v
                         }
                         0xfe => {
-                            let v = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as u64;
+                            let v =
+                                u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as u64;
                             pos += 4;
                             v
                         }
@@ -527,9 +536,8 @@ fn main() {
                     while let Ok(blob) = rx.recv() {
                         let mut off = 0usize;
                         while off + 40 <= blob.len() {
-                            let l = u32::from_le_bytes(
-                                blob[off + 36..off + 40].try_into().unwrap(),
-                            ) as usize;
+                            let l = u32::from_le_bytes(blob[off + 36..off + 40].try_into().unwrap())
+                                as usize;
                             let key: &[u8; 36] = blob[off..off + 36].try_into().unwrap();
                             b.push_wire(key, &blob[off + 40..off + 40 + l]).unwrap();
                             off += 40 + l;
@@ -545,21 +553,22 @@ fn main() {
             let mut buf = vec![0u8; 1 << 24];
             let mut pos = 0usize;
             let mut len = 0usize;
-            let mut refill = |buf: &mut Vec<u8>,
-                              pos: &mut usize,
-                              len: &mut usize,
-                              r: &mut std::io::BufReader<std::fs::File>| {
-                buf.copy_within(*pos..*len, 0);
-                *len -= *pos;
-                *pos = 0;
-                while *len < buf.len() {
-                    let n = r.read(&mut buf[*len..]).unwrap();
-                    if n == 0 {
-                        break;
+            let mut refill =
+                |buf: &mut Vec<u8>,
+                 pos: &mut usize,
+                 len: &mut usize,
+                 r: &mut std::io::BufReader<std::fs::File>| {
+                    buf.copy_within(*pos..*len, 0);
+                    *len -= *pos;
+                    *pos = 0;
+                    while *len < buf.len() {
+                        let n = r.read(&mut buf[*len..]).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        *len += n;
                     }
-                    *len += n;
-                }
-            };
+                };
             let margin = 1 << 18;
             refill(&mut buf, &mut pos, &mut len, &mut r);
             let mut coins_left = meta.coins_count;
@@ -571,14 +580,14 @@ fn main() {
                     pos += 1;
                     match c {
                         0xfd => {
-                            let v = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap())
-                                as u64;
+                            let v =
+                                u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as u64;
                             pos += 2;
                             v
                         }
                         0xfe => {
-                            let v = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap())
-                                as u64;
+                            let v =
+                                u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as u64;
                             pos += 4;
                             v
                         }
@@ -643,7 +652,9 @@ fn main() {
                         refill(&mut buf, &mut pos, &mut len, &mut r);
                     } else {
                         batch.extend_from_slice(&key);
-                        batch.extend_from_slice(&(plen as u32 + (pos - body_start) as u32).to_le_bytes());
+                        batch.extend_from_slice(
+                            &(plen as u32 + (pos - body_start) as u32).to_le_bytes(),
+                        );
                         batch.extend_from_slice(&buf[body_start..pos + plen]);
                         pos += plen;
                     }
@@ -692,23 +703,24 @@ fn main() {
             // BufReader consumed the header already; its inner position:
             // read_metadata read exactly the header bytes.
             let mut abs = 51u64;
-            let mut refill = |buf: &mut Vec<u8>,
-                              pos: &mut usize,
-                              len: &mut usize,
-                              abs: &mut u64,
-                              r: &mut std::io::BufReader<std::fs::File>| {
-                *abs += *pos as u64;
-                buf.copy_within(*pos..*len, 0);
-                *len -= *pos;
-                *pos = 0;
-                while *len < buf.len() {
-                    let n = r.read(&mut buf[*len..]).unwrap();
-                    if n == 0 {
-                        break;
+            let mut refill =
+                |buf: &mut Vec<u8>,
+                 pos: &mut usize,
+                 len: &mut usize,
+                 abs: &mut u64,
+                 r: &mut std::io::BufReader<std::fs::File>| {
+                    *abs += *pos as u64;
+                    buf.copy_within(*pos..*len, 0);
+                    *len -= *pos;
+                    *pos = 0;
+                    while *len < buf.len() {
+                        let n = r.read(&mut buf[*len..]).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        *len += n;
                     }
-                    *len += n;
-                }
-            };
+                };
             // Measure true header size: read_metadata consumed magic4+ver2
             // +net4+base32+count8 = 50 bytes? verify: utxoÿ(4) + u16(2)
             // + magic(4) + hash(32) + count(8) = 50.
@@ -726,14 +738,14 @@ fn main() {
                     pos += 1;
                     match c {
                         0xfd => {
-                            let v = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap())
-                                as u64;
+                            let v =
+                                u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as u64;
                             pos += 2;
                             v
                         }
                         0xfe => {
-                            let v = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap())
-                                as u64;
+                            let v =
+                                u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as u64;
                             pos += 4;
                             v
                         }
@@ -816,7 +828,9 @@ fn main() {
             let el = t.elapsed();
             println!(
                 "index-build: {count} coins {groups} groups in {:.0?} — {:.0} coins/s ({} index entries)",
-                el, count as f64 / el.as_secs_f64(), sparse.len()
+                el,
+                count as f64 / el.as_secs_f64(),
+                sparse.len()
             );
             let run = avila_consensus::sortedrun::SnapshotRun::from_index(f, sparse, count);
             let tr = Instant::now();
