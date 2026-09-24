@@ -1036,21 +1036,31 @@ pub(crate) fn drain_tick(start: std::time::Instant) {
     tick(6, start);
 }
 
+/// The mutable state behind a [`BlockCheck`] — `remaining` and `error`
+/// live under the same mutex `wait` holds while checking them, so a
+/// worker's update and notify can never land in the gap between the
+/// waiter's predicate check and its `Condvar::wait` call.
+struct CheckState {
+    remaining: u64,
+    error: Option<crate::interpreter::ScriptError>,
+}
+
 /// A block's outstanding script checks: workers decrement
 /// `remaining` as each tx verifies; `wait` returns when all pass or
 /// the first failure lands. The block's UTXO effects are already
 /// applied — this only tracks verification, which mutates nothing.
 pub struct BlockCheck {
-    remaining: AtomicU64,
-    error: std::sync::Mutex<Option<crate::interpreter::ScriptError>>,
+    state: std::sync::Mutex<CheckState>,
     done: std::sync::Condvar,
 }
 
 impl BlockCheck {
     fn new(jobs: usize) -> Self {
         Self {
-            remaining: AtomicU64::new(jobs as u64),
-            error: std::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(CheckState {
+                remaining: jobs as u64,
+                error: None,
+            }),
             done: std::sync::Condvar::new(),
         }
     }
@@ -1058,11 +1068,11 @@ impl BlockCheck {
     /// Blocks until the block's script queue drains; returns the first
     /// verification failure, if any.
     pub fn wait(&self) -> Result<(), crate::interpreter::ScriptError> {
-        let mut guard = self.error.lock().unwrap_or_else(|e| e.into_inner());
-        while self.remaining.load(Ordering::Relaxed) != 0 {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while guard.remaining != 0 {
             guard = self.done.wait(guard).unwrap_or_else(|e| e.into_inner());
         }
-        match *guard {
+        match guard.error {
             Some(err) => Err(err),
             None => Ok(()),
         }
@@ -1115,15 +1125,25 @@ impl ScriptPool {
                     q = self.avail.wait(q).unwrap_or_else(|e| e.into_inner());
                 }
             };
-            if let Err(err) = check_input_scripts(&job.tx, &job.outs, job.flags) {
-                let mut guard = job.check.error.lock().unwrap_or_else(|e| e.into_inner());
-                if guard.is_none() {
-                    *guard = Some(err);
-                }
+            let result = check_input_scripts(&job.tx, &job.outs, job.flags);
+            // The predicate `wait` loops on (`remaining`) and the error
+            // slot are updated under the same mutex `wait` holds while
+            // checking them, and the notify happens before it's
+            // dropped — a concurrent `wait` either observes the
+            // decremented count before blocking, or is already
+            // registered on the condvar to receive this notify. Either
+            // way the wakeup can't be missed.
+            let mut guard = job.check.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(err) = result
+                && guard.error.is_none()
+            {
+                guard.error = Some(err);
             }
-            if job.check.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            guard.remaining -= 1;
+            if guard.remaining == 0 {
                 job.check.done.notify_all();
             }
+            drop(guard);
         }
     }
 
@@ -1656,6 +1676,46 @@ mod tests {
             }
             coinbase_outs
         }
+    }
+
+    // -- ScriptPool / BlockCheck concurrency -----------------------------------
+
+    #[test]
+    fn block_check_wait_has_no_lost_wakeup() {
+        // Stress the exact race the old implementation had: `wait`
+        // looped on `remaining != 0` under one mutex while the worker
+        // decremented `remaining` (a separate atomic) and called
+        // `notify_all` outside any mutex. A notify landing between the
+        // waiter's check and its `Condvar::wait` call was lost
+        // forever — `wait` then blocked forever, since `remaining` was
+        // already 0 and nothing would ever notify again. The fix
+        // (`CheckState` behind one mutex) makes that gap impossible.
+        //
+        // The whole stress loop runs on its own thread with a bounded
+        // receive, so a reintroduced race fails this test instead of
+        // hanging the suite.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let pool = ScriptPool::new(4);
+            let tx = coinbase(1, SUBSIDY);
+            for _ in 0..20_000 {
+                let check = std::sync::Arc::new(BlockCheck::new(1));
+                pool.submit(ScriptJob {
+                    tx: tx.clone(),
+                    outs: Vec::new(),
+                    flags: ScriptFlags::NONE,
+                    check: check.clone(),
+                });
+                check.wait().unwrap();
+            }
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .is_ok(),
+            "BlockCheck::wait hung — lost wakeup"
+        );
     }
 
     // -- subsidy -------------------------------------------------------------
