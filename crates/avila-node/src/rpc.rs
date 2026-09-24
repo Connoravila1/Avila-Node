@@ -5505,7 +5505,7 @@ pub(crate) fn dispatch(
         }
         "getvalidationreport" => chain_query(method, queries, |cs, _| {
             let r = cs.validation_report();
-            let snapshot = r.snapshot.map(|s| {
+            let snapshot = r.snapshot.clone().map(|s| {
                 json!({
                     "base_height": s.base_height,
                     "base_hash": s.base_hash,
@@ -5516,10 +5516,41 @@ pub(crate) fn dispatch(
                     "verified": s.verified,
                 })
             });
+            // Astra's acceptance criterion: the operator must be able
+            // to distinguish fully-verified / pending / snapshot-assumed
+            // history at a glance — one `coverage` block, plain words.
+            let coverage = match &r.snapshot {
+                None => json!({
+                    "state": "full_validation",
+                    "verified_ranges": [[0, r.connected_height]],
+                    "pending_replay": [],
+                    "snapshot_assumed": null,
+                    "plain": "every block up to the connected tip was fully validated — no assumptions",
+                }),
+                Some(s) if s.verified => json!({
+                    "state": "snapshot_replay_complete",
+                    "verified_ranges": [[0, r.connected_height]],
+                    "pending_replay": [],
+                    "snapshot_assumed": null,
+                    "plain": format!("snapshot base {} verified against its commitment AND the full history behind it has been replayed — equivalent to full validation", s.base_height),
+                }),
+                Some(s) => json!({
+                    "state": "snapshot_replaying",
+                    "verified_ranges": [[1, s.replayed_height], [s.base_height + 1, r.connected_height]],
+                    "pending_replay": [[s.replayed_height + 1, s.base_height]],
+                    "snapshot_assumed": {
+                        "range": [1, s.base_height],
+                        "commitment": s.expected_utxo_hash,
+                        "meaning": "UTXO set at this height verified against the chainparams-pinned hash_serialized_3 commitment; the transaction history BEHIND it is being replayed in the background",
+                    },
+                    "plain": format!("snapshot at {} commitment-verified; heights {}..={} not yet historically replayed", s.base_height, s.replayed_height + 1, s.base_height),
+                }),
+            };
             Ok(json!({
                 "connected_height": r.connected_height,
                 "header_height": r.header_height,
                 "verified_fraction": r.verified_fraction,
+                "coverage": coverage,
                 "snapshot": snapshot,
             }))
         }),
@@ -7221,6 +7252,10 @@ pub(crate) fn dispatch(
                         }),
                         avila_p2p::manager::NetEvent::ProxyUnreachable => json!({
                             "event": "proxy_unreachable",
+                        }),
+                        avila_p2p::manager::NetEvent::V2Downgraded { addr } => json!({
+                            "event": "v2_downgraded",
+                            "addr": addr.to_string(),
                         }),
                         avila_p2p::manager::NetEvent::CpuThrottled { peer, rate_ns } => json!({
                             "event": "cpu_throttled",

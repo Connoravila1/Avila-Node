@@ -81,6 +81,7 @@ fn main() -> Result<(), String> {
                     println!("peer {peer}: cpu-throttled at {rate_ns}ns/s")
                 }
                 NetEvent::ProxyUnreachable => println!("proxy unreachable — private route down"),
+                NetEvent::V2Downgraded { addr } => println!("{addr}: v2 attempt downgraded to v1"),
             }
         }
         let tip = cs.chain().len() as i64 - 1;

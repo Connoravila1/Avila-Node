@@ -168,6 +168,14 @@ pub enum NetEvent {
     /// private-mode route itself is down. Edge-triggered at 3
     /// consecutive failures so one refused dial isn't noise.
     ProxyUnreachable,
+    /// We attempted BIP324 but the peer only completed cleartext v1 —
+    /// a *forced downgrade* signal: a MITM can strip the v2 attempt
+    /// this way (BIP324 threat model). Telemetry, not a ban — v1
+    /// peers legitimately exist.
+    V2Downgraded {
+        /// The remote address that only completed v1.
+        addr: SocketAddr,
+    },
     CpuThrottled {
         /// The manager-assigned peer id.
         peer: u64,
@@ -528,7 +536,9 @@ pub struct PeerManager<S> {
     /// Dials in flight — counted against outbound slots so a dead
     /// network can't queue unbounded workers, and deduplicated so the
     /// same address is never dialed twice at once.
-    pending_dials: std::collections::HashSet<SocketAddr>,
+    /// Outbound dials in flight, mapped to whether v2 was requested —
+    /// a landed v1 session after a v2 attempt is a forced downgrade.
+    pending_dials: std::collections::HashMap<SocketAddr, bool>,
     /// Nonces we've sent in our own `version` on outbound connections,
     /// live for as long as that connection is (Core's `CheckIncomingNonce`
     /// scans not-yet-`fSuccessfullyConnected` outbound `CNode`s instead;
@@ -619,7 +629,7 @@ impl<S: Read + Write> PeerManager<S> {
             banlist_path: None,
             dial_tx: dial_channel.0,
             dial_rx: dial_channel.1,
-            pending_dials: std::collections::HashSet::new(),
+            pending_dials: std::collections::HashMap::new(),
             outbound_nonces: std::collections::HashSet::new(),
             inbound_tx: inbound_channel.0,
             inbound_rx: inbound_channel.1,
@@ -2585,7 +2595,7 @@ impl PeerManager<TcpStream> {
         // landed mid-dial still applies — Core rechecks IsBanned after
         // connect for the same reason.
         while let Ok((addr, result)) = self.dial_rx.try_recv() {
-            self.pending_dials.remove(&addr);
+            let want_v2 = self.pending_dials.remove(&addr).unwrap_or(false);
             let Ok(session) = result else {
                 // Proxy health (privacy matrix): a failed dial under
                 // proxy mode means the private route itself is down —
@@ -2603,6 +2613,15 @@ impl PeerManager<TcpStream> {
                 continue;
             };
             self.proxy_failures = 0;
+            // Forced-downgrade telemetry: v2 was requested but the
+            // session landed cleartext v1 — exactly what a transport-
+            // stripping MITM produces. Advisory, not a ban.
+            if want_v2 && session.transport_protocol() == "v1" {
+                if self.event_ring.len() >= 1024 {
+                    self.event_ring.pop_front();
+                }
+                self.event_ring.push_back(NetEvent::V2Downgraded { addr });
+            }
             let remote = addrman::net_addr_of(addr, 0);
             // A ban or a full peer set that landed mid-dial still
             // applies — Core rechecks IsBanned after connect.
@@ -2637,7 +2656,7 @@ impl PeerManager<TcpStream> {
                 // Don't stamp the backoff either, so a drop redials fast.
                 if socks
                     .iter()
-                    .any(|s| self.connected_to(*s) || self.pending_dials.contains(s))
+                    .any(|s| self.connected_to(*s) || self.pending_dials.contains_key(s))
                 {
                     continue;
                 }
@@ -2705,7 +2724,7 @@ impl PeerManager<TcpStream> {
             // `AlreadyConnectedTo`/`FindNode` check; the book may
             // still carry peers we established sessions with.
             let sock = addrman::socket_addr(&candidate);
-            if self.connected_to(sock) || self.pending_dials.contains(&sock) {
+            if self.connected_to(sock) || self.pending_dials.contains_key(&sock) {
                 continue;
             }
             // Automatic outbounds use the `-v2transport` setting —
@@ -2733,7 +2752,7 @@ impl PeerManager<TcpStream> {
         start_height: i32,
         dialed: &mut Vec<SocketAddr>,
     ) {
-        if !self.pending_dials.insert(addr) {
+        if self.pending_dials.insert(addr, use_v2).is_some() {
             return; // already in flight
         }
         dialed.push(addr);

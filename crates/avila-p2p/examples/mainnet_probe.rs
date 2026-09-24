@@ -82,7 +82,8 @@ fn main() -> Result<(), String> {
                 }
                 NetEvent::Announced { .. }
                 | NetEvent::TipAdvanced(_)
-                | NetEvent::ProxyUnreachable => {}
+                | NetEvent::ProxyUnreachable
+                | NetEvent::V2Downgraded { .. } => {}
             }
         }
         let indexed = cs.tree().len() - 1;
