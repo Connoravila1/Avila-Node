@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! End-to-end connect timing: replay a wire-format block fixture
 //! through a real persistent chainstate and report where the time
 //! goes — UTXO input fetches, map application, script checks, and

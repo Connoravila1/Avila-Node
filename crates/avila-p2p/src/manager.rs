@@ -1071,8 +1071,7 @@ impl<S: Read + Write> PeerManager<S> {
             let mut groups: HashMap<[u8; 2], usize> = HashMap::new();
             for p in &outbound {
                 if let Some(r) = p.remote {
-                    groups.entry([r.ip[0], r.ip[1]]).or_default();
-                    *groups.get_mut(&[r.ip[0], r.ip[1]]).unwrap() += 1;
+                    *groups.entry([r.ip[0], r.ip[1]]).or_default() += 1;
                 }
             }
             if groups.len() == 1 {
@@ -1521,6 +1520,7 @@ impl<S: Read + Write> PeerManager<S> {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch(
         id: u64,
         peer: &mut PeerEntry<S>,
@@ -1860,8 +1860,8 @@ impl<S: Read + Write> PeerManager<S> {
                     return;
                 }
                 let (our_ids, _) = recon_pool(mempool, salt);
-                match peer.recon_round.take() {
-                    Some(round) => match round.close(&reply_sk, &our_ids) {
+                if let Some(round) = peer.recon_round.take() {
+                    match round.close(&reply_sk, &our_ids) {
                         Some((misses, their_misses)) => {
                             peer.recon_rounds += 1;
                             peer.recon_misses += misses.len() as u64;
@@ -1889,8 +1889,7 @@ impl<S: Read + Write> PeerManager<S> {
                             peer.recon_round = Some(round);
                             let _ = peer.session.send(&Message::ReqBisec);
                         }
-                    },
-                    None => {}
+                    }
                 }
             }
             SessionEvent::Message(Message::ReconcilDiff { short_ids, .. }) => {
@@ -3139,7 +3138,7 @@ mod tests {
             mgr.tick(&mut cs, NOW);
         }
         // Both back-due — each opens its own round.
-        for (_, peer) in mgr.peers.iter_mut() {
+        for peer in mgr.peers.values_mut() {
             peer.next_recon = Instant::now() - Duration::from_secs(1);
         }
         mgr.tick(&mut cs, NOW);

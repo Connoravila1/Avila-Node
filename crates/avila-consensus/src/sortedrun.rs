@@ -2,7 +2,7 @@
 //!
 //! `loadtxoutset`'s stream is already sorted by `(txid, vout)` — the
 //! same order [`crate::utxo_snapshot::outpoint_key`] produces (not
-//! [`crate::coinsdb::key_of`]: that one's vout is little-endian, fine
+//! `crate::coinsdb::key_of`: that one's vout is little-endian, fine
 //! for its use as an unordered hash/B-tree key but wrong for sorting
 //! once vout reaches 256) — so building the
 //! append to `base.run` in stream order while a sparse in-memory index
@@ -169,9 +169,9 @@ impl SortedRun {
         if &hdr[..8] != MAGIC {
             return Err(io::Error::other("bad run magic"));
         }
-        let stride = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
-        let count = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
-        let index_off = u64::from_le_bytes(hdr[24..32].try_into().unwrap());
+        let stride = u32::from_le_bytes(hdr[12..16].try_into().unwrap_or_default());
+        let count = u64::from_le_bytes(hdr[16..24].try_into().unwrap_or_default());
+        let index_off = u64::from_le_bytes(hdr[24..32].try_into().unwrap_or_default());
         let index_len = (f.metadata()?.len() - index_off) / 44;
         let mut sparse = Vec::with_capacity(index_len as usize);
         let mut entry = [0u8; 44];
@@ -180,7 +180,10 @@ impl SortedRun {
             f.read_exact(&mut entry)?;
             let mut key = [0u8; 36];
             key.copy_from_slice(&entry[..36]);
-            sparse.push((key, u64::from_le_bytes(entry[36..44].try_into().unwrap())));
+            sparse.push((
+                key,
+                u64::from_le_bytes(entry[36..44].try_into().unwrap_or_default()),
+            ));
         }
         Ok(Self {
             f: std::sync::Mutex::new(f),
@@ -192,6 +195,12 @@ impl SortedRun {
 
     pub fn len(&self) -> u64 {
         self.count
+    }
+
+    /// `true` when the run holds no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
     }
 
     /// Point lookup: sparse binary search → one window read → scan.
@@ -231,8 +240,9 @@ impl SortedRun {
         }
         let mut pos = 0usize;
         while pos + 40 <= buf.len() {
-            let k: &[u8; 36] = buf[pos..pos + 36].try_into().unwrap();
-            let len = u32::from_le_bytes(buf[pos + 36..pos + 40].try_into().unwrap()) as usize;
+            let k: &[u8; 36] = buf[pos..pos + 36].try_into().unwrap_or(&[0u8; 36]);
+            let len =
+                u32::from_le_bytes(buf[pos + 36..pos + 40].try_into().unwrap_or_default()) as usize;
             if pos + 40 + len > buf.len() {
                 break;
             }
@@ -278,6 +288,12 @@ impl SnapshotRun {
 
     pub fn len(&self) -> u64 {
         self.count
+    }
+
+    /// `true` when the run holds no coins.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
     }
 
     /// Lookup: sparse binary search -> read a window starting at the
@@ -362,7 +378,7 @@ impl SnapshotRun {
             }
             let plen = match varints[2] {
                 0 | 1 => 20usize,
-                2 | 3 | 4 | 5 => 32usize,
+                2..=5 => 32usize,
                 x => (x - 6) as usize,
             };
             if pos + plen > n {
@@ -421,7 +437,7 @@ impl SnapshotRun {
                 "not a utxo snapshot (bad magic)",
             ));
         }
-        let mut coins_left = u64::from_le_bytes(hdr[43..51].try_into().unwrap());
+        let mut coins_left = u64::from_le_bytes(hdr[43..51].try_into().unwrap_or_default());
         let stride = stride.max(1) as u64;
 
         // Sliding 1 MiB window over the coin stream — sequential I/O,
@@ -468,7 +484,7 @@ impl SnapshotRun {
                     let v = u16::from_le_bytes(
                         buf[(*p - *win_off) as usize..(*p - *win_off) as usize + 2]
                             .try_into()
-                            .unwrap(),
+                            .unwrap_or_default(),
                     ) as u64;
                     *p += 2;
                     v
@@ -478,7 +494,7 @@ impl SnapshotRun {
                     let v = u32::from_le_bytes(
                         buf[(*p - *win_off) as usize..(*p - *win_off) as usize + 4]
                             .try_into()
-                            .unwrap(),
+                            .unwrap_or_default(),
                     ) as u64;
                     *p += 4;
                     v
@@ -488,7 +504,7 @@ impl SnapshotRun {
                     let v = u64::from_le_bytes(
                         buf[(*p - *win_off) as usize..(*p - *win_off) as usize + 8]
                             .try_into()
-                            .unwrap(),
+                            .unwrap_or_default(),
                     );
                     *p += 8;
                     v
@@ -543,7 +559,7 @@ impl SnapshotRun {
                 }
                 let plen = match varints[2] {
                     0 | 1 => 20u64,
-                    2 | 3 | 4 | 5 => 32u64,
+                    2..=5 => 32u64,
                     n => n - 6,
                 };
                 // `need` only guarantees 256B — large scripts need an
@@ -572,7 +588,9 @@ impl SnapshotRun {
                 let script = crate::utxo_snapshot::decompress_script(&mut cur, varints[2])?;
                 sink(
                     OutPoint {
-                        txid: crate::hash::Txid::from_bytes(first_key[..32].try_into().unwrap()),
+                        txid: crate::hash::Txid::from_bytes(
+                            first_key[..32].try_into().unwrap_or_default(),
+                        ),
                         vout,
                     },
                     Coin {
@@ -605,7 +623,7 @@ impl SnapshotRun {
         let mut f = self
             .f
             .lock()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("snapshot lock: {e}")))?;
+            .map_err(|e| io::Error::other(format!("snapshot lock: {e}")))?;
         f.seek(io::SeekFrom::Start(51))?;
         let mut out = Vec::with_capacity(self.count as usize);
         // Whole-set iteration, not activation validation — no height
@@ -624,17 +642,17 @@ fn cs(buf: &[u8], pos: &mut usize) -> u64 {
     *pos += 1;
     match c {
         0xfd => {
-            let v = u16::from_le_bytes(buf[*pos..*pos + 2].try_into().unwrap()) as u64;
+            let v = u16::from_le_bytes(buf[*pos..*pos + 2].try_into().unwrap_or_default()) as u64;
             *pos += 2;
             v
         }
         0xfe => {
-            let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap()) as u64;
+            let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap_or_default()) as u64;
             *pos += 4;
             v
         }
         0xff => {
-            let v = u64::from_le_bytes(buf[*pos..*pos + 8].try_into().unwrap());
+            let v = u64::from_le_bytes(buf[*pos..*pos + 8].try_into().unwrap_or_default());
             *pos += 8;
             v
         }

@@ -90,7 +90,7 @@ pub struct MempoolEntry {
     pub size: usize,
     /// Core's `GetModFeesWithDescendants` — this entry's own
     /// `modified_fee()` plus every current in-pool descendant's,
-    /// maintained incrementally by [`Mempool::adjust_descendant_totals`]
+    /// maintained incrementally by `Mempool::adjust_descendant_totals`
     /// rather than walked fresh on each read.
     pub fees_with_descendants: i64,
     /// Core's `GetSizeWithDescendants` — the `vsize` counterpart of
@@ -542,7 +542,7 @@ pub struct Mempool {
     /// Ordered by [`ScoreKey`] (Core's `descendant_score_index`) — the
     /// eviction cursor for the capacity trim. Kept in sync with every
     /// entry's [`Self::effective_score`] on each insertion and removal
-    /// (via [`Self::adjust_descendant_totals`]/[`Self::resync_score_index`])
+    /// (via `Self::adjust_descendant_totals`/[`Self::resync_score_index`])
     /// so eviction is an `O(log n)` `BTreeSet::first()` instead of a
     /// full-pool scan.
     score_index: std::collections::BTreeSet<ScoreKey>,
@@ -1994,7 +1994,7 @@ impl Mempool {
     /// `GetSizeWithDescendants`, read straight off
     /// [`MempoolEntry::fees_with_descendants`]/`size_with_descendants`
     /// rather than walked fresh: those fields are maintained
-    /// incrementally by [`Self::adjust_descendant_totals`] on every
+    /// incrementally by `Self::adjust_descendant_totals` on every
     /// insertion, removal, and `prioritise` call, so this is `O(1)`.
     /// Missing/unpooled `txid` reports as `(0, 1)` (a harmless,
     /// never-winning score; `1` avoids a zero denominator in rate
@@ -2073,7 +2073,7 @@ impl Mempool {
     /// `TrimToSize`, driven off `descendant_score_index`). `O(log n)`:
     /// [`Self::score_index`] is a `BTreeSet` ordered by exactly this
     /// score (ties on txid), kept in sync by
-    /// [`Self::adjust_descendant_totals`]/[`Self::resync_score_index`]
+    /// `Self::adjust_descendant_totals`/[`Self::resync_score_index`]
     /// on every insertion and removal rather than scanned fresh here.
     fn worst_by_descendant_score(&self) -> Option<(Txid, i64, usize)> {
         self.score_index.first().map(|k| (k.txid, k.fee, k.size))
@@ -2092,7 +2092,7 @@ impl Mempool {
     /// `fees_with_descendants`/`size_with_descendants` from scratch (a
     /// full walk, deliberately independent of the incremental
     /// bookkeeping under test) and its [`Self::effective_score`], and
-    /// asserts both match what [`Self::adjust_descendant_totals`] /
+    /// asserts both match what `Self::adjust_descendant_totals` /
     /// [`Self::resync_score_index`] left cached — including that
     /// `score_index` has exactly one row per pooled entry and no more.
     /// Panics on the first mismatch found.
@@ -2596,8 +2596,9 @@ impl Mempool {
                 )
             })
             .collect();
-        entries.sort_by(|a, b| b.0.cmp(&a.0));
-        let mut bands: Vec<(Vec<(i64, i64, usize)>, usize)> = Vec::new();
+        entries.sort_by_key(|e| std::cmp::Reverse(e.0));
+        type Band = (Vec<(i64, i64, usize)>, usize);
+        let mut bands: Vec<Band> = Vec::new();
         let mut band: Vec<(i64, i64, usize)> = Vec::new();
         let mut band_vsize = 0usize;
         for (rate, vsize, fee) in entries {
@@ -2662,8 +2663,9 @@ impl Mempool {
             let Some((&oldest, _)) = self.broadcast.iter().min_by_key(|(_, e)| e.first_seen) else {
                 break;
             };
-            let old = self.broadcast.remove(&oldest).expect("present");
-            self.broadcast_bytes -= old.raw.len();
+            if let Some(old) = self.broadcast.remove(&oldest) {
+                self.broadcast_bytes -= old.raw.len();
+            }
         }
         self.broadcast_bytes += raw.len();
         self.broadcast.insert(
@@ -2730,7 +2732,7 @@ impl Mempool {
     /// remembered for admission; the RPC reports success either way.
     /// For a pooled tx, `delta` also replays through its own and every
     /// in-pool ancestor's `fees_with_descendants` — those are cached
-    /// aggregates now (see [`Self::adjust_descendant_totals`]), not
+    /// aggregates now (see `Self::adjust_descendant_totals`), not
     /// summed fresh at query time, so a change here has to be pushed
     /// rather than picked up automatically.
     pub fn prioritise(&mut self, txid: &Txid, delta: i64) {
@@ -2852,7 +2854,7 @@ impl Mempool {
 
     /// Core's `MaybeUpdateMempoolForReorg` over a batch of disconnected
     /// blocks. `disconnected` carries block hashes in disconnect order
-    /// (most-recent tip first — [`Chainstate::take_disconnected`]).
+    /// (most-recent tip first — `Chainstate::take_disconnected`).
     ///
     /// `fork_first` picks the feed order: `true` iterates fork-adjacent
     /// block first (the batched `ActivateBestChain` reorg — Core's

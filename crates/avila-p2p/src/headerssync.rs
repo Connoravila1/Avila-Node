@@ -22,7 +22,7 @@
 //! download instead:
 //!
 //! * **PRESYNC** — validate continuity and the difficulty schedule
-//!   ([`permitted_difficulty_transition`], the ancestry-free proxy for
+//!   (`permitted_difficulty_transition`, the ancestry-free proxy for
 //!   the real retarget check) and accumulate claimed work, without
 //!   storing headers. Every `commitment_period`th header gets a salted
 //!   1-bit commitment; only the latest header itself is kept.

@@ -3057,7 +3057,9 @@ impl Chainstate {
                 break;
             }
             while bg.pending.len() >= MAX_PENDING {
-                let (h, check) = bg.pending.pop_front().unwrap();
+                let Some((h, check)) = bg.pending.pop_front() else {
+                    break;
+                };
                 if let Err(e) = check.wait() {
                     failed = Some(ConnectError::ScriptVerify(e));
                     let _ = h;

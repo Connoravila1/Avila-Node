@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Scripthash-index cost model: replay a fixture with the Electrum
 //! index on vs off and report the connect-time delta, on-disk log
 //! size, and in-memory index size — the inputs to "is an opt-in

@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! coinsdb_layout — the UTXO record-encoding experiment. Runs the
 //! same workload through `CoinsBackend` under each `CoinFormat` and
 //! prints a comparison table: commit throughput, point reads,
@@ -189,7 +192,7 @@ fn run_bench(be: CoinsBackend, name: &str, dir: &std::path::Path) {
     );
 
     drop(be);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 fn main() {

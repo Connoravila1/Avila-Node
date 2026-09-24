@@ -1,3 +1,7 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(unused_assignments)]
+
 //! Utreexo spike on a synthetic UTXO set: build the accumulator as a
 //! bridge node (MemForest), then validate spends as a light node
 //! (Stump = roots only) — measures proof size, verify cost, and the

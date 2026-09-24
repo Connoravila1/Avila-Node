@@ -1226,7 +1226,7 @@ pub struct ScriptPool {
 
 impl ScriptPool {
     /// Spawns `workers` detached worker threads (same count rule as
-    /// [`run_script_checks`]: `available_parallelism`, capped by the
+    /// `run_script_checks`: `available_parallelism`, capped by the
     /// caller's queue depth).
     #[must_use]
     pub fn new(workers: usize) -> std::sync::Arc<Self> {
@@ -1324,13 +1324,13 @@ pub fn connect_block(
     ctx: &ConnectContext<'_>,
 ) -> Result<BlockUndo, ConnectError> {
     let (undo, pending, _receipt) = connect_block_inner(block, utxo, ctx)?;
-    if let Some(check) = pending {
-        if let Err(err) = check.wait() {
-            // Deferred check failed: undo the application, exactly as
-            // the inline drain's rollback does.
-            let _ = disconnect_block(block, utxo, &undo);
-            return Err(ConnectError::ScriptVerify(err));
-        }
+    if let Some(check) = pending
+        && let Err(err) = check.wait()
+    {
+        // Deferred check failed: undo the application, exactly as
+        // the inline drain's rollback does.
+        let _ = disconnect_block(block, utxo, &undo);
+        return Err(ConnectError::ScriptVerify(err));
     }
     Ok(undo)
 }

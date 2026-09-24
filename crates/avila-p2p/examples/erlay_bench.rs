@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Erlay (BIP-330) set-reconciliation spike on the pure-Rust sketch:
 //! one sketch exchange reconciles D differing tx short-ids — measure
 //! real bytes/D, decode success rates, and decode cost vs full-inv.

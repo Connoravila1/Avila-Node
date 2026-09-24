@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Interop server probe: optionally syncs a chainstate from an upstream
 //! peer (`--from host:port`), then listens for one inbound peer and serves
 //! `getheaders`/`getdata` from it. A fresh bitcoind pointed at the listen

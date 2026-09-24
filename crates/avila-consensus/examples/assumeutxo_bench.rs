@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! assumeutxo end-to-end: time-to-usable-node vs full sync.
 //!
 //! Phase A: full validation of the fixture (baseline).
@@ -87,7 +90,7 @@ fn main() {
     );
 
     // ---- C: fresh node — usable immediately -----------------------
-    let mut p2 = params.clone();
+    let mut p2 = params;
     p2.assumeutxo_data = Box::leak(Box::new([AssumeutxoData {
         height: tip_h,
         hash_serialized: Box::leak(stats.hash_serialized.unwrap().to_string().into_boxed_str()),

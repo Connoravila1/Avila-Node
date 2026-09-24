@@ -32,7 +32,7 @@ pub fn short_id(salt: u64, txid: &[u8; 32]) -> u32 {
     siphash24(salt, salt, txid) as u32
 }
 
-/// Role negotiation: both sides send [`SendRecon`]; the connection runs
+/// Role negotiation: both sides send `SendRecon`; the connection runs
 /// rounds only when roles are compatible (one sender, one responder —
 /// or both, in which case rounds alternate).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,6 +195,7 @@ impl ReconRound {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::codec::Command;

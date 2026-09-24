@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! ECDSA batch-verify cost model — does an SP-style batch ever
 //! beat libsecp's individual verify on secp256k1?
 //!
@@ -11,7 +14,6 @@
 //! same 4x64 width) stands in for field-element ops in the
 //! resultant model — identical cost class.
 
-use k256::elliptic_curve::PrimeField;
 use k256::elliptic_curve::ops::{LinearCombination, Reduce};
 use k256::elliptic_curve::point::DecompressPoint;
 use k256::{AffinePoint, ProjectivePoint, Scalar, U256};

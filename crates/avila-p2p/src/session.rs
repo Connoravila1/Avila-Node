@@ -470,7 +470,7 @@ impl<S: Read + Write> PeerSession<S> {
             self.decoy_rng ^= self.decoy_rng << 13;
             self.decoy_rng ^= self.decoy_rng >> 7;
             self.decoy_rng ^= self.decoy_rng << 17;
-            if self.decoy_rng % self.decoy_rate == 0 {
+            if self.decoy_rng.is_multiple_of(self.decoy_rate) {
                 let dlen = (self.decoy_rng % 2049) as usize;
                 let decoy = channel.encode_decoy(dlen);
                 self.send_buf.extend(decoy);

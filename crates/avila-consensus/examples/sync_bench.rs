@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! End-to-end sync timing: blocks -> decode -> headers -> connect ->
 //! flush, wall-clock by pipeline phase. `connect_bench` breaks down
 //! inside `connect_block`; this reports the whole accept path —

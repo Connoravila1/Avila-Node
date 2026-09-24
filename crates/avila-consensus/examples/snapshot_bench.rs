@@ -1,3 +1,7 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(unused_assignments)]
+
 //! Real-scale coinsdb measurement.
 //!
 //! `file <path> <base_height>` — stream a Core dumptxoutset file into a
@@ -381,22 +385,21 @@ fn main() {
             // Compact [pos..len] to the front and refill. Only called
             // between coins — a coin's parse never straddles once we
             // guarantee a min margin up front.
-            let mut refill =
-                |buf: &mut Vec<u8>,
-                 pos: &mut usize,
-                 len: &mut usize,
-                 r: &mut std::io::BufReader<std::fs::File>| {
-                    buf.copy_within(*pos..*len, 0);
-                    *len -= *pos;
-                    *pos = 0;
-                    while *len < buf.len() {
-                        let n = r.read(&mut buf[*len..]).unwrap();
-                        if n == 0 {
-                            break;
-                        }
-                        *len += n;
+            let refill = |buf: &mut Vec<u8>,
+                          pos: &mut usize,
+                          len: &mut usize,
+                          r: &mut std::io::BufReader<std::fs::File>| {
+                buf.copy_within(*pos..*len, 0);
+                *len -= *pos;
+                *pos = 0;
+                while *len < buf.len() {
+                    let n = r.read(&mut buf[*len..]).unwrap();
+                    if n == 0 {
+                        break;
                     }
-                };
+                    *len += n;
+                }
+            };
             let margin = 1 << 18; // 256KB — max sane coin body margin
             refill(&mut buf, &mut pos, &mut len, &mut r);
             let mut coins_left = meta.coins_count;
@@ -463,7 +466,7 @@ fn main() {
                     }
                     let plen = match varints[2] {
                         0 | 1 => 20usize,
-                        2 | 3 | 4 | 5 => 32usize,
+                        2..=5 => 32usize,
                         n => (n - 6) as usize,
                     };
                     if pos + plen <= len {
@@ -553,22 +556,21 @@ fn main() {
             let mut buf = vec![0u8; 1 << 24];
             let mut pos = 0usize;
             let mut len = 0usize;
-            let mut refill =
-                |buf: &mut Vec<u8>,
-                 pos: &mut usize,
-                 len: &mut usize,
-                 r: &mut std::io::BufReader<std::fs::File>| {
-                    buf.copy_within(*pos..*len, 0);
-                    *len -= *pos;
-                    *pos = 0;
-                    while *len < buf.len() {
-                        let n = r.read(&mut buf[*len..]).unwrap();
-                        if n == 0 {
-                            break;
-                        }
-                        *len += n;
+            let refill = |buf: &mut Vec<u8>,
+                          pos: &mut usize,
+                          len: &mut usize,
+                          r: &mut std::io::BufReader<std::fs::File>| {
+                buf.copy_within(*pos..*len, 0);
+                *len -= *pos;
+                *pos = 0;
+                while *len < buf.len() {
+                    let n = r.read(&mut buf[*len..]).unwrap();
+                    if n == 0 {
+                        break;
                     }
-                };
+                    *len += n;
+                }
+            };
             let margin = 1 << 18;
             refill(&mut buf, &mut pos, &mut len, &mut r);
             let mut coins_left = meta.coins_count;
@@ -633,7 +635,7 @@ fn main() {
                     }
                     let plen = match varints[2] {
                         0 | 1 => 20usize,
-                        2 | 3 | 4 | 5 => 32usize,
+                        2..=5 => 32usize,
                         n => (n - 6) as usize,
                     };
                     if pos + plen > len {
@@ -696,31 +698,30 @@ fn main() {
             let mut buf = vec![0u8; 1 << 24];
             let mut pos = 0usize;
             let mut len = 0usize;
-            let mut file_off = 0u64; // absolute offset of buf[0]
+            let _file_off = 0u64; // absolute offset of buf[0]
             let hdr_off = 51u64; // magic4+ver2+net4+base32+count8+? — measured below
             let _ = hdr_off;
             // Track absolute file position: base = bytes consumed by header.
             // BufReader consumed the header already; its inner position:
             // read_metadata read exactly the header bytes.
             let mut abs = 51u64;
-            let mut refill =
-                |buf: &mut Vec<u8>,
-                 pos: &mut usize,
-                 len: &mut usize,
-                 abs: &mut u64,
-                 r: &mut std::io::BufReader<std::fs::File>| {
-                    *abs += *pos as u64;
-                    buf.copy_within(*pos..*len, 0);
-                    *len -= *pos;
-                    *pos = 0;
-                    while *len < buf.len() {
-                        let n = r.read(&mut buf[*len..]).unwrap();
-                        if n == 0 {
-                            break;
-                        }
-                        *len += n;
+            let refill = |buf: &mut Vec<u8>,
+                          pos: &mut usize,
+                          len: &mut usize,
+                          abs: &mut u64,
+                          r: &mut std::io::BufReader<std::fs::File>| {
+                *abs += *pos as u64;
+                buf.copy_within(*pos..*len, 0);
+                *len -= *pos;
+                *pos = 0;
+                while *len < buf.len() {
+                    let n = r.read(&mut buf[*len..]).unwrap();
+                    if n == 0 {
+                        break;
                     }
-                };
+                    *len += n;
+                }
+            };
             // Measure true header size: read_metadata consumed magic4+ver2
             // +net4+base32+count8 = 50 bytes? verify: utxoÿ(4) + u16(2)
             // + magic(4) + hash(32) + count(8) = 50.
@@ -800,13 +801,12 @@ fn main() {
                     }
                     let plen = match varints[2] {
                         0 | 1 => 20usize,
-                        2 | 3 | 4 | 5 => 32usize,
+                        2..=5 => 32usize,
                         n => (n - 6) as usize,
                     };
                     if pos + plen > len {
                         // giant payload — skip by seeking
                         let skip = plen - (len - pos);
-                        use std::io::Seek;
                         r.seek_relative(skip as i64).unwrap();
                         abs = abs + len as u64 + skip as u64;
                         pos = 0;

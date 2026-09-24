@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! End-to-end PeerManager evidence: connect to a Bitcoin peer over real
 //! TCP and let the manager drive the whole sync — handshake, headers
 //! phase, and the per-tick download scheduler — into a consensus-

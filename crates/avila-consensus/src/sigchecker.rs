@@ -833,10 +833,10 @@ pub fn mark_scripts_verified(wtxid: crate::hash::Wtxid, flags: crate::script::Sc
     if c.map.contains_key(&wtxid) {
         return;
     }
-    if c.order.len() >= VERIFIED_CAP {
-        if let Some(old) = c.order.pop_front() {
-            c.map.remove(&old);
-        }
+    if c.order.len() >= VERIFIED_CAP
+        && let Some(old) = c.order.pop_front()
+    {
+        c.map.remove(&old);
     }
     c.order.push_back(wtxid);
     c.map.insert(wtxid, flags.bits());

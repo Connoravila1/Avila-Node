@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Speculative block pre-validation probe.
 //!
 //! Connect-time script work for mempool-seen txs is already skipped via

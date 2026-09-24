@@ -104,7 +104,7 @@ pub fn write_coin(out: &mut Vec<u8>, coin: &Coin) {
 
 /// One [`OutPoint`] in Core's coins-DB cursor order — the byte-wise sort of
 /// the serialized `COutPoint` key: `txid` raw internal bytes, then `vout`
-/// *numerically* ascending. Unlike [`crate::coinsdb::key_of`] (an
+/// *numerically* ascending. Unlike `crate::coinsdb::key_of` (an
 /// unordered hash/B-tree key, so any fixed encoding works and little-endian
 /// is what's on disk already), this key's whole purpose is byte order —
 /// callers sort by it — so `vout` is big-endian: byte-lexicographic order

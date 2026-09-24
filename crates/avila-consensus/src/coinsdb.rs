@@ -646,7 +646,7 @@ impl CoinsBackend {
     ///
     /// `None` means either "no such coin" or "the stored record exists
     /// but failed to decode" (true corruption — every shape Core can
-    /// actually produce now decodes, since [`decode_coin`] is total
+    /// actually produce now decodes, since `decode_coin` is total
     /// over Core's wire format). Distinguishing those would need an
     /// `Option`-breaking signature change that ripples into every
     /// `UtxoSet` call site outside this module; short of that, [`Self::have`]

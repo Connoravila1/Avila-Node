@@ -81,7 +81,7 @@ fn sip13(key: &[u8; 36], k0: u64, k1: u64) -> u64 {
         k1 ^ 0x7465_6462_7974_6573,
     ];
     for i in 0..4 {
-        let m = u64::from_le_bytes(key[i * 8..i * 8 + 8].try_into().unwrap());
+        let m = u64::from_le_bytes(key[i * 8..i * 8 + 8].try_into().unwrap_or_default());
         v[3] ^= m;
         round(&mut v);
         v[0] ^= m;
@@ -225,8 +225,10 @@ impl Inner {
             self.page.0 = pg;
         }
         let off = (at - pg) as usize;
-        let s: &[u8; SLOT_US] = self.page.1[off..off + SLOT_US].try_into().unwrap();
-        if u64::from_le_bytes(s[36..44].try_into().unwrap()) == 0 {
+        let s: &[u8; SLOT_US] = self.page.1[off..off + SLOT_US]
+            .try_into()
+            .unwrap_or(&[0u8; SLOT_US]);
+        if u64::from_le_bytes(s[36..44].try_into().unwrap_or_default()) == 0 {
             return Ok(None);
         }
         Ok(Some(*s))
@@ -236,7 +238,7 @@ impl Inner {
     fn slot_direct(&self, i: u64) -> io::Result<Option<[u8; SLOT_US]>> {
         let mut b = [0u8; SLOT_US];
         self.idx.read_exact_at(&mut b, IDX_HDR + i * SLOT)?;
-        if u64::from_le_bytes(b[36..44].try_into().unwrap()) == 0 {
+        if u64::from_le_bytes(b[36..44].try_into().unwrap_or_default()) == 0 {
             return Ok(None);
         }
         Ok(Some(b))
@@ -346,20 +348,20 @@ impl HashStore {
                 "coins.idx: bad magic",
             ));
         }
-        let version = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+        let version = u32::from_le_bytes(hdr[8..12].try_into().unwrap_or_default());
         if version != VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("coins.idx: unsupported version {version}"),
             ));
         }
-        let cap = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
-        let count = u64::from_le_bytes(hdr[24..32].try_into().unwrap());
-        let k0 = u64::from_le_bytes(hdr[32..40].try_into().unwrap());
-        let k1 = u64::from_le_bytes(hdr[40..48].try_into().unwrap());
-        let tip = u64::from_le_bytes(hdr[48..56].try_into().unwrap());
-        let idx_gen = u64::from_le_bytes(hdr[56..64].try_into().unwrap());
-        let dat_gen = u64::from_le_bytes(dhdr[12..20].try_into().unwrap());
+        let cap = u64::from_le_bytes(hdr[16..24].try_into().unwrap_or_default());
+        let count = u64::from_le_bytes(hdr[24..32].try_into().unwrap_or_default());
+        let k0 = u64::from_le_bytes(hdr[32..40].try_into().unwrap_or_default());
+        let k1 = u64::from_le_bytes(hdr[40..48].try_into().unwrap_or_default());
+        let tip = u64::from_le_bytes(hdr[48..56].try_into().unwrap_or_default());
+        let idx_gen = u64::from_le_bytes(hdr[56..64].try_into().unwrap_or_default());
+        let dat_gen = u64::from_le_bytes(dhdr[12..20].try_into().unwrap_or_default());
         let gen_ok = Self::reconcile_generations(dir, idx_gen, dat_gen)?;
         // `reconcile_generations` may have just renamed a surviving
         // `.new` file over `coins.idx` or `coins.dat` to finish a torn
@@ -469,6 +471,12 @@ impl HashStore {
         self.count.load(Ordering::Relaxed)
     }
 
+    /// `true` when no live coins are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// The slot index `key` probes to first.
     fn home(&self, cap: u64, key: &[u8; 36]) -> u64 {
         sip13(key, self.k0, self.k1) & (cap - 1)
@@ -477,13 +485,13 @@ impl HashStore {
     /// The stored `(offset, len)` for a present slot.
     fn slot_rec(s: &[u8; SLOT_US]) -> (u64, u32) {
         (
-            u64::from_le_bytes(s[36..44].try_into().unwrap()),
-            u32::from_le_bytes(s[44..48].try_into().unwrap()),
+            u64::from_le_bytes(s[36..44].try_into().unwrap_or_default()),
+            u32::from_le_bytes(s[44..48].try_into().unwrap_or_default()),
         )
     }
 
     fn slot_key(s: &[u8; SLOT_US]) -> &[u8; 36] {
-        s[..36].try_into().unwrap()
+        s[..36].try_into().unwrap_or(&[0u8; 36])
     }
 
     /// The persisted coin at `key` — a probe then one log read.
@@ -502,7 +510,7 @@ impl HashStore {
         // key+record — a mismatch is a detectable miss, never a
         // silently-wrong coin.
         if b.len() < 4
-            || u32::from_le_bytes(b[..4].try_into().unwrap())
+            || u32::from_le_bytes(b[..4].try_into().unwrap_or_default())
                 != rec_tag(key, &b[4..], self.k0, self.k1)
         {
             return None;
@@ -607,7 +615,9 @@ impl HashStore {
                     stored.extend_from_slice(&rec);
                     let (i, found) = self.probe_staged(&mut inner, &stage, &key)?;
                     if found {
-                        let s = Self::slot_at(&mut inner, &stage, i)?.unwrap();
+                        let Some(s) = Self::slot_at(&mut inner, &stage, i)? else {
+                            continue;
+                        };
                         let (off, old_len) = Self::slot_rec(&s);
                         if stored.len() as u32 <= old_len {
                             // Fits the old allocation — overwrite in
@@ -650,10 +660,7 @@ impl HashStore {
                     // through the overlay so staged writes are seen.
                     let mut hole = i;
                     let mut j = (i + 1) & (inner.cap - 1);
-                    loop {
-                        let Some(s) = Self::slot_at(&mut inner, &stage, j)? else {
-                            break;
-                        };
+                    while let Some(s) = Self::slot_at(&mut inner, &stage, j)? {
                         let home = self.home(inner.cap, Self::slot_key(&s));
                         // If j's key hashed outside (hole, j], it
                         // probed through the hole — move it back.
@@ -733,7 +740,7 @@ impl HashStore {
         let mut inner = self
             .inner
             .lock()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("hashstore lock: {e}")))?;
+            .map_err(|e| io::Error::other(format!("hashstore lock: {e}")))?;
         let dtmp = self.dir.join("coins.dat.new");
         let itmp = self.dir.join("coins.idx.new");
         let ndat = std::fs::OpenOptions::new()
@@ -767,9 +774,9 @@ impl HashStore {
             let want = ((end - off) as usize).min(buf.len());
             buf.truncate(want);
             inner.idx.read_exact_at(&mut buf, off)?;
-            for s in buf.chunks_exact_mut(SLOT_US) {
-                let roff = u64::from_le_bytes(s[36..44].try_into().unwrap());
-                let rlen = u32::from_le_bytes(s[44..48].try_into().unwrap());
+            for s in buf.as_chunks_mut::<SLOT_US>().0 {
+                let roff = u64::from_le_bytes(s[36..44].try_into().unwrap_or_default());
+                let rlen = u32::from_le_bytes(s[44..48].try_into().unwrap_or_default());
                 if roff == 0 {
                     continue;
                 }
@@ -855,16 +862,15 @@ impl HashStore {
                 let want = ((end - off) as usize).min(buf.len());
                 buf.truncate(want);
                 inner.idx.read_exact_at(&mut buf, off)?;
-                for s in buf.chunks_exact(SLOT_US) {
-                    let s: &[u8; SLOT_US] = s.try_into().unwrap();
-                    if u64::from_le_bytes(s[36..44].try_into().unwrap()) == 0 {
+                for s in buf.as_chunks::<SLOT_US>().0 {
+                    if u64::from_le_bytes(s[36..44].try_into().unwrap_or_default()) == 0 {
                         continue;
                     }
                     let mut i = sip13(Self::slot_key(s), self.k0, self.k1) & (new_cap - 1);
                     loop {
                         let mut probe = [0u8; SLOT_US];
                         nidx.read_exact_at(&mut probe, IDX_HDR + i * SLOT)?;
-                        if u64::from_le_bytes(probe[36..44].try_into().unwrap()) == 0 {
+                        if u64::from_le_bytes(probe[36..44].try_into().unwrap_or_default()) == 0 {
                             nidx.write_all_at(s, IDX_HDR + i * SLOT)?;
                             break;
                         }
@@ -927,8 +933,7 @@ impl HashStore {
             if inner.idx.read_exact_at(&mut buf, off).is_err() {
                 break;
             }
-            for s in buf.chunks_exact(SLOT_US) {
-                let s: &[u8; SLOT_US] = s.try_into().unwrap();
+            for s in buf.as_chunks::<SLOT_US>().0 {
                 let (roff, rlen) = Self::slot_rec(s);
                 if roff == 0 {
                     continue;
@@ -941,8 +946,8 @@ impl HashStore {
                 if rec.len() < 4 {
                     continue;
                 }
-                let key: &[u8; 36] = s[..36].try_into().unwrap();
-                if u32::from_le_bytes(rec[..4].try_into().unwrap())
+                let key: &[u8; 36] = s[..36].try_into().unwrap_or(&[0u8; 36]);
+                if u32::from_le_bytes(rec[..4].try_into().unwrap_or_default())
                     != rec_tag(key, &rec[4..], self.k0, self.k1)
                 {
                     continue;
@@ -952,7 +957,7 @@ impl HashStore {
                 };
                 let mut txid = [0u8; 32];
                 txid.copy_from_slice(&s[..32]);
-                let vout = u32::from_le_bytes(s[32..36].try_into().unwrap());
+                let vout = u32::from_le_bytes(s[32..36].try_into().unwrap_or_default());
                 out.push((
                     OutPoint {
                         txid: crate::hash::Txid::from_bytes(txid),

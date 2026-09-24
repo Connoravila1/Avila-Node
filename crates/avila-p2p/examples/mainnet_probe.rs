@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Live network evidence: resolve a DNS seed, handshake real Bitcoin
 //! peers, and validate actual headers — and optionally blocks — through
 //! `Chainstate`. Works on any network with DNS seeds.
