@@ -35,6 +35,32 @@ pub const DEFAULT_MAX_PEERS: usize = 8;
 /// predictable (Core bounds this through `BLOCK_DOWNLOAD_WINDOW`).
 pub const MAX_BLOCKS_IN_TRANSIT_TOTAL: usize = 1024;
 
+/// Seconds between initiated BIP330 reconciliation rounds per link —
+/// BIP-330 paces ~1/s per link on mainnet-scale pools; we start
+/// conservative (a round is cheap — one sketch each way).
+const RECON_INTERVAL: Duration = Duration::from_secs(4);
+
+/// Delay before the first round on a new link — early `mempool`/`inv`
+/// traffic settles first so the sketch sees a fuller picture.
+const RECON_FIRST_DELAY: Duration = Duration::from_secs(10);
+
+/// The pool's salted short-ids plus the reverse map — `short_id` keys
+/// this link's sketch; the map resolves `reconcildiff` asks back to
+/// bodies.
+fn recon_pool(
+    mempool: &avila_mempool::Mempool,
+    salt: u64,
+) -> (Vec<u32>, std::collections::HashMap<u32, avila_consensus::hash::Txid>) {
+    let mut ids = Vec::new();
+    let mut map = std::collections::HashMap::new();
+    for txid in mempool.txids() {
+        let id = crate::recon::short_id(salt, txid.as_bytes());
+        ids.push(id);
+        map.insert(id, txid);
+    }
+    (ids, map)
+}
+
 /// Peers that delivered useful headers or blocks within this window are
 /// protected from inbound eviction (Core protects for ~30 min; our
 /// window is shorter since sessions are lighter).
@@ -180,6 +206,31 @@ struct PeerEntry<S> {
     /// [`PeerManager::outbound_nonces`] for the self-connect check and
     /// removed from it when this entry is dropped.
     our_nonce: Option<u64>,
+    /// BIP330 link state — `Some` when the peer negotiated `sendrecon`.
+    recon: Option<crate::recon::ReconPeer>,
+    /// An open reconciliation round we initiated (awaiting `sketch`).
+    recon_round: Option<crate::recon::ReconRound>,
+    /// Our pool's short-id -> txid map for the last open/answer — how a
+    /// `reconcildiff` ask resolves to a body we can send.
+    recon_map: std::collections::HashMap<u32, avila_consensus::hash::Txid>,
+    /// When the next initiated round may start.
+    next_recon: Instant,
+    /// An in-progress bisected close: our half-pools and the misses
+    /// collected so far — `lo` is consumed by the first `sketch`, `hi`
+    /// by the second (fixed reply order).
+    recon_bisect: Option<ReconBisect>,
+}
+
+/// Pending bisected-round state — see [`crate::recon::bisect`].
+struct ReconBisect {
+    /// Our pool's lo half (bit 31 clear).
+    lo: Vec<u32>,
+    /// Our pool's hi half (bit 31 set).
+    hi: Vec<u32>,
+    /// Whether the lo-half sketch was already decoded.
+    got_lo: bool,
+    /// Misses accumulated across both halves.
+    misses: Vec<u32>,
 }
 
 /// A read-only view of one connected peer — the manager's state is
@@ -247,6 +298,8 @@ pub struct PeerSnapshot {
     /// `session_id` — the BIP324 session id, `None` on v1 like Core's
     /// empty string.
     pub v2_session_id: Option<[u8; 32]>,
+    /// BIP330 reconciliation negotiated on this link.
+    pub recon: bool,
 }
 
 /// A bounded set of peers sharing one [`Chainstate`].
@@ -268,6 +321,12 @@ pub struct PeerManager<S> {
     /// Aggregate bound on block reservations across all peers —
     /// defaults to [`MAX_BLOCKS_IN_TRANSIT_TOTAL`].
     max_in_flight_total: usize,
+    /// Height-sorted `(height, hash)` fetch index for the fill pass —
+    /// rebuilt only when the header set grows, so each tick scans the
+    /// unfetched suffix instead of re-sorting the whole index per peer.
+    fetch_index: Vec<(u32, avila_consensus::hash::BlockHash)>,
+    /// Header count `fetch_index` was built at.
+    fetch_index_headers: usize,
     /// Gossiped peer addresses — discovery lives here.
     addrbook: AddrBook,
     /// The transaction pool — policy layer owned here so `tx` intake,
@@ -381,6 +440,8 @@ impl<S: Read + Write> PeerManager<S> {
             headers_leader: None,
             headers_sync_deadline: None,
             max_in_flight_total: MAX_BLOCKS_IN_TRANSIT_TOTAL,
+            fetch_index: Vec::new(),
+            fetch_index_headers: usize::MAX,
             addrbook: AddrBook::new(),
             mempool: avila_mempool::Mempool::new(),
             closed_bytes_sent: 0,
@@ -523,6 +584,7 @@ impl<S: Read + Write> PeerManager<S> {
                     in_flight_hashes: peer.sync.in_flight_hashes().collect(),
                     transport_protocol: peer.session.transport_protocol(),
                     v2_session_id: peer.session.v2_session_id(),
+                    recon: peer.recon.is_some(),
                 }
             })
             .collect();
@@ -670,6 +732,11 @@ impl<S: Read + Write> PeerManager<S> {
                 addr_token_bucket: 1.0,
                 addr_token_timestamp: now,
                 getaddr_recvd: false,
+                recon: None,
+                recon_round: None,
+                recon_map: std::collections::HashMap::new(),
+                next_recon: Instant::now(),
+                recon_bisect: None,
             },
         );
         Some(id)
@@ -796,7 +863,34 @@ impl<S: Read + Write> PeerManager<S> {
             self.send_tx_inv(Some(source), &txid, &wtxid);
         }
         self.fill_queues(cs);
+        self.recon_pass();
         events
+    }
+
+    /// BIP330 scheduled rounds: for every established link that
+    /// negotiated `sendrecon` and is due, open a sketch round over the
+    /// current pool. Failed/finished rounds clear on the next due tick.
+    fn recon_pass(&mut self) {
+        let now = Instant::now();
+        for peer in self.peers.values_mut() {
+            let Some(link) = peer.recon else {
+                continue;
+            };
+            if !link.they_respond
+                || !peer.session.established()
+                || now < peer.next_recon
+            {
+                continue;
+            }
+            peer.next_recon = now + RECON_INTERVAL;
+            let salt = link.our_salt ^ link.their_salt;
+            let (our_ids, our_map) = recon_pool(&self.mempool, salt);
+            let capacity = (our_ids.len() / 64).clamp(8, 512);
+            let (round, req) = crate::recon::ReconRound::open(&our_ids, capacity);
+            peer.recon_round = Some(round);
+            peer.recon_map = our_map;
+            let _ = peer.session.send(&req);
+        }
     }
 
     /// Sends a tx inventory announcement to every established peer that
@@ -815,6 +909,12 @@ impl<S: Read + Write> PeerManager<S> {
             }
             let wants_tx = peer.session.peer().is_some_and(|i| i.relay);
             if !wants_tx {
+                continue;
+            }
+            // BIP-330: a recon link doesn't get tx announcements — the
+            // next round reconciles the difference anyway, and skipping
+            // the inv is exactly where the bandwidth win lives.
+            if peer.recon.is_some() {
                 continue;
             }
             let (inv_type, hash) = if peer.session.peer().is_some_and(|i| i.wtxid_relay) {
@@ -977,7 +1077,46 @@ impl<S: Read + Write> PeerManager<S> {
             .values()
             .flat_map(|p| p.sync.reserved_hashes().copied())
             .collect();
+        // Height-sorted fetch index — rebuilt once per header-set growth
+        // (pages arrive in ~2000-header chunks), not once per peer per
+        // tick: the previous per-peer `headers_by_height` collected and
+        // sorted the entire index for every fill, which was the dominant
+        // block-fetch cost once the header set grew large.
+        let header_count = cs.tree().len();
+        if header_count != self.fetch_index_headers {
+            self.fetch_index = cs
+                .tree()
+                .headers_by_height()
+                .iter()
+                .map(|h| {
+                    let hash = h.hash();
+                    (
+                        cs.tree().get(&hash).map(|n| n.height).unwrap_or(0),
+                        hash,
+                    )
+                })
+                .collect();
+            self.fetch_index_headers = header_count;
+        }
+        // One shared scan: unfetched candidates above the connected
+        // frontier (connected heights have bodies by definition), each
+        // peer taking a slice until the aggregate budget binds.
+        let frontier = cs.chain().len() as u32;
+        let start = self
+            .fetch_index
+            .partition_point(|(h, _)| *h < frontier);
+        let want_total = self.max_in_flight_total.saturating_sub(reserved.len());
+        let candidates: Vec<BlockHash> = self.fetch_index[start..]
+            .iter()
+            .map(|(_, h)| *h)
+            .filter(|h| !cs.have_body(h) && !reserved.contains(h))
+            .take(want_total)
+            .collect();
+        let mut next = 0usize;
         for peer in self.peers.values_mut() {
+            if next >= candidates.len() {
+                break;
+            }
             if !peer.session.established()
                 || peer.sync.stalled()
                 || peer.sync.in_flight() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER
@@ -985,27 +1124,27 @@ impl<S: Read + Write> PeerManager<S> {
                 reserved.extend(peer.sync.reserved_hashes().copied());
                 continue;
             }
-            if reserved.len() >= self.max_in_flight_total {
-                break;
-            }
-            let unfetched: Vec<BlockHash> = cs
-                .tree()
-                .headers_by_height()
-                .iter()
-                .map(|h| h.hash())
-                .filter(|h| !cs.have_body(h) && !reserved.contains(h))
-                .take(
-                    crate::sync::MAX_BLOCKS_IN_TRANSIT_PER_PEER
-                        .min(self.max_in_flight_total - reserved.len()),
-                )
-                .collect();
-            if unfetched.is_empty() {
-                break;
-            }
-            if let Some(req) = peer.sync.want_blocks_excluding(cs, &unfetched, &reserved) {
+            let take = crate::sync::MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                .saturating_sub(peer.sync.in_flight())
+                .min(candidates.len() - next);
+            let unfetched = &candidates[next..next + take];
+            if let Some(req) = peer.sync.want_blocks_excluding(cs, unfetched, &reserved) {
                 let _ = peer.session.send(&req);
             }
+            next += take;
             reserved.extend(peer.sync.reserved_hashes().copied());
+        }
+        // Backlog: announced-but-unrequested blocks drain as slots free —
+        // without this, inv bursts beyond the window are forgotten.
+        let mut global_free = self.max_in_flight_total.saturating_sub(self.in_flight());
+        for peer in self.peers.values_mut() {
+            if !peer.session.established() {
+                continue;
+            }
+            if let Some(req) = peer.sync.drain_pending(cs, global_free) {
+                global_free = global_free.saturating_sub(peer.sync.in_flight());
+                let _ = peer.session.send(&req);
+            }
         }
     }
 
@@ -1046,7 +1185,19 @@ impl<S: Read + Write> PeerManager<S> {
                     relay: false,
                     wtxid_relay: false,
                     addrv2: false,
+                    recon: None,
                 });
+                if let Some(their) = info.recon.clone() {
+                    peer.recon = Some(crate::recon::ReconPeer {
+                        their_salt: their.salt,
+                        our_salt: peer.session.recon_salt(),
+                        they_send: their.is_sender,
+                        they_respond: their.is_responder,
+                    });
+                    // First round a few seconds in — let early traffic
+                    // (mempool asks, invs) settle first.
+                    peer.next_recon = Instant::now() + RECON_FIRST_DELAY;
+                }
                 events.push(NetEvent::Connected {
                     peer: id,
                     info: Box::new(info),
@@ -1259,6 +1410,131 @@ impl<S: Read + Write> PeerManager<S> {
                 // The peer can't serve these — release the slots so the
                 // fill pass reassigns them to another peer.
                 peer.sync.on_notfound(&invs);
+            }
+            SessionEvent::Message(Message::ReqRecon(their_sketch)) => {
+                // Responder side: attribute the decoded difference
+                // against our own pool — ids we hold are their misses,
+                // ids we don't are ours.
+                let Some(link) = peer.recon else {
+                    return;
+                };
+                let salt = link.our_salt ^ link.their_salt;
+                let (our_ids, our_map) = recon_pool(mempool, salt);
+                peer.recon_map = our_map;
+                if let Some((reply, outcome)) =
+                    crate::recon::ReconRound::respond(&their_sketch, &our_ids)
+                {
+                    let _ = peer.session.send(&reply);
+                    if !outcome.responder_misses.is_empty() {
+                        let _ = peer.session.send(&Message::ReconcilDiff {
+                            ask_parents: 0,
+                            short_ids: outcome.responder_misses,
+                        });
+                    }
+                    // Txs they lack and we hold go out directly.
+                    for id in outcome.initiator_misses {
+                        if let Some(tx) = peer
+                            .recon_map
+                            .get(&id)
+                            .and_then(|txid| mempool.get(txid))
+                            .cloned()
+                        {
+                            let _ = peer.session.send(&Message::Tx(tx));
+                        }
+                    }
+                }
+            }
+            SessionEvent::Message(Message::Sketch(reply_sk)) => {
+                let Some(link) = peer.recon else {
+                    return;
+                };
+                let salt = link.our_salt ^ link.their_salt;
+                // Bisected close: each reply sketch decodes against our
+                // matching half (lo first, fixed order).
+                if let Some(mut bs) = peer.recon_bisect.take() {
+                    let (half, is_lo) = if !bs.got_lo {
+                        (&bs.lo, true)
+                    } else {
+                        (&bs.hi, false)
+                    };
+                    if let Some(round) = peer.recon_round.as_ref()
+                        && let Some(misses) = round.close_bisected(&reply_sk, half)
+                    {
+                        bs.misses.extend(misses);
+                    }
+                    if is_lo {
+                        bs.got_lo = true;
+                        peer.recon_bisect = Some(bs);
+                    } else {
+                        // Both halves done — one diff ask for the lot.
+                        peer.recon_round = None;
+                        if !bs.misses.is_empty() {
+                            let _ = peer.session.send(&Message::ReconcilDiff {
+                                ask_parents: 0,
+                                short_ids: bs.misses,
+                            });
+                        }
+                    }
+                    return;
+                }
+                let (our_ids, _) = recon_pool(mempool, salt);
+                match peer.recon_round.take() {
+                    Some(round) => match round.close(&reply_sk, &our_ids) {
+                        Some(misses) if !misses.is_empty() => {
+                            let _ = peer.session.send(&Message::ReconcilDiff {
+                                ask_parents: 0,
+                                short_ids: misses,
+                            });
+                        }
+                        Some(_) => {}
+                        // Over-capacity merge — ask the responder to
+                        // bisect its pool; replies come back as two
+                        // `sketch` messages.
+                        None => {
+                            let (lo, hi) = crate::recon::bisect(&our_ids, 31);
+                            peer.recon_bisect = Some(ReconBisect {
+                                lo,
+                                hi,
+                                got_lo: false,
+                                misses: Vec::new(),
+                            });
+                            peer.recon_round = Some(round);
+                            let _ = peer.session.send(&Message::ReqBisec);
+                        }
+                    },
+                    None => {}
+                }
+            }
+            SessionEvent::Message(Message::ReconcilDiff { short_ids, .. }) => {
+                for id in short_ids {
+                    if let Some(tx) = peer
+                        .recon_map
+                        .get(&id)
+                        .and_then(|txid| mempool.get(txid))
+                        .cloned()
+                    {
+                        let _ = peer.session.send(&Message::Tx(tx));
+                    }
+                }
+            }
+            SessionEvent::Message(Message::ReqBisec) => {
+                // Split our pool at bit 31 and reply with two
+                // half-capacity sketches — each half's difference is
+                // half as wide, and failed halves bisect again on the
+                // initiator's side.
+                let Some(link) = peer.recon else {
+                    return;
+                };
+                let salt = link.our_salt ^ link.their_salt;
+                let (our_ids, _) = recon_pool(mempool, salt);
+                let capacity = (our_ids.len() / 64).clamp(8, 512);
+                let (lo, hi) = crate::recon::bisect_reply(&our_ids, 31, capacity);
+                let _ = peer.session.send(&lo);
+                let _ = peer.session.send(&hi);
+            }
+            SessionEvent::Message(Message::SendRecon(_)) => {
+                // Late renegotiation is ignored — caps were fixed at
+                // handshake.
             }
             SessionEvent::Message(Message::Mempool) => {
                 // BIP35: advertise the whole pool. wtxid entries for
@@ -2267,6 +2543,156 @@ mod tests {
             sent.iter().any(|m| matches!(m, Message::GetHeaders(_))),
             "{sent:?}"
         );
+    }
+
+    #[test]
+    fn reqrecon_is_answered_with_sketch_and_reconcildiff() {
+        let (mut mgr, mut peer, _id) = managed_peer();
+        let mut cs = regtest();
+        // Handshake with the peer negotiating recon caps.
+        let mut events = mgr.tick(&mut cs, NOW);
+        let _ = testpipe::drain(&mut peer, MAGIC);
+        testpipe::inject(&mut peer, MAGIC, &Message::Version(peer_version(600)));
+        testpipe::inject(
+            &mut peer,
+            MAGIC,
+            &Message::SendRecon(crate::message::SendRecon {
+                is_sender: true,
+                is_responder: true,
+                version: crate::recon::RECON_VERSION,
+                salt: 0xABCD,
+            }),
+        );
+        events.extend(mgr.tick(&mut cs, NOW));
+        testpipe::inject(&mut peer, MAGIC, &Message::Verack);
+        events.extend(mgr.tick(&mut cs, NOW));
+        assert!(events.iter().any(|e| matches!(e, NetEvent::Connected { .. })));
+
+        // Peer opens a round over its own 3-id pool; ours is empty.
+        let mut sk = crate::sketch::Sketch::new(8);
+        for id in [7u32, 8, 9] {
+            sk.add(id);
+        }
+        testpipe::inject(
+            &mut peer,
+            MAGIC,
+            &Message::ReqRecon(sk.serialize()),
+        );
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let sent = testpipe::drain(&mut peer, MAGIC);
+        assert!(sent.iter().any(|m| matches!(m, Message::Sketch(_))), "{sent:?}");
+        let rd = sent.iter().find_map(|m| match m {
+            Message::ReconcilDiff { short_ids, .. } => Some(short_ids.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            rd.map(|mut v| { v.sort(); v }),
+            Some(vec![7, 8, 9]),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn recon_peer_opens_round_when_due() {
+        let (mut mgr, mut peer, _id) = managed_peer();
+        let mut cs = regtest();
+        mgr.tick(&mut cs, NOW);
+        let _ = testpipe::drain(&mut peer, MAGIC);
+        testpipe::inject(&mut peer, MAGIC, &Message::Version(peer_version(600)));
+        testpipe::inject(
+            &mut peer,
+            MAGIC,
+            &Message::SendRecon(crate::message::SendRecon {
+                is_sender: true,
+                is_responder: true,
+                version: crate::recon::RECON_VERSION,
+                salt: 0x55,
+            }),
+        );
+        mgr.tick(&mut cs, NOW);
+        testpipe::inject(&mut peer, MAGIC, &Message::Verack);
+        mgr.tick(&mut cs, NOW);
+        // Back-date the due time so recon_pass opens immediately.
+        if let Some((_, p)) = mgr.peers.iter_mut().next() {
+            p.next_recon = std::time::Instant::now() - Duration::from_secs(1);
+        }
+        // recon_pass queues the ReqRecon; it flushes on the next tick.
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let sent = testpipe::drain(&mut peer, MAGIC);
+        assert!(sent.iter().any(|m| matches!(m, Message::ReqRecon(_))), "{sent:?}");
+    }
+
+    #[test]
+    fn two_recon_peers_open_independent_rounds() {
+        // Two links negotiate recon with different salts — each round
+        // runs on its own schedule and its own salted sketch.
+        let (us_a, peer_a) = testpipe::pair();
+        let (us_b, peer_b) = testpipe::pair();
+        let mut pa = peer_a;
+        let mut pb = peer_b;
+        let sa = PeerSession::initiate(
+            us_a,
+            MAGIC,
+            build_version(1, 0, NetAddr::unspecified(), i64::from(NOW)),
+            BUDGET,
+        )
+        .expect("session a");
+        let sb = PeerSession::initiate(
+            us_b,
+            MAGIC,
+            build_version(1, 0, NetAddr::unspecified(), i64::from(NOW)),
+            BUDGET,
+        )
+        .expect("session b");
+        let mut mgr = PeerManager::new(8);
+        let mut cs = regtest();
+        mgr.add_outbound(sa).unwrap();
+        mgr.add_outbound(sb).unwrap();
+        mgr.tick(&mut cs, NOW);
+        let _ = testpipe::drain(&mut pa, MAGIC);
+        let _ = testpipe::drain(&mut pb, MAGIC);
+        for (p, salt) in [(&mut pa, 0x11u64), (&mut pb, 0x22u64)] {
+            testpipe::inject(p, MAGIC, &Message::Version(peer_version(600)));
+            testpipe::inject(
+                p,
+                MAGIC,
+                &Message::SendRecon(crate::message::SendRecon {
+                    is_sender: true,
+                    is_responder: true,
+                    version: crate::recon::RECON_VERSION,
+                    salt,
+                }),
+            );
+            mgr.tick(&mut cs, NOW);
+            testpipe::inject(p, MAGIC, &Message::Verack);
+            mgr.tick(&mut cs, NOW);
+        }
+        // Both back-due — each opens its own round.
+        for (_, peer) in mgr.peers.iter_mut() {
+            peer.next_recon = Instant::now() - Duration::from_secs(1);
+        }
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let sent_a = testpipe::drain(&mut pa, MAGIC);
+        let sent_b = testpipe::drain(&mut pb, MAGIC);
+        assert!(
+            sent_a.iter().any(|m| matches!(m, Message::ReqRecon(_))),
+            "peer a got no round: {sent_a:?}"
+        );
+        assert!(
+            sent_b.iter().any(|m| matches!(m, Message::ReqRecon(_))),
+            "peer b got no round: {sent_b:?}"
+        );
+        // The salts differ — the recon state must be per-peer, not shared.
+        let salts: Vec<u64> = mgr
+            .peers
+            .values()
+            .filter_map(|p| p.recon.as_ref().map(|r| r.their_salt))
+            .collect();
+        assert_eq!(salts.len(), 2);
+        assert!(salts.contains(&0x11) && salts.contains(&0x22), "{salts:?}");
     }
 
     #[test]

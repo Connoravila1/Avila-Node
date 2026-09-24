@@ -25,6 +25,32 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 | 16 | 09-23 | Crash fault-injection on hash engine | Commit ordering survives torn writes | **2 findings, both fixed** | torn records decoded to wrong-but-valid coins (silent corruption) → +4B keyed record tag, tears now misses; coins-ahead-of-tip tear invisible → index-header watermark, open errors loudly. File-level sim; compact() still unsafe | [fault-inject](2026-09-23-fault-injection.md) |
 
 
+| 43 | 09-24 | Repeated-key aggregation in advised ECDSA | Can duplicate public-key terms remove more arithmetic from #40? | **additional CPU win; elapsed benefit inconclusive** | Same 24-block Script replay: ordinary 25.274 CPU s → previous advice 19.133 → repeated-key worker 16.705 (another −12.7%; −33.9% vs ordinary). Historical arithmetic kernel −21.9%; unique-key control +0.3%, within variation. Regtest gains little. 27 kernel + 33 replay comparisons, 95 boundary/protocol checks, and native sanitizer suites pass; same verdict/UTXO hashes and invalid-spend rollback. Same hints and Rust binary; production unchanged, full mainnet IBD unmeasured. | [repeated-keys](2026-09-24-ecdsa-repeated-keys.md) |
+| 42 | 09-24 | BIP-330 tx delivery live + two real sync bugs | Does set reconciliation carry a real transaction end-to-end? | **verified live; bugs fixed** | Two regtest nodes over BIP324-v2: tx mined into A's pool reached B's via sketch diff → reconcildiff ask (33B) → body (430B) → B's mempool — **zero inv announcements** (tx-invs suppressed on recon links). Live run flushed two real bugs: inv bursts >16-slot window were consumed-and-forgotten (fixed: `pending_blocks` drain), and restore was O(n²) via `ancestor_is_invalid` walking to genesis per header on a clean chain (fixed: O(1) early return; 66k headers went 3:45min → instant). | [erlay-sketch](2026-09-24-erlay-sketch.md) |
+| 41 | 09-24 | Zero-copy assumeutxo activation (overlay) | Can `loadtxoutset` activate without importing 170M coins? | **adopted — single-pass, persists** | `activate_snapshot_overlay`: `index_with` builds the sparse index AND streams decoded coins to the commitment hasher in one sequential read; `SnapshotRun` attaches as the lowest UtxoSet layer. Fixture (13k coins): 0.01s single-pass vs 0.03s import; the win is zero duplication + bounded memory, not small-scale latency. `snapshot.path` sidecar re-attaches on resume; `state.dat` carries the delta only (`iter_delta`); `UtxoSet::iter` merges the layer for dump/stats consumers. Resume test: drop+reopen resolves all base coins. | [delta-overlay](2026-09-24-delta-overlay-shim.md) |
+| 40 | 09-24 | Compact ECDSA advice and verification-time production | Can portable advice be small, streaming and cheaper to supply? | **qualified offline experiment; production unchanged** | Mainnet stream 3.57 MB → 146 KB (24.42× smaller); recipient CPU −23.7%. Production + packing 51.35 → 29.13 CPU s (−43.3%); 64-job producer groups improve elapsed. 129 comparison runs + 9 scheduling runs + 133 checks pass; 482 unit tests pass, 2 existing ignores. One already-validating producer + one recipient repays added CPU at sample medians. Full mainnet IBD and online exporter unmeasured. | [advice-economics](2026-09-24-ecdsa-advice-economics.md) |
+
+| 39 | 09-24 | Parallel ECDSA advice with bounded recovery | Does the replay gain survive eight workers, bad hints and durable state? | **qualified offline prototype; not enabled in production** | 3 repeats: mainnet Script CPU 25.05 → 19.29 s (−23.0%), elapsed 19.80 → 16.43 s (−17.0%); complete regtest CPU −7.2% RAM / −5.3% disk+reopen. All-corrupt advice retries 7,351/183,782 checks in 8 bounded groups, +2.5% CPU vs ordinary. 93 replay runs + 10 additional checks; invalid-spend rollback and UTXO hashes pass; 479 unit tests pass, 2 existing ignores. Tradeoffs: sampled summed RSS 59 → 180 MiB; framed sidecar 3.57 MB; two-pass preparation 54.38 s. Full mainnet IBD unmeasured. | [parallel-replay](2026-09-24-ecdsa-parallel-replay.md) |
+
+| 38 | 09-24 | Fetch-frontier scan fix | Was the sync scheduler the bottleneck? | **adopted — ~5x live throughput** | fill_queues re-sorted the whole header index per peer per tick (O(peers x headers)). Now: cached height-index rebuilt on growth + one shared scan from the connected frontier. Signet: 1.7 -> ~9 blk/s; in-flight saturates the 16/peer window (peer RTT is the limiter now). | [fetch-frontier](2026-09-24-fetch-frontier.md) |
+
+| 37 | 09-24 | Utreexo accumulator spike (rustreexo) | Does the ~1KB-state validation primitive work? | **promising — measured on 1M leaves** | Stump = 247B state vs ~50MB set (~864B at 170M vs 12GB). 2000-spend block batch: 16.5KB proof, 17.9ms verify+apply (~1% block bandwidth). Bridge build 566k leaves/s. Integration = program (bridge-node proofs + BIP-181 wire), not patch. | [utreexo](2026-09-24-utreexo-spike.md) |
+
+| 36 | 09-24 | Differential fuzzing vs Knots | Do random block mutations diverge verdicts? | **working — 1080 mutations, 0 consensus divergences** | `tools/diff_fuzz.py`: seeded mutations (merkle/tx/witness/truncate/count) on ~125 real regtest blocks through both submitblock. One strictness class documented: header-identical mutations → Core dup-shortcircuits, Avila strict-decodes first. Ordering, not consensus. | [diff-fuzz](2026-09-24-diff-fuzzing.md) |
+
+| 35 | 09-24 | Erlay recon — pure-Rust minisketch | Is the sketch primitive tractable without C++ FFI? | **adopt (primitive) — works + measured** | ADOPTED intra-Avila: sketch.rs + recon.rs — GF(2^32) minisketch, BIP-330 wire set, salted short-ids, sendrecon negotiation, 4s scheduled rounds. LIVE on real TCP over BIP324-v2: recon:true in getpeerinfo, sustained reqrecon/sketch exchanges both directions. 512B sketch reconciles what 1.28MB inv sends. Remaining: non-empty-pool misses, reqbisec, external interop. | [erlay-sketch](2026-09-24-erlay-sketch.md) |
+
+| 34 | 09-24 | Address-index cost model | What does the Electrum-style index cost? | **measured — build ~free, serve needs disk-backing** | Spend fixture: connect delta ~0% (8.56s vs 8.64s); scindex.dat ~38B/entry. In-mem by_script map ~46B/entry → ~200GB at mainnet — the query layer needs hashstore backing (bounded refactor, already designed). | [addr-index](2026-09-24-address-index-cost.md) |
+
+| 32 | 09-24 | Live network sync (signet) | Can the node sync against real peers? | **works — fetch scheduling is the limiter** | Signet, DNS-seeded: 208 blocks connected in 15.4s; resumed run reached 1124 blocks/66k headers in 640s (~1.7 blk/s — in-flight stays 0-96, scheduler conservative; validation never the bottleneck). Resume works. Mainnet-scale unproven. | [live-signet](2026-09-24-live-signet-sync.md) |
+| 33 | 09-24 | Delta overlay — snapshot as lowest UTXO layer | Can SnapshotRun serve as the read base under the delta? | **partial adopt — read shim done, tested** | `UtxoSet.snapshot` fourth layer; `SnapshotRun::index` portable fallback indexer. Overlay test found 2 real get() bugs: EOF window clamp + zero-count-group underflow on misses. 480 tests pass. activate integration (attach+snapverify+persist) deferred — touches Claude's patch area. | [delta-overlay](2026-09-24-delta-overlay-shim.md) |
+
+| 31 | 09-24 | Verification-transparency ledger | Can the node report its own trust state as a typed value? | **adopted** | `Chainstate::validation_report()` + `getvalidationreport` RPC: connected/header heights, snapshot base+commitment+replayed_height, assumed/unproven ranges, verified_fraction. Snapshot test: fresh→replay→verified 0.0→1.0; full node 1.0. | [validation-report](2026-09-24-validation-report.md) |
+
+| 30 | 09-24 | Speculative block pre-validation | Can a predicted mempool template pre-pay connect work? | **SUBSUMED by #20** | 625-block spend fixture, 512MiB cache: baseline 6.6s (script 6268ms) → verified-prediction 257ms (script 0ms, 25.7×); +prefetch 289ms — worse, read was already 9ms. Verified-tx cache captures the whole win; residual is apply+bookkeeping, no lever. Mainnet ~90% overlap untested — live-sync's job. | [predict](2026-09-24-spec-block-prediction.md) |
+
+| 29 | 09-23 | One-byte ECDSA advice through real Script and chainstate replay | Does #27's kernel gain survive recipient overhead and false signature results? | **replay win; full mainnet IBD unmeasured** | One script thread, 3 repeats: 24 actual mainnet blocks / 183,782 ECDSA attempts, including 6,137 false results: 27.65 → 18.41 s (−33.4% elapsed, −29.0% combined CPU). Complete 625-block regtest replay: 6.17 → 4.22 s, identical 12,995-coin UTXO hash. Early 501-block mainnet loses 22.9% elapsed (only 10 checks). Mainnet hints 183,782 B; two-pass preparation 57.18 s separately; bad parity + whole-sample retry 61.66 s. Script edge cases, hostile/missing hints, worker exit and sanitizer/protocol tests pass. Isolated copied workspace, probabilistic batching, no production changes by this experiment. | [historical-replay](2026-09-23-ecdsa-historical-replay.md) |
+
 | 27 | 09-23 | Native ECDSA batching with untrusted nonce advice; deterministic batch inversion | Does #19 rule out faster local signature verification? | **kernel win; not integrated IBD** | Same pinned libsecp, 16,384 synthetic signatures, 3 repeats: 127.56 CPU µs/sig ordinary → 70.06 with 1 B advice (1.82×) or 56.11 with 33 B (2.27×), batch 8,192. Helper generation 130.60 µs/sig separately; random batch acceptance. Bad advice + fallback costs 44–58% extra CPU. Deterministic no-advice batch inversion saves only 0–3%. Adversarial, cancellation and rare-x tests pass with ASan/UBSan/VERIFY. | [ecdsa-advice](2026-09-23-ibd-ecdsa-advice.md) |
 
 | 26 | 09-23 | Audit read floor; authenticated snapshot directory | Can startup avoid the whole-file index scan? | **prototype: prepared open 0.14–0.25 s** | Same synthetic 170M coins / 9.31 GB: raw cold-advised reads 11.4–13.1 s; 38.96 MB authenticated directory opens in 0.14–0.25 s across six runs, with 2,594/2,594 coin-body checks each. Preparation costs 23.55 s separately and requires a trusted root; not integrated node startup. Pipelined full scan 21–56 s: no reliable sub-20 s win. Revises #25's physical-floor interpretation. | [read-floor](2026-09-23-snapshot-read-floor.md) |
@@ -65,53 +91,151 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 Listed in rough priority; each entry has the hypothesis and the cheapest
 first measurement that would kill or confirm it.
 
-1. **Speculative block pre-validation.** Mempool contents predict the next
-   block (~90% overlap; compact-block sketches confirm). Pre-validate the
-   predicted block so real connect is mostly cache hits → faster block
-   accept/relay. First step: measure actual mempool↔block overlap on a
-   fixture + count connect-phase script work that hits the verified cache.
-   Bounded; reuses the spec engine and verified-tx cache.
+1. **Snapshot activation without materialization.** The overlay shim
+   (#35) proves reads fall through; `activate_snapshot` still bulk-loads
+   via `utxo_snapshot::load` + `coinstats::compute` (OOMs at 170M).
+   First step: attach `SnapshotRun` in place + wire snapverify (bounds
+   already verified) + persist the anchor.
 
-2. **Verification-transparency ledger.** A node that reports its own trust
-   state: "verified N% of history; heights a..b assumed under commitment X;
-   this output checked under flag-set F." Nobody ships inspectable trust.
-   Mostly surfacing what ConnectTiming/assumeutxo state already record.
-   First step: define the typed coverage record + a `getvalidationinfo`-style
-   RPC emitting it on the fixture node.
+2. **Verified-artifact distribution format.** Replay + parallel-verify
+   are proven (astra's ecdsa-parallel-replay); the open item is the
+   artifact spec — one reproducible bundle (snapshot + index +
+   midstates + sig-hints) anyone can generate and verify against
+   anchors. First step: write the format spec.
 
-3. **Live network sync.** The credibility gate — fixtures have carried all
-   claims so far. First step: signet/testnet headers+blocks against real
-   peers; measure tip-follow latency and peer misbehavior handling.
+3. **Utreexo as a first-class UTXO backend.** #38's spike shows a
+   247-byte accumulator state vs the 12GB UTXO set, ~110k leaves/s
+   verify+apply. First step: an `UtxoBackend` impl over rustreexo
+   `Stump` + a proof-carrying connect path on the fixture chain.
 
-4. **Delta overlay integration for SnapshotRun.** The ~90s-to-usable path
-   is bench-proven; making it real needs reads to fall through to the
-   indexed snapshot file with spends/inserts in the mutable layer, plus
-   `activate_snapshot` streaming (no 170M materialization — OOMs at scale).
-   First step: `UtxoSet` read-path shim + diff-test vs current backend.
+4. **Erlay follow-through.** Intra-Avila is live end-to-end (sketch →
+   reconcildiff → body, zero inv announcements). Remaining: capacity
+   tuning on realistic pool diffs, multi-peer round overlap, and
+   external interop (nobody else speaks BIP-330 — Knots if they ship
+   it).
 
-5. **ECDSA advice on real history.** #27's kernel win (1.8-2.3×) is
-   synthetic. First step: extract real sig-check traces from a historical
-   segment and replay them through the advice machinery — tests sighash
-   variants, codeseparator, and edge script forms the kernel bench skipped.
+5. **Per-block verification receipts.** Extend the transparency ledger
+   to per-block machine-checkable records: flags active, sighash modes,
+   script counts, UTXO state-hash before/after, wall time. Exportable
+   and independently replayable. Audits the node; never substitutes
+   for verifying it.
 
-6. **Built-in address index / electrum-style serving (profile).** Point a
-   wallet at your own node, no external indexer. Controversial storage cost
-   is exactly what profiles are for — opt-in distro, consensus untouched.
-   First step: cost model — index size + write overhead on the fixture.
+6. **Proof-carrying blocks (utreexo consumption).** Blocks carrying
+   their own accumulator proofs validate against a ~1KB stump — no
+   UTXO set needed. Parallel proof-verify / sequential apply; node can
+   also serve proofs. Purist gate: needs self-bridge or conventional
+   fallback — a bridge can starve, never forge.
 
-7. **Erlay-style tx reconciliation (BIP-330).** ~44% relay-bandwidth
-   savings; Core hasn't shipped it (simplified recon-only variant is in
-   Warnet testing upstream). Interop is the open question — today ~no peers
-   speak it. First step: implement BIP-330 recon-only message handling and
-   measure reconciliation rounds between two Avila nodes.
+7. **Stem-phase tx relay on top of recon.** Recon rounds are already
+   the epidemic "fluff"; add a private stem path for N hops before the
+   tx joins the reconciliation pool. Honest limits: propagation
+   latency, known Dandelion deanonymization attacks.
 
-8. **Differential fuzzing vs Core/Knots.** Continuous random-block/tx
-   generation with byte-exact comparison — turns "compatible" into a
-   monitored property rather than a claim. First step: fuzz harness on the
-   existing diff fixture generator, seeded corpus from past bugs.
+8. **Shadow-ruleset observatory.** Read-only evaluation of every block
+   under alternate rulesets (Knots policy, proposed softforks) — a
+   continuous consensus-drift monitor. Must never gate acceptance.
 
-9. **Utreexo research program.** BIPs 181-183 now have assigned numbers;
-   rustreexo 0.6.0 exists. Validate blocks against accumulator + proofs —
-   ~KB of state vs 12GB UTXO set. Months, not days; needs bridge-node
-   proof supply. First step: rustreexo spike — add/delete/prove round-trip
-   on the fixture's UTXO set, costed against CoinsBackend.
+9. **Dual-engine lockstep mode.** Two independent validation paths,
+   divergence halts with alarm. Note: bitcoinkernel shares Core's code
+   (common-mode bugs survive); true independence needs a second
+   implementation lineage.
+
+10. **Multi-route sync.** Disjoint transports cross-checking headers —
+    eclipse detection by construction.
+
+11. **Process-level sandboxing.** seccomp/capability separation: the
+    P2P stack can't write the datadir, the validator can't open
+    sockets, RPC gets its own boundary. Nobody ships OS-level
+    containment in a node. Measurable: publish the syscall whitelist,
+    test what a compromised wire parser can actually reach.
+
+12. **Eclipse detection (not just resistance).** Watch the signatures —
+    stalled header progress, suspiciously-uniform peer agreement,
+    work plateau — and cross-check disjoint routes to prove it. Lab
+    experiment: mount a real eclipse, measure detection time.
+
+13. **Fail-closed privacy profile.** Tor unreachable → tx broadcast
+    stops, Electrum stops, RPC stays localhost. Privacy failure
+    becomes impossible-by-configuration, not merely unlikely. Nobody
+    ships this because it's annoying; it's the only honest privacy
+    promise.
+
+14. **Per-peer adversarial accounting.** Formal per-peer budgets —
+    bytes, CPU, memory, queue slots — as a *tested contract*: fuzz the
+    boundaries, prove no hostile peer exceeds allocation under any
+    input sequence.
+
+15. **Continuous self-audit.** Background re-verification of random
+    historical segments, forever — correctness as an ongoing property,
+    catching disk rot and bitflips. Each pass appends receipt evidence.
+
+16. **Pinning oracle.** Mempool watcher that detects pinning patterns
+    against the operator's wallet transactions — descendant-limit
+    saturation, RBF rule-3 pinning, parked conflicts — and reports it.
+    The node tells you when you're under attack; nobody ships this.
+    Real value for LN operators.
+
+17. **V2 traffic padding.** The 2025 v2-transport analysis showed
+    BIP324 encrypts content but leaks message *shape* via TCP payload
+    lengths. BIP324's decoy/garbage mechanism exists for exactly this —
+    nobody uses it. Experiment: fixed-size send cells + decoy traffic;
+    measure observer command-classification accuracy before/after.
+
+18. **Selfish-stem broadcast.** The DoS objection that killed BIP156
+    was relaying *unvalidated* stems. Variant: only locally-originated,
+    mempool-admitted txs take a stem hop — one outbound link,
+    randomized delay, then normal recon fluff. No stempool, no
+    unvalidated relay, most of the origin-privacy benefit.
+
+19. **Recon-diff censorship telemetry.** Every recon round already
+    computes the per-peer pool diff — surface it. A peer persistently
+    missing a large share of your mempool is a censorship/eclipse
+    signal. Security telemetry at zero protocol cost.
+
+20. **Non-deterministic inbound eviction.** The evict-and-fill attack
+    (82-97% linkage accuracy) exploits predictable eviction; randomize
+    it. Small, bounded.
+
+21. **ASMap bucketing.** Core's deployed Erebus countermeasure —
+    bucket peers by ASN (Kartograf-reproducible maps) instead of /16.
+    A parity gap; well-specified, bounded.
+
+22. **Self-eclipse field test.** Build the attack: attacker nodes that
+    monopolize all our outbound slots in a lab topology. Hypothesis:
+    detection signals (header stall, peer homogeneity, route
+    uniformity) fire within bounded time. Kill condition: our own
+    eclipse goes undetected — learn it now. Nobody publishes eclipse
+    experiments on their own node; even a negative result is tooling.
+
+23. **Pinning red-team.** Implement BIP-431's documented pinning
+    attacks as tools (descendant-limit saturation, rule-3 pinning,
+    package-limit pinning), run against our mempool on regtest.
+    Hypothesis: oracle catches all documented classes with bounded
+    false positives. Kill: pinning is indistinguishable from
+    legitimate high-descendant usage — the signal isn't separable.
+
+24. **Continuous dual-engine lockstep.** We already have two coins
+    engines (redb + hashstore) — run both permanently on live traffic,
+    divergence = halt. Continuous consensus-equivalence as a running
+    property. Kill: second-engine overhead impractical at steady state
+    — measure it.
+
+25. **The privacy proof artifact.** Private mode + 24h full outbound
+    packet capture. Hypothesis: zero non-Tor bytes escape. Kill:
+    anything leaks (DNS, NTP, stray v1) — publish exactly where.
+
+26. **First-spy simulation.** Implement the first-spy timing estimator
+    from the Dandelion literature; run against our relay with/without
+    selfish-stem. Hypothesis: stem measurably moves detection
+    probability. Kill: stem-length-1 doesn't move the needle — learn
+    the number before building the real thing.
+
+27. **Self-fuzzing canary.** The node continuously feeds mutated
+    recent blocks back through its own strict decode path — a standing
+    red team inside the node. Kill: generated mutations aren't
+    interesting enough to catch what a test suite misses.
+
+28. **Adversarial live-wire suite.** Hostile peers at max rate —
+    malformed messages, floods, slowloris — measure per-peer budgets
+    hold under sustained attack. Kill: a hostile peer can starve
+    honest peers — find the hole now.

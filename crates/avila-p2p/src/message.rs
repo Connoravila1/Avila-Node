@@ -292,6 +292,27 @@ pub enum Message {
     CFCheckpt(CFCheckpt),
     /// `reject` — BIP61 rejection notice.
     Reject(Reject),
+    /// `sendrecon` — BIP330 (Erlay) reconciliation-capability handshake:
+    /// roles, protocol version and the 64-bit salt that keys the
+    /// connection's transaction short-ids.
+    SendRecon(SendRecon),
+    /// `reqrecon` — BIP330: requester opens a reconciliation round by
+    /// sending its set sketch.
+    ReqRecon(Vec<u8>),
+    /// `sketch` — BIP330: responder's reply sketch; the requester XORs
+    /// it with its own and decodes the symmetric difference.
+    Sketch(Vec<u8>),
+    /// `reconcildiff` — BIP330: short-ids the sender still wants (its
+    /// decode misses) plus a parent-ask flag.
+    ReconcilDiff {
+        /// Whether the sender also asks for missing parents.
+        ask_parents: u32,
+        /// 32-bit short-ids the sender wants bodies for.
+        short_ids: Vec<u32>,
+    },
+    /// `reqbisec` — BIP330: ask the peer to bisect its set when a sketch
+    /// exceeds capacity (empty payload like `mempool`).
+    ReqBisec,
     /// Any other command — Core ignores unknown commands; we preserve the
     /// payload so a session layer can log or drop the peer itself.
     Unknown {
@@ -364,6 +385,31 @@ const MAX_INV_SZ: u64 = 50_000;
 /// the peer is dropped before a single entry is looked at.
 const MAX_ADDR_TO_SEND: u64 = 1_000;
 
+/// BIP330 sketch payload bound — a reconciliation sketch is `4 x
+/// capacity` bytes and capacities beyond ~4096 differences are decode-
+/// expensive anyway; larger payloads are rejected before allocation.
+const MAX_SKETCH_BYTES: usize = 64 * 1024;
+
+/// BIP330 `reconcildiff` short-id list bound — a round asks for at most
+/// the sketch capacity worth of missing txs.
+const MAX_RECONCIL_IDS: u64 = 16_384;
+
+/// `sendrecon` — BIP330 (Erlay) set-reconciliation capability
+/// negotiation. Roles let a pair agree who reconciles; the 64-bit salt
+/// keys this connection's transaction short-ids so a peer cannot
+/// precompute collisions across links.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SendRecon {
+    /// Whether this node initiates reconciliation rounds.
+    pub is_sender: bool,
+    /// Whether this node answers reconciliation requests.
+    pub is_responder: bool,
+    /// Reconciliation protocol version (BIP330 defines 1).
+    pub version: u32,
+    /// Per-connection salt keying [`crate::recon::short_id`].
+    pub salt: u64,
+}
+
 fn get_inv_list(d: &mut Decoder, command: &str) -> Result<Vec<InvVector>, PayloadError> {
     let count = d.read_compact_size().map_err(|e| payload_err(command, e))?;
     if count > MAX_INV_SZ {
@@ -420,6 +466,11 @@ impl Message {
             Self::GetCFCheckpt(_) => "getcfcheckpt",
             Self::CFCheckpt(_) => "cfcheckpt",
             Self::Reject(_) => "reject",
+            Self::SendRecon(_) => "sendrecon",
+            Self::ReqRecon(_) => "reqrecon",
+            Self::Sketch(_) => "sketch",
+            Self::ReconcilDiff { .. } => "reconcildiff",
+            Self::ReqBisec => "reqbisec",
             Self::Unknown { command, .. } => command.as_str(),
         }
     }
@@ -532,7 +583,27 @@ impl Message {
             | Self::WtxidRelay
             | Self::SendAddrV2
             | Self::GetAddr
-            | Self::Mempool => {}
+            | Self::Mempool
+            | Self::ReqBisec => {}
+            Self::SendRecon(r) => {
+                out.push(u8::from(r.is_sender));
+                out.push(u8::from(r.is_responder));
+                out.extend_from_slice(&r.version.to_le_bytes());
+                out.extend_from_slice(&r.salt.to_le_bytes());
+            }
+            Self::ReqRecon(sk) | Self::Sketch(sk) => {
+                write_var_bytes(&mut out, sk);
+            }
+            Self::ReconcilDiff {
+                ask_parents,
+                short_ids,
+            } => {
+                out.extend_from_slice(&ask_parents.to_le_bytes());
+                write_compact_size(&mut out, short_ids.len() as u64);
+                for id in short_ids {
+                    out.extend_from_slice(&id.to_le_bytes());
+                }
+            }
         }
         out
     }
@@ -770,6 +841,39 @@ impl Message {
                     data: data.to_vec(),
                 })
             }
+            "sendrecon" => Self::SendRecon(SendRecon {
+                is_sender: d.read_u8().map_err(|e| payload_err(name, e))? != 0,
+                is_responder: d.read_u8().map_err(|e| payload_err(name, e))? != 0,
+                version: d.read_u32_le().map_err(|e| payload_err(name, e))?,
+                salt: d.read_u64_le().map_err(|e| payload_err(name, e))?,
+            }),
+            "reqrecon" | "sketch" => {
+                let sk = d.read_var_bytes().map_err(|e| payload_err(name, e))?;
+                if sk.len() > MAX_SKETCH_BYTES {
+                    return Err(payload_err(name, "sketch exceeds capacity bound"));
+                }
+                if name == "reqrecon" {
+                    Self::ReqRecon(sk)
+                } else {
+                    Self::Sketch(sk)
+                }
+            }
+            "reconcildiff" => {
+                let ask_parents = d.read_u32_le().map_err(|e| payload_err(name, e))?;
+                let count = d.read_compact_size().map_err(|e| payload_err(name, e))?;
+                if count > MAX_RECONCIL_IDS {
+                    return Err(payload_err(name, "reconcildiff count too large"));
+                }
+                let mut short_ids = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    short_ids.push(d.read_u32_le().map_err(|e| payload_err(name, e))?);
+                }
+                Self::ReconcilDiff {
+                    ask_parents,
+                    short_ids,
+                }
+            }
+            "reqbisec" => Self::ReqBisec,
             _ => {
                 return Ok(Self::Unknown {
                     command: name.to_string(),

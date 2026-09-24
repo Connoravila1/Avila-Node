@@ -5341,6 +5341,28 @@ pub(crate) fn dispatch(
                 "chainstates": chainstates,
             }))
         }),
+        // Avila-specific (no Core equivalent): the node's own
+        // verification coverage — verified vs proven vs assumed heights.
+        "getvalidationreport" => chain_query(method, queries, |cs, _| {
+            let r = cs.validation_report();
+            let snapshot = r.snapshot.map(|s| {
+                json!({
+                    "base_height": s.base_height,
+                    "base_hash": s.base_hash,
+                    "expected_utxo_hash": s.expected_utxo_hash,
+                    "replayed_height": s.replayed_height,
+                    "assumed_heights": [1, s.base_height],
+                    "unproven_heights": [s.replayed_height + 1, s.base_height],
+                    "verified": s.verified,
+                })
+            });
+            Ok(json!({
+                "connected_height": r.connected_height,
+                "header_height": r.header_height,
+                "verified_fraction": r.verified_fraction,
+                "snapshot": snapshot,
+            }))
+        }),
         "getdeploymentinfo" => {
             // RPCHelpMan: 0–1 args.
             if params.as_array().is_some_and(|a| a.len() > 1) {
@@ -6738,6 +6760,9 @@ pub(crate) fn dispatch(
                                 "outbound-full-relay"
                             },
                             "transport_protocol_type": p.transport_protocol,
+                            // BIP330: whether this link negotiated
+                            // transaction reconciliation.
+                            "recon": p.recon,
                             // Core: hex of the BIP324 session id on v2,
                             // "" on v1.
                             "session_id": p
@@ -9536,7 +9561,10 @@ pub(crate) fn dispatch(
                         )
                     })?;
                 let base_height = cs
-                    .activate_snapshot(&mut reader, &meta, !mgr.mempool_ref().is_empty())
+                    // Overlay path: the file streams through the
+                    // commitment check and then serves reads in place —
+                    // no import, no materialization, no 12GB rewrite.
+                    .activate_snapshot_overlay(&path, &meta, !mgr.mempool_ref().is_empty())
                     .map_err(|e| {
                         (
                             RPC_INTERNAL_ERROR,
@@ -12411,6 +12439,15 @@ mod tests {
     use super::*;
     use avila_consensus::params::Network;
 
+    fn default_report() -> avila_consensus::chainstate::ValidationReport {
+        avila_consensus::chainstate::ValidationReport {
+            connected_height: 120,
+            header_height: 140,
+            snapshot: None,
+            verified_fraction: 1.0,
+        }
+    }
+
     fn snap() -> SyncProgress {
         SyncProgress {
             peers: 2,
@@ -12423,6 +12460,7 @@ mod tests {
             peer_details: Vec::new(),
             mempool: (5, 1, Some(2_000)),
             elapsed_secs: 42,
+            validation: default_report(),
         }
     }
 

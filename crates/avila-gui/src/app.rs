@@ -450,6 +450,8 @@ impl AvilaApp {
                     ui.label(muted(format!("· {} peers", p.peers)));
                     ui.label(muted(format!("· {} in flight", p.in_flight)));
                 });
+                ui.add_space(8.0);
+                self.validation_panel(ui, &p.validation);
                 if let Some(Ok(r)) = &self.sync.report {
                     ui.add_space(10.0);
                     ui.label(muted(format!(
@@ -614,6 +616,51 @@ impl AvilaApp {
         }
     }
 
+    /// What the node has actually verified — the typed coverage record,
+    /// not a claim. "Connected" means fully validated; a snapshot prefix
+    /// is *assumed* until background replay proves it against the pinned
+    /// commitment, and this panel says exactly which is which.
+    fn validation_panel(
+        &self,
+        ui: &mut egui::Ui,
+        v: &avila_consensus::chainstate::ValidationReport,
+    ) {
+        ui.label(muted("VERIFICATION"));
+        match &v.snapshot {
+            None => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        mono(format!("{:.1}%", v.verified_fraction * 100.0))
+                            .color(OK),
+                    );
+                    ui.label(muted("of history fully verified — no assumptions"));
+                });
+            }
+            Some(snap) => {
+                ui.horizontal_wrapped(|ui| {
+                    let proven = snap.replayed_height >= snap.base_height;
+                    ui.label(
+                        mono(format!("heights 1-{}", snap.base_height)).color(WARN),
+                    );
+                    ui.label(muted(if proven {
+                        "snapshot-assumed — replay complete, commitment matched"
+                    } else {
+                        "snapshot-assumed — background replay in progress"
+                    }));
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(muted("replayed to"));
+                    ui.label(mono(snap.replayed_height.to_string()).color(ACCENT));
+                    ui.label(muted(format!("of {}", snap.base_height)));
+                    ui.label(muted(format!(
+                        "· post-snapshot heights {}+ fully verified",
+                        snap.base_height + 1
+                    )));
+                });
+            }
+        }
+    }
+
     /// Every peer as an untrusted input: what it *claims* (its asserted
     /// height) vs. what it has *served* (headers/blocks we verified).
     fn peer_table(&self, ui: &mut egui::Ui, peers: &[avila_p2p::manager::PeerSnapshot]) {
@@ -625,6 +672,7 @@ impl AvilaApp {
             .column(Column::remainder().at_least(150.0)) // address
             .column(Column::initial(30.0)) // dir
             .column(Column::initial(120.0).clip(true)) // agent
+            .column(Column::initial(40.0)) // recon
             .column(Column::initial(55.0)) // claims
             .column(Column::initial(50.0)) // hdrs
             .column(Column::initial(45.0)) // blks
@@ -632,7 +680,7 @@ impl AvilaApp {
             .column(Column::initial(45.0)) // idle
             .header(20.0, |mut header| {
                 for label in [
-                    "peer", "dir", "agent", "claims", "hdrs", "blks", "in-flt", "idle",
+                    "peer", "dir", "agent", "recon", "claims", "hdrs", "blks", "in-flt", "idle",
                 ] {
                     header.col(|ui| {
                         ui.label(muted(label));
@@ -656,6 +704,17 @@ impl AvilaApp {
                         let agent = p.user_agent.as_deref().unwrap_or("—");
                         let agent = agent.trim_start_matches('/').trim_end_matches('/');
                         ui.label(muted(agent));
+                    });
+                    row.col(|ui| {
+                        ui.label(
+                            mono(if p.recon { "330" } else { "—" })
+                                .color(if p.recon { ACCENT } else { MUTED }),
+                        )
+                        .on_hover_text(if p.recon {
+                            "BIP-330 set reconciliation active on this link"
+                        } else {
+                            "ordinary inv/getdata relay"
+                        });
                     });
                     row.col(|ui| {
                         // What the peer claims — never presented as verified.

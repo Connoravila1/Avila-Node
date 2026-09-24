@@ -154,6 +154,11 @@ pub struct UtxoSet {
     base: Option<Box<UtxoSet>>,
     /// The persisted coins store — `Some` only on the real leaf set.
     backend: Option<std::sync::Arc<crate::coinsdb::CoinsBackend>>,
+    /// The immutable snapshot base — the lowest layer. Reads fall
+    /// through after map/base/backend all miss. Writes never touch it:
+    /// a spent snapshot coin leaves a tombstone in `map` that shadows
+    /// the base (and commits a harmless no-op delete to the backend).
+    snapshot: Option<std::sync::Arc<crate::sortedrun::SnapshotRun>>,
     /// Approximate bytes held by `map` — the flush-pressure signal.
     map_bytes: usize,
     /// Soft cap on `map_bytes` — Core's `-dbcache` for the coins view.
@@ -174,6 +179,7 @@ impl Default for UtxoSet {
             map: HashMap::new(),
             base: None,
             backend: None,
+            snapshot: None,
             map_bytes: 0,
             budget: DEFAULT_CACHE_BUDGET,
             live_delta: 0,
@@ -210,6 +216,18 @@ impl UtxoSet {
         self.backend = Some(backend);
     }
 
+    /// Attaches an immutable snapshot run as the lowest read layer —
+    /// the delta-overlay base for a SnapshotRun-loaded chainstate.
+    pub fn attach_snapshot(&mut self, run: crate::sortedrun::SnapshotRun) {
+        self.snapshot = Some(std::sync::Arc::new(run));
+    }
+
+    /// Attaches an already-shared snapshot run — the chainstate holds
+    /// the `Arc` and hands the same one here (mirrors `attach_shared`).
+    pub fn attach_shared_snapshot(&mut self, run: std::sync::Arc<crate::sortedrun::SnapshotRun>) {
+        self.snapshot = Some(run);
+    }
+
     /// `true` when a disk backend is attached.
     #[must_use]
     pub fn has_backend(&self) -> bool {
@@ -239,11 +257,16 @@ impl UtxoSet {
     /// O(1): the delta is maintained at write time.
     #[must_use]
     pub fn len(&self) -> usize {
-        let lower = self.base.as_deref().map_or(0, UtxoSet::len).saturating_add(
-            self.backend
-                .as_deref()
-                .map_or(0, |b| b.coins_len() as usize),
-        );
+        let lower = self
+            .base
+            .as_deref()
+            .map_or(0, UtxoSet::len)
+            .saturating_add(
+                self.backend
+                    .as_deref()
+                    .map_or(0, |b| b.coins_len() as usize),
+            )
+            .saturating_add(self.snapshot.as_ref().map_or(0, |s| s.len()) as usize);
         lower.saturating_add_signed(self.live_delta as isize)
     }
 
@@ -268,6 +291,9 @@ impl UtxoSet {
         if let Some(be) = &self.backend {
             return be.get(outpoint);
         }
+        if let Some(snap) = &self.snapshot {
+            return snap.get(outpoint);
+        }
         None
     }
 
@@ -289,7 +315,16 @@ impl UtxoSet {
         if let Some(base) = &self.base {
             return base.have(outpoint);
         }
-        self.backend.as_ref().is_some_and(|be| be.have(outpoint))
+        if self
+            .backend
+            .as_ref()
+            .is_some_and(|be| be.have(outpoint))
+        {
+            return true;
+        }
+        self.snapshot
+            .as_ref()
+            .is_some_and(|s| s.get(outpoint).is_some())
     }
 
     /// Every live `OutPoint → Coin`, materialized — merges the dirty
@@ -298,6 +333,40 @@ impl UtxoSet {
     /// callers all collect anyway.
     #[must_use]
     pub fn iter(&self) -> Vec<(OutPoint, Coin)> {
+        let mut all: HashMap<OutPoint, Coin> = match &self.backend {
+            Some(be) => be.iter_coins().into_iter().collect(),
+            None => HashMap::new(),
+        };
+        // The snapshot file is the lowest layer — everything above
+        // shadows it.
+        if let Some(snap) = &self.snapshot {
+            for (op, c) in snap.iter().unwrap_or_default() {
+                all.insert(op, c);
+            }
+        }
+        if let Some(base) = &self.base {
+            for (op, c) in base.iter() {
+                all.insert(op, c);
+            }
+        }
+        for (op, entry) in &self.map {
+            match entry {
+                Some(c) => {
+                    all.insert(*op, c.clone());
+                }
+                None => {
+                    all.remove(op);
+                }
+            }
+        }
+        all.into_iter().collect()
+    }
+
+    /// [`Self::iter`] without the snapshot layer — the mutable delta
+    /// alone. `state.dat` persists this view: the snapshot file is the
+    /// base and must not be serialized into it.
+    #[must_use]
+    pub fn iter_delta(&self) -> Vec<(OutPoint, Coin)> {
         let mut all: HashMap<OutPoint, Coin> = match &self.backend {
             Some(be) => be.iter_coins().into_iter().collect(),
             None => HashMap::new(),
@@ -339,12 +408,17 @@ impl UtxoSet {
             .as_deref()
             .and_then(|b| b.get(outpoint))
             .or_else(|| self.backend.as_deref().and_then(|be| be.get(outpoint)))
+            .or_else(|| self.snapshot.as_ref().and_then(|s| s.get(outpoint)))
     }
 
     /// `true` if any layer below `map` holds `outpoint`.
     fn lower_live(&self, outpoint: &OutPoint) -> bool {
         self.base.as_deref().is_some_and(|b| b.have(outpoint))
             || self.backend.as_deref().is_some_and(|be| be.have(outpoint))
+            || self
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.get(outpoint).is_some())
     }
 
     /// Writes `entry` into `map`, keeping `live_delta` exact: the map's
@@ -486,6 +560,7 @@ impl UtxoSet {
             map: HashMap::new(),
             base: Some(Box::new(std::mem::take(self))),
             backend: None,
+            snapshot: None,
             map_bytes: 0,
             budget: usize::MAX, // simulation never flushes
             live_delta: 0,
@@ -575,6 +650,7 @@ impl Clone for UtxoSet {
             map: self.map.clone(),
             base: self.base.clone(),
             backend: self.backend.clone(),
+            snapshot: self.snapshot.clone(),
             map_bytes: self.map_bytes,
             budget: self.budget,
             live_delta: self.live_delta,
@@ -1802,6 +1878,82 @@ mod tests {
             .unwrap();
         assert_eq!(coin.out.value, SUBSIDY - 1000);
         assert!(!coin.coinbase);
+    }
+
+
+    /// The snapshot run sits below the backend: reads fall through,
+    /// spends shadow with tombstones, `len` counts the base.
+    #[test]
+    fn snapshot_run_is_lowest_overlay_layer() {
+
+        let dir = std::env::temp_dir().join(format!("avila-overlay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snap.dat");
+
+        // Two coins in distinct txid groups, sorted by key (the format's
+        // grouped order) — the index's binary search relies on it.
+        let mk = |b: u8, vout: u32| OutPoint {
+            txid: Txid::from_bytes([b; 32]),
+            vout,
+        };
+        let coin = |v: i64, h: u32| Coin {
+            out: TxOut {
+                value: v,
+                script_pubkey: Script::new(vec![0x51]),
+            },
+            height: h,
+            coinbase: false,
+        };
+        let op1 = mk(0x10, 0);
+        let op2 = mk(0x20, 1);
+        let c1 = coin(50_000, 7);
+        let c2 = coin(75_000, 8);
+        let coins = vec![(op1, c1.clone()), (op2, c2.clone())];
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            crate::utxo_snapshot::write_snapshot(
+                f,
+                [0xfa, 0xbf, 0xb5, 0xda],
+                &BlockHash::from_bytes([0; 32]),
+                2,
+                &coins,
+            )
+            .unwrap();
+        }
+
+        let run = crate::sortedrun::SnapshotRun::index(&path, 1).unwrap();
+        assert_eq!(run.len(), 2);
+        // Direct probe: both coins resolve through the index.
+        assert_eq!(run.get(&op1).unwrap().out.value, 50_000);
+        assert_eq!(run.get(&op2).unwrap().out.value, 75_000);
+
+        let mut set = UtxoSet::new();
+        set.attach_snapshot(run);
+        assert_eq!(set.len(), 2);
+        assert!(set.have(&op1));
+        let got = set.get(&op1).unwrap();
+        assert_eq!(got.out.value, 50_000);
+        assert_eq!(got.height, 7);
+
+        // Spending a snapshot coin leaves a tombstone — the base stays
+        // immutable, `have`/`len` reflect the spend.
+        assert!(set.spend_coin(&op1).is_some());
+        assert!(!set.have(&op1));
+        assert!(set.get(&op1).is_none());
+        assert_eq!(set.len(), 1);
+
+        // Recreating the same outpoint shadows the tombstone — the
+        // delta behaves exactly like a backend-backed set.
+        let c1b = coin(60_000, 9);
+        set.insert_synthetic(op1, c1b.clone());
+        assert_eq!(set.get(&op1).unwrap().out.value, 60_000);
+        assert_eq!(set.len(), 2);
+
+        // A coin absent from every layer stays absent.
+        assert!(!set.have(&mk(0x99, 0)));
+        assert_eq!(set.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- value rules ----------------------------------------------------------

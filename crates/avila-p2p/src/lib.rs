@@ -27,9 +27,11 @@ pub mod banman;
 pub mod bip324;
 pub mod codec;
 pub mod headerssync;
+pub mod sketch;
 pub mod manager;
 pub mod message;
 pub mod proxy;
+pub mod recon;
 pub mod session;
 pub mod sync;
 

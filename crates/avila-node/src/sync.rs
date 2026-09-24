@@ -146,6 +146,9 @@ pub struct SyncProgress {
     pub mempool: (usize, usize, Option<i64>),
     /// Seconds since this run started — the daemon's `uptime`.
     pub elapsed_secs: u64,
+    /// What the node has actually verified — connected vs. assumed
+    /// coverage per the typed report (`getvalidationreport`).
+    pub validation: avila_consensus::chainstate::ValidationReport,
 }
 
 /// The outcome of a finished (or timed-out) sync run.
@@ -476,6 +479,7 @@ pub fn run(
                 mgr.mempool().estimate_fee(6),
             ),
             elapsed_secs: (crate::time::time() - started_epoch).max(0) as u64,
+            validation: cs.validation_report(),
         };
         if let Some(status) = &cfg.status
             && let Ok(mut w) = status.write()

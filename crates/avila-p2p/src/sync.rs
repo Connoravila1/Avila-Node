@@ -115,6 +115,13 @@ pub struct PeerSync {
     /// `None` once answered (even by an empty page). Core's
     /// `m_last_getheaders_timestamp`.
     headers_in_flight: Option<Instant>,
+    /// Announced block hashes we haven't requested yet — invs beyond
+    /// the in-flight cap wait here instead of being forgotten; drained
+    /// as slots free (`drain_pending`).
+    pending_blocks: VecDeque<BlockHash>,
+    /// Dedupe for `pending_blocks` — keeps the queue from growing a
+    /// duplicate per repeated announcement.
+    pending_set: HashSet<BlockHash>,
     /// Headers applied from this peer so far (a boundless-increment counter
     /// is fine — it's pure bookkeeping).
     headers_applied: usize,
@@ -176,6 +183,8 @@ impl PeerSync {
             headers_applied: 0,
             blocks_received: 0,
             headers_sync: None,
+            pending_blocks: VecDeque::new(),
+            pending_set: HashSet::new(),
         }
     }
 
@@ -557,14 +566,8 @@ impl PeerSync {
         let free = MAX_BLOCKS_IN_TRANSIT_PER_PEER
             .saturating_sub(self.in_flight.len())
             .min(global_free);
-        if free == 0 {
-            return None;
-        }
         let mut want = Vec::new();
         for inv in invs {
-            if want.len() >= free {
-                break;
-            }
             let is_block = matches!(inv.inv_type, InvType::Block | InvType::WitnessBlock);
             let is_tx = matches!(
                 inv.inv_type,
@@ -580,6 +583,18 @@ impl PeerSync {
             // announcements happen). Tx: skip what the pool already holds
             // (announced by txid or wtxid — `contains_hash` covers both).
             if is_block && cs.have_body(&hash) {
+                continue;
+            }
+            // Beyond the request budget this tick: remember the block —
+            // without a backlog the rest of a 100-inv announcement is
+            // silently dropped and the chain stalls behind the tip.
+            if want.len() >= free {
+                if is_block
+                    && self.pending_set.insert(hash)
+                    && !self.wanted.contains(&hash)
+                {
+                    self.pending_blocks.push_back(hash);
+                }
                 continue;
             }
             if is_tx && mempool.is_some_and(|m| m.contains_hash(&hash)) {
@@ -607,6 +622,39 @@ impl PeerSync {
         let now = Instant::now();
         for inv in &want {
             self.in_flight.push_back((inv.hash, now));
+        }
+        Some(Message::GetData(want))
+    }
+
+    /// Request announced-but-unrequested blocks as in-flight slots
+    /// free up — the backlog [`Self::on_inv`] parks when a burst
+    /// exceeds the per-peer window.
+    #[must_use]
+    pub fn drain_pending(&mut self, cs: &Chainstate, global_free: usize) -> Option<Message> {
+        let free = MAX_BLOCKS_IN_TRANSIT_PER_PEER
+            .saturating_sub(self.in_flight.len())
+            .min(global_free);
+        if free == 0 {
+            return None;
+        }
+        let now = Instant::now();
+        let mut want = Vec::new();
+        while want.len() < free {
+            let Some(hash) = self.pending_blocks.pop_front() else {
+                break;
+            };
+            self.pending_set.remove(&hash);
+            if cs.have_body(&hash) || !self.wanted.insert(hash) {
+                continue;
+            }
+            self.in_flight.push_back((hash, now));
+            want.push(InvVector {
+                inv_type: InvType::WitnessBlock,
+                hash,
+            });
+        }
+        if want.is_empty() {
+            return None;
         }
         Some(Message::GetData(want))
     }
@@ -1303,6 +1351,32 @@ mod tests {
         assert_eq!(sync.in_flight(), 3);
         // Same invs again → nothing new to ask for.
         assert!(sync.on_inv(&cs, None, &invs, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn inv_burst_beyond_window_queues_and_drains() {
+        // 20 announced blocks against a 16-slot window: the first 16
+        // are requested now, the rest park in the backlog — arriving
+        // bodies free slots and the drain requests them.
+        let mut sync = PeerSync::new();
+        let cs = regtest();
+        let invs: Vec<InvVector> = (0..20u32)
+            .map(|i| InvVector {
+                inv_type: InvType::WitnessBlock,
+                hash: BlockHash::from_bytes([i as u8; 32]),
+            })
+            .collect();
+        let req = sync.on_inv(&cs, None, &invs, 1024).expect("getdata");
+        let Message::GetData(want) = req else { panic!() };
+        assert_eq!(want.len(), 16);
+        assert_eq!(sync.pending_blocks.len(), 4);
+        // Free a slot — the drain takes one more.
+        sync.in_flight.pop_front();
+        let req = sync.drain_pending(&cs, 1024).expect("drained getdata");
+        let Message::GetData(want) = req else { panic!() };
+        assert_eq!(want.len(), 1);
+        assert_eq!(want[0].hash, BlockHash::from_bytes([16; 32]));
+        assert_eq!(sync.pending_blocks.len(), 3);
     }
 
     #[test]

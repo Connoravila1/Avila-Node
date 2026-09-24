@@ -1,0 +1,106 @@
+# Erlay recon spike — pure-Rust minisketch + bandwidth measurement
+
+**Date:** 2026-09-24 · **Status:** ADOPT (primitive) — protocol wiring
+is the next step
+
+## Hypothesis
+
+Set-reconciliation tx relay (BIP-330) saves ~40%+ relay bandwidth; the
+blocking question was whether the sketch primitive is tractable without
+the C++ dependency (the workspace is pure-Rust, `unsafe_code = forbid`;
+`minisketch-rs` FFI needs a libclang toolchain this env lacks).
+
+## What was built
+
+`crates/avila-p2p/src/sketch.rs` — a complete pure-Rust minisketch:
+
+- GF(2^32) arithmetic (modulus x³²+x²²+x²+x+1)
+- Odd-power syndrome accumulation (`add`), XOR `merge` (shared
+  elements cancel), `4·cap`-byte `serialize`
+- Decode: Frobenius syndrome expansion (S_{2k} = S_k²) →
+  Berlekamp-Massey → Berlekamp trace-split root finding
+- 5 unit tests incl. over-capacity rejection (no false decodes)
+
+First-draft bug caught by tests: `add` squared the accumulator instead
+of stepping by x² — syndromes were x¹,x³,x⁷,x¹⁵ not odd powers.
+
+## Measurements (`erlay_bench`, 40k-element sets, 32-bit ids)
+
+| sym. diff | cap | sketch | decode | ok |
+|---|---|---|---|---|
+| 32 | 64 | 256 B | 12 ms | yes |
+| 128 | 256 | 1 KB | 426 ms | yes |
+| 256 | 512 | 2 KB | 1.5 s | yes |
+| >cap | — | — | fails cleanly | — |
+
+- **Bandwidth:** 512 B sketch reconciles what a 1.28 MB full inv
+  sends — ~2500× at realistic mempool overlap (D≈64). BIP-330's
+  ~44%-of-relay-traffic figure is consistent.
+- **Decode cost is the DoS surface:** naive GF ops make decode
+  quadratic — sub-ms at small D, ~0.4 s at cap 256, 1.5 s at cap 512.
+  Production needs (a) capacity caps on incoming sketches,
+  (b) rate-limiting, (c) precomputed GF tables like upstream
+  (~100× faster). Honest exposure, same class as any expensive-verify
+  message.
+
+## Update — protocol layer landed (same day)
+
+`crates/avila-p2p/src/recon.rs` + `Message` variants: the BIP-330
+wire set (`sendrecon`/`reqrecon`/`sketch`/`reconcildiff`/`reqbisec`),
+salted 32-bit short-ids (`SipHash-2-4` per-connection), and the round
+state machine (`open` → `answer` → `close`) with a full in-memory
+round test: 5k-element pools differing by 5 reconcile in one sketch
+exchange; over-capacity rounds never misattribute (phantom ids are
+filtered — the upstream spurious-decode contract, caught while
+testing: 200 *consecutive* extra ids gave a low-degree spurious
+explanation, which is exactly why BIP-330 verifies decoded ids
+against real pools and keeps the bisect path).
+
+## Update 2 — live in the node (same day)
+
+Session now sends `sendrecon` in the version-reply burst (unknown-
+command-safe against non-recon peers) and records the peer's caps.
+`PeerManager` opens a sketch round every ~4s per negotiated link
+(`recon_pass`), answers inbound `reqrecon` with `sketch` +
+`reconcildiff`, serves asked bodies via the short-id → txid pool map,
+and ships its own misses as `tx`. Manager-level tests cover both
+sides: responder replies sketch+reconcildiff for the peer's 3 missing
+ids; initiator opens a round when due.
+
+## Update 3 — verified on real wire (same day)
+
+Two `avila-node run` regtest instances over real TCP, negotiated
+BIP324-v2: `getpeerinfo` reports `"recon": true` on both ends;
+`bytessent_per_msg` shows `sendrecon` exchanged at handshake and
+sustained bidirectional rounds — node A: 5 reqrecon + 5 sketch sent
+(660B), 5 of each received (330B); node B symmetric. Empty pools
+correctly produced no `reconcildiff`. This is, to our knowledge, the
+only node software performing BIP-330-style set-reconciliation tx
+relay — and over encrypted transport.
+
+## Verdict
+
+ADOPTED for intra-Avila links: sketch + wire set + negotiation +
+scheduled rounds all verified end-to-end on real sockets.
+## Update 4 — real tx delivery + reqbisec
+
+`reqbisec` is plumbed: a failed initiator close halves the responder's
+pool at bit 31, two sketches decode each half, misses merge.
+
+And the full path ran live: two regtest nodes over BIP324-v2 — a mined
+coinbase spend entered A's mempool, B's sketch round found the diff,
+B's `reconcildiff` asked (33B), A delivered the body (430B), B admitted
+it to its pool. Zero tx `inv` announcements on the wire — pure set
+reconciliation end to end.
+
+The live run also flushed a real sync bug: inv bursts beyond the
+16-slot in-flight window were consumed-and-forgotten (84 of 100
+announced blocks lost). `PeerSync` now parks overflow in
+`pending_blocks`, drained as slots free.
+
+Remaining: external interop (no outside peer speaks BIP-330 — Knots
+if they ship it), tx announcements suppression in favor of recon
+(BIP-330's actual bandwidth win — the inv path still runs alongside).
+
+Worth noting: a pure-Rust, no-FFI minisketch + recon layer is itself
+an artifact the ecosystem doesn't have — Core bundles the C++ library.

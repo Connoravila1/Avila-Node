@@ -296,6 +296,40 @@ pub enum BackgroundStatus {
     Verified,
 }
 
+/// Typed verification coverage — the node's own trust state. Heights
+/// are split into *verified* (script-checked by this node), *proven*
+/// (snapshot prefix replayed by background validation), and *assumed*
+/// (prefix taken on the assumeutxo commitment, replay pending).
+#[derive(Clone, Debug)]
+pub struct ValidationReport {
+    /// Highest fully-validated height — every script in `0..=h` checked.
+    pub connected_height: u32,
+    /// Header-verified tip (PoW + structure; bodies may be unchecked).
+    pub header_height: u32,
+    /// Snapshot coverage — present iff an assumeutxo snapshot is active.
+    pub snapshot: Option<SnapshotCoverage>,
+    /// Share of the connected chain whose state was verified or proven
+    /// locally — `1.0` on a full-validation node.
+    pub verified_fraction: f64,
+}
+
+/// The snapshot portion of a [`ValidationReport`].
+#[derive(Clone, Debug)]
+pub struct SnapshotCoverage {
+    /// Snapshot base height — the assumed prefix is `1..=base_height`.
+    pub base_height: u32,
+    /// Display-order hex of the base block hash.
+    pub base_hash: String,
+    /// The chainparams-pinned `hash_serialized_3` commitment the
+    /// replayed set must equal — the sole trust anchor.
+    pub expected_utxo_hash: String,
+    /// Heights `1..=replayed_height` proven by background replay.
+    pub replayed_height: u32,
+    /// `true` once the replay reached the base and matched the
+    /// commitment — the prefix is then proven, not assumed.
+    pub verified: bool,
+}
+
 /// The transaction index behind `-txindex`: every retained block's
 /// txids mapped to its hash, plus an append log (`txindex.dat`) that
 /// makes the index resumable — records are `blockhash || count ||
@@ -1028,6 +1062,16 @@ impl Chainstate {
         self.scripthashindex.is_some()
     }
 
+    /// Index size: `(unique script hashes, total history entries)` —
+    /// the cost-model numbers for the opt-in profile.
+    pub fn scripthash_index_stats(&self) -> Option<(usize, usize)> {
+        let idx = self.scripthashindex.as_ref()?;
+        Some((
+            idx.by_script.len(),
+            idx.by_script.values().map(Vec::len).sum(),
+        ))
+    }
+
     /// Whether `-blockfilterindex` is active — `getindexinfo` reports
     /// `basic block filter index` under it.
     #[must_use]
@@ -1108,30 +1152,33 @@ impl Chainstate {
     /// # Errors
     ///
     /// `SnapshotError` with Core's exact messages.
-    pub fn activate_snapshot<R: std::io::Read>(
-        &mut self,
-        r: &mut R,
+    /// [`Self::activate_snapshot`] and [`Self::activate_snapshot_overlay`]
+    /// share the same `ActivateSnapshot` guard sequence: table lookup,
+    /// header membership, best-chain containment, mempool emptiness,
+    /// and the work comparison.
+    fn check_snapshot_activation(
+        &self,
         meta: &crate::utxo_snapshot::SnapshotMetadata,
         mempool_nonempty: bool,
-    ) -> Result<u32, crate::utxo_snapshot::SnapshotError> {
+    ) -> Result<(BlockHash, u32, crate::params::AssumeutxoData), crate::utxo_snapshot::SnapshotError> {
         use crate::utxo_snapshot::SnapshotError;
         let params = *self.tree.params();
         let base = meta.base_blockhash;
         let base_display = base.to_string();
 
-        // ActivateSnapshot's checks, in order.
         if self.snapshot_base.is_some() {
             return Err(SnapshotError(
                 "Can't activate a snapshot-based chainstate more than once".to_string(),
             ));
         }
-        let Some(au_data) = params.assumeutxo_data.iter().find(|d| {
+        let known_base = params.assumeutxo_data.iter().any(|d| {
             std::str::FromStr::from_str(d.blockhash)
                 .ok()
                 .as_ref()
                 .map(|h: &BlockHash| h.as_bytes() == base.as_bytes())
                 .unwrap_or(false)
-        }) else {
+        });
+        if !known_base {
             let heights = params
                 .assumeutxo_data
                 .iter()
@@ -1141,7 +1188,7 @@ impl Chainstate {
             return Err(SnapshotError(format!(
                 "assumeutxo block hash in snapshot metadata not recognized (hash: {base_display}). The following snapshot heights are available: {heights}"
             )));
-        };
+        }
         let Some(start) = self.tree.get(&base) else {
             return Err(SnapshotError(format!(
                 "The base block header ({base_display}) must appear in the headers chain. Make sure all headers are syncing, and call loadtxoutset again"
@@ -1171,9 +1218,6 @@ impl Chainstate {
             ));
         }
 
-        // PopulateAndValidateSnapshot: the height-keyed table lookup is
-        // a duplicate of the blockhash one here (the table is keyed on
-        // both consistently), then the work comparison Core repeats.
         let Some(au_by_height) = params
             .assumeutxo_data
             .iter()
@@ -1193,6 +1237,158 @@ impl Chainstate {
                 "Work does not exceed active chainstate".to_string(),
             ));
         }
+        Ok((base, base_height, *au_by_height))
+    }
+
+    /// The post-verification commit shared by both activation paths:
+    /// adopt `utxo` as the working set, re-anchor the connected chain
+    /// at the snapshot base, arm background validation, and flush.
+    fn commit_activated_snapshot(
+        &mut self,
+        utxo: UtxoSet,
+        base: BlockHash,
+        base_height: u32,
+        au_n_chain_tx: u64,
+    ) -> Result<(), crate::utxo_snapshot::SnapshotError> {
+        use crate::utxo_snapshot::SnapshotError;
+        let params = *self.tree.params();
+        let mut chain = Vec::with_capacity(base_height as usize + 1);
+        let mut cursor = base;
+        loop {
+            chain.push(cursor);
+            if cursor == params.genesis_header.hash() {
+                break;
+            }
+            cursor = self
+                .tree
+                .get(&cursor)
+                .map(|n| n.header.prev_block_hash)
+                .ok_or_else(|| {
+                    SnapshotError("snapshot base header chain is incomplete".to_string())
+                })?;
+        }
+        chain.reverse();
+        self.utxo = utxo;
+        self.chain = chain;
+        self.undos = if self.coins_backend.is_some() {
+            Vec::new()
+        } else {
+            vec![BlockUndo::default(); base_height as usize]
+        };
+        self.connected = base;
+        self.snapshot_base = Some(base_height);
+        self.background = Some(BackgroundValidation {
+            utxo: UtxoSet::new(),
+            next: 1,
+            pool: None,
+            pending: std::collections::VecDeque::new(),
+        });
+        self.snapshot_verified = false;
+        self.precious = None;
+        self.tree.apply_tx_meta(&base, 0, au_n_chain_tx);
+        if let Some(index) = &mut self.filterindex {
+            index.reset_to_snapshot();
+        }
+        if let Some(index) = &mut self.scripthashindex {
+            index.reset_to_snapshot();
+        }
+        if self.store.is_some() {
+            self.flush()
+                .map_err(|e| SnapshotError(format!("snapshot flush: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Overlay activation — the differentiated path: stream the
+    /// Core-format snapshot file once to verify `AssumeutxoHash` (no
+    /// materialization — `coinstats::compute` collects the whole set),
+    /// index it in place, and attach it as the UtxoSet's lowest read
+    /// layer. Zero imported bytes; the file stays the canonical
+    /// read-only base forever.
+    pub fn activate_snapshot_overlay(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+        meta: &crate::utxo_snapshot::SnapshotMetadata,
+        mempool_nonempty: bool,
+    ) -> Result<u32, crate::utxo_snapshot::SnapshotError> {
+        use crate::utxo_snapshot::SnapshotError;
+        let (base, base_height, au) =
+            self.check_snapshot_activation(meta, mempool_nonempty)?;
+
+        // Single sequential pass — `index_with` builds the sparse
+        // group index AND streams every decoded coin to the
+        // hasher (file order IS the committed hash order; a
+        // mis-ordered file just won't match). Two channels: the
+        // coins feed `compute_streaming` on a worker thread.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(OutPoint, Coin)>(4096);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let bh = base_height;
+        let hasher = std::thread::spawn(move || {
+            let stats = crate::coinstats::compute_streaming(
+                rx.into_iter(),
+                i64::from(bh),
+                base,
+                crate::coinstats::CoinStatsHashType::HashSerialized,
+            );
+            let _ = done_tx.send(stats);
+        });
+        let run = crate::sortedrun::SnapshotRun::index_with(
+            path.as_ref(),
+            // Sparse-index stride — a group every ~64K records keeps
+            // lookups within a short scan of the target.
+            65_536,
+            &mut |op, coin| {
+                let _ = tx.send((op, coin));
+            },
+        )
+        .map_err(|e| SnapshotError(format!("snapshot index: {e}")))?;
+        drop(tx);
+        let stats = done_rx
+            .recv()
+            .map_err(|_| SnapshotError("hash worker dropped".to_string()))?;
+        hasher
+            .join()
+            .map_err(|_| SnapshotError("hash worker panicked".to_string()))?;
+        let got = stats
+            .hash_serialized
+            .map(|h| crate::hash::format_display_hex(h.as_bytes()))
+            .unwrap_or_default();
+        if got != au.hash_serialized {
+            return Err(SnapshotError(format!(
+                "Bad snapshot content hash: expected {}, got {got}",
+                au.hash_serialized
+            )));
+        }
+        debug_assert_eq!(stats.txouts, meta.coins_count);
+
+        // Persist where the overlay file lives — `restore` re-attaches
+        // it by sidecar path so a restart never re-imports.
+        if let Some(store) = &self.store {
+            let canon = std::path::absolute(path.as_ref())
+                .unwrap_or_else(|_| path.as_ref().to_path_buf());
+            if let Err(e) = std::fs::write(store.dir().join("snapshot.path"), canon.to_string_lossy().as_bytes()) {
+                return Err(SnapshotError(format!("snapshot path record: {e}")));
+            }
+        }
+        let mut utxo = UtxoSet::new();
+        if let Some(be) = &self.coins_backend {
+            utxo.attach_shared(be.clone());
+        }
+        utxo.attach_snapshot(run);
+        self.commit_activated_snapshot(utxo, base, base_height, au.n_chain_tx)?;
+        Ok(base_height)
+    }
+
+    pub fn activate_snapshot<R: std::io::Read>(
+        &mut self,
+        r: &mut R,
+        meta: &crate::utxo_snapshot::SnapshotMetadata,
+        mempool_nonempty: bool,
+    ) -> Result<u32, crate::utxo_snapshot::SnapshotError> {
+        use crate::utxo_snapshot::SnapshotError;
+        let (base, base_height, _au) =
+            self.check_snapshot_activation(meta, mempool_nonempty)?;
+        let au_by_height = _au;
 
         let mut loaded = UtxoSet::new();
         if let Some(be) = &self.coins_backend {
@@ -1250,68 +1446,7 @@ impl Chainstate {
             )));
         }
 
-        // Commit: the connected chain becomes the header chain through
-        // the base. Undo slots below it are empty placeholders — those
-        // blocks were never connected here, and the reorg guard keeps
-        // them from ever being "disconnected".
-        let mut chain = Vec::with_capacity(base_height as usize + 1);
-        let mut cursor = base;
-        loop {
-            chain.push(cursor);
-            if cursor == params.genesis_header.hash() {
-                break;
-            }
-            cursor = self
-                .tree
-                .get(&cursor)
-                .map(|n| n.header.prev_block_hash)
-                .ok_or_else(|| {
-                    SnapshotError("snapshot base header chain is incomplete".to_string())
-                })?;
-        }
-        chain.reverse();
-        self.utxo = loaded;
-        self.chain = chain;
-        // Below the base no undo exists anywhere. Memory mode keeps the
-        // `chain.len() - 1` invariant with empty placeholders; backend
-        // mode leaves the tail empty — committed undos live in coinsdb.
-        self.undos = if self.coins_backend.is_some() {
-            Vec::new()
-        } else {
-            vec![BlockUndo::default(); base_height as usize]
-        };
-        self.connected = base;
-        self.snapshot_base = Some(base_height);
-        // Core creates the ibd chainstate at activation — background
-        // validation replays `1..=base` from stored bodies and checks
-        // the recomputed hash before the assumed prefix is trusted.
-        self.background = Some(BackgroundValidation {
-            utxo: UtxoSet::new(),
-            next: 1,
-            pool: None,
-            pending: std::collections::VecDeque::new(),
-        });
-        self.snapshot_verified = false;
-        self.precious = None;
-        self.tree.apply_tx_meta(&base, 0, au_data.n_chain_tx);
-        // The filter index belongs to the connected chain — every
-        // pre-base height entry is now stale, and the first post-base
-        // append chains its header off nothing (Core's snapshot
-        // chainstate starts with an empty index).
-        if let Some(index) = &mut self.filterindex {
-            index.reset_to_snapshot();
-        }
-        if let Some(index) = &mut self.scripthashindex {
-            index.reset_to_snapshot();
-        }
-        // The assumed state must be durable before the call returns —
-        // a crash otherwise resumes the pre-snapshot `state.dat` while
-        // blk files may already hold post-base bodies (Core flushes
-        // the snapshot chainstate on activation).
-        if self.store.is_some() {
-            self.flush()
-                .map_err(|e| SnapshotError(format!("snapshot flush: {e}")))?;
-        }
+        self.commit_activated_snapshot(loaded, base, base_height, au_by_height.n_chain_tx)?;
         Ok(base_height)
     }
 
@@ -1495,7 +1630,12 @@ impl Chainstate {
         if !self.tree.restore_tip(state.best_header) {
             return Err(corrupt("best header not a max-work tip"));
         }
-        let store = self.store.as_ref().ok_or_else(|| corrupt("no store"))?;
+        let store_dir = self
+            .store
+            .as_ref()
+            .ok_or_else(|| corrupt("no store"))?
+            .dir()
+            .to_path_buf();
         let snapshot_base = (state.snapshot_base > 0).then_some(state.snapshot_base);
         for (index, hash) in state.chain.iter().enumerate() {
             if !self.tree.contains(hash) {
@@ -1506,7 +1646,13 @@ impl Chainstate {
             // base were never connected — both legitimately absent
             // from the store.
             let assumed = snapshot_base.is_some_and(|b| index <= b as usize);
-            if index > 0 && !assumed && store.position(hash).is_none() {
+            if index > 0
+                && !assumed
+                && self
+                    .store
+                    .as_ref()
+                    .is_none_or(|s| s.position(hash).is_none())
+            {
                 return Err(corrupt("connected block body not stored"));
             }
         }
@@ -1573,6 +1719,19 @@ impl Chainstate {
                 self.utxo.insert_synthetic(outpoint, coin);
             }
         }
+        // Overlay resume: a snapshot base with a recorded path
+        // re-attaches its file — the delta landed above it already.
+        if snapshot_base.is_some() {
+            let sidecar = store_dir.join("snapshot.path");
+            if let Ok(path) = std::fs::read_to_string(&sidecar) {
+                let run = crate::sortedrun::SnapshotRun::index(
+                    std::path::Path::new(path.trim()),
+                    65_536,
+                )
+                .map_err(|e| corrupt(&format!("snapshot file re-attach: {e}")))?;
+                self.utxo.attach_snapshot(run);
+            }
+        }
         let mut covered: HashSet<BlockHash> = state.failed.into_iter().collect();
         covered.extend(self.chain.iter().copied());
         self.stored_bodies(&covered)
@@ -1630,7 +1789,10 @@ impl Chainstate {
         let (utxo, undos) = if externalized {
             (Vec::new(), Vec::new())
         } else {
-            (self.utxo.iter(), self.undos.clone())
+            // Delta only — an attached snapshot file re-indexes on
+            // resume; serializing its coins here would duplicate the
+            // base into state.dat.
+            (self.utxo.iter_delta(), self.undos.clone())
         };
         StateData {
             tip: self.connected,
@@ -2909,6 +3071,57 @@ impl Chainstate {
     #[must_use]
     pub fn background_height(&self) -> Option<u32> {
         self.background.as_ref().map(|bg| bg.next - 1)
+    }
+
+    /// The node's own verification coverage — which heights were checked
+    /// locally versus taken on an assumeutxo commitment, with the
+    /// background-replay progress that converts assumed into proven.
+    /// Surfaced by `getvalidationreport`; the honest answer to "what did
+    /// this node actually verify?".
+    #[must_use]
+    pub fn validation_report(&self) -> ValidationReport {
+        let connected_height = self.chain().len().saturating_sub(1) as u32;
+        let header_height = self.tree().tip().height;
+        let snapshot = self.snapshot_base.map(|base| {
+            let au = self
+                .tree
+                .params()
+                .assumeutxo_data
+                .iter()
+                .find(|d| d.height == base);
+            let replayed_height = if self.snapshot_verified {
+                base
+            } else {
+                self.background_height().unwrap_or(0)
+            };
+            SnapshotCoverage {
+                base_height: base,
+                base_hash: au.map(|d| d.blockhash.to_string()).unwrap_or_default(),
+                expected_utxo_hash: au
+                    .map(|d| d.hash_serialized.to_string())
+                    .unwrap_or_default(),
+                replayed_height,
+                verified: self.snapshot_verified,
+            }
+        });
+        // Heights strictly above the base were connected normally;
+        // heights the replay reached are proven. Only the unreplayed
+        // prefix is taken on the commitment.
+        let verified_heights = match &snapshot {
+            Some(s) => (connected_height - s.base_height) + s.replayed_height,
+            None => connected_height,
+        };
+        let verified_fraction = if connected_height == 0 {
+            1.0
+        } else {
+            verified_heights as f64 / connected_height as f64
+        };
+        ValidationReport {
+            connected_height,
+            header_height,
+            snapshot,
+            verified_fraction,
+        }
     }
 
     /// `ActivateBestChain` — while a stored-body, non-failed branch outworks
@@ -4524,6 +4737,56 @@ mod tests {
             assert_eq!(got, Some((*op, coin.clone())));
         }
 
+        // Overlay activation of the same file — the zero-copy path must
+        // land the identical state.
+        let dir2 = store_dir("assumeutxo-overlay");
+        let snap_path = dir2.join("snap.dat");
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(&snap_path, &snap).unwrap();
+        let mut cs2 = Chainstate::with_store(&dir2, &p, NOW).unwrap();
+        for b in &blocks {
+            cs2.tree.insert(&b.header, NOW).unwrap();
+        }
+        let h2 = cs2
+            .activate_snapshot_overlay(&snap_path, &meta, false)
+            .unwrap();
+        assert_eq!(h2, 2);
+        assert_eq!(cs2.tip_hash(), base_hash);
+        assert_eq!(cs2.snapshot_base(), Some(2));
+        // Every snapshot coin resolves through the overlay — no import
+        // happened, the file itself serves reads.
+        for (op, coin) in &coins {
+            assert_eq!(cs2.utxo().get(op), Some(coin.clone()));
+        }
+        // And a fresh post-snapshot coin lands in the mutable layer on
+        // top, not in the file.
+        let probe = OutPoint {
+            txid: Txid::from_bytes([0xAB; 32]),
+            vout: 0,
+        };
+        assert!(cs2.utxo().get(&probe).is_none());
+
+        // Resume: flush, drop, reopen — the snapshot file re-attaches
+        // via its recorded path and keeps serving the base coins.
+        cs2.flush().unwrap();
+        drop(cs2);
+        let cs3 = Chainstate::with_store(&dir2, &p, NOW).unwrap();
+        assert_eq!(cs3.tip_hash(), base_hash);
+        assert_eq!(cs3.snapshot_base(), Some(2));
+        for (op, coin) in &coins {
+            assert_eq!(cs3.utxo().get(op), Some(coin.clone()));
+        }
+        // state.dat must NOT carry the base coins — the file is the
+        // base (check the sidecar exists and the inline utxo section
+        // stayed empty on flush).
+        assert!(dir2.join("snapshot.path").exists());
+        // Whole-set consumers see the merged view — dumptxoutset and
+        // gettxoutsetinfo iterate through the file layer.
+        let all: std::collections::HashSet<_> = cs3.utxo().iter().into_iter().map(|(o, _)| o).collect();
+        for (op, _) in &coins {
+            assert!(all.contains(op), "iter() missed base coin {op:?}");
+        }
+
         // A second load is refused exactly like Core's double activate.
         let mut cursor = std::io::Cursor::new(&snap);
         let meta = read_metadata(&mut cursor, p.message_start).unwrap();
@@ -4638,6 +4901,105 @@ mod tests {
         assert_eq!(cs.background_height(), None);
         assert_eq!(cs.tip_hash(), base_hash);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The validation report distinguishes assumed from verified state:
+    /// a fresh snapshot reports the whole prefix assumed, the replay
+    /// converts it to proven, and a plain node reports full coverage.
+    #[test]
+    fn validation_report_covers_snapshot() {
+        use crate::params::AssumeutxoData;
+        use crate::utxo_snapshot::{read_metadata, sorted_coins, write_snapshot};
+        let mut p = params();
+        let mut src = Chainstate::new(&p);
+        let mut blocks = Vec::new();
+        let mut parent = genesis_header();
+        for h in 1..=3u32 {
+            let b = block_on(&parent, vec![coinbase_tx(h, subsidy(h))], &p);
+            src.accept_block(&b, NOW).unwrap();
+            parent = b.header;
+            blocks.push(b);
+        }
+        let base_hash = blocks[1].block_hash();
+        let mut utxo = src.utxo().clone();
+        let undo3 = src.undo(3).unwrap();
+        connect::disconnect_block(&blocks[2], &mut utxo, &undo3).unwrap();
+        let stats = crate::coinstats::compute(
+            &utxo,
+            2,
+            base_hash,
+            crate::coinstats::CoinStatsHashType::HashSerialized,
+        );
+        let coins = sorted_coins(&utxo);
+        let mut snap = Vec::new();
+        write_snapshot(
+            &mut snap,
+            p.message_start,
+            &base_hash,
+            coins.len() as u64,
+            &coins,
+        )
+        .unwrap();
+        p.assumeutxo_data = Box::leak(Box::new([AssumeutxoData {
+            height: 2,
+            hash_serialized: Box::leak(stats.hash_serialized.unwrap().to_string().into_boxed_str()),
+            n_chain_tx: 3,
+            blockhash: Box::leak(base_hash.to_string().into_boxed_str()),
+        }]));
+        let dir = store_dir("validation-report");
+        let mut cs = Chainstate::with_store(&dir, &p, NOW).unwrap();
+        for b in &blocks {
+            cs.tree.insert(&b.header, NOW).unwrap();
+        }
+        let mut cursor = std::io::Cursor::new(&snap);
+        let meta = read_metadata(&mut cursor, p.message_start).unwrap();
+        cs.activate_snapshot(&mut cursor, &meta, false).unwrap();
+
+        // Freshly activated: the whole 1..=2 prefix is assumed, nothing
+        // proven yet, coverage 0.
+        let r = cs.validation_report();
+        assert_eq!(r.connected_height, 2);
+        assert!(!cs.snapshot_verified());
+        let s = r.snapshot.expect("snapshot coverage");
+        assert_eq!(s.base_height, 2);
+        assert_eq!(s.base_hash, base_hash.to_string());
+        assert_eq!(
+            s.expected_utxo_hash,
+            stats.hash_serialized.unwrap().to_string()
+        );
+        assert_eq!(s.replayed_height, 0);
+        assert!(!s.verified);
+        assert_eq!(r.verified_fraction, 0.0);
+
+        // Bodies arrive and the replay proves the prefix.
+        for b in [&blocks[0], &blocks[1]] {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        assert_eq!(cs.background_step(10), Ok(BackgroundStatus::Verified));
+        let r = cs.validation_report();
+        let s = r.snapshot.expect("snapshot coverage");
+        assert!(s.verified);
+        assert_eq!(s.replayed_height, 2);
+        assert_eq!(r.verified_fraction, 1.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node with no snapshot reports full local verification.
+    #[test]
+    fn validation_report_full_node() {
+        let p = params();
+        let dir = store_dir("validation-report-full");
+        let mut cs = Chainstate::with_store(&dir, &p, NOW).unwrap();
+        let blocks = probe_chain(4, &[], &p);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        let r = cs.validation_report();
+        assert_eq!(r.connected_height, 4);
+        assert!(r.snapshot.is_none());
+        assert_eq!(r.verified_fraction, 1.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
