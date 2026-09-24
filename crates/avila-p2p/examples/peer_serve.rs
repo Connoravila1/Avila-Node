@@ -81,8 +81,18 @@ fn pump<S: std::io::Read + std::io::Write>(
                 session.send(&reply).map_err(|e| e.to_string())?;
             }
             SessionEvent::Message(Message::GetData(reqs)) => {
-                for reply in PeerSync::serve_getdata(cs, None, &reqs) {
-                    session.send(&reply).map_err(|e| e.to_string())?;
+                let mut failed = None;
+                PeerSync::serve_getdata(cs, None, &reqs, |reply| {
+                    match session.send(reply) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            failed = Some(e.to_string());
+                            false
+                        }
+                    }
+                });
+                if let Some(e) = failed {
+                    return Err(e);
                 }
             }
             SessionEvent::Message(_) => {}
@@ -197,12 +207,12 @@ fn main() {
                             session.send(&reply).expect("headers reply");
                         }
                         SessionEvent::Message(Message::GetData(reqs)) => {
-                            for reply in PeerSync::serve_getdata(&cs, None, &reqs) {
+                            PeerSync::serve_getdata(&cs, None, &reqs, |reply| {
                                 if matches!(reply, Message::Block(_)) {
                                     served_blocks += 1;
                                 }
-                                session.send(&reply).expect("block reply");
-                            }
+                                session.send(reply).is_ok()
+                            });
                         }
                         SessionEvent::Message(Message::Version(v)) => {
                             println!("peer version {} height {}", v.version, v.start_height);

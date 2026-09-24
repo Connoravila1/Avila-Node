@@ -216,6 +216,16 @@ pub fn serve(
                     let auth = auth.clone();
                     let live = live.clone();
                     thread::spawn(move || {
+                        // Audit R2: the slot must free even when the
+                        // handler panics — a drop guard, not a
+                        // trailing decrement.
+                        struct LiveGuard(Arc<std::sync::atomic::AtomicUsize>);
+                        impl Drop for LiveGuard {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                        let _guard = LiveGuard(live);
                         handle(
                             stream,
                             &status,
@@ -226,7 +236,6 @@ pub fn serve(
                             stop.as_ref(),
                             auth.as_ref(),
                         );
-                        live.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 Err(_) => continue,
@@ -582,7 +591,7 @@ fn handle(
         let _ = stream.flush();
         return;
     }
-    let mut content_length = 0usize;
+    let mut content_length: Option<usize> = None;
     let mut read_bytes = request_line.len();
     let mut authorization = String::new();
     let mut expect_continue = false;
@@ -605,17 +614,31 @@ fn handle(
                     return;
                 }
                 let trimmed = line.trim_end();
-                let lower = trimmed.to_lowercase();
-                if let Some(rest) = lower.strip_prefix("content-length:") {
-                    content_length = rest.trim().parse().unwrap_or(0);
+                // Audit R1: strip prefixes on the ORIGINAL string with
+                // ASCII-only case folding — matching on a lowercased
+                // copy then slicing the original by the copy's length
+                // panics when Unicode case-mapping changes byte length
+                // (e.g. 'İ'). eq_ignore_ascii_case only folds ASCII, so
+                // the returned suffix is always a valid boundary.
+                fn strip_header<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+                    let head = s.get(..prefix.len())?;
+                    head.eq_ignore_ascii_case(prefix)
+                        .then(|| &s[prefix.len()..])
                 }
-                if let Some(rest) = lower.strip_prefix("authorization:") {
-                    // `rest` is a suffix of `trimmed` — same length, so
-                    // this slice keeps the credential's original case;
-                    // trim drops the space after the colon.
-                    authorization = trimmed[trimmed.len() - rest.len()..].trim().to_string();
+                if let Some(rest) = strip_header(trimmed, "content-length:") {
+                    // Duplicate Content-Length with a different value is
+                    // an HTTP smuggling primitive — reject outright.
+                    let n: usize = rest.trim().parse().unwrap_or(usize::MAX);
+                    match content_length {
+                        None => content_length = Some(n),
+                        Some(prev) if prev == n => {}
+                        Some(_) => return,
+                    }
                 }
-                if let Some(rest) = lower.strip_prefix("expect:")
+                if let Some(rest) = strip_header(trimmed, "authorization:") {
+                    authorization = rest.trim().to_string();
+                }
+                if let Some(rest) = strip_header(trimmed, "expect:")
                     && rest.trim() == "100-continue"
                 {
                     expect_continue = true;
@@ -651,6 +674,7 @@ fn handle(
             _ => true,
         }
     };
+    let content_length = content_length.unwrap_or(0);
     if content_length == 0 || content_length > MAX_BODY_BYTES {
         return;
     }
@@ -915,6 +939,7 @@ fn reply_obj(result: Value, error: Option<(i64, String)>, id: &Option<Value>, v2
 fn fund_spend(
     w: &mut crate::watch::WatchWallet,
     cs: &Chainstate,
+    mempool: &avila_mempool::Mempool,
     feerate: i64,
     dest_outputs: Vec<TxOut>,
 ) -> Result<(Transaction, i64, Option<usize>), (i64, String)> {
@@ -936,9 +961,14 @@ fn fund_spend(
                 .unwrap_or(false)
     };
     let mut chosen: Vec<(OutPoint, i64)> = Vec::new();
+    // Core's AvailableCoins: a coin spent by ANY mempool transaction —
+    // above all our own unconfirmed spends — is unavailable. Without
+    // this, back-to-back sends double-pick the same outpoint and the
+    // RBF'd second send silently cancels the first payment (SP-F1).
     let mut coins: Vec<_> = w
         .unspent()
         .filter(|(_, c)| mature(c))
+        .filter(|(op, _)| mempool.spent_by(op).is_none())
         .map(|(op, c)| (op, c.value))
         .collect();
     coins.sort_by_key(|c| std::cmp::Reverse(c.1));
@@ -956,6 +986,16 @@ fn fund_spend(
     let fee = (feerate * est_vsize) / 1000;
     if total < amount + fee {
         return Err((RPC_WALLET_ERROR, "Insufficient funds".into()));
+    }
+    // Audit SP-F2: the wallet path must honor the same fee ceiling
+    // `sendrawtransaction` enforces — a buggy caller or hostile PSBT
+    // path can't burn arbitrary fee here either (0.10 BTC/kvB).
+    let max_rate_sats = (DEFAULT_MAX_RAW_TX_FEE_RATE * 100_000_000.0) as i64;
+    if fee * 1000 > max_rate_sats * est_vsize {
+        return Err((
+            RPC_WALLET_ERROR,
+            format!("Fee exceeds maximum configured by wallet transaction (0.10 BTC/kvB)"),
+        ));
     }
     let change_value = total - amount - fee;
     let mut outputs = dest_outputs;
@@ -10658,9 +10698,12 @@ pub(crate) fn dispatch(
             let dice_arg = param(params, 1, "dice")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            // Mixing OS entropy into caller-supplied entropy is the
+            // safe default — a purist who wants pure-dice (Coldcard-
+            // reproducible) derivation passes mix=false explicitly.
             let mix_arg = param(params, 2, "mix")
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
+                .unwrap_or(true);
             let wallet = wallet.cloned();
             chain_query_deferred(method, queries, move |cs, _| {
                 let Some(wallet) = wallet else {
@@ -10759,6 +10802,15 @@ pub(crate) fn dispatch(
                         )));
                     }
                 };
+                // Audit SEED-4: replacing a loaded signer silently
+                // discards its only in-memory keys. Same guard as
+                // signerload — refuse; signerlock first.
+                if w.signer().is_some() || w.boundary.is_some() {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        "signer already loaded — signerlock first".into(),
+                    )));
+                }
                 // Track the neutered variants through the real import
                 // path — the wallet sees its own coins; the private
                 // versions never touch the watch side.
@@ -10853,6 +10905,7 @@ pub(crate) fn dispatch(
                 let (tx, _fee, _change_pos) = match fund_spend(
                     &mut w,
                     cs,
+                    mgr.mempool_ref(),
                     feerate,
                     vec![TxOut {
                         value: amount,
@@ -11052,7 +11105,8 @@ pub(crate) fn dispatch(
                     }
                 };
                 let feerate = mgr.mempool_ref().estimate_fee(6).unwrap_or(1000);
-                let (mut tx, fee, change_pos) = match fund_spend(&mut w, cs, feerate, dest_outputs)
+                let (mut tx, fee, change_pos) =
+                    match fund_spend(&mut w, cs, mgr.mempool_ref(), feerate, dest_outputs)
                 {
                     Ok(v) => v,
                     Err(e) => return QueryReply::Now(Err(e)),
@@ -11152,6 +11206,17 @@ pub(crate) fn dispatch(
                     };
                 let verified = checks.iter().filter(|c| c.status != "unverified").count();
                 let unverified = checks.iter().filter(|c| c.status == "unverified").count();
+                // LSB-010 class: a PSBT can claim any prevout value —
+                // signing inputs we could not verify against our own
+                // UTXO set would sign a fabricated fee. Hard reject.
+                if unverified > 0 {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        format!(
+                            "{unverified} input(s) not in the verified UTXO set — refusing to sign unverified prevouts"
+                        ),
+                    )));
+                }
                 let complete = if has_boundary {
                     // Queue #39: prevouts verified above; signing
                     // happens in the subprocess — keys never here.
@@ -11347,6 +11412,12 @@ pub(crate) fn dispatch(
             let passphrase = param(params, 0, "passphrase")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            // Audit V-S7: an existing vault is the ONLY backup —
+            // overwriting it (e.g. under a mistyped passphrase)
+            // destroys recovery. Refuse unless explicitly asked.
+            let overwrite = param(params, 1, "overwrite")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let wallet = wallet.cloned();
             chain_query(method, queries, move |_, _| {
                 let Some(wallet) = wallet else {
@@ -11367,17 +11438,51 @@ pub(crate) fn dispatch(
                 let Some(signer) = w.signer() else {
                     return Err((RPC_WALLET_ERROR, "wallet has no signing keys".into()));
                 };
-                let blob = crate::watch::vault_seal(signer, &passphrase)
+                let blob = crate::watch::vault_seal(signer, &w.silents, &passphrase)
                     .map_err(|e| (RPC_WALLET_ERROR, e))?;
                 let path = w.vault_path();
-                // Atomic write, like watchlist.dat.
+                if path.exists() && !overwrite {
+                    return Err((
+                        RPC_WALLET_ERROR,
+                        format!(
+                            "vault already exists at {} — pass overwrite=true to replace it",
+                            path.display()
+                        ),
+                    ));
+                }
+                // Audit V-S4/V-S5: the vault holds key material — create
+                // it 0600, fsync before rename so a power loss can't
+                // leave a "saved" vault that isn't durable.
                 let tmp = path.with_extension("tmp");
-                std::fs::write(&tmp, &blob)
-                    .and_then(|_| std::fs::rename(&tmp, &path))
-                    .map_err(|e| (RPC_WALLET_ERROR, format!("vault write failed: {e}")))?;
+                (|| -> std::io::Result<()> {
+                    use std::io::Write;
+                    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&tmp)?;
+                    // mode() applies only on create — force the perms
+                    // so a pre-existing tmp can't leak the vault.
+                    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                    f.write_all(&blob)?;
+                    f.sync_all()?;
+                    std::fs::rename(&tmp, &path)?;
+                    // fsync the directory so the rename survives
+                    // a power loss, not just the file data.
+                    if let Some(dir) = path.parent()
+                        && let Ok(d) = std::fs::File::open(dir)
+                    {
+                        let _ = d.sync_all();
+                    }
+                    Ok(())
+                })()
+                .map_err(|e| (RPC_WALLET_ERROR, format!("vault write failed: {e}")))?;
                 Ok(json!({
                     "path": path.display().to_string(),
                     "descs": signer.descs_private.len(),
+                    "silents": w.silents.len(),
                 }))
             })
         }
@@ -11433,6 +11538,7 @@ pub(crate) fn dispatch(
                         imported += 1;
                     }
                 }
+                let silents = vault.silents.clone();
                 w.enable_signing(crate::watch::SignerState {
                     provider,
                     descs_private: vault.descs_private,
@@ -11440,9 +11546,18 @@ pub(crate) fn dispatch(
                     provenance: vault.provenance,
                     entropy_commitment: vault.entropy_commitment.clone(),
                 });
+                // V-S1: scan keys ride the vault — restore the watches.
+                for (scan_priv, spend_pub, labels) in silents {
+                    w.track_silent(avila_consensus::silent::SilentAddress {
+                        scan_priv,
+                        spend_pub,
+                        labels,
+                    });
+                }
                 Ok(json!({
                     "loaded": true,
                     "descs_imported": imported,
+                    "silents": w.silents.len(),
                     "entropy_commitment": vault.entropy_commitment,
                 }))
             })
@@ -12083,7 +12198,14 @@ pub(crate) fn dispatch(
                     }
                     let script = Script::new(coin.script.clone());
                     let addr = script_address(&script, params);
-                    let label = w.descs[coin.desc_idx].label.clone();
+                    // Silent-payment coins carry desc_idx = usize::MAX
+                    // (they aren't descriptors) — `.get` so such a coin
+                    // can't panic the wallet lock for every RPC (R3).
+                    let label = w
+                        .descs
+                        .get(coin.desc_idx)
+                        .map(|d| d.label.clone())
+                        .unwrap_or_default();
                     match addr {
                         Some(a) => {
                             let r = by_addr.entry(a).or_insert(Recv {
@@ -16246,7 +16368,9 @@ mod tests {
         assert!(r["inputs_verified"].as_i64().unwrap() >= 1);
 
         // Vault cycle: export → lock → (wallet is watch-only) → load.
-        let (_r, e) = call("signerexport", &json!(["pw"]));
+        // A stale vault from an earlier run may sit at the shared path —
+        // V-S7 requires the explicit overwrite flag to replace it.
+        let (_r, e) = call("signerexport", &json!(["pw", true]));
         assert!(e.is_none(), "{e:?}");
         let (r, e) = call("signerlock", &Value::Null);
         assert_eq!(r["locked"], json!(true), "{e:?}");

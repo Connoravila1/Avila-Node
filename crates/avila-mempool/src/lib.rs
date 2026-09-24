@@ -675,6 +675,13 @@ impl Mempool {
     /// The pooled tx spending `outpoint`, if any — Core's
     /// `gettxspendingprevout` lookup (`mempool.NextTransactionsIter`).
     #[must_use]
+    /// Pool membership generation — bumps on every admission and
+    /// removal, so change-detection caches (Electrum status checks)
+    /// can tell "nothing moved" in O(1) instead of rescanning.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     pub fn spent_by(&self, outpoint: &OutPoint) -> Option<&Transaction> {
         self.spends.get(outpoint).and_then(|id| self.get(id))
     }

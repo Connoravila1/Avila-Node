@@ -63,6 +63,15 @@ struct SubCell {
     /// check is running against it, so the pump polls it directly each
     /// tick instead of waiting on a wake that will never come.
     polling: bool,
+    /// Audit EL-1 change gate — the (tip hash, mempool epoch) the last
+    /// status computation ran against. A tick where neither moved
+    /// can't produce a new status, so the mempool rescan is skipped.
+    last_tip: Option<avila_consensus::hash::BlockHash>,
+    last_mp_epoch: u64,
+    /// Audit EL-2: set when the owning connection closed — a parked
+    /// waiter check sees this and fires once so notify() drops the
+    /// registration instead of carrying a dead cell forever.
+    dead: bool,
 }
 
 /// Shared, mutable connection state — the pump thread and the reader
@@ -86,6 +95,11 @@ struct ConnState {
 /// A conservative default, not a protocol value — worth exposing as a
 /// CLI flag if operators need more.
 const MAX_CONNECTIONS: usize = 64;
+/// Per-connection scripthash-subscription cap — each parked waiter
+/// costs a sync-tick predicate call, so an unbounded set is sync-loop
+/// load from a single client (audit EL-1). Electrum clients manage a
+/// few hundred addresses at most; 1024 is generous.
+const MAX_SUBSCRIPTIONS: usize = 1024;
 
 /// Cap on one JSON-RPC request line's accumulated length before its
 /// terminating newline arrives. Generous for any real request (the
@@ -239,11 +253,15 @@ fn history_entries(
     Some(out)
 }
 
+/// Audit EL-3: `copy_from_slice` needs exactly 32 bytes — decode to
+/// a wrong length and this panics on caller-controlled input. Take a
+/// fixed-size prefix padded with zeros instead.
 fn parse_txid(s: &str) -> Txid {
     let mut b = hex::decode(s).unwrap_or_default();
     b.reverse();
     let mut a = [0u8; 32];
-    a.copy_from_slice(&b[..32.min(b.len())]);
+    let n = 32.min(b.len());
+    a[..n].copy_from_slice(&b[..n]);
     Txid::from_bytes(a)
 }
 
@@ -278,6 +296,11 @@ fn handle(
         wake_tx: wake_tx.clone(),
         writer: Mutex::new(writer),
     }));
+    // Audit EL-2: the pump's own `state` keeps a `wake_tx` sender
+    // alive, so `recv` never reports Disconnected — without a
+    // per-connection flag the pump thread outlives every closed
+    // socket. `alive` is that flag: the read loop clears it on exit.
+    let alive = Arc::new(AtomicBool::new(true));
 
     // The pump: a waiter wake (or a 100ms tick) drains dirty cells into
     // notifications, then re-registers each live subscription.
@@ -286,16 +309,14 @@ fn handle(
         let queries = queries.clone();
         let waiters = waiters.clone();
         let cancel = cancel.clone();
+        let alive = alive.clone();
         thread::spawn(move || {
-            // `while let` can't express this: timeout ticks the pump
-            // too — only `Disconnected` exits.
-            #[allow(clippy::while_let_loop)]
             loop {
                 match wake_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                if cancel.load(Ordering::Relaxed) {
+                if cancel.load(Ordering::Relaxed) || !alive.load(Ordering::Relaxed) {
                     break;
                 }
                 pump_notifications(&state, &queries, &waiters);
@@ -353,10 +374,21 @@ fn handle(
         }
     }
     // Connection closed — drop the waiters' interest so notify()
-    // stops spending ticks on this client.
+    // stops spending ticks on this client, and mark each cell dead so
+    // a parked waiter check fires once (failing wake) and unregisters
+    // instead of lingering until the mempool next moves.
+    alive.store(false, Ordering::Relaxed);
     if let Ok(mut st) = state.lock() {
-        st.subs.clear();
-        st.headers = None;
+        for (_, cell) in st.subs.drain() {
+            if let Ok(mut c) = cell.lock() {
+                c.dead = true;
+            }
+        }
+        if let Some(cell) = st.headers.take()
+            && let Ok(mut c) = cell.lock()
+        {
+            c.dead = true;
+        }
     }
 }
 
@@ -469,12 +501,39 @@ fn pump_notifications(
 /// would run, driven instead by the pump's own tick because the last
 /// `waiters.register` attempt found the node-wide cap full.
 fn poll_script(queries: &QuerySender, sh: [u8; 32], cell: &Arc<Mutex<SubCell>>) {
+    // Audit EL-1: the polling fallback must not rescan either — a
+    // cheap (tip, epoch) probe first; the full status only runs when
+    // one of them moved.
+    let (probe, rx) = crate::rpc::ChainQuery::new(move |cs, mgr| {
+        Ok(json!({
+            "tip": cs.tree().tip().hash().to_string(),
+            "epoch": mgr.mempool_ref().epoch(),
+        }))
+    });
+    if queries.send(probe).is_err() {
+        return;
+    }
+    let Ok(Ok(v)) = rx.recv_timeout(Duration::from_secs(5)) else {
+        return;
+    };
+    let tip: Option<avila_consensus::hash::BlockHash> =
+        v["tip"].as_str().and_then(|t| t.parse().ok());
+    let epoch = v["epoch"].as_u64().unwrap_or(0);
+    let unchanged = cell
+        .lock()
+        .map(|c| c.last_tip == tip && c.last_mp_epoch == epoch)
+        .unwrap_or(false);
+    if unchanged {
+        return;
+    }
     let new = full_status(queries, &sh);
-    if let Ok(mut c) = cell.lock()
-        && c.confirmed_status != new
-    {
-        c.confirmed_status = new;
-        c.dirty = true;
+    if let Ok(mut c) = cell.lock() {
+        c.last_tip = tip;
+        c.last_mp_epoch = epoch;
+        if c.confirmed_status != new {
+            c.confirmed_status = new;
+            c.dirty = true;
+        }
     }
 }
 
@@ -525,14 +584,35 @@ fn reregister_script(
     let check_cell = cell.clone();
     let armed = waiters.register(
         Box::new(move |cs: &Chainstate, mp: &avila_mempool::Mempool| {
-            // The full Electrum status — confirmed history plus
-            // mempool rows — so a mempool tx touching the script fires
-            // the subscription without waiting for a block.
+            // Audit EL-1: the full Electrum status (confirmed history
+            // plus mempool rows) — but recomputed ONLY when the tip or
+            // the pool actually moved. Otherwise each tick scans the
+            // whole mempool per subscription.
+            {
+                let Ok(c) = check_cell.lock() else {
+                    return false;
+                };
+                if c.dead {
+                    return true; // wake fails — the waiter unregisters
+                }
+            }
+            let tip = cs.tree().tip().hash();
+            let epoch = mp.epoch();
+            {
+                let Ok(c) = check_cell.lock() else {
+                    return false;
+                };
+                if c.last_tip == Some(tip) && c.last_mp_epoch == epoch {
+                    return false;
+                }
+            }
             let entries = history_entries(cs, mp, &sh).unwrap_or_default();
             let new = status_hash(&entries);
             let Ok(mut c) = check_cell.lock() else {
                 return false;
             };
+            c.last_tip = Some(tip);
+            c.last_mp_epoch = epoch;
             if c.confirmed_status != new {
                 c.confirmed_status = new;
                 c.dirty = true;
@@ -561,6 +641,9 @@ fn reregister_headers(
             let Ok(mut c) = check_cell.lock() else {
                 return false;
             };
+            if c.dead {
+                return true; // connection gone — drop the waiter
+            }
             if c.confirmed_status.as_deref() != Some(new.as_str()) {
                 c.confirmed_status = Some(new);
                 c.dirty = true;
@@ -616,6 +699,9 @@ fn dispatch(
                 confirmed_status: None,
                 dirty: false,
                 polling: false,
+                last_tip: None,
+                last_mp_epoch: 0,
+                dead: false,
             }));
             let cell2 = cell.clone();
             if let Ok(mut st) = state.lock() {
@@ -700,10 +786,26 @@ fn dispatch(
                 confirmed_status: None,
                 dirty: false,
                 polling: false,
+                last_tip: None,
+                last_mp_epoch: 0,
+                dead: false,
             }));
             let cell2 = cell.clone();
-            if let Ok(mut st) = state.lock() {
-                st.subs.insert(sh, cell.clone());
+            // Audit EL-1: bound the per-connection subscription set —
+            // each sub's waiter check runs on the sync tick, so an
+            // unbounded set turns a single client into sync-loop load.
+            let sub_ok = if let Ok(mut st) = state.lock() {
+                if st.subs.len() < MAX_SUBSCRIPTIONS {
+                    st.subs.insert(sh, cell.clone());
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !sub_ok {
+                return reply_err(id, 1, "subscription limit reached");
             }
             // Answer with the current status immediately (spec) — the
             // query also seeds the cell, then the waiter registers so
@@ -1612,6 +1714,9 @@ mod tests {
             confirmed_status: None,
             dirty: false,
             polling: false,
+            last_tip: None,
+            last_mp_epoch: 0,
+            dead: false,
         }));
         reregister_script([7u8; 32], &script_cell, &waiters, wake_tx.clone());
         assert!(
@@ -1623,6 +1728,9 @@ mod tests {
             confirmed_status: None,
             dirty: false,
             polling: false,
+            last_tip: None,
+            last_mp_epoch: 0,
+            dead: false,
         }));
         reregister_headers(&headers_cell, &waiters, wake_tx);
         assert!(

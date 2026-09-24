@@ -280,6 +280,10 @@ struct PeerEntry<S> {
     /// answered once; a later `getaddr` on the same connection is
     /// silently ignored.
     getaddr_recvd: bool,
+    /// Audit P2P-BIP35: last answered BIP35 `mempool` request —
+    /// the reply carries the whole pool, so it's inbound-only and
+    /// rate-limited rather than free bandwidth amplification.
+    mempool_req_last: Option<Instant>,
     /// The nonce we sent in our own `version`, when this was an
     /// outbound dial (`None` for inbound accepts, which never register
     /// a nonce to check against). Mirrored into
@@ -293,6 +297,11 @@ struct PeerEntry<S> {
     /// Our pool's short-id -> txid map for the last open/answer — how a
     /// `reconcildiff` ask resolves to a body we can send.
     recon_map: std::collections::HashMap<u32, avila_consensus::hash::Txid>,
+    /// Audit P2P-1: last answered `reqrecon` + abuse counter — each
+    /// request costs a sketch solve over the whole pool, so peers get
+    /// a minimum interval; persistently faster is misbehavior.
+    recon_req_last: Option<Instant>,
+    recon_req_violations: u32,
     /// Recon telemetry — completed rounds and cumulative misses each
     /// round produced. A peer whose diff stays persistently wide
     /// (missing most of our pool every round) is an eclipse/censorship
@@ -518,6 +527,12 @@ pub struct PeerManager<S> {
     /// deprioritizes candidates whose ASN already holds ≥2 outbound
     /// slots — a single transit network can't fill the peer set.
     asmap: crate::asmap::AsMap,
+    /// Audit P2P-12: peers disconnected for proven misbehavior are
+    /// discouraged — refused at the dial/accept gates for a window —
+    /// instead of free to reconnect instantly. In-memory only, like
+    /// Core's discouragement: it isn't operator-set, so it never
+    /// lands in banlist.dat.
+    discouraged: std::collections::HashMap<[u8; 16], Instant>,
     /// The operator ban list — Core's `BanMan`/`m_banned`: consulted
     /// on every dial and (future) inbound accept; `setban add` also
     /// drops matching live peers.
@@ -625,6 +640,7 @@ impl<S: Read + Write> PeerManager<S> {
             proxy: None,
             proxy_failures: 0,
             cell_bytes: 0,
+            discouraged: std::collections::HashMap::new(),
             bans: crate::banman::BanList::new(),
             banlist_path: None,
             dial_tx: dial_channel.0,
@@ -690,9 +706,9 @@ impl<S: Read + Write> PeerManager<S> {
             if let Some(nonce) = p.our_nonce {
                 self.outbound_nonces.remove(&nonce);
             }
-            let t = p.session.telemetry();
-            self.closed_bytes_sent = self.closed_bytes_sent.saturating_add(t.bytes_sent);
-            self.closed_bytes_recv = self.closed_bytes_recv.saturating_add(t.bytes_recv);
+            let (sent, recv) = p.session.byte_counters();
+            self.closed_bytes_sent = self.closed_bytes_sent.saturating_add(sent);
+            self.closed_bytes_recv = self.closed_bytes_recv.saturating_add(recv);
         }
     }
 
@@ -703,11 +719,8 @@ impl<S: Read + Write> PeerManager<S> {
         self.peers.values().fold(
             (self.closed_bytes_sent, self.closed_bytes_recv),
             |(sent, recv), p| {
-                let t = p.session.telemetry();
-                (
-                    sent.saturating_add(t.bytes_sent),
-                    recv.saturating_add(t.bytes_recv),
-                )
+                let (ps, pr) = p.session.byte_counters();
+                (sent.saturating_add(ps), recv.saturating_add(pr))
             },
         )
     }
@@ -933,9 +946,12 @@ impl<S: Read + Write> PeerManager<S> {
                 cpu_rate_ns: 0,
                 addr_token_timestamp: now,
                 getaddr_recvd: false,
+                mempool_req_last: None,
                 recon: None,
                 recon_round: None,
                 recon_map: std::collections::HashMap::new(),
+                recon_req_last: None,
+                recon_req_violations: 0,
                 recon_rounds: 0,
                 recon_misses: 0,
                 recon_their_misses: 0,
@@ -1085,6 +1101,16 @@ impl<S: Read + Write> PeerManager<S> {
             }
         }
         for (id, reason) in dead {
+            // Audit P2P-12: proven misbehavior discourages the peer's
+            // IP for a window — reconnects and re-dials are refused at
+            // the existing is_banned gates. In-memory only.
+            if matches!(reason, DisconnectReason::Misbehavior(_))
+                && let Some(peer) = self.peers.get(&id)
+                && let Some(remote) = &peer.remote
+            {
+                self.discouraged
+                    .insert(remote.ip, Instant::now() + DISCOURAGE_FOR);
+            }
             self.drop_peer(id);
             if self.headers_leader == Some(id) {
                 self.headers_leader = None;
@@ -1890,11 +1916,9 @@ impl<S: Read + Write> PeerManager<S> {
                         mempool.clear_unbroadcast(&txid);
                     }
                 }
-                for reply in PeerSync::serve_getdata(cs, Some(mempool), &reqs) {
-                    if peer.session.send(&reply).is_err() {
-                        break; // send budget exhausted — drop the rest
-                    }
-                }
+                PeerSync::serve_getdata(cs, Some(mempool), &reqs, |reply| {
+                    peer.session.send(reply).is_ok()
+                });
             }
             SessionEvent::Message(Message::NotFound(invs)) => {
                 // The peer can't serve these — release the slots so the
@@ -1902,6 +1926,26 @@ impl<S: Read + Write> PeerManager<S> {
                 peer.sync.on_notfound(&invs);
             }
             SessionEvent::Message(Message::ReqRecon(their_sketch)) => {
+                // Audit P2P-1: rate-limit — each request runs a sketch
+                // solve over the whole mempool (up to `q` field ops).
+                // BIP330 initiators send at most one reqrecon per
+                // reconciliation round (~1s cadence); a peer faster
+                // than RECON_REQ_MIN_INTERVAL is burning CPU, not
+                // reconciling — count it, and sustained abuse is
+                // misbehavior.
+                if let Some(t) = peer.recon_req_last
+                    && t.elapsed() < RECON_REQ_MIN_INTERVAL
+                {
+                    peer.recon_req_violations += 1;
+                    if peer.recon_req_violations >= RECON_REQ_MAX_VIOLATIONS {
+                        dead.push((
+                            id,
+                            DisconnectReason::Misbehavior("reqrecon flooding".into()),
+                        ));
+                    }
+                    return;
+                }
+                peer.recon_req_last = Some(Instant::now());
                 // Responder side: attribute the decoded difference
                 // against our own pool — ids we hold are their misses,
                 // ids we don't are ours.
@@ -2037,12 +2081,28 @@ impl<S: Read + Write> PeerManager<S> {
                 // handshake.
             }
             SessionEvent::Message(Message::Mempool) => {
-                // BIP35: advertise the whole pool. wtxid entries for
-                // wtxidrelay peers, txid otherwise — one bounded inv.
+                // Audit P2P-BIP35: Core only serves `mempool` to
+                // inbound peers — a peer we dialed getting the whole
+                // pool lets it read our mempool over a link it didn't
+                // even open. And one request per interval — repeats
+                // are bandwidth amplification, not sync.
+                if !peer.inbound {
+                    return;
+                }
+                if let Some(t) = peer.mempool_req_last
+                    && t.elapsed() < MEMPOOL_REQ_INTERVAL
+                {
+                    return;
+                }
+                peer.mempool_req_last = Some(Instant::now());
+                // BIP35: advertise the pool. wtxid entries for
+                // wtxidrelay peers, txid otherwise — capped so one
+                // request can't pull a multi-MB inv.
                 let by_wtxid = peer.session.peer().is_some_and(|i| i.wtxid_relay);
                 let invs: Vec<crate::message::InvVector> = mempool
                     .txids()
                     .iter()
+                    .take(MAX_MEMPOOL_INV)
                     .filter_map(|txid| {
                         mempool.get(txid).map(|tx| crate::message::InvVector {
                             inv_type: if by_wtxid {
@@ -2368,9 +2428,16 @@ impl<S: Read + Write> PeerManager<S> {
     }
 
     /// `BanMan::IsBanned` for a 16-byte address — the dial/accept gate.
+    /// Audit P2P-12: discouraged peers answer `true` here as well, so
+    /// every dial/accept gate that already consults this method covers
+    /// discouragement without touching each call site.
     #[must_use]
     pub fn is_banned(&self, ip: &[u8; 16], now: i64) -> bool {
         self.bans.is_banned(ip, now)
+            || self
+                .discouraged
+                .get(ip)
+                .is_some_and(|until| *until > Instant::now())
     }
 
     /// `IsBanned(CSubNet)` — listed and active; setban's re-add check.
@@ -2683,26 +2750,33 @@ impl PeerManager<TcpStream> {
         // can't starve or spin the loop.
         let probes_left = self.addrbook.len();
         let mut tried = 0usize;
-        // ASMap bucketing: count the outbound slots each ASN already
-        // holds; a candidate in a saturated ASN is skipped (the probe
-        // budget bounds retries, so the book still makes progress).
-        let asn_counts: HashMap<u32, usize> = if self.asmap.is_empty() {
-            HashMap::new()
-        } else {
-            self.peers
-                .values()
-                .filter(|p| !p.inbound)
-                .filter_map(|p| {
-                    p.remote.and_then(|r| {
+        // Outbound diversity (audit P2P-4): with an ASMap, count the
+        // outbound slots each ASN holds; without one — the default —
+        // fall back to Core's GetGroup bucketing (/16 v4, /32 v6) so
+        // a candidate set still can't land all outbounds on one
+        // operator's address block. Either way a saturated bucket is
+        // skipped; the probe budget keeps the book making progress.
+        let asmap_loaded = !self.asmap.is_empty();
+        let group_counts: HashMap<Vec<u8>, usize> = self
+            .peers
+            .values()
+            .filter(|p| !p.inbound)
+            .filter_map(|p| {
+                p.remote.and_then(|r| {
+                    if asmap_loaded {
                         let ip = std::net::IpAddr::from(r.ip);
-                        self.asmap.asn(&ip)
-                    })
+                        self.asmap
+                            .asn(&ip)
+                            .map(|asn| asn.to_be_bytes().to_vec())
+                    } else {
+                        Some(addrman::net_group(&r.ip))
+                    }
                 })
-                .fold(HashMap::new(), |mut m, asn| {
-                    *m.entry(asn).or_default() += 1;
-                    m
-                })
-        };
+            })
+            .fold(HashMap::new(), |mut m, g| {
+                *m.entry(g).or_default() += 1;
+                m
+            });
         while self.outbound_open()
             && tried < probes_left
             && let Some(candidate) = self.addrbook.select()
@@ -2712,13 +2786,18 @@ impl PeerManager<TcpStream> {
             if self.is_banned(&candidate.ip, now) {
                 continue; // banned candidates aren't dialed
             }
-            if !self.asmap.is_empty() {
+            // Same gate either way: an ASMap candidate is keyed by
+            // ASN, otherwise by netgroup — one outbound per bucket.
+            let group_key = if asmap_loaded {
                 let ip = std::net::IpAddr::from(candidate.ip);
-                if let Some(asn) = self.asmap.asn(&ip)
-                    && asn_counts.get(&asn).copied().unwrap_or(0) >= 2
-                {
-                    continue; // this ASN already holds its share
-                }
+                self.asmap.asn(&ip).map(|asn| asn.to_be_bytes().to_vec())
+            } else {
+                Some(addrman::net_group(&candidate.ip))
+            };
+            if let Some(g) = group_key
+                && group_counts.get(&g).copied().unwrap_or(0) >= 1
+            {
+                continue; // this bucket already holds an outbound slot
             }
             // Already connected or dialing — Core's
             // `AlreadyConnectedTo`/`FindNode` check; the book may
@@ -2833,6 +2912,25 @@ type DialOutcome = Result<PeerSession<TcpStream>, SessionError>;
 /// `V1Fallback` the socket is dropped and the peer redialed in v1 —
 /// Core's `ShouldReconnectV1` (a v1-only peer can't parse the
 /// ellswift bytes we already sent).
+/// How long proven misbehavior keeps an IP off the dial/accept gates
+/// (audit P2P-12). Core's discouragement window is 24h — same here.
+const DISCOURAGE_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Audit P2P-1: minimum spacing between a peer's `reqrecon` requests
+/// — a full reconciliation cadence is ~1s/round, so sub-250ms bursts
+/// are flood, not sync.
+const RECON_REQ_MIN_INTERVAL: Duration = Duration::from_millis(250);
+/// Violations of [`RECON_REQ_MIN_INTERVAL`] before the peer is dropped
+/// for misbehavior.
+const RECON_REQ_MAX_VIOLATIONS: u32 = 8;
+
+/// Audit P2P-BIP35: minimum spacing between a peer's BIP35 `mempool`
+/// requests — the reply is the whole pool, so repeats inside a minute
+/// are amplification, not sync.
+const MEMPOOL_REQ_INTERVAL: Duration = Duration::from_secs(60);
+/// Max inventory entries in one BIP35 reply (~1.8 MB at 36B/entry).
+const MAX_MEMPOOL_INV: usize = 50_000;
+
 /// Inbound handshakes in flight at once — past this cap the listener
 /// drops accepted sockets rather than queue unbounded workers.
 const MAX_PENDING_ACCEPTS: usize = 32;
@@ -4085,7 +4183,11 @@ mod tests {
         use avila_consensus::transaction::{OutPoint, Script, TxIn, TxOut, Witness};
         use avila_consensus::{script, transaction::Transaction};
 
-        let (mut mgr, mut peer_a, _id_a) = managed_peer();
+        // Audit P2P-BIP35: `mempool` is answered only for inbound peers
+        // (Core's rule — a peer we dialed doesn't get the whole pool),
+        // so this test's peer must be inbound.
+        let mut mgr = PeerManager::new(8);
+        let (mut peer_a, _id_a) = add_inbound_peer(&mut mgr).expect("slot");
         // The regtest fixture spends and pays OP_TRUE — nonstandard, as
         // under Core, so opt out like `-acceptnonstdtxn=1`.
         mgr.mempool().set_require_standard(false);

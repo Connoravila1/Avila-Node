@@ -425,6 +425,35 @@ pub enum Network {
     Unroutable,
 }
 
+/// Core's `CNetAddr::GetGroup` — the diversity key outbound selection
+/// falls back to when no ASMap is loaded (audit P2P-4): IPv4 peers
+/// bucket by /16, IPv6 by /32, unroutable entries each get their own
+/// bucket so a localhost/regtest set can't starve and an unroutable
+/// flood can't share one slot.
+#[must_use]
+pub fn net_group(ip: &[u8; 16]) -> Vec<u8> {
+    let v4_mapped = ip[..10] == [0; 10] && ip[10] == 0xff && ip[11] == 0xff;
+    if v4_mapped {
+        let v = &ip[12..16];
+        let unroutable = v[0] == 10
+            || (v[0] == 172 && (16..32).contains(&v[1]))
+            || (v[0] == 192 && v[1] == 168)
+            || v[0] == 127
+            || v[0] == 0;
+        if unroutable {
+            let mut g = vec![0u8];
+            g.extend_from_slice(v);
+            return g;
+        }
+        let mut g = vec![4u8];
+        g.extend_from_slice(&v[..2]);
+        return g;
+    }
+    let mut g = vec![6u8];
+    g.extend_from_slice(&ip[..4]);
+    g
+}
+
 /// `GetNetworkName` — the string Core emits in `getnodeaddresses` and
 /// `getnetworkinfo`'s `networks` array.
 #[must_use]

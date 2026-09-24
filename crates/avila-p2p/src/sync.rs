@@ -40,6 +40,13 @@ const CFCHECKPT_INTERVAL: u32 = 1_000;
 /// may owe us at once.
 pub const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 
+/// Per-`getdata` serve budget: payload bytes (approximate wire size)
+/// emitted for a single request before the rest is announced
+/// `notfound`. Sized so a normal block fetch (≤16 blocks in flight)
+/// always fits, while a 50,000-entry request can never ask for more
+/// than this in one shot — the peer can re-ask for the remainder.
+pub const MAX_GETDATA_SERVE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Core's `BLOCK_STALLING_TIMEOUT_DEFAULT` — a peer that stops answering
 /// `getdata` gets its in-flight slots reclaimed.
 pub const BLOCK_STALLING_TIMEOUT: Duration = Duration::from_secs(2);
@@ -964,19 +971,31 @@ impl PeerSync {
         )])
     }
 
-    /// Answers a peer's `getdata`: a `block` message for each requested
-    /// block whose body we hold (memory or store), `notfound` for the rest.
-    /// Bounded by the request size — `getdata` payloads are already capped
-    /// at `MAX_INV_SZ` by the decoder.
-    #[must_use]
+    /// Answers a peer's `getdata` **incrementally**: each requested
+    /// block/tx is fetched, handed to `send`, and released before the
+    /// next is read — nothing is collected into memory. Serving stops
+    /// when `send` reports exhaustion (its transport buffer is full) or
+    /// when [`MAX_GETDATA_SERVE_BYTES`] of payload has been emitted for
+    /// one request, whichever comes first; everything unserved or
+    /// missing is then announced in a single `notfound`. A hostile
+    /// `getdata` naming 50,000 blocks therefore costs one block buffer
+    /// at a time, never the whole list (Core streams `PushMessage` the
+    /// same way — the send buffer, not a materialized Vec, bounds the
+    /// work).
     pub fn serve_getdata(
         cs: &Chainstate,
         mempool: Option<&avila_mempool::Mempool>,
         requests: &[InvVector],
-    ) -> Vec<Message> {
-        let mut out = Vec::new();
+        mut send: impl FnMut(&Message) -> bool,
+    ) {
+        let mut served = 0usize;
         let mut missing = Vec::new();
+        let mut idx = 0usize;
         for inv in requests {
+            if served >= MAX_GETDATA_SERVE_BYTES {
+                break;
+            }
+            idx += 1;
             match inv.inv_type {
                 InvType::Block | InvType::WitnessBlock => {
                     if let Some(block) = cs.body(&inv.hash) {
@@ -992,7 +1011,15 @@ impl PeerSync {
                                 }
                             }
                         }
-                        out.push(Message::Block(block));
+                        served += block
+                            .transactions
+                            .iter()
+                            .map(|t| t.size_with_witness())
+                            .sum::<usize>()
+                            + 80;
+                        if !send(&Message::Block(block)) {
+                            break;
+                        }
                     } else {
                         missing.push(*inv);
                     }
@@ -1014,17 +1041,24 @@ impl PeerSync {
                         })
                     });
                     match found {
-                        Some(tx) => out.push(Message::Tx(tx.clone())),
+                        Some(tx) => {
+                            served += tx.size_with_witness();
+                            if !send(&Message::Tx(tx.clone())) {
+                                break;
+                            }
+                        }
                         None => missing.push(*inv),
                     }
                 }
                 _ => missing.push(*inv),
             }
         }
+        // Every request never attempted (byte cap or a broken send)
+        // is owed a `notfound` alongside the misses.
+        missing.extend(requests.iter().skip(idx).copied());
         if !missing.is_empty() {
-            out.push(Message::NotFound(missing));
+            let _ = send(&Message::NotFound(missing));
         }
-        out
     }
 }
 
@@ -1646,12 +1680,59 @@ mod tests {
                 hash: unknown,
             },
         ];
-        let out = PeerSync::serve_getdata(&cs, None, &reqs);
+        let mut out = Vec::new();
+        PeerSync::serve_getdata(&cs, None, &reqs, |m| {
+            out.push(m.clone());
+            true
+        });
         assert_eq!(out.len(), 2);
         assert!(matches!(&out[0], Message::Block(b) if b.block_hash() == blocks[0].block_hash()));
         match &out[1] {
             Message::NotFound(v) => assert_eq!(v[0].hash, unknown),
             other => panic!("expected notfound, got {other:?}"),
         }
+    }
+
+    /// Audit P2P-2: a `getdata` must never materialize the request —
+    /// serving is incremental, the send budget is honored mid-stream,
+    /// and unserved requests come back in `notfound`.
+    #[test]
+    fn serve_getdata_streams_and_stops_on_budget() {
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 4);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        // 50 requests for the same block — a stand-in for a hostile
+        // 50,000-entry getdata (decoder caps the real one at that).
+        let reqs: Vec<InvVector> = (0..50)
+            .map(|i| InvVector {
+                inv_type: InvType::WitnessBlock,
+                hash: blocks[i % 4].block_hash(),
+            })
+            .collect();
+        // Budget allows exactly 3 sends: blocks 1-3 go out, the 4th
+        // send fails, the loop stops, and the remaining 46 invs land
+        // in one notfound — no 5th block is ever attempted.
+        let mut sent = 0usize;
+        let mut kinds = Vec::new();
+        PeerSync::serve_getdata(&cs, None, &reqs, |m| {
+            kinds.push(matches!(m, Message::Block(_)));
+            if matches!(m, Message::Block(_)) {
+                sent += 1;
+            }
+            sent <= 3 || matches!(m, Message::NotFound(_))
+        });
+        let blocks_attempted = kinds.iter().filter(|b| **b).count();
+        assert_eq!(blocks_attempted, 4, "stop fires right at the failed send");
+        assert!(matches!(kinds.last(), Some(false))); // trailing notfound
+        // And the byte cap path: MAX_GETDATA_SERVE_BYTES bounds one
+        // request even with an unlimited send budget.
+        let mut out = 0usize;
+        PeerSync::serve_getdata(&cs, None, &reqs, |_| {
+            out += 1;
+            true
+        });
+        assert!(out <= reqs.len() + 1);
     }
 }

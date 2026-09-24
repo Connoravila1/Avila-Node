@@ -82,7 +82,27 @@ pub struct PeerInfo {
 /// Wire telemetry for one session — what `getpeerinfo` reports. Bytes
 /// are counted where they actually move: outbound at `send` (queue
 /// time — a failed flush kills the session anyway), inbound at `poll`'s
-/// read; per-command histograms use whole-frame sizes.
+/// read; per-command histograms use whole-frame sizes. Audit P2P-3:
+/// the command keyspace is attacker-controlled (any printable ASCII
+/// ≤12 bytes parses), so per-command maps are capped — keys past the
+/// cap fold into the `"other"` bucket instead of growing unboundedly.
+const MAX_TELEMETRY_COMMANDS: usize = 64;
+
+/// Insert-or-fold for the per-command maps: real command names get
+/// their own row; everything past the cap lands in `"other"`.
+fn bump_cmd(map: &mut std::collections::HashMap<String, u64>, name: &str, bytes: u64) {
+    if let Some(e) = map.get_mut(name) {
+        *e += bytes;
+        return;
+    }
+    let key = if map.len() < MAX_TELEMETRY_COMMANDS {
+        name
+    } else {
+        "other"
+    };
+    *map.entry(key.to_string()).or_insert(0) += bytes;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SessionTelemetry {
     /// Wire bytes sent to this peer.
@@ -405,6 +425,14 @@ impl<S: Read + Write> PeerSession<S> {
         self.telemetry.clone()
     }
 
+    /// The two cumulative byte counters without cloning the
+    /// per-command maps — `net_totals`/`drop_peer` only need these
+    /// (audit P2P-3: cloning both maps per call was wasted work).
+    #[must_use]
+    pub fn byte_counters(&self) -> (u64, u64) {
+        (self.telemetry.bytes_sent, self.telemetry.bytes_recv)
+    }
+
     /// `getpeerinfo.transport_protocol_type` — "v2" when BIP324 is
     /// active (Core also reports "detecting" mid-handshake; our
     /// sessions resolve before registration).
@@ -461,11 +489,11 @@ impl<S: Read + Write> PeerSession<S> {
                 "per-peer send budget exhausted",
             )));
         }
-        *self
-            .telemetry
-            .sent_by_msg
-            .entry(command.name().to_string())
-            .or_insert(0) += frame.len() as u64;
+        bump_cmd(
+            &mut self.telemetry.sent_by_msg,
+            command.name(),
+            frame.len() as u64,
+        );
         self.telemetry.bytes_sent += frame.len() as u64;
         self.telemetry.last_send = (self.clock)();
         self.send_buf.extend(frame);
@@ -584,11 +612,11 @@ impl<S: Read + Write> PeerSession<S> {
             if self.v2.is_none() {
                 while let Some((command, payload)) = self.decoder.next_frame()? {
                     // Whole wire frame: payload plus the 24-byte header.
-                    *self
-                        .telemetry
-                        .recv_by_msg
-                        .entry(command.name().to_string())
-                        .or_insert(0) += payload.len() as u64 + 24;
+                    bump_cmd(
+                        &mut self.telemetry.recv_by_msg,
+                        command.name(),
+                        payload.len() as u64 + 24,
+                    );
                     self.telemetry.last_recv = (self.clock)();
                     if let Some(event) = self.dispatch(command, &payload)? {
                         events.push(event);
