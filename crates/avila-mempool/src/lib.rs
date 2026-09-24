@@ -4490,4 +4490,110 @@ mod tests {
         assert_eq!(pool2.broadcast_count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// RED TEAM — BIP-431 descendant-limit pinning. A counterparty in
+    /// a shared-protocol tx chains junk off *their* output until the
+    /// package hits the descendant cap; the victim's CPFP bump off
+    /// *their own* output is then rejected. This test is the attack —
+    /// it must succeed for the pinning oracle (#16) to have a target.
+    #[test]
+    fn redteam_descendant_limit_pinning() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
+        // The shared tx: one input, two outputs — vout 0 the victim's,
+        // vout 1 the attacker's (2-party protocol shape).
+        let mut v = spend_tx(mature_outpoint(&blocks, 1), 0, SEQ_RBF);
+        v.outputs = vec![
+            TxOut { value: 2_400_000_000, script_pubkey: Script::new(vec![script::OP_1]) },
+            TxOut { value: 2_400_000_000, script_pubkey: Script::new(vec![script::OP_1]) },
+        ];
+        let v_id = v.txid();
+        pool.accept_tx(v, &cs, NOW).unwrap();
+
+        // Baseline: the victim's bump off their own output IS valid
+        // before the attack — same tx, fresh pool.
+        {
+            let mut clean = permissive_pool();
+            clean.set_require_standard(false);
+            let mut v2 = spend_tx(mature_outpoint(&blocks, 1), 0, SEQ_RBF);
+            v2.outputs = vec![
+                TxOut { value: 2_400_000_000, script_pubkey: Script::new(vec![script::OP_1]) },
+                TxOut { value: 2_400_000_000, script_pubkey: Script::new(vec![script::OP_1]) },
+            ];
+            let v2_id = v2.txid();
+            clean.accept_tx(v2, &cs, NOW).unwrap();
+            let bump = spend_tx(
+                OutPoint { txid: v2_id, vout: 0 }, 2_399_000_000, SEQ_FINAL);
+            assert!(clean.accept_tx(bump, &cs, NOW).is_ok(),
+                "un-pinned bump must be accepted");
+        }
+
+        // The attack: fan a tree of junk descendants off vout 1 —
+        // each junk tx has 2 outputs, a work-queue of spendable
+        // outpoints keeps ancestor depth shallow (a linear chain hits
+        // the ancestor cap at 24 before pinning V).
+        let mut frontier = vec![(OutPoint { txid: v_id, vout: 1 }, 2_400_000_000i64)];
+        for _ in 0..DESCENDANT_LIMIT {
+            let (op, in_val) = frontier.remove(0);
+            let out_val = in_val - 10_000;
+            let mut junk = spend_tx(op, 0, SEQ_FINAL);
+            junk.outputs = vec![
+                TxOut { value: out_val / 2, script_pubkey: Script::new(vec![script::OP_1]) },
+                TxOut { value: out_val - out_val / 2, script_pubkey: Script::new(vec![script::OP_1]) },
+            ];
+            let jid = junk.txid();
+            pool.accept_tx(junk, &cs, NOW).unwrap();
+            frontier.push((OutPoint { txid: jid, vout: 0 }, out_val / 2));
+            frontier.push((OutPoint { txid: jid, vout: 1 }, out_val - out_val / 2));
+        }
+
+        // The pin: victim's own child off vout 0 — REJECTED.
+        let bump = spend_tx(OutPoint { txid: v_id, vout: 0 }, 2_399_000_000, SEQ_FINAL);
+        assert!(
+            matches!(pool.accept_tx(bump, &cs, NOW), Err(MempoolReject::PackageLimits)),
+            "the pin works: victim cannot fee-bump their own tx"
+        );
+    }
+
+    /// RED TEAM — BIP-431 rule-3 pinning: the attacker replaces the
+    /// victim's tx with a *huge* low-feerate conflict whose absolute
+    /// fee is high; the victim's replacement must then exceed that
+    /// absolute fee — a small, high-feerate bump is priced out.
+    #[test]
+    fn redteam_rule3_pinning() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
+        let op = mature_outpoint(&blocks, 1);
+
+        // Victim's tx: small, modest fee, RBF-signaled.
+        let victim = spend_tx(op, 4_999_000_000, SEQ_RBF); // 1k sat fee
+        pool.accept_tx(victim, &cs, NOW).unwrap();
+
+        // Attacker's conflict: huge (64 outputs → large vsize), fee
+        // just above the rule-3 floor — high absolute fee, low feerate.
+        let mut a = spend_tx(op, 0, SEQ_RBF);
+        a.outputs = (0..64)
+            .map(|_| TxOut {
+                value: 70_000_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            })
+            .collect();
+        // a fee = 5_000_000_000 - 64*70_000_000 = 520_000 sat — big.
+        pool.accept_tx(a, &cs, NOW).unwrap(); // replaces the victim
+
+        // The victim tries to re-replace with a normal-size high-feerate
+        // bump: 100k sat fee on ~110 vB is ~900 sat/vB — strong feerate,
+        // but it must exceed the conflict's 520k sat absolute fee.
+        let mut bump = spend_tx(op, 0, SEQ_RBF);
+        bump.outputs = vec![TxOut {
+            value: 4_900_000_000, // 100k sat fee
+            script_pubkey: Script::new(vec![script::OP_1]),
+        }];
+        assert!(
+            matches!(pool.accept_tx(bump, &cs, NOW), Err(MempoolReject::Conflict)),
+            "the pin works: modest bump priced out by the huge conflict"
+        );
+    }
 }
