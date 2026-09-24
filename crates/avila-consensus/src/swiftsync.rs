@@ -4,7 +4,7 @@
 //! again inside the window** — writes+deletes a transient-map sync
 //! never pays.
 //!
-//! The scheme: the [`UtxoSet`] keeps every coin in its write-back map
+//! The scheme: the [`UtxoSet`](crate::connect::UtxoSet) keeps every coin in its write-back map
 //! for the whole window (no flush — the honest cost is transient RAM,
 //! ~682MiB at signet scale) while maintaining a 256-bit wrapping-sum
 //! aggregate over [`coin_tag`]s. `created − spent == Σ live tags`

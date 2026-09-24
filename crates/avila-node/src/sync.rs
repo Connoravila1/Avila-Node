@@ -177,8 +177,8 @@ pub struct SyncProgress {
     /// transactions.
     pub next_block: Option<std::sync::Arc<NextBlock>>,
     /// Eclipse indicators as of the latest check (queue #12) —
-    /// advisory, re-evaluated every [`ECLIPSE_CHECK_INTERVAL`]; empty
-    /// when nothing looks wrong, so a cleared condition clears here too.
+    /// advisory, re-evaluated every 30 seconds; empty when nothing
+    /// looks wrong, so a cleared condition clears here too.
     pub eclipse: Vec<EclipseSignal>,
 }
 
@@ -677,8 +677,7 @@ pub fn run(
         if cfg.preview_next_block {
             if mgr.mempool().is_empty() {
                 next_block = None;
-            } else if next_block_built_at
-                .is_none_or(|t| t.elapsed() >= NEXT_BLOCK_REBUILD_INTERVAL)
+            } else if next_block_built_at.is_none_or(|t| t.elapsed() >= NEXT_BLOCK_REBUILD_INTERVAL)
             {
                 next_block_built_at = Some(Instant::now());
                 next_block = crate::next_block::build_next_block(mgr.mempool(), &cs)

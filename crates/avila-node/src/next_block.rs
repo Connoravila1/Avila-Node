@@ -308,7 +308,10 @@ mod tests {
             .accept_tx(spend, &cs, NOW)
             .expect("spend of a mature coinbase must be admitted");
 
-        assert!(build_next_block(&Mempool::new(), &cs).is_none(), "an empty pool must preview as None");
+        assert!(
+            build_next_block(&Mempool::new(), &cs).is_none(),
+            "an empty pool must preview as None"
+        );
 
         let preview =
             build_next_block(&pool, &cs).expect("a non-empty pool must produce a preview");
@@ -320,6 +323,9 @@ mod tests {
 
         let entry = pool.entry(&spend_txid).expect("entry must still be pooled");
         let expected_vsize = u32::try_from(entry.vsize).unwrap();
-        assert_eq!(preview.steps, vec![(expected_vsize, 10_000.0 / entry.vsize as f64)]);
+        assert_eq!(
+            preview.steps,
+            vec![(expected_vsize, 10_000.0 / entry.vsize as f64)]
+        );
     }
 }
