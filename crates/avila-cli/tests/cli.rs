@@ -1,9 +1,55 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn cli() -> Command {
     Command::new(env!("CARGO_BIN_EXE_avila-node"))
+}
+
+/// A fresh scratch directory under the OS temp dir, unique per test —
+/// `tag` plus pid plus a nanosecond timestamp, since several of these
+/// tests run in parallel threads of the same process.
+fn scratch_dir(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "avila-cli-test-{tag}-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Writes a minimal config under `root` whose network data directory
+/// resolves to `root/data/regtest` (data_dir is relative to the
+/// config file itself, not the process's cwd).
+fn write_config(root: &Path) -> PathBuf {
+    let path = root.join("config.toml");
+    std::fs::write(
+        &path,
+        "schema_version = 1\nnetwork = \"regtest\"\ndata_dir = \"data\"\nevent_capacity = 256\n",
+    )
+    .unwrap();
+    path
+}
+
+/// A minimal `backup`-shaped directory `migrate --rollback`/`restore`
+/// will accept: the manifest marker they check for, plus a `state.dat`
+/// that also passes `migrate`'s own post-rollback compatibility report
+/// (regtest magic + the binary's STATE_VERSION) so a successful
+/// rollback's exit code reflects the rollback alone.
+fn fake_backup(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("backup-manifest.json"), "{}").unwrap();
+    let mut state = avila_consensus::params::Network::Regtest
+        .params()
+        .message_start
+        .to_vec();
+    state.extend_from_slice(&avila_consensus::store::STATE_VERSION.to_le_bytes());
+    std::fs::write(dir.join("state.dat"), &state).unwrap();
 }
 
 #[test]
@@ -51,4 +97,99 @@ fn missing_config_is_an_error_not_a_silent_default() {
         .output()
         .unwrap();
     assert!(!output.status.success());
+}
+
+#[test]
+fn migrate_rollback_refuses_a_nonempty_datadir_without_force() {
+    let root = scratch_dir("migrate-rollback-nonempty");
+    let config = write_config(&root);
+    let live = root.join("data").join("regtest");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(live.join("state.dat"), b"live-state").unwrap();
+    let backup = root.join("backup");
+    fake_backup(&backup);
+
+    let output = cli()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "migrate",
+            "--rollback",
+            backup.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("non-empty"), "{stderr}");
+    assert!(stderr.contains("--force"), "{stderr}");
+    // Refused, so the live file must survive untouched.
+    assert_eq!(
+        std::fs::read(live.join("state.dat")).unwrap(),
+        b"live-state"
+    );
+
+    // --force clears the same refusal and performs the rollback.
+    let output = cli()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "migrate",
+            "--rollback",
+            backup.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        std::fs::read(live.join("state.dat")).unwrap(),
+        std::fs::read(backup.join("state.dat")).unwrap(),
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn migrate_rollback_refuses_a_locked_datadir_even_with_force() {
+    let root = scratch_dir("migrate-rollback-locked");
+    let config = write_config(&root);
+    let live = root.join("data").join("regtest");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(live.join("state.dat"), b"live-state").unwrap();
+    let backup = root.join("backup");
+    fake_backup(&backup);
+
+    // Hold the datadir lock ourselves, the way a running node would.
+    let lock_file = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(live.join(".lock"))
+        .unwrap();
+    lock_file.try_lock().unwrap();
+
+    let output = cli()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "migrate",
+            "--rollback",
+            backup.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("locked"), "{stderr}");
+    // The lock check must run before --force ever gets a say, so the
+    // live file survives.
+    assert_eq!(
+        std::fs::read(live.join("state.dat")).unwrap(),
+        b"live-state"
+    );
+
+    drop(lock_file);
+    let _ = std::fs::remove_dir_all(&root);
 }

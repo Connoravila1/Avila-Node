@@ -185,6 +185,9 @@ enum Command {
         /// Optional backup snapshot to restore before checking.
         #[arg(long)]
         rollback: Option<PathBuf>,
+        /// Overwrite an existing non-empty datadir for --rollback.
+        #[arg(long)]
+        force: bool,
     },
     /// Restore a datadir produced by `backup` over the configured
     /// network directory. Refuses to clobber a non-empty live dir
@@ -789,7 +792,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             let _ = std::fs::remove_file(dst.join("backup-manifest.json"));
             println!("Restored {} file(s) into {}", files.len(), dst.display());
         }
-        Command::Migrate { rollback } => {
+        Command::Migrate { rollback, force } => {
             let dir = config.network_data_dir();
             if let Some(src) = rollback {
                 if !src.join("backup-manifest.json").is_file() {
@@ -800,11 +803,35 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     .into());
                 }
                 if dir.is_dir() {
+                    // Refuse a live datadir — the node holds .lock
+                    // while running, same as Backup's check; a
+                    // rollback out from under it could tear its state.
+                    let lock_path = dir.join(".lock");
+                    if let Ok(lock) = std::fs::File::options()
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&lock_path)
+                    {
+                        lock.try_lock().map_err(|_| {
+                            format!(
+                                "{} is locked — stop the node before running migrate --rollback",
+                                dir.display()
+                            )
+                        })?;
+                    }
                     let non_empty = std::fs::read_dir(&dir)?.next().is_some();
-                    if non_empty {
+                    if non_empty && !force {
                         // Rollback replaces the live dir — refuse
-                        // unless it is already a *different* release's
-                        // state we are about to discard on purpose.
+                        // unless the caller confirms discarding it,
+                        // consistent with Restore's --force gate.
+                        return Err(format!(
+                            "{} is non-empty — pass --force to discard it for rollback",
+                            dir.display()
+                        )
+                        .into());
+                    }
+                    if non_empty {
                         println!("Discarding existing {} for rollback", dir.display());
                         std::fs::remove_dir_all(&dir)?;
                     }
