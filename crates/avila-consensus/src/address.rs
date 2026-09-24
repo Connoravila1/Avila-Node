@@ -420,7 +420,16 @@ fn base58_decode(s: &str) -> bool {
 /// bech32's own error strings.
 pub fn validate_address(s: &str, params: &Params) -> Result<AddressInfo, DestError> {
     let hrp = &params.bech32_hrp;
-    let is_bech32 = s.len() >= hrp.len() && s[..hrp.len()].eq_ignore_ascii_case(hrp);
+    // Byte-slice `s`, not `s[..hrp.len()]`: a `&str` range that lands
+    // inside a multi-byte character panics, and `hrp.len()` is an
+    // attacker-uncontrolled but arbitrary byte offset relative to `s`
+    // (e.g. a leading "€" — 3 bytes — puts offset 2 mid-character).
+    // `[u8]::get` returns `None` instead of panicking on a short
+    // string, and byte comparison needs no boundary at all.
+    let is_bech32 = s
+        .as_bytes()
+        .get(..hrp.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(hrp.as_bytes()));
 
     if !is_bech32 {
         if let Some((version, payload)) = base58check_decode(s) {
@@ -727,5 +736,17 @@ mod tests {
         assert!(validate_address("bcrt1tyddyu", &regtest).is_err());
         let testnet4 = Network::Testnet4.params();
         assert!(validate_address("tb1dclvmr", &testnet4).is_err());
+    }
+
+    /// "€" is 3 UTF-8 bytes; byte offset 2 (mainnet's `hrp.len()`, "bc")
+    /// used to land mid-character and panic on `s[..hrp.len()]`.
+    #[test]
+    fn validate_address_rejects_multibyte_char_at_hrp_boundary() {
+        let mainnet = Network::Mainnet.params();
+        assert!(validate_address("€", &mainnet).is_err());
+        // A longer hrp (regtest's "bcrt", 4 bytes) needs the boundary
+        // mismatch further into the string.
+        let regtest = Network::Regtest.params();
+        assert!(validate_address("aa€bcrt1q", &regtest).is_err());
     }
 }
