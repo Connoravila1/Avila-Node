@@ -50,6 +50,7 @@ const RECON_FIRST_DELAY: Duration = Duration::from_secs(10);
 fn recon_pool(
     mempool: &avila_mempool::Mempool,
     salt: u64,
+    exclude: &std::collections::HashSet<avila_consensus::hash::Txid>,
 ) -> (
     Vec<u32>,
     std::collections::HashMap<u32, avila_consensus::hash::Txid>,
@@ -57,6 +58,12 @@ fn recon_pool(
     let mut ids = Vec::new();
     let mut map = std::collections::HashMap::new();
     for txid in mempool.txids() {
+        // Stem-pending txs stay out of the sketch until fluff — on a
+        // recon link the next scheduled round would leak them inside
+        // the stem delay and turn the hop decorative (queue #7).
+        if exclude.contains(&txid) {
+            continue;
+        }
         let id = crate::recon::short_id(salt, txid.as_bytes());
         ids.push(id);
         map.insert(id, txid);
@@ -934,6 +941,7 @@ impl<S: Read + Write> PeerManager<S> {
             headers_sync_deadline,
             mempool,
             outbound_nonces,
+            stem_pending,
             ..
         } = self;
         // Core's `m_num_preferred_download_peers - state.fPreferredDownload
@@ -943,6 +951,10 @@ impl<S: Read + Write> PeerManager<S> {
         // because it's slow.
         let established_count = peers.values().filter(|p| p.session.established()).count();
         let total_cpu_rate: u64 = peers.values().map(|p| p.cpu_rate_ns).sum();
+        // Stem-pending txids stay out of recon sketches this tick —
+        // a round would leak them inside the stem delay (queue #7).
+        let stem_exclude: std::collections::HashSet<_> =
+            stem_pending.iter().map(|(t, _, _)| *t).collect();
         let mut announce_tip: Option<u64> = None;
         // txid/wtxid to relay at end of tick, and the peer it came from.
         let mut announce_tx: Option<(
@@ -989,6 +1001,7 @@ impl<S: Read + Write> PeerManager<S> {
                             &mut dead,
                             serve_filters,
                             outbound_nonces,
+                            &stem_exclude,
                         );
                         // Per-peer CPU accounting (PEER_BUDGETS):
                         // time inside dispatch lands on this peer's
@@ -1172,7 +1185,10 @@ impl<S: Read + Write> PeerManager<S> {
             .peers
             .iter()
             .filter(|(_, p)| {
-                !p.inbound && p.session.established() && p.session.peer().is_some_and(|i| i.relay)
+                !p.inbound
+                    && p.recon.is_none()
+                    && p.session.established()
+                    && p.session.peer().is_some_and(|i| i.relay)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -1299,7 +1315,9 @@ impl<S: Read + Write> PeerManager<S> {
             }
             peer.next_recon = now + RECON_INTERVAL;
             let salt = link.our_salt ^ link.their_salt;
-            let (our_ids, our_map) = recon_pool(&self.mempool, salt);
+            let pending: std::collections::HashSet<_> =
+                self.stem_pending.iter().map(|(t, _, _)| *t).collect();
+            let (our_ids, our_map) = recon_pool(&self.mempool, salt, &pending);
             let capacity = (our_ids.len() / 64).clamp(8, 512);
             let (round, req) = crate::recon::ReconRound::open(&our_ids, capacity);
             peer.recon_round = Some(round);
@@ -1603,6 +1621,7 @@ impl<S: Read + Write> PeerManager<S> {
         dead: &mut Vec<(u64, DisconnectReason)>,
         serve_filters: bool,
         outbound_nonces: &std::collections::HashSet<u64>,
+        stem_exclude: &std::collections::HashSet<avila_consensus::hash::Txid>,
     ) {
         match event {
             SessionEvent::Established => {
@@ -1857,7 +1876,7 @@ impl<S: Read + Write> PeerManager<S> {
                     return;
                 };
                 let salt = link.our_salt ^ link.their_salt;
-                let (our_ids, our_map) = recon_pool(mempool, salt);
+                let (our_ids, our_map) = recon_pool(mempool, salt, stem_exclude);
                 peer.recon_map = our_map;
                 if let Some((reply, outcome)) =
                     crate::recon::ReconRound::respond(&their_sketch, &our_ids)
@@ -1920,7 +1939,7 @@ impl<S: Read + Write> PeerManager<S> {
                     }
                     return;
                 }
-                let (our_ids, _) = recon_pool(mempool, salt);
+                let (our_ids, _) = recon_pool(mempool, salt, stem_exclude);
                 if let Some(round) = peer.recon_round.take() {
                     match round.close(&reply_sk, &our_ids) {
                         Some((misses, their_misses)) => {
@@ -1974,7 +1993,7 @@ impl<S: Read + Write> PeerManager<S> {
                     return;
                 };
                 let salt = link.our_salt ^ link.their_salt;
-                let (our_ids, _) = recon_pool(mempool, salt);
+                let (our_ids, _) = recon_pool(mempool, salt, stem_exclude);
                 let capacity = (our_ids.len() / 64).clamp(8, 512);
                 let (lo, hi) = crate::recon::bisect_reply(&our_ids, 31, capacity);
                 let _ = peer.session.send(&lo);
@@ -4710,5 +4729,98 @@ mod tests {
             sent_b.iter().any(|m| matches!(m, Message::Pong(9))),
             "quiet peer must still be served: {sent_b:?}"
         );
+    }
+
+    /// Stem on recon links (queue #7): a locally-originated tx in its
+    /// stem delay must not leak through the recon sketch — a round
+    /// inside the delay would defeat the hop. And a recon peer is
+    /// never inv'd (BIP-330 carries it).
+    #[test]
+    fn stem_pending_stays_out_of_recon_sketch() {
+        use avila_consensus::transaction::{OutPoint, Script, TxIn, TxOut, Witness};
+        use avila_consensus::{script, transaction::Transaction};
+
+        let (mut mgr, mut a, ida) = managed_peer();
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 101);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        // Peer A: plain relay link. Peer B: negotiates recon.
+        handshake(&mut mgr, &mut a, &mut cs);
+        testpipe::drain(&mut a, MAGIC);
+        let (mut b, idb) = add_peer(&mut mgr);
+        mgr.tick(&mut cs, NOW);
+        let _ = testpipe::drain(&mut b, MAGIC);
+        testpipe::inject(&mut b, MAGIC, &Message::Version(peer_version(600)));
+        testpipe::inject(
+            &mut b,
+            MAGIC,
+            &Message::SendRecon(crate::message::SendRecon {
+                is_sender: true,
+                is_responder: true,
+                version: crate::recon::RECON_VERSION,
+                salt: 0x66,
+            }),
+        );
+        mgr.tick(&mut cs, NOW);
+        testpipe::inject(&mut b, MAGIC, &Message::Verack);
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut b, MAGIC);
+        assert!(
+            mgr.peers.get(&idb).is_some_and(|p| p.recon.is_some()),
+            "peer B must be a recon link"
+        );
+
+        // Locally-originated tx in the pool → stem announce.
+        let op = OutPoint {
+            txid: blocks[0].transactions[0].txid(),
+            vout: 0,
+        };
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: op,
+                script_sig: Script::new(vec![]),
+                sequence: 0xffff_ffff,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 4_999_000_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let txid = tx.txid();
+        let wtxid = tx.wtxid();
+        mgr.mempool().set_require_standard(false);
+        mgr.mempool().accept_tx(tx, &cs, NOW).unwrap();
+        mgr.stem_announce(txid, wtxid);
+        mgr.tick(&mut cs, NOW); // flush send_bufs
+
+        // The stem inv can land only on the non-recon link A — never B.
+        let sent_b = testpipe::drain(&mut b, MAGIC);
+        assert!(
+            !sent_b.iter().any(|m| matches!(m, Message::Inv(_))),
+            "recon link must never get a stem inv: {sent_b:?}"
+        );
+
+        // While stem-pending, the tx is absent from the sketch ids.
+        let salt = 0xAAu64 ^ 0x66u64; // our_salt ^ their_salt (test salts)
+        let pending: std::collections::HashSet<_> =
+            mgr.stem_pending.iter().map(|(t, _, _)| *t).collect();
+        assert!(pending.contains(&txid), "tx must be stem-pending");
+        let (ids, _) = recon_pool(mgr.mempool_ref(), salt, &pending);
+        let short = crate::recon::short_id(salt, txid.as_bytes());
+        assert!(
+            !ids.contains(&short),
+            "pending tx must stay out of the sketch"
+        );
+
+        // After fluff, it's back in the sketch set.
+        let empty: std::collections::HashSet<_> = Default::default();
+        let (ids, _) = recon_pool(mgr.mempool_ref(), salt, &empty);
+        assert!(ids.contains(&short), "fluffed tx must reconcile");
+        let _ = ida;
     }
 }
