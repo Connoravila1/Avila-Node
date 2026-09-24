@@ -94,6 +94,25 @@ impl RunBuilder {
         Ok(())
     }
 
+    /// Append a record whose body is already in stored format — the
+    /// snapshot bulk-load path copies wire bytes verbatim (the wire
+    /// encoding IS `CoinFormat::Compact`), skipping decode+re-encode.
+    pub fn push_wire(&mut self, key: &[u8; 36], body: &[u8]) -> io::Result<()> {
+        if let Some(prev) = self.last_key {
+            debug_assert!(*key > prev, "sorted-run keys must ascend");
+        }
+        if self.count.is_multiple_of(u64::from(self.stride)) {
+            self.sparse.push((*key, self.pos));
+        }
+        self.w.write_all(key)?;
+        self.w.write_all(&(body.len() as u32).to_le_bytes())?;
+        self.w.write_all(body)?;
+        self.pos += 36 + 4 + body.len() as u64;
+        self.last_key = Some(*key);
+        self.count += 1;
+        Ok(())
+    }
+
     /// Flush records, write the sparse index trailer + header.
     pub fn finish(mut self) -> io::Result<u64> {
         let index_off = self.pos;
@@ -207,6 +226,148 @@ impl SortedRun {
             pos += 40 + len;
         }
         None
+    }
+}
+
+/// Read-only view over an *external* sorted coin stream — the UTXO
+/// snapshot file itself. Wire format already equals `CoinFormat::Compact`
+/// record bytes, so building the UTXO set is an index-only pass:
+/// sample every `stride`-th `(key -> file offset)` and seek-read coins
+/// on demand. ~15MB of index for 170M coins; zero bulk writes.
+pub struct SnapshotRun {
+    f: std::sync::Mutex<File>,
+    /// Sorted sparse index: key -> byte offset of that coin's wire body
+    /// region (points at the coin's vout varint — the record start).
+    sparse: Vec<([u8; 36], u64)>,
+    count: u64,
+}
+
+impl SnapshotRun {
+    pub fn from_index(
+        snap: File,
+        sparse: Vec<([u8; 36], u64)>,
+        count: u64,
+    ) -> Self {
+        Self {
+            f: std::sync::Mutex::new(snap),
+            sparse,
+            count,
+        }
+    }
+
+    pub fn len(&self) -> u64 {
+        self.count
+    }
+
+    /// Lookup: sparse binary search -> read a window starting at the
+    /// record's vout varint -> walk txid group + outputs -> decode the
+    /// wire body directly.
+    ///
+    /// Sparse entries point at the *vout varint* of every stride-th
+    /// coin, but a txid group may start before that — so a lookup must
+    /// scan from the group start. Groups are small (~1-2 outs), so the
+    /// window covers stride+margin coins worth of bytes.
+    pub fn get(&self, op: &OutPoint) -> Option<Coin> {
+        let key = crate::coinsdb::key_of(op);
+        let lo_idx = match self.sparse.binary_search_by(|(k, _)| k.cmp(&key)) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let off = self.sparse[lo_idx].1;
+        // The window must contain up to `stride` whole coin records
+        // starting from an arbitrary group boundary — use a generous
+        // bound: stride * max compressed coin (~75B) + group margin.
+        let cap = 1 << 17; // 128KB covers ~256 groups of typical coins
+        let mut buf = vec![0u8; cap];
+        let mut f = self.f.lock().ok()?;
+        // The sparse offset points at a vout varint mid-group; the key
+        // may sit anywhere in the following `stride` records. Walk
+        // record-by-record: vout compact-size + wire body.
+        f.read_exact_at(&mut buf, off).ok()?;
+        // txid is implicit (32B before each group) — but our offset is
+        // mid-group, so the txid for THIS group isn't at `off`. We
+        // store sparse entries at *vout varints* — recover txid by
+        // reading 32 bytes back? Groups begin with txid; the sparse
+        // key tells us the txid of the indexed coin — for scanning we
+        // only need vout+body per record, with txid from the sparse
+        // entry's key... but a group boundary could appear mid-window.
+        // Simpler robust approach: sparse entries point at *group
+        // starts* only — index every txid group boundary instead of
+        // every coin. Caller guarantees that via index construction.
+        let mut pos = 0usize;
+        let mut cur_txid = [0u8; 32];
+        // First record in window starts a txid group: read txid32+count.
+        cur_txid.copy_from_slice(&buf[pos..pos + 32]);
+        pos += 32;
+        let mut group_left = cs(&buf, &mut pos) as usize;
+        loop {
+            if group_left == 0 {
+                cur_txid.copy_from_slice(&buf[pos..pos + 32]);
+                pos += 32;
+                group_left = cs(&buf, &mut pos) as usize;
+            }
+            let vout = cs(&buf, &mut pos) as u32;
+            let body_start = pos;
+            let mut varints = [0u64; 3];
+            for v in varints.iter_mut() {
+                loop {
+                    let c = buf[pos];
+                    *v = (*v << 7) | u64::from(c & 0x7f);
+                    pos += 1;
+                    if c & 0x80 == 0 {
+                        break;
+                    }
+                }
+            }
+            let plen = match varints[2] {
+                0 | 1 => 20usize,
+                2 | 3 | 4 | 5 => 32usize,
+                n => (n - 6) as usize,
+            };
+            if cur_txid == *op.txid.as_bytes() && vout == op.vout {
+                return crate::coinsdb::decode_coin(
+                    &buf[body_start..pos + plen],
+                    CoinFormat::Compact,
+                );
+            }
+            // Passed the key within this txid's group -> miss.
+            if cur_txid == *op.txid.as_bytes() && vout > op.vout {
+                return None;
+            }
+            if cur_txid > *op.txid.as_bytes() {
+                return None;
+            }
+            pos += plen;
+            group_left -= 1;
+            if pos + 128 > buf.len() {
+                return None; // window exhausted
+            }
+        }
+    }
+}
+
+/// Compact-size decode at buf[pos..] — returns value, advances pos.
+fn cs(buf: &[u8], pos: &mut usize) -> u64 {
+    let c = buf[*pos];
+    *pos += 1;
+    match c {
+        0xfd => {
+            let v = u16::from_le_bytes(buf[*pos..*pos + 2].try_into().unwrap()) as u64;
+            *pos += 2;
+            v
+        }
+        0xfe => {
+            let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap()) as u64;
+            *pos += 4;
+            v
+        }
+        0xff => {
+            let v = u64::from_le_bytes(buf[*pos..*pos + 8].try_into().unwrap());
+            *pos += 8;
+            v
+        }
+        _ => c as u64,
     }
 }
 

@@ -16,6 +16,7 @@ use avila_consensus::connect::{Coin, UtxoSet};
 use avila_consensus::hash::Txid;
 use avila_consensus::transaction::{OutPoint, Script, TxOut};
 use avila_consensus::utxo_snapshot::{read_coins, read_metadata};
+use std::io::Read as _;
 use std::time::Instant;
 
 /// xorshift64* — deterministic, dependency-free key material.
@@ -354,6 +355,470 @@ fn main() {
             );
             let sz = std::fs::metadata(&run_path).unwrap().len() as f64 / (1 << 30) as f64;
             println!("run file = {sz:.2} GiB");
+            return;
+        }
+        // `runfast <path> <base>` — byte-level snapshot walk: parse
+        // group headers + index varints, copy each coin's wire body
+        // verbatim into the run (wire format == stored format). No
+        // Coin objects ever materialize — the ~I/O-bound floor.
+        "runfast" => {
+            let path = args.next().unwrap();
+            let bh: u32 = args.next().map(|x| x.parse().unwrap()).unwrap_or(935_000);
+            base_height = bh;
+            let run_path = dir.join("base.run");
+            let f = std::fs::File::open(&path).unwrap();
+            let mut r = std::io::BufReader::with_capacity(1 << 24, f);
+            let meta = read_metadata(&mut r, [0xf9, 0xbe, 0xb4, 0xd9])
+                .unwrap_or_else(|e| panic!("meta: {e}"));
+            let mut b = avila_consensus::sortedrun::RunBuilder::create(&run_path)
+                .unwrap_or_else(|e| panic!("create: {e}"));
+            let mut buf = vec![0u8; 1 << 24]; // 16MB stream window
+            let mut pos = 0usize;
+            let mut len = 0usize;
+            // Compact [pos..len] to the front and refill. Only called
+            // between coins — a coin's parse never straddles once we
+            // guarantee a min margin up front.
+            let mut refill = |buf: &mut Vec<u8>, pos: &mut usize, len: &mut usize, r: &mut std::io::BufReader<std::fs::File>| {
+                buf.copy_within(*pos..*len, 0);
+                *len -= *pos;
+                *pos = 0;
+                while *len < buf.len() {
+                    let n = r.read(&mut buf[*len..]).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    *len += n;
+                }
+            };
+            let margin = 1 << 18; // 256KB — max sane coin body margin
+            refill(&mut buf, &mut pos, &mut len, &mut r);
+            let mut coins_left = meta.coins_count;
+            let mut sample: Vec<OutPoint> = Vec::new();
+            let mut count = 0u64;
+            // compact-size value at buf[pos..]
+            macro_rules! cs {
+                () => {{
+                    let c = buf[pos];
+                    pos += 1;
+                    match c {
+                        0xfd => {
+                            let v = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as u64;
+                            pos += 2;
+                            v
+                        }
+                        0xfe => {
+                            let v = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as u64;
+                            pos += 4;
+                            v
+                        }
+                        0xff => {
+                            let v = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+                            pos += 8;
+                            v
+                        }
+                        _ => c as u64,
+                    }
+                }};
+            }
+            while coins_left > 0 {
+                if len - pos < margin {
+                    refill(&mut buf, &mut pos, &mut len, &mut r);
+                }
+                let mut key = [0u8; 36];
+                key[..32].copy_from_slice(&buf[pos..pos + 32]);
+                pos += 32;
+                let cnt = cs!();
+                for _ in 0..cnt {
+                    if len - pos < margin {
+                        refill(&mut buf, &mut pos, &mut len, &mut r);
+                    }
+                    let vout = cs!() as u32;
+                    key[32..].copy_from_slice(&vout.to_le_bytes());
+                    let body_start = pos;
+                    // Scan 3 MSB-chained varints; only size_id's value is needed.
+                    let mut varints = [0u64; 3];
+                    for v in varints.iter_mut() {
+                        loop {
+                            let c = buf[pos];
+                            *v = (*v << 7) | u64::from(c & 0x7f);
+                            pos += 1;
+                            if c & 0x80 == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    let plen = match varints[2] {
+                        0 | 1 => 20usize,
+                        2 | 3 | 4 | 5 => 32usize,
+                        n => (n - 6) as usize,
+                    };
+                    if pos + plen <= len {
+                        b.push_wire(&key, &buf[body_start..pos + plen]).unwrap();
+                        pos += plen;
+                    } else {
+                        // Rare: huge bare-script payload — assemble it.
+                        let mut body = Vec::with_capacity(pos - body_start + plen);
+                        body.extend_from_slice(&buf[body_start..len]);
+                        let want = plen - (len - pos);
+                        let mut tail = vec![0u8; want];
+                        r.read_exact(&mut tail).unwrap();
+                        body.extend_from_slice(&tail);
+                        b.push_wire(&key, &body).unwrap();
+                        pos = 0;
+                        len = 0;
+                        refill(&mut buf, &mut pos, &mut len, &mut r);
+                    }
+                    if count.is_multiple_of(65536) {
+                        let mut t = [0u8; 32];
+                        t.copy_from_slice(&key[..32]);
+                        sample.push(OutPoint {
+                            txid: Txid::from_bytes(t),
+                            vout,
+                        });
+                    }
+                    count += 1;
+                    coins_left -= 1;
+                }
+            }
+            let n = b.finish().unwrap_or_else(|e| panic!("finish: {e}"));
+            let el = t.elapsed();
+            println!(
+                "runfast-build: {n} coins in {:.0?} — {:.0} coins/s",
+                el,
+                n as f64 / el.as_secs_f64()
+            );
+            let run = avila_consensus::sortedrun::SortedRun::open(&run_path).unwrap();
+            let tr = Instant::now();
+            let mut hits = 0u64;
+            for op in &sample {
+                if run.get(op).is_some() {
+                    hits += 1;
+                }
+            }
+            let el = tr.elapsed();
+            println!(
+                "point reads: {} in {:.0?} — {:.0}/s ({hits} hits)",
+                sample.len(),
+                el,
+                sample.len() as f64 / el.as_secs_f64()
+            );
+            return;
+        }
+        // `runpipe <path> <base>` — runfast parse on this thread,
+        // record writes on another: batches of pre-formatted
+        // [key36][len4][body] records flow through a bounded channel
+        // so scan CPU overlaps sequential I/O.
+        "runpipe" => {
+            let path = args.next().unwrap();
+            let bh: u32 = args.next().map(|x| x.parse().unwrap()).unwrap_or(935_000);
+            base_height = bh;
+            let run_path = dir.join("base.run");
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+            let wr = std::thread::spawn({
+                let run_path = run_path.clone();
+                move || {
+                    let mut b = avila_consensus::sortedrun::RunBuilder::create(&run_path)
+                        .unwrap_or_else(|e| panic!("create: {e}"));
+                    while let Ok(blob) = rx.recv() {
+                        let mut off = 0usize;
+                        while off + 40 <= blob.len() {
+                            let l = u32::from_le_bytes(
+                                blob[off + 36..off + 40].try_into().unwrap(),
+                            ) as usize;
+                            let key: &[u8; 36] = blob[off..off + 36].try_into().unwrap();
+                            b.push_wire(key, &blob[off + 40..off + 40 + l]).unwrap();
+                            off += 40 + l;
+                        }
+                    }
+                    b.finish().unwrap_or_else(|e| panic!("finish: {e}"))
+                }
+            });
+            let f = std::fs::File::open(&path).unwrap();
+            let mut r = std::io::BufReader::with_capacity(1 << 24, f);
+            let meta = read_metadata(&mut r, [0xf9, 0xbe, 0xb4, 0xd9])
+                .unwrap_or_else(|e| panic!("meta: {e}"));
+            let mut buf = vec![0u8; 1 << 24];
+            let mut pos = 0usize;
+            let mut len = 0usize;
+            let mut refill = |buf: &mut Vec<u8>,
+                              pos: &mut usize,
+                              len: &mut usize,
+                              r: &mut std::io::BufReader<std::fs::File>| {
+                buf.copy_within(*pos..*len, 0);
+                *len -= *pos;
+                *pos = 0;
+                while *len < buf.len() {
+                    let n = r.read(&mut buf[*len..]).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    *len += n;
+                }
+            };
+            let margin = 1 << 18;
+            refill(&mut buf, &mut pos, &mut len, &mut r);
+            let mut coins_left = meta.coins_count;
+            let mut batch = Vec::with_capacity(1 << 22);
+            let mut count = 0u64;
+            macro_rules! cs {
+                () => {{
+                    let c = buf[pos];
+                    pos += 1;
+                    match c {
+                        0xfd => {
+                            let v = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap())
+                                as u64;
+                            pos += 2;
+                            v
+                        }
+                        0xfe => {
+                            let v = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap())
+                                as u64;
+                            pos += 4;
+                            v
+                        }
+                        0xff => {
+                            let v = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+                            pos += 8;
+                            v
+                        }
+                        _ => c as u64,
+                    }
+                }};
+            }
+            while coins_left > 0 {
+                if len - pos < margin {
+                    refill(&mut buf, &mut pos, &mut len, &mut r);
+                }
+                let mut key = [0u8; 36];
+                key[..32].copy_from_slice(&buf[pos..pos + 32]);
+                pos += 32;
+                let cnt = cs!();
+                for _ in 0..cnt {
+                    if len - pos < margin {
+                        refill(&mut buf, &mut pos, &mut len, &mut r);
+                    }
+                    let vout = cs!() as u32;
+                    key[32..].copy_from_slice(&vout.to_le_bytes());
+                    let body_start = pos;
+                    let mut varints = [0u64; 3];
+                    for v in varints.iter_mut() {
+                        loop {
+                            let c = buf[pos];
+                            *v = (*v << 7) | u64::from(c & 0x7f);
+                            pos += 1;
+                            if c & 0x80 == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    let plen = match varints[2] {
+                        0 | 1 => 20usize,
+                        2 | 3 | 4 | 5 => 32usize,
+                        n => (n - 6) as usize,
+                    };
+                    if pos + plen > len {
+                        // rare giant payload — assemble via tail read
+                        let mut body = Vec::with_capacity(pos - body_start + plen);
+                        body.extend_from_slice(&buf[body_start..len]);
+                        let want = plen - (len - pos);
+                        let mut tail = vec![0u8; want];
+                        r.read_exact(&mut tail).unwrap();
+                        body.extend_from_slice(&tail);
+                        batch.extend_from_slice(&key);
+                        batch.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                        batch.extend_from_slice(&body);
+                        pos = 0;
+                        len = 0;
+                        refill(&mut buf, &mut pos, &mut len, &mut r);
+                    } else {
+                        batch.extend_from_slice(&key);
+                        batch.extend_from_slice(&(plen as u32 + (pos - body_start) as u32).to_le_bytes());
+                        batch.extend_from_slice(&buf[body_start..pos + plen]);
+                        pos += plen;
+                    }
+                    count += 1;
+                    coins_left -= 1;
+                    if batch.len() >= 1 << 22 {
+                        if tx.send(std::mem::take(&mut batch)).is_err() {
+                            panic!("writer died");
+                        }
+                        batch = Vec::with_capacity(1 << 22);
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                tx.send(batch).unwrap();
+            }
+            drop(tx);
+            let n = wr.join().unwrap();
+            let el = t.elapsed();
+            println!(
+                "runpipe-build: {n} coins ({count} seen) in {:.0?} — {:.0} coins/s",
+                el,
+                n as f64 / el.as_secs_f64()
+            );
+            return;
+        }
+        // `runindex <path> <base>` — the zero-write load: index every
+        // Nth txid-group start in the snapshot file, then answer reads
+        // by seeking into the file directly. The snapshot IS the UTXO
+        // set; ~15MB of index, no bulk data writes at all.
+        "runindex" => {
+            let path = args.next().unwrap();
+            let bh: u32 = args.next().map(|x| x.parse().unwrap()).unwrap_or(935_000);
+            base_height = bh;
+            let f = std::fs::File::open(&path).unwrap();
+            let mut r = std::io::BufReader::with_capacity(1 << 24, f.try_clone().unwrap());
+            let meta = read_metadata(&mut r, [0xf9, 0xbe, 0xb4, 0xd9])
+                .unwrap_or_else(|e| panic!("meta: {e}"));
+            let mut buf = vec![0u8; 1 << 24];
+            let mut pos = 0usize;
+            let mut len = 0usize;
+            let mut file_off = 0u64; // absolute offset of buf[0]
+            let hdr_off = 51u64; // magic4+ver2+net4+base32+count8+? — measured below
+            let _ = hdr_off;
+            // Track absolute file position: base = bytes consumed by header.
+            // BufReader consumed the header already; its inner position:
+            // read_metadata read exactly the header bytes.
+            let mut abs = 51u64;
+            let mut refill = |buf: &mut Vec<u8>,
+                              pos: &mut usize,
+                              len: &mut usize,
+                              abs: &mut u64,
+                              r: &mut std::io::BufReader<std::fs::File>| {
+                *abs += *pos as u64;
+                buf.copy_within(*pos..*len, 0);
+                *len -= *pos;
+                *pos = 0;
+                while *len < buf.len() {
+                    let n = r.read(&mut buf[*len..]).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    *len += n;
+                }
+            };
+            // Measure true header size: read_metadata consumed magic4+ver2
+            // +net4+base32+count8 = 50 bytes? verify: utxoÿ(4) + u16(2)
+            // + magic(4) + hash(32) + count(8) = 50.
+            abs = 51; // "utxo\\xff"(5) + ver(2) + magic(4) + base(32) + count(8)
+            let margin = 1 << 18;
+            refill(&mut buf, &mut pos, &mut len, &mut abs, &mut r);
+            let mut coins_left = meta.coins_count;
+            let mut sparse: Vec<([u8; 36], u64)> = Vec::new();
+            let mut groups = 0u64;
+            let mut count = 0u64;
+            let mut sample: Vec<OutPoint> = Vec::new();
+            macro_rules! cs {
+                () => {{
+                    let c = buf[pos];
+                    pos += 1;
+                    match c {
+                        0xfd => {
+                            let v = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap())
+                                as u64;
+                            pos += 2;
+                            v
+                        }
+                        0xfe => {
+                            let v = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap())
+                                as u64;
+                            pos += 4;
+                            v
+                        }
+                        0xff => {
+                            let v = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+                            pos += 8;
+                            v
+                        }
+                        _ => c as u64,
+                    }
+                }};
+            }
+            while coins_left > 0 {
+                if len - pos < margin {
+                    refill(&mut buf, &mut pos, &mut len, &mut abs, &mut r);
+                }
+                let group_off = abs + pos as u64;
+                let mut first_key = [0u8; 36];
+                first_key[..32].copy_from_slice(&buf[pos..pos + 32]);
+                let mut cur_txid = [0u8; 32];
+                cur_txid.copy_from_slice(&buf[pos..pos + 32]);
+                pos += 32;
+                let cnt = cs!();
+                // Peek the group's first vout to complete its first key.
+                let save = pos;
+                let v0 = cs!() as u32;
+                first_key[32..].copy_from_slice(&v0.to_le_bytes());
+                if groups.is_multiple_of(256) {
+                    sparse.push((first_key, group_off));
+                }
+                groups += 1;
+                pos = save;
+                for _ in 0..cnt {
+                    if len - pos < margin {
+                        refill(&mut buf, &mut pos, &mut len, &mut abs, &mut r);
+                    }
+                    let vout = cs!() as u32;
+                    let mut varints = [0u64; 3];
+                    for v in varints.iter_mut() {
+                        loop {
+                            let c = buf[pos];
+                            *v = (*v << 7) | u64::from(c & 0x7f);
+                            pos += 1;
+                            if c & 0x80 == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    let plen = match varints[2] {
+                        0 | 1 => 20usize,
+                        2 | 3 | 4 | 5 => 32usize,
+                        n => (n - 6) as usize,
+                    };
+                    if pos + plen > len {
+                        // giant payload — skip by seeking
+                        let skip = plen - (len - pos);
+                        use std::io::Seek;
+                        r.seek_relative(skip as i64).unwrap();
+                        abs = abs + len as u64 + skip as u64;
+                        pos = 0;
+                        len = 0;
+                        refill(&mut buf, &mut pos, &mut len, &mut abs, &mut r);
+                    } else {
+                        pos += plen;
+                    }
+                    if count.is_multiple_of(65536) {
+                        sample.push(OutPoint {
+                            txid: Txid::from_bytes(cur_txid),
+                            vout,
+                        });
+                    }
+                    count += 1;
+                    coins_left -= 1;
+                }
+            }
+            let el = t.elapsed();
+            println!(
+                "index-build: {count} coins {groups} groups in {:.0?} — {:.0} coins/s ({} index entries)",
+                el, count as f64 / el.as_secs_f64(), sparse.len()
+            );
+            let run = avila_consensus::sortedrun::SnapshotRun::from_index(f, sparse, count);
+            let tr = Instant::now();
+            let mut hits = 0u64;
+            for op in &sample {
+                if run.get(op).is_some() {
+                    hits += 1;
+                }
+            }
+            let el = tr.elapsed();
+            println!(
+                "point reads: {} in {:.0?} — {:.0}/s ({hits} hits)",
+                sample.len(),
+                el,
+                sample.len() as f64 / el.as_secs_f64()
+            );
             return;
         }
         "file" => {
