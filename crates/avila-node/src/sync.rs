@@ -291,6 +291,7 @@ pub fn run(
     let mut last_audit = resumed_height;
     let mut audit_failures = 0usize;
     let mut mgr = PeerManager::new(cfg.max_peers);
+    mgr.set_proxy(cfg.proxy);
     // The whole p2p time domain — dial-path ban checks, version
     // `timestamp`s, conntime/lastsend/lastrecv and the last_* peer
     // fields — reads the node clock, so `setmocktime` shifts them too.

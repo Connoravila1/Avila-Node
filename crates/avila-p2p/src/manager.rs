@@ -429,6 +429,10 @@ pub struct PeerManager<S> {
     )>,
     /// Whether locally-submitted txs take the stem path — default on.
     stem_relay: bool,
+    /// SOCKS5 proxy for automatic outbound dials — Core's `-proxy`.
+    /// When set, EVERY outbound connection routes through it; there
+    /// is no clearnet fallback (fail-closed — queue #13).
+    proxy: Option<SocketAddr>,
     /// Last time the eclipse-signal check ran (paced to ~60s).
     eclipse_checked_at: Instant,
     /// Named event ring (queue #33): every NetEvent the tick produces
@@ -541,6 +545,7 @@ impl<S: Read + Write> PeerManager<S> {
             asmap: crate::asmap::AsMap::empty(),
             event_ring: std::collections::VecDeque::with_capacity(1025),
             eclipse_checked_at: Instant::now(),
+            proxy: None,
             bans: crate::banman::BanList::new(),
             banlist_path: None,
             dial_tx: dial_channel.0,
@@ -1136,6 +1141,13 @@ impl<S: Read + Write> PeerManager<S> {
     /// Whether locally submitted txs take the stem path.
     pub fn set_stem_relay(&mut self, on: bool) {
         self.stem_relay = on;
+    }
+
+    /// Routes every automatic outbound dial through a SOCKS5 proxy —
+    /// fail-closed: when set, no dial ever touches clearnet, and a
+    /// dead proxy means no outbound peers rather than a silent leak.
+    pub fn set_proxy(&mut self, proxy: Option<SocketAddr>) {
+        self.proxy = proxy;
     }
 
     /// Loads an AS bucketing map — Erebus mitigation: outbound dialing
@@ -2566,8 +2578,13 @@ impl PeerManager<TcpStream> {
         if self.serve_filters {
             version.services |= crate::message::NODE_COMPACT_FILTERS;
         }
+        let proxy = self.proxy;
         std::thread::spawn(move || {
-            let _ = tx.send((addr, dial(addr, magic, version, use_v2)));
+            let outcome = match proxy {
+                Some(p) => dial_via(p, addr, magic, version, use_v2),
+                None => dial(addr, magic, version, use_v2),
+            };
+            let _ = tx.send((addr, outcome));
         });
     }
 }
@@ -2576,6 +2593,48 @@ impl PeerManager<TcpStream> {
 /// (`nConnectTimeout` is only honored by proxies; direct dials use
 /// the same bound here).
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The proxy dial worker — `socks5_connect` to the SOCKS5 proxy, then
+/// the same session handshake `dial` runs. No clearnet fallback: a
+/// proxy failure IS the dial's failure (fail-closed, queue #13).
+fn dial_via(
+    proxy: SocketAddr,
+    addr: SocketAddr,
+    magic: [u8; 4],
+    version: Version,
+    want_v2: bool,
+) -> DialOutcome {
+    let stream = crate::proxy::socks5_connect(
+        &proxy,
+        &crate::proxy::SocksTarget::Ip(addr),
+        DIAL_TIMEOUT,
+    )?;
+    stream.set_nodelay(true)?;
+    if want_v2 {
+        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        match PeerSession::initiate_v2(stream, magic, version.clone(), SEND_BUDGET_PER_PEER) {
+            Err(SessionError::V1Fallback) => {
+                let stream = crate::proxy::socks5_connect(
+                    &proxy,
+                    &crate::proxy::SocksTarget::Ip(addr),
+                    DIAL_TIMEOUT,
+                )?;
+                stream.set_nodelay(true)?;
+                stream.set_nonblocking(true)?;
+                return PeerSession::initiate(stream, magic, version, SEND_BUDGET_PER_PEER);
+            }
+            Ok(mut session) => {
+                let s = session.stream_mut();
+                s.set_read_timeout(None)?;
+                s.set_nonblocking(true)?;
+                return Ok(session);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    stream.set_nonblocking(true)?;
+    PeerSession::initiate(stream, magic, version, SEND_BUDGET_PER_PEER)
+}
 
 /// One dial worker's product — a live `PeerSession` (v1, or v2 with
 /// the BIP324 handshake already done) or the failure.
