@@ -906,6 +906,58 @@ fn reply_obj(result: Value, error: Option<(i64, String)>, id: &Option<Value>, v2
 /// queue until the missing bodies arrive or the deadline passes.
 /// `method` is carried on the query only so a panic inside `f` can be
 /// logged by name — it plays no role in dispatch itself.
+/// Core's `BroadcastTransaction` tail — mempool admission +
+/// unbroadcast/broadcast-pool marking + stem-hopped relay announce.
+/// Shared by `sendrawtransaction` (after its caller policy bounds) and
+/// `sendtoaddress`.
+fn admit_and_relay(
+    cs: &mut Chainstate,
+    mgr: &mut PeerManager<TcpStream>,
+    tx: Transaction,
+    bytes: Vec<u8>,
+) -> Result<Value, (i64, String)> {
+    let txid = tx.txid();
+    let wtxid = tx.wtxid();
+    if mgr.mempool_ref().entry(&txid).is_some() {
+        return Ok(json!(txid.to_string()));
+    }
+    let now = crate::time::time() as u32;
+    match mgr.mempool().accept_tx(tx, cs, now) {
+        Ok(_) => {
+            // Admitted — relay an inv to every tx-accepting
+            // peer (Core's RelayTransaction path), track it
+            // as unbroadcast until a peer's getdata
+            // acknowledges the announcement, and protect it
+            // in the broadcast pool so a fee-spike eviction
+            // can't make the operator's own tx vanish
+            // (Core issue #30471).
+            mgr.mempool().mark_unbroadcast(&txid);
+            mgr.mempool().mark_broadcast(txid, bytes, now);
+            // Origin privacy: locally submitted txs take a
+            // single stem hop before general announce —
+            // observers see us relay, not originate.
+            mgr.stem_announce(txid, wtxid);
+            Ok(json!(txid.to_string()))
+        }
+        Err(avila_mempool::MempoolReject::AlreadyKnown) => {
+            mgr.mempool().mark_unbroadcast(&txid);
+            mgr.mempool().mark_broadcast(txid, bytes, now);
+            Ok(json!(txid.to_string()))
+        }
+        // Consensus and input failures carry Core's
+        // state.Invalid reason strings via `reason()`;
+        // policy rejects already Display as Core strings.
+        Err(reject) => Err((
+            RPC_VERIFY_REJECTED,
+            match &reject {
+                avila_mempool::MempoolReject::Consensus(e) => e.reason().to_string(),
+                avila_mempool::MempoolReject::Inputs(e) => e.reason().into_owned(),
+                _ => reject.to_string(),
+            },
+        )),
+    }
+}
+
 fn chain_query_deferred(
     method: &str,
     queries: Option<&QuerySender>,
@@ -7486,7 +7538,6 @@ pub(crate) fn dispatch(
                     }
                 };
                 let txid = tx.txid();
-                let wtxid = tx.wtxid();
                 let pool = mgr.mempool_ref();
                 // Core's BroadcastTransaction: an already-pooled txid is
                 // a silent success — resubmitting is idempotent.
@@ -7532,41 +7583,7 @@ pub(crate) fn dispatch(
                             .into(),
                     ));
                 }
-                let now = crate::time::time() as u32;
-                match mgr.mempool().accept_tx(tx, cs, now) {
-                    Ok(_) => {
-                        // Admitted — relay an inv to every tx-accepting
-                        // peer (Core's RelayTransaction path), track it
-                        // as unbroadcast until a peer's getdata
-                        // acknowledges the announcement, and protect it
-                        // in the broadcast pool so a fee-spike eviction
-                        // can't make the operator's own tx vanish
-                        // (Core issue #30471).
-                        mgr.mempool().mark_unbroadcast(&txid);
-                        mgr.mempool().mark_broadcast(txid, bytes.clone(), now);
-                        // Origin privacy: locally submitted txs take a
-                        // single stem hop before general announce —
-                        // observers see us relay, not originate.
-                        mgr.stem_announce(txid, wtxid);
-                        Ok(json!(txid.to_string()))
-                    }
-                    Err(avila_mempool::MempoolReject::AlreadyKnown) => {
-                        mgr.mempool().mark_unbroadcast(&txid);
-                        mgr.mempool().mark_broadcast(txid, bytes.clone(), now);
-                        Ok(json!(txid.to_string()))
-                    }
-                    // Consensus and input failures carry Core's
-                    // state.Invalid reason strings via `reason()`;
-                    // policy rejects already Display as Core strings.
-                    Err(reject) => Err((
-                        RPC_VERIFY_REJECTED,
-                        match &reject {
-                            avila_mempool::MempoolReject::Consensus(e) => e.reason().to_string(),
-                            avila_mempool::MempoolReject::Inputs(e) => e.reason().into_owned(),
-                            _ => reject.to_string(),
-                        },
-                    )),
-                }
+                admit_and_relay(cs, mgr, tx, bytes)
             })
         }
         "submitpackage" => {
@@ -10429,6 +10446,74 @@ pub(crate) fn dispatch(
             })
         }
         // Core's `listdescriptors` — the imported descriptor table.
+        // Wallet address generation — the next index of the active
+        // external ranged descriptor (Core's next_index cursor).
+        "getnewaddress" => {
+            let wallet = wallet.cloned();
+            chain_query_deferred(method, queries, move |cs, _| {
+                let Some(wallet) = wallet else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    )));
+                };
+                let mut w = match wallet.lock() {
+                    Ok(w) => w,
+                    Err(_) => {
+                        return QueryReply::Now(Err((
+                            RPC_MISC_ERROR,
+                            "wallet lock poisoned".into(),
+                        )));
+                    }
+                };
+                // The external active ranged descriptor — the
+                // createdescriptorseed ext desc or an imported one.
+                let params = cs.tree().params();
+                let Some(idx) = w
+                    .descs
+                    .iter()
+                    .position(|d| d.active && !d.internal && d.range.1 >= d.range.0)
+                else {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        "no active external descriptor — import one or run createdescriptorseed"
+                            .into(),
+                    )));
+                };
+                let d = &w.descs[idx];
+                let pos = d.next_index;
+                if pos > d.range.1 {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        format!("descriptor range exhausted at {}", d.range.1),
+                    )));
+                }
+                let desc_text = d.desc.clone();
+                let (parsed, provider, _) = match parse_descriptors(&desc_text, params, true) {
+                    Ok(v) => v,
+                    Err(e) => return QueryReply::Now(Err((RPC_INVALID_ADDRESS_OR_KEY, e))),
+                };
+                let Some(scripts) = parsed[0].expand(pos, &provider) else {
+                    return QueryReply::Now(Err((RPC_WALLET_ERROR, "derivation failed".into())));
+                };
+                // The canonical output script for this descriptor
+                // (wpkh's expansion is one scriptPubKey).
+                let Some(addr) = scripts.iter().find_map(|s| {
+                    avila_consensus::address::script_address(
+                        &avila_consensus::transaction::Script::new(s.clone()),
+                        params,
+                    )
+                }) else {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        "no addressable script".into(),
+                    )));
+                };
+                w.descs[idx].next_index = pos + 1;
+                QueryReply::Now(Ok(json!(addr)))
+            })
+        }
+
         // Avila-specific (no Core equivalent): create a descriptor
         // seed — BIP32 master key from OS CSPRNG or caller-supplied
         // entropy (queue #35/#37). Installs the opt-in signer AND
@@ -10588,6 +10673,216 @@ pub(crate) fn dispatch(
                     "entropy_source": provenance,
                     "warning": "memory-only signer — restart clears key material; the xprv above is the only backup until the encrypted vault lands",
                 })))
+            })
+        }
+
+        // Opt-in spending (queue #35): construct, verify, sign, and
+        // broadcast a payment from the wallet's own coins — the whole
+        // path stays local; the tx takes the same stem hop as any
+        // local broadcast.
+        "sendtoaddress" => {
+            let address = param(params, 0, "address")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let amount_arg = param(params, 1, "amount").cloned();
+            let wallet = wallet.cloned();
+            chain_query_deferred(method, queries, move |cs, mgr| {
+                let Some(wallet) = wallet else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    )));
+                };
+                let (Some(address), Some(amount_arg)) = (address, amount_arg) else {
+                    return QueryReply::Now(Err((
+                        RPC_INVALID_PARAMETER,
+                        "sendtoaddress requires address and amount".into(),
+                    )));
+                };
+                let params = cs.tree().params();
+                let Some(dest) = avila_consensus::address::address_to_script(&address, params)
+                else {
+                    return QueryReply::Now(Err((
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        "Invalid Bitcoin address".into(),
+                    )));
+                };
+                let amount = match amount_from_value(&amount_arg) {
+                    Ok(a) if a > 0 => a,
+                    _ => {
+                        return QueryReply::Now(Err((
+                            RPC_INVALID_PARAMETER,
+                            "Invalid amount".into(),
+                        )));
+                    }
+                };
+                let mut w = match wallet.lock() {
+                    Ok(w) => w,
+                    Err(_) => {
+                        return QueryReply::Now(Err((
+                            RPC_MISC_ERROR,
+                            "wallet lock poisoned".into(),
+                        )));
+                    }
+                };
+                let Some(signer_descs) = w.signer().map(|s| s.descs_private.clone()) else {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        "wallet has no signing keys".into(),
+                    )));
+                };
+                let _ = signer_descs;
+                // Coin selection v1 (queue #38 owns the privacy-aware
+                // version): largest-first accumulation — honest and
+                // simple, and our txs already announce via stem.
+                w.advance(cs);
+                let feerate = mgr.mempool_ref().estimate_fee(6).unwrap_or(1000); // sat/kvB; 1 sat/vB floor
+                // p2wpkh in ≈68 vB, out ≈31 vB, overhead ≈11.
+                let mut chosen: Vec<(OutPoint, i64)> = Vec::new();
+                let mut coins: Vec<_> = w.unspent().map(|(op, c)| (op, c.value)).collect();
+                coins.sort_by_key(|c| std::cmp::Reverse(c.1));
+                // Overhead + dest + change — count the change output
+                // up front (Core's conservative estimate; overpays a
+                // hair when no change results).
+                let mut est_vsize = 11i64 + 62;
+                for (op, v) in coins {
+                    chosen.push((op, v));
+                    est_vsize += 68;
+                    let fee = (feerate * est_vsize) / 1000;
+                    let total: i64 = chosen.iter().map(|(_, v)| v).sum();
+                    if total >= amount + fee {
+                        break;
+                    }
+                }
+                let total: i64 = chosen.iter().map(|(_, v)| v).sum();
+                let fee = (feerate * est_vsize) / 1000;
+                if total < amount + fee {
+                    return QueryReply::Now(Err((RPC_WALLET_ERROR, "Insufficient funds".into())));
+                }
+                // Change above dust goes to the internal descriptor's
+                // next index (Core's change-addr convention).
+                let change_value = total - amount - fee;
+                let mut outputs = vec![TxOut {
+                    value: amount,
+                    script_pubkey: dest,
+                }];
+                if change_value > 546 {
+                    let Some(idx) = w
+                        .descs
+                        .iter()
+                        .position(|d| d.active && d.internal && d.range.1 >= d.range.0)
+                    else {
+                        return QueryReply::Now(Err((
+                            RPC_WALLET_ERROR,
+                            "no internal descriptor for change".into(),
+                        )));
+                    };
+                    let d = &w.descs[idx];
+                    let pos = d.next_index;
+                    let desc_text = d.desc.clone();
+                    let (parsed, provider, _) = match parse_descriptors(&desc_text, params, true) {
+                        Ok(v) => v,
+                        Err(e) => return QueryReply::Now(Err((RPC_INVALID_ADDRESS_OR_KEY, e))),
+                    };
+                    let Some(scripts) = parsed[0].expand(pos, &provider) else {
+                        return QueryReply::Now(Err((
+                            RPC_WALLET_ERROR,
+                            "change derivation failed".into(),
+                        )));
+                    };
+                    let Some(change_spk) = scripts
+                        .iter()
+                        .find(|s| s.len() == 22 && s[0] == 0x00 && s[1] == 0x14)
+                    else {
+                        return QueryReply::Now(Err((
+                            RPC_WALLET_ERROR,
+                            "no wpkh change script".into(),
+                        )));
+                    };
+                    outputs.push(TxOut {
+                        value: change_value,
+                        script_pubkey: Script::new(change_spk.clone()),
+                    });
+                    w.descs[idx].next_index = pos + 1;
+                }
+                // Fingerprint-matched to Core's wallet: version 2,
+                // RBF-signalling sequence, anti-fee-sniping locktime,
+                // random output ordering.
+                let inputs: Vec<TxIn> = chosen
+                    .iter()
+                    .map(|(op, _)| TxIn {
+                        previous_output: *op,
+                        script_sig: Script::new(Vec::new()),
+                        sequence: 0xffff_fffd,
+                        witness: Witness::default(),
+                    })
+                    .collect();
+                // BIP69-style ordering is NOT used — Core shuffles;
+                // match the dominant fingerprint (queue #38 measures).
+                let mut order: Vec<usize> = (0..outputs.len()).collect();
+                if outputs.len() == 2 {
+                    let mut b = [0u8; 1];
+                    let _ = getrandom::fill(&mut b);
+                    if b[0] & 1 == 1 {
+                        order.swap(0, 1);
+                    }
+                }
+                let outputs: Vec<TxOut> = order.iter().map(|&i| outputs[i].clone()).collect();
+                let tx = Transaction {
+                    version: 2,
+                    inputs,
+                    outputs,
+                    lock_time: cs.chain().len().saturating_sub(1) as u32,
+                };
+                // Sign: PSBT → verified prevouts → Creator::Real → finalize.
+                let mut psbt = avila_consensus::psbt::Psbt::from_unsigned_tx(tx);
+                let signer_provider = match w.signer() {
+                    Some(s) => s.provider.clone(),
+                    None => {
+                        return QueryReply::Now(Err((
+                            RPC_WALLET_ERROR,
+                            "wallet has no signing keys".into(),
+                        )));
+                    }
+                };
+                let (verified, unverified) =
+                    match avila_consensus::sign::verify_and_fill_prevouts(cs.utxo(), &mut psbt) {
+                        Ok(v) => v,
+                        Err(msg) => return QueryReply::Now(Err((RPC_VERIFY_ERROR, msg))),
+                    };
+                if unverified > 0 {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        format!("{unverified} input(s) not in the verified UTXO set"),
+                    )));
+                }
+                let _ = verified;
+                let txdata = avila_consensus::sign::precompute_psbt_data(&psbt);
+                let mut complete = true;
+                for i in 0..psbt.tx.inputs.len() {
+                    complete &= avila_consensus::sign::sign_psbt_input(
+                        &signer_provider,
+                        &mut psbt,
+                        i,
+                        Some(&txdata),
+                        1,
+                        false,
+                        None,
+                        true,
+                    );
+                }
+                if !complete {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        "signing incomplete — missing keys for some inputs".into(),
+                    )));
+                }
+                let Some(final_tx) = avila_consensus::sign::finalize_and_extract_psbt(&mut psbt)
+                else {
+                    return QueryReply::Now(Err((RPC_WALLET_ERROR, "finalization failed".into())));
+                };
+                let bytes = final_tx.encode();
+                QueryReply::Now(admit_and_relay(cs, mgr, final_tx, bytes))
             })
         }
 
@@ -13222,7 +13517,7 @@ mod tests {
         let (r, e) = snap_dispatch("getblockcount", &Value::Null, &snap);
         assert_eq!(r, json!(120));
         assert!(e.is_none());
-        let (_, e) = snap_dispatch("sendtoaddress", &Value::Null, &snap);
+        let (_, e) = snap_dispatch("bumpfee", &Value::Null, &snap);
         assert_eq!(e.unwrap().0, RPC_METHOD_NOT_FOUND);
         let (r, _) = snap_dispatch("uptime", &Value::Null, &snap);
         assert_eq!(r, json!(42));
