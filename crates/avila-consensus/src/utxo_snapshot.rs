@@ -333,9 +333,13 @@ pub(crate) fn decompress_amount(mut x: u64) -> u64 {
         x + 1
     };
     while e > 0 {
-        // Malicious input can drive the exponent past u64 — saturate
-        // (the caller's MAX_MONEY range-check rejects it downstream).
-        n = n.saturating_mul(10);
+        // Core's DecompressAmount does `n *= 10` on a `uint64_t`, and
+        // C++ unsigned overflow is defined wrap-around — match it
+        // exactly rather than saturating, so a hostile exponent wraps
+        // to the same value Core would compute bit-for-bit (the
+        // caller's MAX_MONEY range-check still rejects it downstream;
+        // this is only about matching *what* gets rejected/accepted).
+        n = n.wrapping_mul(10);
         e -= 1;
     }
     n
@@ -599,6 +603,22 @@ mod tests {
             let c = compress_amount(sats);
             assert_eq!(decompress_amount(c), sats, "roundtrip({sats}) via {c}");
         }
+    }
+
+    /// `DecompressAmount`'s exponent loop must wrap like Core's
+    /// `uint64_t n *= 10` (defined overflow), not saturate — a hostile
+    /// amount varint has to decode to the exact value Core computes,
+    /// even wildly out of `MAX_MONEY` range, so the downstream range
+    /// check rejects (or doesn't) the same inputs Core would.
+    #[test]
+    fn amount_decompress_wraps_like_core_not_saturates() {
+        // u64::MAX is a legal terminal `read_varint` value for an
+        // amount (bounded by `u64::MAX`, unlike `code`/`size_id`).
+        // Expected value computed independently, mirroring C++'s
+        // `n *= 10` mod-2^64 semantics.
+        assert_eq!(decompress_amount(u64::MAX), 2_049_638_230_412_174_624);
+        // A saturating implementation would clamp to u64::MAX instead.
+        assert_ne!(decompress_amount(u64::MAX), u64::MAX);
     }
 
     /// A 65-byte `0x04`-prefixed P2PK script whose X coordinate is
