@@ -4029,6 +4029,33 @@ fn tx_json(tx: &Transaction, params: &avila_consensus::params::Params, include_h
     out
 }
 
+/// `getblock` verbosity-3's per-input `vin[i]["prevout"]` (Core's
+/// `TxToUniv` with a non-null `txundo`) — `generated`/`height`/`value`/
+/// `scriptPubKey` describe the coin this input spent, from undo data.
+/// `undo.spent` lines up with `tx.inputs` in order and is empty for
+/// the coinbase, which is exactly why a length mismatch (the only
+/// case) is a no-op rather than a partial/misaligned attachment.
+fn attach_prevouts(
+    txj: &mut Value,
+    undo: &avila_consensus::connect::TxUndo,
+    params: &avila_consensus::params::Params,
+) {
+    let Some(vin) = txj["vin"].as_array_mut() else {
+        return;
+    };
+    if vin.len() != undo.spent.len() {
+        return;
+    }
+    for (v, coin) in vin.iter_mut().zip(&undo.spent) {
+        v["prevout"] = json!({
+            "generated": coin.coinbase,
+            "height": coin.height,
+            "value": value_from_amount(coin.out.value),
+            "scriptPubKey": script_pubkey_json(&coin.out.script_pubkey, params),
+        });
+    }
+}
+
 /// A pooled entry in Core's `getmempoolentry` shape — the admission
 /// facts plus computed ancestor/descendant package totals.
 fn entry_json(
@@ -5620,9 +5647,14 @@ pub(crate) fn dispatch(
                 Ok(h) => h,
                 Err(e) => return (Value::Null, Some(e)),
             };
+            // Core's ParseVerbosity + getblock: <=0 means hex, and any
+            // value at or past the max (3, once prevout is included)
+            // means the max — a clamp, not a rejection of anything
+            // outside {0,1,2}.
             let verbosity = param(params, 1, "verbosity")
-                .and_then(Value::as_u64)
-                .unwrap_or(1);
+                .and_then(Value::as_i64)
+                .unwrap_or(1)
+                .clamp(0, 3);
             chain_query(method, queries, move |cs, _| {
                 let Some(node) = cs.tree().get(&hash) else {
                     return Err((RPC_INVALID_ADDRESS_OR_KEY, "Block not found".into()));
@@ -5630,38 +5662,61 @@ pub(crate) fn dispatch(
                 let Some(block) = cs.body(&hash) else {
                     return Err((RPC_MISC_ERROR, "Block not available (pruned data)".into()));
                 };
-                match verbosity {
-                    0 => Ok(json!(hex::encode(&block.encode()))),
-                    1 | 2 => {
-                        let mut out = header_json(cs, node);
-                        out["nTx"] = json!(block.transactions.len());
-                        out["size"] = json!(block.size_with_witness());
-                        out["strippedsize"] = json!(block.size_without_witness());
-                        out["weight"] = json!(block.weight());
-                        out["tx"] = if verbosity == 1 {
-                            json!(
-                                block
-                                    .txids()
-                                    .iter()
-                                    .map(|t| t.to_string())
-                                    .collect::<Vec<_>>()
-                            )
-                        } else {
-                            json!(
-                                block
-                                    .transactions
-                                    .iter()
-                                    .map(|tx| tx_json(tx, cs.tree().params(), true))
-                                    .collect::<Vec<_>>()
-                            )
-                        };
-                        Ok(out)
-                    }
-                    _ => Err((
-                        RPC_INVALID_PARAMS,
-                        format!("unsupported verbosity {verbosity} — 0, 1 and 2 are implemented"),
-                    )),
+                if verbosity == 0 {
+                    return Ok(json!(hex::encode(&block.encode())));
                 }
+                let mut out = header_json(cs, node);
+                out["nTx"] = json!(block.transactions.len());
+                out["size"] = json!(block.size_with_witness());
+                out["strippedsize"] = json!(block.size_without_witness());
+                out["weight"] = json!(block.weight());
+                out["tx"] = if verbosity == 1 {
+                    json!(
+                        block
+                            .txids()
+                            .iter()
+                            .map(|t| t.to_string())
+                            .collect::<Vec<_>>()
+                    )
+                } else {
+                    // verbosity 2: full tx objects. verbosity 3
+                    // additionally attaches each input's prevout from
+                    // the block's undo data (Core's TxToUniv with a
+                    // non-null txundo). Undo missing for a block whose
+                    // body we do have is Core's own "expected but
+                    // can't be read" internal error, not a silent
+                    // downgrade to verbosity 2's shape.
+                    let undo = if verbosity >= 3 {
+                        match cs.undo(node.height) {
+                            Some(u) => Some(u),
+                            None => {
+                                return Err((
+                                    RPC_INTERNAL_ERROR,
+                                    "Undo data expected but can't be read. This could be due \
+                                     to disk corruption or a conflict with a pruning event."
+                                        .into(),
+                                ));
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    json!(
+                        block
+                            .transactions
+                            .iter()
+                            .enumerate()
+                            .map(|(i, tx)| {
+                                let mut txj = tx_json(tx, cs.tree().params(), true);
+                                if let Some(txundo) = undo.as_ref().and_then(|u| u.txs.get(i)) {
+                                    attach_prevouts(&mut txj, txundo, cs.tree().params());
+                                }
+                                txj
+                            })
+                            .collect::<Vec<_>>()
+                    )
+                };
+                Ok(out)
             })
         }
         // Core's getblockstats — per-block fee/size/UTXO aggregates.
@@ -6476,14 +6531,18 @@ pub(crate) fn dispatch(
                 Ok(t) => t,
                 Err(e) => return (Value::Null, Some(e)),
             };
-            // Core accepts verbosity as a bool or 0/1/2 int.
+            // Core accepts verbosity as a bool or int; ParseVerbosity's
+            // clamp is <=0 (or false) means hex, and anything at or
+            // past the max (2) means the max — not a rejection of
+            // values outside {0,1,2}.
             let verbosity = param(params, 1, "verbose")
                 .map(|v| {
-                    v.as_u64()
-                        .or_else(|| v.as_bool().map(u64::from))
+                    v.as_i64()
+                        .or_else(|| v.as_bool().map(i64::from))
                         .unwrap_or(0)
                 })
-                .unwrap_or(0);
+                .unwrap_or(0)
+                .clamp(0, 2);
             let block_hash = param(params, 2, "blockhash")
                 .and_then(Value::as_str)
                 .and_then(|s| s.parse::<BlockHash>().ok());
@@ -6539,37 +6598,34 @@ pub(crate) fn dispatch(
                             .into(),
                     ));
                 };
-                match verbosity {
-                    0 => Ok(json!(hex::encode(&tx.encode()))),
-                    1 | 2 => {
-                        let mut out = tx_json(&tx, cs.tree().params(), true);
-                        if let Some(bh) = in_block
-                            && let Some(node) = cs.tree().get(&bh)
-                        {
-                            out["blockhash"] = json!(bh.to_string());
-                            out["blocktime"] = json!(node.header.time);
-                            out["time"] = json!(node.header.time);
-                            // `in_active_chain` is emitted on the index
-                            // path only (Core's convention — a named
-                            // block is by definition where the caller
-                            // looked); confirmations count only for
-                            // active-chain blocks.
-                            let active = !via_index || cs.on_active_chain(&bh);
-                            if via_index {
-                                out["in_active_chain"] = json!(active);
-                            }
-                            if active {
-                                let tip = cs.tree().tip().height;
-                                out["confirmations"] = json!(i64::from(tip - node.height) + 1);
-                            }
-                        }
-                        Ok(out)
-                    }
-                    _ => Err((
-                        RPC_INVALID_PARAMS,
-                        format!("unsupported verbosity {verbosity} — 0, 1 and 2 are implemented"),
-                    )),
+                if verbosity == 0 {
+                    return Ok(json!(hex::encode(&tx.encode())));
                 }
+                // verbosity 1 and 2 share this shape today — Core's
+                // verbosity-2 fee/prevout addition isn't implemented
+                // here yet.
+                let mut out = tx_json(&tx, cs.tree().params(), true);
+                if let Some(bh) = in_block
+                    && let Some(node) = cs.tree().get(&bh)
+                {
+                    out["blockhash"] = json!(bh.to_string());
+                    out["blocktime"] = json!(node.header.time);
+                    out["time"] = json!(node.header.time);
+                    // `in_active_chain` is emitted on the index
+                    // path only (Core's convention — a named
+                    // block is by definition where the caller
+                    // looked); confirmations count only for
+                    // active-chain blocks.
+                    let active = !via_index || cs.on_active_chain(&bh);
+                    if via_index {
+                        out["in_active_chain"] = json!(active);
+                    }
+                    if active {
+                        let tip = cs.tree().tip().height;
+                        out["confirmations"] = json!(i64::from(tip - node.height) + 1);
+                    }
+                }
+                Ok(out)
             })
         }
         // Core's savemempool — writes mempool.dat under the chainstate
@@ -12120,7 +12176,7 @@ pub(crate) fn dispatch(
                      \x20 chain: getblockcount, getbestblockhash, getblockchaininfo, getchaintips,\n\
                      \x20   getdifficulty,\n\
                      \x20   getblockhash <height>, getblockheader <hash> [verbose],\n\
-                     \x20   getblock <hash> [verbosity 0-2], getblockstats <hash|height> [stats],\n\
+                     \x20   getblock <hash> [verbosity 0-3], getblockstats <hash|height> [stats],\n\
                      \x20   getdeploymentinfo [blockhash],\n\
                      \x20   getrawtransaction <txid> [verbosity] [blockhash],\n\
                      \x20   decoderawtransaction <hex> [iswitness], getindexinfo [index_name],\n\
@@ -13874,6 +13930,170 @@ mod tests {
             None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
+    }
+
+    /// `getblock` verbosity: Core clamps rather than rejects (<=0 is
+    /// hex, >=3 is the max), and verbosity 3 attaches per-input
+    /// prevout info from undo data — or Core's own "expected but
+    /// can't be read" error when this block has none (genesis, always).
+    #[test]
+    fn getblock_verbosity_clamps_and_attaches_prevouts_at_3() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let addr = "bcrt1q9mc2hc2f6x2lsxh7xnuu3fdjj628hvjatzgxcr";
+
+        let (r, e) = dispatch(
+            "getblockhash",
+            &json!([0]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        let genesis = r.as_str().unwrap().to_string();
+        // Genesis never has undo data (Chainstate::undo(0) is always
+        // None) — verbosity 3 there must surface Core's internal
+        // error, not silently fall back to verbosity 2's shape.
+        let (r, e) = dispatch(
+            "getblock",
+            &json!([genesis, 3]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(r.is_null());
+        assert_eq!(e.unwrap().0, RPC_INTERNAL_ERROR);
+
+        let (r, e) = dispatch(
+            "generatetoaddress",
+            &json!([1, addr]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        let block_hash = r.as_array().unwrap()[0].as_str().unwrap().to_string();
+
+        // A verbosity far past the max clamps to 3 rather than -32602.
+        let (r, e) = dispatch(
+            "getblock",
+            &json!([block_hash, 99]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        let vin0 = &r["tx"][0]["vin"][0];
+        assert!(vin0.get("coinbase").is_some(), "{vin0}");
+        // The coinbase's undo entry has no spent coins — no prevout
+        // to attach, and none must be fabricated.
+        assert!(vin0.get("prevout").is_none(), "{vin0}");
+
+        // A negative verbosity clamps to 0 (hex) exactly like 0 does.
+        let (hex_neg, e) = dispatch(
+            "getblock",
+            &json!([block_hash, -5]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        let (hex_zero, _) = dispatch(
+            "getblock",
+            &json!([block_hash, 0]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(hex_neg, hex_zero);
+    }
+
+    /// `getrawtransaction` verbosity clamps the same way (<=0 hex,
+    /// >=2 the max) instead of rejecting anything outside {0,1,2}.
+    #[test]
+    fn getrawtransaction_verbosity_clamps_instead_of_rejecting() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let addr = "bcrt1q9mc2hc2f6x2lsxh7xnuu3fdjj628hvjatzgxcr";
+
+        let (r, e) = dispatch(
+            "generatetoaddress",
+            &json!([1, addr]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        let block_hash = r.as_array().unwrap()[0].as_str().unwrap().to_string();
+        let (r, e) = dispatch(
+            "getblock",
+            &json!([block_hash, 1]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        let txid = r["tx"][0].as_str().unwrap().to_string();
+
+        let (r, e) = dispatch(
+            "getrawtransaction",
+            &json!([txid, 99, block_hash]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["txid"], txid);
+
+        let (hex_neg, e) = dispatch(
+            "getrawtransaction",
+            &json!([txid, -3, block_hash]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        let (hex_zero, _) = dispatch(
+            "getrawtransaction",
+            &json!([txid, 0, block_hash]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(hex_neg, hex_zero);
     }
 
     /// `decoderawtransaction` — the regtest genesis coinbase decodes
