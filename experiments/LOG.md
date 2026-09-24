@@ -25,6 +25,7 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 | 16 | 09-23 | Crash fault-injection on hash engine | Commit ordering survives torn writes | **2 findings, both fixed** | torn records decoded to wrong-but-valid coins (silent corruption) → +4B keyed record tag, tears now misses; coins-ahead-of-tip tear invisible → index-header watermark, open errors loudly. File-level sim; compact() still unsafe | [fault-inject](2026-09-23-fault-injection.md) |
 
 
+| 50 | 09-24 | Dual-engine lockstep (fixture) | Do redb and hashstore diverge on identical commit streams? | **no — 300 rounds identical** | Same mixed create/delete stream committed to both engines; sampled `get` parity after every commit + full `iter_coins` equality at the end. Production live-shadow plumbing stays open; the fixture proves the engines are behaviorally equivalent. | — |
 | 49 | 09-24 | Self-fuzzing canary | Do mutated blocks ever misdecode silently? | **no — 4000 mutants clean** | `mutated_blocks_never_misdecode`: seeded xorshift mutates a real block (bit flips, truncations, extensions, splices); every surviving decode must re-encode byte-identical. The standing red-team harness inside the decoder. | — |
 | 48 | 09-24 | Selfish-stem relay + first-spy sim | Does a 1-hop stem on own-txs hide origin? | **adopted — 5× reduction** | `stem_announce`: own txs inv one random outbound peer, fluff after 2-15s randomized delay; no stempool (dodges the DoS that killed BIP156), zero protocol change. Sim (`tools/firstspy_sim.py`, 300-node graph, 15% spies, 4k runs): first-spy names origin 68.9%→14.4% — residual ≈ spy density. | experiments/2026-09-24-selfish-stem.md |
 | 47 | 09-24 | Transport hardening triplet | Can cheap defenses close documented leaks? | **adopted ×3** | Non-deterministic inbound eviction (Springer evict-and-fill needs steerable picks — now uniform-random among unprotected); V2 decoy injection (~1-in-4 sends carry random-length IGNORE packets, spec-legal, receivers drop silently — fuzzes the length histogram the 2025 analysis classified commands from); recon-diff telemetry (per-peer rounds+misses in getpeerinfo — persistently-wide diff = censorship signal). | — |
@@ -250,7 +251,7 @@ first measurement that would kill or confirm it.
     false positives. Kill: pinning is indistinguishable from
     legitimate high-descendant usage — the signal isn't separable.
 
-24. **Continuous dual-engine lockstep.** We already have two coins
+24. **Continuous dual-engine lockstep.** (fixture-scale proven — #50; live-shadow plumbing open) We already have two coins
     engines (redb + hashstore) — run both permanently on live traffic,
     divergence = halt. Continuous consensus-equivalence as a running
     property. Kill: second-engine overhead impractical at steady state
