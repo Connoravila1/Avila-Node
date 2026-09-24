@@ -2,7 +2,8 @@
 //! hand so they carry the palette exactly, focus ring included.
 
 use crate::model::work_zeros;
-use crate::theme::{self, Palette, font, mono};
+use crate::theme::{self, Palette, Skin, font, mono};
+use crate::xp;
 use eframe::egui::{
     self, Color32, CornerRadius, CursorIcon, Mesh, Painter, Pos2, Rect, Response, RichText, Sense,
     Shape, Stroke, StrokeKind, TextFormat, Ui, Vec2, pos2, text::LayoutJob, vec2,
@@ -24,6 +25,10 @@ pub fn label(ui: &mut Ui, text: &str) -> Response {
 
 /// A section heading with an optional note beside it, over a hairline.
 pub fn section(ui: &mut Ui, title: &str, note: Option<&str>) {
+    if Skin::current() == Skin::Xp {
+        xp::group_header(ui, title, note);
+        return;
+    }
     let pal = Palette::of(ui.ctx());
     ui.horizontal(|ui| {
         ui.label(
@@ -102,6 +107,9 @@ pub enum Kind {
 }
 
 pub fn button(ui: &mut Ui, text: &str, kind: Kind) -> Response {
+    if Skin::current() == Skin::Xp {
+        return xp::push_button(ui, text, kind == Kind::Primary);
+    }
     let pal = Palette::of(ui.ctx());
     let galley = ui.painter().layout_no_wrap(
         text.to_owned(),
@@ -150,6 +158,9 @@ pub fn button(ui: &mut Ui, text: &str, kind: Kind) -> Response {
 
 /// A row of mutually exclusive choices. Returns whether it changed.
 pub fn segmented<T: Copy + PartialEq>(ui: &mut Ui, value: &mut T, options: &[(T, &str)]) -> bool {
+    if Skin::current() == Skin::Xp {
+        return xp::radios(ui, value, options);
+    }
     let pal = Palette::of(ui.ctx());
     let f = font(theme::MEDIUM, 13.0);
     let galleys: Vec<_> = options
@@ -200,6 +211,15 @@ pub fn segmented<T: Copy + PartialEq>(ui: &mut Ui, value: &mut T, options: &[(T,
         focus_ring(ui, &resp, rect, pal.round.saturating_add(1));
     }
     changed
+}
+
+/// A check box. XP draws its own; elsewhere egui's, in the palette.
+pub fn checkbox(ui: &mut Ui, value: &mut bool, text: &str) -> Response {
+    if Skin::current() == Skin::Xp {
+        xp::checkbox(ui, value, text)
+    } else {
+        ui.checkbox(value, text)
+    }
 }
 
 fn focus_ring(ui: &Ui, resp: &Response, rect: Rect, radius: u8) {
@@ -426,7 +446,12 @@ pub fn table_header(
     let fixed: f32 = cols.iter().filter_map(|c| c.width).sum();
     let flex = cols.iter().filter(|c| c.width.is_none()).count().max(1) as f32;
     let spare = ((width - fixed) / flex).max(0.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 28.0), Sense::hover());
+    let xp = Skin::current() == Skin::Xp;
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(width, if xp { 24.0 } else { 28.0 }), Sense::hover());
+    if xp {
+        xp::list_header(ui.painter(), rect);
+    }
     let mut x = rect.left();
     let mut ranges = Vec::with_capacity(cols.len());
     let mut clicked = None;
@@ -442,11 +467,14 @@ pub fn table_header(
             clicked = Some(i);
         }
         let on = sorted.filter(|(col, _)| *col == i);
-        let color = if on.is_some() || resp.hovered() {
+        let color = if xp || on.is_some() || resp.hovered() {
             pal.text
         } else {
             pal.muted
         };
+        if xp {
+            xp::list_column(ui.painter(), whole, on.is_some(), resp.hovered());
+        }
         let galley = fit(
             ui.painter(),
             c.title.to_owned(),
@@ -482,11 +510,13 @@ pub fn table_header(
         }
         ranges.push(cell);
     }
-    ui.painter().hline(
-        rect.x_range(),
-        rect.bottom() - 0.5,
-        Stroke::new(1.0, pal.hairline),
-    );
+    if !xp {
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 0.5,
+            Stroke::new(1.0, pal.hairline),
+        );
+    }
     (ranges, clicked)
 }
 
@@ -495,6 +525,10 @@ pub fn table_header(
 pub fn table_row(ui: &mut Ui, height: f32, selected: bool) -> (Rect, Response) {
     let pal = Palette::of(ui.ctx());
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
+    if Skin::current() == Skin::Xp {
+        xp::list_row(ui.painter(), rect, selected, resp.hovered());
+        return (rect, resp.on_hover_cursor(CursorIcon::PointingHand));
+    }
     if selected {
         ui.painter().rect_filled(rect, 0, pal.well);
         ui.painter().vline(

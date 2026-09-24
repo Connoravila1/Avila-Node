@@ -134,7 +134,7 @@ pub fn show(
 }
 
 /// Each page's glyph, drawn rather than borrowed from an icon font.
-fn icon(p: &Painter, page: Page, c: Pos2, fg: Color32, bg: Color32) {
+pub fn icon(p: &Painter, page: Page, c: Pos2, fg: Color32, bg: Color32) {
     let s = Stroke::new(1.6, fg);
     match page {
         // The ribbon in miniature.

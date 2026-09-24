@@ -33,7 +33,8 @@ fn privacy(ui: &mut Ui, s: &Scene, prefs: &mut Prefs) {
     grid(ui, "privacy", |ui| {
         key(ui, s, "Peer addresses");
         ui.vertical(|ui| {
-            ui.checkbox(
+            widgets::checkbox(
+                ui,
                 &mut prefs.hide_addresses,
                 "Hide them everywhere (Ctrl+Shift+H)",
             );
@@ -126,7 +127,11 @@ fn starting(ui: &mut Ui, s: &Scene, run: &mut RunSettings, node: &Node, open_adv
 
         key(ui, s, "Chainstate");
         ui.vertical(|ui| {
-            ui.checkbox(&mut run.store, "Keep it on disk, so the next start resumes");
+            widgets::checkbox(
+                ui,
+                &mut run.store,
+                "Keep it on disk, so the next start resumes",
+            );
             ui.label(
                 RichText::new(node.config().network_data_dir().display().to_string())
                     .font(mono(12.0))
@@ -150,14 +155,17 @@ fn starting(ui: &mut Ui, s: &Scene, run: &mut RunSettings, node: &Node, open_adv
         ui.end_row();
     });
     ui.add_space(10.0);
-    egui::CollapsingHeader::new(
+    let mut header = egui::CollapsingHeader::new(
         RichText::new("Advanced")
             .font(crate::theme::font(crate::theme::MEDIUM, 14.0))
             .color(s.pal.text),
     )
     .id_salt("advanced")
-    .open(open_advanced.then_some(true))
-    .show(ui, |ui| advanced(ui, s, run));
+    .open(open_advanced.then_some(true));
+    if crate::theme::Skin::current() == crate::theme::Skin::Xp {
+        header = header.icon(crate::xp::expander);
+    }
+    header.show(ui, |ui| advanced(ui, s, run));
     for problem in run.problems() {
         ui.label(RichText::new(problem).size(13.0).color(s.pal.alert));
     }
@@ -170,7 +178,7 @@ fn advanced(ui: &mut Ui, s: &Scene, run: &mut RunSettings) {
         key(ui, s, "Incoming connections");
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
-                ui.checkbox(&mut run.listen, "Accept them on port");
+                widgets::checkbox(ui, &mut run.listen, "Accept them on port");
                 field(ui, &mut run.listen_port, "8333", 80.0);
             });
             help(
@@ -211,18 +219,21 @@ fn advanced(ui: &mut Ui, s: &Scene, run: &mut RunSettings) {
 
         key(ui, s, "Indexes");
         ui.vertical(|ui| {
-            ui.checkbox(&mut run.txindex, "Transaction index");
+            widgets::checkbox(ui, &mut run.txindex, "Transaction index");
             help(ui, s, "Look up any transaction by its id, not only your own.");
-            ui.checkbox(&mut run.blockfilterindex, "Block filter index (BIP 158)");
+            widgets::checkbox(ui, &mut run.blockfilterindex, "Block filter index (BIP 158)");
             help(
                 ui,
                 s,
                 "Compact filters that let wallets find their transactions without revealing their addresses.",
             );
-            ui.add_enabled(
-                run.blockfilterindex,
-                egui::Checkbox::new(&mut run.peerblockfilters, "Serve filters to peers (BIP 157)"),
-            );
+            ui.add_enabled_ui(run.blockfilterindex, |ui| {
+                widgets::checkbox(
+                    ui,
+                    &mut run.peerblockfilters,
+                    "Serve filters to peers (BIP 157)",
+                );
+            });
             if !run.blockfilterindex {
                 run.peerblockfilters = false;
             }
@@ -258,7 +269,7 @@ fn appearance(ui: &mut Ui, s: &Scene, prefs: &mut Prefs) {
         ui.end_row();
         key(ui, s, "Toybox");
         ui.vertical(|ui| {
-            ui.checkbox(&mut prefs.toybox, "Show it in the sidebar");
+            widgets::checkbox(ui, &mut prefs.toybox, "Show it in the sidebar");
             help(
                 ui,
                 s,

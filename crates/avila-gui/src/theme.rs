@@ -24,6 +24,9 @@ pub const TITLE: &str = "title";
 pub const MEDIUM: &str = "medium";
 pub const STRONG: &str = "strong";
 pub const MONO_MEDIUM: &str = "mono-medium";
+/// The XP skin's title bars and its start button.
+pub const CAPTION: &str = "caption";
+pub const START: &str = "start";
 
 /// Every surface and text color, resolved for one appearance.
 #[derive(Clone, Copy, Debug)]
@@ -107,18 +110,18 @@ impl Palette {
         hearts: false,
     };
 
-    /// Toybox: beige windows, a blue bar down the side, a green start
-    /// button, and a progress bar made of chunks. Proven is green here.
+    /// Toybox: Windows XP. White folder panes in beige chrome, a green
+    /// progress bar made of chunks. Proven is green here.
     pub const XP: Self = Self {
         dark: false,
-        canvas: Color32::from_rgb(236, 233, 216),
+        canvas: Color32::from_rgb(255, 255, 255),
         raised: Color32::from_rgb(255, 255, 255),
-        well: Color32::from_rgb(214, 211, 196),
-        hairline: Color32::from_rgb(172, 168, 153),
-        text: Color32::from_rgb(12, 12, 12),
-        muted: Color32::from_rgb(78, 78, 78),
-        faint: Color32::from_rgb(138, 136, 126),
-        signal: Color32::from_rgb(54, 169, 54),
+        well: Color32::from_rgb(241, 239, 228),
+        hairline: Color32::from_rgb(208, 205, 190),
+        text: Color32::from_rgb(0, 0, 0),
+        muted: Color32::from_rgb(88, 88, 88),
+        faint: Color32::from_rgb(150, 148, 138),
+        signal: Color32::from_rgb(50, 172, 50),
         signal_text: Color32::from_rgb(22, 116, 22),
         alert: Color32::from_rgb(196, 0, 0),
         rail: Color32::from_rgb(36, 94, 219),
@@ -126,8 +129,8 @@ impl Palette {
         rail_active: Color32::from_rgb(19, 62, 168),
         rail_active_ink: Color32::from_rgb(255, 255, 255),
         primary: Color32::from_rgb(60, 154, 60),
-        on_primary: Color32::from_rgb(255, 255, 255),
-        round: 4,
+        on_primary: Color32::from_rgb(0, 0, 0),
+        round: 3,
         chunky: true,
         hearts: false,
     };
@@ -192,11 +195,7 @@ static SKIN: AtomicU8 = AtomicU8::new(0);
 impl Skin {
     #[must_use]
     pub fn current() -> Self {
-        match SKIN.load(Ordering::Relaxed) {
-            1 => Self::Xp,
-            2 => Self::Julia,
-            _ => Self::Standard,
-        }
+        Self::from_code(SKIN.load(Ordering::Relaxed))
     }
 
     fn code(self) -> u8 {
@@ -206,11 +205,21 @@ impl Skin {
             Self::Julia => 2,
         }
     }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Xp,
+            2 => Self::Julia,
+            _ => Self::Standard,
+        }
+    }
 }
 
-/// Puts `skin` in force, re-installing egui's own visuals to match.
+/// Puts `skin` in force, re-installing egui's own visuals to match (and,
+/// going in or out of XP, the fonts).
 pub fn set_skin(ctx: &egui::Context, skin: Skin) {
-    if SKIN.swap(skin.code(), Ordering::Relaxed) == skin.code() {
+    let was = Skin::from_code(SKIN.swap(skin.code(), Ordering::Relaxed));
+    if was == skin {
         return;
     }
     let pal = match skin {
@@ -218,13 +227,31 @@ pub fn set_skin(ctx: &egui::Context, skin: Skin) {
         Skin::Julia => Some(Palette::JULIA),
         Skin::Standard => None,
     };
+    let xp = skin == Skin::Xp;
     for theme in [Theme::Light, Theme::Dark] {
         let base = match (pal, theme) {
             (Some(p), _) => p,
             (None, Theme::Dark) => Palette::DARK,
             (None, Theme::Light) => Palette::LIGHT,
         };
-        ctx.set_visuals_of(theme, visuals(&base));
+        let mut v = visuals(&base);
+        if xp {
+            xp_visuals(&mut v);
+        }
+        ctx.set_visuals_of(theme, v);
+        ctx.style_mut_of(theme, |style| {
+            style.spacing.scroll = if xp {
+                egui::style::ScrollStyle {
+                    foreground_color: false,
+                    ..egui::style::ScrollStyle::solid()
+                }
+            } else {
+                egui::style::ScrollStyle::floating()
+            };
+        });
+    }
+    if (was == Skin::Xp) != xp {
+        install_fonts(ctx, xp);
     }
 }
 
@@ -247,7 +274,11 @@ pub fn mono(size: f32) -> FontId {
 /// Jost (display, titles — the wordmark's geometry), Instrument Sans
 /// (interface text) and IBM Plex Mono (hashes, heights, bytes). egui's
 /// bundled fonts stay behind each as fallback for symbols.
-pub fn install_fonts(ctx: &egui::Context) {
+///
+/// The XP skin puts XP's own faces first when the system has them:
+/// Tahoma (or Verdana, its wider sibling) and Trebuchet MS for titles.
+/// None of them ship with the node; without them the bundled faces serve.
+pub fn install_fonts(ctx: &egui::Context, xp: bool) {
     let mut fonts = FontDefinitions::default();
     let faces: [(&str, &'static [u8]); 7] = [
         (
@@ -284,6 +315,10 @@ pub fn install_fonts(ctx: &egui::Context) {
             .font_data
             .insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
     }
+    let borrowed: &[(&str, Arc<FontData>)] = if xp { xp_faces() } else { &[] };
+    for (name, data) in borrowed {
+        fonts.font_data.insert((*name).to_owned(), data.clone());
+    }
     let proportional_fallback = fonts
         .families
         .get(&FontFamily::Proportional)
@@ -294,34 +329,159 @@ pub fn install_fonts(ctx: &egui::Context) {
         .get(&FontFamily::Monospace)
         .cloned()
         .unwrap_or_default();
-    let chain = |first: &str, rest: &[String]| {
-        let mut v = vec![first.to_owned()];
+    // A family's faces: XP's first when it's on and they were found.
+    let chain = |xp_faces: &[&str], own: &str, rest: &[String]| {
+        let mut v: Vec<String> = xp_faces
+            .iter()
+            .filter(|f| borrowed.iter().any(|(n, _)| n == *f))
+            .map(|f| (*f).to_owned())
+            .take(1)
+            .collect();
+        v.push(own.to_owned());
         v.extend(rest.iter().cloned());
         v
     };
     fonts.families.insert(
         FontFamily::Proportional,
-        chain("instrument-regular", &proportional_fallback),
+        chain(&["xp-ui"], "instrument-regular", &proportional_fallback),
     );
-    fonts
-        .families
-        .insert(FontFamily::Monospace, chain("plex-mono", &mono_fallback));
-    for (family, face) in [
-        (DISPLAY, "jost-light"),
-        (TITLE, "jost-regular"),
-        (MEDIUM, "instrument-medium"),
-        (STRONG, "instrument-semibold"),
+    fonts.families.insert(
+        FontFamily::Monospace,
+        chain(&[], "plex-mono", &mono_fallback),
+    );
+    for (family, xp_face, face) in [
+        (DISPLAY, &["xp-display"][..], "jost-light"),
+        (TITLE, &["xp-caption"][..], "jost-regular"),
+        (MEDIUM, &["xp-ui"][..], "instrument-medium"),
+        (STRONG, &["xp-bold"][..], "instrument-semibold"),
+        (CAPTION, &["xp-caption"][..], "instrument-semibold"),
+        (
+            START,
+            &["xp-start", "xp-caption"][..],
+            "instrument-semibold",
+        ),
     ] {
+        // Without Trebuchet, XP's big type falls back to the interface
+        // face rather than Jost's geometry.
+        let own = if xp && (family == DISPLAY || family == TITLE) {
+            "instrument-semibold"
+        } else {
+            face
+        };
         fonts.families.insert(
             FontFamily::Name(family.into()),
-            chain(face, &proportional_fallback),
+            chain(xp_face, own, &proportional_fallback),
         );
     }
     fonts.families.insert(
         FontFamily::Name(MONO_MEDIUM.into()),
-        chain("plex-mono-medium", &mono_fallback),
+        chain(&[], "plex-mono-medium", &mono_fallback),
     );
     ctx.set_fonts(fonts);
+}
+
+/// XP's faces found on this system, looked up once.
+fn xp_faces() -> &'static [(&'static str, Arc<FontData>)] {
+    static FACES: std::sync::OnceLock<Vec<(&'static str, Arc<FontData>)>> =
+        std::sync::OnceLock::new();
+    FACES.get_or_init(|| {
+        // Each role, and the files (then fontconfig families) that fill
+        // it, best first.
+        type Choices = &'static [(&'static [&'static str], &'static str)];
+        let roles: [(&str, Choices); 5] = [
+            (
+                "xp-ui",
+                &[
+                    (&["tahoma.ttf", "Tahoma.ttf"], "Tahoma"),
+                    (&["verdana.ttf", "Verdana.ttf"], "Verdana"),
+                    (&["DejaVuSans.ttf"], "DejaVu Sans"),
+                ],
+            ),
+            (
+                "xp-bold",
+                &[
+                    (&["tahomabd.ttf", "Tahoma Bold.ttf"], "Tahoma:bold"),
+                    (
+                        &["verdanab.ttf", "Verdana_Bold.ttf", "Verdana Bold.ttf"],
+                        "Verdana:bold",
+                    ),
+                    (&["DejaVuSans-Bold.ttf"], "DejaVu Sans:bold"),
+                ],
+            ),
+            (
+                "xp-caption",
+                &[(
+                    &[
+                        "trebucbd.ttf",
+                        "Trebuchet_MS_Bold.ttf",
+                        "Trebuchet MS Bold.ttf",
+                    ],
+                    "Trebuchet MS:bold",
+                )],
+            ),
+            (
+                "xp-display",
+                &[(
+                    &["trebuc.ttf", "Trebuchet_MS.ttf", "Trebuchet MS.ttf"],
+                    "Trebuchet MS",
+                )],
+            ),
+            (
+                "xp-start",
+                &[(
+                    &[
+                        "trebucbi.ttf",
+                        "Trebuchet_MS_Bold_Italic.ttf",
+                        "Trebuchet MS Bold Italic.ttf",
+                    ],
+                    "Trebuchet MS:bold:italic",
+                )],
+            ),
+        ];
+        roles
+            .iter()
+            .filter_map(|(role, options)| {
+                options.iter().find_map(|(files, pattern)| {
+                    system_font(files, pattern)
+                        .map(|bytes| (*role, Arc::new(FontData::from_owned(bytes))))
+                })
+            })
+            .collect()
+    })
+}
+
+/// A font file from the usual places, else from fontconfig — but only if
+/// it really is the family asked for, not fontconfig's nearest stand-in.
+fn system_font(files: &[&str], pattern: &str) -> Option<Vec<u8>> {
+    const DIRS: [&str; 8] = [
+        "/usr/share/fonts/truetype/msttcorefonts",
+        "/usr/share/fonts/truetype/dejavu",
+        "/usr/share/fonts/TTF",
+        "/usr/share/fonts/dejavu",
+        "/usr/share/fonts/microsoft",
+        "C:\\Windows\\Fonts",
+        "/Library/Fonts",
+        "/System/Library/Fonts/Supplemental",
+    ];
+    let found = DIRS
+        .iter()
+        .flat_map(|dir| files.iter().map(move |f| std::path::Path::new(dir).join(f)))
+        .find_map(|path| std::fs::read(path).ok());
+    if found.is_some() || cfg!(test) {
+        return found;
+    }
+    let out = std::process::Command::new("fc-match")
+        .args(["--format=%{family}\n%{file}", pattern])
+        .output()
+        .ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let (family, file) = text.split_once('\n')?;
+    let wanted = pattern.split(':').next()?;
+    family
+        .split(',')
+        .any(|f| f.trim().eq_ignore_ascii_case(wanted))
+        .then(|| std::fs::read(file.trim()).ok())
+        .flatten()
 }
 
 /// Installs both appearances into egui's own visuals, so native widgets
@@ -393,4 +553,58 @@ fn visuals(pal: &Palette) -> Visuals {
     }
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, pal.text);
     v
+}
+
+/// egui's own widgets in XP's clothes: white menus whose items light up
+/// blue with white text, fields edged in blue-gray, blue scroll thumbs.
+/// (Check boxes and choices are painted in `xp` itself.)
+fn xp_visuals(v: &mut Visuals) {
+    let select = Color32::from_rgb(49, 106, 197);
+    let edge = Color32::from_rgb(127, 157, 185);
+    let black = Stroke::new(1.0, Color32::BLACK);
+    let white = Stroke::new(1.0, Color32::WHITE);
+    v.override_text_color = None;
+    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(172, 168, 153));
+    v.window_corner_radius = CornerRadius::ZERO;
+    v.menu_corner_radius = CornerRadius::ZERO;
+    v.popup_shadow = egui::Shadow {
+        offset: [3, 3],
+        blur: 4,
+        spread: 0,
+        color: Color32::from_black_alpha(70),
+    };
+    v.selection.bg_fill = Color32::from_rgb(187, 206, 238);
+    v.selection.stroke = Stroke::new(1.0, select);
+    let w = &mut v.widgets;
+    w.noninteractive.fg_stroke = black;
+    for (state, fill, weak, stroke, fg) in [
+        (
+            &mut w.inactive,
+            Color32::from_rgb(193, 211, 251),
+            Color32::from_rgb(244, 243, 238),
+            Stroke::new(1.0, edge),
+            black,
+        ),
+        (
+            &mut w.hovered,
+            Color32::from_rgb(214, 227, 254),
+            select,
+            Stroke::new(1.0, edge),
+            white,
+        ),
+        (
+            &mut w.active,
+            Color32::from_rgb(166, 190, 244),
+            Color32::from_rgb(38, 88, 176),
+            Stroke::new(1.0, select),
+            white,
+        ),
+        (&mut w.open, select, select, Stroke::new(1.0, select), white),
+    ] {
+        state.bg_fill = fill;
+        state.weak_bg_fill = weak;
+        state.bg_stroke = stroke;
+        state.fg_stroke = fg;
+        state.corner_radius = CornerRadius::same(2);
+    }
 }

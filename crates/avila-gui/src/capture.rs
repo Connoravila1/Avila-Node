@@ -6,13 +6,33 @@
 use crate::rail::Page;
 use crate::ribbon::Scale;
 use crate::theme::Skin;
-use eframe::egui::{self, ColorImage, Context, Event, Theme, UserData, ViewportCommand};
+use eframe::egui::{
+    self, ColorImage, Context, Event, PointerButton, RawInput, Theme, UserData, ViewportCommand,
+};
 use std::path::PathBuf;
 
 /// Frames to let layout, fonts and textures settle before each shot.
 const SETTLE: u32 = 14;
 /// Frames of a game playing itself before its shot.
 const PLAY_SETTLE: u32 = 300;
+/// A pose's pointer steps start this many frames in, one every `STEP`.
+const STEP_START: u32 = 4;
+const STEP: u32 = 3;
+
+/// A pointer step, in points: move there, and click if asked.
+pub type Step = (f32, f32, bool);
+
+/// What's open on the XP skin's desktop.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Desk {
+    #[default]
+    Window,
+    StartMenu,
+    /// The window restored, over the wallpaper.
+    Restored,
+    TurnOff,
+    About,
+}
 
 /// How the app should be posed for one shot.
 #[derive(Clone, Copy, Debug)]
@@ -35,6 +55,9 @@ pub struct Pose {
     pub skin: Skin,
     /// Let the game play itself for a while.
     pub play: bool,
+    pub desk: Desk,
+    /// Pointer steps to play once posed: open a menu, hover an item.
+    pub pointer: &'static [Step],
 }
 
 #[derive(Clone, Copy)]
@@ -53,6 +76,21 @@ pub struct Capture {
     requested: bool,
     /// Whether the current shot has been posed yet.
     posed: bool,
+    /// Frames since it was.
+    posed_frames: u32,
+}
+
+fn file_name(shot: &Shot) -> String {
+    format!(
+        "{}-{}{}.png",
+        if shot.theme == Theme::Dark {
+            "dark"
+        } else {
+            "light"
+        },
+        shot.pose.page.label().to_lowercase(),
+        shot.name,
+    )
 }
 
 impl Capture {
@@ -75,6 +113,8 @@ impl Capture {
             advanced: false,
             skin: Skin::Standard,
             play: false,
+            desk: Desk::Window,
+            pointer: &[],
         };
         let mut shots = Vec::new();
         for theme in [Theme::Light, Theme::Dark] {
@@ -94,6 +134,10 @@ impl Capture {
         let picked = Pose {
             select_peer: true,
             ..pose(Page::Peers)
+        };
+        let xp = |page| Pose {
+            skin: Skin::Xp,
+            ..pose(page)
         };
         for (theme, pose, size, name) in [
             (Theme::Light, by_work(Page::Overview), FULL, "-work"),
@@ -224,6 +268,91 @@ impl Capture {
             ),
             (Theme::Dark, pose(Page::Overview), SMALL, "-small"),
             (Theme::Light, pose(Page::Peers), SMALL, "-small"),
+            (Theme::Light, xp(Page::Chain), FULL, "-xp"),
+            (
+                Theme::Light,
+                Pose {
+                    select_peer: true,
+                    ..xp(Page::Peers)
+                },
+                FULL,
+                "-xp",
+            ),
+            (Theme::Light, xp(Page::Activity), FULL, "-xp"),
+            (
+                Theme::Light,
+                Pose {
+                    scroll: 600.0,
+                    ..xp(Page::Peers)
+                },
+                FULL,
+                "-xp-table",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    advanced: true,
+                    ..xp(Page::Settings)
+                },
+                FULL,
+                "-xp",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    desk: Desk::StartMenu,
+                    ..xp(Page::Overview)
+                },
+                FULL,
+                "-xp-start",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    desk: Desk::Restored,
+                    ..xp(Page::Chain)
+                },
+                FULL,
+                "-xp-desktop",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    eclipse: true,
+                    ..xp(Page::Overview)
+                },
+                FULL,
+                "-xp-eclipse",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    desk: Desk::TurnOff,
+                    ..xp(Page::Overview)
+                },
+                FULL,
+                "-xp-turnoff",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    desk: Desk::About,
+                    ..xp(Page::Peers)
+                },
+                FULL,
+                "-xp-about",
+            ),
+            (Theme::Light, xp(Page::Overview), SMALL, "-xp-small"),
+            (
+                Theme::Light,
+                Pose {
+                    // Open View, then point at its second item.
+                    pointer: &[(66.0, 41.0, true), (110.0, 88.0, false)],
+                    ..xp(Page::Chain)
+                },
+                FULL,
+                "-xp-menu",
+            ),
         ] {
             shots.push(Shot {
                 theme,
@@ -232,6 +361,10 @@ impl Capture {
                 name,
             });
         }
+        // `AVILA_GUI_CAPTURE_ONLY=xp` takes just the shots so named.
+        if let Ok(only) = std::env::var("AVILA_GUI_CAPTURE_ONLY") {
+            shots.retain(|shot| file_name(shot).contains(&only));
+        }
         Some(Self {
             dir,
             shots,
@@ -239,7 +372,41 @@ impl Capture {
             wait: SETTLE,
             requested: false,
             posed: false,
+            posed_frames: 0,
         })
+    }
+
+    /// Plays the current shot's pointer steps into egui's input, before
+    /// the frame runs.
+    pub fn feed(&mut self, raw: &mut RawInput) {
+        let frame = self.posed_frames;
+        self.posed_frames = self.posed_frames.saturating_add(1);
+        let Some(shot) = self.shots.get(self.next) else {
+            return;
+        };
+        let Some(k) = frame.checked_sub(STEP_START) else {
+            return;
+        };
+        let Some(&(x, y, click)) = shot.pose.pointer.get((k / STEP) as usize) else {
+            return;
+        };
+        let pos = egui::pos2(x, y);
+        let button = |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        match k % STEP {
+            0 => {
+                raw.events.push(Event::PointerMoved(pos));
+                if click {
+                    raw.events.push(button(true));
+                }
+            }
+            1 if click => raw.events.push(button(false)),
+            _ => {}
+        }
     }
 
     /// Runs at the top of every frame: saves a shot that arrived, says how
@@ -255,16 +422,7 @@ impl Capture {
         if let (Some(image), Some(shot)) = (arrived, self.shots.get(self.next).copied())
             && self.requested
         {
-            let name = format!(
-                "{}-{}{}.png",
-                if shot.theme == Theme::Dark {
-                    "dark"
-                } else {
-                    "light"
-                },
-                shot.pose.page.label().to_lowercase(),
-                shot.name,
-            );
+            let name = file_name(&shot);
             if let Err(e) = std::fs::write(self.dir.join(&name), png(&image)) {
                 eprintln!("capture: couldn't write {name}: {e}");
             }
@@ -278,7 +436,13 @@ impl Capture {
         };
         if !self.posed {
             self.posed = true;
-            self.wait = if shot.pose.play { PLAY_SETTLE } else { SETTLE };
+            self.posed_frames = 0;
+            let steps = STEP_START + STEP * shot.pose.pointer.len() as u32 + 30;
+            self.wait = if shot.pose.play {
+                PLAY_SETTLE
+            } else {
+                SETTLE.max(steps)
+            };
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(
                 shot.size[0],
                 shot.size[1],

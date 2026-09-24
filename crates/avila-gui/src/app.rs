@@ -9,10 +9,10 @@ use crate::prefs::{Prefs, ThemeChoice};
 use crate::rail::{self, Page};
 use crate::ribbon::View;
 use crate::session::{ActivityKind, Phase, RunSettings, Session};
-use crate::theme::{self, Palette, font};
+use crate::theme::{self, Palette, Skin, font};
 use crate::toybox;
 use crate::widgets::{self, Kind, hatch};
-use crate::{brand, model};
+use crate::{brand, model, xp};
 use avila_node::Node;
 use avila_node::events::NodeEvent;
 use eframe::egui::{
@@ -41,6 +41,20 @@ pub struct App {
     game: toybox::Game,
     /// The preferences last put in force; any change re-applies them.
     applied: Prefs,
+    /// The Windows XP skin's desktop.
+    xp: xp::Xp,
+    /// Pages visited, and pages gone back from, for XP's Back and
+    /// Forward; `seen` is the page as of the last frame.
+    history: Vec<Page>,
+    ahead: Vec<Page>,
+    seen: Page,
+    /// Start the node again once it has stopped.
+    restart: bool,
+    /// Whether the system draws the window's frame (not under XP, which
+    /// draws its own); `None` until first asked.
+    decorated: Option<bool>,
+    /// Save preferences on exit (not for captures or one-run skins).
+    keep_prefs: bool,
 }
 
 impl App {
@@ -51,12 +65,27 @@ impl App {
         theme_override: Option<ThemeChoice>,
     ) -> Self {
         let ctx = &cc.egui_ctx;
-        theme::install_fonts(ctx);
+        theme::install_fonts(ctx, false);
         theme::install_style(ctx);
         let mut prefs = Prefs::load(cc.storage);
         if let Some(choice) = theme_override {
             prefs.theme = choice;
         }
+        // `AVILA_GUI_SKIN=xp` (or `julia`) wears a toybox skin for this
+        // run only, for development.
+        let skin = std::env::var("AVILA_GUI_SKIN")
+            .ok()
+            .map(|s| match s.as_str() {
+                "xp" => Skin::Xp,
+                "julia" => Skin::Julia,
+                _ => Skin::Standard,
+            });
+        if let Some(skin) = skin {
+            prefs.toybox = true;
+            prefs.skin = skin;
+        }
+        let capture = Capture::from_env();
+        let keep_prefs = capture.is_none() && skin.is_none();
         prefs.apply(ctx);
         let network = node.config().get().network;
         let run = RunSettings::new(network);
@@ -90,7 +119,8 @@ impl App {
             prefs,
             filter: None,
             swirl: brand::swirl_texture(ctx),
-            capture: Capture::from_env(),
+            capture,
+            keep_prefs,
             bench: Bench::from_env(),
             autostart,
             selected_peer: None,
@@ -99,6 +129,12 @@ impl App {
             ribbon_view: View::default(),
             game: toybox::Game::default(),
             applied: prefs,
+            xp: xp::Xp::default(),
+            history: Vec::new(),
+            ahead: Vec::new(),
+            seen: Page::default(),
+            restart: false,
+            decorated: None,
         }
     }
 
@@ -118,6 +154,127 @@ impl App {
     fn start(&mut self) {
         let data_dir = self.node.config().network_data_dir();
         self.session.start(self.network(), data_dir, &self.run);
+    }
+
+    /// The current page inside its margins; either layout wraps it.
+    fn page_body(
+        &mut self,
+        ui: &mut Ui,
+        pal: Palette,
+        network: avila_core::Network,
+        open_advanced: bool,
+        margin: Margin,
+    ) -> Option<Action> {
+        let mut action = None;
+        Frame::new().inner_margin(margin).show(ui, |ui| {
+            let scene = Scene {
+                pal,
+                session: &self.session,
+                network,
+                swirl: self.swirl.as_ref(),
+            };
+            action = match self.page {
+                Page::Overview => pages::overview::show(ui, &scene, &mut self.prefs.scale),
+                Page::Chain => pages::chain::show(
+                    ui,
+                    &scene,
+                    &mut self.prefs.scale,
+                    &mut self.ribbon_view,
+                    &mut self.prefs.rhythm_clock,
+                ),
+                Page::Peers => pages::peers::show(
+                    ui,
+                    &scene,
+                    &mut self.selected_peer,
+                    &mut self.sky,
+                    &mut self.peer_sort,
+                    self.prefs.hide_addresses,
+                ),
+                Page::Activity => {
+                    pages::activity::show(ui, &scene, &mut self.filter, self.prefs.hide_addresses)
+                }
+                Page::Toybox => {
+                    toybox::show(ui, &scene, &mut self.game, &mut self.prefs);
+                    None
+                }
+                Page::Settings => pages::settings::show(
+                    ui,
+                    &scene,
+                    &mut self.run,
+                    &mut self.prefs,
+                    &self.node,
+                    open_advanced,
+                ),
+            };
+        });
+        action
+    }
+
+    /// The pages on offer: the toybox joins while it's on.
+    fn pages(&self) -> Vec<Page> {
+        let mut pages = Page::ALL.to_vec();
+        if self.prefs.toybox {
+            pages.insert(pages.len() - 1, Page::Toybox);
+        }
+        pages
+    }
+
+    /// What the XP skin's chrome shows of the node this frame.
+    fn xp_chrome(&self, ctx: &egui::Context, phase: Phase) -> xp::Chrome {
+        let network = network_name(self.shown_network());
+        let view = self.session.view.as_ref();
+        let peers = view.map(|v| v.established().count());
+        let mut details = vec![
+            "Avila Node".to_owned(),
+            format!("{network}, {}", phase.label().to_lowercase()),
+        ];
+        let mut panels = vec![phase.label().to_owned()];
+        if let Some(v) = view {
+            let n = peers.unwrap_or(0);
+            let lines = [
+                format!("Block {}", model::thousands(v.connected.into())),
+                format!("{n} peer{}", if n == 1 { "" } else { "s" }),
+                format!("Up {}", model::span(v.uptime_secs)),
+            ];
+            details.extend(lines.iter().cloned());
+            panels.extend(lines);
+        }
+        panels.push(network.to_owned());
+        xp::Chrome {
+            title: format!("{} - Avila Node", self.page.label()),
+            page: self.page,
+            pages: self.pages(),
+            swirl: self.swirl.clone(),
+            running: self.session.running(),
+            busy: phase == Phase::Stopping,
+            hide: self.prefs.hide_addresses,
+            back: !self.history.is_empty(),
+            forward: !self.ahead.is_empty(),
+            signs: view.map(|v| v.eclipse.clone()).unwrap_or_default(),
+            peers: peers.filter(|_| self.session.running()),
+            demo: self.session.demo,
+            path: format!("Avila Node\\{network}\\{}", self.page.label()),
+            details,
+            panels,
+            // Captures keep the active look, whatever has the focus.
+            focused: self.capture.is_some() || ctx.input(|i| i.viewport().focused.unwrap_or(true)),
+        }
+    }
+
+    fn go_back(&mut self) {
+        if let Some(page) = self.history.pop() {
+            self.ahead.push(self.page);
+            self.page = page;
+            self.seen = page;
+        }
+    }
+
+    fn go_forward(&mut self) {
+        if let Some(page) = self.ahead.pop() {
+            self.history.push(self.page);
+            self.page = page;
+            self.seen = page;
+        }
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -250,6 +407,10 @@ impl eframe::App for App {
             self.start();
         }
         self.session.poll();
+        if self.restart && !self.session.running() && self.session.phase() != Phase::Stopping {
+            self.restart = false;
+            self.start();
+        }
         if let Some(page) = self
             .bench
             .as_mut()
@@ -272,8 +433,15 @@ impl eframe::App for App {
             {
                 v.eclipse = vec![crate::model::Eclipse::DiversityCollapse];
             }
-            self.prefs.toybox |= pose.page == Page::Toybox || pose.skin != theme::Skin::Standard;
+            self.prefs.toybox |= pose.page == Page::Toybox || pose.skin != Skin::Standard;
             self.prefs.skin = pose.skin;
+            self.xp.start_open = pose.desk == crate::capture::Desk::StartMenu;
+            self.xp.restored = pose.desk == crate::capture::Desk::Restored;
+            self.xp.dialog = match pose.desk {
+                crate::capture::Desk::TurnOff => xp::Dialog::TurnOff,
+                crate::capture::Desk::About => xp::Dialog::About,
+                _ => xp::Dialog::None,
+            };
             if pose.play && !self.game.animating() {
                 self.game.demo();
             }
@@ -294,106 +462,109 @@ impl eframe::App for App {
         let network = self.shown_network();
         let mut action = None;
 
-        egui::Panel::left("rail")
-            .exact_size(rail::WIDTH)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(Frame::new().fill(pal.rail))
-            .show(ui, |ui| {
-                rail::show(
-                    ui,
-                    &mut self.page,
-                    self.swirl.as_ref(),
-                    network_name(network),
-                    phase.live(),
-                    self.prefs.toybox,
-                );
-            });
-        egui::Panel::top("status")
-            .exact_size(68.0)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(Frame::new().fill(pal.canvas).inner_margin(Margin {
-                left: 30,
-                right: 30,
-                top: 0,
-                bottom: 0,
-            }))
-            .show(ui, |ui| {
-                action = self.status_line(ui, pal, phase);
-            });
-        egui::CentralPanel::default()
-            .frame(Frame::new().fill(pal.canvas))
-            .show(ui, |ui| {
-                let top = ui.max_rect();
-                ui.painter().hline(
-                    top.x_range(),
-                    top.top() + 0.5,
-                    Stroke::new(1.0, pal.hairline),
-                );
-                let mut scroll = ScrollArea::vertical().auto_shrink([false, false]);
-                if let Some(y) = pose_scroll {
-                    scroll = scroll.vertical_scroll_offset(y);
-                }
-                scroll.show(ui, |ui| {
-                    Frame::new()
-                        .inner_margin(Margin {
-                            left: 32,
-                            right: 32,
-                            top: 26,
-                            bottom: 40,
-                        })
-                        .show(ui, |ui| {
-                            let scene = Scene {
-                                pal,
-                                session: &self.session,
-                                network,
-                                swirl: self.swirl.as_ref(),
-                            };
-                            let page_action = match self.page {
-                                Page::Overview => {
-                                    pages::overview::show(ui, &scene, &mut self.prefs.scale)
-                                }
-                                Page::Chain => pages::chain::show(
-                                    ui,
-                                    &scene,
-                                    &mut self.prefs.scale,
-                                    &mut self.ribbon_view,
-                                    &mut self.prefs.rhythm_clock,
-                                ),
-                                Page::Peers => pages::peers::show(
-                                    ui,
-                                    &scene,
-                                    &mut self.selected_peer,
-                                    &mut self.sky,
-                                    &mut self.peer_sort,
-                                    self.prefs.hide_addresses,
-                                ),
-                                Page::Activity => pages::activity::show(
-                                    ui,
-                                    &scene,
-                                    &mut self.filter,
-                                    self.prefs.hide_addresses,
-                                ),
-                                Page::Toybox => {
-                                    toybox::show(ui, &scene, &mut self.game, &mut self.prefs);
-                                    None
-                                }
-                                Page::Settings => pages::settings::show(
-                                    ui,
-                                    &scene,
-                                    &mut self.run,
-                                    &mut self.prefs,
-                                    &self.node,
-                                    open_advanced,
-                                ),
-                            };
-                            if page_action.is_some() {
-                                action = page_action;
-                            }
-                        });
+        if Skin::current() == Skin::Xp {
+            let chrome = self.xp_chrome(&ctx, phase);
+            let mut desk = std::mem::take(&mut self.xp);
+            let mut pick = None;
+            let mut page_action = None;
+            egui::CentralPanel::default()
+                .frame(Frame::NONE)
+                .show(ui, |ui| {
+                    pick = xp::desktop(ui, &mut desk, &chrome, pose_scroll, |ui| {
+                        page_action = self.page_body(
+                            ui,
+                            pal,
+                            network,
+                            open_advanced,
+                            Margin {
+                                left: 26,
+                                right: 22,
+                                top: 18,
+                                bottom: 30,
+                            },
+                        );
+                    });
                 });
-            });
+            self.xp = desk;
+            action = page_action;
+            match pick {
+                Some(xp::Pick::Open(page)) => action = Some(Action::Open(page)),
+                Some(xp::Pick::Back) => self.go_back(),
+                Some(xp::Pick::Forward) => self.go_forward(),
+                Some(xp::Pick::ToggleHide) => {
+                    self.prefs.hide_addresses = !self.prefs.hide_addresses;
+                }
+                Some(xp::Pick::LogOff) => self.prefs.skin = Skin::Standard,
+                Some(xp::Pick::StartNode) => action = Some(Action::Start),
+                Some(xp::Pick::StopNode) => action = Some(Action::Stop),
+                Some(xp::Pick::RestartNode) if self.session.running() => {
+                    self.restart = true;
+                    action = Some(Action::Stop);
+                }
+                Some(xp::Pick::RestartNode) => action = Some(Action::Start),
+                None => {}
+            }
+        } else {
+            egui::Panel::left("rail")
+                .exact_size(rail::WIDTH)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(Frame::new().fill(pal.rail))
+                .show(ui, |ui| {
+                    rail::show(
+                        ui,
+                        &mut self.page,
+                        self.swirl.as_ref(),
+                        network_name(network),
+                        phase.live(),
+                        self.prefs.toybox,
+                    );
+                });
+            egui::Panel::top("status")
+                .exact_size(68.0)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(Frame::new().fill(pal.canvas).inner_margin(Margin {
+                    left: 30,
+                    right: 30,
+                    top: 0,
+                    bottom: 0,
+                }))
+                .show(ui, |ui| {
+                    action = self.status_line(ui, pal, phase);
+                });
+            egui::CentralPanel::default()
+                .frame(Frame::new().fill(pal.canvas))
+                .show(ui, |ui| {
+                    let top = ui.max_rect();
+                    ui.painter().hline(
+                        top.x_range(),
+                        top.top() + 0.5,
+                        Stroke::new(1.0, pal.hairline),
+                    );
+                    let mut scroll = ScrollArea::vertical().auto_shrink([false, false]);
+                    if let Some(y) = pose_scroll {
+                        scroll = scroll.vertical_scroll_offset(y);
+                    }
+                    scroll.show(ui, |ui| {
+                        let page_action = self.page_body(
+                            ui,
+                            pal,
+                            network,
+                            open_advanced,
+                            Margin {
+                                left: 32,
+                                right: 32,
+                                top: 26,
+                                bottom: 40,
+                            },
+                        );
+                        if page_action.is_some() {
+                            action = page_action;
+                        }
+                    });
+                });
+        }
 
         match action {
             Some(Action::Start) => self.start(),
@@ -409,6 +580,20 @@ impl eframe::App for App {
         }
         if self.page == Page::Toybox && !self.prefs.toybox {
             self.page = Page::Settings;
+        }
+        if self.page != self.seen {
+            self.history.push(self.seen);
+            if self.history.len() > 32 {
+                self.history.remove(0);
+            }
+            self.ahead.clear();
+            self.seen = self.page;
+        }
+        // XP draws its own title bar, so the system's goes while it's on.
+        let framed = Skin::current() != Skin::Xp;
+        if self.decorated != Some(framed) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(framed));
+            self.decorated = Some(framed);
         }
         // Smooth frames only while the new-block pulse runs; otherwise
         // just often enough for "seconds ago" to tick over.
@@ -436,9 +621,16 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        // A capture run poses the app; it mustn't overwrite real choices.
-        if self.capture.is_none() {
+        // A capture run poses the app, and a skin from the environment is
+        // for one run; neither may overwrite real choices.
+        if self.keep_prefs {
             self.prefs.save(storage);
+        }
+    }
+
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(capture) = &mut self.capture {
+            capture.feed(raw_input);
         }
     }
 

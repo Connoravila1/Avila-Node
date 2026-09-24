@@ -15,6 +15,7 @@ mod session;
 mod theme;
 mod toybox;
 mod widgets;
+mod xp;
 
 use std::error::Error;
 use std::path::PathBuf;
