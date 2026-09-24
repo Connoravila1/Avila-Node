@@ -376,6 +376,10 @@ pub struct PeerManager<S> {
     stem_pending: Vec<(avila_consensus::hash::Txid, avila_consensus::hash::Wtxid, Instant)>,
     /// Whether locally-submitted txs take the stem path — default on.
     stem_relay: bool,
+    /// Named event ring (queue #33): every NetEvent the tick produces
+    /// also lands here, capped — the operator-facing "what is the node
+    /// doing" stream that Core #34901 asked for.
+    event_ring: std::collections::VecDeque<NetEvent>,
     /// Erebus mitigation (queue #21): when loaded, outbound dialing
     /// deprioritizes candidates whose ASN already holds ≥2 outbound
     /// slots — a single transit network can't fill the peer set.
@@ -480,6 +484,7 @@ impl<S: Read + Write> PeerManager<S> {
             stem_pending: Vec::new(),
             stem_relay: true,
             asmap: crate::asmap::AsMap::empty(),
+            event_ring: std::collections::VecDeque::with_capacity(1025),
             bans: crate::banman::BanList::new(),
             banlist_path: None,
             dial_tx: dial_channel.0,
@@ -914,7 +919,18 @@ impl<S: Read + Write> PeerManager<S> {
         self.recon_pass();
         self.rebroadcast_pass(cs, now);
         self.stem_fluff_pass();
+        for e in &events {
+            if self.event_ring.len() >= 1024 {
+                self.event_ring.pop_front();
+            }
+            self.event_ring.push_back(e.clone());
+        }
         events
+    }
+
+    /// The bounded event ring — newest `NetEvent`s first.
+    pub fn recent_events(&self) -> &std::collections::VecDeque<NetEvent> {
+        &self.event_ring
     }
 
     /// Announces a locally submitted transaction via a single stem

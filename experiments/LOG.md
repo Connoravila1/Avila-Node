@@ -25,6 +25,7 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 | 16 | 09-23 | Crash fault-injection on hash engine | Commit ordering survives torn writes | **2 findings, both fixed** | torn records decoded to wrong-but-valid coins (silent corruption) → +4B keyed record tag, tears now misses; coins-ahead-of-tip tear invisible → index-header watermark, open errors loudly. File-level sim; compact() still unsafe | [fault-inject](2026-09-23-fault-injection.md) |
 
 
+| 52 | 09-24 | Named observability surface | Can the node stream "what it's doing" natively? | **adopted (ring-level)** | `getevents` RPC over a capped 1024-entry `NetEvent` ring in the manager — connects, disconnects, tip advances, announcements, newest first. The `chain_query` channel carries it; mempool/consensus event classes extend it next. ASMap bucketing machinery also landed (#21): ASN-aware outbound dial deprioritization, kartograf-format parsing open. | — |
 | 51 | 09-24 | Mempool analytics (block projection) | Can the node answer "next N blocks" natively? | **adopted** | `block_projection` sorts the pool by modified feerate into ~1MvB virtual blocks; `getmempoolblocks` RPC returns per-band min/median/max feerate + fees — the mempool.space query without the stack. Package-aware ordering (full template machinery per chunk) noted as the refinement. | — |
 | 50 | 09-24 | Dual-engine lockstep (fixture) | Do redb and hashstore diverge on identical commit streams? | **no — 300 rounds identical** | Same mixed create/delete stream committed to both engines; sampled `get` parity after every commit + full `iter_coins` equality at the end. Production live-shadow plumbing stays open; the fixture proves the engines are behaviorally equivalent. | — |
 | 49 | 09-24 | Self-fuzzing canary | Do mutated blocks ever misdecode silently? | **no — 4000 mutants clean** | `mutated_blocks_never_misdecode`: seeded xorshift mutates a real block (bit flips, truncations, extensions, splices); every surviving decode must re-encode byte-identical. The standing red-team harness inside the decoder. | — |
@@ -204,7 +205,7 @@ first measurement that would kill or confirm it.
     (82-97% linkage accuracy) exploits predictable eviction; randomize
     it. Small, bounded.
 
-21. **ASMap bucketing.** Core's deployed Erebus countermeasure —
+21. **ASMap bucketing.** (machinery shipped — #52; kartograf-format map loading open) Core's deployed Erebus countermeasure —
     bucket peers by ASN (Kartograf-reproducible maps) instead of /16.
     A parity gap; well-specified, bounded.
 

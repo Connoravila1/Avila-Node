@@ -4566,6 +4566,11 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
     ),
     ("getmempoolinfo", &[], GETMEMPOOLINFO_HELP),
     (
+        "getevents",
+        &[("count", Some("number"), false)],
+        "getevents ( count )\n\nReturns the node's recent event stream — connections, disconnects, tip advances, announcements — newest first.\n\nArguments:\n1. count  (number, optional, default=100, max=1024)\n\nResult:\n[ { \"event\": \"connected|disconnected|tip_advanced|announced\", ... }, ... ]\n",
+    ),
+    (
         "getmempoolblocks",
         &[("nblocks", Some("number"), false)],
         "getmempoolblocks ( nblocks )\n\nProjects the mempool into virtual blocks by modified-feerate order — the mempool.space 'next blocks' view, native.\n\nArguments:\n1. nblocks  (number, optional, default=8, max=64) How many projected blocks to return.\n\nResult:\n[ { \"block\": n, \"txs\": n, \"vsize\": n, \"totalfee\": btc, \"minfeerate\": btc/kvB, \"medianfeerate\": btc/kvB, \"maxfeerate\": btc/kvB }, ... ]\n",
@@ -6921,6 +6926,41 @@ pub(crate) fn dispatch(
                         "maxfeerate": value_from_amount(b.max_feerate),
                     }))
                     .collect::<Vec<_>>()))
+            })
+        }
+        "getevents" => {
+            let n = param(params, 0, "count")
+                .and_then(Value::as_u64)
+                .map_or(100, |v| v.min(1024) as usize);
+            chain_query(method, queries, move |_, mgr| {
+                let events: Vec<Value> = mgr
+                    .recent_events()
+                    .iter()
+                    .rev()
+                    .take(n)
+                    .map(|e| match e {
+                        avila_p2p::manager::NetEvent::Connected { peer, info } => json!({
+                            "event": "connected",
+                            "peer": peer,
+                            "subver": info.user_agent,
+                        }),
+                        avila_p2p::manager::NetEvent::Disconnected { peer, reason } => json!({
+                            "event": "disconnected",
+                            "peer": peer,
+                            "reason": format!("{reason:?}"),
+                        }),
+                        avila_p2p::manager::NetEvent::TipAdvanced(h) => json!({
+                            "event": "tip_advanced",
+                            "height": h,
+                        }),
+                        avila_p2p::manager::NetEvent::Announced { peer, missing } => json!({
+                            "event": "announced",
+                            "peer": peer,
+                            "missing": missing.len(),
+                        }),
+                    })
+                    .collect();
+                Ok(json!(events))
             })
         }
         "getchaintips" => chain_query(method, queries, |cs, _| {
