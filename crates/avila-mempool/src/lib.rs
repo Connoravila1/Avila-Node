@@ -201,6 +201,11 @@ pub const MAX_DISCONNECTED_TX_POOL_BYTES: usize = 20 * 4_000_000;
 /// Core's `ORPHAN_TX_EXPIRE_TIME` — orphans live at most 20 minutes.
 pub const ORPHAN_EXPIRE_SECS: u32 = 20 * 60;
 
+/// Core's `DEFAULT_MEMPOOL_EXPIRY_HOURS` (336h = 14 days) in seconds —
+/// a pooled entry older than this is swept regardless of fee, taking
+/// its descendants with it.
+pub const DEFAULT_MEMPOOL_EXPIRY_SECS: u32 = 336 * 60 * 60;
+
 /// One admission gate's outcome in a policy explanation.
 #[derive(Clone, Debug)]
 pub struct PolicyStep {
@@ -349,6 +354,9 @@ pub struct Mempool {
     /// Core's `blockSinceLastRollingFeeBump` — decay is paused (the raw
     /// `rolling_min_fee` applies unchanged) until a block connects.
     block_since_rolling_fee_bump: bool,
+    /// Core's `-mempoolexpiry` in seconds — a pooled entry older than
+    /// this is swept regardless of fee.
+    mempool_expiry_secs: u32,
     /// Confirmation observations from connected blocks.
     estimator: FeeEstimator,
     /// `prioritisetransaction` accumulations by txid — Core's
@@ -387,6 +395,7 @@ impl Mempool {
             rolling_min_fee: 0.0,
             last_rolling_fee_update: 0,
             block_since_rolling_fee_bump: false,
+            mempool_expiry_secs: DEFAULT_MEMPOOL_EXPIRY_SECS,
             estimator: FeeEstimator::new(),
             deltas: HashMap::new(),
             unbroadcast: HashSet::new(),
@@ -508,6 +517,17 @@ impl Mempool {
         } else {
             (rate.round() as i64).max(INCREMENTAL_RELAY_FEE)
         }
+    }
+
+    /// The pooled-entry expiry age in seconds — Core's `-mempoolexpiry`.
+    #[must_use]
+    pub fn mempool_expiry_secs(&self) -> u32 {
+        self.mempool_expiry_secs
+    }
+
+    /// Overrides the expiry age — an operator knob.
+    pub fn set_mempool_expiry_secs(&mut self, secs: u32) {
+        self.mempool_expiry_secs = secs;
     }
 
     /// Overrides the entry cap — an operator knob.
@@ -1127,6 +1147,13 @@ impl Mempool {
         cs: &avila_consensus::chainstate::Chainstate,
         now: u32,
     ) -> Result<Txid, MempoolReject> {
+        // 0. Sweep anything that's aged out (Core's `CTxMemPool::Expire`,
+        //    normally run from a periodic scheduled task or a reorg;
+        //    driven off admission here instead since this crate has no
+        //    scheduler of its own). Cheap relative to admission itself
+        //    and bounded by the entry cap.
+        self.expire(now);
+
         // 1. Context-free consensus (Core's CheckTransaction).
         check_transaction(&tx)?;
         if tx.is_coinbase() {
@@ -1850,6 +1877,32 @@ impl Mempool {
             }
         }
         self.remove(txid);
+    }
+
+    /// Core's `CTxMemPool::Expire`: drops every entry that has sat
+    /// unconfirmed for at least [`Self::mempool_expiry_secs`], taking
+    /// its descendants with it — Core walks its time-sorted index only
+    /// to the first not-yet-expired entry and expands each expired root
+    /// to its descendants; the effect (and, since a descendant can't be
+    /// older than its parent, the exact set) is the same whether or not
+    /// an expired descendant is reached again once its own ancestor's
+    /// removal has already swept it. Returns the number of entries
+    /// removed.
+    pub fn expire(&mut self, now: u32) -> usize {
+        let cutoff = now.saturating_sub(self.mempool_expiry_secs);
+        let stale: Vec<Txid> = self
+            .map
+            .iter()
+            .filter(|(_, e)| e.time < cutoff)
+            .map(|(id, _)| *id)
+            .collect();
+        let before = self.map.len();
+        for id in &stale {
+            if self.map.contains_key(id) {
+                self.remove_recursive(id);
+            }
+        }
+        before - self.map.len()
     }
 
     /// `remove_recursive` for a transaction that is not itself pooled —
@@ -2814,6 +2867,43 @@ mod tests {
         let much_later = NOW + 30 * 24 * 60 * 60;
         assert_eq!(pool.min_mempool_fee(much_later), 0);
         assert!(pool.accept_tx(mid, &cs, much_later).is_ok());
+    }
+
+    #[test]
+    fn expire_sweeps_stale_entries_and_their_descendants() {
+        // Core's `CTxMemPool::Expire`: an entry older than
+        // `DEFAULT_MEMPOOL_EXPIRY_SECS` (14 days) is dropped regardless
+        // of fee, taking its descendants — even a *fresh* one — with it.
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let parent_id = parent.txid();
+        pool.accept_tx(parent, &cs, NOW).unwrap(); // pooled at time NOW
+
+        let child = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            4_998_000_000,
+            SEQ_FINAL,
+        );
+        let child_id = child.txid();
+        let later = NOW + 60; // the child arrives a minute after its parent
+        pool.accept_tx(child, &cs, later).unwrap();
+        assert_eq!(pool.len(), 2);
+
+        // Neither has aged out yet.
+        assert_eq!(pool.expire(later), 0);
+        assert_eq!(pool.len(), 2);
+
+        // Past the *parent's* 14-day expiry — the child alone is still
+        // under the limit (pooled 60s later), but leaves anyway via the
+        // parent's removal cascade.
+        let expired_at = NOW + DEFAULT_MEMPOOL_EXPIRY_SECS + 1;
+        assert_eq!(pool.expire(expired_at), 2);
+        assert!(pool.get(&parent_id).is_none());
+        assert!(pool.get(&child_id).is_none());
     }
 
     #[test]
