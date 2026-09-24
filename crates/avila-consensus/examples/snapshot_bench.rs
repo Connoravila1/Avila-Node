@@ -137,6 +137,7 @@ fn measure(
     );
 }
 
+const FLUSH_EVERY: u64 = 16_000_000; // knob: batch granularity
 fn main() {
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_else(|| "synthetic".into());
@@ -217,6 +218,144 @@ fn main() {
             println!("gen: {written} coins -> {path}");
             return;
         }
+        // `decode <path>` — stream-decode only: isolates wire format +
+        // decompression cost from backend insert cost.
+        "decode" => {
+            let path = args.next().unwrap_or_else(|| "/tmp/mainnet-utxo.dat".into());
+            base_height = args.next().map(|x| x.parse().unwrap()).unwrap_or(935_000);
+            let f = std::fs::File::open(&path).unwrap();
+            let mut r = std::io::BufReader::with_capacity(1 << 24, f);
+            let meta = read_metadata(&mut r, [0xf9, 0xbe, 0xb4, 0xd9])
+                .unwrap_or_else(|e| panic!("meta: {e}"));
+            let mut count = 0u64;
+            let mut bytes = 0u64;
+            read_coins(&mut r, meta.coins_count, base_height, |_, coin| {
+                bytes += coin.out.script_pubkey.as_bytes().len() as u64;
+                count += 1;
+            })
+            .unwrap_or_else(|e| panic!("read: {e}"));
+            let el = t.elapsed();
+            println!(
+                "decode-only: {count} coins ({bytes} script bytes) in {:.0?} — {:.0} coins/s",
+                el, count as f64 / el.as_secs_f64()
+            );
+            return;
+        }
+        // `sharded <path> <base> <n>` — one decode thread routes each
+        // coin to one of N independent backends (txid top-byte shard);
+        // each shard has its own dirty map + redb file, so writes
+        // parallelize. Tests whether insert is writer-bound.
+        "sharded" => {
+            let path = args.next().unwrap();
+            let bh: u32 = args.next().map(|x| x.parse().unwrap()).unwrap_or(935_000);
+            base_height = bh;
+            let nshards: usize = args.next().map(|x| x.parse().unwrap()).unwrap_or(4);
+            let f = std::fs::File::open(&path).unwrap();
+            let mut r = std::io::BufReader::with_capacity(1 << 24, f);
+            let meta = read_metadata(&mut r, [0xf9, 0xbe, 0xb4, 0xd9])
+                .unwrap_or_else(|e| panic!("meta: {e}"));
+            let mut senders = Vec::new();
+            let mut workers = Vec::new();
+            for si in 0..nshards {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<(OutPoint, Coin)>(65_536);
+                senders.push(tx);
+                let sdir = dir.join(format!("shard{si}"));
+                workers.push(std::thread::spawn(move || {
+                    let be = std::sync::Arc::new(
+                        avila_consensus::coinsdb::CoinsBackend::open(&sdir).unwrap(),
+                    );
+                    let mut set = UtxoSet::new();
+                    set.attach_shared(be.clone());
+                    set.set_budget(256 << 20);
+                    let mut since = 0u64;
+                    let mut cnt = 0u64;
+                    while let Ok((op, coin)) = rx.recv() {
+                        set.insert_synthetic(op, coin);
+                        since += 1;
+                        cnt += 1;
+                        if since >= 8_000_000 {
+                            set.flush_partial_to_backend().unwrap();
+                            since = 0;
+                        }
+                    }
+                    set.flush_to_backend(&[], bh).unwrap();
+                    cnt
+                }));
+            }
+            let mut ferr: Option<String> = None;
+            read_coins(&mut r, meta.coins_count, bh, |op, coin| {
+                if ferr.is_some() {
+                    return;
+                }
+                let shard = (op.txid.as_bytes()[0] as usize) % nshards;
+                if senders[shard].send((op, coin)).is_err() {
+                    ferr = Some(format!("shard{shard} died"));
+                }
+            })
+            .unwrap_or_else(|e| panic!("read: {e}"));
+            drop(senders);
+            if let Some(e) = ferr {
+                panic!("{e}");
+            }
+            let total: u64 = workers.into_iter().map(|w| w.join().unwrap()).sum();
+            let el = t.elapsed();
+            println!(
+                "sharded({nshards}): {total} coins in {:.0?} — {:.0} coins/s",
+                el,
+                total as f64 / el.as_secs_f64()
+            );
+            return;
+        }
+        // `run <path> <base>` — bulk-load via SortedRun: sequential
+        // append of the already-sorted stream + sparse index. The
+        // ~5min path: no B-tree, no incremental hashing.
+        "run" => {
+            let path = args.next().unwrap();
+            let bh: u32 = args.next().map(|x| x.parse().unwrap()).unwrap_or(935_000);
+            base_height = bh;
+            let run_path = dir.join("base.run");
+            let f = std::fs::File::open(&path).unwrap();
+            let mut r = std::io::BufReader::with_capacity(1 << 24, f);
+            let meta = read_metadata(&mut r, [0xf9, 0xbe, 0xb4, 0xd9])
+                .unwrap_or_else(|e| panic!("meta: {e}"));
+            let mut b = avila_consensus::sortedrun::RunBuilder::create(&run_path)
+                .unwrap_or_else(|e| panic!("create: {e}"));
+            let mut count = 0u64;
+            let mut sample: Vec<OutPoint> = Vec::new();
+            read_coins(&mut r, meta.coins_count, bh, |op, coin| {
+                b.push(&op, &coin).unwrap_or_else(|e| panic!("push: {e}"));
+                if count.is_multiple_of(65536) {
+                    sample.push(op);
+                }
+                count += 1;
+            })
+            .unwrap_or_else(|e| panic!("read: {e}"));
+            let n = b.finish().unwrap_or_else(|e| panic!("finish: {e}"));
+            let el = t.elapsed();
+            println!(
+                "run-build: {n} coins in {:.0?} — {:.0} coins/s",
+                el,
+                n as f64 / el.as_secs_f64()
+            );
+            let run = avila_consensus::sortedrun::SortedRun::open(&run_path).unwrap();
+            let tr = Instant::now();
+            let mut hits = 0u64;
+            for op in &sample {
+                if run.get(op).is_some() {
+                    hits += 1;
+                }
+            }
+            let el = tr.elapsed();
+            println!(
+                "point reads: {} in {:.0?} — {:.0}/s ({hits} hits)",
+                sample.len(),
+                el,
+                sample.len() as f64 / el.as_secs_f64()
+            );
+            let sz = std::fs::metadata(&run_path).unwrap().len() as f64 / (1 << 30) as f64;
+            println!("run file = {sz:.2} GiB");
+            return;
+        }
         "file" => {
             // Push-based path — mirrors `Chainstate::load_snapshot`.
             let path = args
@@ -253,7 +392,7 @@ fn main() {
                 set.insert_synthetic(op, coin);
                 since_flush += 1;
                 count += 1;
-                if since_flush >= 2_000_000 {
+                if since_flush >= FLUSH_EVERY {
                     if let Err(e) = set.flush_partial_to_backend() {
                         ferr = Some(e.to_string());
                     }
@@ -291,7 +430,7 @@ fn main() {
                 }
                 set.insert_synthetic(op, coin);
                 since_flush += 1;
-                if since_flush >= 2_000_000 {
+                if since_flush >= FLUSH_EVERY {
                     set.flush_partial_to_backend()
                         .unwrap_or_else(|e| panic!("mid flush: {e}"));
                     since_flush = 0;
@@ -340,7 +479,7 @@ fn main() {
                 }
                 set.insert_synthetic(op, coin);
                 since_flush += 1;
-                if since_flush >= 2_000_000 {
+                if since_flush >= FLUSH_EVERY {
                     set.flush_partial_to_backend()
                         .unwrap_or_else(|e| panic!("mid flush: {e}"));
                     since_flush = 0;

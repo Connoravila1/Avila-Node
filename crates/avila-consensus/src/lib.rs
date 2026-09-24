@@ -32,6 +32,7 @@ pub mod psbt;
 pub mod rules;
 pub mod script;
 pub mod sigchecker;
+pub mod sortedrun;
 pub mod sign;
 pub mod signet;
 pub mod silent;
