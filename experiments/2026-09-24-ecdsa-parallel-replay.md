@@ -1,5 +1,9 @@
 # Experiment: parallel ECDSA advice with bounded recovery
 
+Follow-up: [compact streams and producer economics](2026-09-24-ecdsa-advice-economics.md)
+implements bounded block framing and verification-time production. The results
+below describe the earlier witness-ID-map experiment.
+
 Status: measured parallel prototype; production adoption withheld.
 
 Roadmap: W2 validation throughput, W3 synchronization advice. Scorecard: P1

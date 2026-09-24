@@ -1007,6 +1007,18 @@ impl<S: Read + Write> PeerManager<S> {
             next += take;
             reserved.extend(peer.sync.reserved_hashes().copied());
         }
+        // Backlog: announced-but-unrequested blocks drain as slots free —
+        // without this, inv bursts beyond the window are forgotten.
+        let mut global_free = self.max_in_flight_total.saturating_sub(self.in_flight());
+        for peer in self.peers.values_mut() {
+            if !peer.session.established() {
+                continue;
+            }
+            if let Some(req) = peer.sync.drain_pending(cs, global_free) {
+                global_free = global_free.saturating_sub(peer.sync.in_flight());
+                let _ = peer.session.send(&req);
+            }
+        }
     }
 
     /// One peer's event → replies and chainstate effects.

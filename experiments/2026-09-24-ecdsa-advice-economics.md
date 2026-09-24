@@ -8,7 +8,116 @@ this experiment.
 
 ## Measurements
 
-Final measurements and validation results are recorded below after qualification.
+The mainnet sidecar is **24.42× smaller**. The streaming recipient retains a
+**23.7% CPU-time reduction**. Producing and packing advice now costs **29.13 CPU
+seconds**, versus **51.35** for the previous two-pass workflow: **43.3% less**.
+The producer still costs more than ordinary verification alone; its benefit
+depends on recipients reusing its output.
+
+Three repeats per arm, eight Script workers, using the same final binary.
+CPU includes native child processes. Times below are medians in seconds:
+
+| Workload | Ordinary CPU | Stream CPU | CPU change | Ordinary elapsed | Stream elapsed |
+|---|---:|---:|---:|---:|---:|
+| 24 recent mainnet blocks, supplied undo | 25.176 | 19.203 | −23.7% | 20.498 | 18.338 |
+| Complete 625-block regtest, RAM | 5.794 | 5.466 | −5.7% | 5.173 | 6.029 |
+| Same regtest, disk + flush + reopen | 6.087 | 5.753 | −5.5% | 6.408 | 6.694 |
+| Early mainnet, 501 blocks / 10 ECDSA checks | 0.0154 | 0.0159 | +0.0005 s | 0.0177 | 0.0173 |
+
+Elapsed improvements do **not** hold across all workloads. The smaller chain
+fixtures regress in median elapsed time despite using less CPU. On the modern
+sample, ordinary CPU ranged 24.970–25.379 s and stream CPU 19.008–19.263 s;
+elapsed ranges were 19.205–22.818 s and 18.007–19.296 s. The earlier comparison
+phase also retained a legacy-map control: 25.247 s ordinary, 19.487 s with the
+map, and 19.311 s with the stream. The compact format mainly fixes transport and
+memory growth; it does not create another large cryptographic speedup.
+
+The first batched producer replayed 137,316 Script attempts after provisional
+false results. A preliminary run used 32.84 CPU seconds, slightly worse than
+the per-call producer's 32.08 s in that run. Reusing already-completed
+transactions reduced actual Script replay to **18,831 attempts**. Three repeats
+then measured 28.95 s for the batched producer versus 32.24 s for per-call IPC.
+All generated hints match the independent producer exactly, including false
+results. The bounded cache really does fill on this sample: 568 insertions were
+not retained in the 512-job profile. This selects recomputation, with the same
+final output, rather than unbounded allocation.
+
+Producer scheduling was measured separately, rotating three group sizes through
+three repetitions. Recipient groups remain at 512 transactions:
+
+| Maximum producer group | CPU median | Elapsed median | Elapsed range |
+|---|---:|---:|---:|
+| 512 transactions | 29.002 | 23.131 | 22.982–27.440 |
+| 128 transactions | 28.935 | 22.236 | 18.051–23.418 |
+| **64 transactions** | **28.912** | **18.675** | **17.756–19.728** |
+
+Use **64** for the tested producer profile. Smaller groups preserve its CPU
+savings and improve scheduling on this workload. This is the best of the tested
+settings, not a claim of optimal scheduling on other histories or hardware.
+Packing adds a median **0.217 CPU seconds**. The old workflow was freshly
+remeasured once: 28.110 s for capture plus 23.026 s for separate production,
+including the Python producer's CPU, plus packing.
+
+## Whole-system cost
+
+Let B = 25.176 s for ordinary validation, V = 19.203 s for an advised recipient,
+and P = 29.128 s for production plus packing. These are a CPU accounting model
+for this sample, excluding real network transport:
+
+- A node already validating pays **P − B = 3.953 extra CPU seconds** to export
+  advice. Each recipient saves **B − V = 5.973 seconds**. One additional
+  recipient repays that incremental producer cost at these medians.
+- A dedicated helper created solely to supply advice must repay all of P.
+  The nominal crossover is **five recipients**. That fifth-recipient margin is
+  small and should not be treated as a practical guarantee.
+- A lone node creating advice solely for its own subsequent replay loses:
+  it pays both production and recipient costs.
+
+This is a measured argument for reusing a validating node's work across nodes.
+It is not an end-to-end IBD duration forecast.
+
+## Validation and memory
+
+All **129 comparison runs**, **nine scheduling runs**, and **133 additional
+boundary/memory checks** passed. The additional checks include eight packing
+checks. The copied consensus library passed **482 tests**, with zero failures
+and two pre-existing ignores. Three codec tests also passed independently,
+including a file larger than 32 MiB whose decoded frames are released as it
+streams. [Complete measurements and source/build identities](results/2026-09-24-ecdsa-advice-economics.json)
+include the preliminary producer and both comparison phases.
+
+Corrupting every mainnet hint caused seven groups to retry 6,597 checks, with
+at most 465 transactions in any retried group. CPU was 25.816 s, about 2.5%
+above the ordinary median; the final Script digest remained identical. Missing,
+reordered, truncated, wrongly keyed and malformed frames preserved the ordinary
+result. Worker startup failures, exits and malformed replies recovered through
+ordinary checks. Failed producers emitted conservative unknown hints.
+
+The invalid-spend test changes a transaction's amount, rebuilds commitments and
+PoW, and supplies the original hint under the changed block identity. The stream
+recipient rejected it, restored the exact prefix UTXO hash/tip, and accepted the
+original valid branch; one group retried six checks. Both producer variants
+also rejected the invalid branch correctly.
+
+New synthetic Script cases construct **x(R) = n + 2** at both parities, using the
+legacy SIGHASH_SINGLE out-of-range case and Q = (R − zG)/2. They exercise real
+escape values 2 and 3 through capture, production, packing and batch reception.
+Wrong parity and truncated escapes recover correctly. These paths and the
+ordinary edge cases also pass with the ASan/UBSan/VERIFY native worker.
+
+Separate 20 ms sampled process-tree RSS profiles measured 59.6 MiB ordinary,
+208.6 MiB with the legacy map, 125.2 MiB with the stream, and 96.6 MiB for the
+batched producer. The optimized arms each reached nine processes. These are
+single sampled profiles, sum shared pages repeatedly, and are **not memory caps**
+or an attribution of the whole difference to framing. The mainnet reader held
+one decoded frame with at most 11,823 hint bytes. Complete chain runs briefly
+held up to 11 frames as queued/finishing workers released references.
+
+Two harness issues are recorded: the preliminary producer run stopped on an
+over-strict assertion about cache saturation, despite correct output; the
+standalone extras selector initially omitted its own attack fixture. Both were
+repaired, and the complete and standalone suites passed. Neither repair changed
+the signature kernel.
 
 ## Compact, streaming transport
 
@@ -41,8 +150,11 @@ The 24-block mainnet sample shrinks from **3,570,094 to 146,202 bytes**: 24.42×
 smaller, a 95.90% reduction, and **0.376%** of its 38,849,984 serialized block
 bytes. The complete regtest stream is **49,456 bytes**, versus 596,144 bytes with
 witness-ID framing. All numbers include framing. Actual network transfer was not
-timed. Dense framing also emits empty blocks; that tradeoff matters for the early
-coinbase-heavy sample and is accounted for in the measurements.
+timed. Dense framing emits hintless blocks and grows the early sample from 306
+to 18,524 bytes. A tested sparse export simply omits those frames: **320 bytes**
+for early mainnet and **45,016 bytes** for regtest, with identical outcomes and
+no reader changes. The mainnet sample has advice in every block. This optional
+sparse export is exercised by the checker; the timed packer emits dense frames.
 
 ## Producing advice while verifying
 
@@ -133,9 +245,26 @@ python3 tools/check_ecdsa_economics.py \
   --output target/ecdsa-economics/checks-2 \
   --producer-mode produce-batch --rare-cases \
   --checked-worker target/ecdsa-replay/final-1/worker-checked
+
+python3 tools/check_ecdsa_economics.py \
+  --build-dir target/ecdsa-economics/batched-2 \
+  --output target/ecdsa-economics/checks-direct-2 \
+  --producer-mode produce --rare-cases --only extras \
+  --checked-worker target/ecdsa-replay/final-1/worker-checked
+
+python3 tools/check_ecdsa_economics.py \
+  --build-dir target/ecdsa-economics/batched-2 \
+  --output target/ecdsa-economics/schedule-1 \
+  --producer-mode produce-batch --only schedule
 ```
 
 Use fresh output directories. Raw traces, sidecars, databases and executables stay
 under ignored `target/`; only source, reports and measurement metadata belong in
 the repository. The native worker's source and notices are unchanged from the
 [original experiment](2026-09-23-ibd-ecdsa-advice.md).
+
+The meaningful remaining qualification is a larger, era-diverse/full-IBD run,
+an online exporter without the packing-map limit, and independent review of the
+cryptographic and consensus boundary. The experiment does not enable the new
+verifier in a production node. Its worker protocol also still lacks an internal
+hang deadline; the lab harness uses external timeouts.
