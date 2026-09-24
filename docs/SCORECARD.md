@@ -146,6 +146,29 @@ acceptance claims but do not substitute for the P/Q benchmarks above.
 - **Operator tooling**: backup/restore/migrate round-trips,
   datadir advisory lock, `-rpcwhitelist` scoping, crash-recovery
   replay from blk files — all covered by tests + live runs.
+- **BIP-330 set-reconciliation relay**: pure-Rust minisketch
+  (BM + trace-split decode, GF(2^32)) negotiated via `sendrecon`,
+  rounds scheduled per link, `reqbisec` recovery on decode failure.
+  Verified live over BIP324-v2 TCP: a mined mempool tx reached the
+  peer's pool via reconcildiff ask (33B) + body (430B) with **zero
+  `inv` announcements** on the wire (tx-invs suppressed on recon
+  links). The live run flushed a real sync bug — inv bursts beyond
+  the in-flight window were dropped; `PeerSync` now parks and drains
+  them (`experiments/2026-09-24-erlay-sketch.md`).
+- **Zero-copy assumeutxo overlay**: `activate_snapshot_overlay`
+  streams a Core-format snapshot file once — sparse index builds
+  while a worker hashes for `AssumeutxoHash` — then attaches the
+  file as the UtxoSet's lowest read layer. No import, no
+  materialization; `snapshot.path` sidecar re-attaches on resume.
+  Fixture: 0.01s single-pass vs 0.03s import at 13k coins; the win
+  is duplication (the import writes every coin into coinsdb) +
+  bounded memory, not latency at small scale
+  (`experiments/2026-09-24-delta-overlay-shim.md`).
+- **Live network sync**: signet headers+blocks against real peers —
+  1124 blocks / 66k headers in 600s; the fetch scan was quadratic
+  (per-peer full-header sort per tick); the shared frontier index
+  lifted block throughput ~5× to ~9 blk/s
+  (`experiments/2026-09-24-live-signet-sync.md`).
 | Q5 | Interoperability and distribution: tested APIs/clients/platforms, install/upgrade success | All advertised workflows qualified, explicit compatibility matrix and unsupported cases | Client suites, native packages and release qualification; foundation Linux checks only |
 | Q6 | Maintainability and supply chain: reproducible builds, reviewability, build cost, repair effort | Reproducible release artifacts, documented component contracts and tested release/recovery procedures | Independent rebuilds, dependency inventory, scoped reviews, reproduction reports; **not qualified** |
 
