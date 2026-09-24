@@ -5864,4 +5864,77 @@ mod tests {
         assert_eq!(all[0].hash, b3.block_hash());
         assert!(all.iter().any(|r| r.hash == a2.block_hash()));
     }
+
+    /// #31 end-to-end: real block connects keep `agg == Σ tags(live)`,
+    /// and the emitted hints verify against the same set.
+    #[test]
+    fn swiftsync_agg_tracks_real_connects() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        cs.enable_swiftsync();
+        let sum = |cs: &Chainstate| {
+            let mut a = crate::swiftsync::TagAgg::default();
+            for (op, c) in cs.utxo().iter() {
+                a.add(&crate::swiftsync::coin_tag(&op, &c));
+            }
+            a
+        };
+        assert_eq!(cs.swiftsync_agg().unwrap(), sum(&cs));
+
+        // 105 coinbases — mature at h>101.
+        let mut parent = genesis_header();
+        let mut mature = None;
+        for height in 1..=105u32 {
+            let block = block_on(&parent, vec![coinbase_tx(height, subsidy(height))], &params);
+            if height == 1 {
+                mature = Some(block.transactions[0].txid());
+            }
+            parent = block.header;
+            cs.accept_block(&block, NOW).unwrap();
+            assert_eq!(
+                cs.swiftsync_agg().unwrap(),
+                sum(&cs),
+                "agg drifted at height {height}"
+            );
+        }
+
+        // A block spending the height-1 coinbase — real spend path.
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: mature.unwrap(),
+                    vout: 0,
+                },
+                script_sig: Script::new(vec![]),
+                sequence: SEQUENCE_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: subsidy(1) - 1000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let block = block_on(
+            &parent,
+            vec![coinbase_tx(106, subsidy(106)), spend],
+            &params,
+        );
+        cs.accept_block(&block, NOW).unwrap();
+        assert_eq!(cs.swiftsync_agg().unwrap(), sum(&cs));
+
+        // The emitted artifact verifies; a tampered claim does not.
+        let hints = cs.emit_hints(106);
+        assert_eq!(
+            cs.verify_hints(&hints),
+            crate::swiftsync::HintsVerdict::Verified
+        );
+        let mut bad = hints.clone();
+        bad.survivors.pop();
+        assert_eq!(
+            cs.verify_hints(&bad),
+            crate::swiftsync::HintsVerdict::SurvivorMismatch
+        );
+    }
 }

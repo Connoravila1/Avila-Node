@@ -4587,6 +4587,16 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         &[("count", Some("number"), false)],
         "getblockreceipts ( count )\n\nRecent per-block verification receipts, newest first — what this node actually checked when it connected each block.\n\nArguments:\n1. count  (number, optional, default=10, max=2016) How many receipts to return.\n\nResult:\n[ { \"height\": n, \"hash\": \"hex\", \"script_flags\": n, \"txs\": n, \"sigops\": n, \"fees\": btc, \"checks_enabled\": bool, \"script_checks\": n, \"verified_hits\": n, \"spent_coins\": n, \"created_coins\": n, \"delta_commitment\": \"hex\", \"wall_ns\": n }, ... ]\n",
     ),
+    (
+        "emitswiftsynchints",
+        &[("path", Some("string"), true)],
+        "emitswiftsynchints \"path\"\n\nWrite the SwiftSync hints artifact for the current UTXO set — the committed tag aggregate plus the sorted survivor outpoints.\n\nArguments:\n1. path  (string, required) Output file path.\n\nResult:\n{ \"height\": n, \"survivors\": n, \"aggregate\": \"hex\", \"bytes\": n }\n",
+    ),
+    (
+        "verifyswiftsynchints",
+        &[("path", Some("string"), true)],
+        "verifyswiftsynchints \"path\"\n\nVerify a SwiftSync hints file against this node's own UTXO set: committed aggregate equality plus survivor-set equality. A wrong file only wastes the optimization — the node writes its own live set either way.\n\nArguments:\n1. path  (string, required) Hints file path.\n\nResult:\n\"verified\" | \"aggregate_mismatch\" | \"survivor_mismatch\"\n",
+    ),
     ("getmempoolinfo", &[], GETMEMPOOLINFO_HELP),
     (
         "getevents",
@@ -5443,6 +5453,54 @@ pub(crate) fn dispatch(
                         format!("no receipt retained at height {height}"),
                     )),
                 }
+            })
+        }
+        "emitswiftsynchints" => {
+            let path = param(params, 0, "path")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            chain_query(method, queries, move |cs, _| {
+                let Some(path) = path else {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "emitswiftsynchints requires a path".to_string(),
+                    ));
+                };
+                let height = (cs.chain().len() - 1) as u32;
+                let hints = cs.emit_hints(height);
+                let bytes = hints.encode();
+                let len = bytes.len();
+                std::fs::write(&path, bytes)
+                    .map_err(|e| (RPC_MISC_ERROR, format!("write hints to {path}: {e}")))?;
+                Ok(json!({
+                    "height": hints.height,
+                    "survivors": hints.survivors.len(),
+                    "aggregate": hex::encode(&hints.aggregate.to_bytes()),
+                    "bytes": len,
+                }))
+            })
+        }
+        "verifyswiftsynchints" => {
+            let path = param(params, 0, "path")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            chain_query(method, queries, move |cs, _| {
+                let Some(path) = path else {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "verifyswiftsynchints requires a path".to_string(),
+                    ));
+                };
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| (RPC_MISC_ERROR, format!("read hints {path}: {e}")))?;
+                let hints = avila_consensus::swiftsync::Hints::decode(&bytes)
+                    .map_err(|e| (RPC_INVALID_PARAMETER, format!("bad hints: {e}")))?;
+                use avila_consensus::swiftsync::HintsVerdict::*;
+                Ok(json!(match cs.verify_hints(&hints) {
+                    Verified => "verified",
+                    AggregateMismatch => "aggregate_mismatch",
+                    SurvivorMismatch => "survivor_mismatch",
+                }))
             })
         }
         "getvalidationreport" => chain_query(method, queries, |cs, _| {

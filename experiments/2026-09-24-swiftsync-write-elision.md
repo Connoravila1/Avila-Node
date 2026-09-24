@@ -167,9 +167,15 @@ malformed files reject without panic; the hold suppresses a real
 backend's flush pressure and a real flush leaves the aggregate
 untouched.
 
-Still open: the consumer-side sync integration (checkpoint verify +
-release inside the IBD loop), the hints-file RPC surface
-(`gettxouthints`-style), and the never-keep-full-coins variant that
-would shrink the transient map (the 682MiB-at-signet cost — for
-mainnet IBD this design needs a spool or a smaller per-coin
-footprint).
+Sync integration + RPC (same commit): the sync loop releases
+`swift_hold` when the connected height reaches the header tip (IBD
+complete — the honest checkpoint); `emitswiftsynchints "path"` and
+`verifyswiftsynchints "path"` expose the artifact and the consumer
+verdict. A fourth test (`chainstate::tests::swiftsync_agg_tracks_real_connects`)
+drives 106 real connects through `accept_block` and re-derives the
+sum at every height — invariant holds including a real spend block.
+
+Still open: the never-keep-full-coins variant that would shrink the
+transient map (the 682MiB-at-signet cost — for mainnet IBD this
+design needs a spool or a smaller per-coin footprint), and a live
+end-to-end run where two nodes exchange a real hints file.

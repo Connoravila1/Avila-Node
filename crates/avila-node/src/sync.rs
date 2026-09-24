@@ -306,6 +306,11 @@ pub fn run(
     // sync. The value bounds post-crash replay depth, not correctness.
     let mut last_flush = resumed_height;
     let mut last_audit = resumed_height;
+    // SwiftSync transient window: holds the coins cache unflushed
+    // while `swift_hold` is set; released once the connected height
+    // reaches the header tip (IBD complete). Tracking continues —
+    // the aggregate stays live for emit/verify.
+    let mut swift_released = cs.swiftsync_agg().is_none();
     let mut audit_failures = 0usize;
     let mut mgr = PeerManager::new(cfg.max_peers);
     mgr.set_proxy(cfg.proxy);
@@ -514,6 +519,20 @@ pub fn run(
             if bad > 0 {
                 eprintln!(
                     "self-audit: {bad} of 8 sampled blocks FAILED integrity checks                      ({audit_failures} cumulative) — storage may be corrupt"
+                );
+            }
+        }
+        // SwiftSync checkpoint: the transient window ends when the
+        // chain is fully connected — release the hold so normal
+        // budget pressure + flushing resume. The aggregate keeps
+        // tracking for emit/verify.
+        if !swift_released && connected >= cs.tree().tip().height {
+            swift_released = true;
+            cs.release_swiftsync_hold();
+            if let Some(agg) = cs.swiftsync_agg() {
+                eprintln!(
+                    "swiftsync: window closed at {connected} —                      aggregate {:x?} live, flushing resumes",
+                    &agg.to_bytes()[..8]
                 );
             }
         }
