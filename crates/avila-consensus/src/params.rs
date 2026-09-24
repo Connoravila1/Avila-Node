@@ -71,8 +71,9 @@ impl Network {
                 signet_challenge: &[],
                 // kernel/chainparams.cpp: uint256{...} values, in display hex.
                 minimum_chain_work: Work(U256::from_be_bytes(MINIMUM_CHAIN_WORK_MAINNET)),
+                // Core v31.1: defaultAssumeValid, height 938343.
                 assume_valid: BlockHash::from_str(
-                    "00000000000000000001b658dd1120e82e66d2790811f89ede9742ada3ed6d77",
+                    "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac",
                 )
                 .ok(),
                 message_start: [0xf9, 0xbe, 0xb4, 0xd9],
@@ -160,8 +161,9 @@ impl Network {
                 signet_blocks: false,
                 signet_challenge: &[],
                 minimum_chain_work: Work(U256::from_be_bytes(MINIMUM_CHAIN_WORK_TESTNET4)),
+                // Core v31.1: defaultAssumeValid, height 123613.
                 assume_valid: BlockHash::from_str(
-                    "0000000000003ed4f08dbdf6f7d6b271a6bcffce25675cb40aa9fa43179a89f3",
+                    "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a",
                 )
                 .ok(),
                 message_start: [0x1c, 0x16, 0x3f, 0x28],
@@ -203,9 +205,21 @@ impl Network {
                         min_activation_height: 0,
                     },
                 ],
-                // Core's `CTestNet4Params` ships an empty table — no
-                // snapshot point exists for this network.
-                assumeutxo_data: &[],
+                // Core v31.1 `CTestNet4Params::m_assumeutxo_data`.
+                assumeutxo_data: &[
+                    AssumeutxoData {
+                        height: 90_000,
+                        hash_serialized: "784fb5e98241de66fdd429f4392155c9e7db5c017148e66e8fdbc95746f8b9b5",
+                        n_chain_tx: 11_347_043,
+                        blockhash: "0000000002ebe8bcda020e0dd6ccfbdfac531d2f6a81457191b99fc2df2dbe3b",
+                    },
+                    AssumeutxoData {
+                        height: 120_000,
+                        hash_serialized: "10b05d05ad468d0971162e1b222a4aa66caca89da2bb2a93f8f37fb29c4794b0",
+                        n_chain_tx: 14_141_057,
+                        blockhash: "000000000bd2317e51b3c5794981c35ba894ce27d3e772d5c39ecd9cbce01dc8",
+                    },
+                ],
                 genesis_header: TESTNET4_GENESIS,
             },
             Network::Signet => Params {
@@ -220,8 +234,9 @@ impl Network {
                 signet_blocks: true,
                 signet_challenge: &SIGNET_CHALLENGE,
                 minimum_chain_work: Work(U256::from_be_bytes(MINIMUM_CHAIN_WORK_SIGNET)),
+                // Core v31.1: defaultAssumeValid, height 293175.
                 assume_valid: BlockHash::from_str(
-                    "000000895a110f46e59eb82bbc5bfb67fa314656009c295509c21b4999f5180a",
+                    "00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329",
                 )
                 .ok(),
                 message_start: [0x0a, 0x03, 0xcf, 0x40],
@@ -262,12 +277,20 @@ impl Network {
                         min_activation_height: 0,
                     },
                 ],
-                assumeutxo_data: &[AssumeutxoData {
-                    height: 160_000,
-                    hash_serialized: "fe0a44309b74d6b5883d246cb419c6221bcccf0b308c9b59b7d70783dbdf928a",
-                    n_chain_tx: 2_289_496,
-                    blockhash: "0000003ca3c99aff040f2563c2ad8f8ec88bd0fd6b8f0895cfaf1ef90353a62c",
-                }],
+                assumeutxo_data: &[
+                    AssumeutxoData {
+                        height: 160_000,
+                        hash_serialized: "fe0a44309b74d6b5883d246cb419c6221bcccf0b308c9b59b7d70783dbdf928a",
+                        n_chain_tx: 2_289_496,
+                        blockhash: "0000003ca3c99aff040f2563c2ad8f8ec88bd0fd6b8f0895cfaf1ef90353a62c",
+                    },
+                    AssumeutxoData {
+                        height: 290_000,
+                        hash_serialized: "97267e000b4b876800167e71b9123f1529d13b14308abec2888bbd2160d14545",
+                        n_chain_tx: 28_547_497,
+                        blockhash: "0000000577f2741bb30cd9d39d6d71b023afbeb9764f6260786a97969d5c9ac0",
+                    },
+                ],
                 genesis_header: SIGNET_GENESIS,
             },
             Network::Regtest => Params {
@@ -744,25 +767,25 @@ const TESTNET4_GENESIS: BlockHeader = BlockHeader {
     nonce: 393_743_547,
 };
 
-/// `consensus.nMinimumChainWork` for mainnet (Core `kernel/chainparams.cpp`):
-/// `uint256{"0000000000000000000000000000000000000000b1f3b93b65b16d035a82be84"}`.
+/// `consensus.nMinimumChainWork` for mainnet (Core v31.1 `kernel/chainparams.cpp`):
+/// `uint256{"0000000000000000000000000000000000000001128750f82f4c366153a3a030"}`.
 const MINIMUM_CHAIN_WORK_MAINNET: [u8; 32] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xb1, 0xf3, 0xb9, 0x3b, 0x65, 0xb1,
-    0x6d, 0x03, 0x5a, 0x82, 0xbe, 0x84,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x12, 0x87, 0x50, 0xf8, 0x2f,
+    0x4c, 0x36, 0x61, 0x53, 0xa3, 0xa0, 0x30,
 ];
 
-/// `consensus.nMinimumChainWork` for testnet4:
-/// `uint256{"0000000000000000000000000000000000000000000001d6dce8651b6094e4c1"}`.
+/// `consensus.nMinimumChainWork` for testnet4 (Core v31.1):
+/// `uint256{"0000000000000000000000000000000000000000000009a0fe15d0177d086304"}`.
 const MINIMUM_CHAIN_WORK_TESTNET4: [u8; 32] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xd6, 0xdc, 0xe8, 0x65,
-    0x1b, 0x60, 0x94, 0xe4, 0xc1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x09, 0xa0, 0xfe, 0x15, 0xd0,
+    0x17, 0x7d, 0x08, 0x63, 0x04,
 ];
 
-/// `consensus.nMinimumChainWork` for the default signet:
-/// `uint256{"000000000000000000000000000000000000000000000000000002b517f3d1a1"}`.
+/// `consensus.nMinimumChainWork` for the default signet (Core v31.1):
+/// `uint256{"00000000000000000000000000000000000000000000000000000b463ea0a4b8"}`.
 const MINIMUM_CHAIN_WORK_SIGNET: [u8; 32] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x00, 0x02, 0xb5,
-    0x17, 0xf3, 0xd1, 0xa1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b, 0x46, 0x3e,
+    0xa0, 0xa4, 0xb8,
 ];
 
 /// The default signet's BIP325 block challenge (Core `kernel/chainparams.cpp`
@@ -909,6 +932,57 @@ mod tests {
             assert_eq!(params.segwit_height, segwit, "{network:?} segwit_height");
             assert_eq!(params.taproot_height, taproot, "{network:?} taproot_height");
         }
+    }
+
+    /// `kernel/chainparams.cpp`'s `nMinimumChainWork` and
+    /// `defaultAssumeValid` (Core v31.1), transcribed per network.
+    /// These are pure data with nothing else to exercise the exact
+    /// values, so a stale transcription after a Core version bump
+    /// would otherwise go unnoticed.
+    #[test]
+    fn minimum_chain_work_and_assume_valid_match_core_v31_1() {
+        assert_eq!(
+            Network::Mainnet.params().minimum_chain_work.0.to_hex(),
+            "0000000000000000000000000000000000000001128750f82f4c366153a3a030"
+        );
+        assert_eq!(
+            Network::Mainnet.params().assume_valid.unwrap().to_string(),
+            "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac"
+        );
+        assert_eq!(
+            Network::Testnet4.params().minimum_chain_work.0.to_hex(),
+            "0000000000000000000000000000000000000000000009a0fe15d0177d086304"
+        );
+        assert_eq!(
+            Network::Testnet4.params().assume_valid.unwrap().to_string(),
+            "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"
+        );
+        assert_eq!(
+            Network::Signet.params().minimum_chain_work.0.to_hex(),
+            "00000000000000000000000000000000000000000000000000000b463ea0a4b8"
+        );
+        assert_eq!(
+            Network::Signet.params().assume_valid.unwrap().to_string(),
+            "00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329"
+        );
+    }
+
+    /// `m_assumeutxo_data` (Core v31.1): testnet4 ships two snapshot
+    /// points — the table used to be transcribed empty — and signet's
+    /// higher second point (290,000) is present alongside the first.
+    #[test]
+    fn assumeutxo_tables_match_core_v31_1() {
+        let t4 = Network::Testnet4.params();
+        let t4_heights: Vec<u32> = t4.assumeutxo_data.iter().map(|d| d.height).collect();
+        assert_eq!(t4_heights, [90_000, 120_000]);
+
+        let signet = Network::Signet.params();
+        let signet_heights: Vec<u32> = signet.assumeutxo_data.iter().map(|d| d.height).collect();
+        assert_eq!(signet_heights, [160_000, 290_000]);
+
+        let mainnet = Network::Mainnet.params();
+        let mainnet_heights: Vec<u32> = mainnet.assumeutxo_data.iter().map(|d| d.height).collect();
+        assert_eq!(mainnet_heights, [840_000, 880_000, 910_000, 935_000]);
     }
 
     /// The genesis constants must produce each network's canonical hash. For the public
