@@ -97,32 +97,32 @@ pub fn state(
     for &n in to_compute.iter().rev() {
         let mtp = i64::from(tree.median_time_past(&n.hash()).unwrap_or(0));
         state = match state {
-            // Core checks the timeout before the start: a window that
-            // opens already past the deadline goes straight to FAILED.
-            Bip9State::Defined if mtp >= dep.timeout => Bip9State::Failed,
+            // Post-Speedy-Trial order (Core v31.1 versionbits.cpp):
+            // DEFINED only ever checks the start time — even a window
+            // that opens already past the deadline still spends one
+            // period as STARTED before FAILED can be reached. There is
+            // no direct DEFINED → FAILED transition.
             Bip9State::Defined if mtp >= dep.start_time => Bip9State::Started,
             Bip9State::Started => {
-                // Timeout first — Core's STARTED arm fails the
-                // deployment even when the final window reaches the
-                // threshold in the same period.
-                if mtp >= dep.timeout {
+                // Threshold first — a window that both meets the
+                // signalling threshold and is past the timeout still
+                // locks in; Core's STARTED arm only falls through to
+                // the timeout check when the count comes up short.
+                let mut count = 0u32;
+                let mut c = Some(n);
+                for _ in 0..period {
+                    let Some(node) = c else { break };
+                    if signals(&node.header, dep.bit) {
+                        count += 1;
+                    }
+                    c = tree.get(&node.header.prev_block_hash);
+                }
+                if count >= threshold {
+                    Bip9State::LockedIn
+                } else if mtp >= dep.timeout {
                     Bip9State::Failed
                 } else {
-                    // Count signalling blocks in the window ending at n.
-                    let mut count = 0u32;
-                    let mut c = Some(n);
-                    for _ in 0..period {
-                        let Some(node) = c else { break };
-                        if signals(&node.header, dep.bit) {
-                            count += 1;
-                        }
-                        c = tree.get(&node.header.prev_block_hash);
-                    }
-                    if count >= threshold {
-                        Bip9State::LockedIn
-                    } else {
-                        state
-                    }
+                    state
                 }
             }
             Bip9State::LockedIn if n.height + 1 >= dep.min_activation_height => Bip9State::Active,
@@ -345,9 +345,11 @@ mod tests {
         assert_eq!(state_since(&tree, Some(&hs4[143]), &dep, &p), 432);
     }
 
-    /// STARTED → FAILED when the deadline passes before the threshold:
-    /// Core checks the timeout *before* counting, so a deployment whose
-    /// last window would reach threshold still fails.
+    /// STARTED → FAILED when the deadline passes without reaching the
+    /// threshold: Core counts signalling first and only falls through
+    /// to the timeout check when the count comes up short, so a
+    /// window that never signals at all still fails once past the
+    /// deadline.
     #[test]
     fn timeout_fails_from_started() {
         let mut p = params();
@@ -360,9 +362,30 @@ mod tests {
         let hs = grow(&mut tree, &p, 288, QUIET, 600);
         // Window 0 closed in STARTED…
         assert_eq!(state(&tree, Some(&hs[143]), &dep, &p), Bip9State::Started);
-        // …and window 1 closed past the timeout → FAILED at h287.
+        // …and window 1 closed past the timeout with no signalling → FAILED at h287.
         assert_eq!(state(&tree, Some(&hs[287]), &dep, &p), Bip9State::Failed);
         assert_eq!(state_since(&tree, Some(&hs[287]), &dep, &p), 288);
+    }
+
+    /// STARTED → LOCKED_IN, not FAILED, when the final window both
+    /// meets the threshold and closes past the timeout: Core's
+    /// Speedy-Trial order checks the threshold before the timeout, so
+    /// reaching it wins even in the deployment's last eligible window.
+    #[test]
+    fn threshold_wins_over_timeout_in_final_window() {
+        let mut p = params();
+        let t0 = p.genesis_header.time;
+        // Same deadline placement as `timeout_fails_from_started` —
+        // inside window 1 — but this window signals unanimously.
+        p.bip9_deployments[0].timeout = i64::from(t0) + 200 * 600;
+        let dep = p.bip9_deployments[0];
+        let mut tree = HeaderTree::new(p);
+        let hs = grow(&mut tree, &p, 144, QUIET, 600);
+        assert_eq!(state(&tree, Some(&hs[143]), &dep, &p), Bip9State::Started);
+        let hs2 = grow(&mut tree, &p, 144, SIGNALLING, 600);
+        // Window 1 closes past the timeout, but every block signalled:
+        // the threshold check wins → LOCKED_IN, not FAILED.
+        assert_eq!(state(&tree, Some(&hs2[143]), &dep, &p), Bip9State::LockedIn);
     }
 
     /// `min_activation_height` holds ACTIVE back past LOCKED_IN until a
