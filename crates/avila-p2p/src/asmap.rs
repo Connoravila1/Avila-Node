@@ -9,7 +9,7 @@
 //! that format is the remaining integration work. The bucketing logic
 //! is the part that's actually testable and what this module ships.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 /// One prefix→ASN row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,10 +83,56 @@ impl AsMap {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Load a text map: one `a.b.c.d/plen<ws>asn` row per line
+    /// (`#` comments and blank lines skipped). Returns the map and
+    /// the count of malformed lines skipped — a partial map still
+    /// buckets, a wrong one misleads silently, so we report the
+    /// count rather than fail or stay quiet.
+    ///
+    /// This is the operator-facing bridge until Core's bit-packed
+    /// `asmap.dat` (kartograf output) parsing lands; a map converted
+    /// to these rows drives identical bucketing.
+    pub fn load_file(path: &std::path::Path) -> std::io::Result<(Self, usize)> {
+        let text = std::fs::read_to_string(path)?;
+        let mut entries = Vec::new();
+        let mut skipped = 0usize;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut it = line.split_whitespace();
+            let row = (|| -> Option<Prefix> {
+                let cidr = it.next()?;
+                let asn: u32 = it.next()?.parse().ok()?;
+                if it.next().is_some() {
+                    return None;
+                }
+                let (addr, plen) = cidr.rsplit_once('/')?;
+                let ip: Ipv4Addr = addr.parse().ok()?;
+                let plen: u8 = plen.parse().ok()?;
+                if plen > 32 {
+                    return None;
+                }
+                Some(Prefix {
+                    net: u32::from_be_bytes(ip.octets()),
+                    plen,
+                    asn,
+                })
+            })();
+            match row {
+                Some(p) => entries.push(p),
+                None => skipped += 1,
+            }
+        }
+        Ok((Self { entries }, skipped))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
     use std::net::Ipv4Addr;
 
@@ -109,5 +155,26 @@ mod tests {
         assert_eq!(m.asn(&a), Some(2));
         assert_eq!(m.asn(&b), Some(1));
         assert_eq!(m.asn(&IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))), None);
+    }
+
+    #[test]
+    fn load_file_parses_rows_and_counts_bad_lines() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("asmap-test-{}", std::process::id()));
+        std::fs::write(
+            &path,
+            "# comment\n\n10.0.0.0/8 100\n10.1.0.0/16 200\nbad row\n192.0.2.0/24\t300\n1.2.3.4/33 9\n",
+        )
+        .unwrap();
+        let (m, skipped) = AsMap::load_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(m.len(), 3, "three good rows");
+        assert_eq!(skipped, 2, "bad row + /33 overflow skipped");
+        assert_eq!(
+            m.asn(&IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))),
+            Some(200),
+            "longest prefix wins through the loader"
+        );
+        assert_eq!(m.asn(&IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9))), Some(300));
     }
 }

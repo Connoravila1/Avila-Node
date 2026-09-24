@@ -31,6 +31,11 @@ pub struct SyncConfig {
     /// Optional SOCKS5 proxy for all outbound connections (Core's
     /// `-proxy`); DNS-seeded and explicit dials both route through it.
     pub proxy: Option<SocketAddr>,
+    /// Core's `-asmap=<file>`: a prefix→ASN map for outbound-dial
+    /// bucketing (the Erebus mitigation, queue #21). Text format —
+    /// one `a.b.c.d/plen asn` row per line; Core's bit-packed
+    /// `asmap.dat` parsing is open. Empty/absent = no bucketing.
+    pub asmap_path: Option<std::path::PathBuf>,
     /// When set, the chainstate persists under this directory —
     /// re-running resumes from the stored snapshot instead of genesis.
     pub data_dir: Option<std::path::PathBuf>,
@@ -102,6 +107,7 @@ impl Default for SyncConfig {
             max_peers: 8,
             timeout: Duration::from_secs(120),
             proxy: None,
+            asmap_path: None,
             data_dir: None,
             dbcache: None,
             cancel: None,
@@ -314,6 +320,23 @@ pub fn run(
     let mut audit_failures = 0usize;
     let mut mgr = PeerManager::new(cfg.max_peers);
     mgr.set_proxy(cfg.proxy);
+    if let Some(path) = &cfg.asmap_path {
+        match avila_p2p::asmap::AsMap::load_file(path) {
+            Ok((map, skipped)) => {
+                println!(
+                    "ASMap loaded: {} prefixes{}",
+                    map.len(),
+                    if skipped > 0 {
+                        format!(" ({skipped} malformed lines skipped)")
+                    } else {
+                        String::new()
+                    }
+                );
+                mgr.set_asmap(map);
+            }
+            Err(e) => eprintln!("asmap: cannot read {}: {e} — bucketing off", path.display()),
+        }
+    }
     // The whole p2p time domain — dial-path ban checks, version
     // `timestamp`s, conntime/lastsend/lastrecv and the last_* peer
     // fields — reads the node clock, so `setmocktime` shifts them too.

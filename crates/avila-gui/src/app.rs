@@ -841,6 +841,7 @@ impl AvilaApp {
             max_peers: 8,
             timeout: Duration::from_secs(3600),
             proxy: self.sync.proxy_input.trim().parse().ok(),
+            asmap_path: None,
             data_dir: self
                 .sync
                 .store
