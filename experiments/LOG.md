@@ -88,39 +88,25 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 Listed in rough priority; each entry has the hypothesis and the cheapest
 first measurement that would kill or confirm it.
 
-1. **Live network sync.** The credibility gate — fixtures have carried all
-   claims so far. First step: signet/testnet headers+blocks against real
-   peers; measure tip-follow latency and peer misbehavior handling.
+1. **Snapshot activation without materialization.** The overlay shim
+   (#35) proves reads fall through; `activate_snapshot` still bulk-loads
+   via `utxo_snapshot::load` + `coinstats::compute` (OOMs at 170M).
+   First step: attach `SnapshotRun` in place + wire snapverify (bounds
+   already verified) + persist the anchor.
 
-2. **Delta overlay integration for SnapshotRun.** The ~90s-to-usable path
-   is bench-proven; making it real needs reads to fall through to the
-   indexed snapshot file with spends/inserts in the mutable layer, plus
-   `activate_snapshot` streaming (no 170M materialization — OOMs at scale).
-   First step: `UtxoSet` read-path shim + diff-test vs current backend.
+2. **Verified-artifact distribution format.** Replay + parallel-verify
+   are proven (astra's ecdsa-parallel-replay); the open item is the
+   artifact spec — one reproducible bundle (snapshot + index +
+   midstates + sig-hints) anyone can generate and verify against
+   anchors. First step: write the format spec.
 
-2. **ECDSA advice on real history.** #27's kernel win (1.8-2.3×) is
-   synthetic. First step: extract real sig-check traces from a historical
-   segment and replay them through the advice machinery — tests sighash
-   variants, codeseparator, and edge script forms the kernel bench skipped.
+3. **Utreexo as a first-class UTXO backend.** #38's spike shows a
+   247-byte accumulator state vs the 12GB UTXO set, ~110k leaves/s
+   verify+apply. First step: an `UtxoBackend` impl over rustreexo
+   `Stump` + a proof-carrying connect path on the fixture chain.
 
-3. **Built-in address index / electrum-style serving (profile).** Point a
-   wallet at your own node, no external indexer. Controversial storage cost
-   is exactly what profiles are for — opt-in distro, consensus untouched.
-   First step: cost model — index size + write overhead on the fixture.
-
-3. **Erlay-style tx reconciliation (BIP-330).** ~44% relay-bandwidth
-   savings; Core hasn't shipped it (simplified recon-only variant is in
-   Warnet testing upstream). Interop is the open question — today ~no peers
-   speak it. First step: implement BIP-330 recon-only message handling and
-   measure reconciliation rounds between two Avila nodes.
-
-3. **Differential fuzzing vs Core/Knots.** Continuous random-block/tx
-   generation with byte-exact comparison — turns "compatible" into a
-   monitored property rather than a claim. First step: fuzz harness on the
-   existing diff fixture generator, seeded corpus from past bugs.
-
-3. **Utreexo research program.** BIPs 181-183 now have assigned numbers;
-   rustreexo 0.6.0 exists. Validate blocks against accumulator + proofs —
-   ~KB of state vs 12GB UTXO set. Months, not days; needs bridge-node
-   proof supply. First step: rustreexo spike — add/delete/prove round-trip
-   on the fixture's UTXO set, costed against CoinsBackend.
+4. **Erlay follow-through.** Intra-Avila is live end-to-end (sketch →
+   reconcildiff → body, zero inv announcements). Remaining: capacity
+   tuning on realistic pool diffs, multi-peer round overlap, and
+   external interop (nobody else speaks BIP-330 — Knots if they ship
+   it).
