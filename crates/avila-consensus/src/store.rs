@@ -589,7 +589,12 @@ pub fn write_state(dir: &Path, magic: [u8; 4], data: &StateData) -> io::Result<(
         f.write_all(&file_bytes)?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, dir.join(STATE_FILE))
+    fs::rename(&tmp, dir.join(STATE_FILE))?;
+    // The rename itself needs a directory fsync to be durable — without
+    // it a crash can leave the directory entry still pointing at the
+    // old state.dat (or at nothing) even though the new file's bytes
+    // already hit disk (hashstore.rs's renames do the same).
+    File::open(dir)?.sync_all()
 }
 
 /// Reads `dir/state.dat`, verifying magic, version and checksum.
