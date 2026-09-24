@@ -167,3 +167,34 @@ first measurement that would kill or confirm it.
 15. **Continuous self-audit.** Background re-verification of random
     historical segments, forever — correctness as an ongoing property,
     catching disk rot and bitflips. Each pass appends receipt evidence.
+
+16. **Pinning oracle.** Mempool watcher that detects pinning patterns
+    against the operator's wallet transactions — descendant-limit
+    saturation, RBF rule-3 pinning, parked conflicts — and reports it.
+    The node tells you when you're under attack; nobody ships this.
+    Real value for LN operators.
+
+17. **V2 traffic padding.** The 2025 v2-transport analysis showed
+    BIP324 encrypts content but leaks message *shape* via TCP payload
+    lengths. BIP324's decoy/garbage mechanism exists for exactly this —
+    nobody uses it. Experiment: fixed-size send cells + decoy traffic;
+    measure observer command-classification accuracy before/after.
+
+18. **Selfish-stem broadcast.** The DoS objection that killed BIP156
+    was relaying *unvalidated* stems. Variant: only locally-originated,
+    mempool-admitted txs take a stem hop — one outbound link,
+    randomized delay, then normal recon fluff. No stempool, no
+    unvalidated relay, most of the origin-privacy benefit.
+
+19. **Recon-diff censorship telemetry.** Every recon round already
+    computes the per-peer pool diff — surface it. A peer persistently
+    missing a large share of your mempool is a censorship/eclipse
+    signal. Security telemetry at zero protocol cost.
+
+20. **Non-deterministic inbound eviction.** The evict-and-fill attack
+    (82-97% linkage accuracy) exploits predictable eviction; randomize
+    it. Small, bounded.
+
+21. **ASMap bucketing.** Core's deployed Erebus countermeasure —
+    bucket peers by ASN (Kartograf-reproducible maps) instead of /16.
+    A parity gap; well-specified, bounded.
