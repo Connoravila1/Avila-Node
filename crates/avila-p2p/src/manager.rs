@@ -659,29 +659,43 @@ impl<S: Read + Write> PeerManager<S> {
     /// `SelectNodeToEvict` protection-then-score ordering.
     fn evict_worst_inbound(&mut self) -> Option<u64> {
         let now = Instant::now();
-        let mut scored: Vec<(bool, Instant, Instant, u64)> = self
+        let scored: Vec<(bool, u64)> = self
             .peers
             .iter()
             .filter(|(id, p)| p.inbound && self.headers_leader != Some(**id))
             .map(|(id, p)| {
                 let protected = now.duration_since(p.last_useful) < USEFUL_PROTECTION_WINDOW;
-                // Reverse-ordered key: unprotected first, then oldest
-                // last_useful, then oldest connected_at.
-                (protected, p.last_useful, p.connected_at, *id)
+                (protected, *id)
             })
             .collect();
-        // Unprotected sort before protected; within a class, the least
-        // recently useful and longest-connected peer is the target.
-        scored.sort();
-        let worst = scored
+        // Evict-and-fill mitigation (Springer 2023: predictable inbound
+        // eviction lets an attacker pick WHICH peer leaves — freeing a
+        // slot for their own connection — and link a node's addresses
+        // at 82-97% accuracy). The choice among the unprotected set is
+        // therefore non-deterministic: an attacker can't steer which
+        // connection drops, and filling slots evicts their own links
+        // as often as honest ones. Deterministic scoring remains only
+        // as the all-protected fallback ordering.
+        let unprotected: Vec<u64> = scored
             .iter()
-            .find(|(protected, ..)| !protected)
-            .or_else(|| scored.first())
-            .map(|(.., id)| *id);
-        if let Some(id) = worst {
-            self.drop_peer(id);
+            .filter(|(protected, _)| !protected)
+            .map(|(_, id)| *id)
+            .collect();
+        let pick_from: &[u64] = if unprotected.is_empty() {
+            // All protected — fall back to the full candidate set;
+            // randomize there too so the fallback isn't steerable.
+            &scored.iter().map(|(_, id)| *id).collect::<Vec<_>>()
+        } else {
+            &unprotected
+        };
+        if pick_from.is_empty() {
+            return None;
         }
-        worst
+        let mut seed = [0u8; 8];
+        let _ = getrandom::fill(&mut seed);
+        let pick = pick_from[u64::from_le_bytes(seed) as usize % pick_from.len()];
+        self.drop_peer(pick);
+        Some(pick)
     }
 
     fn add(
