@@ -560,7 +560,9 @@ impl SnapshotRun {
         })?;
         f.seek(io::SeekFrom::Start(51))?;
         let mut out = Vec::with_capacity(self.count as usize);
-        crate::utxo_snapshot::read_coins(&mut *f, self.count, 0, |op, coin| {
+        // Whole-set iteration, not activation validation — no height
+        // bound applies here.
+        crate::utxo_snapshot::read_coins(&mut *f, self.count, u32::MAX, |op, coin| {
             out.push((op, coin));
         })
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.0))?;

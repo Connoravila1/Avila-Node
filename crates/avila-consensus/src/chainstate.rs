@@ -4421,6 +4421,12 @@ mod tests {
         // base (check the sidecar exists and the inline utxo section
         // stayed empty on flush).
         assert!(dir2.join("snapshot.path").exists());
+        // Whole-set consumers see the merged view — dumptxoutset and
+        // gettxoutsetinfo iterate through the file layer.
+        let all: std::collections::HashSet<_> = cs3.utxo().iter().into_iter().map(|(o, _)| o).collect();
+        for (op, _) in &coins {
+            assert!(all.contains(op), "iter() missed base coin {op:?}");
+        }
 
         // A second load is refused exactly like Core's double activate.
         let mut cursor = std::io::Cursor::new(&snap);
