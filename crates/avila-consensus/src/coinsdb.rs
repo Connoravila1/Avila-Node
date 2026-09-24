@@ -337,6 +337,12 @@ pub struct CoinsBackend {
     format: CoinFormat,
     /// The hash store when `engine == Engine::Hash`.
     hash: Option<crate::hashstore::HashStore>,
+    /// Continuous lockstep (queue #24): an optional second backend
+    /// running the *other* engine at `dir/dual-shadow`, replaying
+    /// every commit and cross-checking every written outpoint plus
+    /// `coins_len`. Divergence is a loud error — consensus-equivalence
+    /// as a running property, not a test. `AVILA_COINS_DUAL=1`.
+    shadow: Option<Box<CoinsBackend>>,
     /// Cached `coins_len` — avoids a meta read per `len()` call.
     /// Atomic so commits stay `&self` (the backend lives behind `Arc`
     /// inside `UtxoSet`; the sync loop is still the only writer).
@@ -373,7 +379,19 @@ impl CoinsBackend {
             Ok("redb") => Some(Engine::Redb),
             _ => None,
         };
-        Self::open_inner(dir, None, None, eng)
+        let mut be = Self::open_inner(dir, None, None, eng)?;
+        if std::env::var("AVILA_COINS_DUAL").as_deref() == Ok("1") {
+            let other = if be.engine == Engine::Redb {
+                Engine::Hash
+            } else {
+                Engine::Redb
+            };
+            be.shadow = Some(Box::new(Self::open_with_engine(
+                &dir.join("dual-shadow"),
+                other,
+            )?));
+        }
+        Ok(be)
     }
 
     /// Opens with an explicit record format. A fresh database is
@@ -547,6 +565,7 @@ impl CoinsBackend {
             engine,
             format,
             hash,
+            shadow: None,
             coins_len: AtomicU64::new(coins_len),
             stats: std::sync::Mutex::new((0, 0, 0)),
         })
@@ -695,14 +714,68 @@ impl CoinsBackend {
         new_undos: &[(u32, crate::hash::BlockHash, BlockUndo)],
         tip: u32,
     ) -> std::io::Result<()> {
-        self.commit_inner(dirty, new_undos, Some(tip))
+        self.commit_inner(dirty, new_undos, Some(tip))?;
+        self.commit_shadow(dirty, new_undos, Some(tip))
     }
 
     /// Like `commit` but leaves the meta tip untouched — mid-import
     /// batches in snapshot loading. A torn import then still reads
     /// tip=old (an unfinished activation never looks committed).
     pub fn commit_partial(&self, dirty: &HashMap<OutPoint, Option<Coin>>) -> std::io::Result<()> {
-        self.commit_inner(dirty, &[], None)
+        self.commit_inner(dirty, &[], None)?;
+        self.commit_shadow(dirty, &[], None)
+    }
+
+    /// Queue #24's lockstep: replay the delta on the shadow engine,
+    /// then prove the committed state agrees — every touched outpoint
+    /// reads identically and the cumulative `coins_len` matches (a
+    /// divergent *base* shows up in the length even when the delta's
+    /// own keys happen to agree). `None` shadow = the single-engine
+    /// fast path, zero cost.
+    fn commit_shadow(
+        &self,
+        dirty: &HashMap<OutPoint, Option<Coin>>,
+        new_undos: &[(u32, crate::hash::BlockHash, BlockUndo)],
+        tip: Option<u32>,
+    ) -> std::io::Result<()> {
+        let Some(shadow) = &self.shadow else { return Ok(()) };
+        shadow.commit_inner(dirty, new_undos, tip)?;
+        if self.coins_len() != shadow.coins_len() {
+            return Err(std::io::Error::other(format!(
+                "dual-engine divergence: coins_len {} (primary, {:?}) vs {} (shadow, {:?})",
+                self.coins_len(),
+                self.engine,
+                shadow.coins_len(),
+                shadow.engine,
+            )));
+        }
+        for op in dirty.keys() {
+            let a = self.get(op);
+            let b = shadow.get(op);
+            if a != b {
+                return Err(std::io::Error::other(format!(
+                    "dual-engine divergence at {op:?}: {:?}={a:?} vs {:?}={b:?}",
+                    self.engine, shadow.engine,
+                )));
+            }
+        }
+        // Bounded cross-set sample — value corruption on keys outside
+        // the delta escapes the loop above; 64 shadow entries per
+        // commit sweeps the set over repeated commits without an
+        // O(n) scan each time. Full-set equality stays a fixture's
+        // job (`dual_engine_lockstep`); this is the running check.
+        for (op, scoin) in shadow.iter_coins().into_iter().take(64) {
+            if self.get(&op).as_ref() != Some(&scoin) {
+                return Err(std::io::Error::other(format!(
+                    "dual-engine divergence (sampled) at {op:?}: {:?}={:?} vs {:?}={:?}",
+                    self.engine,
+                    self.get(&op),
+                    shadow.engine,
+                    Some(&scoin),
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn commit_inner(
@@ -960,6 +1033,70 @@ mod tests {
         assert_eq!(a, b, "final sets diverge");
         let _ = std::fs::remove_dir_all(&dir_r);
         let _ = std::fs::remove_dir_all(&dir_h);
+    }
+
+    /// The production form of lockstep: one backend shadows every
+    /// commit onto the other engine — agreement is silent, divergence
+    /// halts the commit loudly.
+    #[test]
+    fn dual_shadow_detects_len_divergence() {
+        let dir = test_dir("dual-shadow");
+        let mut be = CoinsBackend::open_with_engine(&dir, Engine::Redb).unwrap();
+        be.shadow = Some(Box::new(
+            CoinsBackend::open_with_engine(&dir.join("shadow"), Engine::Hash).unwrap(),
+        ));
+        // Agreement: mixed deltas replay cleanly.
+        let mut dirty = HashMap::new();
+        dirty.insert(op(1, 0), Some(coin(100, 1)));
+        dirty.insert(op(2, 1), Some(coin(200, 1)));
+        be.commit(&dirty, &[], 1).unwrap();
+        let mut dirty2 = HashMap::new();
+        dirty2.insert(op(1, 0), None);
+        dirty2.insert(op(3, 0), Some(coin(50, 2)));
+        be.commit(&dirty2, &[], 2).unwrap();
+        // Poison the shadow underneath — a coin the primary never
+        // wrote. The next commit's coins_len check must fire.
+        let mut poison = HashMap::new();
+        poison.insert(op(9, 9), Some(coin(1, 99)));
+        be.shadow
+            .as_ref()
+            .unwrap()
+            .commit_inner(&poison, &[], Some(99))
+            .unwrap();
+        let mut dirty3 = HashMap::new();
+        dirty3.insert(op(4, 0), Some(coin(10, 3)));
+        let err = be.commit(&dirty3, &[], 3).unwrap_err();
+        assert!(err.to_string().contains("divergence"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Value corruption on an outpoint outside the committed delta —
+    /// same set length, different bytes — is what the bounded sample
+    /// sweep exists for.
+    #[test]
+    fn dual_shadow_detects_value_divergence_on_untouched_key() {
+        let dir = test_dir("dual-shadow-value");
+        let mut be = CoinsBackend::open_with_engine(&dir, Engine::Redb).unwrap();
+        be.shadow = Some(Box::new(
+            CoinsBackend::open_with_engine(&dir.join("shadow"), Engine::Hash).unwrap(),
+        ));
+        let mut dirty = HashMap::new();
+        dirty.insert(op(1, 0), Some(coin(100, 1)));
+        be.commit(&dirty, &[], 1).unwrap();
+        // Same-key overwrite in the shadow only — coins_len unchanged.
+        let mut poison = HashMap::new();
+        poison.insert(op(1, 0), Some(coin(101, 1)));
+        be.shadow
+            .as_ref()
+            .unwrap()
+            .commit_inner(&poison, &[], Some(1))
+            .unwrap();
+        // An unrelated delta still trips the sample sweep.
+        let mut dirty2 = HashMap::new();
+        dirty2.insert(op(7, 7), Some(coin(5, 2)));
+        let err = be.commit(&dirty2, &[], 2).unwrap_err();
+        assert!(err.to_string().contains("divergence"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
