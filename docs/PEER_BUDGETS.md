@@ -49,11 +49,10 @@ is disconnected; no row may be bypassed by message ordering or rate.
 - CPU per peer during message dispatch — measured but not enforced
   per-peer; a pathological message could cost disproportionate
   validate work before the frame budget trips it.
-- Recon bisection depth under adversarial sketches — rounds are
-  bounded but worst-case sketch sizes need a hard cap.
-- `getcfilters`/`getcfheaders`/`getcfcheckpt` request ranges are
-  capped (1,000/2,000 entries) but repeated legal requests cost
-  disk reads with no per-peer rate limit.
+- ~~Recon bisection depth~~ — sketch wire size capped at 2,048
+  fields; rounds are bounded by the 2-sketch half-pool close.
+- ~~getcf* rate limiting~~ — 1 req/s + burst 20 token bucket;
+  exhausted peers are silently unserved.
 
 These rows are the honest gaps — closing them is queue work, not a
 claim made before it exists.
