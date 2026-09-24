@@ -298,3 +298,49 @@ first measurement that would kill or confirm it.
     malformed messages, floods, slowloris — measure per-peer budgets
     hold under sustained attack. Kill: a hostile peer can starve
     honest peers — find the hole now.
+
+35. **Signing core.** The wallet becomes a signer: a real
+    `SigningProvider` over an encrypted-at-rest key store feeding the
+    existing `SignStep`/`SignPSBTInput` port — `signpsbt`,
+    `sendtoaddress`, `walletcreatefundedpsbt` become real. Descriptors
+    in, PSBT out; everything below builds on this. Kill: none —
+    foundational.
+
+36. **UTXO-verified signing + signing receipts.** The differentiator:
+    the signer checks every PSBT prevout claim against the node's own
+    *verified* UTXO set — the LSB-010 fee-attack class solved
+    structurally (Trezor's fix requires full prevtxs; we have the
+    chain). Every sign emits a receipt: sighash, checked amounts,
+    fee delta. Hypothesis: a node-attached signer can enforce
+    no-unverified-amounts without prevtx bloat. Kill: none — the
+    property is enforceable by construction; measure the UX cost.
+
+37. **Entropy ceremony.** Coldcard-convention dice input (SHA256 over
+    ASCII roll digits; 99 rolls = 256 bits, 50 = 128, face-frequency
+    check >30% warns), multi-source XOR mixing (OS CSPRNG + user
+    entropy + optional external), commit-before-generate provenance
+    recorded in the wallet and surfaced in `getwalletinfo`. Milk Sad
+    is the cautionary tale (mt19937+time → 32-bit space). Kill: none —
+    this is the purist trust boundary; get it right or don't ship.
+
+38. **Fingerprint self-measurement.** Run the published wallet-
+    fingerprint taxonomy (BIP69 ordering, anti-fee-sniping nLockTime,
+    nSequence value, low-R grinding, coin-selection shape, change
+    position — ~50% single-tx identification accuracy in the
+    literature) against our own tx construction. Configurable
+    fingerprint policy: mimic-dominant vs strict-uniform. Hypothesis:
+    we can measure and control attribution signal; a distinctive
+    construction is itself a tell. Kill: no policy meaningfully lowers
+    measured identifiability — report that too.
+
+39. **Signer process boundary.** The key store + signer in a separate
+    process with a narrow IPC (PSBT in, signed PSBT out); the P2P
+    process holds no key material. Same kernel — defense-in-depth, not
+    airgap — but ahead of shipped Core multiprocess. Hypothesis: full
+    compromise of the wire parser still can't reach keys; measure the
+    IPC signing latency. Kill: latency breaks interactive use.
+
+40. **Deferred-deps wallet work.** MuSig2 key-path multisig
+    (rust-secp256k1 `musig` module — needs bump from our 0.29),
+    silent-payments *send* (libsecp sender API), Payjoin sender
+    (BIP78/77). Queue only after 35–37 land.
