@@ -274,4 +274,62 @@ mod tests {
         assert!(decode(&[1, 1, 0xfc], 1).is_err()); // padding
         assert!(decode(&[1, 1, 3, 4], 1).is_err()); // escape
     }
+
+    #[test]
+    fn reader_lookahead_and_recovery() {
+        let path =
+            std::env::temp_dir().join(format!("avila-advice-recovery-{}", std::process::id()));
+        let mut file = File::create(&path).unwrap();
+        file.write_all(MAGIC).unwrap();
+        write_frame(&mut file, &[2; 32], &[vec![1]]).unwrap();
+        // A bounded but malformed body must not poison the following frame.
+        file.write_all(&[3; 32]).unwrap();
+        file.write_all(&3u32.to_le_bytes()).unwrap();
+        file.write_all(&[1, 1, 0xfc]).unwrap();
+        write_frame(&mut file, &[4; 32], &[vec![0]]).unwrap();
+        drop(file);
+        let mut reader = Reader::open(&path).unwrap();
+        assert!(reader.block(&[1; 32], 1).is_none());
+        assert_eq!(reader.block(&[2; 32], 1).unwrap().hints, vec![vec![1]]);
+        assert!(reader.block(&[3; 32], 1).is_none());
+        assert_eq!(reader.block(&[4; 32], 1).unwrap().hints, vec![vec![0]]);
+        assert!(reader.block(&[5; 32], 1).is_none());
+        assert_eq!(
+            (
+                reader.stats.frames,
+                reader.stats.rejected,
+                reader.stats.missed
+            ),
+            (2, 1, 2)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn streams_past_the_old_whole_file_limit() {
+        let path = std::env::temp_dir().join(format!("avila-advice-large-{}", std::process::id()));
+        let hints = vec![vec![3; 80_000]; 6]; // bounded escapes exercise the largest encoding
+        let mut file = std::io::BufWriter::new(File::create(&path).unwrap());
+        file.write_all(MAGIC).unwrap();
+        for i in 0..58u64 {
+            let mut hash = [0; 32];
+            hash[..8].copy_from_slice(&i.to_le_bytes());
+            write_frame(&mut file, &hash, &hints).unwrap();
+        }
+        file.flush().unwrap();
+        drop(file);
+        assert!(std::fs::metadata(&path).unwrap().len() > 32 << 20);
+        let mut reader = Reader::open(&path).unwrap();
+        for i in 0..58u64 {
+            let mut hash = [0; 32];
+            hash[..8].copy_from_slice(&i.to_le_bytes());
+            let frame = reader.block(&hash, 6).unwrap();
+            assert_eq!(frame.hints, hints);
+            assert_eq!(Arc::strong_count(&frame), 1);
+            assert!(reader.next.is_none()); // Reader retains neither prior nor decoded frames.
+        }
+        assert_eq!(reader.stats.frames, 58);
+        assert_eq!(reader.stats.rejected, 0);
+        std::fs::remove_file(path).unwrap();
+    }
 }

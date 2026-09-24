@@ -56,12 +56,23 @@ testing: 200 *consecutive* extra ids gave a low-degree spurious
 explanation, which is exactly why BIP-330 verifies decoded ids
 against real pools and keeps the bisect path).
 
+## Update 2 — live in the node (same day)
+
+Session now sends `sendrecon` in the version-reply burst (unknown-
+command-safe against non-recon peers) and records the peer's caps.
+`PeerManager` opens a sketch round every ~4s per negotiated link
+(`recon_pass`), answers inbound `reqrecon` with `sketch` +
+`reconcildiff`, serves asked bodies via the short-id → txid pool map,
+and ships its own misses as `tx`. Manager-level tests cover both
+sides: responder replies sketch+reconcildiff for the peer's 3 missing
+ids; initiator opens a round when due.
+
 ## Verdict
 
-The primitive + round layer are real and tested; remaining work is
-manager/session integration (recon scheduling, `sendrecon` during
-negotiation, decoded-miss → `getdata`/`tx` wiring) — plus interop
-reality: no live peers speak it yet, so it's intra-Avila first.
+The primitive + round layer + live scheduling are real and tested.
+Remaining: an end-to-end two-node run with real mempool traffic,
+`reqbisec` fallback behavior, and interop (no external peers speak
+BIP-330 — intra-Avila first, Knots if they merge it).
 
 Worth noting: a pure-Rust, no-FFI minisketch + recon layer is itself
 an artifact the ecosystem doesn't have — Core bundles the C++ library.

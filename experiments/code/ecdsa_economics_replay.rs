@@ -7,8 +7,8 @@ use avila_consensus::{
 use std::path::Path;
 use std::time::Instant;
 
-mod ecdsa_parallel_rollback;
 mod ecdsa_stream_cases;
+mod ecdsa_stream_rollback;
 
 fn take<'a>(data: &mut &'a [u8], count: usize) -> Result<&'a [u8], String> {
     if count > data.len() {
@@ -170,6 +170,12 @@ fn pack_replay(mut raw: &[u8], kind: &str, output: &Path) -> Result<Outcome, Str
             }
             let block = Block::decode(take(&mut raw, size)?).map_err(|e| e.to_string())?;
             take(&mut raw, undo)?;
+            if kind != "scripts"
+                && block.header.prev_block_hash == avila_consensus::hash::BlockHash::ZERO
+            {
+                // Chainstate already starts at genesis: no Script jobs consume this frame.
+                continue;
+            }
             advice::pack_transactions(
                 &mut writer,
                 block.block_hash().as_bytes(),
@@ -194,13 +200,13 @@ fn main() {
     assert_eq!(
         args.len(),
         10,
-        "usage: parallel <chain|scripts|cases> <corpus> <baseline|capture|candidate> <sidecar> <worker> <batch> <minimum> <group-jobs> <ram|fresh-directory>"
+        "usage: economics <chain|scripts|cases|rollback> <corpus> <baseline|capture|candidate|stream|produce|pack> <sidecar> <worker> <batch> <minimum> <group-jobs> <ram|fresh-directory|packed-output>"
     );
     assert!(std::fs::metadata(&args[2]).unwrap().len() <= 256 << 20);
     let raw = std::fs::read(&args[2]).unwrap();
     let start = Instant::now();
-    let sidecar = if args[1] == "rollback" && args[3] == "candidate" {
-        ecdsa_parallel_rollback::advice_for_invalid(&raw, Path::new(&args[4])).unwrap()
+    let sidecar = if args[1] == "rollback" && matches!(args[3].as_str(), "candidate" | "stream") {
+        ecdsa_stream_rollback::advice_for_invalid(&raw, Path::new(&args[4])).unwrap()
     } else {
         std::path::PathBuf::from(&args[4])
     };
@@ -220,7 +226,7 @@ fn main() {
             "chain" => chain_replay(&raw, &args[9]),
             "scripts" => scripts_replay(&raw),
             "cases" => ecdsa_stream_cases::run(),
-            "rollback" => ecdsa_parallel_rollback::run(&raw),
+            "rollback" => ecdsa_stream_rollback::run(&raw),
             _ => panic!("workload"),
         }
     };

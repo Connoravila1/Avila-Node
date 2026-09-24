@@ -83,12 +83,14 @@ impl ReconRound {
         )
     }
 
-    /// Responder side: merge the initiator's sketch against `our_ids`,
-    /// decode the symmetric difference, and answer with a `sketch` of
-    /// our own (so the initiator can learn its misses too) plus the
-    /// split outcome for the caller to act on.
+    /// Responder side (stateless — needs only the responder's own
+    /// pool): merge the initiator's sketch against `our_ids`, decode
+    /// the symmetric difference, and answer with a `sketch` of our own
+    /// (so the initiator can learn its misses too). Attribution needs
+    /// no knowledge of the initiator's set: a decoded id in `our_ids`
+    /// is the initiator's miss; anything else is our own miss.
     #[must_use]
-    pub fn answer(&self, their_sketch_bytes: &[u8], our_ids: &[u32]) -> Option<(Message, RoundOutcome)> {
+    pub fn respond(their_sketch_bytes: &[u8], our_ids: &[u32]) -> Option<(Message, RoundOutcome)> {
         let mut merged = Sketch::deserialize(their_sketch_bytes)?;
         let mut ours = Sketch::new(merged.capacity());
         for &id in our_ids {
@@ -102,13 +104,11 @@ impl ReconRound {
         let ours_set: std::collections::HashSet<u32> = our_ids.iter().copied().collect();
         let (mut responder_misses, mut initiator_misses) = (Vec::new(), Vec::new());
         for id in diff {
-            if self.initiator_ids.contains(&id) {
-                responder_misses.push(id);
-            } else if ours_set.contains(&id) {
+            if ours_set.contains(&id) {
                 initiator_misses.push(id);
+            } else {
+                responder_misses.push(id);
             }
-            // An id in neither set cannot occur — the merged sketch's
-            // difference is drawn from the two input sets by definition.
         }
         Some((reply, RoundOutcome {
             responder_misses,
@@ -189,7 +189,7 @@ mod tests {
         let Message::ReqRecon(their_sk) = req else {
             panic!("expected reqrecon")
         };
-        let (reply, outcome) = round.answer(&their_sk, &b).expect("decode");
+        let (reply, outcome) = ReconRound::respond(&their_sk, &b).expect("decode");
         // Responder learns it is missing the 3 A-only ids.
         assert_eq!(outcome.responder_misses.len(), 3);
         assert_eq!(outcome.initiator_misses.len(), 2);
@@ -218,7 +218,8 @@ mod tests {
         let Message::ReqRecon(their_sk) = req else {
             panic!("expected reqrecon")
         };
-        if let Some((_reply, outcome)) = round.answer(&their_sk, &b) {
+        let _ = round;
+        if let Some((_reply, outcome)) = ReconRound::respond(&their_sk, &b) {
             for id in &outcome.responder_misses {
                 assert!(a_set.contains(id), "responder miss {id:#x} not in A");
             }

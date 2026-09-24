@@ -73,6 +73,10 @@ pub struct PeerInfo {
     pub wtxid_relay: bool,
     /// Whether the peer understands BIP155 addrv2.
     pub addrv2: bool,
+    /// The peer's BIP330 reconciliation negotiation, if it sent
+    /// `sendrecon` during the handshake — `None` means the link runs
+    /// ordinary inv/getdata tx relay only.
+    pub recon: Option<crate::message::SendRecon>,
 }
 
 /// Wire telemetry for one session — what `getpeerinfo` reports. Bytes
@@ -180,6 +184,9 @@ pub struct PeerSession<S> {
     send_buf: VecDeque<u8>,
     state: Handshake,
     our_version: Version,
+    /// The salt we advertised in `sendrecon` — derived from the session
+    /// id + our version nonce so each link's short-ids differ.
+    recon_salt: u64,
     /// Whether we initiated the connection (Core's outbound vs inbound).
     outbound: bool,
     peer: Option<PeerInfo>,
@@ -290,6 +297,8 @@ impl<S: Read + Write> PeerSession<S> {
         send_budget: usize,
         outbound: bool,
     ) -> Self {
+        let session_id = next_session_id();
+        let recon_salt = session_id ^ our_version.nonce;
         Self {
             stream,
             magic,
@@ -302,13 +311,21 @@ impl<S: Read + Write> PeerSession<S> {
             connected_at: Instant::now(),
             telemetry: SessionTelemetry {
                 connected: wall_epoch(),
-                session_id: next_session_id(),
+                session_id,
                 ..SessionTelemetry::default()
             },
             send_budget,
             clock: wall_epoch,
             v2: None,
+            recon_salt,
         }
+    }
+
+    /// The salt this session advertised in `sendrecon` — the manager
+    /// combines it with the peer's to key link short-ids.
+    #[must_use]
+    pub fn recon_salt(&self) -> u64 {
+        self.recon_salt
     }
 
     /// Swaps the telemetry clock — the manager calls this at
@@ -531,6 +548,7 @@ impl<S: Read + Write> PeerSession<S> {
                     relay: v.relay,
                     wtxid_relay: false,
                     addrv2: false,
+                    recon: None,
                 });
                 // ProcessMessage(VERSION)'s reply burst: inbound answers
                 // with our version first, then negotiation + verack.
@@ -539,6 +557,14 @@ impl<S: Read + Write> PeerSession<S> {
                 }
                 self.send(&Message::WtxidRelay)?;
                 self.send(&Message::SendAddrV2)?;
+                self.send(&Message::SendRecon(crate::message::SendRecon {
+                    is_sender: true,
+                    is_responder: true,
+                    version: crate::recon::RECON_VERSION,
+                    // Per-connection salt — session id mixes process
+                    // entropy so a peer cannot precompute short-ids.
+                    salt: self.recon_salt,
+                }))?;
                 self.send(&Message::Verack)?;
                 self.state = Handshake::AwaitVerack;
                 Ok(Some(SessionEvent::Message(Message::Version(v))))
@@ -568,6 +594,15 @@ impl<S: Read + Write> PeerSession<S> {
                 }
                 if let Some(p) = &mut self.peer {
                     p.addrv2 = true;
+                }
+                Ok(None)
+            }
+            (_, Message::SendRecon(r)) => {
+                if self.state == Handshake::Done {
+                    return Err(SessionError::LateNegotiation);
+                }
+                if let Some(p) = &mut self.peer {
+                    p.recon = Some(r);
                 }
                 Ok(None)
             }
@@ -686,7 +721,7 @@ mod tests {
         let events = us.poll().unwrap();
         let peer_sent = testpipe::drain(&mut peer_end, MAGIC);
         let names: Vec<&str> = peer_sent.iter().map(|m| m.command_name()).collect();
-        assert_eq!(names, ["wtxidrelay", "sendaddrv2", "verack"]);
+        assert_eq!(names, ["wtxidrelay", "sendaddrv2", "sendrecon", "verack"]);
         assert!(!us.established());
 
         testpipe::inject(&mut peer_end, MAGIC, &Message::Verack);
@@ -712,7 +747,7 @@ mod tests {
         let events = us.poll().unwrap();
         let sent = testpipe::drain(&mut peer_end, MAGIC);
         let names: Vec<&str> = sent.iter().map(|m| m.command_name()).collect();
-        assert_eq!(names, ["version", "wtxidrelay", "sendaddrv2", "verack"]);
+        assert_eq!(names, ["version", "wtxidrelay", "sendaddrv2", "sendrecon", "verack"]);
         assert!(matches!(
             events[0],
             SessionEvent::Message(Message::Version(_))
