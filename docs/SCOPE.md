@@ -35,6 +35,26 @@ Best by every metric is the direction of work, not a provable permanent ranking.
 Correctness and privacy evidence has a stated scope; faster code does not compensate
 for missing checks. There are no measured node-performance results in this scaffold.
 
+## Bitcoin only
+
+This project is a Bitcoin node. Only Bitcoin.
+
+- No support for other blockchains, assets, tokens, or alternate
+  consensus networks — not as features, not as integrations, not as
+  optional modes, not as "prepared" abstractions.
+- No infrastructure that treats contested forks or alternate rulesets
+  as legitimate parallel chains. There is one Bitcoin; a node's job
+  during a split is to follow the strongest valid chain under Bitcoin's
+  rules, not to evaluate rival ledgers.
+- Bitcoin test networks (regtest, signet, testnet4) are in scope —
+  they exist to test Bitcoin.
+- Differential testing against other Bitcoin implementations (Core,
+  Knots, btcd) and shadow comparison of Bitcoin mempool *policy* are
+  in scope — they measure this node's fidelity to Bitcoin.
+- The test for any proposed work: does it serve a Bitcoin node's
+  correctness, performance, privacy, or usability? If it serves another
+  asset or chain — in any form — it is out.
+
 ## Product requirements
 
 - Independently validate Bitcoin blocks and transactions, select the strongest
