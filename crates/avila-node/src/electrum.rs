@@ -58,6 +58,11 @@ struct SubCell {
     /// Set by the waiter's check closure when the status changed —
     /// the pump drains it into a notification.
     dirty: bool,
+    /// True when the last `waiters.register` call for this cell was
+    /// turned away (the node-wide `BlockWaiters` cap was full) — no
+    /// check is running against it, so the pump polls it directly each
+    /// tick instead of waiting on a wake that will never come.
+    polling: bool,
 }
 
 /// Shared, mutable connection state — the pump thread and the reader
@@ -390,6 +395,12 @@ fn pump_notifications(
         )
     };
     for (sh, cell) in subs {
+        // No waiter is watching this cell (its last registration hit
+        // the node-wide cap) — poll it directly on this tick rather
+        // than wait on a wake that will never come.
+        if cell.lock().map(|c| c.polling).unwrap_or(false) {
+            poll_script(queries, sh, &cell);
+        }
         let fired = cell.lock().map(|c| c.dirty).unwrap_or(false);
         if !fired {
             continue; // its waiter is still parked — no re-register
@@ -407,10 +418,14 @@ fn pump_notifications(
             });
             send(state, &note);
         }
-        // The waiter consumed itself when it fired — park a fresh one.
+        // The waiter consumed itself when it fired — park a fresh one
+        // (or, if the cap is still full, fall back to polling again).
         reregister_script(sh, &cell, waiters, wake_tx.clone());
     }
     if let Some(cell) = headers {
+        if cell.lock().map(|c| c.polling).unwrap_or(false) {
+            poll_headers(queries, &cell);
+        }
         let fired = cell.lock().map(|c| c.dirty).unwrap_or(false);
         if fired {
             if let Ok(mut c) = cell.lock() {
@@ -438,24 +453,73 @@ fn pump_notifications(
     }
 }
 
+/// Recomputes `sh`'s status against the live chain and marks its cell
+/// dirty on a change — the same comparison a registered waiter's check
+/// would run, driven instead by the pump's own tick because the last
+/// `waiters.register` attempt found the node-wide cap full.
+fn poll_script(queries: &QuerySender, sh: [u8; 32], cell: &Arc<Mutex<SubCell>>) {
+    let new = full_status(queries, &sh);
+    if let Ok(mut c) = cell.lock()
+        && c.confirmed_status != new
+    {
+        c.confirmed_status = new;
+        c.dirty = true;
+    }
+}
+
+/// `poll_script`'s counterpart for `blockchain.headers.subscribe`.
+fn poll_headers(queries: &QuerySender, cell: &Arc<Mutex<SubCell>>) {
+    let (query, rx) = crate::rpc::ChainQuery::new(move |cs, _mgr| Ok(json!(header_status(cs))));
+    if queries.send(query).is_err() {
+        return;
+    }
+    let Ok(Ok(new)) = rx.recv_timeout(Duration::from_secs(5)) else {
+        return;
+    };
+    let new = new.as_str().map(str::to_string);
+    if let Ok(mut c) = cell.lock()
+        && c.confirmed_status != new
+    {
+        c.confirmed_status = new;
+        c.dirty = true;
+    }
+}
+
+/// The current tip's `"hex:height"` status string — what
+/// `blockchain.headers.subscribe` compares across ticks.
+fn header_status(cs: &Chainstate) -> String {
+    let tip = cs.tip_hash();
+    let height = cs.chain().len() as i64 - 1;
+    let hex_hdr = cs
+        .tree()
+        .get(&tip)
+        .map(|n| hex::encode(&n.header.encode()))
+        .unwrap_or_default();
+    format!("{hex_hdr}:{height}")
+}
+
 /// Registers a script subscription's waiter — the check recomputes
 /// the status hash against the live chainstate and fires when it
-/// differs from what the client was last told.
+/// differs from what the client was last told. `BlockWaiters::register`
+/// can turn the registration away once the node-wide cap (rpc.rs's
+/// `MAX_BLOCK_WAITERS`) is full; rather than silently drop the
+/// subscription's updates, that marks the cell for direct polling on
+/// the pump's own tick until a slot frees up.
 fn reregister_script(
     sh: [u8; 32],
     cell: &Arc<Mutex<SubCell>>,
     waiters: &Arc<BlockWaiters>,
     wake_tx: mpsc::SyncSender<()>,
 ) {
-    let cell = cell.clone();
-    waiters.register(
+    let check_cell = cell.clone();
+    let armed = waiters.register(
         Box::new(move |cs: &Chainstate, mp: &avila_mempool::Mempool| {
             // The full Electrum status — confirmed history plus
             // mempool rows — so a mempool tx touching the script fires
             // the subscription without waiting for a block.
             let entries = history_entries(cs, mp, &sh).unwrap_or_default();
             let new = status_hash(&entries);
-            let Ok(mut c) = cell.lock() else {
+            let Ok(mut c) = check_cell.lock() else {
                 return false;
             };
             if c.confirmed_status != new {
@@ -468,25 +532,22 @@ fn reregister_script(
         }),
         wake_tx,
     );
+    if let Ok(mut c) = cell.lock() {
+        c.polling = !armed;
+    }
 }
 
+/// [`reregister_script`]'s counterpart for `blockchain.headers.subscribe`.
 fn reregister_headers(
     cell: &Arc<Mutex<SubCell>>,
     waiters: &Arc<BlockWaiters>,
     wake_tx: mpsc::SyncSender<()>,
 ) {
-    let cell = cell.clone();
-    waiters.register(
+    let check_cell = cell.clone();
+    let armed = waiters.register(
         Box::new(move |cs: &Chainstate, _mp: &avila_mempool::Mempool| {
-            let tip = cs.tip_hash();
-            let height = cs.chain().len() as i64 - 1;
-            let hex_hdr = cs
-                .tree()
-                .get(&tip)
-                .map(|n| hex::encode(&n.header.encode()))
-                .unwrap_or_default();
-            let new = format!("{hex_hdr}:{height}");
-            let Ok(mut c) = cell.lock() else {
+            let new = header_status(cs);
+            let Ok(mut c) = check_cell.lock() else {
                 return false;
             };
             if c.confirmed_status.as_deref() != Some(new.as_str()) {
@@ -499,6 +560,9 @@ fn reregister_headers(
         }),
         wake_tx,
     );
+    if let Ok(mut c) = cell.lock() {
+        c.polling = !armed;
+    }
 }
 
 fn dispatch(
@@ -540,6 +604,7 @@ fn dispatch(
             let cell = Arc::new(Mutex::new(SubCell {
                 confirmed_status: None,
                 dirty: false,
+                polling: false,
             }));
             let cell2 = cell.clone();
             if let Ok(mut st) = state.lock() {
@@ -623,6 +688,7 @@ fn dispatch(
             let cell = Arc::new(Mutex::new(SubCell {
                 confirmed_status: None,
                 dirty: false,
+                polling: false,
             }));
             let cell2 = cell.clone();
             if let Ok(mut st) = state.lock() {
@@ -1490,5 +1556,181 @@ mod tests {
         cancel.store(true, Ordering::Relaxed);
         assert_eq!(rejected, 4, "accepted={accepted} rejected={rejected}");
         assert_eq!(accepted, MAX_CONNECTIONS);
+    }
+
+    /// A registration the node-wide waiter cap turns away must not
+    /// leave the subscription dark — the cell falls back to polling.
+    #[test]
+    fn reregister_falls_back_to_polling_when_waiters_are_full() {
+        let waiters = Arc::new(BlockWaiters::new());
+        let (dummy_tx, _dummy_rx) = mpsc::sync_channel::<()>(1);
+        for _ in 0..256 {
+            assert!(waiters.register(Box::new(|_cs, _mp| false), dummy_tx.clone()));
+        }
+        assert!(
+            !waiters.register(Box::new(|_cs, _mp| false), dummy_tx.clone()),
+            "the cap (256) must already be full"
+        );
+
+        let (wake_tx, _wake_rx) = mpsc::sync_channel::<()>(1);
+        let script_cell = Arc::new(Mutex::new(SubCell {
+            confirmed_status: None,
+            dirty: false,
+            polling: false,
+        }));
+        reregister_script([7u8; 32], &script_cell, &waiters, wake_tx.clone());
+        assert!(
+            script_cell.lock().unwrap().polling,
+            "a full cap must flip the script cell to polling"
+        );
+
+        let headers_cell = Arc::new(Mutex::new(SubCell {
+            confirmed_status: None,
+            dirty: false,
+            polling: false,
+        }));
+        reregister_headers(&headers_cell, &waiters, wake_tx);
+        assert!(
+            headers_cell.lock().unwrap().polling,
+            "a full cap must flip the headers cell to polling"
+        );
+    }
+
+    /// End-to-end: even with the node-wide waiter cap exhausted, a
+    /// scripthash subscription must still see a mempool payment — the
+    /// pump's own polling fallback stands in for the missing waiter.
+    #[test]
+    fn scripthash_subscription_polls_when_waiter_cap_is_full() {
+        let params = Network::Regtest.params();
+        let mut cs = Chainstate::new(&params);
+        cs.enable_scripthashindex(None).unwrap();
+        let b1 = block_on(&params.genesis_header, vec![cb(1)], &params);
+        cs.accept_block(&b1, 1_700_000_000).unwrap();
+        let mut parent = b1.header;
+        for h in 2..=101u32 {
+            let b = block_on(&parent, vec![cb(h)], &params);
+            cs.accept_block(&b, 1_700_000_000 + h).unwrap();
+            parent = b.header;
+        }
+
+        let waiters = Arc::new(BlockWaiters::new());
+        // Exhaust the node-wide cap (MAX_BLOCK_WAITERS = 256, rpc.rs)
+        // with waiters that never fire, so this subscription's own
+        // registration is guaranteed to be turned away.
+        let (dummy_tx, _dummy_rx) = mpsc::sync_channel::<()>(1);
+        for _ in 0..256 {
+            assert!(waiters.register(Box::new(|_cs, _mp| false), dummy_tx.clone()));
+        }
+
+        let (qtx, qrx) = mpsc::channel::<crate::rpc::ChainQuery>();
+        let waiters2 = waiters.clone();
+        let mut mgr = PeerManager::new(4);
+        let mut rescans = std::collections::VecDeque::new();
+        thread::spawn(move || {
+            loop {
+                match qrx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(q) => q.answer(&mut cs, &mut mgr, &mut rescans),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        waiters2.notify(&cs, mgr.mempool());
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+
+        let status = empty_status();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (qtx2, waiters3, status2, cancel2) =
+            (qtx.clone(), waiters.clone(), status.clone(), cancel.clone());
+        thread::spawn(move || {
+            while !cancel2.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((s, _)) => {
+                        let q = qtx2.clone();
+                        let w = waiters3.clone();
+                        let st = status2.clone();
+                        let c = cancel2.clone();
+                        thread::spawn(move || handle(s, q, w, st, c));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let conn = TcpStream::connect(addr).unwrap();
+        let mut wr = conn.try_clone().unwrap();
+        let mut send = |v: Value| {
+            wr.write_all(format!("{}\n", serde_json::to_string(&v).unwrap()).as_bytes())
+                .unwrap();
+        };
+        let mut rd = BufReader::new(conn);
+        rd.get_ref()
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let read = |rd: &mut BufReader<TcpStream>| -> Value {
+            let mut line = String::new();
+            rd.read_line(&mut line).unwrap();
+            serde_json::from_str(&line).unwrap()
+        };
+
+        let watch_spk = vec![0x51u8, 0x03];
+        let watch_sh = sha256(&watch_spk);
+        send(
+            json!({"jsonrpc":"2.0","id":1,"method":"blockchain.scripthash.subscribe","params":[format_scripthash(&watch_sh)]}),
+        );
+        let r = read(&mut rd);
+        assert!(r["result"].is_null(), "fresh script: {r}");
+
+        let mtx = Transaction {
+            version: 2,
+            inputs: vec![avila_consensus::transaction::TxIn {
+                previous_output: OutPoint {
+                    txid: b1.transactions[0].txid(),
+                    vout: 0,
+                },
+                script_sig: Script::new(vec![]),
+                sequence: SEQUENCE_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: vec![avila_consensus::transaction::TxOut {
+                value: 1_000,
+                script_pubkey: Script::new(watch_spk.clone()),
+            }],
+            lock_time: 0,
+        };
+        let (q, rx2) = crate::rpc::ChainQuery::new(move |cs, mgr| {
+            mgr.mempool()
+                .accept_tx(mtx, cs, 1_700_000_100)
+                .unwrap_or_else(|e| panic!("mature coinbase spend must accept: {e:?}"));
+            Ok(serde_json::json!(null))
+        });
+        qtx.send(q).unwrap();
+        let _ = rx2.recv();
+
+        let mut got_push = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let mut line = String::new();
+            if rd.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let m: Value = serde_json::from_str(&line).unwrap();
+            if m["method"] == "blockchain.scripthash.subscribe" {
+                assert!(m["params"][1].is_string(), "push: {m}");
+                got_push = true;
+                break;
+            }
+        }
+        assert!(
+            got_push,
+            "a full waiter cap must not silence the subscription"
+        );
+        cancel.store(true, Ordering::Relaxed);
     }
 }
