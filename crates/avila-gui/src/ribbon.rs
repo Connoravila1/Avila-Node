@@ -310,11 +310,16 @@ pub fn show(
             r.right() >= band.right() - 0.5,
         )
     };
+    let julia = crate::julia::on();
+    let mut proven_edge = None;
     for span in cov.proven.iter().filter(|s| s.blocks() > 0) {
         if let Some(r) = seg(*span, 2.0) {
             p.rect_filled(r, ends(r), pal.signal);
             if pal.chunky {
                 chunks(&p, r, &pal);
+            }
+            if julia {
+                crate::julia::candy(&p, r);
             }
         }
     }
@@ -365,10 +370,26 @@ pub fn show(
     }
     let replay = trust.snapshot.as_ref().filter(|s| !s.proven);
     if let Some(s) = replay {
-        p.vline(
-            x(s.replayed.min(s.base)),
-            (band.top() - 5.0)..=(band.bottom() + 5.0),
-            Stroke::new(2.0, pal.text),
+        let at = x(s.replayed.min(s.base));
+        if julia {
+            // Julia ties a bow where the replay has got to.
+            p.vline(at, band.y_range(), Stroke::new(2.0, pal.signal_text));
+            proven_edge = Some(pos2(at, band.top()));
+        } else {
+            p.vline(
+                at,
+                (band.top() - 5.0)..=(band.bottom() + 5.0),
+                Stroke::new(2.0, pal.text),
+            );
+        }
+    }
+    if let Some(edge) = proven_edge {
+        crate::julia::bow(
+            ui.painter(),
+            edge + vec2(0.0, 1.0),
+            (opts.band * 1.5).clamp(18.0, 30.0),
+            pal.signal,
+            pal.signal_text,
         );
     }
     if let Some(f) = opts.pulse.filter(|f| (0.0..1.0).contains(f)) {

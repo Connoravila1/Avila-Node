@@ -55,6 +55,8 @@ pub struct Pose {
     pub skin: Skin,
     /// Let the game play itself for a while.
     pub play: bool,
+    /// Open a finished game.
+    pub over: bool,
     pub desk: Desk,
     /// Pointer steps to play once posed: open a menu, hover an item.
     pub pointer: &'static [Step],
@@ -113,6 +115,7 @@ impl Capture {
             advanced: false,
             skin: Skin::Standard,
             play: false,
+            over: false,
             desk: Desk::Window,
             pointer: &[],
         };
@@ -137,6 +140,10 @@ impl Capture {
         };
         let xp = |page| Pose {
             skin: Skin::Xp,
+            ..pose(page)
+        };
+        let julia = |page| Pose {
+            skin: Skin::Julia,
             ..pose(page)
         };
         for (theme, pose, size, name) in [
@@ -265,6 +272,46 @@ impl Capture {
                 },
                 FULL,
                 "-julia",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    scroll: 600.0,
+                    ..pose(Page::Settings)
+                },
+                FULL,
+                "-appearance",
+            ),
+            (Theme::Light, pose(Page::Toybox), FULL, ""),
+            (Theme::Dark, pose(Page::Toybox), FULL, ""),
+            (
+                Theme::Light,
+                Pose {
+                    over: true,
+                    ..pose(Page::Toybox)
+                },
+                FULL,
+                "-over",
+            ),
+            (Theme::Light, julia(Page::Chain), FULL, "-julia"),
+            (
+                Theme::Light,
+                Pose {
+                    advanced: true,
+                    ..julia(Page::Settings)
+                },
+                FULL,
+                "-julia",
+            ),
+            (Theme::Light, julia(Page::Toybox), FULL, "-julia"),
+            (
+                Theme::Light,
+                Pose {
+                    play: true,
+                    ..julia(Page::Toybox)
+                },
+                FULL,
+                "-julia-play",
             ),
             (Theme::Dark, pose(Page::Overview), SMALL, "-small"),
             (Theme::Light, pose(Page::Peers), SMALL, "-small"),

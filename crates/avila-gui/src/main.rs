@@ -6,6 +6,7 @@ mod clock;
 mod constellation;
 mod demo;
 mod fingerprint;
+mod julia;
 mod model;
 mod pages;
 mod prefs;

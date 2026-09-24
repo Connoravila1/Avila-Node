@@ -333,12 +333,21 @@ impl Constellation {
                 }
             }
         };
+        let hearts = crate::julia::on();
         let dot = |p: &eframe::egui::Painter, s: &Star, ink: Color32, halo: bool| {
             let c = at(s);
             if halo {
                 p.circle_filled(c, s.look.size + 6.0, ink.gamma_multiply(0.14));
             }
-            if s.look.inbound {
+            if hearts {
+                let size = s.look.size * 2.3;
+                if s.look.inbound {
+                    crate::julia::heart(p, c, size, pal.canvas);
+                    crate::julia::heart_outline(p, c, size, Stroke::new(1.5, ink));
+                } else {
+                    crate::julia::heart(p, c, size, ink);
+                }
+            } else if s.look.inbound {
                 p.circle_filled(c, s.look.size, pal.canvas);
                 p.circle_stroke(c, s.look.size - 0.75, Stroke::new(1.5, ink));
             } else {
@@ -384,6 +393,15 @@ impl Constellation {
 
         // This node: the logo itself.
         p.circle_filled(center, 15.0, pal.signal);
+        if hearts {
+            crate::julia::bow(
+                &p,
+                center + vec2(0.0, -17.0),
+                20.0,
+                pal.signal,
+                pal.signal_text,
+            );
+        }
         if let Some(tex) = swirl {
             p.image(
                 tex.id(),
@@ -556,8 +574,14 @@ pub fn legend(ui: &mut Ui) {
                     p.line_segment([a - vec2(0.0, 1.8), b - vec2(0.0, 1.8)], s);
                     p.line_segment([a + vec2(0.0, 1.8), b + vec2(0.0, 1.8)], s);
                 }
+                3 if crate::julia::on() => {
+                    crate::julia::heart(p, r.center(), 11.0, pal.text);
+                }
                 3 => {
                     p.circle_filled(r.center(), 4.5, pal.text);
+                }
+                _ if crate::julia::on() => {
+                    crate::julia::heart_outline(p, r.center(), 11.0, Stroke::new(1.5, pal.text));
                 }
                 _ => {
                     p.circle_stroke(r.center(), 4.0, Stroke::new(1.5, pal.text));

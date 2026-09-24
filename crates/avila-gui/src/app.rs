@@ -65,7 +65,7 @@ impl App {
         theme_override: Option<ThemeChoice>,
     ) -> Self {
         let ctx = &cc.egui_ctx;
-        theme::install_fonts(ctx, false);
+        theme::install_fonts(ctx, Skin::Standard);
         theme::install_style(ctx);
         let mut prefs = Prefs::load(cc.storage);
         if let Some(choice) = theme_override {
@@ -361,7 +361,7 @@ impl App {
                 let (c, p) = (r.center(), ui.painter());
                 match phase {
                     Phase::CaughtUp | Phase::Syncing if pal.hearts => {
-                        heart(p, c, 7.5, pal.signal);
+                        crate::julia::heart(p, c, 16.0, pal.signal);
                     }
                     Phase::CaughtUp | Phase::Syncing => {
                         p.circle_filled(c, 9.0, pal.signal_alpha(0.22));
@@ -442,8 +442,16 @@ impl eframe::App for App {
                 crate::capture::Desk::About => xp::Dialog::About,
                 _ => xp::Dialog::None,
             };
-            if pose.play && !self.game.animating() {
-                self.game.demo();
+            if pose.play {
+                if !self.game.animating() {
+                    self.game.demo();
+                }
+            } else if pose.over {
+                if !self.game.over() {
+                    self.game.demo_over();
+                }
+            } else {
+                self.game.shelve();
             }
             self.page = pose.page;
             self.prefs.scale = pose.scale;
@@ -537,6 +545,9 @@ impl eframe::App for App {
                 .frame(Frame::new().fill(pal.canvas))
                 .show(ui, |ui| {
                     let top = ui.max_rect();
+                    if crate::julia::on() {
+                        crate::julia::wallpaper(ui.painter(), top, ui.input(|i| i.time));
+                    }
                     ui.painter().hline(
                         top.x_range(),
                         top.top() + 0.5,
@@ -641,22 +652,6 @@ impl eframe::App for App {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         visuals.panel_fill.to_normalized_gamma_f32()
     }
-}
-
-/// Julia mode's status light.
-fn heart(p: &egui::Painter, c: egui::Pos2, size: f32, color: egui::Color32) {
-    let r = size * 0.5;
-    p.circle_filled(c + vec2(-r * 0.95, -r * 0.35), r, color);
-    p.circle_filled(c + vec2(r * 0.95, -r * 0.35), r, color);
-    p.add(egui::Shape::convex_polygon(
-        vec![
-            c + vec2(-size * 0.93, -r * 0.05),
-            c + vec2(size * 0.93, -r * 0.05),
-            c + vec2(0.0, size),
-        ],
-        color,
-        Stroke::NONE,
-    ));
 }
 
 /// Says, wherever it shows, that nothing on screen is real.

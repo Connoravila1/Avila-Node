@@ -27,6 +27,8 @@ pub const MONO_MEDIUM: &str = "mono-medium";
 /// The XP skin's title bars and its start button.
 pub const CAPTION: &str = "caption";
 pub const START: &str = "start";
+/// Pacifico: Julia's script, and the Julia card's name in the toybox.
+pub const SCRIPT: &str = "script";
 
 /// Every surface and text color, resolved for one appearance.
 #[derive(Clone, Copy, Debug)]
@@ -215,8 +217,8 @@ impl Skin {
     }
 }
 
-/// Puts `skin` in force, re-installing egui's own visuals to match (and,
-/// going in or out of XP, the fonts).
+/// Puts `skin` in force, re-installing egui's own visuals and the fonts to
+/// match.
 pub fn set_skin(ctx: &egui::Context, skin: Skin) {
     let was = Skin::from_code(SKIN.swap(skin.code(), Ordering::Relaxed));
     if was == skin {
@@ -250,9 +252,7 @@ pub fn set_skin(ctx: &egui::Context, skin: Skin) {
             };
         });
     }
-    if (was == Skin::Xp) != xp {
-        install_fonts(ctx, xp);
-    }
+    install_fonts(ctx, skin);
 }
 
 /// A font of one of the named families.
@@ -278,9 +278,16 @@ pub fn mono(size: f32) -> FontId {
 /// The XP skin puts XP's own faces first when the system has them:
 /// Tahoma (or Verdana, its wider sibling) and Trebuchet MS for titles.
 /// None of them ship with the node; without them the bundled faces serve.
-pub fn install_fonts(ctx: &egui::Context, xp: bool) {
+/// The Julia skin sets its titles and big numbers in Pacifico, a subset
+/// of which ships (about 21 KB).
+pub fn install_fonts(ctx: &egui::Context, skin: Skin) {
+    let xp = skin == Skin::Xp;
     let mut fonts = FontDefinitions::default();
-    let faces: [(&str, &'static [u8]); 7] = [
+    let faces: [(&str, &'static [u8]); 8] = [
+        (
+            "pacifico",
+            include_bytes!("../assets/fonts/Pacifico-Julia.ttf"),
+        ),
         (
             "jost-light",
             include_bytes!("../assets/fonts/Jost-Light.ttf"),
@@ -361,18 +368,26 @@ pub fn install_fonts(ctx: &egui::Context, xp: bool) {
             "instrument-semibold",
         ),
     ] {
+        let big = family == DISPLAY || family == TITLE;
         // Without Trebuchet, XP's big type falls back to the interface
         // face rather than Jost's geometry.
-        let own = if xp && (family == DISPLAY || family == TITLE) {
+        let own = if xp && big {
             "instrument-semibold"
         } else {
             face
         };
-        fonts.families.insert(
-            FontFamily::Name(family.into()),
-            chain(xp_face, own, &proportional_fallback),
-        );
+        let mut faces = chain(xp_face, own, &proportional_fallback);
+        if skin == Skin::Julia && big {
+            faces.insert(0, "pacifico".to_owned());
+        }
+        fonts
+            .families
+            .insert(FontFamily::Name(family.into()), faces);
     }
+    fonts.families.insert(
+        FontFamily::Name(SCRIPT.into()),
+        chain(&[], "pacifico", &proportional_fallback),
+    );
     fonts.families.insert(
         FontFamily::Name(MONO_MEDIUM.into()),
         chain(&[], "plex-mono-medium", &mono_fallback),

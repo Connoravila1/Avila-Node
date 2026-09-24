@@ -57,6 +57,9 @@ pub fn show(
     let rect = ui.max_rect();
     let p = ui.painter().clone();
     let cx = rect.center().x;
+    if crate::julia::on() {
+        crate::julia::rail(&p, rect, pos2(cx, rect.top() + 42.0), ui.input(|i| i.time));
+    }
     if let Some(tex) = swirl {
         let mark = Rect::from_center_size(pos2(cx, rect.top() + 42.0), vec2(46.0, 46.0));
         p.image(

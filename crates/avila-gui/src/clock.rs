@@ -183,8 +183,12 @@ fn dial(ui: &Ui, c: Pos2, hands: &[Hand; 3], pal: &Palette, pulse: Option<f32>) 
         );
     }
     // The tip at the center: orange, because it's proven here.
-    p.circle_filled(c, 6.0, pal.signal);
-    p.circle_stroke(c, 6.0, Stroke::new(1.5, pal.canvas));
+    if crate::julia::on() {
+        crate::julia::heart(p, c, 18.0, pal.signal);
+    } else {
+        p.circle_filled(c, 6.0, pal.signal);
+        p.circle_stroke(c, 6.0, Stroke::new(1.5, pal.canvas));
+    }
     if let Some(f) = pulse {
         p.circle_stroke(
             c,

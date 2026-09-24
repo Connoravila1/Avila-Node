@@ -3,7 +3,7 @@
 
 use crate::model::work_zeros;
 use crate::theme::{self, Palette, Skin, font, mono};
-use crate::xp;
+use crate::{julia, xp};
 use eframe::egui::{
     self, Color32, CornerRadius, CursorIcon, Mesh, Painter, Pos2, Rect, Response, RichText, Sense,
     Shape, Stroke, StrokeKind, TextFormat, Ui, Vec2, pos2, text::LayoutJob, vec2,
@@ -25,9 +25,10 @@ pub fn label(ui: &mut Ui, text: &str) -> Response {
 
 /// A section heading with an optional note beside it, over a hairline.
 pub fn section(ui: &mut Ui, title: &str, note: Option<&str>) {
-    if Skin::current() == Skin::Xp {
-        xp::group_header(ui, title, note);
-        return;
+    match Skin::current() {
+        Skin::Xp => return xp::group_header(ui, title, note),
+        Skin::Julia => return julia::section(ui, title, note),
+        Skin::Standard => {}
     }
     let pal = Palette::of(ui.ctx());
     ui.horizontal(|ui| {
@@ -149,8 +150,18 @@ pub fn button(ui: &mut Ui, text: &str, kind: Kind) -> Response {
             ),
         };
         let p = ui.painter();
-        p.rect(rect, pal.round, fill, stroke, StrokeKind::Inside);
-        p.galley(rect.center() - galley.size() / 2.0, galley, fg);
+        if julia::on() {
+            let (base, edge, fg) = match kind {
+                Kind::Primary => (pal.primary, pal.signal_text, pal.on_primary),
+                Kind::Quiet => (pal.raised, pal.hairline, pal.signal_text),
+            };
+            julia::jelly(p, rect, pal.round, base, edge, hot, down);
+            let sink = if down { vec2(0.0, 1.0) } else { Vec2::ZERO };
+            p.galley(rect.center() - galley.size() / 2.0 + sink, galley, fg);
+        } else {
+            p.rect(rect, pal.round, fill, stroke, StrokeKind::Inside);
+            p.galley(rect.center() - galley.size() / 2.0, galley, fg);
+        }
         focus_ring(ui, &resp, rect, pal.round.saturating_add(2));
     }
     resp.on_hover_cursor(CursorIcon::PointingHand)
@@ -213,12 +224,13 @@ pub fn segmented<T: Copy + PartialEq>(ui: &mut Ui, value: &mut T, options: &[(T,
     changed
 }
 
-/// A check box. XP draws its own; elsewhere egui's, in the palette.
+/// A check box: XP's and Julia's are their own; otherwise egui's, in the
+/// palette.
 pub fn checkbox(ui: &mut Ui, value: &mut bool, text: &str) -> Response {
-    if Skin::current() == Skin::Xp {
-        xp::checkbox(ui, value, text)
-    } else {
-        ui.checkbox(value, text)
+    match Skin::current() {
+        Skin::Xp => xp::checkbox(ui, value, text),
+        Skin::Julia => julia::checkbox(ui, value, text),
+        Skin::Standard => ui.checkbox(value, text),
     }
 }
 
@@ -395,7 +407,11 @@ pub fn sparkline(
         p.vline(points[i].x, rect.y_range(), Stroke::new(1.0, pal.faint));
     }
     p.add(Shape::line(points.clone(), Stroke::new(1.5, color)));
-    p.circle_filled(last, 2.5, color);
+    if julia::on() {
+        julia::heart(p, last, 8.0, color);
+    } else {
+        p.circle_filled(last, 2.5, color);
+    }
     match (hovered, readout) {
         (Some(i), Some(describe)) => {
             p.circle_filled(points[i], 3.5, color);
@@ -531,11 +547,20 @@ pub fn table_row(ui: &mut Ui, height: f32, selected: bool) -> (Rect, Response) {
     }
     if selected {
         ui.painter().rect_filled(rect, 0, pal.well);
-        ui.painter().vline(
-            rect.left() + 1.0,
-            rect.y_range(),
-            Stroke::new(2.0, pal.text),
-        );
+        if julia::on() {
+            julia::heart(
+                ui.painter(),
+                pos2(rect.left() + 1.0, rect.center().y),
+                11.0,
+                pal.signal,
+            );
+        } else {
+            ui.painter().vline(
+                rect.left() + 1.0,
+                rect.y_range(),
+                Stroke::new(2.0, pal.text),
+            );
+        }
     } else if resp.hovered() {
         ui.painter()
             .rect_filled(rect, 0, pal.well.gamma_multiply(0.6));

@@ -269,11 +269,11 @@ fn appearance(ui: &mut Ui, s: &Scene, prefs: &mut Prefs) {
         ui.end_row();
         key(ui, s, "Toybox");
         ui.vertical(|ui| {
-            widgets::checkbox(ui, &mut prefs.toybox, "Show it in the sidebar");
+            widgets::segmented(ui, &mut prefs.toybox, &[(false, "Off"), (true, "On")]);
             help(
                 ui,
                 s,
-                "A game and some silly skins. Nothing in it touches the node.",
+                "A game and some silly skins, on their own page. Nothing in it touches the node.",
             );
         });
         ui.end_row();
