@@ -9442,7 +9442,20 @@ pub(crate) fn dispatch(
                 )
                 .map_err(|e| (RPC_MISC_ERROR, format!("writing UTXO snapshot: {e}")))?;
                 drop(file);
-                let _ = std::fs::rename(&temppath, &path);
+                // A failed rename left the data sitting at `temppath`
+                // (still named `.incomplete`) — reporting success
+                // anyway would tell the caller a file exists at `path`
+                // that doesn't.
+                std::fs::rename(&temppath, &path).map_err(|e| {
+                    (
+                        RPC_MISC_ERROR,
+                        format!(
+                            "Unable to rename temporary snapshot file {} to {}: {e}",
+                            temppath.display(),
+                            path.display()
+                        ),
+                    )
+                })?;
                 Ok(json!({
                     "coins_written": written,
                     "base_hash": target.hash().to_string(),
@@ -15567,6 +15580,63 @@ mod tests {
                 "Unable to import mempool file, see debug.log for details.".to_string()
             )
         );
+    }
+
+    /// `dumptxoutset`'s success path against a real store-backed
+    /// chainstate: the snapshot lands at the requested path (not left
+    /// behind at its `.incomplete` name), which is only true once the
+    /// final rename is actually awaited rather than discarded.
+    #[test]
+    fn dumptxoutset_writes_the_snapshot_to_the_requested_path() {
+        let params = Network::Regtest.params();
+        let dir = std::env::temp_dir().join(format!(
+            "avila-rpc-dumptxoutset-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = crate::time::time() as u32;
+        let cs = Chainstate::with_store(&dir, &params, now).unwrap();
+        let queries = query_server(cs);
+        let snap = snap();
+        let addr = "bcrt1q9mc2hc2f6x2lsxh7xnuu3fdjj628hvjatzgxcr";
+
+        let (_, e) = dispatch(
+            "generatetoaddress",
+            &json!([1, addr]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+
+        let out_path = dir.join("snapshot.dat");
+        let (r, e) = dispatch(
+            "dumptxoutset",
+            &json!([out_path.to_str().unwrap(), "latest"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["coins_written"], json!(1));
+        assert!(out_path.is_file(), "snapshot missing at {out_path:?}");
+        assert!(
+            !out_path.with_extension("dat.incomplete").exists(),
+            "snapshot left behind under its .incomplete name"
+        );
+
+        drop(queries);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `getblockfilter`/`scanblocks` — no filter index exists, so both
