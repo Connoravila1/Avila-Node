@@ -2231,6 +2231,20 @@ impl Chainstate {
                         self.drain_pending_to(SPEC_DEPTH)
                             .map_err(BlockRejection::Connect)?;
                     }
+                    // This block's own body may have been the missing
+                    // link for an already-stored, already-bodied child
+                    // (Core: `ReceivedBlockTransactions` continues its
+                    // `m_blocks_unlinked` walk past the block it was
+                    // just called for). A failure here means a
+                    // *different*, previously-submitted block turned
+                    // out invalid — it's marked and left behind by
+                    // `maybe_reorg`/`simulate_branch`, but `hash` itself
+                    // already connected, so this call still reports its
+                    // success.
+                    let next = self.best_bodied_descendant(self.connected);
+                    if next != self.connected {
+                        let _ = self.maybe_reorg(next, &params);
+                    }
                     // The write-back cache is flushed at block
                     // boundaries — a full map commits coins + undo tail
                     // + tip atomically (Core's `FlushStateToDisk` under
@@ -2254,7 +2268,15 @@ impl Chainstate {
                 }
             }
         } else {
-            match self.maybe_reorg(hash, &params) {
+            // `hash` doesn't extend the connected tip. Its own branch
+            // might still be short of the tip's work, but its arrival
+            // can complete the body chain for a heavier *descendant*
+            // that was already fully stored and just waiting on this
+            // link (Core's `ReceivedBlockTransactions` walking
+            // `m_blocks_unlinked` forward instead of only ever
+            // reconsidering the block it was called for).
+            let target = self.newly_linked_candidate(hash).unwrap_or(hash);
+            match self.maybe_reorg(target, &params) {
                 Ok(Some(disconnected)) => Ok(Acceptance::Connected {
                     height,
                     reorged: disconnected,
@@ -2433,6 +2455,82 @@ impl Chainstate {
         self.undos.extend(new_undos.into_iter().skip(split));
         self.connected = hash;
         Ok(Some(disconnected))
+    }
+
+    /// A body just arrived for `hash`, which does not extend the
+    /// connected tip. An ancestor's linkage is unaffected by a
+    /// descendant's body arriving, so `hash` becomes a reorg candidate
+    /// only once its own ancestor chain back to the active chain is
+    /// fully bodied (Core's `ReceivedBlockTransactions` gating on
+    /// `pindex->pprev->HaveNumChainTxs()`); returns `None` while an
+    /// ancestor is still missing a body — the caller falls back to
+    /// treating `hash` alone as the candidate, which is what the
+    /// existing insufficient-work/missing-body checks in
+    /// [`Chainstate::maybe_reorg`] already report as `Parked`.
+    ///
+    /// Once `hash`'s ancestor chain is complete, any already-bodied
+    /// descendant of `hash` is newly linked too (Core's
+    /// `m_blocks_unlinked` forward walk) — delegates to
+    /// [`Chainstate::best_bodied_descendant`] to find the best of them.
+    fn newly_linked_candidate(&mut self, hash: BlockHash) -> Option<BlockHash> {
+        let chain_set: HashSet<BlockHash> = self.chain.iter().copied().collect();
+        let mut cursor = hash;
+        while !chain_set.contains(&cursor) {
+            if !self.have_body(&cursor) {
+                return None;
+            }
+            cursor = self.tree.get(&cursor)?.header.prev_block_hash;
+        }
+        Some(self.best_bodied_descendant(hash))
+    }
+
+    /// Assuming `hash`'s own ancestor chain back to the active chain is
+    /// already fully bodied — true by construction for the connected
+    /// tip itself, and established by
+    /// [`Chainstate::newly_linked_candidate`] otherwise — walks
+    /// `hash`'s descendants in the header tree and returns the
+    /// greatest-chainwork node reached whose own body is present and
+    /// whose branch carries no failed block. Returns `hash` itself when
+    /// it has no such descendant.
+    ///
+    /// A failed node's entire subtree is skipped: every descendant of a
+    /// failed block is normally unreachable (rejected at header
+    /// insertion, `bad-prevblk`) — the sole exception is a header
+    /// already accepted into the tree before its ancestor later failed
+    /// a connect attempt, which this walk's `ancestor_is_invalid` check
+    /// catches instead.
+    ///
+    /// `O(nodes)` to index parent→children once, then `O(subtree)` to
+    /// walk it — this runs only on an out-of-order body arrival, not
+    /// the common per-block path Core's `m_blocks_unlinked` multimap
+    /// exists to make cheap.
+    fn best_bodied_descendant(&mut self, hash: BlockHash) -> BlockHash {
+        let Some(start) = self.tree.get(&hash).copied() else {
+            return hash;
+        };
+        let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
+        for (h, node) in self.tree.nodes() {
+            children
+                .entry(node.header.prev_block_hash)
+                .or_default()
+                .push(*h);
+        }
+        let mut best = (start.chainwork, hash);
+        let mut stack = children.remove(&hash).unwrap_or_default();
+        while let Some(h) = stack.pop() {
+            if !self.have_body(&h) || self.tree.ancestor_is_invalid(h) {
+                continue;
+            }
+            if let Some(node) = self.tree.get(&h) {
+                if node.chainwork > best.0 {
+                    best = (node.chainwork, h);
+                }
+            }
+            if let Some(kids) = children.remove(&h) {
+                stack.extend(kids);
+            }
+        }
+        best.1
     }
 
     /// Runs a candidate branch against an overlay UTXO set: disconnect
@@ -3179,6 +3277,99 @@ mod tests {
             txid: a2_txid,
             vout: 0
         }));
+    }
+
+    #[test]
+    fn out_of_order_bodies_activate_heaviest_linked_branch() {
+        // Headers-first sync: b1→b2→b3's headers all land (heavier
+        // than the two-block tip a1,a2) before any of their bodies.
+        // Bodies then arrive out of order — b3, b2, b1. The old code
+        // only ever reconsidered the just-arrived block's own hash:
+        // b3 and b2 each still lack a full body chain when they
+        // arrive, and b1 alone (1 block) never outworks the 2-block
+        // tip, so the node parked on a2 forever even once every body
+        // was present. b1's arrival must notice that it completes b3's
+        // body chain, and that b3 now outworks the tip.
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        let a1 = block_on(&genesis_header(), vec![coinbase_tx(1, subsidy(1))], &params);
+        let a2 = block_on(&a1.header, vec![coinbase_tx(2, subsidy(2))], &params);
+        cs.accept_block(&a1, NOW).unwrap();
+        cs.accept_block(&a2, NOW).unwrap();
+
+        let b1 = block_on(
+            &genesis_header(),
+            vec![tagged_coinbase(1, subsidy(1), script::OP_EQUAL)],
+            &params,
+        );
+        let b2 = block_on(
+            &b1.header,
+            vec![tagged_coinbase(2, subsidy(2), script::OP_EQUAL)],
+            &params,
+        );
+        let b3 = block_on(
+            &b2.header,
+            vec![tagged_coinbase(3, subsidy(3), script::OP_EQUAL)],
+            &params,
+        );
+        cs.accept_header(&b1.header, NOW).unwrap();
+        cs.accept_header(&b2.header, NOW).unwrap();
+        cs.accept_header(&b3.header, NOW).unwrap();
+
+        assert_eq!(
+            cs.accept_block(&b3, NOW),
+            Ok(Acceptance::Parked { height: 3 })
+        );
+        assert_eq!(cs.tip_hash(), a2.block_hash());
+        assert_eq!(
+            cs.accept_block(&b2, NOW),
+            Ok(Acceptance::Parked { height: 2 })
+        );
+        assert_eq!(cs.tip_hash(), a2.block_hash());
+        assert_eq!(
+            cs.accept_block(&b1, NOW),
+            Ok(Acceptance::Connected {
+                height: 1,
+                reorged: true
+            })
+        );
+        assert_eq!(cs.tip_hash(), b3.block_hash());
+        assert_eq!(cs.chain().len(), 4);
+        assert_eq!(cs.chain()[1], b1.block_hash());
+    }
+
+    #[test]
+    fn out_of_order_bodies_extend_active_chain_directly() {
+        // Main-chain case: t1 and t2 both directly extend the
+        // connected tip. Their bodies arrive out of order — t2 before
+        // t1. t2 parks on arrival (its own parent's body is still
+        // missing); t1's arrival connects directly (it does extend the
+        // tip) but must also notice t2's body is already stored and
+        // pick it up too.
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        let t = block_on(&genesis_header(), vec![coinbase_tx(1, subsidy(1))], &params);
+        cs.accept_block(&t, NOW).unwrap();
+
+        let t1 = block_on(&t.header, vec![coinbase_tx(2, subsidy(2))], &params);
+        let t2 = block_on(&t1.header, vec![coinbase_tx(3, subsidy(3))], &params);
+        cs.accept_header(&t1.header, NOW).unwrap();
+        cs.accept_header(&t2.header, NOW).unwrap();
+
+        assert_eq!(
+            cs.accept_block(&t2, NOW),
+            Ok(Acceptance::Parked { height: 3 })
+        );
+        assert_eq!(cs.tip_hash(), t.block_hash());
+        assert_eq!(
+            cs.accept_block(&t1, NOW),
+            Ok(Acceptance::Connected {
+                height: 2,
+                reorged: false
+            })
+        );
+        assert_eq!(cs.tip_hash(), t2.block_hash());
+        assert_eq!(cs.chain().len(), 4);
     }
 
     #[test]
