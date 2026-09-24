@@ -10889,145 +10889,228 @@ pub(crate) fn dispatch(
                 Ok(json!({ "hash": hash }))
             })
         }
-        "getblocktemplate" => chain_query(method, queries, |cs, mgr| {
-            let now = crate::time::time() as u32;
-            // No wallet exists — the coinbase pays Core's default
-            // `OP_TRUE` anyone-can-spend script (what Core's
-            // BlockAssembler uses when no payout script is supplied).
-            let template = mgr
-                .mempool_ref()
-                .build_template(cs, Script::new(vec![avila_consensus::script::OP_1]), now)
-                .map_err(|e| (RPC_MISC_ERROR, format!("template: {e}")))?;
-            let block = &template.block;
-            let height = template.height;
-            let tip = cs.tip_hash();
-            let mtp = cs.tree().median_time_past(&tip).unwrap_or(0);
-            // In-block txid → index in the transactions array (1-based,
-            // coinbase excluded) for `depends`.
-            let position: std::collections::HashMap<Txid, usize> = block
-                .transactions
-                .iter()
-                .enumerate()
-                .skip(1)
-                .map(|(i, tx)| (tx.txid(), i))
-                .collect();
-            let flags =
-                avila_consensus::script::block_script_flags(cs.tree().params(), height, &tip);
-            let pool = mgr.mempool_ref();
-            let txs: Vec<Value> = block
-                .transactions
-                .iter()
-                .skip(1)
-                .map(|tx| {
-                    let txid = tx.txid();
-                    let mut depends: Vec<usize> = tx
-                        .inputs
-                        .iter()
-                        .filter_map(|i| position.get(&i.previous_output.txid))
-                        .copied()
-                        .collect();
-                    depends.sort_unstable();
-                    depends.dedup();
-                    // GetTransactionSigOpCost: legacy + p2sh + witness.
-                    let mut sigops = 0u64;
-                    for input in &tx.inputs {
-                        if let Some(coin) = pool.resolve(cs, &input.previous_output) {
-                            let spk = &coin.out.script_pubkey;
-                            sigops += spk.sig_ops(false);
-                            sigops += if spk.is_p2sh() {
-                                spk.p2sh_sig_ops(&input.script_sig)
-                            } else {
-                                input.script_sig.sig_ops(false)
-                            };
-                            sigops += avila_consensus::script::count_witness_sig_ops(
-                                &input.script_sig,
-                                spk,
-                                &input.witness,
-                                flags,
-                            );
-                        }
-                    }
-                    let fee = pool.entry(&txid).map(|e| e.fee).unwrap_or(0);
-                    json!({
-                        "data": hex::encode(&tx.encode()),
-                        "txid": txid.to_string(),
-                        "hash": tx.wtxid().to_string(),
-                        "depends": depends,
-                        "fee": fee,
-                        "sigops": sigops,
-                        "weight": tx.weight(),
-                    })
-                })
-                .collect();
-            let target = template.block.header.bits.expand().value;
-            // `!segwit` is Core's mandatory-rule marker: a miner that
-            // can't enforce segwit produces invalid blocks. `taproot`
-            // is informational (always-active on regtest, buried on
-            // mainnet/signet/testnet4).
-            let mut rules = vec!["csv"];
-            if flags.contains(avila_consensus::script::ScriptFlags::WITNESS) {
-                rules.push("!segwit");
-            }
-            if flags.contains(avila_consensus::script::ScriptFlags::TAPROOT) {
-                rules.push("taproot");
-            }
-            // `vbavailable` advertises BIP9 deployments in
-            // started/locked_in at the tip — keyed by name, valued by
-            // the version bit number (Core's getblocktemplate).
-            let params = cs.tree().params();
-            let tip_node = cs.tree().tip();
-            let mut vbavailable = serde_json::Map::new();
-            for dep in params.bip9_deployments.iter() {
-                let st =
-                    avila_consensus::bip9::state(cs.tree(), Some(&tip_node.hash()), dep, params);
-                use avila_consensus::bip9::Bip9State;
-                if matches!(st, Bip9State::Started | Bip9State::LockedIn) {
-                    vbavailable.insert(dep.name.to_string(), json!(dep.bit));
+        "getblocktemplate" => {
+            // BIP22 mode select — `template_request` is already
+            // type-checked as an object upstream. Absent/null `mode`
+            // is "template"; a non-string `mode` is Core's own -8
+            // before it even looks at the string value.
+            let request = &params[0];
+            let mode = match request.get("mode") {
+                None | Some(Value::Null) => "template",
+                Some(Value::String(s)) => s.as_str(),
+                Some(_) => {
+                    return (
+                        Value::Null,
+                        Some((RPC_INVALID_PARAMETER, "Invalid mode".into())),
+                    );
                 }
+            };
+            if mode == "proposal" {
+                // BIP23 proposal mode: validate proposed block data
+                // instead of building a template. Core's own wording
+                // for a missing/wrong-typed `data`.
+                let Some(data) = request.get("data").and_then(Value::as_str) else {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            "Missing data String key for proposal".into(),
+                        )),
+                    );
+                };
+                let block = hex::decode(data)
+                    .ok()
+                    .and_then(|b| avila_consensus::block::Block::decode(&b).ok());
+                let Some(block) = block else {
+                    return (
+                        Value::Null,
+                        Some((RPC_DESERIALIZATION_ERROR, "Block decode failed".into())),
+                    );
+                };
+                return chain_query(method, queries, move |cs, _mgr| {
+                    let tip = cs.tip_hash();
+                    // Core's TestBlockValidity: a proposal not
+                    // extending the current tip is inconclusive
+                    // without rewinding, which this check doesn't do.
+                    if block.header.prev_block_hash != tip {
+                        return Ok(json!("inconclusive-not-best-prevblk"));
+                    }
+                    let params = cs.tree().params();
+                    if let Err(e) = avila_consensus::check::check_block(&block, params) {
+                        return Ok(json!(e.reason()));
+                    }
+                    let ctx = avila_consensus::check::BlockContext {
+                        params,
+                        height: cs.tree().tip().height + 1,
+                        parent_median_time_past: cs.tree().median_time_past(&tip),
+                    };
+                    if let Err(e) = avila_consensus::check::contextual_check_block(&block, &ctx) {
+                        return Ok(json!(e.reason()));
+                    }
+                    // No trial ConnectBlock here (script checks,
+                    // double-spends, …): connect_block's context
+                    // derives height/ancestry from a HeaderTree
+                    // lookup, and there's no side-effect-free way
+                    // through this crate's public API to stage that
+                    // for a block that was never accepted, short of
+                    // inserting it into the live, sync-loop-owned
+                    // tree. Structural and contextual checks are what
+                    // this validates; a bad signature or a
+                    // double-spend against the live UTXO set would
+                    // still pass.
+                    Ok(Value::Null)
+                });
             }
-            let mut out = json!({
-                // Core's modern capability set — `proposal` is the only
-                // extension bitcoind 25+ advertises.
-                "capabilities": ["proposal"],
-                "version": block.header.version,
-                "rules": rules,
-                "vbavailable": vbavailable,
-                "vbrequired": 0,
-                "previousblockhash": tip.to_string(),
-                "transactions": txs,
-                // Core omits `flags` when the coinbase aux is empty.
-                "coinbaseaux": {},
-                "coinbasevalue": block.transactions[0].outputs[0].value,
-                // Core's longpollid = tip hash + candidate height.
-                "longpollid": format!("{}{}", tip, height),
-                "target": target.to_hex(),
-                "mintime": mtp + 1,
-                "mutable": ["time", "transactions", "prevblock"],
-                "noncerange": "00000000ffffffff",
-                "sigoplimit": 80_000,
-                "sizelimit": 4_000_000,
-                "weightlimit": 4_000_000,
-                "curtime": now,
-                "bits": format!("{:08x}", block.header.bits.0),
-                "height": height,
-            });
-            // BIP22: the witness commitment script a miner must carry.
-            // build_template adds it to every block once segwit is
-            // active — find it by the OP_RETURN + magic prefix rather
-            // than assuming an output index.
-            let commitment = block.transactions[0].outputs.iter().find(|o| {
-                let b = o.script_pubkey.as_bytes();
-                b.len() >= 6
-                    && b[0] == avila_consensus::script::OP_RETURN
-                    && b[1] == 0x24
-                    && b[2..6] == avila_mempool::template::WITNESS_COMMITMENT_MAGIC
-            });
-            if let Some(out0) = commitment {
-                out["default_witness_commitment"] =
-                    json!(hex::encode(out0.script_pubkey.as_bytes()));
+            if mode != "template" {
+                return (
+                    Value::Null,
+                    Some((RPC_INVALID_PARAMETER, "Invalid mode".into())),
+                );
             }
-            Ok(out)
-        }),
+            chain_query(method, queries, |cs, mgr| {
+                let now = crate::time::time() as u32;
+                // No wallet exists — the coinbase pays Core's default
+                // `OP_TRUE` anyone-can-spend script (what Core's
+                // BlockAssembler uses when no payout script is supplied).
+                let template = mgr
+                    .mempool_ref()
+                    .build_template(cs, Script::new(vec![avila_consensus::script::OP_1]), now)
+                    .map_err(|e| (RPC_MISC_ERROR, format!("template: {e}")))?;
+                let block = &template.block;
+                let height = template.height;
+                let tip = cs.tip_hash();
+                let mtp = cs.tree().median_time_past(&tip).unwrap_or(0);
+                // In-block txid → index in the transactions array (1-based,
+                // coinbase excluded) for `depends`.
+                let position: std::collections::HashMap<Txid, usize> = block
+                    .transactions
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .map(|(i, tx)| (tx.txid(), i))
+                    .collect();
+                let flags =
+                    avila_consensus::script::block_script_flags(cs.tree().params(), height, &tip);
+                let pool = mgr.mempool_ref();
+                let txs: Vec<Value> = block
+                    .transactions
+                    .iter()
+                    .skip(1)
+                    .map(|tx| {
+                        let txid = tx.txid();
+                        let mut depends: Vec<usize> = tx
+                            .inputs
+                            .iter()
+                            .filter_map(|i| position.get(&i.previous_output.txid))
+                            .copied()
+                            .collect();
+                        depends.sort_unstable();
+                        depends.dedup();
+                        // GetTransactionSigOpCost: legacy + p2sh + witness.
+                        let mut sigops = 0u64;
+                        for input in &tx.inputs {
+                            if let Some(coin) = pool.resolve(cs, &input.previous_output) {
+                                let spk = &coin.out.script_pubkey;
+                                sigops += spk.sig_ops(false);
+                                sigops += if spk.is_p2sh() {
+                                    spk.p2sh_sig_ops(&input.script_sig)
+                                } else {
+                                    input.script_sig.sig_ops(false)
+                                };
+                                sigops += avila_consensus::script::count_witness_sig_ops(
+                                    &input.script_sig,
+                                    spk,
+                                    &input.witness,
+                                    flags,
+                                );
+                            }
+                        }
+                        let fee = pool.entry(&txid).map(|e| e.fee).unwrap_or(0);
+                        json!({
+                            "data": hex::encode(&tx.encode()),
+                            "txid": txid.to_string(),
+                            "hash": tx.wtxid().to_string(),
+                            "depends": depends,
+                            "fee": fee,
+                            "sigops": sigops,
+                            "weight": tx.weight(),
+                        })
+                    })
+                    .collect();
+                let target = template.block.header.bits.expand().value;
+                // `!segwit` is Core's mandatory-rule marker: a miner that
+                // can't enforce segwit produces invalid blocks. `taproot`
+                // is informational (always-active on regtest, buried on
+                // mainnet/signet/testnet4).
+                let mut rules = vec!["csv"];
+                if flags.contains(avila_consensus::script::ScriptFlags::WITNESS) {
+                    rules.push("!segwit");
+                }
+                if flags.contains(avila_consensus::script::ScriptFlags::TAPROOT) {
+                    rules.push("taproot");
+                }
+                // `vbavailable` advertises BIP9 deployments in
+                // started/locked_in at the tip — keyed by name, valued by
+                // the version bit number (Core's getblocktemplate).
+                let params = cs.tree().params();
+                let tip_node = cs.tree().tip();
+                let mut vbavailable = serde_json::Map::new();
+                for dep in params.bip9_deployments.iter() {
+                    let st = avila_consensus::bip9::state(
+                        cs.tree(),
+                        Some(&tip_node.hash()),
+                        dep,
+                        params,
+                    );
+                    use avila_consensus::bip9::Bip9State;
+                    if matches!(st, Bip9State::Started | Bip9State::LockedIn) {
+                        vbavailable.insert(dep.name.to_string(), json!(dep.bit));
+                    }
+                }
+                let mut out = json!({
+                    // Core's modern capability set — `proposal` is the only
+                    // extension bitcoind 25+ advertises.
+                    "capabilities": ["proposal"],
+                    "version": block.header.version,
+                    "rules": rules,
+                    "vbavailable": vbavailable,
+                    "vbrequired": 0,
+                    "previousblockhash": tip.to_string(),
+                    "transactions": txs,
+                    // Core omits `flags` when the coinbase aux is empty.
+                    "coinbaseaux": {},
+                    "coinbasevalue": block.transactions[0].outputs[0].value,
+                    // Core's longpollid = tip hash + candidate height.
+                    "longpollid": format!("{}{}", tip, height),
+                    "target": target.to_hex(),
+                    "mintime": mtp + 1,
+                    "mutable": ["time", "transactions", "prevblock"],
+                    "noncerange": "00000000ffffffff",
+                    "sigoplimit": 80_000,
+                    "sizelimit": 4_000_000,
+                    "weightlimit": 4_000_000,
+                    "curtime": now,
+                    "bits": format!("{:08x}", block.header.bits.0),
+                    "height": height,
+                });
+                // BIP22: the witness commitment script a miner must carry.
+                // build_template adds it to every block once segwit is
+                // active — find it by the OP_RETURN + magic prefix rather
+                // than assuming an output index.
+                let commitment = block.transactions[0].outputs.iter().find(|o| {
+                    let b = o.script_pubkey.as_bytes();
+                    b.len() >= 6
+                        && b[0] == avila_consensus::script::OP_RETURN
+                        && b[1] == 0x24
+                        && b[2..6] == avila_mempool::template::WITNESS_COMMITMENT_MAGIC
+                });
+                if let Some(out0) = commitment {
+                    out["default_witness_commitment"] =
+                        json!(hex::encode(out0.script_pubkey.as_bytes()));
+                }
+                Ok(out)
+            })
+        }
         "getorphantxs" => {
             // getInt<int> semantics: bool → the special -3, non-int
             // → -1 out-of-range, other non-num → bare -3, then the
@@ -12785,6 +12868,152 @@ mod tests {
             r["localservicesnames"],
             json!(["NETWORK", "WITNESS", "P2P_V2"])
         );
+    }
+
+    /// `getblocktemplate` mode="proposal" (BIP23): a valid block
+    /// extending the tip returns null, a wrong prevblock or a
+    /// structural violation returns Core's reject-reason string, and
+    /// an unrecognized mode or a malformed request errors like Core's
+    /// own template_request handling.
+    #[test]
+    fn getblocktemplate_proposal_mode_validates_without_connecting() {
+        let params = Network::Regtest.params();
+        let queries = query_server(Chainstate::new(&params));
+        let snap = snap();
+
+        // Build and grind a real block against the live chainstate —
+        // the same steps generatetoaddress/generateblock use — without
+        // ever calling accept_block, so proposal-checking it can't
+        // accidentally connect it for real.
+        let (hex_data, e) = chain_query("test-setup", Some(&queries), |cs, mgr| {
+            let now = crate::time::time() as u32;
+            let mut template = mgr
+                .mempool_ref()
+                .build_template(cs, Script::new(vec![avila_consensus::script::OP_1]), now)
+                .map_err(|e| (RPC_MISC_ERROR, format!("template: {e}")))?;
+            let params = *cs.tree().params();
+            while avila_consensus::pow::check_proof_of_work(
+                &template.block.block_hash(),
+                template.block.header.bits,
+                &params,
+            )
+            .is_err()
+            {
+                template.block.header.nonce = template.block.header.nonce.wrapping_add(1);
+            }
+            Ok(json!(hex::encode(&template.block.encode())))
+        });
+        assert!(e.is_none(), "{e:?}");
+        let hex_data = hex_data.as_str().unwrap().to_string();
+        let mut block = avila_consensus::block::Block::decode(&hex::decode(&hex_data).unwrap())
+            .expect("decodes back");
+
+        // A genuinely valid proposal on the tip: null.
+        let (r, e) = dispatch(
+            "getblocktemplate",
+            &json!([{"mode": "proposal", "data": hex_data, "rules": ["segwit"]}]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert!(r.is_null(), "{r}");
+
+        // Wrong prevblock: Core's exact inconclusive string, checked
+        // before any structural work.
+        block.header.prev_block_hash = BlockHash::from_bytes([0xAB; 32]);
+        let wrong_prev = hex::encode(&block.encode());
+        let (r, e) = dispatch(
+            "getblocktemplate",
+            &json!([{"mode": "proposal", "data": wrong_prev, "rules": ["segwit"]}]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, json!("inconclusive-not-best-prevblk"));
+
+        // A structural violation (merkle root no longer matches the
+        // transaction list) surfaces check_block's own reject reason —
+        // the header (and its nonce) is untouched, so this fails on
+        // the merkle check, not proof-of-work.
+        let mut bad_merkle =
+            avila_consensus::block::Block::decode(&hex::decode(&hex_data).unwrap()).unwrap();
+        bad_merkle
+            .transactions
+            .push(bad_merkle.transactions[0].clone());
+        let (r, e) = dispatch(
+            "getblocktemplate",
+            &json!([{"mode": "proposal", "data": hex::encode(&bad_merkle.encode()), "rules": ["segwit"]}]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, json!("bad-txnmrklroot"));
+
+        // Missing `data` for proposal mode.
+        let (_, e) = dispatch(
+            "getblocktemplate",
+            &json!([{"mode": "proposal"}]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (
+                RPC_TYPE_ERROR,
+                "Missing data String key for proposal".into()
+            )
+        );
+
+        // Undecodable `data`.
+        let (_, e) = dispatch(
+            "getblocktemplate",
+            &json!([{"mode": "proposal", "data": "zz"}]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            e.unwrap(),
+            (RPC_DESERIALIZATION_ERROR, "Block decode failed".into())
+        );
+
+        // An unrecognized (or non-string) mode is Core's own -8.
+        for bad_mode in [json!("bogus"), json!(5)] {
+            let (_, e) = dispatch(
+                "getblocktemplate",
+                &json!([{"mode": bad_mode, "rules": ["segwit"]}]),
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(
+                e.unwrap(),
+                (RPC_INVALID_PARAMETER, "Invalid mode".into()),
+                "mode {bad_mode}"
+            );
+        }
     }
 
     /// Every expected string below is verbatim Knots 29.3
