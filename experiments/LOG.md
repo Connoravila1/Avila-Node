@@ -25,6 +25,10 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 | 16 | 09-23 | Crash fault-injection on hash engine | Commit ordering survives torn writes | **2 findings, both fixed** | torn records decoded to wrong-but-valid coins (silent corruption) → +4B keyed record tag, tears now misses; coins-ahead-of-tip tear invisible → index-header watermark, open errors loudly. File-level sim; compact() still unsafe | [fault-inject](2026-09-23-fault-injection.md) |
 
 
+| 30 | 09-24 | Speculative block pre-validation | Can a predicted mempool template pre-pay connect work? | **SUBSUMED by #20** | 625-block spend fixture, 512MiB cache: baseline 6.6s (script 6268ms) → verified-prediction 257ms (script 0ms, 25.7×); +prefetch 289ms — worse, read was already 9ms. Verified-tx cache captures the whole win; residual is apply+bookkeeping, no lever. Mainnet ~90% overlap untested — live-sync's job. | [predict](2026-09-24-spec-block-prediction.md) |
+
+| 29 | 09-23 | One-byte ECDSA advice through real Script and chainstate replay | Does #27's kernel gain survive recipient overhead and false signature results? | **replay win; full mainnet IBD unmeasured** | One script thread, 3 repeats: 24 actual mainnet blocks / 183,782 ECDSA attempts, including 6,137 false results: 27.65 → 18.41 s (−33.4% elapsed, −29.0% combined CPU). Complete 625-block regtest replay: 6.17 → 4.22 s, identical 12,995-coin UTXO hash. Early 501-block mainnet loses 22.9% elapsed (only 10 checks). Mainnet hints 183,782 B; two-pass preparation 57.18 s separately; bad parity + whole-sample retry 61.66 s. Script edge cases, hostile/missing hints, worker exit and sanitizer/protocol tests pass. Isolated copied workspace, probabilistic batching, no production changes by this experiment. | [historical-replay](2026-09-23-ecdsa-historical-replay.md) |
+
 | 27 | 09-23 | Native ECDSA batching with untrusted nonce advice; deterministic batch inversion | Does #19 rule out faster local signature verification? | **kernel win; not integrated IBD** | Same pinned libsecp, 16,384 synthetic signatures, 3 repeats: 127.56 CPU µs/sig ordinary → 70.06 with 1 B advice (1.82×) or 56.11 with 33 B (2.27×), batch 8,192. Helper generation 130.60 µs/sig separately; random batch acceptance. Bad advice + fallback costs 44–58% extra CPU. Deterministic no-advice batch inversion saves only 0–3%. Adversarial, cancellation and rare-x tests pass with ASan/UBSan/VERIFY. | [ecdsa-advice](2026-09-23-ibd-ecdsa-advice.md) |
 
 | 26 | 09-23 | Audit read floor; authenticated snapshot directory | Can startup avoid the whole-file index scan? | **prototype: prepared open 0.14–0.25 s** | Same synthetic 170M coins / 9.31 GB: raw cold-advised reads 11.4–13.1 s; 38.96 MB authenticated directory opens in 0.14–0.25 s across six runs, with 2,594/2,594 coin-body checks each. Preparation costs 23.55 s separately and requires a trusted root; not integrated node startup. Pipelined full scan 21–56 s: no reliable sub-20 s win. Revises #25's physical-floor interpretation. | [read-floor](2026-09-23-snapshot-read-floor.md) |
@@ -65,52 +69,45 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 Listed in rough priority; each entry has the hypothesis and the cheapest
 first measurement that would kill or confirm it.
 
-1. **Speculative block pre-validation.** Mempool contents predict the next
-   block (~90% overlap; compact-block sketches confirm). Pre-validate the
-   predicted block so real connect is mostly cache hits → faster block
-   accept/relay. First step: measure actual mempool↔block overlap on a
-   fixture + count connect-phase script work that hits the verified cache.
-   Bounded; reuses the spec engine and verified-tx cache.
-
-2. **Verification-transparency ledger.** A node that reports its own trust
+1. **Verification-transparency ledger.** A node that reports its own trust
    state: "verified N% of history; heights a..b assumed under commitment X;
    this output checked under flag-set F." Nobody ships inspectable trust.
    Mostly surfacing what ConnectTiming/assumeutxo state already record.
    First step: define the typed coverage record + a `getvalidationinfo`-style
    RPC emitting it on the fixture node.
 
-3. **Live network sync.** The credibility gate — fixtures have carried all
+2. **Live network sync.** The credibility gate — fixtures have carried all
    claims so far. First step: signet/testnet headers+blocks against real
    peers; measure tip-follow latency and peer misbehavior handling.
 
-4. **Delta overlay integration for SnapshotRun.** The ~90s-to-usable path
+3. **Delta overlay integration for SnapshotRun.** The ~90s-to-usable path
    is bench-proven; making it real needs reads to fall through to the
    indexed snapshot file with spends/inserts in the mutable layer, plus
    `activate_snapshot` streaming (no 170M materialization — OOMs at scale).
    First step: `UtxoSet` read-path shim + diff-test vs current backend.
 
-5. **ECDSA advice on real history.** #27's kernel win (1.8-2.3×) is
+4. **ECDSA advice on real history.** #27's kernel win (1.8-2.3×) is
    synthetic. First step: extract real sig-check traces from a historical
    segment and replay them through the advice machinery — tests sighash
    variants, codeseparator, and edge script forms the kernel bench skipped.
 
-6. **Built-in address index / electrum-style serving (profile).** Point a
+5. **Built-in address index / electrum-style serving (profile).** Point a
    wallet at your own node, no external indexer. Controversial storage cost
    is exactly what profiles are for — opt-in distro, consensus untouched.
    First step: cost model — index size + write overhead on the fixture.
 
-7. **Erlay-style tx reconciliation (BIP-330).** ~44% relay-bandwidth
+6. **Erlay-style tx reconciliation (BIP-330).** ~44% relay-bandwidth
    savings; Core hasn't shipped it (simplified recon-only variant is in
    Warnet testing upstream). Interop is the open question — today ~no peers
    speak it. First step: implement BIP-330 recon-only message handling and
    measure reconciliation rounds between two Avila nodes.
 
-8. **Differential fuzzing vs Core/Knots.** Continuous random-block/tx
+7. **Differential fuzzing vs Core/Knots.** Continuous random-block/tx
    generation with byte-exact comparison — turns "compatible" into a
    monitored property rather than a claim. First step: fuzz harness on the
    existing diff fixture generator, seeded corpus from past bugs.
 
-9. **Utreexo research program.** BIPs 181-183 now have assigned numbers;
+8. **Utreexo research program.** BIPs 181-183 now have assigned numbers;
    rustreexo 0.6.0 exists. Validate blocks against accumulator + proofs —
    ~KB of state vs 12GB UTXO set. Months, not days; needs bridge-node
    proof supply. First step: rustreexo spike — add/delete/prove round-trip
