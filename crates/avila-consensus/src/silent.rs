@@ -42,13 +42,38 @@ fn label_point(scan_priv: &[u8; 32], m: u32) -> Option<PublicKey> {
     Some(PublicKey::from_secret_key(&secp, &sk))
 }
 
+/// BIP341's NUMS point `H = lift_x(0x50929b74…)` — the provably
+/// unspendable internal key a taproot output uses when it carries no
+/// key-path spend. BIP352 skips an input whose script-path control
+/// block names `H` as the internal key: such an output can never have
+/// had a real signer key to aggregate into `A`.
+const NUMS_H: [u8; 32] = [
+    0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
+    0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
+];
+
 /// The public key a BIP352 input contributes to `A`. `prevout` is the
 /// spent output's scriptPubKey; `txin` carries the scriptSig/witness.
 /// `None` when the script type carries no key — per BIP352 ineligible
 /// inputs are simply ignored, not disqualifying.
 fn input_pubkey(txin: &crate::transaction::TxIn, prevout: &[u8]) -> Option<PublicKey> {
-    // p2tr key-path spend: the x-only key in the output script.
+    // p2tr: a key-path spend and a script-path spend both contribute
+    // the output's x-only key, *unless* it's a script-path spend whose
+    // control block names the NUMS point `H` as the internal key —
+    // BIP352 requires skipping that input outright.
     if prevout.len() == 34 && prevout[0] == 0x51 && prevout[1] == 0x20 {
+        let mut stack = txin.witness.items();
+        // BIP341: an annex is present iff there are >= 2 items and the
+        // last one starts with 0x50 — strip it before looking for a
+        // control block.
+        if stack.len() >= 2 && stack.last().is_some_and(|last| last.first() == Some(&0x50)) {
+            stack = &stack[..stack.len() - 1];
+        }
+        // >= 2 items left means a script-path spend; the control block
+        // is the last one: `<byte> <32-byte internal key> …` (BIP341).
+        if stack.len() >= 2 && stack[stack.len() - 1].get(1..33) == Some(&NUMS_H[..]) {
+            return None;
+        }
         let x = XOnlyPublicKey::from_slice(&prevout[2..34]).ok()?;
         return Some(x.public_key(secp256k1::Parity::Even));
     }
@@ -526,5 +551,81 @@ mod tests {
                 label: Some(0),
             }]
         );
+    }
+
+    fn dummy_txin(script_sig: Vec<u8>, witness: Witness) -> TxIn {
+        TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_bytes([0u8; 32]),
+                vout: 0,
+            },
+            script_sig: Script::new(script_sig),
+            sequence: 0xffff_ffff,
+            witness,
+        }
+    }
+
+    /// BIP352: a P2TR script-path spend whose control block's internal
+    /// key is the NUMS point `H` must be skipped outright — such an
+    /// output can never have had a real signer key.
+    #[test]
+    fn input_pubkey_skips_p2tr_script_path_with_nums_internal_key() {
+        let mut prevout = vec![0x51, 0x20];
+        prevout.extend_from_slice(&[0xaa; 32]);
+        let mut control_block = vec![0xc0];
+        control_block.extend_from_slice(&NUMS_H);
+        let txin = dummy_txin(vec![], Witness::new(vec![vec![0x51], control_block]));
+        assert_eq!(input_pubkey(&txin, &prevout), None);
+    }
+
+    /// The annex (last witness item starting with 0x50, when >= 2
+    /// items are present) must be stripped before the control block is
+    /// found, or a NUMS-keyed script path hides behind it undetected.
+    #[test]
+    fn input_pubkey_strips_annex_before_finding_control_block() {
+        let mut prevout = vec![0x51, 0x20];
+        prevout.extend_from_slice(&[0xaa; 32]);
+        let mut control_block = vec![0xc0];
+        control_block.extend_from_slice(&NUMS_H);
+        let annex = vec![0x50, 0x01];
+        let witness = Witness::new(vec![vec![0x51], control_block, annex]);
+        let txin = dummy_txin(vec![], witness);
+        assert_eq!(input_pubkey(&txin, &prevout), None);
+    }
+
+    /// A script-path spend whose control block's internal key is *not*
+    /// `H` still contributes the output's x-only key — BIP352 only
+    /// special-cases the NUMS point, not script-path spends generally.
+    #[test]
+    fn input_pubkey_uses_output_key_for_non_nums_control_block() {
+        let out_x =
+            crate::hex::decode("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")
+                .unwrap_or_default();
+        let mut prevout = vec![0x51, 0x20];
+        prevout.extend_from_slice(&out_x);
+        let mut control_block = vec![0xc0];
+        control_block.extend_from_slice(&[0x11; 32]);
+        let txin = dummy_txin(vec![], Witness::new(vec![vec![0x51], control_block]));
+        let expect = XOnlyPublicKey::from_slice(&out_x)
+            .unwrap_or_else(|_| unreachable!())
+            .public_key(secp256k1::Parity::Even);
+        assert_eq!(input_pubkey(&txin, &prevout), Some(expect));
+    }
+
+    /// A key-path spend (single witness item, or two once an annex is
+    /// stripped) is never treated as a script path — no control block
+    /// to inspect, so the output key always applies.
+    #[test]
+    fn input_pubkey_treats_single_item_witness_as_key_path() {
+        let out_x =
+            crate::hex::decode("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")
+                .unwrap_or_default();
+        let mut prevout = vec![0x51, 0x20];
+        prevout.extend_from_slice(&out_x);
+        let txin = dummy_txin(vec![], Witness::new(vec![vec![0x30; 64]]));
+        let expect = XOnlyPublicKey::from_slice(&out_x)
+            .unwrap_or_else(|_| unreachable!())
+            .public_key(secp256k1::Parity::Even);
+        assert_eq!(input_pubkey(&txin, &prevout), Some(expect));
     }
 }
