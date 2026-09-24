@@ -121,6 +121,13 @@ pub enum MempoolReject {
     /// both as `too-long-mempool-chain`.
     #[error("too-long-mempool-chain")]
     PackageLimits,
+    /// The candidate's own in-pool ancestor set overlaps the set of
+    /// entries it would evict (conflicts plus their descendants) — Core's
+    /// `EntriesAndTxidsDisjoint`. Left unchecked, admitting the tx and
+    /// then evicting its conflicts leaves a dangling reference to a coin
+    /// that never confirmed.
+    #[error("bad-txns-spends-conflicting-tx")]
+    SpendsConflict,
 }
 
 /// Core's `DEFAULT_ANCESTOR_LIMIT` — a candidate may not bring its
@@ -265,6 +272,13 @@ pub struct Mempool {
     /// BIP125 signaling (`-mempoolfullrbf` default-on). When false,
     /// the signaling requirement is enforced.
     full_rbf: bool,
+    /// Weight budgeted for the coinbase (and witness commitment) when
+    /// selecting a block template — Core's `-blockreservedweight`
+    /// (`DEFAULT_BLOCK_RESERVED_WEIGHT`).
+    block_reserved_weight: usize,
+    /// Sigop cost budgeted for the coinbase's own outputs when selecting
+    /// a template — Core's `DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS`.
+    coinbase_max_additional_sigops: u64,
     /// Confirmation observations from connected blocks.
     estimator: FeeEstimator,
     /// `prioritisetransaction` accumulations by txid — Core's
@@ -295,6 +309,8 @@ impl Mempool {
             by_rate: std::collections::BTreeMap::new(),
             min_relay_fee: DEFAULT_MIN_RELAY_FEE,
             full_rbf: true,
+            block_reserved_weight: template::DEFAULT_BLOCK_RESERVED_WEIGHT,
+            coinbase_max_additional_sigops: template::DEFAULT_COINBASE_MAX_ADDITIONAL_SIGOPS,
             estimator: FeeEstimator::new(),
             deltas: HashMap::new(),
             unbroadcast: HashSet::new(),
@@ -398,6 +414,40 @@ impl Mempool {
     /// Overrides the full-RBF policy — `-mempoolfullrbf`'s analog.
     pub fn set_full_rbf(&mut self, on: bool) {
         self.full_rbf = on;
+    }
+
+    /// Weight budgeted for the coinbase when building a template —
+    /// `-blockreservedweight`'s analog.
+    #[must_use]
+    pub fn block_reserved_weight(&self) -> usize {
+        self.block_reserved_weight
+    }
+
+    /// Overrides the block-reserved-weight budget, clamped to
+    /// [`template::MINIMUM_BLOCK_RESERVED_WEIGHT`]`..=MAX_BLOCK_WEIGHT` —
+    /// Core refuses a smaller reserve outright at startup; clamping up
+    /// is the conservative analog for a runtime setter.
+    pub fn set_block_reserved_weight(&mut self, weight: usize) {
+        self.block_reserved_weight = weight.clamp(
+            template::MINIMUM_BLOCK_RESERVED_WEIGHT,
+            avila_consensus::block::MAX_BLOCK_WEIGHT,
+        );
+    }
+
+    /// Sigop cost budgeted for the coinbase's own outputs when building
+    /// a template — Core's `-blockmaxsigopscost`-adjacent
+    /// `coinbase_output_max_additional_sigops` option.
+    #[must_use]
+    pub fn coinbase_max_additional_sigops(&self) -> u64 {
+        self.coinbase_max_additional_sigops
+    }
+
+    /// Overrides the coinbase sigop-cost budget, clamped to
+    /// `0..=MAX_BLOCK_SIGOPS_COST` (Core's `std::clamp` in
+    /// `ApplyArgsManOptions`).
+    pub fn set_coinbase_max_additional_sigops(&mut self, sigops: u64) {
+        self.coinbase_max_additional_sigops =
+            sigops.min(avila_consensus::check::MAX_BLOCK_SIGOPS_COST);
     }
 
     /// Does `tx` signal BIP125 replaceability (any input sequence below
@@ -594,6 +644,22 @@ impl Mempool {
 
         let vsize = tx.weight().div_ceil(4);
         let ancestors = self.ancestors_of(tx);
+
+        if !conflicts.is_empty() {
+            let replaced = self.set_being_replaced(&conflicts);
+            if !push(
+                &mut steps,
+                "spends-conflict",
+                if ancestors.iter().any(|a| replaced.contains(a)) {
+                    Err("bad-txns-spends-conflicting-tx".into())
+                } else {
+                    Ok("ancestors disjoint from replaced set".into())
+                },
+            ) {
+                return steps;
+            }
+        }
+
         let ancestor_vsize: usize = ancestors
             .iter()
             .filter_map(|id| self.map.get(id))
@@ -818,6 +884,19 @@ impl Mempool {
         //    by accepting it.
         let vsize = tx.weight().div_ceil(4);
         let ancestors = self.ancestors_of(&tx);
+
+        // Core's `EntriesAndTxidsDisjoint`: a tx that both conflicts with
+        // a pooled entry and descends from it (directly, or through one
+        // of that entry's own in-pool descendants) is invalid — step 10
+        // below evicts the whole replaced set out from under it, leaving
+        // an ancestor reference that can never resolve.
+        if !conflicts.is_empty() {
+            let replaced = self.set_being_replaced(&conflicts);
+            if ancestors.iter().any(|a| replaced.contains(a)) {
+                return Err(MempoolReject::SpendsConflict);
+            }
+        }
+
         if ancestors.len() + 1 > ANCESTOR_LIMIT {
             return Err(MempoolReject::PackageLimits);
         }
@@ -959,6 +1038,22 @@ impl Mempool {
             }
         }
         Ok(txid)
+    }
+
+    /// The full set of entries a replacement would tear out of the pool:
+    /// each direct conflict plus every one of its in-pool descendants —
+    /// exactly what [`Self::remove_recursive`] removes per conflict in
+    /// step 10 of [`Self::accept_tx`]. Core's `EntriesAndTxidsDisjoint`
+    /// checks the candidate's ancestors against direct conflicts alone;
+    /// we check against this wider set because it's what our own
+    /// eviction actually tears out from under the candidate's ancestry.
+    fn set_being_replaced(&self, conflicts: &[Txid]) -> HashSet<Txid> {
+        let mut replaced: HashSet<Txid> = HashSet::new();
+        for &conflict in conflicts {
+            replaced.insert(conflict);
+            replaced.extend(self.descendant_txids(&conflict));
+        }
+        replaced
     }
 
     /// All in-pool ancestors of a candidate — the transitive closure of
@@ -1614,6 +1709,33 @@ mod tests {
         }
     }
 
+    /// A tx spending two outpoints into one output — for conflict/ancestor
+    /// scenarios `spend_tx` can't build.
+    fn spend_two(op1: OutPoint, op2: OutPoint, value: i64, sequence: u32) -> Transaction {
+        Transaction {
+            version: 2,
+            inputs: vec![
+                TxIn {
+                    previous_output: op1,
+                    script_sig: Script::new(vec![]),
+                    sequence,
+                    witness: Witness::default(),
+                },
+                TxIn {
+                    previous_output: op2,
+                    script_sig: Script::new(vec![]),
+                    sequence,
+                    witness: Witness::default(),
+                },
+            ],
+            outputs: vec![TxOut {
+                value,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        }
+    }
+
     fn mature_outpoint(blocks: &[Block], h: usize) -> OutPoint {
         OutPoint {
             txid: blocks[h - 1].transactions[0].txid(),
@@ -1716,6 +1838,37 @@ mod tests {
         let tx2 = spend_tx(op, 4_999_999_000, SEQ_FINAL);
         pool.accept_tx(tx1, &cs, NOW).unwrap();
         assert_eq!(pool.accept_tx(tx2, &cs, NOW), Err(MempoolReject::Conflict));
+    }
+
+    #[test]
+    fn rbf_cannot_spend_its_own_conflict() {
+        // Core's EntriesAndTxidsDisjoint (policy/rbf.cpp): `x` double-spends
+        // `p`'s input (conflicts with `p`) *and* spends `p`'s output (`p` is
+        // one of `x`'s ancestors). Without the check, `p` gets evicted as a
+        // replaced conflict while `x` is admitted still pointing at `p`'s
+        // now-gone output — a dangling in-pool parent that can never confirm.
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let op = mature_outpoint(&blocks, 1);
+        let p = spend_tx(op, 4_999_000_000, SEQ_RBF);
+        let p_id = p.txid();
+        pool.accept_tx(p, &cs, NOW).unwrap();
+
+        let x = spend_two(
+            OutPoint {
+                txid: p_id,
+                vout: 0,
+            },
+            op,
+            4_000_000_000,
+            SEQ_RBF,
+        );
+        assert_eq!(
+            pool.accept_tx(x, &cs, NOW),
+            Err(MempoolReject::SpendsConflict)
+        );
+        // The rejected replacement must not have taken its conflict with it.
+        assert!(pool.get(&p_id).is_some());
     }
 
     #[test]
@@ -2093,6 +2246,44 @@ mod tests {
             .map(|t| t.txid())
             .collect();
         assert_eq!(order, vec![pid, cid, sid]);
+    }
+
+    #[test]
+    fn template_rejects_oversized_coinbase_weight() {
+        // node/miner.cpp's BlockAssembler budgets a fixed weight for the
+        // coinbase during selection, but a caller-supplied
+        // `miner_script_pubkey` isn't bounded by that budget — the real,
+        // assembled block must still be checked before it's handed out
+        // as a template.
+        let (cs, _blocks) = chainstate_at(101);
+        let pool = Mempool::new();
+        let huge_script = Script::new(vec![0u8; 1_100_000]);
+        let err = pool
+            .build_template(&cs, huge_script, NOW + 120)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            template::TemplateError::WeightExceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn template_rejects_oversized_coinbase_sigops() {
+        // A script that is tiny by weight but stuffed with
+        // non-accurate-counted OP_CHECKMULTISIG (20 sigops each, Core's
+        // GetSigOpCount default) — the coinbase's own sigop cost alone
+        // can blow MAX_BLOCK_SIGOPS_COST even though its weight is
+        // negligible and the pool is empty.
+        let (cs, _blocks) = chainstate_at(101);
+        let pool = Mempool::new();
+        let sigop_script = Script::new(vec![script::OP_CHECKMULTISIG; 2_000]);
+        let err = pool
+            .build_template(&cs, sigop_script, NOW + 120)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            template::TemplateError::SigOpsExceeded { .. }
+        ));
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use avila_consensus::arith::CompactTarget;
 use avila_consensus::block::{Block, MAX_BLOCK_WEIGHT};
+use avila_consensus::check::MAX_BLOCK_SIGOPS_COST;
 use avila_consensus::connect::block_subsidy;
 use avila_consensus::hash::{BlockHash, Txid};
 use avila_consensus::header::BlockHeader;
@@ -27,8 +28,28 @@ use crate::Mempool;
 /// BIP141's witness-commitment script magic: `OP_RETURN aa21a9ed …`.
 pub const WITNESS_COMMITMENT_MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
 
-/// Space reserved for the coinbase and future commitment output.
-const COINBASE_RESERVE_WEIGHT: usize = 1_000;
+/// Core's `DEFAULT_BLOCK_RESERVED_WEIGHT` (`policy/policy.h`) — weight
+/// budgeted for the coinbase transaction (and witness commitment) when
+/// selecting mempool transactions for a template. Overridable via
+/// [`Mempool::set_block_reserved_weight`].
+pub const DEFAULT_BLOCK_RESERVED_WEIGHT: usize = 8_000;
+
+/// Core's `MINIMUM_BLOCK_RESERVED_WEIGHT` — the floor Core clamps
+/// `-blockreservedweight` to (and refuses to start below); a smaller
+/// reserve risks a coinbase that doesn't fit its own budget.
+pub const MINIMUM_BLOCK_RESERVED_WEIGHT: usize = 2_000;
+
+/// Core's `DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS` — sigop cost
+/// budgeted for the coinbase's own outputs (payouts, witness commitment)
+/// out of `MAX_BLOCK_SIGOPS_COST` when selecting mempool transactions.
+/// Overridable via [`Mempool::set_coinbase_max_additional_sigops`].
+pub const DEFAULT_COINBASE_MAX_ADDITIONAL_SIGOPS: u64 = 400;
+
+/// Core's `BLOCK_FULL_ENOUGH_WEIGHT_DELTA` (`node/miner.cpp`) — once
+/// 1000 candidates in a row fail to fit (`MAX_CONSECUTIVE_FAILURES`),
+/// treat the block as full once fewer than this much weight remains,
+/// rather than scanning the rest of the pool for a smaller fit.
+const BLOCK_FULL_ENOUGH_WEIGHT_DELTA: usize = 4_000;
 
 /// A ready-to-mine block candidate built from the pool.
 #[derive(Clone, Debug)]
@@ -55,6 +76,27 @@ pub enum TemplateError {
     /// Difficulty retarget failed for the next height.
     #[error("difficulty: {0}")]
     Difficulty(String),
+    /// The assembled block's weight exceeds `MAX_BLOCK_WEIGHT` — the
+    /// real coinbase (miner script, witness commitment) outgrew the
+    /// weight budgeted for it during selection. Returned instead of an
+    /// invalid block; never observed with the default reserve unless the
+    /// caller supplies an oversized `miner_script_pubkey`.
+    #[error("block weight {actual} exceeds MAX_BLOCK_WEIGHT ({max})")]
+    WeightExceeded {
+        /// The assembled block's actual weight.
+        actual: usize,
+        /// `MAX_BLOCK_WEIGHT`.
+        max: usize,
+    },
+    /// The assembled block's total sigop cost exceeds
+    /// `MAX_BLOCK_SIGOPS_COST`. Returned instead of an invalid block.
+    #[error("block sigop cost {actual} exceeds MAX_BLOCK_SIGOPS_COST ({max})")]
+    SigOpsExceeded {
+        /// The assembled block's actual sigop cost.
+        actual: u64,
+        /// `MAX_BLOCK_SIGOPS_COST`.
+        max: u64,
+    },
 }
 
 impl Mempool {
@@ -97,7 +139,7 @@ impl Mempool {
         // `GetModFeeAndSize` — the smaller of the tx's own modified
         // feerate and its in-pool ancestor package's feerate.
         let flags = avila_consensus::script::block_script_flags(cs.tree().params(), height, &tip);
-        let package = self.select_package_txs(cs, height, mtp, flags);
+        let (package, tx_sigops) = self.select_package_txs(cs, height, mtp, flags);
         let chosen: Vec<&crate::MempoolEntry> =
             package.iter().filter_map(|id| self.entry(id)).collect();
         let fees: i64 = chosen.iter().map(|e| e.fee).sum();
@@ -109,6 +151,7 @@ impl Mempool {
             cs,
             miner_script_pubkey,
             &txs,
+            tx_sigops,
             height,
             &tip_node.header,
             tip,
@@ -126,9 +169,52 @@ impl Mempool {
         })
     }
 
+    /// A transaction's sigop cost — Core's `GetTransactionSigOpCost`:
+    /// legacy sigops (every input's `scriptSig` plus every output's
+    /// `scriptPubKey`, non-accurate count, ×4) plus, per input, P2SH
+    /// redeem-script sigops and witness sigops resolved against
+    /// whatever coin that input spends (confirmed UTXO or pool parent).
+    /// An input that doesn't resolve contributes only its legacy share
+    /// — it shouldn't happen for an already-admitted entry.
+    fn real_sigop_cost(
+        &self,
+        cs: &avila_consensus::chainstate::Chainstate,
+        tx: &Transaction,
+        flags: avila_consensus::script::ScriptFlags,
+    ) -> u64 {
+        use avila_consensus::block::WITNESS_SCALE_FACTOR;
+        let mut sigops = tx
+            .inputs
+            .iter()
+            .map(|i| i.script_sig.sig_ops(false))
+            .sum::<u64>()
+            + tx.outputs
+                .iter()
+                .map(|o| o.script_pubkey.sig_ops(false))
+                .sum::<u64>();
+        sigops *= WITNESS_SCALE_FACTOR as u64;
+        for input in &tx.inputs {
+            if let Some(coin) = self.resolve(cs, &input.previous_output) {
+                let spk = &coin.out.script_pubkey;
+                if spk.is_p2sh() {
+                    sigops += spk.p2sh_sig_ops(&input.script_sig) * WITNESS_SCALE_FACTOR as u64;
+                }
+                sigops += avila_consensus::script::count_witness_sig_ops(
+                    &input.script_sig,
+                    spk,
+                    &input.witness,
+                    flags,
+                );
+            }
+        }
+        sigops
+    }
+
     /// Core's `BlockAssembler::addPackageTxs` — pick transactions by
     /// ancestor-feerate packages. Returns the included txids in block
-    /// order (parents before children).
+    /// order (parents before children), plus their total real sigop
+    /// cost (Core's `GetTransactionSigOpCost`, summed — not the
+    /// ancestor-package score) for the caller's final block-wide check.
     ///
     /// Selection sorts every entry by the *minimum* of its own
     /// modified feerate and the feerate of itself plus all its
@@ -143,9 +229,9 @@ impl Mempool {
         height: u32,
         mtp: u32,
         flags: avila_consensus::script::ScriptFlags,
-    ) -> Vec<Txid> {
+    ) -> (Vec<Txid>, u64) {
         use avila_consensus::block::WITNESS_SCALE_FACTOR;
-        use avila_consensus::check::{MAX_BLOCK_SIGOPS_COST, is_final_tx};
+        use avila_consensus::check::is_final_tx;
 
         /// `policy::nBytesPerSigOp` — legacy sigop cost granularity.
         const BYTES_PER_SIGOP: u64 = 20;
@@ -154,7 +240,12 @@ impl Mempool {
         /// Core's `MAX_CONSECUTIVE_FAILURES` — give up once the block
         /// is nearly full and nothing fits.
         const MAX_CONSECUTIVE_FAILURES: i64 = 1000;
-        let cap = MAX_BLOCK_WEIGHT - COINBASE_RESERVE_WEIGHT;
+        // Core's BlockAssembler starts `nBlockWeight`/`nBlockSigOpsCost`
+        // at the coinbase's budgeted reserve rather than zero; we instead
+        // shrink the caps by the same amount and keep the running totals
+        // at zero — equivalent, and reuses the existing accounting below.
+        let cap = MAX_BLOCK_WEIGHT.saturating_sub(self.block_reserved_weight);
+        let sigops_cap = MAX_BLOCK_SIGOPS_COST.saturating_sub(self.coinbase_max_additional_sigops);
 
         // Per-entry cached facts: the sigop-adjusted vsize Core calls
         // `GetTxSize`, real weight for block accounting, sigop cost,
@@ -253,31 +344,7 @@ impl Mempool {
         let mut facts: HashMap<Txid, Facts> = HashMap::with_capacity(self.entries().count());
         for e in self.entries() {
             let txid = e.tx.txid();
-            let mut sigops =
-                e.tx.inputs
-                    .iter()
-                    .map(|i| i.script_sig.sig_ops(false))
-                    .sum::<u64>()
-                    + e.tx
-                        .outputs
-                        .iter()
-                        .map(|o| o.script_pubkey.sig_ops(false))
-                        .sum::<u64>();
-            sigops *= WITNESS_SCALE_FACTOR as u64;
-            for input in &e.tx.inputs {
-                if let Some(coin) = self.resolve(cs, &input.previous_output) {
-                    let spk = &coin.out.script_pubkey;
-                    if spk.is_p2sh() {
-                        sigops += spk.p2sh_sig_ops(&input.script_sig) * WITNESS_SCALE_FACTOR as u64;
-                    }
-                    sigops += avila_consensus::script::count_witness_sig_ops(
-                        &input.script_sig,
-                        spk,
-                        &input.witness,
-                        flags,
-                    );
-                }
-            }
+            let sigops = self.real_sigop_cost(cs, &e.tx, flags);
             let weight = e.tx.weight() as u64;
             let tx_size = weight
                 .max(sigops * BYTES_PER_SIGOP)
@@ -414,12 +481,12 @@ impl Mempool {
 
             // `-blockmintxfee` floor — everything else sorts lower.
             if package_fees < BLOCK_MIN_FEE_SAT_PER_KVB * package_size as i64 / 1000 {
-                return chosen;
+                return (chosen, block_sigops);
             }
 
             // TestPackage: weight (vsize terms) + sigops.
             if block_weight + WITNESS_SCALE_FACTOR as u64 * package_size >= cap as u64
-                || block_sigops + package_sigops >= MAX_BLOCK_SIGOPS_COST
+                || block_sigops + package_sigops >= sigops_cap
             {
                 if using_modified {
                     map_modified.remove(&iter);
@@ -427,7 +494,7 @@ impl Mempool {
                 }
                 consecutive_failed += 1;
                 if consecutive_failed > MAX_CONSECUTIVE_FAILURES
-                    && block_weight + COINBASE_RESERVE_WEIGHT as u64 > cap as u64
+                    && block_weight + BLOCK_FULL_ENOUGH_WEIGHT_DELTA as u64 > cap as u64
                 {
                     break;
                 }
@@ -500,7 +567,7 @@ impl Mempool {
                 }
             }
         }
-        chosen
+        (chosen, block_sigops)
     }
 
     /// Assembles the candidate block — the tail of [`build_template`]
@@ -509,11 +576,28 @@ impl Mempool {
     /// semantics: exactly the listed txs, in order, plus the
     /// coinbase). Returns the block plus the count of non-coinbase
     /// transactions included.
+    ///
+    /// `tx_sigops` is the caller's precomputed total sigop cost of
+    /// `txs` (Core's `GetTransactionSigOpCost`, summed) — used only for
+    /// the final `MAX_BLOCK_SIGOPS_COST` check below, since a coinbase
+    /// has no prevouts of its own to derive its sigop cost from `txs`.
+    ///
+    /// # Errors
+    ///
+    /// [`TemplateError::WeightExceeded`] or [`TemplateError::SigOpsExceeded`]
+    /// if the assembled block — coinbase included — doesn't fit the
+    /// consensus caps. `select_package_txs` budgets a reserve for the
+    /// coinbase so this should not trigger with a normally sized miner
+    /// output script, but a caller-supplied `miner_script_pubkey` (or an
+    /// explicit `txs` set from `build_explicit_block`) isn't bounded by
+    /// that budget, so the real, assembled block is checked rather than
+    /// trusting the plan.
     #[allow(clippy::too_many_arguments)]
     fn assemble_block(
         cs: &avila_consensus::chainstate::Chainstate,
         miner_script_pubkey: Script,
         txs: &[(Transaction, i64)],
+        tx_sigops: u64,
         height: u32,
         tip_header: &avila_consensus::header::BlockHeader,
         tip: BlockHash,
@@ -614,6 +698,43 @@ impl Mempool {
 
         let (root, _) = block.merkle_root();
         block.header.merkle_root = root;
+
+        // Final safety net: verify the *real* assembled block rather
+        // than trusting `select_package_txs`'s budgeted reserve, which
+        // only bounds mempool-selected weight/sigops, not a caller's
+        // `miner_script_pubkey` or an explicit `generateblock`-style
+        // `txs` set. Core's own coinbase shape is bounded by its own
+        // code, not a runtime check; ours accepts caller-supplied
+        // scripts, so we check rather than assume.
+        let weight = block.weight();
+        if weight > MAX_BLOCK_WEIGHT {
+            return Err(TemplateError::WeightExceeded {
+                actual: weight,
+                max: MAX_BLOCK_WEIGHT,
+            });
+        }
+        // Core's `GetTransactionSigOpCost` special-cases a coinbase to
+        // only its own legacy sigops (`GetLegacySigOpCount * 4`) — no
+        // P2SH/witness component, since a coinbase has no real prevouts.
+        let coinbase = &block.transactions[0];
+        let coinbase_sigops: u64 = (coinbase
+            .inputs
+            .iter()
+            .map(|i| i.script_sig.sig_ops(false))
+            .sum::<u64>()
+            + coinbase
+                .outputs
+                .iter()
+                .map(|o| o.script_pubkey.sig_ops(false))
+                .sum::<u64>())
+            * avila_consensus::block::WITNESS_SCALE_FACTOR as u64;
+        let total_sigops = coinbase_sigops.saturating_add(tx_sigops);
+        if total_sigops > MAX_BLOCK_SIGOPS_COST {
+            return Err(TemplateError::SigOpsExceeded {
+                actual: total_sigops,
+                max: MAX_BLOCK_SIGOPS_COST,
+            });
+        }
         Ok(block)
     }
 
@@ -649,10 +770,19 @@ impl Mempool {
         )
         .map_err(|e| TemplateError::Difficulty(e.to_string()))?;
         let subsidy = block_subsidy(height, cs.tree().params());
+        // Explicit sets bypass `select_package_txs`'s budgeted reserve
+        // entirely, so their real sigop cost has to be computed here for
+        // `assemble_block`'s final check.
+        let flags = avila_consensus::script::block_script_flags(cs.tree().params(), height, &tip);
+        let tx_sigops: u64 = txs
+            .iter()
+            .map(|(tx, _)| self.real_sigop_cost(cs, tx, flags))
+            .sum();
         Self::assemble_block(
             cs,
             miner_script_pubkey,
             txs,
+            tx_sigops,
             height,
             &tip_node.header,
             tip,
