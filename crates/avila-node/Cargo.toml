@@ -10,10 +10,12 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+argon2 = "0.5.3"
 avila-consensus.workspace = true
 avila-core.workspace = true
 avila-mempool = { version = "0.1.0-dev", path = "../avila-mempool" }
 avila-p2p.workspace = true
+chacha20poly1305 = "0.10.1"
 getrandom = "0.3"
 libc.workspace = true
 prctl.workspace = true

@@ -188,6 +188,183 @@ pub fn resolve_entropy(
     })
 }
 
+/// Vault format: `AVLAVLT1` || argon2 params (m,t,p as u32 LE) ||
+/// salt(32) || nonce(12) || ciphertext+tag — argon2id passphrase KDF
+/// feeding ChaCha20Poly1305. The plaintext is the signer's private
+/// descriptors + provenance records (NOT the watch list — secrets
+/// never share a file with watch state).
+const VAULT_MAGIC: &[u8; 8] = b"AVLAVLT1";
+/// Argon2id params — memory-hard at wallet scale (64 MiB, 3 lanes,
+/// 2 passes): a stolen vault resists commodity GPU grinding far
+/// better than any iterated-hash KDF.
+const VAULT_ARGON_M: u32 = 65_536;
+const VAULT_ARGON_T: u32 = 2;
+const VAULT_ARGON_P: u32 = 3;
+
+/// What a vault carries — enough to rebuild `SignerState` from the
+/// private descriptors (derivation is deterministic; the seed is
+/// never stored separately).
+pub struct VaultContents {
+    /// The xprv descriptors (with checksums).
+    pub descs_private: Vec<String>,
+    /// Neutered watch descriptors (public — safe in any file).
+    pub descs_watch: Vec<String>,
+    /// "os" | "user" | "dice" | "mixed:…".
+    pub provenance: String,
+    /// `sha256(raw entropy input)` at creation time.
+    pub entropy_commitment: String,
+}
+
+/// Seal the signer's secrets under `passphrase` — argon2id KDF →
+/// ChaCha20Poly1305 AEAD over the private descriptors + provenance.
+///
+/// # Errors
+/// RNG or KDF failure — both are fatal for a vault write.
+pub fn vault_seal(signer: &SignerState, passphrase: &str) -> Result<Vec<u8>, String> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    let mut pt = Vec::new();
+    pt.push(signer.provenance.len() as u8);
+    pt.extend_from_slice(signer.provenance.as_bytes());
+    pt.push(signer.entropy_commitment.len() as u8);
+    pt.extend_from_slice(signer.entropy_commitment.as_bytes());
+    pt.extend_from_slice(&(signer.descs_private.len() as u32).to_le_bytes());
+    for d in &signer.descs_private {
+        pt.extend_from_slice(&(d.len() as u32).to_le_bytes());
+        pt.extend_from_slice(d.as_bytes());
+    }
+    pt.extend_from_slice(&(signer.descs_watch.len() as u32).to_le_bytes());
+    for d in &signer.descs_watch {
+        pt.extend_from_slice(&(d.len() as u32).to_le_bytes());
+        pt.extend_from_slice(d.as_bytes());
+    }
+    let mut salt = [0u8; 32];
+    let mut nonce = [0u8; 12];
+    getrandom::fill(&mut salt).map_err(|e| format!("rng failed: {e}"))?;
+    getrandom::fill(&mut nonce).map_err(|e| format!("rng failed: {e}"))?;
+    let argon = argon2::Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        argon2::Params::new(VAULT_ARGON_M, VAULT_ARGON_T, VAULT_ARGON_P, Some(32))
+            .map_err(|e| format!("argon2 params: {e}"))?,
+    );
+    let mut key = [0u8; 32];
+    argon
+        .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
+        .map_err(|e| format!("argon2: {e}"))?;
+    let cipher = chacha20poly1305::ChaCha20Poly1305::new(&key.into());
+    let ct = cipher
+        .encrypt(
+            (&nonce).into(),
+            chacha20poly1305::aead::Payload {
+                msg: &pt,
+                aad: VAULT_MAGIC,
+            },
+        )
+        .map_err(|_| "encrypt failed".to_string())?;
+    let mut out = VAULT_MAGIC.to_vec();
+    for v in [VAULT_ARGON_M, VAULT_ARGON_T, VAULT_ARGON_P] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Open a vault blob with `passphrase` — wrong passphrase or tampered
+/// ciphertext is an AEAD failure, not a wrong-password guess.
+///
+/// # Errors
+/// Bad magic, truncated blob, KDF or AEAD failure.
+pub fn vault_open(bytes: &[u8], passphrase: &str) -> Result<VaultContents, String> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    let hdr = 8 + 12 + 32 + 12; // magic + params + salt + nonce
+    if bytes.len() < hdr || &bytes[..8] != VAULT_MAGIC {
+        return Err("not an avila signer vault".into());
+    }
+    let param_u32 = |r: &[u8]| -> Result<u32, String> {
+        r.try_into()
+            .map(u32::from_le_bytes)
+            .map_err(|_| "vault header truncated".to_string())
+    };
+    let m = param_u32(&bytes[8..12])?;
+    let t = param_u32(&bytes[12..16])?;
+    let p = param_u32(&bytes[16..20])?;
+    let salt = &bytes[20..52];
+    let nonce = &bytes[52..64];
+    let ct = &bytes[64..];
+    let argon = argon2::Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        argon2::Params::new(m, t, p, Some(32))
+            .map_err(|e| format!("vault argon2 params unreasonable: {e}"))?,
+    );
+    let mut key = [0u8; 32];
+    argon
+        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .map_err(|e| format!("argon2: {e}"))?;
+    let cipher = chacha20poly1305::ChaCha20Poly1305::new(&key.into());
+    let pt = cipher
+        .decrypt(
+            nonce.into(),
+            chacha20poly1305::aead::Payload {
+                msg: ct,
+                aad: VAULT_MAGIC,
+            },
+        )
+        .map_err(|_| "vault open failed — wrong passphrase or corrupt vault".to_string())?;
+    /// Byte cursor over the decrypted plaintext — every read bounds-
+    /// checked; a truncated vault is an error, not a panic.
+    struct Cursor<'a> {
+        buf: &'a [u8],
+        at: usize,
+    }
+    impl Cursor<'_> {
+        fn take(&mut self, n: usize) -> Result<&[u8], String> {
+            if self.at + n > self.buf.len() {
+                return Err("vault plaintext truncated".into());
+            }
+            let r = &self.buf[self.at..self.at + n];
+            self.at += n;
+            Ok(r)
+        }
+        fn take_u32(&mut self) -> Result<usize, String> {
+            self.take(4)?
+                .try_into()
+                .map(u32::from_le_bytes)
+                .map(|v| v as usize)
+                .map_err(|_| "vault plaintext truncated".to_string())
+        }
+        fn read_strs(&mut self) -> Result<Vec<String>, String> {
+            let n = self.take_u32()?;
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                let dl = self.take_u32()?;
+                out.push(
+                    String::from_utf8(self.take(dl)?.to_vec())
+                        .map_err(|_| "bad desc".to_string())?,
+                );
+            }
+            Ok(out)
+        }
+    }
+    let mut cur = Cursor { buf: &pt, at: 0 };
+    let plen = cur.take(1)?[0] as usize;
+    let provenance =
+        String::from_utf8(cur.take(plen)?.to_vec()).map_err(|_| "bad provenance".to_string())?;
+    let clen = cur.take(1)?[0] as usize;
+    let entropy_commitment =
+        String::from_utf8(cur.take(clen)?.to_vec()).map_err(|_| "bad commitment".to_string())?;
+    let descs_private = cur.read_strs()?;
+    let descs_watch = cur.read_strs()?;
+    Ok(VaultContents {
+        descs_private,
+        descs_watch,
+        provenance,
+        entropy_commitment,
+    })
+}
+
 /// Opt-in signing material (queue #35): populated ONLY by
 /// `createdescriptorseed`/key import — the wallet stays watch-only
 /// (Core's `disable_private_keys` model) until the operator asks for
@@ -200,6 +377,8 @@ pub struct SignerState {
     /// Private-material descriptor bodies — only surfaced by
     /// explicitly-private RPCs, never logged.
     pub descs_private: Vec<String>,
+    /// Neutered watch descriptors (public — safe in any file).
+    pub descs_watch: Vec<String>,
     /// Seed entropy provenance: "os" (system CSPRNG), "user",
     /// "dice", or "mixed:…" when OS entropy was XOR-folded in.
     pub provenance: String,
@@ -478,6 +657,12 @@ impl WatchWallet {
         self.signer = Some(signer);
     }
 
+    /// Drop the signer — `signerlock`; secrets leave memory with the
+    /// state (the vault holds the recoverable form).
+    pub fn disable_signing(&mut self) {
+        self.signer = None;
+    }
+
     /// Whether the wallet holds signing keys (opt-in signer active).
     #[must_use]
     pub fn is_signer(&self) -> bool {
@@ -550,6 +735,12 @@ impl WatchWallet {
             .iter()
             .filter(|(_, c)| c.spent_height.is_none())
             .map(|(&(txid, vout), c)| (OutPoint { txid, vout }, c))
+    }
+
+    /// The vault's path — sibling of `watchlist.dat`, same dir.
+    #[must_use]
+    pub fn vault_path(&self) -> PathBuf {
+        self.path.with_file_name("signervault.dat")
     }
 
     /// Persists when dirty — `watchlist.dat` via tmp+rename like the
@@ -1195,5 +1386,35 @@ mod tests {
         assert_ne!(mixed.seed, plain.seed);
         // Commitment still binds to the user's input, not the OS half.
         assert_eq!(mixed.commitment, plain.commitment);
+    }
+
+    /// Queue #35 — the vault roundtrips its contents, rejects the
+    /// wrong passphrase at the AEAD layer (no oracle), and rejects
+    /// tampered ciphertext.
+    #[test]
+    fn vault_seal_open_roundtrips_and_rejects() {
+        let signer = SignerState {
+            provider: avila_consensus::descriptor::FlatProvider::default(),
+            descs_private: vec!["wpkh(tprv8x/0/*)#testp".to_string()],
+            descs_watch: vec!["wpkh(tpub8x/0/*)#testw".to_string()],
+            provenance: "dice".to_string(),
+            entropy_commitment: "abc123".to_string(),
+        };
+        let blob = vault_seal(&signer, "correct horse").unwrap();
+        assert!(blob.starts_with(b"AVLAVLT1"));
+        let v = vault_open(&blob, "correct horse").unwrap();
+        assert_eq!(v.descs_private, signer.descs_private);
+        assert_eq!(v.descs_watch, signer.descs_watch);
+        assert_eq!(v.provenance, "dice");
+        assert_eq!(v.entropy_commitment, "abc123");
+        // Wrong passphrase → AEAD failure, not a hint.
+        assert!(vault_open(&blob, "wrong horse").is_err());
+        // Tampered ciphertext → AEAD failure.
+        let mut bad = blob.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        assert!(vault_open(&bad, "correct horse").is_err());
+        // Truncated blob → error, not panic.
+        assert!(vault_open(&blob[..40], "correct horse").is_err());
     }
 }

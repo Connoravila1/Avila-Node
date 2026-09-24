@@ -906,6 +906,33 @@ fn reply_obj(result: Value, error: Option<(i64, String)>, id: &Option<Value>, v2
 /// queue until the missing bodies arrive or the deadline passes.
 /// `method` is carried on the query only so a panic inside `f` can be
 /// logged by name — it plays no role in dispatch itself.
+/// Build the signer provider from private descriptors — parse each
+/// xprv root, then expand a bounded lookahead collecting derived
+/// secrets + origins (descriptor.rs's `ExpandPrivate`). Shared by
+/// `createdescriptorseed` and `signerload`.
+fn signer_provider_from_descs(
+    descs_private: &[String],
+    params: &avila_consensus::params::Params,
+) -> Result<avila_consensus::descriptor::FlatProvider, String> {
+    let mut signing = avila_consensus::descriptor::FlatProvider::default();
+    let mut expanded = avila_consensus::descriptor::FlatProvider::default();
+    for d in descs_private {
+        let (parsed, p, _) = parse_descriptors(d, params, true)?;
+        signing.keys.extend(p.keys);
+        signing.xprvs.extend(p.xprvs);
+        let mut cache = avila_consensus::descriptor::DeriveCache::new();
+        for pos in 0..64u32 {
+            let _ = parsed[0].expand_into(pos, &signing, &mut expanded, true, &mut cache);
+        }
+    }
+    signing.keys.extend(expanded.keys);
+    signing.pubkeys.extend(expanded.pubkeys);
+    signing.origins.extend(expanded.origins);
+    signing.scripts.extend(expanded.scripts);
+    signing.tr_trees.extend(expanded.tr_trees);
+    Ok(signing)
+}
+
 /// Core's `BroadcastTransaction` tail — mempool admission +
 /// unbroadcast/broadcast-pool marking + stem-hopped relay announce.
 /// Shared by `sendrawtransaction` (after its caller policy bounds) and
@@ -10599,29 +10626,10 @@ pub(crate) fn dispatch(
                     (with_sum(format!("wpkh([{origin}]{xpub}/0/*)")), false),
                     (with_sum(format!("wpkh([{origin}]{xpub}/1/*)")), true),
                 ];
-                // Signing provider: parse the private descs (xprv
-                // roots), then expand a bounded lookahead collecting
-                // derived secrets + origins — `ExpandPrivate`.
-                let mut signing = avila_consensus::descriptor::FlatProvider::default();
-                let mut expanded = avila_consensus::descriptor::FlatProvider::default();
-                for d in &priv_descs {
-                    let (parsed, p, _) = match parse_descriptors(d, params, true) {
-                        Ok(v) => v,
-                        Err(e) => return QueryReply::Now(Err((RPC_INVALID_ADDRESS_OR_KEY, e))),
-                    };
-                    signing.keys.extend(p.keys);
-                    signing.xprvs.extend(p.xprvs);
-                    let mut cache = avila_consensus::descriptor::DeriveCache::new();
-                    for pos in 0..64u32 {
-                        let _ =
-                            parsed[0].expand_into(pos, &signing, &mut expanded, true, &mut cache);
-                    }
-                }
-                signing.keys.extend(expanded.keys);
-                signing.pubkeys.extend(expanded.pubkeys);
-                signing.origins.extend(expanded.origins);
-                signing.scripts.extend(expanded.scripts);
-                signing.tr_trees.extend(expanded.tr_trees);
+                let signing = match signer_provider_from_descs(&priv_descs, params) {
+                    Ok(s) => s,
+                    Err(e) => return QueryReply::Now(Err((RPC_INVALID_ADDRESS_OR_KEY, e))),
+                };
 
                 let mut w = match wallet.lock() {
                     Ok(w) => w,
@@ -10650,6 +10658,7 @@ pub(crate) fn dispatch(
                 w.enable_signing(crate::watch::SignerState {
                     provider: signing,
                     descs_private: priv_descs.to_vec(),
+                    descs_watch: watch_descs.iter().map(|(d, _)| d.clone()).collect(),
                     provenance: provenance.clone(),
                     entropy_commitment: resolved.commitment.clone(),
                 });
@@ -10660,7 +10669,7 @@ pub(crate) fn dispatch(
                     "entropy_source": provenance,
                     "entropy_commitment": resolved.commitment,
                     "warnings": resolved.warnings,
-                    "warning": "memory-only signer — restart clears key material; the xprv above is the only backup until the encrypted vault lands",
+                    "warning": "memory-only signer — restart clears key material; back up via signerexport or the xprv above",
                 })))
             })
         }
@@ -10958,6 +10967,132 @@ pub(crate) fn dispatch(
                     "inputs_verified": verified,
                     "inputs_unverified": unverified,
                 })))
+            })
+        }
+
+        // Signer persistence (queue #35): the vault holds the private
+        // descriptors + provenance under argon2id → ChaCha20Poly1305.
+        // Secrets never share a file with watch state; the vault path
+        // is a sibling of watchlist.dat.
+        "signerexport" => {
+            let passphrase = param(params, 0, "passphrase")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let wallet = wallet.cloned();
+            chain_query(method, queries, move |_, _| {
+                let Some(wallet) = wallet else {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    ));
+                };
+                let Some(passphrase) = passphrase.filter(|p| !p.is_empty()) else {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "signerexport requires a non-empty passphrase".into(),
+                    ));
+                };
+                let w = wallet
+                    .lock()
+                    .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                let Some(signer) = w.signer() else {
+                    return Err((RPC_WALLET_ERROR, "wallet has no signing keys".into()));
+                };
+                let blob = crate::watch::vault_seal(signer, &passphrase)
+                    .map_err(|e| (RPC_WALLET_ERROR, e))?;
+                let path = w.vault_path();
+                // Atomic write, like watchlist.dat.
+                let tmp = path.with_extension("tmp");
+                std::fs::write(&tmp, &blob)
+                    .and_then(|_| std::fs::rename(&tmp, &path))
+                    .map_err(|e| (RPC_WALLET_ERROR, format!("vault write failed: {e}")))?;
+                Ok(json!({
+                    "path": path.display().to_string(),
+                    "descs": signer.descs_private.len(),
+                }))
+            })
+        }
+
+        "signerload" => {
+            let passphrase = param(params, 0, "passphrase")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let wallet = wallet.cloned();
+            chain_query(method, queries, move |cs, _| {
+                let Some(wallet) = wallet else {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    ));
+                };
+                let Some(passphrase) = passphrase else {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "signerload requires a passphrase".into(),
+                    ));
+                };
+                let mut w = wallet
+                    .lock()
+                    .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                if w.signer().is_some() {
+                    return Err((
+                        RPC_WALLET_ERROR,
+                        "signer already loaded — signerlock first".into(),
+                    ));
+                }
+                let path = w.vault_path();
+                let blob = std::fs::read(&path)
+                    .map_err(|e| (RPC_WALLET_ERROR, format!("vault read failed: {e}")))?;
+                let vault = crate::watch::vault_open(&blob, &passphrase)
+                    .map_err(|e| (RPC_WALLET_ERROR, e))?;
+                let params = cs.tree().params();
+                let provider = signer_provider_from_descs(&vault.descs_private, params)
+                    .map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
+                // Re-import the neutered watch descs — idempotent if
+                // they're already tracked (import rejects exact dups).
+                let mut imported = 0usize;
+                for d in &vault.descs_watch {
+                    let req = json!({
+                        "desc": d,
+                        "timestamp": "now",
+                        "active": true,
+                        "internal": d.contains("/1/*"),
+                        "range": [0, 999],
+                    });
+                    if import_one_descriptor(&mut w, cs, &req).is_ok() {
+                        imported += 1;
+                    }
+                }
+                w.enable_signing(crate::watch::SignerState {
+                    provider,
+                    descs_private: vault.descs_private,
+                    descs_watch: vault.descs_watch,
+                    provenance: vault.provenance,
+                    entropy_commitment: vault.entropy_commitment.clone(),
+                });
+                Ok(json!({
+                    "loaded": true,
+                    "descs_imported": imported,
+                    "entropy_commitment": vault.entropy_commitment,
+                }))
+            })
+        }
+
+        "signerlock" => {
+            let wallet = wallet.cloned();
+            chain_query(method, queries, move |_, _| {
+                let Some(wallet) = wallet else {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    ));
+                };
+                let mut w = wallet
+                    .lock()
+                    .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                let had = w.signer().is_some();
+                w.disable_signing();
+                Ok(json!({ "locked": had }))
             })
         }
 
