@@ -4566,6 +4566,11 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
     ),
     ("getmempoolinfo", &[], GETMEMPOOLINFO_HELP),
     (
+        "getmempoolblocks",
+        &[("nblocks", Some("number"), false)],
+        "getmempoolblocks ( nblocks )\n\nProjects the mempool into virtual blocks by modified-feerate order — the mempool.space 'next blocks' view, native.\n\nArguments:\n1. nblocks  (number, optional, default=8, max=64) How many projected blocks to return.\n\nResult:\n[ { \"block\": n, \"txs\": n, \"vsize\": n, \"totalfee\": btc, \"minfeerate\": btc/kvB, \"medianfeerate\": btc/kvB, \"maxfeerate\": btc/kvB }, ... ]\n",
+    ),
+    (
         "getpinningrisk",
         &[("margin", Some("number"), false)],
         "getpinningrisk ( margin )\n\nLists mempool transactions whose descendant package is at or near the descendant cap (BIP-431 pinning surface — such a tx cannot be CPFP-bumped).\n\nArguments:\n1. margin  (number, optional, default=5) Flag txs within this many descendants of the cap.\n\nResult:\n[ { \"txid\": \"hex\", \"descendants\": n }, ... ]\n",
@@ -6893,6 +6898,28 @@ pub(crate) fn dispatch(
                     .pinning_risk(margin)
                     .into_iter()
                     .map(|(txid, n)| json!({"txid": txid.to_string(), "descendants": n}))
+                    .collect::<Vec<_>>()))
+            })
+        }
+        "getmempoolblocks" => {
+            let n = param(params, 0, "nblocks")
+                .and_then(Value::as_u64)
+                .map_or(8, |v| v.min(64) as usize);
+            chain_query(method, queries, move |_, mgr| {
+                Ok(json!(mgr
+                    .mempool_ref()
+                    .block_projection(n)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, b)| json!({
+                        "block": i + 1,
+                        "txs": b.tx_count,
+                        "vsize": b.vsize,
+                        "totalfee": value_from_amount(b.total_fees),
+                        "minfeerate": value_from_amount(b.min_feerate),
+                        "medianfeerate": value_from_amount(b.median_feerate),
+                        "maxfeerate": value_from_amount(b.max_feerate),
+                    }))
                     .collect::<Vec<_>>()))
             })
         }

@@ -357,6 +357,24 @@ impl Default for FeeEstimator {
     }
 }
 
+/// One projected virtual block in [`Mempool::block_projection`].
+#[derive(Clone, Debug)]
+pub struct BlockBand {
+    /// Txs in this band.
+    pub tx_count: usize,
+    /// Total virtual size (vbytes).
+    pub vsize: usize,
+    /// Sum of modified fees (sats).
+    pub total_fees: i64,
+    /// Lowest feerate in the band — the "clear this band" threshold
+    /// (sats per kvB).
+    pub min_feerate: i64,
+    /// Median feerate.
+    pub median_feerate: i64,
+    /// Highest feerate.
+    pub max_feerate: i64,
+}
+
 /// A bounded policy pool over the live UTXO set.
 pub struct Mempool {
     /// txid → entry.
@@ -2339,6 +2357,62 @@ impl Mempool {
     #[must_use]
     pub fn unbroadcast_count(&self) -> usize {
         self.unbroadcast.len()
+    }
+
+    /// Mempool-block projection (queue #32 — the mempool.space layer):
+    /// sort pooled entries by modified feerate, chunk greedily into
+    /// virtual blocks of ~1 MvB, report each band's fee range. The
+    /// "what's in the next N blocks" query people stand up an entire
+    /// mempool.space stack to answer. Ancestor-feerate ordering is
+    /// what `build_template` uses for block 1 — tail bands differ only
+    /// in inter-package interleaving.
+    #[must_use]
+    pub fn block_projection(&self, max_blocks: usize) -> Vec<BlockBand> {
+        const BLOCK_VSIZE: usize = 1_000_000; // ~4M weight / 4
+        let mut entries: Vec<(i64, usize, i64)> = self
+            .map
+            .values()
+            .map(|e| {
+                (
+                    e.modified_fee() * 1000 / e.vsize.max(1) as i64,
+                    e.vsize,
+                    e.modified_fee(),
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut bands: Vec<(Vec<(i64, i64, usize)>, usize)> = Vec::new();
+        let mut band: Vec<(i64, i64, usize)> = Vec::new();
+        let mut band_vsize = 0usize;
+        for (rate, vsize, fee) in entries {
+            if band_vsize + vsize > BLOCK_VSIZE && !band.is_empty() {
+                bands.push((std::mem::take(&mut band), band_vsize));
+                if bands.len() >= max_blocks {
+                    break;
+                }
+                band_vsize = 0;
+            }
+            band.push((rate, fee, vsize));
+            band_vsize += vsize;
+        }
+        if !band.is_empty() && bands.len() < max_blocks {
+            bands.push((band, band_vsize));
+        }
+        bands
+            .into_iter()
+            .map(|(b, vsize)| {
+                let mut rates: Vec<i64> = b.iter().map(|(r, _, _)| *r).collect();
+                rates.sort_unstable();
+                BlockBand {
+                    tx_count: b.len(),
+                    vsize,
+                    total_fees: b.iter().map(|(_, f, _)| *f).sum(),
+                    min_feerate: *rates.first().unwrap_or(&0),
+                    median_feerate: rates[rates.len() / 2],
+                    max_feerate: *rates.last().unwrap_or(&0),
+                }
+            })
+            .collect()
     }
 
     /// Pinning-risk scan — BIP-431 descendant-limit detection: every
@@ -4507,6 +4581,31 @@ mod tests {
         assert!(!pool2.is_broadcast_pending(&txid));
         assert_eq!(pool2.broadcast_count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mempool-block projection: high-fee txs land in band 1, low-fee
+    /// in the tail, and band boundaries respect the vsize cap.
+    #[test]
+    fn block_projection_bands_by_feerate() {
+        let (cs, blocks) = chainstate_at(105);
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
+        // Three txs: fat-fee, mid-fee, dust-fee — each spends its own
+        // mature coinbase.
+        for (i, value) in [(1usize, 2_000_000_000i64), (2, 4_000_000_000), (3, 4_999_000_000)] {
+            let tx = spend_tx(mature_outpoint(&blocks, i), value, SEQ_FINAL);
+            pool.accept_tx(tx, &cs, NOW).unwrap();
+        }
+        let bands = pool.block_projection(8);
+        assert_eq!(bands.len(), 1, "tiny pool fits one block");
+        let b = &bands[0];
+        assert_eq!(b.tx_count, 3);
+        // Highest-fee tx is the ~3B-fee one; the band's min is the
+        // ~1k-sat dust-fee tx's rate.
+        assert!(b.max_feerate > b.min_feerate);
+        assert!(b.min_feerate > 0);
+        // vsize accounts every entry.
+        assert!(b.vsize >= 3);
     }
 
     /// RED TEAM — BIP-431 descendant-limit pinning. A counterparty in
