@@ -4289,6 +4289,50 @@ mod tests {
         assert_eq!(RAN.load(Ordering::Relaxed), 2);
     }
 
+    /// Fail-closed proxy (queue #13/#25): with a proxy set, the dial
+    /// worker's connection must arrive AT THE PROXY — a clearnet
+    /// bypass is observable as "proxy saw nothing". The proxy refuses
+    /// (not a SOCKS5 response), so the dial fails and no peer lands.
+    #[test]
+    fn proxy_mode_never_touches_cleared() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        // Record whether the proxy saw a connection, then refuse.
+        let proxy_saw = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let saw = proxy_saw.clone();
+        std::thread::spawn(move || {
+            while let Ok((mut s, _)) = proxy_listener.accept() {
+                saw.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Read the SOCKS5 greeting then drop — the dial fails.
+                let mut buf = [0u8; 8];
+                let _ = s.read(&mut buf);
+            }
+        });
+        let mut mgr = PeerManager::new(4);
+        mgr.set_proxy(Some(proxy_addr));
+        // A routable candidate (public IP) — the book accepts it.
+        let candidate: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+        mgr.addrbook().add_many(
+            std::iter::once((crate::addrman::net_addr_of(candidate, 0), NOW)),
+            NOW,
+        );
+        let dialed = mgr.maintain_outbounds(MAGIC, 0);
+        assert_eq!(dialed, vec![candidate], "the dial must be queued");
+        // Give the dial worker time to hit the proxy and fail.
+        std::thread::sleep(Duration::from_millis(300));
+        let mut cs = regtest();
+        mgr.tick(&mut cs, NOW);
+        let _ = mgr.maintain_outbounds(MAGIC, 0);
+        mgr.tick(&mut cs, NOW);
+        assert!(
+            proxy_saw.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the dial must have arrived at the proxy — a clearnet bypass is a leak"
+        );
+        assert_eq!(mgr.len(), 0, "no peer may land through a dead proxy");
+    }
+
     /// Eclipse detector (queue #12): four inbound-only established
     /// peers trips `AllInbound`; a healthy mixed set stays quiet.
     #[test]
