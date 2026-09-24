@@ -80,6 +80,12 @@ pub fn hash_label(ui: &mut Ui, hash: &str, size: f32, keep: Option<usize>) -> Re
     if resp.clicked() {
         ui.ctx().copy_text(hash.to_owned());
     }
+    resp.context_menu(|ui| {
+        if ui.button("Copy hash").clicked() {
+            ui.ctx().copy_text(hash.to_owned());
+            ui.close();
+        }
+    });
     resp
 }
 
@@ -301,7 +307,16 @@ pub fn hatch(painter: &Painter, rect: Rect, color: Color32, gap: f32, width: f32
 }
 
 /// A sparkline of `values` (oldest first) with a soft area beneath it.
-pub fn sparkline(ui: &mut Ui, values: &[f64], size: Vec2, color: Color32) -> Response {
+/// Describes the sample at an index of a sparkline's series, on hover.
+pub type Readout<'a> = &'a dyn Fn(usize) -> String;
+
+pub fn sparkline(
+    ui: &mut Ui,
+    values: &[f64],
+    size: Vec2,
+    color: Color32,
+    readout: Option<Readout>,
+) -> Response {
     let pal = Palette::of(ui.ctx());
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     let p = ui.painter();
@@ -310,16 +325,17 @@ pub fn sparkline(ui: &mut Ui, values: &[f64], size: Vec2, color: Color32) -> Res
         rect.bottom() - 0.5,
         Stroke::new(1.0, pal.hairline),
     );
-    let values = downsample(values, rect.width().max(2.0) as usize);
-    if values.len() < 2 {
+    let max = rect.width().max(2.0) as usize;
+    let shown = downsample(values, max);
+    if shown.len() < 2 {
         return resp;
     }
-    let lo = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let hi = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let lo = shown.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = shown.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let span = hi - lo;
     let inner = rect.shrink2(vec2(0.0, 3.0));
-    let n = values.len() - 1;
-    let points: Vec<Pos2> = values
+    let n = shown.len() - 1;
+    let points: Vec<Pos2> = shown
         .iter()
         .enumerate()
         .map(|(i, v)| {
@@ -344,10 +360,30 @@ pub fn sparkline(ui: &mut Ui, values: &[f64], size: Vec2, color: Color32) -> Res
         }
     }
     p.add(Shape::mesh(area));
-    let last = points[points.len() - 1];
-    p.add(Shape::line(points, Stroke::new(1.5, color)));
+    let last = points[n];
+    // The sample under the pointer: a hairline, a dot, and its reading.
+    let hovered = resp.hover_pos().map(|pos| {
+        let f = ((pos.x - inner.left()) / inner.width()).clamp(0.0, 1.0);
+        (f * n as f32).round() as usize
+    });
+    if let Some(i) = hovered {
+        p.vline(points[i].x, rect.y_range(), Stroke::new(1.0, pal.faint));
+    }
+    p.add(Shape::line(points.clone(), Stroke::new(1.5, color)));
     p.circle_filled(last, 2.5, color);
-    resp
+    match (hovered, readout) {
+        (Some(i), Some(describe)) => {
+            p.circle_filled(points[i], 3.5, color);
+            // Downsampled index back to the series' own.
+            let original = if values.len() <= max {
+                i
+            } else {
+                (i + 1) * values.len() / max - 1
+            };
+            resp.on_hover_text_at_pointer(describe(original))
+        }
+        _ => resp,
+    }
 }
 
 /// Keeps the last value of each of `max` buckets.
@@ -371,7 +407,15 @@ pub struct Col {
 
 /// Lays the columns across the available width, paints their titles,
 /// and returns each column's x range (inset by the cell padding).
-pub fn table_header(ui: &mut Ui, cols: &[Col]) -> Vec<egui::Rangef> {
+/// Lays the columns across the available width, paints their titles
+/// (with an arrow on the sorted one: up ascending, down descending), and
+/// returns each column's x range (inset by the cell padding) and the
+/// index of a title clicked this frame.
+pub fn table_header(
+    ui: &mut Ui,
+    cols: &[Col],
+    sorted: Option<(usize, bool)>,
+) -> (Vec<egui::Rangef>, Option<usize>) {
     let pal = Palette::of(ui.ctx());
     let width = ui.available_width();
     let fixed: f32 = cols.iter().filter_map(|c| c.width).sum();
@@ -380,18 +424,57 @@ pub fn table_header(ui: &mut Ui, cols: &[Col]) -> Vec<egui::Rangef> {
     let (rect, _) = ui.allocate_exact_size(vec2(width, 28.0), Sense::hover());
     let mut x = rect.left();
     let mut ranges = Vec::with_capacity(cols.len());
-    for c in cols {
+    let mut clicked = None;
+    for (i, c) in cols.iter().enumerate() {
         let w = c.width.unwrap_or(spare);
+        let whole = Rect::from_x_y_ranges(x..=(x + w), rect.y_range());
         let cell = egui::Rangef::new(x + 10.0, x + w - 10.0);
         x += w;
+        let resp = ui
+            .interact(whole, ui.id().with(("column", i)), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand);
+        if resp.clicked() {
+            clicked = Some(i);
+        }
+        let on = sorted.filter(|(col, _)| *col == i);
+        let color = if on.is_some() || resp.hovered() {
+            pal.text
+        } else {
+            pal.muted
+        };
         let galley = fit(
             ui.painter(),
             c.title.to_owned(),
             font(theme::MEDIUM, 12.0),
-            pal.muted,
-            cell.span(),
+            color,
+            cell.span() - 12.0,
         );
+        let title_w = galley.size().x;
         put(ui.painter(), cell, rect.center().y, galley, c.right);
+        if let Some((_, descending)) = on {
+            // A small triangle beside the title.
+            let tx = if c.right {
+                cell.max - title_w - 9.0
+            } else {
+                cell.min + title_w + 9.0
+            };
+            let cy = rect.center().y;
+            let pts = if descending {
+                vec![
+                    pos2(tx - 3.5, cy - 2.0),
+                    pos2(tx + 3.5, cy - 2.0),
+                    pos2(tx, cy + 2.5),
+                ]
+            } else {
+                vec![
+                    pos2(tx - 3.5, cy + 2.0),
+                    pos2(tx + 3.5, cy + 2.0),
+                    pos2(tx, cy - 2.5),
+                ]
+            };
+            ui.painter()
+                .add(Shape::convex_polygon(pts, pal.text, Stroke::NONE));
+        }
         ranges.push(cell);
     }
     ui.painter().hline(
@@ -399,7 +482,7 @@ pub fn table_header(ui: &mut Ui, cols: &[Col]) -> Vec<egui::Rangef> {
         rect.bottom() - 0.5,
         Stroke::new(1.0, pal.hairline),
     );
-    ranges
+    (ranges, clicked)
 }
 
 /// A clickable table row with a hairline under it; the selected row

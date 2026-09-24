@@ -16,13 +16,35 @@ pub fn show(
     run: &mut RunSettings,
     prefs: &mut Prefs,
     node: &Node,
+    open_advanced: bool,
 ) -> Option<Action> {
-    starting(ui, s, run, node);
+    starting(ui, s, run, node, open_advanced);
+    ui.add_space(30.0);
+    privacy(ui, s, prefs);
     ui.add_space(30.0);
     appearance(ui, s, prefs);
     ui.add_space(30.0);
     this_node(ui, s, node);
     None
+}
+
+fn privacy(ui: &mut Ui, s: &Scene, prefs: &mut Prefs) {
+    widgets::section(ui, "Privacy", None);
+    grid(ui, "privacy", |ui| {
+        key(ui, s, "Peer addresses");
+        ui.vertical(|ui| {
+            ui.checkbox(
+                &mut prefs.hide_addresses,
+                "Hide them everywhere (Ctrl+Shift+H)",
+            );
+            help(
+                ui,
+                s,
+                "For screenshots and screen sharing. The peer graph and the activity log never show addresses; this also masks the table, the peer panel and the session fingerprints.",
+            );
+        });
+        ui.end_row();
+    });
 }
 
 fn grid(ui: &mut Ui, id: &str, rows: impl FnOnce(&mut Ui)) {
@@ -51,7 +73,7 @@ fn field(ui: &mut Ui, value: &mut String, hint: &str, width: f32) {
     );
 }
 
-fn starting(ui: &mut Ui, s: &Scene, run: &mut RunSettings, node: &Node) {
+fn starting(ui: &mut Ui, s: &Scene, run: &mut RunSettings, node: &Node, open_advanced: bool) {
     let note = s
         .session
         .running()
@@ -127,9 +149,97 @@ fn starting(ui: &mut Ui, s: &Scene, run: &mut RunSettings, node: &Node) {
         });
         ui.end_row();
     });
+    ui.add_space(10.0);
+    egui::CollapsingHeader::new(
+        RichText::new("Advanced")
+            .font(crate::theme::font(crate::theme::MEDIUM, 14.0))
+            .color(s.pal.text),
+    )
+    .id_salt("advanced")
+    .open(open_advanced.then_some(true))
+    .show(ui, |ui| advanced(ui, s, run));
     for problem in run.problems() {
         ui.label(RichText::new(problem).size(13.0).color(s.pal.alert));
     }
+}
+
+/// What the node supports but most people never need to touch.
+fn advanced(ui: &mut Ui, s: &Scene, run: &mut RunSettings) {
+    ui.add_space(6.0);
+    grid(ui, "advanced-grid", |ui| {
+        key(ui, s, "Incoming connections");
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut run.listen, "Accept them on port");
+                field(ui, &mut run.listen_port, "8333", 80.0);
+            });
+            help(
+                ui,
+                s,
+                "Lets other nodes connect to yours, so you serve the network too. They learn your IP address; behind a router, the port also needs forwarding.",
+            );
+        });
+        ui.end_row();
+
+        key(ui, s, "Cache");
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                field(ui, &mut run.dbcache_mib, "450", 100.0);
+                help(ui, s, "MiB");
+            });
+            help(
+                ui,
+                s,
+                "Memory for the coin set. More makes the first sync faster.",
+            );
+        });
+        ui.end_row();
+
+        key(ui, s, "Mempool limit");
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                field(ui, &mut run.maxmempool_mb, "300", 100.0);
+                help(ui, s, "MB");
+            });
+            help(
+                ui,
+                s,
+                "Unconfirmed transactions kept in memory; when it fills, the cheapest leave first.",
+            );
+        });
+        ui.end_row();
+
+        key(ui, s, "Indexes");
+        ui.vertical(|ui| {
+            ui.checkbox(&mut run.txindex, "Transaction index");
+            help(ui, s, "Look up any transaction by its id, not only your own.");
+            ui.checkbox(&mut run.blockfilterindex, "Block filter index (BIP 158)");
+            help(
+                ui,
+                s,
+                "Compact filters that let wallets find their transactions without revealing their addresses.",
+            );
+            ui.add_enabled(
+                run.blockfilterindex,
+                egui::Checkbox::new(&mut run.peerblockfilters, "Serve filters to peers (BIP 157)"),
+            );
+            if !run.blockfilterindex {
+                run.peerblockfilters = false;
+            }
+        });
+        ui.end_row();
+
+        key(ui, s, "Electrum server");
+        ui.vertical(|ui| {
+            field(ui, &mut run.electrum, "Off", 220.0);
+            help(
+                ui,
+                s,
+                "An address with a port, like 127.0.0.1:50001, so wallets such as Sparrow can use this node.",
+            );
+        });
+        ui.end_row();
+    });
 }
 
 fn appearance(ui: &mut Ui, s: &Scene, prefs: &mut Prefs) {

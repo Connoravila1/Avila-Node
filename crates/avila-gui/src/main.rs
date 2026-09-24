@@ -2,6 +2,7 @@ mod app;
 mod bench;
 mod brand;
 mod capture;
+mod clock;
 mod constellation;
 mod demo;
 mod fingerprint;

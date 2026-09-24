@@ -27,6 +27,7 @@ pub struct Scene<'a> {
 pub enum Action {
     Start,
     Stop,
+    Open(crate::rail::Page),
 }
 
 impl Scene<'_> {

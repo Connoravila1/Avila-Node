@@ -37,6 +37,21 @@ pub struct RunSettings {
     pub store: bool,
     /// Prune block files beyond this many MiB (empty: keep everything).
     pub prune_mib: String,
+    /// Accept connections from other nodes on `listen_port`.
+    pub listen: bool,
+    pub listen_port: String,
+    /// Coins cache in MiB (empty: the node's default).
+    pub dbcache_mib: String,
+    /// Mempool size cap in MB (empty: the node's default).
+    pub maxmempool_mb: String,
+    /// Index every transaction by id.
+    pub txindex: bool,
+    /// Keep BIP 158 block filters.
+    pub blockfilterindex: bool,
+    /// Serve those filters to peers (BIP 157).
+    pub peerblockfilters: bool,
+    /// Run an Electrum server at this `host:port` (empty: off).
+    pub electrum: String,
 }
 
 impl RunSettings {
@@ -53,7 +68,29 @@ impl RunSettings {
             stop_after: None,
             store: true,
             prune_mib: String::new(),
+            listen: false,
+            listen_port: params(network).default_port.to_string(),
+            dbcache_mib: String::new(),
+            maxmempool_mb: String::new(),
+            txindex: false,
+            blockfilterindex: false,
+            peerblockfilters: false,
+            electrum: String::new(),
         }
+    }
+
+    /// Where to accept inbound peers, when listening.
+    fn listen_addr(&self) -> Option<SocketAddr> {
+        let port = self.listen_port.trim().parse::<u16>().ok()?;
+        self.listen.then(|| SocketAddr::from(([0, 0, 0, 0], port)))
+    }
+
+    /// A whole number of mebibytes, as bytes; `None` when blank or bad.
+    fn mib(text: &str) -> Option<usize> {
+        text.trim()
+            .parse::<usize>()
+            .ok()
+            .map(|n| n.saturating_mul(1024 * 1024))
     }
 
     fn connect_addrs(&self) -> Vec<SocketAddr> {
@@ -81,6 +118,32 @@ impl RunSettings {
         let prune = self.prune_mib.trim();
         if !prune.is_empty() && prune.parse::<u64>().is_err() {
             out.push("The prune target is a whole number of MiB, like 5000.".into());
+        }
+        if self.listen && self.listen_port.trim().parse::<u16>().is_err() {
+            out.push("The listening port is a number from 1 to 65535.".into());
+        }
+        for (value, what) in [
+            (&self.dbcache_mib, "The cache size"),
+            (&self.maxmempool_mb, "The mempool limit"),
+        ] {
+            let v = value.trim();
+            if !v.is_empty() && v.parse::<usize>().is_err() {
+                out.push(format!("{what} is a whole number, like 450."));
+            }
+        }
+        let electrum = self.electrum.trim();
+        if !electrum.is_empty() && electrum.parse::<SocketAddr>().is_err() {
+            out.push(
+                "The Electrum server needs an address with a port, like 127.0.0.1:50001.".into(),
+            );
+        }
+        if self.peerblockfilters && !self.blockfilterindex {
+            out.push("Serving block filters needs the block filter index turned on.".into());
+        }
+        if self.txindex && !prune.is_empty() {
+            out.push(
+                "Pruning deletes the old blocks the transaction index points into. Turn one of them off, as Core requires.".into(),
+            );
         }
         out
     }
@@ -160,6 +223,9 @@ pub struct Activity {
     pub text: String,
     /// A hash or peer detail, shown in monospace after the text.
     pub detail: Option<String>,
+    /// The peer's address, kept off the line itself (as Core keeps IPs
+    /// out of its log) and shown on hover unless addresses are hidden.
+    pub addr: Option<String>,
 }
 
 /// How the last run ended.
@@ -314,6 +380,18 @@ impl Session {
             v2transport: true,
             // The overview draws the block this mempool would build next.
             preview_next_block: true,
+            listen: settings.listen_addr(),
+            dbcache: RunSettings::mib(&settings.dbcache_mib),
+            maxmempool_bytes: settings
+                .maxmempool_mb
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .map(|mb| mb.saturating_mul(1_000_000)),
+            txindex: settings.txindex,
+            blockfilterindex: settings.blockfilterindex,
+            peerblockfilters: settings.peerblockfilters,
+            electrum: settings.electrum.trim().parse().ok(),
             ..SyncConfig::default()
         };
         let (tx, rx) = channel();
@@ -491,6 +569,22 @@ impl Session {
             self.blocks_connected(prev, next, t);
         }
         self.peers_changed(next, t);
+        for e in next.eclipse.iter().filter(|e| !prev.eclipse.contains(e)) {
+            self.log(
+                ActivityKind::Peers,
+                format!("Eclipse warning: {}", e.title().to_lowercase()),
+                None,
+                t,
+            );
+        }
+        for e in prev.eclipse.iter().filter(|e| !next.eclipse.contains(e)) {
+            self.log(
+                ActivityKind::Peers,
+                format!("Eclipse warning cleared: {}", e.title().to_lowercase()),
+                None,
+                t,
+            );
+        }
         let was_proven = prev.trust.snapshot.as_ref().is_some_and(|s| s.proven);
         if let Some(s) = &next.trust.snapshot
             && s.proven
@@ -522,15 +616,15 @@ impl Session {
                     .iter()
                     .find(|(height, _)| *height == h)
                     .map(|(_, hash)| hash.clone());
-                let from = next
-                    .established()
-                    .find(|p| p.last_block == Some(h))
-                    .map(|p| format!(", delivered by {}", peer_name(p)))
+                let deliverer = next.established().find(|p| p.last_block == Some(h));
+                let from = deliverer
+                    .map(|p| format!(" from peer {}", p.id))
                     .unwrap_or_default();
-                self.log(
+                self.log_with(
                     ActivityKind::Blocks,
                     format!("Connected block {}{from}", thousands(h.into())),
                     hash,
+                    deliverer.and_then(|p| p.addr.clone()),
                     t,
                 );
             }
@@ -570,9 +664,15 @@ impl Session {
             .filter(|p| !self.known_peers.contains_key(&p.id))
             .collect();
         joined.sort_by_key(|p| p.id);
-        let joined: Vec<(String, Option<String>)> = joined
+        let joined: Vec<(String, Option<String>, Option<String>)> = joined
             .into_iter()
-            .map(|p| (format!("Connected to {}", peer_name(p)), peer_detail(p)))
+            .map(|p| {
+                (
+                    format!("Connected to peer {}", p.id),
+                    peer_detail(p),
+                    p.addr.clone(),
+                )
+            })
             .collect();
         let mut left: Vec<&PeerView> = self
             .known_peers
@@ -580,21 +680,36 @@ impl Session {
             .filter(|p| !current.contains_key(&p.id))
             .collect();
         left.sort_by_key(|p| p.id);
-        let left: Vec<String> = left
+        let left: Vec<(String, Option<String>, Option<String>)> = left
             .into_iter()
-            .map(|p| format!("Disconnected from {}", peer_name(p)))
+            .map(|p| {
+                (
+                    format!("Disconnected from peer {}", p.id),
+                    peer_detail(p),
+                    p.addr.clone(),
+                )
+            })
             .collect();
-        for (text, detail) in joined {
-            self.log(ActivityKind::Peers, text, detail, t);
-        }
-        for text in left {
-            self.log(ActivityKind::Peers, text, None, t);
+        for (text, detail, addr) in joined.into_iter().chain(left) {
+            self.log_with(ActivityKind::Peers, text, detail, addr, t);
         }
         self.known_peers = current;
     }
 
     /// Adds an activity line at session time `t`; returns its serial.
     pub fn log(&mut self, kind: ActivityKind, text: String, detail: Option<String>, t: f64) -> u64 {
+        self.log_with(kind, text, detail, None, t)
+    }
+
+    /// [`Self::log`] for a line about a peer, carrying its address.
+    fn log_with(
+        &mut self,
+        kind: ActivityKind,
+        text: String,
+        detail: Option<String>,
+        addr: Option<String>,
+        t: f64,
+    ) -> u64 {
         self.serial += 1;
         let clock = self.clock_at(t);
         self.activity.push_back(Activity {
@@ -603,6 +718,7 @@ impl Session {
             kind,
             text,
             detail,
+            addr,
         });
         while self.activity.len() > ACTIVITY {
             self.activity.pop_front();
@@ -610,7 +726,9 @@ impl Session {
         self.serial
     }
 
-    fn clock_at(&self, t: f64) -> String {
+    /// Wall-clock `HH:MM:SS` (UTC) for session time `t`.
+    #[must_use]
+    pub fn clock_at(&self, t: f64) -> String {
         let wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64());

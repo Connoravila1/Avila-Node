@@ -11,10 +11,12 @@
 //! as wide as the work its blocks carry — and since mining has grown so
 //! much harder, the recent years dominate.
 
-use crate::model::{ChainCurve, TrustView, percent, thousands, year_month, year_start};
+use crate::model::{ChainCurve, TrustView, month_year, percent, thousands, year_month, year_start};
 use crate::theme::{Palette, mono};
 use crate::widgets::{self, end_radius, hatch};
-use eframe::egui::{Color32, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use eframe::egui::{
+    Align2, Color32, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
+};
 use serde::{Deserialize, Serialize};
 
 const HALVING: u32 = 210_000;
@@ -161,9 +163,47 @@ impl<'a> Ruler<'a> {
         .clamp(0.0, 1.0)
     }
 
+    /// The height at fraction `f` along the ruler (the inverse of
+    /// [`Self::at`]).
+    #[must_use]
+    pub fn height_at(&self, f: f64) -> f64 {
+        let f = f.clamp(0.0, 1.0);
+        match self.curve {
+            Some((curve, total)) => curve
+                .height_at_work(f * total)
+                .unwrap_or(0.0)
+                .min(f64::from(self.top)),
+            None => f * f64::from(self.top),
+        }
+    }
+
     #[must_use]
     pub fn width(&self, span: Span) -> f64 {
         self.at(span.to) - self.at(span.from)
+    }
+}
+
+/// The visible slice of a zoomable ribbon, as fractions of its ruler.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct View {
+    pub lo: f64,
+    pub hi: f64,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self { lo: 0.0, hi: 1.0 }
+    }
+}
+
+impl View {
+    #[must_use]
+    pub fn zoomed(&self) -> bool {
+        self.lo > 1e-9 || self.hi < 1.0 - 1e-9
+    }
+
+    fn span(&self) -> f64 {
+        (self.hi - self.lo).max(1e-12)
     }
 }
 
@@ -179,7 +219,38 @@ pub struct Options {
     pub pulse: Option<f32>,
 }
 
-pub fn show(ui: &mut Ui, trust: &TrustView, curve: &ChainCurve, opts: &Options) -> Response {
+/// Where a height stands, in the ribbon's words.
+fn status(trust: &TrustView, height: u32) -> &'static str {
+    let assumed = trust
+        .snapshot
+        .as_ref()
+        .filter(|s| !s.proven && s.base <= trust.connected)
+        .is_some_and(|s| height > s.replayed.min(s.base) && height <= s.base);
+    if height == 0 {
+        "Genesis"
+    } else if assumed {
+        "Assumed from the snapshot"
+    } else if height <= trust.connected {
+        "Proven here"
+    } else if height <= trust.headers {
+        "Headers only"
+    } else {
+        "Not known yet"
+    }
+}
+
+/// Draws the ribbon. With `view`, it zooms: scroll to zoom around the
+/// pointer, drag to pan, double-click to see the whole chain again.
+/// Hovering anywhere reads out the block there. `recent` supplies hashes
+/// for the newest blocks.
+pub fn show(
+    ui: &mut Ui,
+    trust: &TrustView,
+    curve: &ChainCurve,
+    recent: &[(u32, String)],
+    opts: &Options,
+    view: Option<&mut View>,
+) -> Response {
     let pal = Palette::of(ui.ctx());
     let cov = Coverage::of(trust);
     let ruler = Ruler::new(cov.top, opts.scale, curve);
@@ -190,12 +261,27 @@ pub fn show(ui: &mut Ui, trust: &TrustView, curve: &ChainCurve, opts: &Options) 
         0.0
     };
     let axis_rows = 2.0 * 17.0;
-    let (rect, resp) = ui.allocate_exact_size(
-        vec2(width, years_row + opts.band + 12.0 + axis_rows),
-        Sense::hover(),
-    );
+    let sense = if view.is_some() {
+        Sense::click_and_drag()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(width, years_row + opts.band + 12.0 + axis_rows), sense);
     let band = Rect::from_min_size(rect.min + vec2(0.0, years_row), vec2(width, opts.band));
-    let p = ui.painter();
+
+    // Zoom and pan, before anything is drawn with the view.
+    let mut v = View::default();
+    if let Some(view) = view {
+        if cov.top > 24 {
+            steer(ui, &resp, band, view, &ruler, cov.top);
+        }
+        v = *view;
+    }
+    let fx = |f: f64| band.left() + band.width() * ((f - v.lo) / v.span()) as f32;
+    let x = |h: u32| fx(ruler.at(h));
+
+    let p = ui.painter().with_clip_rect(band.expand2(vec2(1.0, 8.0)));
     p.rect(
         band,
         RADIUS,
@@ -206,15 +292,16 @@ pub fn show(ui: &mut Ui, trust: &TrustView, curve: &ChainCurve, opts: &Options) 
     if cov.top == 0 {
         return resp;
     }
-    let x = |h: u32| band.left() + band.width() * ruler.at(h) as f32;
-    // A segment's rect, at least `min` wide so a sliver stays visible.
+    // A segment's rect, at least `min` wide so a sliver stays visible,
+    // and cut to what's in view.
     let seg = |span: Span, min: f32| {
         let (mut l, mut r) = (x(span.from), x(span.to));
         if r - l < min {
-            r = (l + min).min(band.right());
+            r = l + min;
             l = r - min;
         }
-        Rect::from_x_y_ranges(l..=r, band.y_range())
+        let (l, r) = (l.max(band.left()), r.min(band.right()));
+        (r > l).then(|| Rect::from_x_y_ranges(l..=r, band.y_range()))
     };
     let ends = |r: Rect| {
         end_radius(
@@ -223,23 +310,45 @@ pub fn show(ui: &mut Ui, trust: &TrustView, curve: &ChainCurve, opts: &Options) 
             r.right() >= band.right() - 0.5,
         )
     };
-
     for span in cov.proven.iter().filter(|s| s.blocks() > 0) {
-        let r = seg(*span, 2.0);
-        p.rect_filled(r, ends(r), pal.signal);
+        if let Some(r) = seg(*span, 2.0) {
+            p.rect_filled(r, ends(r), pal.signal);
+        }
     }
-    if let Some(span) = cov.assumed {
-        let r = seg(span, 3.0);
+    if let Some(r) = cov.assumed.and_then(|span| seg(span, 3.0)) {
         p.rect_filled(
             r,
             ends(r),
             pal.signal_alpha(if pal.dark { 0.16 } else { 0.20 }),
         );
-        hatch(p, r, pal.signal, 6.0, 1.6);
+        hatch(&p, r, pal.signal, 6.0, 1.6);
     }
-    if let Some(span) = cov.pending {
-        let r = seg(span, 3.0);
+    if let Some(r) = cov.pending.and_then(|span| seg(span, 3.0)) {
         p.rect_stroke(r, ends(r), Stroke::new(1.0, pal.muted), StrokeKind::Inside);
+    }
+    // Close in, the blocks themselves: a seam between each, and their
+    // heights once there's room to write them.
+    let (first, last) = (ruler.height_at(v.lo), ruler.height_at(v.hi));
+    let px_per_block = band.width() / (last - first).max(1.0) as f32;
+    if px_per_block >= 5.0 {
+        let seam = Stroke::new(1.0, pal.canvas.gamma_multiply(0.9));
+        for h in (first.floor() as u32)..=(last.ceil() as u32).min(cov.top) {
+            let at = x(h);
+            if at > band.left() + 0.5 && at < band.right() - 0.5 {
+                p.vline(at, band.y_range(), seam);
+            }
+            // A height only where its own cell can hold it.
+            if h > 0 && px_per_block >= 58.0 {
+                let mid = (x(h - 1) + at) / 2.0;
+                p.text(
+                    pos2(mid, band.center().y),
+                    Align2::CENTER_CENTER,
+                    thousands(h.into()),
+                    mono(10.0),
+                    pal.canvas,
+                );
+            }
+        }
     }
     // Halvings notch the band: the chain's own ruler.
     let mut k = 1;
@@ -253,9 +362,8 @@ pub fn show(ui: &mut Ui, trust: &TrustView, curve: &ChainCurve, opts: &Options) 
     }
     let replay = trust.snapshot.as_ref().filter(|s| !s.proven);
     if let Some(s) = replay {
-        let hx = x(s.replayed.min(s.base));
         p.vline(
-            hx,
+            x(s.replayed.min(s.base)),
             (band.top() - 5.0)..=(band.bottom() + 5.0),
             Stroke::new(2.0, pal.text),
         );
@@ -263,7 +371,7 @@ pub fn show(ui: &mut Ui, trust: &TrustView, curve: &ChainCurve, opts: &Options) 
     if let Some(f) = opts.pulse.filter(|f| (0.0..1.0).contains(f)) {
         let c = pos2(x(trust.connected).min(band.right() - 2.0), band.center().y);
         let fade = 1.0 - f;
-        p.circle_stroke(
+        ui.painter().circle_stroke(
             c,
             5.0 + 20.0 * f,
             Stroke::new(0.5 + 2.0 * fade, pal.signal.gamma_multiply(fade)),
@@ -274,17 +382,36 @@ pub fn show(ui: &mut Ui, trust: &TrustView, curve: &ChainCurve, opts: &Options) 
     }
 
     // Axis labels: two rows under the band, placed by priority, skipped
-    // when there's no room rather than overlapping.
+    // when there's no room rather than overlapping. Zoomed in, the ends
+    // of the view take the place of genesis and the tip.
     let p = ui.painter();
-    let mut marks: Vec<(f32, String, Color32, Option<bool>)> = vec![
-        (band.left(), "genesis".into(), pal.muted, Some(false)),
-        (
-            band.right(),
-            thousands(cov.top.into()),
-            pal.muted,
-            Some(true),
-        ),
-    ];
+    let inside = |mx: f32| mx >= band.left() - 0.5 && mx <= band.right() + 0.5;
+    let mut marks: Vec<(f32, String, Color32, Option<bool>)> = if v.zoomed() {
+        vec![
+            (
+                band.left(),
+                thousands(first.round() as u64),
+                pal.muted,
+                Some(false),
+            ),
+            (
+                band.right(),
+                thousands(last.round() as u64),
+                pal.muted,
+                Some(true),
+            ),
+        ]
+    } else {
+        vec![
+            (band.left(), "genesis".into(), pal.muted, Some(false)),
+            (
+                band.right(),
+                thousands(cov.top.into()),
+                pal.muted,
+                Some(true),
+            ),
+        ]
+    };
     if let Some(s) = replay {
         let r = s.replayed.min(s.base);
         marks.push((
@@ -311,6 +438,9 @@ pub fn show(ui: &mut Ui, trust: &TrustView, curve: &ChainCurve, opts: &Options) 
     }
     let mut placed: [Vec<Rect>; 2] = [Vec::new(), Vec::new()];
     for (mx, text, color, right) in marks {
+        if !inside(mx) {
+            continue;
+        }
         let right = right.unwrap_or(mx > band.center().x);
         let galley = p.layout_no_wrap(text, mono(11.5), color);
         let w = galley.size().x;
@@ -337,7 +467,99 @@ pub fn show(ui: &mut Ui, trust: &TrustView, curve: &ChainCurve, opts: &Options) 
             break;
         }
     }
-    resp
+
+    // The reading under the pointer.
+    let Some(pos) = resp
+        .hover_pos()
+        .filter(|pos| band.x_range().contains(pos.x))
+    else {
+        return resp;
+    };
+    let f = v.lo + f64::from((pos.x - band.left()) / band.width()) * v.span();
+    // Block h fills (h-1, h], so the block under the pointer rounds up.
+    let height = ruler.height_at(f).ceil() as u32;
+    ui.painter().vline(
+        pos.x,
+        (band.top() - 3.0)..=(band.bottom() + 3.0),
+        Stroke::new(1.0, pal.text.gamma_multiply(0.7)),
+    );
+    let when = curve.time_at(height).map(|t| month_year(t as i64));
+    let hash = recent
+        .iter()
+        .find(|(h, _)| *h == height)
+        .map(|(_, hash)| hash.clone());
+    let work = ruler.by_work().then(|| percent(f));
+    resp.on_hover_ui_at_pointer(|ui| {
+        ui.label(
+            RichText::new(format!("Block {}", thousands(height.into())))
+                .font(mono(12.5))
+                .color(pal.text),
+        );
+        ui.label(
+            RichText::new(status(trust, height))
+                .size(13.0)
+                .color(pal.text),
+        );
+        if let Some(when) = when {
+            ui.label(
+                RichText::new(format!("Mined around {when}"))
+                    .size(12.5)
+                    .color(pal.muted),
+            );
+        }
+        if let Some(work) = work {
+            ui.label(
+                RichText::new(format!("{work} of the chain’s work comes before it"))
+                    .size(12.5)
+                    .color(pal.muted),
+            );
+        }
+        if let Some(hash) = hash {
+            ui.label(crate::widgets::hash_job(&hash, 11.5, &pal, Some(16)));
+        }
+    })
+}
+
+/// Applies this frame's scroll (zoom around the pointer), pinch, drag
+/// (pan) and double-click (reset) to `view`.
+fn steer(ui: &Ui, resp: &Response, band: Rect, view: &mut View, ruler: &Ruler, top: u32) {
+    if resp.double_clicked() {
+        *view = View::default();
+        return;
+    }
+    // Closest zoom: a couple of dozen blocks at the tip.
+    let min_span = ruler
+        .width(Span {
+            from: top.saturating_sub(24),
+            to: top,
+        })
+        .max(1e-9);
+    if resp.hovered() {
+        let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+        let factor = (-f64::from(scroll) * 0.004).exp() / f64::from(pinch);
+        if (factor - 1.0).abs() > 1e-6
+            && let Some(pos) = resp.hover_pos()
+        {
+            let span = view.span();
+            let at = f64::from(((pos.x - band.left()) / band.width()).clamp(0.0, 1.0));
+            let anchor = view.lo + span * at;
+            let new_span = (span * factor).clamp(min_span, 1.0);
+            let lo = (anchor - at * new_span).clamp(0.0, 1.0 - new_span);
+            *view = View {
+                lo,
+                hi: lo + new_span,
+            };
+            // The page mustn't scroll too.
+            ui.ctx()
+                .input_mut(|i| i.smooth_scroll_delta = eframe::egui::Vec2::ZERO);
+        }
+    }
+    if resp.dragged() {
+        let span = view.span();
+        let dx = f64::from(resp.drag_delta().x / band.width()) * span;
+        let lo = (view.lo - dx).clamp(0.0, 1.0 - span);
+        *view = View { lo, hi: lo + span };
+    }
 }
 
 /// Years along the top edge, wherever there's room for them.
@@ -354,6 +576,9 @@ fn year_ruler(ui: &Ui, curve: &ChainCurve, band: Rect, x: &dyn Fn(u32) -> f32, p
             continue;
         };
         let mx = x(h.round() as u32);
+        if mx < band.left() || mx > band.right() {
+            continue;
+        }
         let galley = p.layout_no_wrap(year.to_string(), mono(10.5), pal.faint);
         let left = mx - galley.size().x / 2.0;
         if left < last_right + 10.0 || left + galley.size().x > band.right() {

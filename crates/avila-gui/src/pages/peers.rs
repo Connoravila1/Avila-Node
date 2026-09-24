@@ -17,11 +17,67 @@ use std::collections::HashMap;
 /// The side panel's width when there's room for it beside the sky.
 const SIDE: f32 = 372.0;
 
+/// The table's order: a column title (as in [`columns`]) and direction.
+/// No column keeps the natural order — ours first, longest connected
+/// first.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PeerSort {
+    pub column: Option<&'static str>,
+    pub descending: bool,
+}
+
+impl PeerSort {
+    /// A click on `title`: the same column flips, a new one starts in
+    /// the direction that puts the interesting end first.
+    fn click(&mut self, title: &'static str) {
+        if self.column == Some(title) {
+            self.descending = !self.descending;
+        } else {
+            self.column = Some(title);
+            self.descending = !matches!(title, "Peer" | "Ping");
+        }
+    }
+
+    fn apply(&self, peers: &mut [&PeerView]) {
+        let Some(column) = self.column else {
+            return;
+        };
+        let key = |p: &PeerView| -> f64 {
+            match column {
+                "Transport" => f64::from(u8::from(p.v2)),
+                "Erlay" => f64::from(u8::from(p.recon)),
+                "Direction" => f64::from(u8::from(!p.inbound)),
+                "Height at connect" => f64::from(p.their_height.unwrap_or(-1)),
+                "Ping" => p.ping_ms.unwrap_or(f64::MAX),
+                "Blocks" => p.blocks_served as f64,
+                "Traffic" => p.bytes_recv as f64,
+                "Connected" => p.connected_secs as f64,
+                _ => p.id as f64,
+            }
+        };
+        peers.sort_by(|a, b| {
+            let order = key(a).total_cmp(&key(b));
+            if self.descending {
+                order.reverse()
+            } else {
+                order
+            }
+        });
+    }
+}
+
+/// How a peer is named where its address may not be shown.
+fn masked_name(p: &PeerView) -> String {
+    format!("peer {} · {}", p.id, crate::model::network_kind(p))
+}
+
 pub fn show(
     ui: &mut Ui,
     s: &Scene,
     selected: &mut Option<u64>,
     sky: &mut Constellation,
+    sort: &mut PeerSort,
+    hide: bool,
 ) -> Option<Action> {
     let Some(v) = &s.session.view else {
         widgets::empty(
@@ -51,6 +107,7 @@ pub fn show(
     if selected.is_some_and(|id| !peers.iter().any(|p| p.id == id)) {
         *selected = None;
     }
+    eclipse_banner(ui, s, &v.eclipse);
     let deliverer = peers
         .iter()
         .find(|p| p.last_block == Some(v.connected))
@@ -64,7 +121,7 @@ pub fn show(
             let w = ui.available_width() - SIDE - 32.0;
             ui.allocate_ui_with_layout(vec2(w, 0.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(w);
-                outcome = sky.show(ui, &peers, *selected, pulse, now, SKY, s.swirl);
+                outcome = sky.show(ui, &peers, *selected, pulse, now, SKY, s.swirl, hide);
                 ui.add_space(8.0);
                 constellation::legend(ui);
             });
@@ -79,32 +136,69 @@ pub fn show(
                         .max_height(SKY + 40.0)
                         .min_scrolled_height(SKY + 40.0)
                         .auto_shrink([false, true])
-                        .show(ui, |ui| panel(ui, s, &peers, selected));
+                        .show(ui, |ui| panel(ui, s, &peers, selected, hide));
                 },
             );
         });
     } else {
-        outcome = sky.show(ui, &peers, *selected, pulse, now, 320.0, s.swirl);
+        outcome = sky.show(ui, &peers, *selected, pulse, now, 320.0, s.swirl, hide);
         ui.add_space(8.0);
         constellation::legend(ui);
         ui.add_space(12.0);
-        panel(ui, s, &peers, selected);
+        panel(ui, s, &peers, selected, hide);
     }
-    if let Some(id) = outcome.clicked {
+    if let Some(id) = outcome.select {
+        *selected = Some(id);
+    } else if let Some(id) = outcome.clicked {
         *selected = (*selected != Some(id)).then_some(id);
     } else if outcome.clicked_empty {
         *selected = None;
     }
     shared_groups(ui, s, &peers);
     ui.add_space(22.0);
-    table(ui, s, &peers, selected);
+    sort.apply(&mut peers);
+    table(ui, s, &peers, selected, sort, hide);
     None
 }
 
-fn panel(ui: &mut Ui, s: &Scene, peers: &[&PeerView], selected: &mut Option<u64>) {
+/// The node's eclipse indicators, when it raises any: what each means,
+/// in a box that doesn't blend in.
+fn eclipse_banner(ui: &mut Ui, s: &Scene, signs: &[crate::model::Eclipse]) {
+    if signs.is_empty() {
+        return;
+    }
+    let pal = s.pal;
+    egui::Frame::new()
+        .fill(pal.alert.gamma_multiply(0.08))
+        .stroke(Stroke::new(1.0, pal.alert.gamma_multiply(0.6)))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(16, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new("Possible eclipse")
+                    .font(font(theme::STRONG, 14.0))
+                    .color(pal.alert),
+            );
+            for e in signs {
+                ui.label(RichText::new(e.title()).size(13.5).color(pal.text));
+                ui.label(RichText::new(e.explain()).size(12.5).color(pal.muted));
+            }
+            ui.label(
+                RichText::new(
+                    "These are signs, not proof. Adding a peer you trust under Settings is the surest check.",
+                )
+                .size(12.5)
+                .color(pal.faint),
+            );
+        });
+    ui.add_space(16.0);
+}
+
+fn panel(ui: &mut Ui, s: &Scene, peers: &[&PeerView], selected: &mut Option<u64>, hide: bool) {
     match selected.and_then(|id| peers.iter().find(|p| p.id == id)) {
         Some(p) => {
-            if detail(ui, s, p) {
+            if detail(ui, s, p, hide) {
                 *selected = None;
             }
         }
@@ -164,11 +258,14 @@ fn overview(ui: &mut Ui, s: &Scene, peers: &[&PeerView]) {
 }
 
 /// One peer up close. Returns whether it was closed.
-fn detail(ui: &mut Ui, s: &Scene, p: &PeerView) -> bool {
+fn detail(ui: &mut Ui, s: &Scene, p: &PeerView, hide: bool) -> bool {
     let pal = s.pal;
     let mut closed = false;
     ui.horizontal(|ui| {
-        let name = p.addr.clone().unwrap_or_else(|| format!("peer {}", p.id));
+        let name = match &p.addr {
+            Some(addr) if !hide => addr.clone(),
+            _ => masked_name(p),
+        };
         ui.add(egui::Label::new(RichText::new(name).font(mono(15.0)).color(pal.text)).truncate());
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             closed = widgets::button(ui, "Close", Kind::Quiet).clicked();
@@ -190,6 +287,18 @@ fn detail(ui: &mut Ui, s: &Scene, p: &PeerView) -> bool {
 
     heading(ui, s, "Transport");
     match &p.session_id {
+        Some(_) if hide => {
+            ui.label(
+                RichText::new("Encrypted · BIP324")
+                    .size(13.5)
+                    .color(pal.text),
+            );
+            ui.label(
+                RichText::new("The session fingerprint is hidden along with addresses.")
+                    .size(12.5)
+                    .color(pal.faint),
+            );
+        }
         Some(id) => {
             ui.horizontal_top(|ui| {
                 randomart(ui, id, &pal);
@@ -415,9 +524,10 @@ fn shared_groups(ui: &mut Ui, s: &Scene, peers: &[&PeerView]) {
     let mut shared: Vec<(String, usize)> = outbound.into_iter().filter(|(_, n)| *n >= 2).collect();
     shared.sort();
     for (group, n) in shared {
+        let prefix = if group.contains(':') { "/32" } else { "/16" };
         ui.label(
             RichText::new(format!(
-                "{n} peers we dialed share {group}. Outbound peers in one network group are easier for a single operator to control; Core spreads them across groups."
+                "{n} peers we dialed share one {prefix} network group. Outbound peers in one group are easier for a single operator to control; Core spreads them across groups."
             ))
             .size(13.0)
             .color(s.pal.alert),
@@ -463,7 +573,7 @@ fn columns(width: f32) -> Vec<Col> {
         (
             Col {
                 title: "Height at connect",
-                width: Some(128.0),
+                width: Some(146.0),
                 right: true,
             },
             6,
@@ -521,15 +631,35 @@ fn columns(width: f32) -> Vec<Col> {
     keep.into_iter().map(|(c, _)| c).collect()
 }
 
-fn table(ui: &mut Ui, s: &Scene, peers: &[&PeerView], selected: &mut Option<u64>) {
+fn table(
+    ui: &mut Ui,
+    s: &Scene,
+    peers: &[&PeerView],
+    selected: &mut Option<u64>,
+    sort: &mut PeerSort,
+    hide: bool,
+) {
     let pal = s.pal;
     let cols = columns(ui.available_width());
-    let ranges = widgets::table_header(ui, &cols);
+    let sorted = sort.column.and_then(|title| {
+        cols.iter()
+            .position(|c| c.title == title)
+            .map(|i| (i, sort.descending))
+    });
+    let (ranges, clicked) = widgets::table_header(ui, &cols, sorted);
+    if let Some(i) = clicked {
+        sort.click(cols[i].title);
+    }
     for p in peers {
         let (rect, resp) = widgets::table_row(ui, 50.0, *selected == Some(p.id));
         if resp.clicked() {
             *selected = (*selected != Some(p.id)).then_some(p.id);
         }
+        resp.context_menu(|ui| {
+            if let Some(pick) = constellation::peer_menu(ui, p, hide) {
+                *selected = Some(pick);
+            }
+        });
         let painter = ui.painter();
         let (top, mid, low) = (rect.top() + 16.0, rect.center().y, rect.top() + 34.0);
         let dim = |c: Color32| {
@@ -568,7 +698,10 @@ fn table(ui: &mut Ui, s: &Scene, peers: &[&PeerView], selected: &mut Option<u64>
             };
             match col.title {
                 "Peer" => two(
-                    p.addr.clone().unwrap_or_else(|| format!("peer {}", p.id)),
+                    match &p.addr {
+                        Some(addr) if !hide => addr.clone(),
+                        _ => masked_name(p),
+                    },
                     mono(12.5),
                     pal.text,
                     p.agent
@@ -647,4 +780,38 @@ fn table(ui: &mut Ui, s: &Scene, peers: &[&PeerView], selected: &mut Option<u64>
         .size(12.5)
         .color(pal.faint),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::test_peer;
+
+    #[test]
+    fn sorting_starts_with_the_interesting_end_and_flips() {
+        let mut fast = test_peer(1);
+        fast.ping_ms = Some(20.0);
+        fast.bytes_recv = 10;
+        let mut slow = test_peer(2);
+        slow.ping_ms = Some(300.0);
+        slow.bytes_recv = 900;
+        let mut unknown = test_peer(3);
+        unknown.ping_ms = None;
+        let mut sort = PeerSort::default();
+        let order = |sort: &PeerSort| {
+            let mut v = vec![&slow, &unknown, &fast];
+            sort.apply(&mut v);
+            v.iter().map(|p| p.id).collect::<Vec<_>>()
+        };
+        // Unsorted keeps the natural order.
+        assert_eq!(order(&sort), vec![2, 3, 1]);
+        // Ping starts fastest first; peers without one sink.
+        sort.click("Ping");
+        assert_eq!(order(&sort), vec![1, 2, 3]);
+        sort.click("Ping");
+        assert_eq!(order(&sort), vec![3, 2, 1]);
+        // Traffic starts with the heaviest.
+        sort.click("Traffic");
+        assert_eq!(order(&sort)[0], 2);
+    }
 }

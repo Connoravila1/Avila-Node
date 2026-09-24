@@ -468,6 +468,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     },
                     profile: Default::default(),
                     next_block: None,
+                    eclipse: Vec::new(),
                 }));
             let (query_tx, query_rx) = std::sync::mpsc::channel();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

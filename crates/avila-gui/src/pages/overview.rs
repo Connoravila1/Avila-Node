@@ -50,6 +50,7 @@ fn idle(ui: &mut Ui, s: &Scene) -> Option<Action> {
         ui,
         &crate::model::TrustView::default(),
         &ChainCurve::default(),
+        &[],
         &Options {
             band: 40.0,
             halvings: false,
@@ -57,6 +58,7 @@ fn idle(ui: &mut Ui, s: &Scene) -> Option<Action> {
             scale: Scale::Blocks,
             pulse: None,
         },
+        None,
     );
     action
 }
@@ -106,6 +108,7 @@ fn hero(ui: &mut Ui, s: &Scene, v: &NodeView, scale: &mut Scale) {
         ui,
         &v.trust,
         &v.curve,
+        &v.recent,
         &Options {
             band: 40.0,
             halvings: false,
@@ -113,6 +116,7 @@ fn hero(ui: &mut Ui, s: &Scene, v: &NodeView, scale: &mut Scale) {
             scale: *scale,
             pulse: s.pulse(),
         },
+        None,
     );
     ui.horizontal(|ui| {
         let toggle = 200.0;
@@ -257,11 +261,21 @@ fn last_block(ui: &mut Ui, s: &Scene, v: &NodeView, w: f32) {
     }
     note(ui, s, &format!("Block {}", thousands(v.connected.into())));
     ui.add_space(8.0);
+    let at = |i: usize| s.session.history.get(i).copied();
     widgets::sparkline(
         ui,
         &s.session.series(|x| f64::from(x.connected)),
         vec2(w, 44.0),
         s.pal.signal,
+        Some(&|i| {
+            at(i).map_or_else(String::new, |x| {
+                format!(
+                    "Block {} at {}",
+                    thousands(x.connected.into()),
+                    s.session.clock_at(x.t)
+                )
+            })
+        }),
     );
 }
 
@@ -288,6 +302,11 @@ fn peers(ui: &mut Ui, s: &Scene, v: &NodeView, w: f32) {
         &s.session.series(|x| x.peers as f64),
         vec2(w, 44.0),
         s.pal.muted,
+        Some(&|i| {
+            s.session.history.get(i).map_or_else(String::new, |x| {
+                format!("{} peers at {}", x.peers, s.session.clock_at(x.t))
+            })
+        }),
     );
 }
 
@@ -332,6 +351,15 @@ fn mempool(ui: &mut Ui, s: &Scene, v: &NodeView, w: f32) {
                 &s.session.series(|x| x.mempool as f64),
                 vec2(w, 44.0),
                 s.pal.muted,
+                Some(&|i| {
+                    s.session.history.get(i).map_or_else(String::new, |x| {
+                        format!(
+                            "{} transactions at {}",
+                            thousands(x.mempool as u64),
+                            s.session.clock_at(x.t)
+                        )
+                    })
+                }),
             );
         }
     }

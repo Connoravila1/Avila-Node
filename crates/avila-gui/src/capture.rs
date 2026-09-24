@@ -20,6 +20,14 @@ pub struct Pose {
     pub select_peer: bool,
     /// Scroll the page down this far.
     pub scroll: f32,
+    pub hide: bool,
+    pub clock: bool,
+    /// Zoom the Chain page's ribbon to this slice of it.
+    pub zoom: Option<(f64, f64)>,
+    /// Pretend the node raised an eclipse indicator.
+    pub eclipse: bool,
+    /// Open the Settings page's advanced section.
+    pub advanced: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -51,6 +59,11 @@ impl Capture {
             scale: Scale::Blocks,
             select_peer: false,
             scroll: 0.0,
+            hide: false,
+            clock: false,
+            zoom: None,
+            eclipse: false,
+            advanced: false,
         };
         let mut shots = Vec::new();
         for theme in [Theme::Light, Theme::Dark] {
@@ -93,6 +106,64 @@ impl Capture {
                 },
                 FULL,
                 "-selected-lower",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    hide: true,
+                    eclipse: true,
+                    ..picked
+                },
+                FULL,
+                "-hidden",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    scroll: 620.0,
+                    clock: true,
+                    ..pose(Page::Chain)
+                },
+                FULL,
+                "-clock",
+            ),
+            (
+                Theme::Dark,
+                Pose {
+                    scroll: 620.0,
+                    clock: true,
+                    ..pose(Page::Chain)
+                },
+                FULL,
+                "-clock",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    zoom: Some((0.99995, 1.0)),
+                    ..pose(Page::Chain)
+                },
+                FULL,
+                "-zoomed",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    zoom: Some((0.999_985, 1.0)),
+                    ..pose(Page::Chain)
+                },
+                FULL,
+                "-zoomed-close",
+            ),
+            (
+                Theme::Dark,
+                Pose {
+                    advanced: true,
+                    scroll: 560.0,
+                    ..pose(Page::Settings)
+                },
+                FULL,
+                "-advanced",
             ),
             (Theme::Dark, pose(Page::Overview), SMALL, "-small"),
             (Theme::Light, pose(Page::Peers), SMALL, "-small"),

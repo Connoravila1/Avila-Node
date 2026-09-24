@@ -13,7 +13,12 @@ use eframe::egui::{
 /// Rows drawn at most; the log itself keeps more.
 const SHOWN: usize = 300;
 
-pub fn show(ui: &mut Ui, s: &Scene, filter: &mut Option<ActivityKind>) -> Option<Action> {
+pub fn show(
+    ui: &mut Ui,
+    s: &Scene,
+    filter: &mut Option<ActivityKind>,
+    hide: bool,
+) -> Option<Action> {
     ui.horizontal(|ui| {
         let mut options: Vec<(Option<ActivityKind>, &str)> = vec![(None, "All")];
         options.extend(ActivityKind::ALL.iter().map(|k| (Some(*k), k.label())));
@@ -40,14 +45,14 @@ pub fn show(ui: &mut Ui, s: &Scene, filter: &mut Option<ActivityKind>) -> Option
         return filter.is_none().then(|| start_offer(ui, s)).flatten();
     }
     for (i, a) in rows.into_iter().enumerate() {
-        row(ui, s, a, i);
+        row(ui, s, a, i, hide);
     }
     None
 }
 
 /// One entry, painted into a fixed-height row — and only when it's on
 /// screen, so a long log costs nothing to scroll past.
-fn row(ui: &mut Ui, s: &Scene, a: &Activity, index: usize) {
+fn row(ui: &mut Ui, s: &Scene, a: &Activity, index: usize, hide: bool) {
     let pal = s.pal;
     let height = if a.detail.is_some() { 56.0 } else { 38.0 };
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
@@ -106,8 +111,16 @@ fn row(ui: &mut Ui, s: &Scene, a: &Activity, index: usize) {
         rect.bottom() - 0.5,
         Stroke::new(1.0, pal.hairline),
     );
-    if elided {
-        resp.on_hover_text(&a.text);
+    // The line names a peer by number, as Core's log does; its address
+    // is one hover away, unless addresses are hidden.
+    match (&a.addr, elided) {
+        (Some(addr), _) if !hide => {
+            resp.on_hover_text(format!("{}\n{addr}", a.text));
+        }
+        (_, true) => {
+            resp.on_hover_text(&a.text);
+        }
+        _ => {}
     }
 }
 

@@ -59,12 +59,16 @@ pub struct Constellation {
     ghosts: Vec<Ghost>,
     last: Option<f64>,
     animating: bool,
+    /// The peer a right-click menu is open for.
+    menu_for: Option<u64>,
 }
 
 #[derive(Default)]
 pub struct Outcome {
     pub clicked: Option<u64>,
     pub clicked_empty: bool,
+    /// "Show details" from a right-click menu.
+    pub select: Option<u64>,
 }
 
 /// Core's default network group: the /16 of an IPv4 address, the /32 of
@@ -81,14 +85,6 @@ pub fn netgroup(p: &PeerView) -> String {
             format!("{:x}:{:x}::/32", s[0], s[1])
         }
         None => "unknown".into(),
-    }
-}
-
-/// An address without its port, as short as it can be said.
-fn short_addr(p: &PeerView) -> String {
-    match p.addr.as_deref().and_then(|a| a.parse::<SocketAddr>().ok()) {
-        Some(a) => a.ip().to_string(),
-        None => peer_name(p),
     }
 }
 
@@ -120,6 +116,7 @@ impl Constellation {
         now: f64,
         height: f32,
         swirl: Option<&TextureHandle>,
+        hide: bool,
     ) -> Outcome {
         let pal = Palette::of(ui.ctx());
         let (rect, resp) =
@@ -175,7 +172,12 @@ impl Constellation {
                 continue;
             };
             let look = Look {
-                label: short_addr(p),
+                // Software, not addresses: the picture people share
+                // shouldn't map out who this node talks to.
+                label: p
+                    .agent
+                    .as_deref()
+                    .map_or_else(|| format!("peer {}", p.id), agent_name),
                 inbound: p.inbound,
                 v2: p.v2,
                 recon: p.recon,
@@ -287,10 +289,13 @@ impl Constellation {
             } else {
                 Align2::RIGHT_CENTER
             };
+            // How many share a group, not which group: a prefix is part
+            // of an address.
+            let prefix = if group.contains(':') { "/32" } else { "/16" };
             p.text(
                 center + vec2(mid.cos(), mid.sin()) * (r + 8.0),
                 anchor,
-                *group,
+                format!("{} in one {prefix}", ids.len()),
                 mono(10.0),
                 color,
             );
@@ -445,14 +450,27 @@ impl Constellation {
         let mut out = Outcome::default();
         if let Some(id) = hovered {
             if let Some(peer) = peers.iter().find(|p| p.id == id) {
-                resp.clone().on_hover_ui(|ui| tooltip(ui, peer, &pal));
+                resp.clone().on_hover_ui(|ui| tooltip(ui, peer, &pal, hide));
             }
             if resp.clicked() {
                 out.clicked = Some(id);
             }
+            if resp.secondary_clicked() {
+                self.menu_for = Some(id);
+            }
         } else if resp.clicked() {
             out.clicked_empty = true;
         }
+        let menu_for = self.menu_for;
+        resp.context_menu(|ui| {
+            let Some(peer) = menu_for.and_then(|id| peers.iter().find(|p| p.id == id)) else {
+                ui.label("Right-click a peer");
+                return;
+            };
+            if let Some(pick) = peer_menu(ui, peer, hide) {
+                out.select = Some(pick);
+            }
+        });
         if hovered.is_some() {
             ui.ctx()
                 .set_cursor_icon(eframe::egui::CursorIcon::PointingHand);
@@ -461,8 +479,43 @@ impl Constellation {
     }
 }
 
-fn tooltip(ui: &mut Ui, p: &PeerView, pal: &Palette) {
-    ui.label(RichText::new(peer_name(p)).font(mono(12.5)).color(pal.text));
+/// The right-click menu for a peer, shared by the sky and the table.
+/// Returns the peer to select, if "Show details" was chosen.
+pub fn peer_menu(ui: &mut Ui, p: &PeerView, hide: bool) -> Option<u64> {
+    let mut pick = None;
+    if ui.button("Show details").clicked() {
+        pick = Some(p.id);
+        ui.close();
+    }
+    if let Some(addr) = &p.addr
+        && ui
+            .add_enabled(!hide, eframe::egui::Button::new("Copy address"))
+            .on_disabled_hover_text("Addresses are hidden")
+            .clicked()
+    {
+        ui.ctx().copy_text(addr.clone());
+        ui.close();
+    }
+    if let Some(id) = &p.session_id
+        && ui
+            .add_enabled(!hide, eframe::egui::Button::new("Copy session id"))
+            .on_disabled_hover_text("Addresses are hidden")
+            .clicked()
+    {
+        ui.ctx()
+            .copy_text(crate::fingerprint::hex_groups(id).concat());
+        ui.close();
+    }
+    pick
+}
+
+fn tooltip(ui: &mut Ui, p: &PeerView, pal: &Palette, hide: bool) {
+    let name = if hide || p.addr.is_none() {
+        format!("peer {} · {}", p.id, crate::model::network_kind(p))
+    } else {
+        format!("{} · peer {}", peer_name(p), p.id)
+    };
+    ui.label(RichText::new(name).font(mono(12.5)).color(pal.text));
     if let Some(agent) = &p.agent {
         ui.label(RichText::new(agent_name(agent)).size(12.5).color(pal.muted));
     }

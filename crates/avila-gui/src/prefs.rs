@@ -28,6 +28,12 @@ pub struct Prefs {
     /// How the Trust Ribbon measures the chain.
     #[serde(default)]
     pub scale: Scale,
+    /// Mask peer addresses everywhere, for screenshots and screen shares.
+    #[serde(default)]
+    pub hide_addresses: bool,
+    /// Draw the Rhythm section as a clock instead of bars.
+    #[serde(default)]
+    pub rhythm_clock: bool,
 }
 
 impl Default for Prefs {
@@ -36,6 +42,8 @@ impl Default for Prefs {
             theme: ThemeChoice::Light,
             size: 1.0,
             scale: Scale::Blocks,
+            hide_addresses: false,
+            rhythm_clock: false,
         }
     }
 }
@@ -120,6 +128,8 @@ mod tests {
             theme: ThemeChoice::Dark,
             size: 1.12,
             scale: Scale::Work,
+            hide_addresses: true,
+            rhythm_clock: true,
         };
         prefs.save(&mut storage);
         assert_eq!(
@@ -128,6 +138,8 @@ mod tests {
                 theme: ThemeChoice::Dark,
                 size: 1.15,
                 scale: Scale::Work,
+                hide_addresses: true,
+                rhythm_clock: true,
             }
         );
         assert_eq!(storage.0.len(), 1);

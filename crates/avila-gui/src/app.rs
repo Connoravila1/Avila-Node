@@ -3,9 +3,11 @@
 use crate::bench::Bench;
 use crate::capture::Capture;
 use crate::constellation::Constellation;
+use crate::pages::peers::PeerSort;
 use crate::pages::{self, Action, Scene};
 use crate::prefs::{Prefs, ThemeChoice};
 use crate::rail::{self, Page};
+use crate::ribbon::View;
 use crate::session::{ActivityKind, Phase, RunSettings, Session};
 use crate::theme::{self, Palette, SIGNAL, font};
 use crate::widgets::{self, Kind, hatch};
@@ -32,6 +34,9 @@ pub struct App {
     /// The peer whose panel is open on the Peers page.
     selected_peer: Option<u64>,
     sky: Constellation,
+    peer_sort: PeerSort,
+    /// The Chain page's zoom into the ribbon.
+    ribbon_view: View,
 }
 
 impl App {
@@ -86,6 +91,8 @@ impl App {
             autostart,
             selected_peer: None,
             sky: Constellation::default(),
+            peer_sort: PeerSort::default(),
+            ribbon_view: View::default(),
         }
     }
 
@@ -115,6 +122,9 @@ impl App {
                     if i.key_pressed(*key) {
                         self.page = page;
                     }
+                }
+                if i.modifiers.shift && i.key_pressed(Key::H) {
+                    self.prefs.hide_addresses = !self.prefs.hide_addresses;
                 }
             }
         });
@@ -159,6 +169,28 @@ impl App {
             if self.session.demo {
                 ui.add_space(6.0);
                 demo_badge(ui, pal);
+            }
+            if self
+                .session
+                .view
+                .as_ref()
+                .is_some_and(|v| !v.eclipse.is_empty())
+            {
+                ui.add_space(6.0);
+                let warn = ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Possible eclipse")
+                                .font(font(theme::MEDIUM, 12.5))
+                                .color(pal.alert),
+                        )
+                        .fill(pal.alert.gamma_multiply(0.08))
+                        .stroke(Stroke::new(1.0, pal.alert.gamma_multiply(0.6))),
+                    )
+                    .on_hover_text("The node sees signs its peers may be controlled by one attacker. Open Peers for details.");
+                if warn.clicked() {
+                    action = Some(Action::Open(Page::Peers));
+                }
             }
             ui.add_space(16.0);
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
@@ -217,8 +249,20 @@ impl eframe::App for App {
             self.page = page;
         }
         let mut pose_scroll = None;
+        let mut open_advanced = false;
         if let Some(pose) = self.capture.as_mut().and_then(|c| c.drive(&ctx)) {
             pose_scroll = Some(pose.scroll);
+            open_advanced = pose.advanced;
+            self.prefs.hide_addresses = pose.hide;
+            self.prefs.rhythm_clock = pose.clock;
+            if let Some((lo, hi)) = pose.zoom {
+                self.ribbon_view = View { lo, hi };
+            }
+            if pose.eclipse
+                && let Some(v) = self.session.view.as_mut()
+            {
+                v.eclipse = vec![crate::model::Eclipse::DiversityCollapse];
+            }
             self.page = pose.page;
             self.prefs.scale = pose.scale;
             if pose.select_peer && self.selected_peer.is_none() {
@@ -295,18 +339,27 @@ impl eframe::App for App {
                                 Page::Overview => {
                                     pages::overview::show(ui, &scene, &mut self.prefs.scale)
                                 }
-                                Page::Chain => {
-                                    pages::chain::show(ui, &scene, &mut self.prefs.scale)
-                                }
+                                Page::Chain => pages::chain::show(
+                                    ui,
+                                    &scene,
+                                    &mut self.prefs.scale,
+                                    &mut self.ribbon_view,
+                                    &mut self.prefs.rhythm_clock,
+                                ),
                                 Page::Peers => pages::peers::show(
                                     ui,
                                     &scene,
                                     &mut self.selected_peer,
                                     &mut self.sky,
+                                    &mut self.peer_sort,
+                                    self.prefs.hide_addresses,
                                 ),
-                                Page::Activity => {
-                                    pages::activity::show(ui, &scene, &mut self.filter)
-                                }
+                                Page::Activity => pages::activity::show(
+                                    ui,
+                                    &scene,
+                                    &mut self.filter,
+                                    self.prefs.hide_addresses,
+                                ),
                                 Page::Settings => {
                                     let before = self.prefs;
                                     let a = pages::settings::show(
@@ -315,6 +368,7 @@ impl eframe::App for App {
                                         &mut self.run,
                                         &mut self.prefs,
                                         &self.node,
+                                        open_advanced,
                                     );
                                     if self.prefs != before {
                                         self.prefs.apply(ui.ctx());
@@ -332,6 +386,7 @@ impl eframe::App for App {
         match action {
             Some(Action::Start) => self.start(),
             Some(Action::Stop) => self.session.stop(),
+            Some(Action::Open(page)) => self.page = page,
             None => {}
         }
         // Smooth frames only while the new-block pulse runs; otherwise

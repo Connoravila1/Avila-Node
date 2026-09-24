@@ -12667,6 +12667,7 @@ mod tests {
             validation: default_report(),
             profile: Default::default(),
             next_block: None,
+            eclipse: Vec::new(),
         }
     }
 

@@ -3,14 +3,20 @@
 
 use super::{Action, Scene, start_offer};
 use crate::model::{NodeView, btc, month_year, percent, span, thousands};
-use crate::ribbon::{self, Coverage, Options, Ruler, Scale};
+use crate::ribbon::{self, Coverage, Options, Ruler, Scale, View};
 use crate::session;
 use crate::theme::{self, font, mono};
-use crate::widgets;
+use crate::widgets::{self, Kind};
 use avila_consensus::connect::block_subsidy;
 use eframe::egui::{self, Align, Layout, Rect, RichText, Sense, Ui, vec2};
 
-pub fn show(ui: &mut Ui, s: &Scene, scale: &mut Scale) -> Option<Action> {
+pub fn show(
+    ui: &mut Ui,
+    s: &Scene,
+    scale: &mut Scale,
+    view: &mut View,
+    clock: &mut bool,
+) -> Option<Action> {
     let Some(v) = &s.session.view else {
         widgets::empty(
             ui,
@@ -34,7 +40,10 @@ pub fn show(ui: &mut Ui, s: &Scene, scale: &mut Scale) -> Option<Action> {
         ui.label(RichText::new(note).size(13.0).color(s.pal.muted));
         if !v.curve.is_empty() {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ribbon::scale_toggle(ui, scale);
+                if ribbon::scale_toggle(ui, scale) {
+                    // A zoomed view means different blocks on another ruler.
+                    *view = View::default();
+                }
             });
         }
     });
@@ -45,6 +54,7 @@ pub fn show(ui: &mut Ui, s: &Scene, scale: &mut Scale) -> Option<Action> {
         ui,
         &v.trust,
         &v.curve,
+        &v.recent,
         &Options {
             band: 52.0,
             halvings: true,
@@ -52,8 +62,29 @@ pub fn show(ui: &mut Ui, s: &Scene, scale: &mut Scale) -> Option<Action> {
             scale: *scale,
             pulse: s.pulse(),
         },
+        Some(view),
     );
-    ribbon::legend(ui, &v.trust, &Ruler::new(cov.top, *scale, &v.curve));
+    ui.horizontal(|ui| {
+        let toggle = 150.0;
+        ui.allocate_ui_with_layout(
+            vec2((ui.available_width() - toggle).max(0.0), 30.0),
+            Layout::left_to_right(Align::Center),
+            |ui| ribbon::legend(ui, &v.trust, &Ruler::new(cov.top, *scale, &v.curve)),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if view.zoomed() {
+                if widgets::button(ui, "Whole chain", Kind::Quiet).clicked() {
+                    *view = View::default();
+                }
+            } else {
+                ui.label(
+                    RichText::new("Scroll on the ribbon to zoom")
+                        .size(12.5)
+                        .color(s.pal.faint),
+                );
+            }
+        });
+    });
     ui.add_space(28.0);
     validation(ui, s, v);
     if v.trust.snapshot.is_some() {
@@ -61,7 +92,7 @@ pub fn show(ui: &mut Ui, s: &Scene, scale: &mut Scale) -> Option<Action> {
         snapshot(ui, s, v);
     }
     ui.add_space(28.0);
-    rhythm(ui, s, v);
+    rhythm(ui, s, v, clock);
     ui.add_space(28.0);
     recent(ui, s, v);
     None
@@ -69,12 +100,34 @@ pub fn show(ui: &mut Ui, s: &Scene, scale: &mut Scale) -> Option<Action> {
 
 /// Where the chain stands in its two long cycles: the 2,016-block
 /// difficulty period and the 210,000-block halving era.
-fn rhythm(ui: &mut Ui, s: &Scene, v: &NodeView) {
+fn rhythm(ui: &mut Ui, s: &Scene, v: &NodeView, clock: &mut bool) {
     let params = session::params(s.network);
     let tip = v.headers.max(v.connected);
     let spacing = params.pow_target_spacing.max(1);
     let interval = (params.pow_target_timespan / spacing).max(1) as u32;
-    widgets::section(ui, "Rhythm", Some("difficulty periods and halvings"));
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Rhythm")
+                .font(font(theme::TITLE, 19.0))
+                .color(s.pal.text),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("blocks, difficulty periods and halvings")
+                .size(13.0)
+                .color(s.pal.muted),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            widgets::segmented(ui, clock, &[(false, "Bars"), (true, "Clock")]);
+        });
+    });
+    widgets::hairline(ui);
+    ui.add_space(6.0);
+    if *clock {
+        ui.add_space(8.0);
+        crate::clock::show(ui, s, v, &params);
+        return;
+    }
     facts(ui, "rhythm", |ui| {
         key(ui, s, "Difficulty period");
         ui.vertical(|ui| {

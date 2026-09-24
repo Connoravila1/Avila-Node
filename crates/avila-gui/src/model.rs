@@ -2,6 +2,7 @@
 //! types, so a real run and the `--demo` preview feed the same code.
 
 use avila_node::sync::SyncProgress;
+use avila_p2p::manager::EclipseSignal;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -25,6 +26,43 @@ pub struct NodeView {
     pub curve: ChainCurve,
     /// The block this node's mempool would build next.
     pub next_block: Option<NextBlockView>,
+    /// Eclipse indicators the node currently raises.
+    pub eclipse: Vec<Eclipse>,
+}
+
+/// An eclipse indicator — the node's advisory signs that an attacker
+/// may be controlling what it sees. Signs, not proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Eclipse {
+    TipStale,
+    DiversityCollapse,
+    AllInbound,
+}
+
+impl Eclipse {
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::TipStale => "Peers are ahead but not delivering",
+            Self::DiversityCollapse => "Every peer you dialed is in one network group",
+            Self::AllInbound => "Every peer dialed you",
+        }
+    }
+
+    #[must_use]
+    pub fn explain(self) -> &'static str {
+        match self {
+            Self::TipStale => {
+                "Your newest block is over a day old while at least four peers say they have more. Peers that hold blocks back are how an eclipse attack keeps a node behind."
+            }
+            Self::DiversityCollapse => {
+                "At least four outbound peers, all in the same /16 address range: one operator could be running all of them."
+            }
+            Self::AllInbound => {
+                "None of the connections your node made itself is up, so everything you hear comes from peers that chose you."
+            }
+        }
+    }
 }
 
 /// What the node has verified versus what it is assuming — the typed
@@ -137,6 +175,15 @@ impl From<&SyncProgress> for NodeView {
                 }),
                 verified_fraction: v.verified_fraction,
             },
+            eclipse: p
+                .eclipse
+                .iter()
+                .map(|s| match s {
+                    EclipseSignal::TipStale => Eclipse::TipStale,
+                    EclipseSignal::DiversityCollapse => Eclipse::DiversityCollapse,
+                    EclipseSignal::AllInbound => Eclipse::AllInbound,
+                })
+                .collect(),
             curve: ChainCurve::new(
                 p.profile
                     .samples
@@ -311,6 +358,21 @@ pub fn clean_agent(raw: &str) -> String {
         .collect()
 }
 
+/// `IPv4`, `IPv6`, or `unknown` — what can be said about a peer's address
+/// without saying the address.
+#[must_use]
+pub fn network_kind(p: &PeerView) -> &'static str {
+    match p
+        .addr
+        .as_deref()
+        .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
+    {
+        Some(std::net::SocketAddr::V4(_)) => "IPv4",
+        Some(std::net::SocketAddr::V6(_)) => "IPv6",
+        None => "unknown network",
+    }
+}
+
 /// Service bits worth naming, in the order they're shown.
 #[must_use]
 pub fn services(bits: u64) -> Vec<&'static str> {
@@ -412,6 +474,25 @@ impl ChainCurve {
         }
         let f = (t - f64::from(a.time)) / span;
         Some(f64::from(a.height) + f64::from(b.height - a.height) * f)
+    }
+
+    /// The height at which cumulative work reaches `work`, interpolated.
+    #[must_use]
+    pub fn height_at_work(&self, work: f64) -> Option<f64> {
+        let pts = &self.points;
+        let i = pts.partition_point(|p| p.work <= work);
+        if i == 0 {
+            return pts.first().map(|p| f64::from(p.height));
+        }
+        let a = &pts[i - 1];
+        let Some(b) = pts.get(i) else {
+            return Some(f64::from(a.height));
+        };
+        let span = b.work - a.work;
+        if span <= 0.0 {
+            return Some(f64::from(a.height));
+        }
+        Some(f64::from(a.height) + f64::from(b.height - a.height) * (work - a.work) / span)
     }
 
     /// The first header of the current difficulty period, if sampled.
@@ -689,6 +770,8 @@ mod tests {
         assert_eq!(c.height_at_time(1_000.0), Some(1008.0));
         assert_eq!(c.height_at_time(9_000.0), None);
         assert_eq!(c.period_start(2016).map(|p| p.height), Some(2016));
+        assert_eq!(c.height_at_work(10.0), Some(1008.0));
+        assert_eq!(c.height_at_work(25.0), Some(2516.0));
         assert!(ChainCurve::default().work_at(5).is_none());
     }
 

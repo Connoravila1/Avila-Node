@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use avila_consensus::chainstate::Chainstate;
 use avila_consensus::params::Params;
-use avila_p2p::manager::{NetEvent, PeerManager};
+use avila_p2p::manager::{EclipseSignal, NetEvent, PeerManager};
 
 pub use crate::chain_profile::{ChainProfile, ProfilePoint};
 pub use crate::next_block::NextBlock;
@@ -164,6 +164,10 @@ pub struct SyncProgress {
     /// [`SyncConfig::preview_next_block`] is set and the pool has
     /// transactions.
     pub next_block: Option<std::sync::Arc<NextBlock>>,
+    /// Eclipse indicators as of the latest check (queue #12) —
+    /// advisory, re-evaluated every [`ECLIPSE_CHECK_INTERVAL`]; empty
+    /// when nothing looks wrong, so a cleared condition clears here too.
+    pub eclipse: Vec<EclipseSignal>,
 }
 
 /// The outcome of a finished (or timed-out) sync run.
@@ -250,6 +254,11 @@ fn sandbox_self() {
 /// stored chain — every ~2 weeks of mainnet history, or a cheap
 /// interval during IBD.
 const AUDIT_INTERVAL: u32 = 2016;
+
+/// How often [`SyncProgress::eclipse`] is re-evaluated — the manager's
+/// own advisory check runs about once a minute; a display can afford a
+/// little more.
+const ECLIPSE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How often [`SyncConfig::preview_next_block`] rebuilds
 /// [`SyncProgress::next_block`] — `build_template`'s package selection
@@ -440,6 +449,10 @@ pub fn run(
     // NEXT_BLOCK_REBUILD_INTERVAL on the wall clock.
     let mut next_block: Option<std::sync::Arc<NextBlock>> = None;
     let mut next_block_built_at: Option<Instant> = None;
+    // The eclipse indicators' current state for displays; the manager
+    // only emits an event when something is wrong, so re-evaluate here.
+    let mut eclipse: Vec<EclipseSignal> = Vec::new();
+    let mut eclipse_checked_at: Option<Instant> = None;
     let cancelled = || {
         cfg.cancel
             .as_ref()
@@ -587,6 +600,10 @@ pub fn run(
                     .map(std::sync::Arc::new);
             }
         }
+        if eclipse_checked_at.is_none_or(|t| t.elapsed() >= ECLIPSE_CHECK_INTERVAL) {
+            eclipse_checked_at = Some(Instant::now());
+            eclipse = mgr.eclipse_signals(&cs, unix_now());
+        }
         let snapshot = SyncProgress {
             peers: mgr.len(),
             connected_height: connected,
@@ -605,6 +622,7 @@ pub fn run(
             validation: cs.validation_report(),
             profile: chain_profile_arc.clone(),
             next_block: next_block.clone(),
+            eclipse: eclipse.clone(),
         };
         if let Some(status) = &cfg.status
             && let Ok(mut w) = status.write()
