@@ -82,10 +82,25 @@ relay — and over encrypted transport.
 
 ADOPTED for intra-Avila links: sketch + wire set + negotiation +
 scheduled rounds all verified end-to-end on real sockets.
-Remaining: non-empty-pool traffic (`sendrawtransaction` across two
-linked nodes to observe misses resolve), `reqbisec` fallback, and
-external interop (no outside peer speaks BIP-330 — Knots if they
-ship it).
+## Update 4 — real tx delivery + reqbisec
+
+`reqbisec` is plumbed: a failed initiator close halves the responder's
+pool at bit 31, two sketches decode each half, misses merge.
+
+And the full path ran live: two regtest nodes over BIP324-v2 — a mined
+coinbase spend entered A's mempool, B's sketch round found the diff,
+B's `reconcildiff` asked (33B), A delivered the body (430B), B admitted
+it to its pool. Zero tx `inv` announcements on the wire — pure set
+reconciliation end to end.
+
+The live run also flushed a real sync bug: inv bursts beyond the
+16-slot in-flight window were consumed-and-forgotten (84 of 100
+announced blocks lost). `PeerSync` now parks overflow in
+`pending_blocks`, drained as slots free.
+
+Remaining: external interop (no outside peer speaks BIP-330 — Knots
+if they ship it), tx announcements suppression in favor of recon
+(BIP-330's actual bandwidth win — the inv path still runs alongside).
 
 Worth noting: a pure-Rust, no-FFI minisketch + recon layer is itself
 an artifact the ecosystem doesn't have — Core bundles the C++ library.
