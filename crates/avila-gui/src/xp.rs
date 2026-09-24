@@ -13,9 +13,8 @@ use crate::theme::{self, CAPTION, MEDIUM, START, STRONG, font};
 use eframe::egui::{
     self, Align, Align2, Color32, Context, CornerRadius, CursorIcon, FontId, Id, Key, Layout, Mesh,
     Order, Painter, Pos2, Rect, ResizeDirection, Response, ScrollArea, Sense, Shape, Stroke,
-    StrokeKind, TextStyle, TextureHandle, Ui, UiBuilder, Vec2, ViewportCommand, pos2, vec2,
+    StrokeKind, TextureHandle, Ui, UiBuilder, Vec2, ViewportCommand, pos2, vec2,
 };
-use egui::containers::menu::{MenuConfig, menu_style};
 use egui::scroll_area::ScrollBarVisibility;
 
 pub const TASKBAR: f32 = 30.0;
@@ -139,6 +138,8 @@ pub struct Xp {
     /// The window shrunk to show the desktop.
     pub restored: bool,
     pub dialog: Dialog,
+    /// The menu dropped down from the menu bar.
+    menu_open: Option<usize>,
     /// The task pane's boxes, folded shut.
     folded: [bool; 3],
     address_open: bool,
@@ -194,12 +195,16 @@ fn at(stops: &Stops, t: f32) -> Color32 {
 /// A rounded rectangle filled with a vertical gradient through `stops`.
 /// Built from horizontal strips, one at every stop and down each curve,
 /// so a many-stop gradient keeps every stop.
+#[inline]
 pub fn gradient(p: &Painter, rect: Rect, radius: impl Into<CornerRadius>, stops: &Stops) {
+    shade(p, rect, radius.into(), stops);
+}
+
+fn shade(p: &Painter, rect: Rect, radius: CornerRadius, stops: &Stops) {
     let (w, h) = (rect.width(), rect.height());
     if w <= 0.0 || h <= 0.0 {
         return;
     }
-    let radius = radius.into();
     let cap = (w.min(h) / 2.0).max(0.0);
     let [nw, ne, sw, se] =
         [radius.nw, radius.ne, radius.sw, radius.se].map(|r| f32::from(r).min(cap));
@@ -307,6 +312,24 @@ fn dotted(p: &Painter, rect: Rect) {
         1.0,
         1.0,
     ));
+}
+
+/// Every popup the skin opens goes through here, so egui's area code is
+/// compiled once, not once per popup: a copy per call site cost tens of
+/// kilobytes of download.
+fn popup(
+    ctx: &Context,
+    id: &str,
+    pos: Pos2,
+    order: Order,
+    content: &mut dyn FnMut(&mut Ui),
+) -> Rect {
+    egui::Area::new(Id::new(id))
+        .order(order)
+        .fixed_pos(pos)
+        .show(ctx, |ui| content(ui))
+        .response
+        .rect
 }
 
 /// The node's swirl on an orange disc: our stand-in for the flag.
@@ -621,6 +644,7 @@ pub fn desktop(
     if ctx.input(|i| i.key_pressed(Key::Escape)) {
         state.start_open = false;
         state.address_open = false;
+        state.menu_open = None;
         state.dialog = Dialog::None;
     }
     if !ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
@@ -813,23 +837,6 @@ fn window(
 // Menus
 // ---------------------------------------------------------------------
 
-/// The menu bar's own buttons: small, flat, blue when open.
-fn bar_look(style: &mut egui::Style) {
-    menu_style(style);
-    style.spacing.button_padding = vec2(7.0, 2.0);
-    style.spacing.interact_size.y = 20.0;
-    style.spacing.item_spacing.x = 0.0;
-    style.text_styles.insert(TextStyle::Button, ui_font(12.5));
-}
-
-/// Inside a menu: tight rows on white.
-fn menu_look(style: &mut egui::Style) {
-    menu_style(style);
-    style.spacing.item_spacing = vec2(0.0, 0.0);
-    style.spacing.menu_margin = egui::Margin::same(2);
-    style.text_styles.insert(TextStyle::Button, ui_font(12.5));
-}
-
 #[derive(Clone, Copy)]
 enum Mark {
     None,
@@ -880,9 +887,6 @@ fn item(ui: &mut Ui, label: &str, keys: &str, mark: Mark) -> bool {
             ink,
         );
     }
-    if resp.clicked() {
-        ui.close();
-    }
     resp.clicked()
 }
 
@@ -895,80 +899,183 @@ fn menu_rule(ui: &mut Ui) {
     );
 }
 
-fn menus(ui: &mut Ui, rect: Rect, state: &mut Xp, c: &Chrome) -> Option<Pick> {
-    let mut pick = None;
-    let mut bar = ui.new_child(
-        UiBuilder::new()
-            .max_rect(rect.shrink2(vec2(4.0, 1.0)))
-            .layout(Layout::left_to_right(Align::Center)),
-    );
-    // The bar's row takes its height from here, before its own style.
-    bar.spacing_mut().interact_size.y = 20.0;
-    egui::MenuBar::new()
-        .style(bar_look)
-        .config(MenuConfig::new().style(menu_look))
-        .ui(&mut bar, |ui| {
-            ui.menu_button("File", |ui| {
-                if c.running {
-                    if item(ui, "Stop node", "", Mark::None) {
-                        pick = Some(Pick::StopNode);
-                    }
-                } else if item(ui, "Start node", "", Mark::None) {
-                    pick = Some(Pick::StartNode);
-                }
-                menu_rule(ui);
-                if item(ui, "Log Off", "", Mark::None) {
-                    pick = Some(Pick::LogOff);
-                }
-                if item(ui, "Close", "Alt+F4", Mark::None) {
-                    ui.ctx().send_viewport_cmd(ViewportCommand::Close);
-                }
-            });
-            ui.menu_button("View", |ui| {
-                for page in &c.pages {
+const MENU_TITLES: [&str; 4] = ["File", "View", "Tools", "Help"];
+
+/// What a menu entry does.
+#[derive(Clone, Copy)]
+enum Act {
+    Pick(Pick),
+    Quit,
+    About,
+}
+
+type Entry = Option<(String, String, Mark, Act)>;
+
+/// One menu's entries: label, shortcut, mark and action; `None` is a rule.
+fn entries(menu: usize, c: &Chrome) -> Vec<Entry> {
+    let e = |label: &str, keys: &str, mark: Mark, act: Act| {
+        Some((label.to_owned(), keys.to_owned(), mark, act))
+    };
+    match menu {
+        0 => vec![
+            if c.running {
+                e("Stop node", "", Mark::None, Act::Pick(Pick::StopNode))
+            } else {
+                e("Start node", "", Mark::None, Act::Pick(Pick::StartNode))
+            },
+            None,
+            e("Log Off", "", Mark::None, Act::Pick(Pick::LogOff)),
+            e("Close", "Alt+F4", Mark::None, Act::Quit),
+        ],
+        1 => {
+            let mut v: Vec<Entry> = c
+                .pages
+                .iter()
+                .map(|page| {
                     let keys = Page::ALL
                         .iter()
                         .position(|p| p == page)
                         .map_or(String::new(), |i| format!("Ctrl+{}", i + 1));
-                    if item(ui, page.label(), &keys, Mark::Dot(*page == c.page)) {
-                        pick = Some(Pick::Open(*page));
-                    }
-                }
-                menu_rule(ui);
-                if item(
-                    ui,
-                    "Hide peer addresses",
-                    "Ctrl+Shift+H",
-                    Mark::Check(c.hide),
-                ) {
-                    pick = Some(Pick::ToggleHide);
-                }
-            });
-            ui.menu_button("Tools", |ui| {
-                if item(ui, "Shitcoin Defense", "", Mark::None) {
-                    pick = Some(Pick::Open(Page::Toybox));
-                }
-                menu_rule(ui);
-                if item(ui, "Options…", "", Mark::None) {
-                    pick = Some(Pick::Open(Page::Settings));
-                }
-            });
-            ui.menu_button("Help", |ui| {
-                if item(ui, "About Avila Node", "", Mark::None) {
-                    state.dialog = Dialog::About;
-                }
-            });
-        });
+                    Some((
+                        page.label().to_owned(),
+                        keys,
+                        Mark::Dot(*page == c.page),
+                        Act::Pick(Pick::Open(*page)),
+                    ))
+                })
+                .collect();
+            v.push(None);
+            v.push(e(
+                "Hide peer addresses",
+                "Ctrl+Shift+H",
+                Mark::Check(c.hide),
+                Act::Pick(Pick::ToggleHide),
+            ));
+            v
+        }
+        2 => vec![
+            e(
+                "Shitcoin Defense",
+                "",
+                Mark::None,
+                Act::Pick(Pick::Open(Page::Toybox)),
+            ),
+            None,
+            e(
+                "Options…",
+                "",
+                Mark::None,
+                Act::Pick(Pick::Open(Page::Settings)),
+            ),
+        ],
+        _ => vec![e("About Avila Node", "", Mark::None, Act::About)],
+    }
+}
+
+/// The menu bar, drawn by hand: titles light up blue, a click opens one,
+/// and while one is open the pointer slides between them.
+fn menus(ui: &mut Ui, rect: Rect, state: &mut Xp, c: &Chrome) -> Option<Pick> {
+    let p = ui.painter().clone();
+    let mut x = rect.left() + 4.0;
+    let mut anchor = None;
+    for (i, title) in MENU_TITLES.iter().enumerate() {
+        let galley = p.layout_no_wrap((*title).to_owned(), ui_font(12.5), Color32::PLACEHOLDER);
+        let r = Rect::from_min_size(
+            pos2(x, rect.top() + 1.0),
+            vec2(galley.size().x + 16.0, rect.height() - 3.0),
+        );
+        x = r.right();
+        let resp = ui.interact(r, Id::new(("xp-menu-title", i)), Sense::click());
+        if resp.clicked() {
+            state.menu_open = if state.menu_open == Some(i) {
+                None
+            } else {
+                Some(i)
+            };
+        } else if resp.hovered() && state.menu_open.is_some() {
+            state.menu_open = Some(i);
+        }
+        let lit = state.menu_open == Some(i) || resp.hovered();
+        if lit {
+            p.rect_filled(r, 0, SELECTION);
+        }
+        p.galley(
+            r.center() - galley.size() / 2.0,
+            galley,
+            if lit { Color32::WHITE } else { Color32::BLACK },
+        );
+        if state.menu_open == Some(i) {
+            anchor = Some(r.left_bottom());
+        }
+    }
     // Where XP waves its flag, the node shows its swirl.
     let badge = Rect::from_min_max(
         pos2(rect.right() - 40.0, rect.top()),
         pos2(rect.right(), rect.bottom() + TOOLBAR - 2.0),
     );
-    let p = ui.painter();
     p.rect_filled(badge, 0, Color32::WHITE);
     p.vline(badge.left(), badge.y_range(), Stroke::new(1.0, ETCH_DARK));
-    swirl_disc(p, badge.center(), 12.0, c.swirl.as_ref());
-    pick
+    swirl_disc(&p, badge.center(), 12.0, c.swirl.as_ref());
+
+    let (Some(menu), Some(at)) = (state.menu_open, anchor) else {
+        return None;
+    };
+    let list = entries(menu, c);
+    let mut chosen = None;
+    let area = popup(ui.ctx(), "xp-menu", at, Order::Foreground, &mut |ui| {
+        let under = ui.painter().add(Shape::Noop);
+        ui.spacing_mut().item_spacing = Vec2::ZERO;
+        ui.add_space(2.0);
+        for entry in &list {
+            match entry {
+                Some((label, keys, mark, act)) => {
+                    if item(ui, label, keys, *mark) {
+                        chosen = Some(*act);
+                    }
+                }
+                None => menu_rule(ui),
+            }
+        }
+        ui.add_space(2.0);
+        let r = ui.min_rect().expand2(vec2(2.0, 0.0));
+        ui.painter().set(
+            under,
+            Shape::Vec(vec![
+                Shape::rect_filled(
+                    r.translate(vec2(3.0, 3.0)),
+                    0,
+                    Color32::from_black_alpha(50),
+                ),
+                Shape::rect_filled(r, 0, Color32::WHITE),
+                Shape::rect_stroke(
+                    r,
+                    0,
+                    Stroke::new(1.0, rgb(172, 168, 153)),
+                    StrokeKind::Inside,
+                ),
+            ]),
+        );
+    });
+    let clicked_away = ui.ctx().input(|i| {
+        i.pointer.any_click()
+            && i.pointer
+                .interact_pos()
+                .is_some_and(|pos| !area.contains(pos) && !rect.contains(pos))
+    });
+    if chosen.is_some() || clicked_away {
+        state.menu_open = None;
+    }
+    match chosen? {
+        Act::Pick(pick) => Some(pick),
+        Act::Quit => {
+            ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+            None
+        }
+        Act::About => {
+            state.dialog = Dialog::About;
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1160,10 +1267,12 @@ fn address_bar(ui: &mut Ui, rect: Rect, state: &mut Xp, c: &Chrome) -> Option<Pi
             field.left_bottom() + vec2(0.0, 1.0),
             vec2(field.width(), 20.0 * c.pages.len() as f32 + 4.0),
         );
-        egui::Area::new(Id::new("xp-address-list"))
-            .order(Order::Foreground)
-            .fixed_pos(list.min)
-            .show(ui.ctx(), |ui| {
+        popup(
+            ui.ctx(),
+            "xp-address-list",
+            list.min,
+            Order::Foreground,
+            &mut |ui| {
                 let (r, _) = ui.allocate_exact_size(list.size(), Sense::hover());
                 let p = ui.painter();
                 p.rect_filled(r, 0, Color32::WHITE);
@@ -1197,7 +1306,8 @@ fn address_bar(ui: &mut Ui, rect: Rect, state: &mut Xp, c: &Chrome) -> Option<Pi
                         pick = Some(Pick::Open(*page));
                     }
                 }
-            });
+            },
+        );
         let clicked_away = ui.ctx().input(|i| {
             i.pointer.any_click()
                 && i.pointer
@@ -1858,196 +1968,192 @@ fn start_menu(ctx: &Context, bottom_left: Pos2, state: &mut Xp, c: &Chrome) -> O
     let origin = bottom_left - vec2(0.0, size.y);
     let menu = Rect::from_min_size(origin, size);
     let mut pick = None;
-    egui::Area::new(Id::new("xp-start-menu"))
-        .order(Order::Foreground)
-        .fixed_pos(origin)
-        .show(ctx, |ui| {
-            let (rect, _) = ui.allocate_exact_size(size, Sense::click());
-            let p = ui.painter().clone();
-            let top = CornerRadius {
-                nw: 7,
-                ne: 7,
-                sw: 0,
-                se: 0,
-            };
-            p.rect_filled(
-                rect.translate(vec2(3.0, 0.0)),
-                top,
-                Color32::from_black_alpha(60),
+    popup(ctx, "xp-start-menu", origin, Order::Foreground, &mut |ui| {
+        let (rect, _) = ui.allocate_exact_size(size, Sense::click());
+        let p = ui.painter().clone();
+        let top = CornerRadius {
+            nw: 7,
+            ne: 7,
+            sw: 0,
+            se: 0,
+        };
+        p.rect_filled(
+            rect.translate(vec2(3.0, 0.0)),
+            top,
+            Color32::from_black_alpha(60),
+        );
+        p.rect_filled(rect, top, rgb(0, 72, 211));
+        // Header: who's here.
+        let head = Rect::from_min_size(rect.min, vec2(size.x, 62.0));
+        gradient(
+            &p,
+            head,
+            top,
+            &[
+                (0.0, rgb(24, 104, 222)),
+                (0.12, rgb(66, 146, 238)),
+                (0.5, rgb(38, 118, 226)),
+                (1.0, rgb(18, 84, 204)),
+            ],
+        );
+        p.hline(
+            head.x_range(),
+            head.bottom() - 1.0,
+            Stroke::new(2.0, rgb(240, 160, 70)),
+        );
+        let tile = Rect::from_min_size(head.min + vec2(8.0, 8.0), vec2(46.0, 46.0));
+        p.rect_filled(tile, 4, theme::SIGNAL);
+        p.rect_stroke(
+            tile,
+            4,
+            Stroke::new(2.0, Color32::WHITE),
+            StrokeKind::Inside,
+        );
+        if let Some(tex) = &c.swirl {
+            p.image(
+                tex.id(),
+                tile.shrink(7.0),
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                theme::INK,
             );
-            p.rect_filled(rect, top, rgb(0, 72, 211));
-            // Header: who's here.
-            let head = Rect::from_min_size(rect.min, vec2(size.x, 62.0));
+        }
+        let who = std::env::var("USER")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| "Node operator".into());
+        shadowed(
+            &p,
+            pos2(tile.right() + 10.0, head.center().y),
+            Align2::LEFT_CENTER,
+            &who,
+            font(CAPTION, 16.0),
+            Color32::WHITE,
+        );
+        // Body: the pages on white, shortcuts on pale blue.
+        let body = Rect::from_min_max(
+            pos2(rect.left() + 2.0, head.bottom()),
+            pos2(rect.right() - 2.0, rect.bottom() - 46.0),
+        );
+        let split = body.left() + body.width() * 0.55;
+        p.rect_filled(
+            Rect::from_min_max(body.min, pos2(split, body.bottom())),
+            0,
+            Color32::WHITE,
+        );
+        p.rect_filled(
+            Rect::from_min_max(pos2(split, body.top()), body.max),
+            0,
+            rgb(211, 229, 250),
+        );
+        p.vline(split, body.y_range(), Stroke::new(1.0, rgb(149, 189, 237)));
+        for (i, page) in c.pages.iter().enumerate() {
+            let r = Rect::from_min_size(
+                pos2(body.left() + 4.0, body.top() + 8.0 + 44.0 * i as f32),
+                vec2(split - body.left() - 8.0, 42.0),
+            );
+            if pinned(ui, &p, r, *page) {
+                pick = Some(Pick::Open(*page));
+            }
+        }
+        let right = split + 4.0;
+        let w = body.right() - right - 4.0;
+        let mut y = body.top() + 8.0;
+        for (label, choice) in [
+            ("My Node", Some(Pick::Open(Page::Overview))),
+            ("My Peers", Some(Pick::Open(Page::Peers))),
+            ("My Activity", Some(Pick::Open(Page::Activity))),
+            ("Control Panel", Some(Pick::Open(Page::Settings))),
+            ("Help and Support", None),
+            (
+                if c.hide {
+                    "Show Addresses"
+                } else {
+                    "Hide Addresses"
+                },
+                Some(Pick::ToggleHide),
+            ),
+        ] {
+            let r = Rect::from_min_size(pos2(right, y), vec2(w, 30.0));
+            y += 32.0;
+            if shortcut(ui, &p, r, label) {
+                match choice {
+                    Some(choice) => pick = Some(choice),
+                    None => state.dialog = Dialog::About,
+                }
+            }
+        }
+        // Footer: log off (leave the skin), turn off (the dialog).
+        let foot = Rect::from_min_max(pos2(rect.left(), body.bottom()), rect.max);
+        gradient(
+            &p,
+            foot,
+            0,
+            &[
+                (0.0, rgb(58, 136, 234)),
+                (0.5, rgb(32, 106, 218)),
+                (1.0, rgb(16, 84, 200)),
+            ],
+        );
+        let off = Rect::from_min_size(
+            pos2(foot.right() - 164.0, foot.top() + 8.0),
+            vec2(156.0, 30.0),
+        );
+        let log = Rect::from_min_size(pos2(off.left() - 98.0, foot.top() + 8.0), vec2(92.0, 30.0));
+        for (r, label, color, id) in [
+            (log, "Log Off", rgb(236, 176, 30), 0),
+            (off, "Turn Off Computer", rgb(222, 72, 40), 1),
+        ] {
+            let resp = ui
+                .interact(r, Id::new(("xp-foot", id)), Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand);
+            if resp.hovered() {
+                p.rect_filled(r, 3, Color32::from_white_alpha(40));
+            }
+            let icon =
+                Rect::from_center_size(pos2(r.left() + 14.0, r.center().y), vec2(22.0, 22.0));
             gradient(
                 &p,
-                head,
-                top,
+                icon,
+                4,
                 &[
-                    (0.0, rgb(24, 104, 222)),
-                    (0.12, rgb(66, 146, 238)),
-                    (0.5, rgb(38, 118, 226)),
-                    (1.0, rgb(18, 84, 204)),
+                    (0.0, color.lerp_to_gamma(Color32::WHITE, 0.35)),
+                    (1.0, color),
                 ],
             );
-            p.hline(
-                head.x_range(),
-                head.bottom() - 1.0,
-                Stroke::new(2.0, rgb(240, 160, 70)),
-            );
-            let tile = Rect::from_min_size(head.min + vec2(8.0, 8.0), vec2(46.0, 46.0));
-            p.rect_filled(tile, 4, theme::SIGNAL);
             p.rect_stroke(
-                tile,
+                icon,
                 4,
-                Stroke::new(2.0, Color32::WHITE),
+                Stroke::new(1.0, Color32::WHITE),
                 StrokeKind::Inside,
             );
-            if let Some(tex) = &c.swirl {
-                p.image(
-                    tex.id(),
-                    tile.shrink(7.0),
-                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                    theme::INK,
-                );
+            let dot = icon.center();
+            if id == 0 {
+                // A key: a ring, a shaft, two teeth.
+                let s = Stroke::new(1.8, Color32::WHITE);
+                p.circle_stroke(dot + vec2(-4.0, 0.0), 3.2, s);
+                p.line_segment([dot + vec2(-0.8, 0.0), dot + vec2(7.0, 0.0)], s);
+                p.line_segment([dot + vec2(4.0, 0.0), dot + vec2(4.0, 3.5)], s);
+                p.line_segment([dot + vec2(6.5, 0.0), dot + vec2(6.5, 3.0)], s);
+            } else {
+                power(&p, dot, 5.5, Color32::WHITE);
             }
-            let who = std::env::var("USER")
-                .ok()
-                .filter(|u| !u.is_empty())
-                .unwrap_or_else(|| "Node operator".into());
             shadowed(
                 &p,
-                pos2(tile.right() + 10.0, head.center().y),
+                pos2(r.left() + 30.0, r.center().y),
                 Align2::LEFT_CENTER,
-                &who,
-                font(CAPTION, 16.0),
+                label,
+                ui_font(12.5),
                 Color32::WHITE,
             );
-            // Body: the pages on white, shortcuts on pale blue.
-            let body = Rect::from_min_max(
-                pos2(rect.left() + 2.0, head.bottom()),
-                pos2(rect.right() - 2.0, rect.bottom() - 46.0),
-            );
-            let split = body.left() + body.width() * 0.55;
-            p.rect_filled(
-                Rect::from_min_max(body.min, pos2(split, body.bottom())),
-                0,
-                Color32::WHITE,
-            );
-            p.rect_filled(
-                Rect::from_min_max(pos2(split, body.top()), body.max),
-                0,
-                rgb(211, 229, 250),
-            );
-            p.vline(split, body.y_range(), Stroke::new(1.0, rgb(149, 189, 237)));
-            for (i, page) in c.pages.iter().enumerate() {
-                let r = Rect::from_min_size(
-                    pos2(body.left() + 4.0, body.top() + 8.0 + 44.0 * i as f32),
-                    vec2(split - body.left() - 8.0, 42.0),
-                );
-                if pinned(ui, &p, r, *page) {
-                    pick = Some(Pick::Open(*page));
-                }
-            }
-            let right = split + 4.0;
-            let w = body.right() - right - 4.0;
-            let mut y = body.top() + 8.0;
-            for (label, choice) in [
-                ("My Node", Some(Pick::Open(Page::Overview))),
-                ("My Peers", Some(Pick::Open(Page::Peers))),
-                ("My Activity", Some(Pick::Open(Page::Activity))),
-                ("Control Panel", Some(Pick::Open(Page::Settings))),
-                ("Help and Support", None),
-                (
-                    if c.hide {
-                        "Show Addresses"
-                    } else {
-                        "Hide Addresses"
-                    },
-                    Some(Pick::ToggleHide),
-                ),
-            ] {
-                let r = Rect::from_min_size(pos2(right, y), vec2(w, 30.0));
-                y += 32.0;
-                if shortcut(ui, &p, r, label) {
-                    match choice {
-                        Some(choice) => pick = Some(choice),
-                        None => state.dialog = Dialog::About,
-                    }
-                }
-            }
-            // Footer: log off (leave the skin), turn off (the dialog).
-            let foot = Rect::from_min_max(pos2(rect.left(), body.bottom()), rect.max);
-            gradient(
-                &p,
-                foot,
-                0,
-                &[
-                    (0.0, rgb(58, 136, 234)),
-                    (0.5, rgb(32, 106, 218)),
-                    (1.0, rgb(16, 84, 200)),
-                ],
-            );
-            let off = Rect::from_min_size(
-                pos2(foot.right() - 164.0, foot.top() + 8.0),
-                vec2(156.0, 30.0),
-            );
-            let log =
-                Rect::from_min_size(pos2(off.left() - 98.0, foot.top() + 8.0), vec2(92.0, 30.0));
-            for (r, label, color, id) in [
-                (log, "Log Off", rgb(236, 176, 30), 0),
-                (off, "Turn Off Computer", rgb(222, 72, 40), 1),
-            ] {
-                let resp = ui
-                    .interact(r, Id::new(("xp-foot", id)), Sense::click())
-                    .on_hover_cursor(CursorIcon::PointingHand);
-                if resp.hovered() {
-                    p.rect_filled(r, 3, Color32::from_white_alpha(40));
-                }
-                let icon =
-                    Rect::from_center_size(pos2(r.left() + 14.0, r.center().y), vec2(22.0, 22.0));
-                gradient(
-                    &p,
-                    icon,
-                    4,
-                    &[
-                        (0.0, color.lerp_to_gamma(Color32::WHITE, 0.35)),
-                        (1.0, color),
-                    ],
-                );
-                p.rect_stroke(
-                    icon,
-                    4,
-                    Stroke::new(1.0, Color32::WHITE),
-                    StrokeKind::Inside,
-                );
-                let dot = icon.center();
+            if resp.clicked() {
                 if id == 0 {
-                    // A key: a ring, a shaft, two teeth.
-                    let s = Stroke::new(1.8, Color32::WHITE);
-                    p.circle_stroke(dot + vec2(-4.0, 0.0), 3.2, s);
-                    p.line_segment([dot + vec2(-0.8, 0.0), dot + vec2(7.0, 0.0)], s);
-                    p.line_segment([dot + vec2(4.0, 0.0), dot + vec2(4.0, 3.5)], s);
-                    p.line_segment([dot + vec2(6.5, 0.0), dot + vec2(6.5, 3.0)], s);
+                    pick = Some(Pick::LogOff);
                 } else {
-                    power(&p, dot, 5.5, Color32::WHITE);
-                }
-                shadowed(
-                    &p,
-                    pos2(r.left() + 30.0, r.center().y),
-                    Align2::LEFT_CENTER,
-                    label,
-                    ui_font(12.5),
-                    Color32::WHITE,
-                );
-                if resp.clicked() {
-                    if id == 0 {
-                        pick = Some(Pick::LogOff);
-                    } else {
-                        state.dialog = Dialog::TurnOff;
-                    }
+                    state.dialog = Dialog::TurnOff;
                 }
             }
-        });
+        }
+    });
     let button = Rect::from_min_size(bottom_left, vec2(100.0, TASKBAR));
     let clicked_away = ctx.input(|i| {
         i.pointer.any_click()
@@ -2174,94 +2280,91 @@ fn balloon(ctx: &Context, tray_icon: Pos2, state: &mut Xp, signs: &[Eclipse]) ->
     let size = vec2(330.0, 96.0);
     let origin = tray_icon - vec2(size.x - 34.0, size.y + 16.0);
     let mut pick = None;
-    egui::Area::new(Id::new("xp-balloon"))
-        .order(Order::Foreground)
-        .fixed_pos(origin)
-        .show(ctx, |ui| {
-            let (rect, resp) = ui.allocate_exact_size(size + vec2(0.0, 14.0), Sense::click());
-            let body = Rect::from_min_size(rect.min, size);
-            let p = ui.painter();
-            p.rect_filled(
-                body.translate(vec2(2.0, 2.0)),
-                8,
-                Color32::from_black_alpha(50),
-            );
-            p.rect_filled(body, 8, rgb(255, 255, 225));
-            p.rect_stroke(
-                body,
-                8,
-                Stroke::new(1.0, Color32::BLACK),
-                StrokeKind::Inside,
-            );
-            let tip = pos2(body.right() - 34.0, body.bottom() + 13.0);
-            let (a, b) = (
-                pos2(tip.x - 18.0, body.bottom() - 1.0),
-                pos2(tip.x, body.bottom() - 1.0),
-            );
-            p.add(Shape::convex_polygon(
-                vec![a, b, tip],
-                rgb(255, 255, 225),
-                Stroke::NONE,
-            ));
-            p.line_segment([a + vec2(0.0, 0.5), tip], Stroke::new(1.0, Color32::BLACK));
-            p.line_segment([b + vec2(0.0, 0.5), tip], Stroke::new(1.0, Color32::BLACK));
-            glyph(
-                p,
-                Glyph::Warn,
-                body.left_top() + vec2(18.0, 20.0),
-                16.0,
-                true,
-            );
-            p.text(
-                body.left_top() + vec2(34.0, 12.0),
-                Align2::LEFT_TOP,
-                "Your node might be eclipsed",
-                font(STRONG, 12.5),
-                Color32::BLACK,
-            );
-            let close = Rect::from_min_size(
-                pos2(body.right() - 22.0, body.top() + 8.0),
-                vec2(14.0, 14.0),
-            );
-            p.rect_stroke(
-                close,
-                2,
-                Stroke::new(1.0, rgb(130, 130, 130)),
-                StrokeKind::Inside,
-            );
-            let x = Stroke::new(1.3, Color32::BLACK);
-            p.line_segment(
-                [
-                    close.left_top() + vec2(3.5, 3.5),
-                    close.right_bottom() - vec2(3.5, 3.5),
-                ],
-                x,
-            );
-            p.line_segment(
-                [
-                    close.right_top() + vec2(-3.5, 3.5),
-                    close.left_bottom() + vec2(3.5, -3.5),
-                ],
-                x,
-            );
-            let text = signs.first().map_or("", |e| e.title());
-            let galley = p.layout(
-                format!("{text}. Click here to see your peers."),
-                ui_font(12.0),
-                Color32::BLACK,
-                size.x - 48.0,
-            );
-            p.galley(body.left_top() + vec2(34.0, 34.0), galley, Color32::BLACK);
-            if resp.clicked() {
-                let on_close = resp
-                    .interact_pointer_pos()
-                    .is_some_and(|pos| close.expand(3.0).contains(pos));
-                state.dismissed = signs.to_vec();
-                if !on_close {
-                    pick = Some(Pick::Open(Page::Peers));
-                }
+    popup(ctx, "xp-balloon", origin, Order::Foreground, &mut |ui| {
+        let (rect, resp) = ui.allocate_exact_size(size + vec2(0.0, 14.0), Sense::click());
+        let body = Rect::from_min_size(rect.min, size);
+        let p = ui.painter();
+        p.rect_filled(
+            body.translate(vec2(2.0, 2.0)),
+            8,
+            Color32::from_black_alpha(50),
+        );
+        p.rect_filled(body, 8, rgb(255, 255, 225));
+        p.rect_stroke(
+            body,
+            8,
+            Stroke::new(1.0, Color32::BLACK),
+            StrokeKind::Inside,
+        );
+        let tip = pos2(body.right() - 34.0, body.bottom() + 13.0);
+        let (a, b) = (
+            pos2(tip.x - 18.0, body.bottom() - 1.0),
+            pos2(tip.x, body.bottom() - 1.0),
+        );
+        p.add(Shape::convex_polygon(
+            vec![a, b, tip],
+            rgb(255, 255, 225),
+            Stroke::NONE,
+        ));
+        p.line_segment([a + vec2(0.0, 0.5), tip], Stroke::new(1.0, Color32::BLACK));
+        p.line_segment([b + vec2(0.0, 0.5), tip], Stroke::new(1.0, Color32::BLACK));
+        glyph(
+            p,
+            Glyph::Warn,
+            body.left_top() + vec2(18.0, 20.0),
+            16.0,
+            true,
+        );
+        p.text(
+            body.left_top() + vec2(34.0, 12.0),
+            Align2::LEFT_TOP,
+            "Your node might be eclipsed",
+            font(STRONG, 12.5),
+            Color32::BLACK,
+        );
+        let close = Rect::from_min_size(
+            pos2(body.right() - 22.0, body.top() + 8.0),
+            vec2(14.0, 14.0),
+        );
+        p.rect_stroke(
+            close,
+            2,
+            Stroke::new(1.0, rgb(130, 130, 130)),
+            StrokeKind::Inside,
+        );
+        let x = Stroke::new(1.3, Color32::BLACK);
+        p.line_segment(
+            [
+                close.left_top() + vec2(3.5, 3.5),
+                close.right_bottom() - vec2(3.5, 3.5),
+            ],
+            x,
+        );
+        p.line_segment(
+            [
+                close.right_top() + vec2(-3.5, 3.5),
+                close.left_bottom() + vec2(3.5, -3.5),
+            ],
+            x,
+        );
+        let text = signs.first().map_or("", |e| e.title());
+        let galley = p.layout(
+            format!("{text}. Click here to see your peers."),
+            ui_font(12.0),
+            Color32::BLACK,
+            size.x - 48.0,
+        );
+        p.galley(body.left_top() + vec2(34.0, 34.0), galley, Color32::BLACK);
+        if resp.clicked() {
+            let on_close = resp
+                .interact_pointer_pos()
+                .is_some_and(|pos| close.expand(3.0).contains(pos));
+            state.dismissed = signs.to_vec();
+            if !on_close {
+                pick = Some(Pick::Open(Page::Peers));
             }
-        });
+        }
+    });
     pick
 }
 
@@ -2349,76 +2452,67 @@ fn dialogs(ctx: &Context, desk: Rect, state: &mut Xp, c: &Chrome) -> Option<Pick
         Dialog::About => {
             let size = vec2(440.0, 212.0);
             let rect = Rect::from_center_size(desk.center(), size);
-            egui::Area::new(Id::new("xp-about"))
-                .order(Order::Foreground)
-                .fixed_pos(rect.min)
-                .show(ctx, |ui| {
-                    let (rect, _) = ui.allocate_exact_size(size, Sense::click());
-                    let (client, closed) = dialog_window(ui, rect, "About Avila Node");
-                    let p = ui.painter();
-                    swirl_disc(
-                        p,
-                        client.left_top() + vec2(44.0, 48.0),
-                        24.0,
-                        c.swirl.as_ref(),
-                    );
-                    let x = client.left() + 84.0;
-                    p.text(
-                        pos2(x, client.top() + 22.0),
-                        Align2::LEFT_TOP,
-                        "Avila Node",
-                        font(CAPTION, 18.0),
+            popup(ctx, "xp-about", rect.min, Order::Foreground, &mut |ui| {
+                let (rect, _) = ui.allocate_exact_size(size, Sense::click());
+                let (client, closed) = dialog_window(ui, rect, "About Avila Node");
+                let p = ui.painter();
+                swirl_disc(
+                    p,
+                    client.left_top() + vec2(44.0, 48.0),
+                    24.0,
+                    c.swirl.as_ref(),
+                );
+                let x = client.left() + 84.0;
+                p.text(
+                    pos2(x, client.top() + 22.0),
+                    Align2::LEFT_TOP,
+                    "Avila Node",
+                    font(CAPTION, 18.0),
+                    Color32::BLACK,
+                );
+                let lines = [
+                    format!("Version {}", env!("CARGO_PKG_VERSION")),
+                    "A Bitcoin full node that checks every block itself.".to_owned(),
+                    "Bitcoin only.".to_owned(),
+                ];
+                let mut y = client.top() + 52.0;
+                for line in lines {
+                    let galley = p.layout(
+                        line,
+                        ui_font(12.0),
                         Color32::BLACK,
+                        client.right() - x - 16.0,
                     );
-                    let lines = [
-                        format!("Version {}", env!("CARGO_PKG_VERSION")),
-                        "A Bitcoin full node that checks every block itself.".to_owned(),
-                        "Bitcoin only.".to_owned(),
-                    ];
-                    let mut y = client.top() + 52.0;
-                    for line in lines {
-                        let galley = p.layout(
-                            line,
-                            ui_font(12.0),
-                            Color32::BLACK,
-                            client.right() - x - 16.0,
-                        );
-                        let h = galley.size().y;
-                        p.galley(pos2(x, y), galley, Color32::BLACK);
-                        y += h + 3.0;
-                    }
-                    let ok = Rect::from_min_size(
-                        pos2(client.right() - 90.0, client.bottom() - 36.0),
-                        vec2(75.0, 23.0),
-                    );
-                    if dialog_button(ui, ok, "OK", true) || closed {
-                        state.dialog = Dialog::None;
-                    }
-                });
+                    let h = galley.size().y;
+                    p.galley(pos2(x, y), galley, Color32::BLACK);
+                    y += h + 3.0;
+                }
+                let ok = Rect::from_min_size(
+                    pos2(client.right() - 90.0, client.bottom() - 36.0),
+                    vec2(75.0, 23.0),
+                );
+                if dialog_button(ui, ok, "OK", true) || closed {
+                    state.dialog = Dialog::None;
+                }
+            });
         }
         Dialog::TurnOff => {
             // The screen fades to gray behind the question, as XP's did.
             let screen = ctx.content_rect();
-            egui::Area::new(Id::new("xp-fade"))
-                .order(Order::Foreground)
-                .fixed_pos(screen.min)
-                .show(ctx, |ui| {
-                    let resp = ui.allocate_rect(screen, Sense::click());
-                    ui.painter()
-                        .rect_filled(screen, 0, Color32::from_black_alpha(110));
-                    if resp.clicked() {
-                        state.dialog = Dialog::None;
-                    }
-                });
+            popup(ctx, "xp-fade", screen.min, Order::Foreground, &mut |ui| {
+                let resp = ui.allocate_rect(screen, Sense::click());
+                ui.painter()
+                    .rect_filled(screen, 0, Color32::from_black_alpha(110));
+                if resp.clicked() {
+                    state.dialog = Dialog::None;
+                }
+            });
             let size = vec2(312.0, 200.0);
             let rect = Rect::from_center_size(desk.center(), size);
-            egui::Area::new(Id::new("xp-turn-off"))
-                .order(Order::Tooltip)
-                .fixed_pos(rect.min)
-                .show(ctx, |ui| {
-                    let (rect, _) = ui.allocate_exact_size(size, Sense::click());
-                    pick = turn_off(ui, rect, state, c);
-                });
+            popup(ctx, "xp-turn-off", rect.min, Order::Tooltip, &mut |ui| {
+                let (rect, _) = ui.allocate_exact_size(size, Sense::click());
+                pick = turn_off(ui, rect, state, c);
+            });
         }
     }
     pick
@@ -2707,37 +2801,49 @@ fn radio_face(p: &Painter, c: Pos2, on: bool, hot: bool, enabled: bool) {
 }
 
 /// A row of radio buttons: XP's way of choosing one of a few.
+#[inline]
 pub fn radios<T: Copy + PartialEq>(ui: &mut Ui, value: &mut T, options: &[(T, &str)]) -> bool {
-    let mut changed = false;
+    let labels: Vec<&str> = options.iter().map(|(_, label)| *label).collect();
+    let current = options.iter().position(|(option, _)| option == value);
+    match radio_row(ui, current, &labels) {
+        Some(i) => {
+            *value = options[i].0;
+            true
+        }
+        None => false,
+    }
+}
+
+/// [`radios`] without the type: placed by hand, left to right, even
+/// inside a right-to-left row. Returns the option newly chosen.
+fn radio_row(ui: &mut Ui, current: Option<usize>, labels: &[&str]) -> Option<usize> {
+    let mut chosen = None;
     let enabled = ui.is_enabled();
-    let galleys: Vec<_> = options
+    let galleys: Vec<_> = labels
         .iter()
-        .map(|(_, label)| {
+        .map(|label| {
             ui.painter()
-                .layout_no_wrap((*label).to_owned(), ui_font(13.0), Color32::BLACK)
+                .layout_no_wrap((*label).to_owned(), ui_font(13.0), Color32::PLACEHOLDER)
         })
         .collect();
-    // Placed by hand, left to right, even inside a right-to-left row.
     let gap = 16.0;
-    let widths: Vec<f32> = galleys.iter().map(|g| 19.0 + g.size().x).collect();
-    let total = widths.iter().sum::<f32>() + gap * options.len().saturating_sub(1) as f32;
+    let total = galleys.iter().map(|g| 19.0 + g.size().x).sum::<f32>()
+        + gap * labels.len().saturating_sub(1) as f32;
     let base = ui.next_auto_id();
     let (row, _) = ui.allocate_exact_size(vec2(total, 22.0), Sense::hover());
     let mut x = row.left();
-    for (i, ((option, _), (galley, w))) in options
-        .iter()
-        .zip(galleys.into_iter().zip(widths))
-        .enumerate()
-    {
-        let rect = Rect::from_min_size(pos2(x, row.top()), vec2(w, row.height()));
-        x += w + gap;
+    for (i, galley) in galleys.into_iter().enumerate() {
+        let rect = Rect::from_min_size(
+            pos2(x, row.top()),
+            vec2(19.0 + galley.size().x, row.height()),
+        );
+        x = rect.right() + gap;
         let resp = ui
             .interact(rect, base.with(i), Sense::click())
             .on_hover_cursor(CursorIcon::PointingHand);
-        let on = *option == *value;
+        let on = current == Some(i);
         if resp.clicked() && !on {
-            *value = *option;
-            changed = true;
+            chosen = Some(i);
         }
         let p = ui.painter();
         radio_face(
@@ -2758,7 +2864,7 @@ pub fn radios<T: Copy + PartialEq>(ui: &mut Ui, value: &mut T, options: &[(T, &s
             dotted(p, text_rect.expand(1.0));
         }
     }
-    changed
+    chosen
 }
 
 /// A check box: a white square, a navy edge, a green tick.
