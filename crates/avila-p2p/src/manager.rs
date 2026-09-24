@@ -4333,6 +4333,56 @@ mod tests {
         assert_eq!(mgr.len(), 0, "no peer may land through a dead proxy");
     }
 
+    /// Self-eclipse field test (queue #22): the lab attack — every
+    /// outbound slot held by a coordinated attacker, all in one /16,
+    /// all claiming a higher chain, our tip stale. The detector must
+    /// fire TipStale AND DiversityCollapse — the indicators catching
+    /// exactly the condition they exist for.
+    #[test]
+    fn self_eclipse_field_test() {
+        let mut mgr = PeerManager::new(8);
+        let mut cs = regtest();
+        let mut ends = Vec::new();
+        // Four attacker peers, one /16 (203.0.113.0/16), all outbound.
+        for i in 0..4u8 {
+            let (us_end, peer_end) = testpipe::pair();
+            let session = PeerSession::initiate(
+                us_end,
+                MAGIC,
+                build_version(9, 0, NetAddr::unspecified(), i64::from(NOW)),
+                BUDGET,
+            )
+            .expect("session");
+            let remote = crate::addrman::net_addr_of(
+                format!("203.0.113.{i}:8333").parse().unwrap(),
+                0,
+            );
+            let id = mgr.add_outbound_to(session, remote).expect("slot");
+            ends.push((peer_end, id));
+        }
+        // Attackers complete the handshake, all claiming height 99999.
+        for (end, _) in &mut ends {
+            testpipe::inject(end, MAGIC, &Message::Version(peer_version(99999)));
+            testpipe::inject(end, MAGIC, &Message::Verack);
+        }
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        assert_eq!(mgr.len(), 4, "attackers hold all outbound slots");
+        let signals = mgr.eclipse_signals(&cs, NOW);
+        assert!(
+            signals.contains(&EclipseSignal::TipStale),
+            "stale tip + all peers claiming higher must fire TipStale: {signals:?}"
+        );
+        assert!(
+            signals.contains(&EclipseSignal::DiversityCollapse),
+            "one /16 holding all outbound slots must fire DiversityCollapse: {signals:?}"
+        );
+        assert!(
+            !signals.contains(&EclipseSignal::AllInbound),
+            "outbound attackers are not AllInbound"
+        );
+    }
+
     /// Eclipse detector (queue #12): four inbound-only established
     /// peers trips `AllInbound`; a healthy mixed set stays quiet.
     #[test]
