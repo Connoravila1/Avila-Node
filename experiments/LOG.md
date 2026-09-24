@@ -112,3 +112,32 @@ first measurement that would kill or confirm it.
    tuning on realistic pool diffs, multi-peer round overlap, and
    external interop (nobody else speaks BIP-330 — Knots if they ship
    it).
+
+5. **Per-block verification receipts.** Extend the transparency ledger
+   to per-block machine-checkable records: flags active, sighash modes,
+   script counts, UTXO state-hash before/after, wall time. Exportable
+   and independently replayable. Audits the node; never substitutes
+   for verifying it.
+
+6. **Proof-carrying blocks (utreexo consumption).** Blocks carrying
+   their own accumulator proofs validate against a ~1KB stump — no
+   UTXO set needed. Parallel proof-verify / sequential apply; node can
+   also serve proofs. Purist gate: needs self-bridge or conventional
+   fallback — a bridge can starve, never forge.
+
+7. **Stem-phase tx relay on top of recon.** Recon rounds are already
+   the epidemic "fluff"; add a private stem path for N hops before the
+   tx joins the reconciliation pool. Honest limits: propagation
+   latency, known Dandelion deanonymization attacks.
+
+8. **Shadow-ruleset observatory.** Read-only evaluation of every block
+   under alternate rulesets (Knots policy, proposed softforks) — a
+   continuous consensus-drift monitor. Must never gate acceptance.
+
+9. **Dual-engine lockstep mode.** Two independent validation paths,
+   divergence halts with alarm. Note: bitcoinkernel shares Core's code
+   (common-mode bugs survive); true independence needs a second
+   implementation lineage.
+
+10. **Multi-route sync.** Disjoint transports cross-checking headers —
+    eclipse detection by construction.
