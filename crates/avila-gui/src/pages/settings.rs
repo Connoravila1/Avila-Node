@@ -140,9 +140,9 @@ fn appearance(ui: &mut Ui, s: &Scene, prefs: &mut Prefs) {
             ui,
             &mut prefs.theme,
             &[
-                (ThemeChoice::System, "Match the system"),
                 (ThemeChoice::Light, "Light"),
                 (ThemeChoice::Dark, "Dark"),
+                (ThemeChoice::System, "Match the system"),
             ],
         );
         ui.end_row();

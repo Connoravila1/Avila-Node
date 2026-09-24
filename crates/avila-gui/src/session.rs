@@ -190,6 +190,8 @@ pub struct Session {
     rx: Option<Receiver<Msg>>,
     cancel: Option<Arc<AtomicBool>>,
     sim: Option<Demo>,
+    /// When the simulator last stepped, session seconds.
+    sim_stepped: Option<f64>,
     origin: Instant,
     /// Session time each height was first seen as the tip.
     tip_seen: HashMap<u32, f64>,
@@ -214,6 +216,7 @@ impl Session {
             rx: None,
             cancel: None,
             sim: None,
+            sim_stepped: None,
             origin: Instant::now(),
             tip_seen: HashMap::new(),
             known_peers: HashMap::new(),
@@ -309,6 +312,8 @@ impl Session {
                 .ok()
                 .map(|mib| mib.saturating_mul(1024 * 1024)),
             v2transport: true,
+            // The overview draws the block this mempool would build next.
+            preview_next_block: true,
             ..SyncConfig::default()
         };
         let (tx, rx) = channel();
@@ -352,6 +357,12 @@ impl Session {
     pub fn poll(&mut self) -> bool {
         let now = self.now();
         if let Some(sim) = &self.sim {
+            // Ten steps a second is all the simulation needs, however
+            // fast the window happens to be repainting.
+            if self.sim_stepped.is_some_and(|at| now - at < 0.1) {
+                return false;
+            }
+            self.sim_stepped = Some(now);
             let view = sim.view_at(now);
             self.apply(view, now);
             return true;
@@ -419,6 +430,12 @@ impl Session {
         }
         if let Some((h, _)) = view.recent.last() {
             self.tip_seen.entry(*h).or_insert(t);
+            // A sync sees hundreds of thousands of tips; only the recent
+            // ones are ever shown.
+            if self.tip_seen.len() > 512 {
+                let keep = h.saturating_sub(256);
+                self.tip_seen.retain(|height, _| *height >= keep);
+            }
         }
         if self.history.back().is_none_or(|s| t - s.t >= 1.0) {
             self.history.push_back(Sample {
@@ -658,7 +675,11 @@ pub fn agent_name(agent: &str) -> String {
     if trimmed.is_empty() {
         return "unknown software".into();
     }
-    trimmed.replace(':', " ").replace('/', " · ")
+    let name = trimmed.replace(':', " ").replace('/', " · ");
+    match name.char_indices().nth(48) {
+        Some((cut, _)) => format!("{}…", &name[..cut]),
+        None => name,
+    }
 }
 
 #[cfg(test)]

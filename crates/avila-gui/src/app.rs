@@ -1,5 +1,6 @@
 //! The window: the brand rail, the status line, and the current page.
 
+use crate::bench::Bench;
 use crate::capture::Capture;
 use crate::constellation::Constellation;
 use crate::pages::{self, Action, Scene};
@@ -26,6 +27,7 @@ pub struct App {
     filter: Option<ActivityKind>,
     swirl: Option<TextureHandle>,
     capture: Option<Capture>,
+    bench: Option<Bench>,
     autostart: bool,
     /// The peer whose panel is open on the Peers page.
     selected_peer: Option<u64>,
@@ -66,12 +68,21 @@ impl App {
         Self {
             node,
             session,
-            page: Page::Overview,
+            // `AVILA_GUI_PAGE=peers` opens on that page (for development).
+            page: std::env::var("AVILA_GUI_PAGE")
+                .ok()
+                .and_then(|want| {
+                    Page::ALL
+                        .into_iter()
+                        .find(|p| p.label().eq_ignore_ascii_case(&want))
+                })
+                .unwrap_or_default(),
             run,
             prefs,
             filter: None,
             swirl: brand::swirl_texture(ctx),
             capture: Capture::from_env(),
+            bench: Bench::from_env(),
             autostart,
             selected_peer: None,
             sky: Constellation::default(),
@@ -192,12 +203,19 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if std::mem::take(&mut self.autostart) {
             self.start();
         }
         self.session.poll();
+        if let Some(page) = self
+            .bench
+            .as_mut()
+            .and_then(|b| b.drive(&ctx, frame.info().cpu_usage))
+        {
+            self.page = page;
+        }
         let mut pose_scroll = None;
         if let Some(pose) = self.capture.as_mut().and_then(|c| c.drive(&ctx)) {
             pose_scroll = Some(pose.scroll);
@@ -318,16 +336,20 @@ impl eframe::App for App {
         }
         // Smooth frames only while the new-block pulse runs; otherwise
         // just often enough for "seconds ago" to tick over.
-        let pulsing = Scene {
-            pal,
-            session: &self.session,
-            network,
-            swirl: None,
-        }
-        .pulse()
-        .is_some();
+        // Only the pages that draw the new-block pulse animate for it.
+        let shows_pulse = matches!(self.page, Page::Overview | Page::Chain | Page::Peers);
+        let pulsing = shows_pulse
+            && Scene {
+                pal,
+                session: &self.session,
+                network,
+                swirl: None,
+            }
+            .pulse()
+            .is_some();
         let settling = self.page == Page::Peers && self.sky.animating();
-        if self.capture.is_some() || pulsing || settling {
+        let benching = self.bench.as_ref().is_some_and(Bench::forcing);
+        if self.capture.is_some() || pulsing || settling || benching {
             ctx.request_repaint();
         } else if self.session.running() {
             ctx.request_repaint_after(Duration::from_millis(250));

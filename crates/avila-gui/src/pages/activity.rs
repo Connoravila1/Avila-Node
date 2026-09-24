@@ -3,9 +3,12 @@
 
 use super::{Action, Scene, start_offer};
 use crate::session::{Activity, ActivityKind};
-use crate::theme::{self, font, mono};
+use crate::theme::{self, body, font, mono};
 use crate::widgets;
-use eframe::egui::{Align, Layout, RichText, Ui, vec2};
+use eframe::egui::{
+    Align, Align2, CursorIcon, Layout, Rect, RichText, Sense, Stroke, Ui, pos2, text::TextWrapping,
+    vec2,
+};
 
 /// Rows drawn at most; the log itself keeps more.
 const SHOWN: usize = 300;
@@ -36,55 +39,76 @@ pub fn show(ui: &mut Ui, s: &Scene, filter: &mut Option<ActivityKind>) -> Option
         widgets::empty(ui, "Nothing yet", body);
         return filter.is_none().then(|| start_offer(ui, s)).flatten();
     }
-    for a in rows {
-        row(ui, s, a);
+    for (i, a) in rows.into_iter().enumerate() {
+        row(ui, s, a, i);
     }
     None
 }
 
-fn row(ui: &mut Ui, s: &Scene, a: &Activity) {
+/// One entry, painted into a fixed-height row — and only when it's on
+/// screen, so a long log costs nothing to scroll past.
+fn row(ui: &mut Ui, s: &Scene, a: &Activity, index: usize) {
     let pal = s.pal;
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        fixed(ui, 84.0, |ui| {
-            ui.label(RichText::new(&a.clock).font(mono(12.0)).color(pal.faint));
-        });
-        fixed(ui, 108.0, |ui| {
-            // Orange means proven here, so only verification wears it.
-            let color = if a.kind == ActivityKind::Verification {
-                pal.signal_text
-            } else {
-                pal.muted
-            };
-            ui.label(
-                RichText::new(a.kind.label())
-                    .font(font(theme::MEDIUM, 12.5))
-                    .color(color),
-            );
-        });
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 3.0;
-            ui.label(RichText::new(&a.text).size(14.0).color(pal.text));
-            if let Some(d) = &a.detail {
-                if is_hash(d) {
-                    let keep = (ui.available_width() < 560.0).then_some(16);
-                    widgets::hash_label(ui, d, 12.0, keep);
-                } else {
-                    ui.label(RichText::new(d).font(mono(12.0)).color(pal.muted));
-                }
+    let height = if a.detail.is_some() { 56.0 } else { 38.0 };
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let p = ui.painter();
+    let top = rect.top() + 9.0;
+    p.text(
+        pos2(rect.left(), top + 1.0),
+        Align2::LEFT_TOP,
+        &a.clock,
+        mono(12.0),
+        pal.faint,
+    );
+    // Orange means proven here, so only verification wears it.
+    let kind = if a.kind == ActivityKind::Verification {
+        pal.signal_text
+    } else {
+        pal.muted
+    };
+    p.text(
+        pos2(rect.left() + 84.0, top + 1.0),
+        Align2::LEFT_TOP,
+        a.kind.label(),
+        font(theme::MEDIUM, 12.5),
+        kind,
+    );
+    let x = rect.left() + 192.0;
+    let w = (rect.right() - x).max(40.0);
+    let text = widgets::fit(p, a.text.clone(), body(14.0), pal.text, w);
+    let elided = text.elided;
+    p.galley(pos2(x, top), text, pal.text);
+    if let Some(d) = &a.detail {
+        let at = pos2(x, top + 23.0);
+        if is_hash(d) {
+            let mut job = widgets::hash_job(d, 12.0, &pal, None);
+            job.wrap = TextWrapping::truncate_at_width(w);
+            let galley = p.layout_job(job);
+            let r = Rect::from_min_size(at, galley.size());
+            p.galley(at, galley, pal.muted);
+            let copy = ui
+                .interact(r, ui.id().with(("hash", index)), Sense::click())
+                .on_hover_cursor(CursorIcon::Copy)
+                .on_hover_text("Copy the full hash");
+            if copy.clicked() {
+                ui.ctx().copy_text(d.clone());
             }
-        });
-    });
-    ui.add_space(6.0);
-    widgets::hairline(ui);
-    ui.add_space(6.0);
-}
-
-fn fixed(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui)) {
-    ui.allocate_ui_with_layout(vec2(width, 20.0), Layout::top_down(Align::Min), |ui| {
-        ui.set_width(width);
-        add(ui);
-    });
+        } else {
+            let galley = widgets::fit(p, d.clone(), mono(12.0), pal.muted, w);
+            ui.painter().galley(at, galley, pal.muted);
+        }
+    }
+    ui.painter().hline(
+        rect.x_range(),
+        rect.bottom() - 0.5,
+        Stroke::new(1.0, pal.hairline),
+    );
+    if elided {
+        resp.on_hover_text(&a.text);
+    }
 }
 
 fn is_hash(s: &str) -> bool {

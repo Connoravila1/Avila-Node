@@ -42,6 +42,10 @@ struct Star {
     angle: f32,
     radius: f32,
     look: Look,
+    /// Easing toward a real move (arrival, reordering); otherwise the
+    /// star rests and follows small drifts — a ping wobbling by a few
+    /// percent — without animating.
+    easing: bool,
 }
 
 struct Ghost {
@@ -181,13 +185,27 @@ impl Constellation {
                 angle,
                 radius: 0.0,
                 look: look.clone(),
+                easing: true,
             });
             let da = turn(star.angle, angle);
             let dr = radius - star.radius;
-            star.angle += da * k;
-            star.radius += dr * k;
             star.look = look;
-            moving |= da.abs() > 0.002 || dr.abs() > 0.3;
+            let small = da.abs() < 0.02 && dr.abs() < 3.0;
+            // Loose enough that a star easing after a drifting target
+            // still arrives (the drift keeps it ~1 px behind).
+            let arrived = da.abs() < 0.006 && dr.abs() < 1.5;
+            if (star.easing && arrived) || (!star.easing && small) {
+                // At rest: follow the target outright. No repaint needed;
+                // the next routine frame shows it.
+                star.angle = angle;
+                star.radius = radius;
+                star.easing = false;
+            } else {
+                star.easing = true;
+                star.angle += da * k;
+                star.radius += dr * k;
+                moving = true;
+            }
         }
         let gone: Vec<u64> = self
             .stars

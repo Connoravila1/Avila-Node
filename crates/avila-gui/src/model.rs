@@ -99,7 +99,7 @@ impl From<&SyncProgress> for NodeView {
                     addr: s.remote.map(|a| a.to_string()),
                     inbound: s.inbound,
                     established: s.established,
-                    agent: s.user_agent.clone(),
+                    agent: s.user_agent.as_deref().map(clean_agent),
                     their_height: s.start_height,
                     v2: s.transport_protocol == "v2",
                     recon: s.recon,
@@ -137,8 +137,26 @@ impl From<&SyncProgress> for NodeView {
                 }),
                 verified_fraction: v.verified_fraction,
             },
-            curve: ChainCurve::default(),
-            next_block: None,
+            curve: ChainCurve::new(
+                p.profile
+                    .samples
+                    .iter()
+                    .chain(p.profile.tip.iter())
+                    .map(|s| CurvePoint {
+                        height: s.height,
+                        work: s.work,
+                        time: s.time,
+                    })
+                    .collect(),
+            ),
+            next_block: p.next_block.as_deref().map(|b| NextBlockView {
+                height: b.height,
+                tx_count: b.tx_count,
+                weight: b.weight,
+                fees: b.fees,
+                subsidy: b.subsidy,
+                steps: b.steps.as_slice().into(),
+            }),
         }
     }
 }
@@ -278,6 +296,19 @@ impl Traffic {
     pub fn total_sent(&self) -> u64 {
         self.sent.iter().sum()
     }
+}
+
+/// A peer's user agent as it may be shown: Core's `SanitizeString`
+/// (`SAFE_CHARS_DEFAULT`) over at most `MAX_SUBVERSION_LENGTH` bytes. The
+/// string is whatever the peer chose to send — megabytes, control
+/// characters, direction overrides — so nothing else reaches the screen.
+#[must_use]
+pub fn clean_agent(raw: &str) -> String {
+    const SAFE: &str = " .,;-_/:?@()";
+    raw.chars()
+        .take(256)
+        .filter(|c| c.is_ascii_alphanumeric() || SAFE.contains(*c))
+        .collect()
 }
 
 /// Service bits worth naming, in the order they're shown.
@@ -681,6 +712,16 @@ mod tests {
             services(1 | 8 | 2048),
             vec!["Full blocks", "Segwit", "v2 transport"]
         );
+    }
+
+    #[test]
+    fn peer_agents_are_cleaned_before_display() {
+        assert_eq!(clean_agent("/Satoshi:29.0.0/"), "/Satoshi:29.0.0/");
+        assert_eq!(
+            clean_agent("/Satoshi:29.0.0/\n\nUpdate now at evil\u{202e}moc.example"),
+            "/Satoshi:29.0.0/Update now at evilmoc.example"
+        );
+        assert_eq!(clean_agent(&"A".repeat(4_000_000)).len(), 256);
     }
 
     #[test]

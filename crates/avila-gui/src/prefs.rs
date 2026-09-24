@@ -5,16 +5,19 @@ use clap::ValueEnum;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
-const KEY: &str = "appearance";
+const KEY: &str = "appearance.v2";
+/// Where the first release kept it — when following the system was the
+/// default rather than light.
+const KEY_V1: &str = "appearance";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeChoice {
-    /// Follow the operating system.
     #[default]
-    System,
     Light,
     Dark,
+    /// Follow the operating system.
+    System,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -30,7 +33,7 @@ pub struct Prefs {
 impl Default for Prefs {
     fn default() -> Self {
         Self {
-            theme: ThemeChoice::System,
+            theme: ThemeChoice::Light,
             size: 1.0,
             scale: Scale::Blocks,
         }
@@ -43,9 +46,22 @@ impl Prefs {
 
     #[must_use]
     pub fn load(storage: Option<&dyn eframe::Storage>) -> Self {
-        storage
-            .and_then(|s| eframe::get_value::<Self>(s, KEY))
-            .map(Self::normalized)
+        let Some(storage) = storage else {
+            return Self::default();
+        };
+        if let Some(prefs) = eframe::get_value::<Self>(storage, KEY) {
+            return prefs.normalized();
+        }
+        // Carried over from the first release, where "match the system"
+        // was saved for anyone who never chose; light is the default now.
+        eframe::get_value::<Self>(storage, KEY_V1)
+            .map(|old| Self {
+                theme: match old.theme {
+                    ThemeChoice::System => ThemeChoice::Light,
+                    chosen => chosen,
+                },
+                ..old.normalized()
+            })
             .unwrap_or_default()
     }
 
@@ -116,13 +132,33 @@ mod tests {
         );
         assert_eq!(storage.0.len(), 1);
         assert_eq!(Prefs::load(None), Prefs::default());
-        // Prefs saved before the ribbon had a scale still load.
+        storage.0.insert(KEY.into(), "not ron".into());
+        assert_eq!(Prefs::load(Some(&storage)), Prefs::default());
+    }
+
+    #[test]
+    fn first_release_prefs_carry_over_with_light_as_the_default() {
+        let mut storage = Storage::default();
+        assert_eq!(Prefs::load(Some(&storage)).theme, ThemeChoice::Light);
+        // Saved by the first release, before the ribbon had a scale: the
+        // untouched default ("system") becomes light; a real choice stays.
         storage
             .0
-            .insert(KEY.into(), "(theme:light,size:1.0)".into());
-        assert_eq!(Prefs::load(Some(&storage)).scale, Scale::Blocks);
-        assert_eq!(Prefs::load(Some(&storage)).theme, ThemeChoice::Light);
-        storage.0.insert(KEY.into(), "not json".into());
-        assert_eq!(Prefs::load(Some(&storage)), Prefs::default());
+            .insert(KEY_V1.into(), "(theme:system,size:1.15)".into());
+        let carried = Prefs::load(Some(&storage));
+        assert_eq!(carried.theme, ThemeChoice::Light);
+        assert_eq!(carried.size, 1.15);
+        assert_eq!(carried.scale, Scale::Blocks);
+        storage
+            .0
+            .insert(KEY_V1.into(), "(theme:dark,size:1.0)".into());
+        assert_eq!(Prefs::load(Some(&storage)).theme, ThemeChoice::Dark);
+        // Once saved under the new key, an explicit "system" sticks.
+        Prefs {
+            theme: ThemeChoice::System,
+            ..Prefs::default()
+        }
+        .save(&mut storage);
+        assert_eq!(Prefs::load(Some(&storage)).theme, ThemeChoice::System);
     }
 }
