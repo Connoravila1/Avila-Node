@@ -10519,8 +10519,19 @@ pub(crate) fn dispatch(
             }
         }
         "generatetoaddress" => {
-            let Some(nblocks) = param(params, 0, "nblocks").and_then(Value::as_u64) else {
+            // Core's `getInt<int>` — same i32-range check as
+            // generatetodescriptor below. `nblocks` must be bounded
+            // before it ever sizes anything: this used to feed
+            // `Vec::with_capacity` unbounded, so a huge value aborted
+            // the process instead of erroring.
+            let Some(nblocks) = param(params, 0, "nblocks").and_then(Value::as_i64) else {
                 return missing_params("nblocks address");
+            };
+            let Some(nblocks) = i32::try_from(nblocks).ok() else {
+                return (
+                    Value::Null,
+                    Some((RPC_MISC_ERROR, "JSON integer out of range".into())),
+                );
             };
             let Some(address) = param(params, 1, "address")
                 .and_then(Value::as_str)
@@ -10541,8 +10552,10 @@ pub(crate) fn dispatch(
                     ));
                 };
                 let now = crate::time::time() as u32;
-                let mut hashes = Vec::with_capacity(nblocks as usize);
-                for _ in 0..nblocks {
+                // Never pre-allocate from the user-supplied count —
+                // grow as blocks are actually mined.
+                let mut hashes = Vec::new();
+                for _ in 0..nblocks.max(0) {
                     let template = mgr
                         .mempool_ref()
                         .build_template(cs, script.clone(), now)
@@ -13599,6 +13612,22 @@ mod tests {
             None,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
+
+        // A `nblocks` outside i32 must error, not size an allocation —
+        // it used to reach `Vec::with_capacity(nblocks as usize)`
+        // straight from this value and abort the process.
+        let (r, e) = dispatch(
+            "generatetoaddress",
+            &json!([9_999_999_999_i64, addr]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(r.is_null());
+        assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
         // generateblock: coinbase-only block pays a descriptor.
         let (r, e) = dispatch(
