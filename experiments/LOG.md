@@ -200,6 +200,38 @@ first measurement that would kill or confirm it.
     bucket peers by ASN (Kartograf-reproducible maps) instead of /16.
     A parity gap; well-specified, bounded.
 
+29. **First-class watch-only wallet.** Descriptor/xpub import, balance
+    and history, no keys on the node, answers through the Electrum
+    server already shipped. Five+ separate projects (bwt, EPS,
+    xpub-watcher, Fully Noded, eps-plugin) exist solely because this
+    is clunky on Core. One binary replaces the wallet-backend stack.
+
+30. **Broadcast pool.** Own-broadcast txs protected from mempool
+    eviction, rebroadcast until confirmed, optional future-dated
+    broadcast. Filed as Core issue #30471 — real wallet-dev demand:
+    txs silently vanish during fee spikes today.
+
+31. **SwiftSync-style write-elision IBD.** Hash aggregate (all outputs
+    minus all inputs = UTXO set) + untrusted hints file marking
+    survivors; coins that die young never hit disk. Core is landing
+    this now (PR #34004); our advice machinery fits it exactly.
+    First measurement: what fraction of fixture coins die within the
+    sync window.
+
+32. **Built-in mempool analytics.** The mempool.space layer native:
+    mempool-block fee forecast, tx lifecycle/RBF tracking, pinning
+    surface (compounds with #16). People stand up docker+mysql+electrs
+    for this today.
+
+33. **Named observability surface.** Package existing per-peer
+    claims-vs-served, timing, recon state as the documented
+    event-stream API — literally Core issue #34901 ("block processing
+    is a black box"), which we already satisfy.
+
+34. **Evidence server.** Compact filters (shipped) + PoW fraud proofs
+    + artifact bundles served to the operator's own light clients —
+    your phone trusts your node.
+
 22. **Self-eclipse field test.** Build the attack: attacker nodes that
     monopolize all our outbound slots in a lab topology. Hypothesis:
     detection signals (header stall, peer homogeneity, route
