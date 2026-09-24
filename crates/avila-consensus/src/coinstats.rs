@@ -60,7 +60,12 @@ fn bogo_size(script_len: usize) -> u64 {
 
 /// Core's `TxOutSer` (v29): `outpoint` ‖ `uint32(height << 1 |
 /// coinbase)` ‖ `CTxOut` — the bytes both hash algorithms consume.
-fn tx_out_ser(out: &mut Vec<u8>, outpoint: &OutPoint, coin: &Coin) {
+///
+/// `pub(crate)` so callers that must stream the hash instead of
+/// materializing the whole set (e.g. `Chainstate::activate_snapshot`,
+/// which would otherwise hold tens of GB of coins at mainnet size) can
+/// feed the same bytes into their own incremental hasher.
+pub(crate) fn tx_out_ser(out: &mut Vec<u8>, outpoint: &OutPoint, coin: &Coin) {
     out.extend_from_slice(outpoint.txid.as_bytes());
     out.extend_from_slice(&outpoint.vout.to_le_bytes());
     let height_coinbase = (coin.height << 1) | u32::from(coin.coinbase);

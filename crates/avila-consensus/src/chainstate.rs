@@ -1186,12 +1186,27 @@ impl Chainstate {
         // Backend mode: stream the coins through the dirty map in
         // bounded batches — a single commit of a full mainnet snapshot
         // (~166M entries) would balloon the write transaction.
+        //
+        // `hash_serialized_3` is folded into the same streaming pass
+        // instead of a later `coinstats::compute(&loaded, ..)` —
+        // `compute` collects every coin into a `Vec` to sort it into
+        // cursor order first, which at mainnet size (~170M coins) is
+        // tens of GB just for that scratch copy. The snapshot file is
+        // already in Core's cursor order (it was itself produced by
+        // walking that same cursor), so each coin can be fed straight
+        // into an incremental hasher as it's read, with no sort and no
+        // second copy of the set.
         let mut since_flush = 0u32;
         let mut flush_err: Option<std::io::Error> = None;
+        let mut sha = crate::hash::Sha256d::new();
+        let mut ser_buf = Vec::new();
         crate::utxo_snapshot::read_coins(r, meta.coins_count, base_height, |outpoint, coin| {
             if flush_err.is_some() {
                 return;
             }
+            ser_buf.clear();
+            crate::coinstats::tx_out_ser(&mut ser_buf, &outpoint, &coin);
+            sha.update(&ser_buf);
             loaded.insert_synthetic(outpoint, coin);
             since_flush += 1;
             if since_flush >= 2_000_000 && loaded.has_backend() {
@@ -1212,16 +1227,7 @@ impl Chainstate {
 
         // `AssumeutxoHash` — hash_serialized_3 of the loaded set must
         // match the chainparams value.
-        let stats = crate::coinstats::compute(
-            &loaded,
-            i64::from(base_height),
-            base,
-            crate::coinstats::CoinStatsHashType::HashSerialized,
-        );
-        let got = stats
-            .hash_serialized
-            .map(|h| crate::hash::format_display_hex(h.as_bytes()))
-            .unwrap_or_default();
+        let got = crate::hash::format_display_hex(&sha.finalize());
         if got != au_by_height.hash_serialized {
             return Err(SnapshotError(format!(
                 "Bad snapshot content hash: expected {}, got {got}",
