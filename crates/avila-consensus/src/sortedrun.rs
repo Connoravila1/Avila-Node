@@ -80,8 +80,17 @@ impl RunBuilder {
     /// bug worth failing loudly on.
     pub fn push(&mut self, op: &OutPoint, coin: &Coin) -> io::Result<()> {
         let key = crate::utxo_snapshot::outpoint_key(op);
-        if let Some(prev) = self.last_key {
-            debug_assert!(key > prev, "sorted-run keys must ascend");
+        if let Some(prev) = self.last_key
+            && key <= prev
+        {
+            // A no-op in release builds (no debug-assertions in this
+            // profile) is not a check — this invariant guards a binary
+            // search other code trusts blindly, so a violation must be
+            // a real, always-on error.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sorted-run keys must ascend",
+            ));
         }
         if self.count.is_multiple_of(u64::from(self.stride)) {
             self.sparse.push((key, self.pos));
@@ -100,8 +109,14 @@ impl RunBuilder {
     /// snapshot bulk-load path copies wire bytes verbatim (the wire
     /// encoding IS `CoinFormat::Compact`), skipping decode+re-encode.
     pub fn push_wire(&mut self, key: &[u8; 36], body: &[u8]) -> io::Result<()> {
-        if let Some(prev) = self.last_key {
-            debug_assert!(*key > prev, "sorted-run keys must ascend");
+        if let Some(prev) = self.last_key
+            && *key <= prev
+        {
+            // See `push`: this must not compile away in release.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sorted-run keys must ascend",
+            ));
         }
         if self.count.is_multiple_of(u64::from(self.stride)) {
             self.sparse.push((*key, self.pos));
@@ -465,6 +480,23 @@ mod tests {
         assert_eq!(run.get(&high).expect("vout 256").out.value, 222);
         assert_eq!(run.get(&op(49, 0)).expect("filler before").out.value, 49);
         assert_eq!(run.get(&op(51, 0)).expect("filler after").out.value, 51);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A genuinely descending push (vout 256 then vout 1) must be
+    /// rejected with a real error in every build profile — the
+    /// invariant used to be a `debug_assert!`, a no-op once
+    /// debug-assertions are off (release).
+    #[test]
+    fn descending_vout_past_256_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("srun-vout256-desc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("base.run");
+        let txid = op(0, 0).txid;
+        let mut b = RunBuilder::create_with_stride(&path, 4).unwrap();
+        b.push(&OutPoint { txid, vout: 256 }, &coin(1)).unwrap();
+        assert!(b.push(&OutPoint { txid, vout: 1 }, &coin(2)).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
