@@ -206,7 +206,7 @@ impl SortedRun {
         // Read enough bytes for `stride` records (~40KB typical).
         let cap = (u64::from(self.stride) * 84).min(off_hi.saturating_sub(off_lo)).max(84);
         let mut buf = vec![0u8; cap as usize];
-        let mut f = self.f.lock().ok()?;
+        let f = self.f.lock().ok()?;
         if f.read_exact_at(&mut buf, off_lo).is_err() {
             return None;
         }
@@ -280,7 +280,7 @@ impl SnapshotRun {
         // bound: stride * max compressed coin (~75B) + group margin.
         let cap = 1 << 17; // 128KB covers ~256 groups of typical coins
         let mut buf = vec![0u8; cap];
-        let mut f = self.f.lock().ok()?;
+        let f = self.f.lock().ok()?;
         // The sparse offset points at a vout varint mid-group; the key
         // may sit anywhere in the following `stride` records. Walk
         // record-by-record: vout compact-size + wire body.
