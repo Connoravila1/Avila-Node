@@ -666,6 +666,13 @@ impl V2Channel {
         self.cipher.encrypt_packet(&contents, &[], false)
     }
 
+    /// Queue a decoy packet — `len` junk bytes under the IGNORE bit.
+    /// Spec-legal on any v2 link (receivers drop silently); used to
+    /// fuzz the wire's length histogram against traffic analysis.
+    pub fn encode_decoy(&mut self, len: usize) -> Vec<u8> {
+        self.cipher.encrypt_packet(&vec![0u8; len], &[], true)
+    }
+
     /// Feed raw socket bytes; returns complete `(command, payload)`
     /// messages (decoy packets drop silently; the handshake tail —
     /// peer garbage + terminator + version packet — is consumed
@@ -916,6 +923,39 @@ mod tests {
             .feed(&packet[..LENGTH_LEN])
             .expect_err("a contents length past MAX_CONTENTS_LEN must be rejected");
         assert_eq!(err, "packet contents too large");
+    }
+
+    /// Decoy packets interleave with real traffic and drop silently —
+    /// the padding mechanism behind the session's decoy injection.
+    #[test]
+    fn decoys_interleave_silently() {
+        use std::io::{Read, Write};
+
+        const MAGIC: [u8; 4] = [0xfa, 0xbf, 0xb5, 0xda];
+
+        let (mut a, mut b) = crate::testpipe::pair();
+        let pending = start_handshake(&mut a).unwrap();
+        let mut ch_b = respond_handshake(&mut b, MAGIC).unwrap();
+        let Handshake::V2(cipher_a, garbage_a) = finish_handshake(&mut a, pending, MAGIC).unwrap()
+        else {
+            panic!("v1 fallback on a v2 peer");
+        };
+        let mut ch_a = V2Channel::new(cipher_a, garbage_a);
+        a.write_all(&ch_a.handshake_tail()).unwrap();
+        let mut buf = [0u8; 4096];
+        let n = b.read(&mut buf).unwrap();
+        ch_b.feed(&buf[..n]).unwrap();
+
+        // message, decoy, message, decoy — as the session's injection
+        // emits them.
+        let mut wire = ch_a.encode_message("ping", &[]);
+        wire.extend_from_slice(&ch_a.encode_decoy(1337));
+        wire.extend_from_slice(&ch_a.encode_message("verack", &[]));
+        wire.extend_from_slice(&ch_a.encode_decoy(42));
+
+        let msgs = ch_b.feed(&wire).unwrap();
+        let names: Vec<&str> = msgs.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(names, ["ping", "verack"], "decoys drop silently");
     }
 
     #[test]
