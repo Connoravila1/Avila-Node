@@ -176,7 +176,10 @@ impl Mempool {
     /// whatever coin that input spends (confirmed UTXO or pool parent).
     /// An input that doesn't resolve contributes only its legacy share
     /// — it shouldn't happen for an already-admitted entry.
-    fn real_sigop_cost(
+    ///
+    /// `pub(crate)`: `accept_tx`/`explain_tx` (lib.rs) use it too, for
+    /// the per-tx sigop cap and the sigop-adjusted vsize.
+    pub(crate) fn real_sigop_cost(
         &self,
         cs: &avila_consensus::chainstate::Chainstate,
         tx: &Transaction,

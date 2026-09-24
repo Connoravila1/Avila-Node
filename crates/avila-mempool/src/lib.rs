@@ -29,6 +29,11 @@ pub const DEFAULT_MIN_RELAY_FEE: i64 = 100;
 /// Policy only; consensus has no per-tx weight cap beyond the block's.
 pub const MAX_STANDARD_TX_WEIGHT: usize = 400_000;
 
+/// Core's `MAX_STANDARD_TX_SIGOPS_COST` (`policy/policy.h`) —
+/// `MAX_BLOCK_SIGOPS_COST / 5`: the most a single relayed tx may cost
+/// in sigops, independent of its byte size.
+pub const MAX_STANDARD_TX_SIGOPS_COST: u64 = avila_consensus::check::MAX_BLOCK_SIGOPS_COST / 5;
+
 /// Deployed Core's `DEFAULT_INCREMENTAL_RELAY_FEE` — a replacement must
 /// cover its own relay at this rate on top of the conflicting tx's fee.
 pub const INCREMENTAL_RELAY_FEE: i64 = 100; // sat/kvB
@@ -138,6 +143,11 @@ pub enum MempoolReject {
     /// their descendants) — Core's `GetEntriesForConflicts`.
     #[error("too many potential replacements")]
     TooManyReplacements,
+    /// Sigop cost exceeds [`MAX_STANDARD_TX_SIGOPS_COST`] — Core's
+    /// `PreChecks`: a handful of expensive scripts can burn CPU wildly
+    /// out of proportion to a tx's byte size.
+    #[error("bad-txns-too-many-sigops")]
+    TooManySigops,
 }
 
 /// Core's `DEFAULT_ANCESTOR_LIMIT` — a candidate may not bring its
@@ -753,6 +763,22 @@ impl Mempool {
             }
         };
 
+        let flags = standard_script_flags(cs, next_height, &tip);
+        let sigop_cost = self.real_sigop_cost(cs, tx, flags);
+        if !push(
+            &mut steps,
+            "sigop-cap",
+            if sigop_cost > MAX_STANDARD_TX_SIGOPS_COST {
+                Err(format!(
+                    "bad-txns-too-many-sigops: {sigop_cost} > {MAX_STANDARD_TX_SIGOPS_COST}"
+                ))
+            } else {
+                Ok(format!("{sigop_cost} <= {MAX_STANDARD_TX_SIGOPS_COST}"))
+            },
+        ) {
+            return steps;
+        }
+
         if !conflicts.is_empty() {
             let conflict_fees: i64 = conflicts
                 .iter()
@@ -791,7 +817,6 @@ impl Mempool {
             }
         }
 
-        let flags = standard_script_flags(cs, next_height, &tip);
         let spent_outs: Vec<_> = spent.iter().map(|c| c.out.clone()).collect();
         if !push(
             &mut steps,
@@ -961,6 +986,15 @@ impl Mempool {
         let (_, fee) =
             check_tx_inputs(&tx, &overlay, next_height).map_err(MempoolReject::Inputs)?;
 
+        // 4.5 Per-tx sigop cap (Core's PreChecks, `GetTransactionSigOpCost`
+        //    vs `MAX_STANDARD_TX_SIGOPS_COST`): a handful of expensive
+        //    inputs can burn CPU wildly out of proportion to a tx's size,
+        //    so it's capped independent of the byte/weight limits.
+        let flags = standard_script_flags(cs, next_height, &tip);
+        if self.real_sigop_cost(cs, &tx, flags) > MAX_STANDARD_TX_SIGOPS_COST {
+            return Err(MempoolReject::TooManySigops);
+        }
+
         // 5. BIP125 fee rule: replacement must pay the conflicts' fees
         //    plus incremental relay for its own size.
         if !conflicts.is_empty() {
@@ -989,8 +1023,8 @@ impl Mempool {
 
         // 7. Script checks: consensus flags at the next height plus
         //    Core's standardness set (policy — a tx failing only these
-        //    is still block-valid, just not relayed).
-        let flags = standard_script_flags(cs, next_height, &tip);
+        //    is still block-valid, just not relayed). `flags` was
+        //    already computed for the sigop cap above (4.5).
         let spent_outs: Vec<_> = spent.iter().map(|c| c.out.clone()).collect();
         check_input_scripts(&tx, &spent_outs, flags).map_err(MempoolReject::ScriptVerify)?;
         avila_consensus::sigchecker::mark_scripts_verified(tx.txid(), flags);
@@ -1744,34 +1778,8 @@ mod tests {
         }
     }
 
-    /// A tx spending two outpoints into one output — for conflict/ancestor
-    /// scenarios `spend_tx` can't build.
-    fn spend_two(op1: OutPoint, op2: OutPoint, value: i64, sequence: u32) -> Transaction {
-        Transaction {
-            version: 2,
-            inputs: vec![
-                TxIn {
-                    previous_output: op1,
-                    script_sig: Script::new(vec![]),
-                    sequence,
-                    witness: Witness::default(),
-                },
-                TxIn {
-                    previous_output: op2,
-                    script_sig: Script::new(vec![]),
-                    sequence,
-                    witness: Witness::default(),
-                },
-            ],
-            outputs: vec![TxOut {
-                value,
-                script_pubkey: Script::new(vec![script::OP_1]),
-            }],
-            lock_time: 0,
-        }
-    }
-
-    /// A tx spending every outpoint in `ops` into one output.
+    /// A tx spending every outpoint in `ops` into one output — covers the
+    /// `spend_tx`-can't-build cases (multi-input conflict/ancestor tests).
     fn spend_many(ops: &[OutPoint], value: i64, sequence: u32) -> Transaction {
         Transaction {
             version: 2,
@@ -1882,6 +1890,36 @@ mod tests {
     }
 
     #[test]
+    fn tx_with_excessive_sigop_cost_is_rejected() {
+        // Core's PreChecks: GetTransactionSigOpCost vs
+        // MAX_STANDARD_TX_SIGOPS_COST (16,000), independent of tx size.
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = Mempool::new();
+        let op = mature_outpoint(&blocks, 1);
+        // 250 bare OP_CHECKMULTISIG opcodes in the sole output: legacy
+        // sigop count (non-accurate, 20 each) * WITNESS_SCALE_FACTOR(4)
+        // = 250*20*4 = 20,000 > 16,000, while the tx itself is tiny.
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: op,
+                script_sig: Script::new(vec![]),
+                sequence: SEQ_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 4_999_000_000,
+                script_pubkey: Script::new(vec![script::OP_CHECKMULTISIG; 250]),
+            }],
+            lock_time: 0,
+        };
+        assert_eq!(
+            pool.accept_tx(tx, &cs, NOW),
+            Err(MempoolReject::TooManySigops)
+        );
+    }
+
+    #[test]
     fn double_spend_without_rbf_is_rejected() {
         let (cs, blocks) = chainstate_at(101);
         let mut pool = Mempool::new();
@@ -1941,12 +1979,14 @@ mod tests {
         let p_id = p.txid();
         pool.accept_tx(p, &cs, NOW).unwrap();
 
-        let x = spend_two(
-            OutPoint {
-                txid: p_id,
-                vout: 0,
-            },
-            op,
+        let x = spend_many(
+            &[
+                OutPoint {
+                    txid: p_id,
+                    vout: 0,
+                },
+                op,
+            ],
             4_000_000_000,
             SEQ_RBF,
         );
