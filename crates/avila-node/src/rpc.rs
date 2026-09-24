@@ -4296,6 +4296,16 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
     ),
     ("getbalances", &[], GETBALANCES_HELP),
     (
+        "getwalletinfo",
+        &[],
+        "getwalletinfo\n\nWatch-wallet status: descriptor count, coin tracking, scan floor, gaps.\n",
+    ),
+    (
+        "listtransactions",
+        &[("count", Some("number"), false), ("skip", Some("number"), false)],
+        "listtransactions ( count skip )\n\nWatch-wallet history — receives and spends per tracked coin, newest first.\n",
+    ),
+    (
         "restorewallet",
         &[
             ("filename", Some("string"), true),
@@ -10550,6 +10560,97 @@ pub(crate) fn dispatch(
                     },
                     "warnings": warnings,
                 }))
+            })
+        }
+        // Watch-wallet status — descriptor count, scan progress,
+        // gaps. The watch-only analogue of Core's `getwalletinfo`.
+        "getwalletinfo" => {
+            let wallet = wallet.cloned();
+            chain_query(method, queries, move |cs, _mgr| {
+                let Some(wallet) = wallet else {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    ));
+                };
+                let mut w = wallet
+                    .lock()
+                    .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                w.advance(cs);
+                let unspent = w.unspent().count();
+                let last = w.chain.last().copied();
+                Ok(json!({
+                    "walletname": "avila-watch",
+                    "walletversion": 1,
+                    "descriptors": w.descs.len(),
+                    "coins_tracked": w.coins.len(),
+                    "coins_unspent": unspent,
+                    "scan_floor": w.scan_floor,
+                    "gaps": w.gaps.iter().map(|(a, b)| json!([a, b])).collect::<Vec<_>>(),
+                    "lastprocessedblock": {
+                        "hash": last.map(|h| h.to_string()).unwrap_or_default(),
+                        "height": w.chain.len() as i64 - 1,
+                    },
+                    "private_keys_enabled": false,
+                }))
+            })
+        }
+        // Wallet history — synthesized from the per-coin lifecycle:
+        // each coin is a "receive", each spent coin contributes a
+        // "send" under its spender's txid. `count`/`skip` window the
+        // newest-first list like Core.
+        "listtransactions" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let count = arr.first().and_then(Value::as_i64).unwrap_or(10);
+            let skip = arr.get(1).and_then(Value::as_i64).unwrap_or(0);
+            let wallet = wallet.cloned();
+            chain_query(method, queries, move |cs, _mgr| {
+                let Some(wallet) = wallet else {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    ));
+                };
+                let mut w = wallet
+                    .lock()
+                    .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                w.advance(cs);
+                let tip = w.chain.len() as u32;
+                let mut rows: Vec<Value> = Vec::new();
+                for ((txid, vout), coin) in &w.coins {
+                    rows.push(json!({
+                        "category": "receive",
+                        "txid": txid.to_string(),
+                        "vout": vout,
+                        "amount": value_from_amount(coin.value),
+                        "blockhash": coin.block.to_string(),
+                        "blockheight": coin.height,
+                        "confirmations": tip.saturating_sub(coin.height),
+                    }));
+                    if let (Some(sh), Some(sp)) = (coin.spent_height, coin.spent_by) {
+                        rows.push(json!({
+                            "category": "send",
+                            "txid": sp.to_string(),
+                            "vout": vout,
+                            "amount": value_from_amount(-coin.value),
+                            "blockheight": sh,
+                            "blockhash": w.chain.get(sh as usize).map(|h| h.to_string()),
+                            "confirmations": tip.saturating_sub(sh),
+                        }));
+                    }
+                }
+                rows.sort_by_key(|r| {
+                    std::cmp::Reverse(
+                        r["blockheight"].as_i64().unwrap_or(0),
+                    )
+                });
+                let skip = skip.max(0) as usize;
+                let out: Vec<Value> = rows
+                    .into_iter()
+                    .skip(skip)
+                    .take(count.max(0) as usize)
+                    .collect();
+                Ok(json!(out))
             })
         }
         // Core's `listreceivedbyaddress` — receipts grouped by address;
