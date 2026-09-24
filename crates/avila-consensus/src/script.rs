@@ -1012,8 +1012,14 @@ fn witness_sig_ops(version: u8, program: &[u8], witness: &Witness) -> u64 {
 /// output spent by a push-only `script_sig` — the witness program inside the
 /// redeem script (nested segwit).
 ///
-/// The caller must only reach this when `flags` also has [`ScriptFlags::P2SH`]
-/// set (Core `assert`s it inside `CountWitnessSigOps`).
+/// The caller must only reach the `WITNESS`-active path with `flags` also
+/// holding [`ScriptFlags::P2SH`] (Core `assert`s it inside
+/// `CountWitnessSigOps`, *after* its own `WITNESS` early return — a block
+/// under a [`Params::script_flag_exceptions`] replacement can have `flags`
+/// with neither bit set, and Core's order lets that short-circuit before
+/// the assert; checking `P2SH` first would trip it).
+///
+/// [`Params::script_flag_exceptions`]: crate::params::Params::script_flag_exceptions
 #[must_use]
 pub fn count_witness_sig_ops(
     script_sig: &Script,
@@ -1021,10 +1027,10 @@ pub fn count_witness_sig_ops(
     witness: &Witness,
     flags: ScriptFlags,
 ) -> u64 {
-    debug_assert!(flags.contains(ScriptFlags::P2SH));
     if !flags.contains(ScriptFlags::WITNESS) {
         return 0;
     }
+    debug_assert!(flags.contains(ScriptFlags::P2SH));
     if let Some((version, program)) = script_pubkey.witness_program() {
         return witness_sig_ops(version, program, witness);
     }
@@ -1163,6 +1169,22 @@ mod tests {
         // A truncated push stops iteration mid-script, like Core's break on GetOp.
         let t = script(&[OP_CHECKSIG, 0x05, 0xaa]);
         assert_eq!(t.sig_ops(true), 1);
+    }
+
+    #[test]
+    fn count_witness_sig_ops_checks_witness_before_p2sh_assert() {
+        // A block under `Params::script_flag_exceptions` can carry
+        // `flags = 0` — neither WITNESS nor P2SH. Core's
+        // `CountWitnessSigOps` returns 0 via its `WITNESS` early return
+        // before ever reaching the `P2SH` assert; checking `P2SH` first
+        // would panic a debug build on exactly this input.
+        let script_sig = script(&[]);
+        let script_pubkey = script(&[OP_HASH160]);
+        let witness = Witness::default();
+        assert_eq!(
+            count_witness_sig_ops(&script_sig, &script_pubkey, &witness, ScriptFlags::NONE),
+            0
+        );
     }
 
     #[test]
