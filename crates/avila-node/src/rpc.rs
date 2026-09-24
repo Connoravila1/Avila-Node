@@ -143,14 +143,27 @@ pub struct DeferredQuery {
 /// one, the sync loop holds the receiving half.
 pub type QuerySender = mpsc::Sender<ChainQuery>;
 
-/// Request/response byte cap — RPC requests are small; a peer that
-/// floods headers past this is disconnected.
-const MAX_REQUEST: usize = 64 * 1024;
+/// Core's `MAX_HEADERS_SIZE` (`evhttp_set_max_headers_size`): the
+/// request line plus headers — everything read before auth runs — is
+/// bounded by this.
+const MAX_HEADER_BYTES: usize = 8192;
+
+/// Core's `MAX_SIZE` body cap (`evhttp_set_max_body_size`). A full
+/// block's hex for `submitblock` runs to ~8 MB; the old shared 64 KiB
+/// request cap refused any block past ~32 KB and every large
+/// transaction, PSBT or package.
+const MAX_BODY_BYTES: usize = 0x0200_0000;
+
+/// Core's `-rpcservertimeout` default. The body is read only after
+/// auth, so it gets an idle timeout per read rather than the pre-auth
+/// wall-clock deadline — a multi-megabyte `submitblock` over a slow
+/// link would never fit in that.
+const BODY_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a chain query may wait for the sync loop to answer.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Wall-clock ceiling on reading a request's line, headers, and body —
+/// Wall-clock ceiling on reading a request's line and headers —
 /// a fixed deadline, not merely the per-`read` socket timeout `handle`
 /// also sets. A per-call timeout alone lets a client trickle a byte
 /// every few seconds and never trip it, holding one of the 64
@@ -543,16 +556,16 @@ fn handle(
     // line, all bounded. Non-POST gets Core's 405 before auth.
     //
     // Each `read_line` below is capped with `Read::take` to whatever
-    // remains of the MAX_REQUEST budget: plain `BufRead::read_line`
+    // remains of the MAX_HEADER_BYTES budget: plain `BufRead::read_line`
     // has no size limit of its own and keeps buffering as long as no
     // `\n` shows up, so an unterminated line (a multi-hundred-KiB
     // request line with no newline, say) would be read into memory in
     // full — pre-auth — before the old post-hoc `read_bytes >
-    // MAX_REQUEST` check ever ran.
+    // MAX_HEADER_BYTES` check ever ran.
     let mut request_line = String::new();
     match reader
         .by_ref()
-        .take(MAX_REQUEST as u64)
+        .take(MAX_HEADER_BYTES as u64)
         .read_line(&mut request_line)
     {
         Ok(0) | Err(_) => return,
@@ -578,7 +591,7 @@ fn handle(
             return;
         }
         let mut line = String::new();
-        let budget = MAX_REQUEST.saturating_sub(read_bytes) as u64;
+        let budget = MAX_HEADER_BYTES.saturating_sub(read_bytes) as u64;
         if budget == 0 {
             return;
         }
@@ -638,7 +651,7 @@ fn handle(
             _ => true,
         }
     };
-    if content_length == 0 || content_length > MAX_REQUEST {
+    if content_length == 0 || content_length > MAX_BODY_BYTES {
         return;
     }
     // A client that sent `Expect: 100-continue` is waiting for this
@@ -650,7 +663,10 @@ fn handle(
         let _ = write!(stream, "HTTP/1.1 100 Continue\r\n\r\n");
         let _ = stream.flush();
     }
-    if !arm_deadline(&stream) {
+    if stream
+        .set_read_timeout(Some(BODY_READ_IDLE_TIMEOUT))
+        .is_err()
+    {
         return;
     }
     let mut body = vec![0u8; content_length];
@@ -12503,8 +12519,8 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(addr).unwrap();
-        // Well past MAX_REQUEST, and not a single `\n` in it.
-        let junk = vec![b'A'; MAX_REQUEST + 4096];
+        // Well past MAX_HEADER_BYTES, and not a single `\n` in it.
+        let junk = vec![b'A'; MAX_HEADER_BYTES + 4096];
         let writer = thread::spawn(move || {
             let _ = client.write_all(&junk);
             let mut resp = Vec::new();
@@ -12563,6 +12579,42 @@ mod tests {
         assert!(interim.starts_with("HTTP/1.1 100 Continue"), "{interim}");
 
         client.write_all(body).unwrap();
+        client.flush().unwrap();
+
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).unwrap();
+        let resp = String::from_utf8_lossy(&resp);
+        assert!(resp.contains("\"result\":120"), "{resp}");
+        server.join().unwrap();
+    }
+
+    /// A request body past the old 64 KiB shared cap — a real block's
+    /// `submitblock` hex is megabytes — is read and served, not dropped.
+    #[test]
+    fn large_request_body_is_served() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status: SharedStatus = Arc::new(RwLock::new(snap()));
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle(stream, &status, None, None, None, None, None, None);
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        // JSON whitespace padding stands in for a large hex parameter.
+        let mut body = br#"{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]"#.to_vec();
+        body.resize(body.len() + 3 * 1024 * 1024, b' ');
+        body.push(b'}');
+        write!(
+            client,
+            "POST / HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        client.write_all(&body).unwrap();
         client.flush().unwrap();
 
         let mut resp = Vec::new();
