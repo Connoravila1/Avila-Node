@@ -12,6 +12,9 @@ use avila_consensus::chainstate::Chainstate;
 use avila_consensus::params::Params;
 use avila_p2p::manager::{NetEvent, PeerManager};
 
+pub use crate::chain_profile::{ChainProfile, ProfilePoint};
+pub use crate::next_block::NextBlock;
+
 /// Connected-block interval between mid-sync `state.dat` checkpoints
 /// — Core's `FlushStateToDisk` cadence analogue. 2048 blocks bounds a
 /// crash to replaying at most that many blk-file entries.
@@ -92,6 +95,11 @@ pub struct SyncConfig {
     /// every waiter on loop exit (Core's validation-interface
     /// notifications, polled instead of callbacked).
     pub waiters: Option<std::sync::Arc<crate::rpc::BlockWaiters>>,
+    /// When set, rebuild [`SyncProgress::next_block`] from the live
+    /// mempool periodically. The desktop GUI sets this to draw a
+    /// preview of the block this node would produce next; other
+    /// callers leave it off to skip the extra template-assembly work.
+    pub preview_next_block: bool,
 }
 
 impl Default for SyncConfig {
@@ -117,6 +125,7 @@ impl Default for SyncConfig {
             status: None,
             queries: None,
             waiters: None,
+            preview_next_block: false,
         }
     }
 }
@@ -149,6 +158,12 @@ pub struct SyncProgress {
     /// What the node has actually verified — connected vs. assumed
     /// coverage per the typed report (`getvalidationreport`).
     pub validation: avila_consensus::chainstate::ValidationReport,
+    /// Work and time along the best header chain (see [`ChainProfile`]).
+    pub profile: std::sync::Arc<ChainProfile>,
+    /// The block the mempool would produce next; `None` unless
+    /// [`SyncConfig::preview_next_block`] is set and the pool has
+    /// transactions.
+    pub next_block: Option<std::sync::Arc<NextBlock>>,
 }
 
 /// The outcome of a finished (or timed-out) sync run.
@@ -235,6 +250,14 @@ fn sandbox_self() {
 /// stored chain — every ~2 weeks of mainnet history, or a cheap
 /// interval during IBD.
 const AUDIT_INTERVAL: u32 = 2016;
+
+/// How often [`SyncConfig::preview_next_block`] rebuilds
+/// [`SyncProgress::next_block`] — `build_template`'s package selection
+/// isn't free, so a busy mempool doesn't get re-summarized every tick.
+/// Measured on the wall clock ([`Instant`]), not the mockable clock:
+/// this throttle is a UI cadence, not a consensus- or protocol-visible
+/// timestamp.
+const NEXT_BLOCK_REBUILD_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Re-verify `n` random connected blocks' internal proofs; returns the
 /// failure count. Heights are sampled by a seeded xorshift — the audit
@@ -406,6 +429,17 @@ pub fn run(
     let mut established_total = 0u32;
     let mut disconnects = 0u32;
     let mut connected = 0u32;
+    // Work/time profile of the best header chain (queue: ChainProfile) —
+    // kept across ticks and refreshed incrementally; the Arc is rebuilt
+    // only when the tip actually moves, so an unchanged tip costs
+    // readers nothing but a refcount bump.
+    let mut chain_profile = ChainProfile::default();
+    let mut chain_profile_arc = std::sync::Arc::new(chain_profile.clone());
+    // The next-block preview (queue: NextBlock) — GUI-only, off by
+    // default; `next_block_built_at` throttles rebuilds to
+    // NEXT_BLOCK_REBUILD_INTERVAL on the wall clock.
+    let mut next_block: Option<std::sync::Arc<NextBlock>> = None;
+    let mut next_block_built_at: Option<Instant> = None;
     let cancelled = || {
         cfg.cancel
             .as_ref()
@@ -531,6 +565,28 @@ pub fn run(
             .skip(chain.len().saturating_sub(12))
             .map(|(i, h)| (i as u32, *h))
             .collect();
+        // ChainProfile::refresh is a no-op once the tip hash matches, so
+        // this is cheap on every tick that didn't just connect a block;
+        // only rebuild the published Arc when the tip actually moved.
+        let prev_profile_tip = chain_profile.tip;
+        chain_profile.refresh(cs.tree());
+        if chain_profile.tip != prev_profile_tip {
+            chain_profile_arc = std::sync::Arc::new(chain_profile.clone());
+        }
+        // Next-block preview: only while the GUI asked for it, only
+        // while there's something to preview, and throttled so a busy
+        // mempool isn't re-templated every tick.
+        if cfg.preview_next_block {
+            if mgr.mempool().is_empty() {
+                next_block = None;
+            } else if next_block_built_at
+                .is_none_or(|t| t.elapsed() >= NEXT_BLOCK_REBUILD_INTERVAL)
+            {
+                next_block_built_at = Some(Instant::now());
+                next_block = crate::next_block::build_next_block(mgr.mempool(), &cs)
+                    .map(std::sync::Arc::new);
+            }
+        }
         let snapshot = SyncProgress {
             peers: mgr.len(),
             connected_height: connected,
@@ -547,6 +603,8 @@ pub fn run(
             ),
             elapsed_secs: (crate::time::time() - started_epoch).max(0) as u64,
             validation: cs.validation_report(),
+            profile: chain_profile_arc.clone(),
+            next_block: next_block.clone(),
         };
         if let Some(status) = &cfg.status
             && let Ok(mut w) = status.write()

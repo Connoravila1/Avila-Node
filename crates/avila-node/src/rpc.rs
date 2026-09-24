@@ -12665,6 +12665,8 @@ mod tests {
             mempool: (5, 1, Some(2_000)),
             elapsed_secs: 42,
             validation: default_report(),
+            profile: Default::default(),
+            next_block: None,
         }
     }
 

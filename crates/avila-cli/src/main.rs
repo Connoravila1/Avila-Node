@@ -466,6 +466,8 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                         snapshot: None,
                         verified_fraction: 1.0,
                     },
+                    profile: Default::default(),
+                    next_block: None,
                 }));
             let (query_tx, query_rx) = std::sync::mpsc::channel();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -602,6 +604,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 status: Some(status),
                 queries: Some(std::sync::Arc::new(std::sync::Mutex::new(query_rx))),
                 waiters: Some(waiters),
+                preview_next_block: false,
             };
             println!(
                 "Running {} — syncing to tip, then serving (Ctrl+C to stop)...",
@@ -668,6 +671,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 status: None,
                 queries: None,
                 waiters: None,
+                preview_next_block: false,
             };
             println!("Syncing {network} (target height {blocks}, {max_peers} peers max)...");
             let mut last = (u32::MAX, u32::MAX);
