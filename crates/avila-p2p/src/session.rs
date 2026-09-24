@@ -334,6 +334,16 @@ impl<S: Read + Write> PeerSession<S> {
         self.peer.as_ref()
     }
 
+    /// The nonce we advertised in our own `version` (Core's
+    /// `CNode::GetLocalNonce`). On an outbound dial the manager remembers
+    /// this so a matching nonce on a later *inbound* connection's
+    /// `version` can be recognized as our own loopback — Core's
+    /// `CheckIncomingNonce` self-connection check.
+    #[must_use]
+    pub fn our_nonce(&self) -> u64 {
+        self.our_version.nonce
+    }
+
     /// Whether the handshake has completed.
     #[must_use]
     pub fn established(&self) -> bool {

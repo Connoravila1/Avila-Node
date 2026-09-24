@@ -156,6 +156,12 @@ struct PeerEntry<S> {
     /// answered once; a later `getaddr` on the same connection is
     /// silently ignored.
     getaddr_recvd: bool,
+    /// The nonce we sent in our own `version`, when this was an
+    /// outbound dial (`None` for inbound accepts, which never register
+    /// a nonce to check against). Mirrored into
+    /// [`PeerManager::outbound_nonces`] for the self-connect check and
+    /// removed from it when this entry is dropped.
+    our_nonce: Option<u64>,
 }
 
 /// A read-only view of one connected peer — the manager's state is
@@ -283,6 +289,15 @@ pub struct PeerManager<S> {
     /// network can't queue unbounded workers, and deduplicated so the
     /// same address is never dialed twice at once.
     pending_dials: std::collections::HashSet<SocketAddr>,
+    /// Nonces we've sent in our own `version` on outbound connections,
+    /// live for as long as that connection is (Core's `CheckIncomingNonce`
+    /// scans not-yet-`fSuccessfullyConnected` outbound `CNode`s instead;
+    /// keeping ours for the connection's whole life is a conservative
+    /// superset — nobody but the dialed peer ever sees our nonce, so the
+    /// only extra case caught is that same peer replaying it back at us
+    /// after our dial already finished handshaking). A matching nonce on
+    /// an inbound peer's `version` means that connection loops back to us.
+    outbound_nonces: std::collections::HashSet<u64>,
     /// The epoch-seconds clock every time-domain decision reads —
     /// ban checks, version `timestamp`s, session telemetry and the
     /// `last_*` fields. Core's `GetTime`: [`wall_epoch`] until the
@@ -353,6 +368,7 @@ impl<S: Read + Write> PeerManager<S> {
             dial_tx: dial_channel.0,
             dial_rx: dial_channel.1,
             pending_dials: std::collections::HashSet::new(),
+            outbound_nonces: std::collections::HashSet::new(),
             inbound_tx: inbound_channel.0,
             inbound_rx: inbound_channel.1,
             pending_accepts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -409,6 +425,9 @@ impl<S: Read + Write> PeerManager<S> {
     /// totals so `getnettotals` keeps counting past sessions.
     fn drop_peer(&mut self, id: u64) {
         if let Some(p) = self.peers.remove(&id) {
+            if let Some(nonce) = p.our_nonce {
+                self.outbound_nonces.remove(&nonce);
+            }
             let t = p.session.telemetry();
             self.closed_bytes_sent = self.closed_bytes_sent.saturating_add(t.bytes_sent);
             self.closed_bytes_recv = self.closed_bytes_recv.saturating_add(t.bytes_recv);
@@ -586,6 +605,15 @@ impl<S: Read + Write> PeerManager<S> {
         self.next_id += 1;
         session.set_clock(self.clock);
         let now = Instant::now();
+        // Self-connection detection (Core's `CheckIncomingNonce`):
+        // remember the nonce on an outbound dial so a matching inbound
+        // `version` can be recognized as our own loopback connection.
+        // Inbound accepts register no nonce — Core only ever checks
+        // against outbound dials, never the other way around.
+        let our_nonce = (!inbound).then(|| session.our_nonce());
+        if let Some(nonce) = our_nonce {
+            self.outbound_nonces.insert(nonce);
+        }
         self.peers.insert(
             id,
             PeerEntry {
@@ -594,6 +622,7 @@ impl<S: Read + Write> PeerManager<S> {
                 remote,
                 wants_headers_announce: false,
                 inbound,
+                our_nonce,
                 connected_at: now,
                 last_useful: now,
                 last_rx: now,
@@ -634,6 +663,7 @@ impl<S: Read + Write> PeerManager<S> {
             addrbook,
             headers_leader,
             mempool,
+            outbound_nonces,
             ..
         } = self;
         let mut announce_tip: Option<u64> = None;
@@ -667,6 +697,7 @@ impl<S: Read + Write> PeerManager<S> {
                             &mut events,
                             &mut dead,
                             serve_filters,
+                            outbound_nonces,
                         );
                     }
                 }
@@ -948,6 +979,7 @@ impl<S: Read + Write> PeerManager<S> {
         events: &mut Vec<NetEvent>,
         dead: &mut Vec<(u64, DisconnectReason)>,
         serve_filters: bool,
+        outbound_nonces: &std::collections::HashSet<u64>,
     ) {
         match event {
             SessionEvent::Established => {
@@ -1224,6 +1256,18 @@ impl<S: Read + Write> PeerManager<S> {
                     peer.ping_last = Some(rtt);
                     peer.ping_min = Some(peer.ping_min.map_or(rtt, |m| m.min(rtt)));
                     peer.ping_outstanding = None;
+                }
+            }
+            SessionEvent::Message(Message::Version(v)) => {
+                // Self-connection check (Core's `CheckIncomingNonce`):
+                // only inbound peers are checked, against nonces *we*
+                // sent on our own outbound dials — an inbound version
+                // carrying one means this connection loops back to us.
+                if peer.inbound && outbound_nonces.contains(&v.nonce) {
+                    dead.push((
+                        id,
+                        DisconnectReason::Session("connected to self".to_string()),
+                    ));
                 }
             }
             SessionEvent::Message(_) => {}
@@ -2161,6 +2205,74 @@ mod tests {
             "{events:?}"
         );
         assert!(mgr.is_empty());
+    }
+
+    /// Core's `CheckIncomingNonce`: an inbound peer whose `version`
+    /// carries the same nonce we sent on a live outbound dial is our
+    /// own connection looping back to us, and gets disconnected.
+    #[test]
+    fn inbound_version_matching_our_outbound_nonce_is_self_connect() {
+        let mut mgr = PeerManager::new(8);
+        let mut cs = regtest();
+        // `add_peer`'s outbound dial sends `build_version(9, ...)`.
+        let (_out_peer, _out_id) = add_peer(&mut mgr);
+
+        let (us_end, mut peer_end) = testpipe::pair();
+        let session = PeerSession::initiate(
+            us_end,
+            MAGIC,
+            build_version(99, 0, NetAddr::unspecified(), i64::from(NOW)),
+            BUDGET,
+        )
+        .expect("session");
+        let in_id = mgr.add_inbound(session).expect("slot");
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer_end, MAGIC);
+
+        // The "peer" answers with our own outbound nonce (9) — as if
+        // this inbound socket were the far end of our own dial.
+        testpipe::inject(
+            &mut peer_end,
+            MAGIC,
+            &Message::Version(Version {
+                version: PROTOCOL_VERSION,
+                services: NODE_NETWORK,
+                timestamp: i64::from(NOW),
+                addr_recv: NetAddr::unspecified(),
+                addr_from: NetAddr::unspecified(),
+                nonce: 9,
+                user_agent: "/peer:0.0/".to_string(),
+                start_height: 600,
+                relay: true,
+            }),
+        );
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                NetEvent::Disconnected { peer, .. } if *peer == in_id
+            )),
+            "{events:?}"
+        );
+        assert!(!mgr.peers.contains_key(&in_id));
+    }
+
+    /// An inbound peer whose nonce doesn't match any live outbound
+    /// dial's is an ordinary peer, not a self-connection.
+    #[test]
+    fn inbound_version_with_unrelated_nonce_is_not_self_connect() {
+        let mut mgr = PeerManager::new(8);
+        let mut cs = regtest();
+        let (_out_peer, _out_id) = add_peer(&mut mgr); // registers nonce 9
+
+        let (mut peer_end, in_id) = add_inbound_peer(&mut mgr).expect("slot");
+        let events = handshake(&mut mgr, &mut peer_end, &mut cs); // peer_version's nonce is 7, not 9
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, NetEvent::Disconnected { .. }))
+        );
+        assert!(mgr.peers.contains_key(&in_id));
     }
 
     #[test]
