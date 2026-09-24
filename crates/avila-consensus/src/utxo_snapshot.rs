@@ -73,8 +73,15 @@ pub(crate) fn compress_script(script: &Script) -> (u64, Vec<u8>) {
             // 3 = odd Y; the payload is X only.
             (u64::from(key[0]), key[1..33].to_vec())
         }
-        ScriptType::PubKey(key) if key.len() == 65 && key[0] == 4 => {
+        ScriptType::PubKey(key)
+            if key.len() == 65 && key[0] == 4 && secp256k1::PublicKey::from_slice(&key).is_ok() =>
+        {
             // 4/5 — uncompressed keys keep X; Y is recomputed on decode.
+            // Gated on full validity (secp256k1 parse succeeds), like
+            // compressor.cpp's `IsToPubKey`: `CPubKey::IsFullyValid()`
+            // is checked "last since it's expensive" before taking this
+            // path — an off-curve key falls through to the raw fallback
+            // below instead, matching Core exactly.
             (4 + u64::from(key[64] & 1), key[1..33].to_vec())
         }
         // Witness and everything else take the default `len + 6` +
@@ -371,24 +378,33 @@ pub(crate) fn decompress_script(
             Ok(Script::new(s))
         }
         // P2PK uncompressed — payload is X plus Y's parity; the full
-        // point is recovered and serialized uncompressed.
+        // point is recovered and serialized uncompressed. An off-curve
+        // X can't be `XOnlyPublicKey::from_slice`d — Core's
+        // `DecompressScript` returns `false` in that case and
+        // `ScriptCompression::Unser` ignores the bool, leaving `script`
+        // at its default-constructed empty value; we match that (an
+        // empty script) instead of hard-erroring, so a coin nobody but
+        // an adversary would create still decodes rather than poisoning
+        // the whole snapshot/record read.
         id @ (4 | 5) => {
             let x = take(32)?;
-            let xonly = secp256k1::XOnlyPublicKey::from_slice(&x).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "bad X coordinate")
-            })?;
-            let parity = if id == 4 {
-                secp256k1::Parity::Even
-            } else {
-                secp256k1::Parity::Odd
-            };
-            let pubkey = secp256k1::PublicKey::from_x_only_public_key(xonly, parity)
-                .serialize_uncompressed();
-            let mut s = Vec::with_capacity(67);
-            s.push(65);
-            s.extend_from_slice(&pubkey);
-            s.push(0xac);
-            Ok(Script::new(s))
+            match secp256k1::XOnlyPublicKey::from_slice(&x) {
+                Ok(xonly) => {
+                    let parity = if id == 4 {
+                        secp256k1::Parity::Even
+                    } else {
+                        secp256k1::Parity::Odd
+                    };
+                    let pubkey = secp256k1::PublicKey::from_x_only_public_key(xonly, parity)
+                        .serialize_uncompressed();
+                    let mut s = Vec::with_capacity(67);
+                    s.push(65);
+                    s.extend_from_slice(&pubkey);
+                    s.push(0xac);
+                    Ok(Script::new(s))
+                }
+                Err(_) => Ok(Script::new(Vec::new())),
+            }
         }
         n => {
             let payload = take((n - 6) as usize)?;
@@ -575,5 +591,80 @@ mod tests {
             let c = compress_amount(sats);
             assert_eq!(decompress_amount(c), sats, "roundtrip({sats}) via {c}");
         }
+    }
+
+    /// A 65-byte `0x04`-prefixed P2PK script whose X coordinate is
+    /// off-curve — anyone can mine one; Bitcoin's script rules only
+    /// check the push shape, not that the "pubkey" is a real curve
+    /// point. Core's `IsToPubKey` refuses to compress such a script
+    /// (`CPubKey::IsFullyValid()` fails) and stores it raw.
+    fn invalid_uncompressed_pubkey_script() -> Script {
+        let mut s = Vec::with_capacity(67);
+        s.push(65);
+        s.push(4);
+        // 2^256 - 1 exceeds the secp256k1 field prime, so it isn't
+        // even a candidate X — guaranteed off-curve regardless of Y.
+        s.extend_from_slice(&[0xffu8; 64]);
+        s.push(0xac);
+        Script::new(s)
+    }
+
+    #[test]
+    fn compress_script_rejects_off_curve_uncompressed_pubkey() {
+        let script = invalid_uncompressed_pubkey_script();
+        assert!(matches!(script.classify(), ScriptType::PubKey(_)));
+        let (size_id, payload) = compress_script(&script);
+        // Falls to the raw `len + 6` fallback, never id 4/5.
+        assert_eq!(size_id, script.len() as u64 + 6);
+        assert_eq!(payload, script.as_bytes());
+    }
+
+    #[test]
+    fn decompress_script_id_4_5_off_curve_x_yields_empty_script() {
+        // A record that *claims* id 4 over an off-curve X (a corrupt
+        // record, or a hostile/foreign snapshot) must decode to an
+        // empty script — Core's `DecompressScript` returns `false` and
+        // `ScriptCompression::Unser` ignores it, leaving the
+        // default-constructed empty `CScript` — never a hard error
+        // that would abort a whole snapshot load.
+        let mut r = &[0xffu8; 32][..];
+        let script = decompress_script(&mut r, 4).unwrap();
+        assert!(script.as_bytes().is_empty());
+    }
+
+    /// End-to-end: a coin carrying the off-curve pubkey script
+    /// round-trips byte-exact through `write_snapshot`/`read_coins` —
+    /// before this fix, `read_coins` aborted the whole load on this
+    /// coin's unrecoverable compressed X.
+    #[test]
+    fn snapshot_roundtrips_off_curve_pubkey_coin() {
+        let script = invalid_uncompressed_pubkey_script();
+        let op = OutPoint {
+            txid: crate::hash::Txid::from_bytes([7u8; 32]),
+            vout: 0,
+        };
+        let coin = Coin {
+            out: crate::transaction::TxOut {
+                value: 5_000,
+                script_pubkey: script.clone(),
+            },
+            height: 100,
+            coinbase: false,
+        };
+        let mut buf = Vec::new();
+        let message_start = [0xf9, 0xbe, 0xb4, 0xd9];
+        let base = BlockHash::from_bytes([1u8; 32]);
+        write_snapshot(&mut buf, message_start, &base, 1, &[(op, coin)]).unwrap();
+
+        let mut r = &buf[..];
+        let meta = read_metadata(&mut r, message_start).unwrap();
+        assert_eq!(meta.coins_count, 1);
+        let mut got = Vec::new();
+        read_coins(&mut r, meta.coins_count, 100, |o, c| got.push((o, c))).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, op);
+        assert_eq!(got[0].1.out.value, 5_000);
+        assert_eq!(got[0].1.out.script_pubkey.as_bytes(), script.as_bytes());
+        assert_eq!(got[0].1.height, 100);
     }
 }

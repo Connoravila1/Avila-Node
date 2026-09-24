@@ -611,6 +611,15 @@ impl CoinsBackend {
 
     /// The persisted coin at `outpoint` — a direct lookup; the
     /// in-memory layer above owns caching.
+    ///
+    /// `None` means either "no such coin" or "the stored record exists
+    /// but failed to decode" (true corruption — every shape Core can
+    /// actually produce now decodes, since [`decode_coin`] is total
+    /// over Core's wire format). Distinguishing those would need an
+    /// `Option`-breaking signature change that ripples into every
+    /// `UtxoSet` call site outside this module; short of that, [`Self::have`]
+    /// is kept decoding the same bytes so the two methods never
+    /// disagree about a corrupt record's presence.
     #[must_use]
     pub fn get(&self, outpoint: &OutPoint) -> Option<Coin> {
         if let Some(h) = &self.hash {
@@ -622,8 +631,14 @@ impl CoinsBackend {
         decode_coin(g.value(), self.format)
     }
 
-    /// `true` if the backend holds `outpoint` — cheaper than `get`
-    /// when the coin itself isn't needed.
+    /// `true` if the backend holds a *decodable* coin at `outpoint`.
+    ///
+    /// This decodes the record rather than only checking key presence,
+    /// deliberately: a stored key whose bytes fail to decode is
+    /// corruption, and [`Self::get`] already reports that as absent —
+    /// disagreeing here (raw presence says yes) would let a caller's
+    /// `have` guard and `get` read of the same coin reach opposite
+    /// conclusions, which is worse than the redundant decode costs.
     #[must_use]
     pub fn have(&self, outpoint: &OutPoint) -> bool {
         if let Some(h) = &self.hash {
@@ -633,7 +648,9 @@ impl CoinsBackend {
             .begin_read()
             .ok()
             .and_then(|r| r.open_table(COINS).ok())
-            .is_some_and(|t| matches!(t.get(&key_of(outpoint)[..]), Ok(Some(_))))
+            .is_some_and(|t| {
+                matches!(t.get(&key_of(outpoint)[..]), Ok(Some(g)) if decode_coin(g.value(), self.format).is_some())
+            })
     }
 
     /// The stored undo for `height`, decoded — `None` if absent.
@@ -1143,6 +1160,65 @@ mod tests {
         assert_eq!(u.txs.len(), 2);
         assert_eq!(u.txs[1].spent[0].out.value, 50_000);
         assert_eq!(u.txs[1].overwritten[0].1.out.value, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 65-byte `0x04`-prefixed P2PK script whose X coordinate is
+    /// off-curve — anyone can mine one; script classification only
+    /// checks the push shape, not curve membership (see
+    /// `utxo_snapshot`'s tests for the full story). Before the
+    /// `compress_script`/`decompress_script` fix, this coin's compressed
+    /// form was unrecoverable: `get`/`iter_coins` silently dropped it
+    /// while `have` (a raw presence check) still said yes.
+    fn invalid_uncompressed_pubkey_script() -> Script {
+        let mut s = vec![65u8, 4];
+        s.extend_from_slice(&[0xffu8; 64]);
+        s.push(0xac);
+        Script::new(s)
+    }
+
+    #[test]
+    fn compact_codec_roundtrips_off_curve_pubkey_coin() {
+        let c = Coin {
+            out: TxOut {
+                value: 12_345,
+                script_pubkey: invalid_uncompressed_pubkey_script(),
+            },
+            height: 42,
+            coinbase: false,
+        };
+        let enc = encode_coin(&c, CoinFormat::Compact);
+        let dec = decode_coin(&enc, CoinFormat::Compact)
+            .unwrap_or_else(|| panic!("must decode, not silently drop"));
+        assert_eq!(dec, c);
+    }
+
+    /// `get`, `have` and `iter_coins` must all agree that the coin is
+    /// present, byte-exact — the exact three accessors the bug report
+    /// named as disagreeing before this fix.
+    #[test]
+    fn backend_get_have_iter_agree_on_off_curve_pubkey_coin() {
+        let dir = test_dir("off-curve-pubkey");
+        let be = CoinsBackend::open_with_format(&dir, CoinFormat::Compact).unwrap();
+        let c = Coin {
+            out: TxOut {
+                value: 777,
+                script_pubkey: invalid_uncompressed_pubkey_script(),
+            },
+            height: 1,
+            coinbase: false,
+        };
+        let mut dirty = HashMap::new();
+        dirty.insert(op(9, 0), Some(c.clone()));
+        be.commit(&dirty, &[], 1).unwrap();
+
+        assert!(be.have(&op(9, 0)));
+        assert_eq!(be.get(&op(9, 0)), Some(c.clone()));
+        assert!(
+            be.iter_coins()
+                .iter()
+                .any(|(o, got)| *o == op(9, 0) && *got == c)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
