@@ -7173,7 +7173,10 @@ pub(crate) fn dispatch(
                         // (Core issue #30471).
                         mgr.mempool().mark_unbroadcast(&txid);
                         mgr.mempool().mark_broadcast(txid, bytes.clone(), now);
-                        mgr.announce_tx(txid, wtxid);
+                        // Origin privacy: locally submitted txs take a
+                        // single stem hop before general announce —
+                        // observers see us relay, not originate.
+                        mgr.stem_announce(txid, wtxid);
                         Ok(json!(txid.to_string()))
                     }
                     Err(avila_mempool::MempoolReject::AlreadyKnown) => {

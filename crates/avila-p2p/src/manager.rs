@@ -367,6 +367,15 @@ pub struct PeerManager<S> {
     /// Unix-second gate for the broadcast-pool rebroadcast pass —
     /// operator txs retry on a slower cadence than recon rounds.
     next_rebroadcast: u32,
+    /// Selfish-stem relay (queue #18): locally-originated txs announce
+    /// to ONE outbound peer first, hold a randomized delay, then fluff
+    /// to everyone — the origin hides behind a hop instead of
+    /// broadcasting to all at once. Entries: (txid, wtxid, fluff_at).
+    /// Weaker than full Dandelion (single hop, no protocol change) —
+    /// the point is plausible-deniability routing for our own txs.
+    stem_pending: Vec<(avila_consensus::hash::Txid, avila_consensus::hash::Wtxid, Instant)>,
+    /// Whether locally-submitted txs take the stem path — default on.
+    stem_relay: bool,
     /// The operator ban list — Core's `BanMan`/`m_banned`: consulted
     /// on every dial and (future) inbound accept; `setban add` also
     /// drops matching live peers.
@@ -464,6 +473,8 @@ impl<S: Read + Write> PeerManager<S> {
             addnode_dial: HashMap::new(),
             last_maintained: None,
             next_rebroadcast: 0,
+            stem_pending: Vec::new(),
+            stem_relay: true,
             bans: crate::banman::BanList::new(),
             banlist_path: None,
             dial_tx: dial_channel.0,
@@ -897,7 +908,86 @@ impl<S: Read + Write> PeerManager<S> {
         self.fill_queues(cs);
         self.recon_pass();
         self.rebroadcast_pass(cs, now);
+        self.stem_fluff_pass();
         events
+    }
+
+    /// Announces a locally submitted transaction via a single stem
+    /// hop — one random outbound relay peer gets the inv now; the
+    /// general announce fires after a randomized delay
+    /// (`stem_fluff_pass`). An observer watching our links sees us
+    /// *relay* the tx once, not originate it — the difference between
+    /// "probably their tx" and "maybe someone's."
+    pub fn stem_announce(
+        &mut self,
+        txid: avila_consensus::hash::Txid,
+        wtxid: avila_consensus::hash::Wtxid,
+    ) {
+        if !self.stem_relay {
+            self.announce_tx(txid, wtxid);
+            return;
+        }
+        let mut seed = [0u8; 8];
+        let _ = getrandom::fill(&mut seed);
+        let roll = u64::from_le_bytes(seed);
+        // Pick a random established OUTBOUND peer that accepts tx relay —
+        // outbound links are our chosen routes; an inbound stem hop
+        // would leak to whoever connected to us.
+        let candidates: Vec<u64> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| {
+                !p.inbound
+                    && p.session.established()
+                    && p.session.peer().is_some_and(|i| i.relay)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let Some(&hop) = candidates.get((roll as usize) % candidates.len().max(1)) else {
+            // No outbound peer — fluff immediately, better than silence.
+            self.announce_tx(txid, wtxid);
+            return;
+        };
+        if let Some(peer) = self.peers.get_mut(&hop) {
+            let (inv_type, hash) =
+                if peer.session.peer().is_some_and(|i| i.wtxid_relay) {
+                    (crate::message::InvType::Wtx, BlockHash::from_bytes(*wtxid.as_bytes()))
+                } else {
+                    (crate::message::InvType::Tx, BlockHash::from_bytes(*txid.as_bytes()))
+                };
+            let _ = peer.session.send(&Message::Inv(vec![
+                crate::message::InvVector { inv_type, hash },
+            ]));
+        }
+        // Fluff after a randomized 2–15s delay — the Dandelion stem
+        // phase compressed to one hop.
+        let delay_ms = 2_000 + (roll >> 8) % 13_000;
+        self.stem_pending.push((
+            txid,
+            wtxid,
+            Instant::now() + Duration::from_millis(delay_ms),
+        ));
+    }
+
+    /// Drains stem-pending entries whose delay elapsed — the fluff
+    /// phase announces the tx normally (recon links pick it up in the
+    /// next round regardless).
+    fn stem_fluff_pass(&mut self) {
+        let now = Instant::now();
+        let mut i = 0;
+        while i < self.stem_pending.len() {
+            if self.stem_pending[i].2 <= now {
+                let (txid, wtxid, _) = self.stem_pending.remove(i);
+                self.send_tx_inv(None, &txid, &wtxid);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Whether locally submitted txs take the stem path.
+    pub fn set_stem_relay(&mut self, on: bool) {
+        self.stem_relay = on;
     }
 
     /// Broadcast-pool retries — Core issue #30471's broadcast pool:
@@ -919,7 +1009,9 @@ impl<S: Read + Write> PeerManager<S> {
             match self.mempool.accept_tx(tx.clone(), cs, now) {
                 Ok(_) => {
                     self.mempool.mark_unbroadcast(&txid);
-                    self.send_tx_inv(None, &txid, &tx.wtxid());
+                    // Retries keep the origin-privacy property — stem
+                    // hop, not an immediate all-peer announce.
+                    self.stem_announce(txid, tx.wtxid());
                 }
                 Err(_) => {
                     // Dead iff an input resolves nowhere — UTXO set
@@ -3949,5 +4041,53 @@ mod tests {
         // mockscheduler 3600 — forward fires it once (not 60×).
         mgr.scheduler_forward(3600);
         assert_eq!(RAN.load(Ordering::Relaxed), 2);
+    }
+
+    /// Selfish-stem (#18): a locally submitted tx inv goes to exactly
+    /// ONE outbound peer immediately; after the randomized delay the
+    /// fluff pass announces it to everyone.
+    #[test]
+    fn selfish_stem_announces_one_hop_then_fluffs() {
+        let (mut mgr, mut a, _ida) = managed_peer();
+        let mut cs = crate::testchain::regtest();
+        handshake(&mut mgr, &mut a, &mut cs);
+        testpipe::drain(&mut a, MAGIC);
+        let (mut b, _idb) = add_peer(&mut mgr);
+        handshake_peer(&mut mgr, &mut b, &mut cs);
+        testpipe::drain(&mut b, MAGIC);
+
+        let txid = avila_consensus::hash::Txid::from_bytes([7u8; 32]);
+        let wtxid = avila_consensus::hash::Wtxid::from_bytes([9u8; 32]);
+        mgr.stem_announce(txid, wtxid);
+        mgr.tick(&mut cs, NOW); // flush send_bufs to the wire
+
+        let msgs_a = testpipe::drain(&mut a, MAGIC);
+        let msgs_b = testpipe::drain(&mut b, MAGIC);
+        let inv = |msgs: &[Message]| {
+            msgs.iter()
+                .filter(|m| matches!(m, Message::Inv(v) if v.iter().any(|iv| {
+                    iv.inv_type == crate::message::InvType::Wtx
+                        || iv.inv_type == crate::message::InvType::Tx
+                })))
+                .count()
+        };
+        assert_eq!(
+            inv(&msgs_a) + inv(&msgs_b),
+            1,
+            "exactly one stem hop gets the inv — a: {msgs_a:?}, b: {msgs_b:?}"
+        );
+        assert_eq!(mgr.stem_pending.len(), 1, "fluff is pending");
+
+        // Force the delay elapsed; the next tick fluffs to everyone.
+        mgr.stem_pending[0].2 = Instant::now() - Duration::from_secs(1);
+        mgr.tick(&mut cs, NOW); // fluff queues the inv
+        mgr.tick(&mut cs, NOW); // next tick flushes to the wire
+        let msgs_a = testpipe::drain(&mut a, MAGIC);
+        let msgs_b = testpipe::drain(&mut b, MAGIC);
+        assert!(
+            inv(&msgs_a) + inv(&msgs_b) >= 1,
+            "fluff announce went out"
+        );
+        assert!(mgr.stem_pending.is_empty());
     }
 }
