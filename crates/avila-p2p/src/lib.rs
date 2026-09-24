@@ -26,6 +26,7 @@ pub mod addrman;
 pub mod banman;
 pub mod bip324;
 pub mod codec;
+pub mod headerssync;
 pub mod manager;
 pub mod message;
 pub mod proxy;

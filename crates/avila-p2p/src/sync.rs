@@ -17,12 +17,16 @@
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use avila_consensus::arith::{U256, Work};
 use avila_consensus::block::Block;
 use avila_consensus::chainstate::{Acceptance, Chainstate};
 use avila_consensus::hash::BlockHash;
 use avila_consensus::header::BlockHeader;
+use avila_consensus::params::Params;
+use avila_consensus::pow;
 use thiserror::Error;
 
+use crate::headerssync::{HeadersSyncParams, HeadersSyncState};
 use crate::message::{GetHeaders, InvType, InvVector, MAX_HEADERS_RESULTS, Message};
 
 /// Core's `MAX_GETCFILTERS_SIZE` — max filters per `getcfilters` (BIP157).
@@ -105,6 +109,11 @@ pub struct PeerSync {
     headers_applied: usize,
     /// Block bodies received from this peer.
     blocks_received: usize,
+    /// A low-work-chain presync/redownload in progress with this peer
+    /// (Core's `Peer::m_headers_sync`) — `Some` only while the batches
+    /// we've seen so far haven't proven enough claimed work to trust
+    /// directly. See [`crate::headerssync`].
+    headers_sync: Option<HeadersSyncState>,
 }
 
 impl Default for PeerSync {
@@ -136,6 +145,7 @@ impl PeerSync {
             headers_in_flight: None,
             headers_applied: 0,
             blocks_received: 0,
+            headers_sync: None,
         }
     }
 
@@ -215,14 +225,31 @@ impl PeerSync {
     /// Feeds a `headers` page into the chainstate. The first header must
     /// extend something we know (its prev is in the tree); each later header
     /// chains to its predecessor — otherwise the peer sent a discontinuous
-    /// sequence.
+    /// sequence. Every header's own proof-of-work is checked up front too
+    /// (Core's `CheckHeadersPoW`), independent of whichever path below ends
+    /// up handling the batch.
+    ///
+    /// A batch that doesn't yet carry [`headerssync`](crate::headerssync)'s
+    /// anti-DoS work threshold is diverted into a per-peer presync/redownload
+    /// instead of reaching [`Chainstate::accept_header`] directly — see that
+    /// module for why. Once a peer's low-work sync is in progress, every
+    /// subsequent `headers` message feeds it until it either proves enough
+    /// work (releasing verified headers for real acceptance) or gives up.
     ///
     /// A full page means the peer holds more: the outcome carries the next
-    /// `getheaders`. `fetchable` lists newly indexed blocks whose bodies we
-    /// lack — the caller passes them to [`Self::want_blocks`].
+    /// `getheaders` (from the low-work sync's own locator while one is in
+    /// progress, otherwise the ordinary best-header locator). `fetchable`
+    /// lists newly indexed blocks whose bodies we lack — the caller passes
+    /// them to [`Self::want_blocks`].
     ///
     /// # Errors
-    /// [`SyncError`] on discontinuity or a consensus-invalid header.
+    /// [`SyncError`] on discontinuous or PoW-invalid headers, or a
+    /// consensus-invalid header — from the ordinary path, or from a header
+    /// a completed low-work redownload released and handed to
+    /// `accept_header` for real (a low-work sync's own internal failures,
+    /// e.g. a commitment mismatch, are not treated as misbehavior: the sync
+    /// is simply abandoned, exactly as headers full of consensus-honest
+    /// content dropped mid-download would be).
     pub fn on_headers(
         &mut self,
         cs: &mut Chainstate,
@@ -230,17 +257,78 @@ impl PeerSync {
         now: u32,
     ) -> Result<HeadersOutcome, SyncError> {
         self.headers_in_flight = None;
+
+        if headers.is_empty() {
+            // Nothing to check; an empty page also settles any low-work
+            // sync in progress (Core: a bare reply means the peer
+            // suddenly has nothing more, e.g. it reorged onto our chain).
+            self.headers_sync = None;
+            return Ok(HeadersOutcome {
+                added: 0,
+                known: 0,
+                continuation: None,
+                fetchable: Vec::new(),
+            });
+        }
+
+        let params = *cs.tree().params();
+        for header in headers {
+            pow::check_proof_of_work(&header.hash(), header.bits, &params)
+                .map_err(|e| SyncError::InvalidHeader(e.to_string()))?;
+        }
+        for i in 1..headers.len() {
+            if headers[i].prev_block_hash != headers[i - 1].hash() {
+                return Err(SyncError::DiscontinuousHeaders);
+            }
+        }
+
+        // A low-work sync already in progress consumes the batch on its
+        // own terms — its continuity is against wherever *it* left off,
+        // which needn't be anything in our tree yet.
+        if self.headers_sync.is_some() {
+            return self.continue_low_work_sync(cs, headers, now);
+        }
+
+        if !cs.tree().contains(&headers[0].prev_block_hash) {
+            return Err(SyncError::DiscontinuousHeaders);
+        }
+
+        // Anti-DoS gate (Core's `TryLowWorkHeadersSync`): a headers batch
+        // that doesn't carry enough claimed work must never reach
+        // `accept_header` directly, or a cheap low-difficulty chain could
+        // grow the header tree without bound.
+        if let Some(outcome) = self.try_low_work_headers_sync(cs, &params, headers, now) {
+            return Ok(outcome);
+        }
+
+        let (added, known, fetchable) = self.accept_headers(cs, headers, now)?;
+        let continuation = if headers.len() as u64 == MAX_HEADERS_RESULTS {
+            Some(self.request_headers(cs))
+        } else {
+            None
+        };
+        Ok(HeadersOutcome {
+            added,
+            known,
+            continuation,
+            fetchable,
+        })
+    }
+
+    /// Runs `headers` through `accept_header` one at a time, updating this
+    /// peer's applied-headers counter. Returns `(added, known, fetchable)`;
+    /// shared by the ordinary path and a low-work redownload's release.
+    fn accept_headers(
+        &mut self,
+        cs: &mut Chainstate,
+        headers: &[BlockHeader],
+        now: u32,
+    ) -> Result<(usize, usize, Vec<BlockHash>), SyncError> {
         let mut added = 0usize;
         let mut known = 0usize;
         let mut fetchable = Vec::new();
-        for (i, header) in headers.iter().enumerate() {
+        for header in headers {
             let hash = header.hash();
-            if i > 0 && header.prev_block_hash != headers[i - 1].hash() {
-                return Err(SyncError::DiscontinuousHeaders);
-            }
-            if i == 0 && !cs.tree().contains(&header.prev_block_hash) {
-                return Err(SyncError::DiscontinuousHeaders);
-            }
             let had_header = cs.tree().contains(&hash);
             match cs.accept_header(header, now) {
                 Ok(_) => {
@@ -252,21 +340,131 @@ impl PeerSync {
                     }
                     self.headers_applied += 1;
                 }
-                Err(rej) => {
-                    return Err(SyncError::InvalidHeader(rej.to_string()));
-                }
+                Err(rej) => return Err(SyncError::InvalidHeader(rej.to_string())),
             }
         }
-        let continuation = if headers.len() as u64 == MAX_HEADERS_RESULTS {
-            Some(self.request_headers(cs))
-        } else {
-            None
+        Ok((added, known, fetchable))
+    }
+
+    /// Core's `TryLowWorkHeadersSync`: gates a fresh headers batch behind
+    /// [`headerssync::anti_dos_work_threshold`](crate::headerssync::anti_dos_work_threshold).
+    /// `headers` must have already passed `on_headers`'s PoW/continuity
+    /// checks, and `headers[0]` must connect to something in `cs`'s tree.
+    ///
+    /// Returns `Some(outcome)` when the batch was fully handled here (a
+    /// presync started, or a short low-work batch was ignored outright) —
+    /// the caller returns that outcome as-is. `None` means the batch
+    /// already carries enough work and the caller should run it through
+    /// [`Self::accept_headers`] normally.
+    fn try_low_work_headers_sync(
+        &mut self,
+        cs: &Chainstate,
+        params: &Params,
+        headers: &[BlockHeader],
+        now: u32,
+    ) -> Option<HeadersOutcome> {
+        let fork = *cs.tree().get(&headers[0].prev_block_hash)?;
+        let claimed_batch_work = headers.iter().fold(Work::ZERO, |acc, h| {
+            acc.checked_add(Work::from_compact(h.bits))
+                .unwrap_or(Work(U256::MAX))
+        });
+        let total_work = fork
+            .chainwork
+            .checked_add(claimed_batch_work)
+            .unwrap_or(Work(U256::MAX));
+        let threshold = crate::headerssync::anti_dos_work_threshold(cs, params);
+        if total_work >= threshold {
+            return None;
+        }
+        if headers.len() as u64 != MAX_HEADERS_RESULTS {
+            // Short low-work batch: the peer has nothing more to give
+            // and never proved sufficient work — ignore it outright
+            // (Core logs "Ignoring low-work chain" and does nothing).
+            return Some(HeadersOutcome {
+                added: 0,
+                known: 0,
+                continuation: None,
+                fetchable: Vec::new(),
+            });
+        }
+        let sync_params = HeadersSyncParams::for_network(params.network);
+        let mut state = HeadersSyncState::new(cs, &fork, *params, sync_params, threshold, now);
+        let result = state.process_next_headers(headers, true);
+        // A brand-new presync's first page can never itself release
+        // redownloaded headers — that only happens once REDOWNLOAD is
+        // already under way, on a later call.
+        debug_assert!(result.pow_validated_headers.is_empty());
+        let continuation = self.next_low_work_request(cs, &state, result.request_more);
+        if !state.is_final() {
+            self.headers_sync = Some(state);
+        }
+        Some(HeadersOutcome {
+            added: 0,
+            known: 0,
+            continuation,
+            fetchable: Vec::new(),
+        })
+    }
+
+    /// Core's `IsContinuationOfLowWorkHeadersSync`: hands a wire batch to
+    /// an already-in-progress presync/redownload. An internal failure (bad
+    /// continuity relative to where the sync left off, an impossible
+    /// difficulty transition, a commitment mismatch, or the peer-length
+    /// bound) is not punished on its own — the sync is simply abandoned,
+    /// same as Core's "just give up" — but headers a completed REDOWNLOAD
+    /// releases go through the ordinary [`Self::accept_headers`] path and
+    /// *can* misbehave there like any other header.
+    fn continue_low_work_sync(
+        &mut self,
+        cs: &mut Chainstate,
+        headers: &[BlockHeader],
+        now: u32,
+    ) -> Result<HeadersOutcome, SyncError> {
+        let Some(mut state) = self.headers_sync.take() else {
+            // Only called when `headers_sync.is_some()`; defended anyway.
+            return Ok(HeadersOutcome {
+                added: 0,
+                known: 0,
+                continuation: None,
+                fetchable: Vec::new(),
+            });
         };
+        let full_page = headers.len() as u64 == MAX_HEADERS_RESULTS;
+        let result = state.process_next_headers(headers, full_page);
+        let continuation = self.next_low_work_request(cs, &state, result.request_more);
+        if !state.is_final() {
+            self.headers_sync = Some(state);
+        }
+        if !result.success {
+            return Ok(HeadersOutcome {
+                added: 0,
+                known: 0,
+                continuation: None,
+                fetchable: Vec::new(),
+            });
+        }
+        let (added, known, fetchable) =
+            self.accept_headers(cs, &result.pow_validated_headers, now)?;
         Ok(HeadersOutcome {
             added,
             known,
             continuation,
             fetchable,
+        })
+    }
+
+    /// Builds the next `getheaders` for an in-progress low-work sync and
+    /// timestamps it as this peer's new outstanding request, or `None`
+    /// when the sync didn't ask for more this round.
+    fn next_low_work_request(
+        &mut self,
+        cs: &Chainstate,
+        state: &HeadersSyncState,
+        request_more: bool,
+    ) -> Option<Message> {
+        request_more.then(|| {
+            self.headers_in_flight = Some(Instant::now());
+            state.next_headers_request(cs)
         })
     }
 
@@ -721,6 +919,8 @@ mod tests {
 
     const NOW: u32 = 1_800_000_000;
 
+    use avila_consensus::params::Network;
+
     use crate::testchain::{block_on, chain_blocks, regtest};
 
     #[test]
@@ -764,6 +964,82 @@ mod tests {
         let mut sync = PeerSync::new();
         let out = sync.on_headers(&mut cs, &headers, NOW).unwrap();
         assert!(out.continuation.is_none());
+    }
+
+    /// Wiring check for the anti-DoS gate: a full-page, low-work batch
+    /// must be diverted into a presync (nothing stored, more requested)
+    /// rather than reaching `accept_header` directly; once the whole
+    /// chain has been paged through presync and its claimed work clears
+    /// the floor, it switches to redownloading the identical range and,
+    /// once redownloaded work also clears the floor, releases everything
+    /// for real acceptance. The state-machine details (commitments,
+    /// buffering, ...) are covered in `headerssync`'s own tests; this
+    /// only pins that `PeerSync::on_headers` actually calls into it, over
+    /// the two full pages each phase needs for a 4000-header chain.
+    #[test]
+    fn on_headers_diverts_a_low_work_chain_then_applies_it_once_proven() {
+        use avila_consensus::arith::{U256, Work};
+        use avila_consensus::chainstate::Chainstate;
+
+        // Threshold picked so a single 2000-header page's claimed work
+        // (2 per regtest header, plus genesis's own 2 = 4002) is *not*
+        // enough on its own — otherwise the very first page would clear
+        // it immediately and never divert into presync at all — but a
+        // handful of headers past it is. A non-full page that crosses
+        // the floor still asks for more (Core: `full_headers_message ||
+        // state == REDOWNLOAD`), so this second page need not itself be
+        // a full 2000 headers — kept tiny so the chain this test mines
+        // stays small.
+        let mut params = Network::Regtest.params();
+        params.minimum_chain_work = Work(U256::from_u64(4_010));
+        let seed = Chainstate::new(&params);
+        let blocks = chain_blocks(&seed, MAX_HEADERS_RESULTS as u32 + 4);
+        let headers: Vec<BlockHeader> = blocks.iter().map(|b| b.header).collect();
+        let page1 = &headers[..MAX_HEADERS_RESULTS as usize];
+        let page2 = &headers[MAX_HEADERS_RESULTS as usize..];
+
+        let mut cs = Chainstate::new(&params);
+        let mut sync = PeerSync::new();
+
+        // Presync, page 1: below the floor on its own — diverted, and
+        // asks for more (this page was full).
+        let out = sync.on_headers(&mut cs, page1, NOW).unwrap();
+        assert_eq!((out.added, out.known), (0, 0));
+        assert!(
+            out.continuation.is_some(),
+            "a full low-work page should page for more"
+        );
+        assert_eq!(
+            cs.tree().len(),
+            1,
+            "a low-work batch must never be stored directly"
+        );
+
+        // Presync, page 2: the full chain's claimed work now clears the
+        // floor, promoting presync to redownload — still nothing stored.
+        let out = sync.on_headers(&mut cs, page2, NOW).unwrap();
+        assert_eq!((out.added, out.known), (0, 0));
+        assert!(
+            out.continuation.is_some(),
+            "redownload should start by re-requesting from the top"
+        );
+        assert_eq!(cs.tree().len(), 1);
+
+        // Redownload, page 1: re-verifies the same range against the
+        // commitments taken during presync; buffered, not yet released
+        // (this page's own work hasn't cleared the floor again yet).
+        let out = sync.on_headers(&mut cs, page1, NOW).unwrap();
+        assert_eq!((out.added, out.known), (0, 0));
+        assert!(out.continuation.is_some());
+        assert_eq!(cs.tree().len(), 1);
+
+        // Redownload, page 2: crosses the floor again partway through,
+        // releasing the entire verified chain for real acceptance.
+        let out = sync.on_headers(&mut cs, page2, NOW).unwrap();
+        assert_eq!(out.added, headers.len());
+        assert!(out.continuation.is_none(), "the sync is complete");
+        assert_eq!(cs.tree().len(), headers.len() + 1);
+        assert_eq!(cs.tree().tip().height as usize, headers.len());
     }
 
     #[test]

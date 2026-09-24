@@ -756,15 +756,14 @@ impl V2Channel {
             if ignore {
                 continue;
             }
-            match decode_message_type(&contents) {
-                Some((cmd, payload)) => out.push((cmd, payload.to_vec())),
-                // Core's `ReceiveMsgBytes`: "Message deserialization
-                // failed. Drop the message but don't disconnect the
-                // peer" — an unparseable message *type* means this one
-                // packet is unusable, not that the transport itself
-                // desynchronized (the AEAD tag already authenticated
-                // it). Skip it and keep decoding the rest of `bytes`.
-                None => {}
+            // Core's `ReceiveMsgBytes`: "Message deserialization failed.
+            // Drop the message but don't disconnect the peer" — an
+            // unparseable message *type* means this one packet is
+            // unusable, not that the transport itself desynchronized
+            // (the AEAD tag already authenticated it). Skip it and keep
+            // decoding the rest of `bytes` rather than failing outright.
+            if let Some((cmd, payload)) = decode_message_type(&contents) {
+                out.push((cmd, payload.to_vec()));
             }
         }
         Ok(out)

@@ -712,18 +712,16 @@ impl<S: Read + Write> PeerManager<S> {
                 }
             }
             // Stall eviction: a block download that's gone quiet, or an
-            // outstanding `getheaders` that has (Core's
-            // `HEADERS_RESPONSE_TIME`). The latter matters even for a
-            // peer that's otherwise alive and answering pings — without
-            // it a headers leader that simply stops replying to
+            // outstanding `getheaders` that has gone unanswered past
+            // Core's `HEADERS_RESPONSE_TIME`. The latter matters even
+            // for a peer that's otherwise alive and answering pings —
+            // without it a headers leader that simply stops replying to
             // `getheaders` would freeze header sync until it
             // disconnects for some unrelated reason, since only the
             // leader is allowed to keep paging. Dropping it here clears
             // `headers_leader` below and `fill_queues` hands leadership
             // to another established peer on the next tick.
-            if peer.sync.stalled() {
-                dead.push((id, DisconnectReason::Stalled));
-            } else if peer.sync.headers_timed_out() {
+            if peer.sync.stalled() || peer.sync.headers_timed_out() {
                 dead.push((id, DisconnectReason::Stalled));
             }
         }
@@ -2336,6 +2334,57 @@ mod tests {
                 } if *p == id
             )),
             "{events:?}"
+        );
+    }
+
+    /// End-to-end (through `tick`) check of the header-chain anti-DoS
+    /// gate: a full-page, low-work `headers` message is not misbehavior
+    /// on its own (no disconnect) and nothing from it reaches the header
+    /// tree, yet the manager still relays the presync's own continuation
+    /// `getheaders`. The state machine itself is covered by
+    /// `headerssync`'s and `sync`'s own tests; this only pins that the
+    /// wiring through `dispatch`/`tick` behaves the same way.
+    #[test]
+    fn low_work_headers_page_is_diverted_not_stored() {
+        let (mut mgr, mut peer, id) = managed_peer();
+        let mut params = avila_consensus::params::Network::Regtest.params();
+        // Above a single 2000-header regtest page's own claimed work
+        // (2 per header, plus genesis's own 2 = 4002) — otherwise that
+        // one page would already clear the floor and never divert.
+        params.minimum_chain_work =
+            avila_consensus::arith::Work(avila_consensus::arith::U256::from_u64(4_010));
+        let seed = avila_consensus::chainstate::Chainstate::new(&params);
+        let blocks = chain_blocks(&seed, crate::message::MAX_HEADERS_RESULTS as u32);
+        let headers: Vec<avila_consensus::header::BlockHeader> =
+            blocks.iter().map(|b| b.header).collect();
+        let mut cs = avila_consensus::chainstate::Chainstate::new(&params);
+        handshake(&mut mgr, &mut peer, &mut cs);
+        mgr.tick(&mut cs, NOW); // settle the Established-time getheaders
+        testpipe::drain(&mut peer, MAGIC);
+        let _ = id;
+
+        testpipe::inject(&mut peer, MAGIC, &Message::Headers(headers));
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, NetEvent::Disconnected { .. })),
+            "a low-work batch is not misbehavior on its own: {events:?}"
+        );
+        assert_eq!(
+            cs.tree().len(),
+            1,
+            "nothing from a low-work page should be stored directly"
+        );
+
+        // The manager still relays the presync's own continuation
+        // request (flushed on the *next* tick — see the comment in
+        // `getaddr_from_outbound_peer_is_ignored`).
+        mgr.tick(&mut cs, NOW);
+        let sent = testpipe::drain(&mut peer, MAGIC);
+        assert!(
+            sent.iter().any(|m| matches!(m, Message::GetHeaders(_))),
+            "the presync should still page for more: {sent:?}"
         );
     }
 
