@@ -4302,7 +4302,10 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
     ),
     (
         "listtransactions",
-        &[("count", Some("number"), false), ("skip", Some("number"), false)],
+        &[
+            ("count", Some("number"), false),
+            ("skip", Some("number"), false),
+        ],
         "listtransactions ( count skip )\n\nWatch-wallet history — receives and spends per tracked coin, newest first.\n",
     ),
     (
@@ -4584,6 +4587,11 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         "getmempoolblocks",
         &[("nblocks", Some("number"), false)],
         "getmempoolblocks ( nblocks )\n\nProjects the mempool into virtual blocks by modified-feerate order — the mempool.space 'next blocks' view, native.\n\nArguments:\n1. nblocks  (number, optional, default=8, max=64) How many projected blocks to return.\n\nResult:\n[ { \"block\": n, \"txs\": n, \"vsize\": n, \"totalfee\": btc, \"minfeerate\": btc/kvB, \"medianfeerate\": btc/kvB, \"maxfeerate\": btc/kvB }, ... ]\n",
+    ),
+    (
+        "getmempoolhistory",
+        &[("count", Some("number"), false)],
+        "getmempoolhistory ( count )\n\nRecent mempool removal events, newest first — the transaction lifecycle view: what confirmed, what was RBF-replaced (and by which tx), what the capacity trim evicted, what expired.\n\nArguments:\n1. count  (number, optional, default=64, max=4096) How many events to return.\n\nResult:\n[ { \"txid\": \"hex\", \"cause\": \"confirmed|block-conflict|replaced|evicted|expired|reorg-drop|removed\", \"replaced_by\": \"hex\"|null, \"fee\": btc, \"vsize\": n, \"admitted_at\": n, \"removed_at\": n, \"height\": n }, ... ]\n",
     ),
     (
         "getpinningrisk",
@@ -6883,6 +6891,7 @@ pub(crate) fn dispatch(
             // BTC-denominated fields like Core's: our counters are
             // satoshis, so convert through `ValueFromAmount`.
             let relay = pool.min_relay_fee();
+            let lc = pool.lifecycle_stats();
             Ok(json!({
                 "loaded": true,
                 "size": pool.len(),
@@ -6901,6 +6910,22 @@ pub(crate) fn dispatch(
                 // Full-RBF matches deployed Core's -mempoolfullrbf=1:
                 // replacements no longer need BIP125 signaling.
                 "fullrbf": pool.full_rbf(),
+                // Transaction-lifecycle ledger (queue #32): cumulative
+                // admission verdicts and per-cause removal counters.
+                "lifecycle": {
+                    "accepted": lc.accepted,
+                    "rejected": lc.rejected,
+                    "parked_orphans": lc.parked_orphans,
+                    "orphans_expired": lc.orphans_expired,
+                    "replacements": lc.replacements,
+                    "confirmed": lc.confirmed,
+                    "block_conflicts": lc.block_conflicts,
+                    "replaced": lc.replaced,
+                    "evicted": lc.evicted,
+                    "expired": lc.expired,
+                    "reorg_dropped": lc.reorg_dropped,
+                    "explicit": lc.explicit,
+                },
             }))
         }),
         "getpinningrisk" => {
@@ -6908,12 +6933,13 @@ pub(crate) fn dispatch(
                 .and_then(Value::as_u64)
                 .map_or(5, |v| v as usize);
             chain_query(method, queries, move |_, mgr| {
-                Ok(json!(mgr
-                    .mempool_ref()
-                    .pinning_risk(margin)
-                    .into_iter()
-                    .map(|(txid, n)| json!({"txid": txid.to_string(), "descendants": n}))
-                    .collect::<Vec<_>>()))
+                Ok(json!(
+                    mgr.mempool_ref()
+                        .pinning_risk(margin)
+                        .into_iter()
+                        .map(|(txid, n)| json!({"txid": txid.to_string(), "descendants": n}))
+                        .collect::<Vec<_>>()
+                ))
             })
         }
         "getmempoolblocks" => {
@@ -6921,21 +6947,60 @@ pub(crate) fn dispatch(
                 .and_then(Value::as_u64)
                 .map_or(8, |v| v.min(64) as usize);
             chain_query(method, queries, move |_, mgr| {
-                Ok(json!(mgr
-                    .mempool_ref()
-                    .block_projection(n)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, b)| json!({
-                        "block": i + 1,
-                        "txs": b.tx_count,
-                        "vsize": b.vsize,
-                        "totalfee": value_from_amount(b.total_fees),
-                        "minfeerate": value_from_amount(b.min_feerate),
-                        "medianfeerate": value_from_amount(b.median_feerate),
-                        "maxfeerate": value_from_amount(b.max_feerate),
-                    }))
-                    .collect::<Vec<_>>()))
+                Ok(json!(
+                    mgr.mempool_ref()
+                        .block_projection(n)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, b)| json!({
+                            "block": i + 1,
+                            "txs": b.tx_count,
+                            "vsize": b.vsize,
+                            "totalfee": value_from_amount(b.total_fees),
+                            "minfeerate": value_from_amount(b.min_feerate),
+                            "medianfeerate": value_from_amount(b.median_feerate),
+                            "maxfeerate": value_from_amount(b.max_feerate),
+                        }))
+                        .collect::<Vec<_>>()
+                ))
+            })
+        }
+        "getmempoolhistory" => {
+            let n = param(params, 0, "count")
+                .and_then(Value::as_u64)
+                .map_or(64, |v| v.min(4096) as usize);
+            chain_query(method, queries, move |_, mgr| {
+                Ok(json!(
+                    mgr.mempool_ref()
+                        .lifecycle_events(n)
+                        .into_iter()
+                        .map(|e| {
+                            let (cause, replaced_by) = match e.cause {
+                                avila_mempool::RemovalCause::Confirmed => ("confirmed", None),
+                                avila_mempool::RemovalCause::BlockConflict => {
+                                    ("block-conflict", None)
+                                }
+                                avila_mempool::RemovalCause::Replaced { by } => {
+                                    ("replaced", Some(by.to_string()))
+                                }
+                                avila_mempool::RemovalCause::Evicted => ("evicted", None),
+                                avila_mempool::RemovalCause::Expired => ("expired", None),
+                                avila_mempool::RemovalCause::ReorgDrop => ("reorg-drop", None),
+                                avila_mempool::RemovalCause::Explicit => ("removed", None),
+                            };
+                            json!({
+                                "txid": e.txid.to_string(),
+                                "cause": cause,
+                                "replaced_by": replaced_by,
+                                "fee": value_from_amount(e.fee),
+                                "vsize": e.vsize,
+                                "admitted_at": e.admitted_at,
+                                "removed_at": e.removed_at,
+                                "height": e.removed_height,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                ))
             })
         }
         "getevents" => {
@@ -10643,11 +10708,7 @@ pub(crate) fn dispatch(
                         }));
                     }
                 }
-                rows.sort_by_key(|r| {
-                    std::cmp::Reverse(
-                        r["blockheight"].as_i64().unwrap_or(0),
-                    )
-                });
+                rows.sort_by_key(|r| std::cmp::Reverse(r["blockheight"].as_i64().unwrap_or(0)));
                 let skip = skip.max(0) as usize;
                 let out: Vec<Value> = rows
                     .into_iter()

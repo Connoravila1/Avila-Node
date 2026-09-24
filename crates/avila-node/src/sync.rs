@@ -472,7 +472,9 @@ pub fn run(
                 NetEvent::Connected { .. } => established_total += 1,
                 NetEvent::Disconnected { .. } => disconnects += 1,
                 NetEvent::EclipseSuspected(signals) => {
-                    eprintln!("eclipse indicators: {signals:?} — advisory only, cross-check routes");
+                    eprintln!(
+                        "eclipse indicators: {signals:?} — advisory only, cross-check routes"
+                    );
                 }
                 _ => {}
             }

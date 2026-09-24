@@ -375,6 +375,108 @@ pub struct BlockBand {
     pub max_feerate: i64,
 }
 
+/// Why a pooled transaction left the mempool — the lifecycle ledger's
+/// cause axis. Every removal path tags its removals with one of these;
+/// `Replaced` additionally carries the txid of the transaction that
+/// took the inputs, which is the RBF linkage the analytics layer
+/// answers "what bumped this" with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemovalCause {
+    /// Confirmed in a connected block.
+    Confirmed,
+    /// Double-spent by a transaction in a connected block.
+    BlockConflict,
+    /// Torn out by an admitted replacement — a BIP125 conflict set or
+    /// a TRUC sibling eviction. `by` is the replacement's txid.
+    Replaced {
+        /// The admitted replacement's txid.
+        by: Txid,
+    },
+    /// Capacity trim (entry or serialized-bytes cap) — Core's
+    /// `TrimToSize`.
+    Evicted,
+    /// `-mempoolexpiry` sweep.
+    Expired,
+    /// A disconnected block's tx failed re-admission, so its in-pool
+    /// dependents had to drop with it (Core's `removeRecursive` on a
+    /// failed resurrected tx).
+    ReorgDrop,
+    /// A direct `remove`/`remove_recursive` call carrying no internal
+    /// cause — tests and external callers.
+    Explicit,
+}
+
+/// One removal, captured at the point the entry leaves the pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LifecycleEvent {
+    /// The removed entry's txid.
+    pub txid: Txid,
+    /// Why it left.
+    pub cause: RemovalCause,
+    /// Base fee of the removed entry (sats).
+    pub fee: i64,
+    /// Virtual size of the removed entry.
+    pub vsize: usize,
+    /// Admission timestamp (the entry's `time`).
+    pub admitted_at: u32,
+    /// Caller-supplied clock at removal — 0 on paths that carry no
+    /// wall-clock (block-connect records the height instead).
+    pub removed_at: u32,
+    /// Chain-height context at removal: confirmation height for
+    /// block-connect, next-height for admission-path removals — 0
+    /// where the path carries none.
+    pub removed_height: u32,
+}
+
+/// Depth of [`Mempool`]'s lifecycle ring — the number of most-recent
+/// removal events retained for `getmempoolhistory`. Counters in
+/// [`LifecycleStats`] are cumulative and unaffected by the cap.
+const LIFECYCLE_RING_CAP: usize = 4096;
+
+/// Cumulative lifecycle counters since pool start — the
+/// `getmempoolinfo` `lifecycle` object. Admission events count every
+/// `accept_tx` outcome; removal events count every entry that left
+/// the pool, by cause.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LifecycleStats {
+    /// Successful `accept_tx` admissions — includes orphan un-parks
+    /// and reorg re-adds (every entry insertion).
+    pub accepted: u64,
+    /// `accept_tx` rejections — everything that failed checks without
+    /// being parked as an orphan.
+    pub rejected: u64,
+    /// Submissions that failed input resolution and were offered to
+    /// the orphan pool.
+    pub parked_orphans: u64,
+    /// Orphans dropped by the orphan-expiry sweep (the orphan pool is
+    /// not the pool — tracked here because the lifecycle view wants
+    /// the full "what happened to my submission" story).
+    pub orphans_expired: u64,
+    /// Admitted replacements — `accept_tx` calls that tore at least
+    /// one conflict out of the pool (BIP125 bumps and TRUC sibling
+    /// evictions). Counts *admissions*, not entries removed; `replaced`
+    /// below counts the torn-out entries.
+    pub replacements: u64,
+    /// Entries removed because a connected block confirmed them.
+    pub confirmed: u64,
+    /// Entries removed because a connected block spent their inputs
+    /// differently.
+    pub block_conflicts: u64,
+    /// Entries torn out by an admitted replacement (conflicts plus
+    /// their descendants, and TRUC-evicted siblings).
+    pub replaced: u64,
+    /// Entries removed by the capacity trim.
+    pub evicted: u64,
+    /// Entries removed by the `-mempoolexpiry` sweep.
+    pub expired: u64,
+    /// Entries dropped when a disconnected block's tx failed
+    /// re-admission.
+    pub reorg_dropped: u64,
+    /// Entries removed by an untagged `remove`/`remove_recursive`
+    /// call.
+    pub explicit: u64,
+}
+
 /// A bounded policy pool over the live UTXO set.
 pub struct Mempool {
     /// txid → entry.
@@ -474,6 +576,12 @@ pub struct Mempool {
     /// Bumps on every membership change — subscription checks compare
     /// it to skip recomputing when the pool hasn't moved.
     epoch: u64,
+    /// Cumulative lifecycle counters — see [`LifecycleStats`].
+    lifecycle: LifecycleStats,
+    /// Bounded ring of the most recent removal events (newest last),
+    /// [`LIFECYCLE_RING_CAP`] deep — the `getmempoolhistory` backing
+    /// store. Ephemeral: not persisted to `mempool.dat`.
+    lifecycle_ring: std::collections::VecDeque<LifecycleEvent>,
 }
 
 impl Mempool {
@@ -506,6 +614,8 @@ impl Mempool {
             estimator: FeeEstimator::new(),
             deltas: HashMap::new(),
             unbroadcast: HashSet::new(),
+            lifecycle: LifecycleStats::default(),
+            lifecycle_ring: std::collections::VecDeque::new(),
             broadcast: std::collections::HashMap::new(),
             broadcast_bytes: 0,
             epoch: 0,
@@ -1305,6 +1415,26 @@ impl Mempool {
         cs: &avila_consensus::chainstate::Chainstate,
         now: u32,
     ) -> Result<Txid, MempoolReject> {
+        // Lifecycle admission counters — one per outermost verdict.
+        // `InputsMissingOrSpent` always follows a `park_orphan`, so it
+        // counts under `parked_orphans`, not `rejected`.
+        let result = self.accept_tx_inner(tx, cs, now);
+        match &result {
+            Ok(_) => self.lifecycle.accepted += 1,
+            Err(MempoolReject::InputsMissingOrSpent) => self.lifecycle.parked_orphans += 1,
+            Err(_) => self.lifecycle.rejected += 1,
+        }
+        result
+    }
+
+    /// The admission path [`Self::accept_tx`] wraps — kept separate so
+    /// the lifecycle counters see exactly one verdict per submission.
+    fn accept_tx_inner(
+        &mut self,
+        tx: Transaction,
+        cs: &avila_consensus::chainstate::Chainstate,
+        now: u32,
+    ) -> Result<Txid, MempoolReject> {
         // 0. Sweep anything that's aged out (Core's `CTxMemPool::Expire`,
         //    normally run from a periodic scheduled task or a reorg;
         //    driven off admission here instead since this crate has no
@@ -1615,7 +1745,7 @@ impl Mempool {
             }
             // The evicted entry's descendants leave with it — Core's
             // TrimToSize drops clusters, not lone txs.
-            self.remove_recursive(&worst_id);
+            self.remove_recursive_inner(&worst_id, RemovalCause::Evicted, now, next_height);
         }
         // Core's `TrackPackageRemoved`: the rolling floor only ever
         // rises here, to the priciest thing this trim gave up plus one
@@ -1634,8 +1764,18 @@ impl Mempool {
 
         // 10. BIP125 replacement: drop the conflicts (their descendants
         //     go too — a child can't outlive its parent in the pool).
-        for id in conflicts {
-            self.remove_recursive(&id);
+        //     Every removed entry is tagged with the replacement's
+        //     txid — the lifecycle ledger's RBF linkage.
+        if !conflicts.is_empty() {
+            self.lifecycle.replacements += 1;
+            for id in conflicts {
+                self.remove_recursive_inner(
+                    &id,
+                    RemovalCause::Replaced { by: txid },
+                    now,
+                    next_height,
+                );
+            }
         }
 
         for input in &tx.inputs {
@@ -2008,8 +2148,10 @@ impl Mempool {
 
     /// Drops orphans older than [`ORPHAN_EXPIRE_SECS`].
     fn expire_orphans(&mut self, now: u32) {
+        let before = self.orphans.len();
         self.orphans
             .retain(|_, e| now.saturating_sub(e.time) < ORPHAN_EXPIRE_SECS);
+        self.lifecycle.orphans_expired += (before - self.orphans.len()) as u64;
     }
 
     /// `mempool.dat` file magic + version byte.
@@ -2152,9 +2294,8 @@ impl Mempool {
                 tb.copy_from_slice(&buf[cursor..cursor + 32]);
                 let txid = Txid::from_bytes(tb);
                 cursor += 32;
-                let rl =
-                    u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap_or_default())
-                        as usize;
+                let rl = u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap_or_default())
+                    as usize;
                 cursor += 4;
                 if rl > Self::MAX_TX_BYTES || cursor + rl + 8 > buf.len() {
                     break;
@@ -2163,9 +2304,8 @@ impl Mempool {
                 cursor += rl;
                 let first_seen =
                     u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap_or_default());
-                let attempts = u32::from_le_bytes(
-                    buf[cursor + 4..cursor + 8].try_into().unwrap_or_default(),
-                );
+                let attempts =
+                    u32::from_le_bytes(buf[cursor + 4..cursor + 8].try_into().unwrap_or_default());
                 cursor += 8;
                 if Transaction::decode(&raw).is_ok()
                     && self.broadcast_bytes + raw.len() <= BROADCAST_POOL_BYTES
@@ -2174,7 +2314,12 @@ impl Mempool {
                     self.broadcast_bytes += raw.len();
                     self.broadcast.insert(
                         txid,
-                        BroadcastEntry { raw, first_seen, next_retry: now, attempts },
+                        BroadcastEntry {
+                            raw,
+                            first_seen,
+                            next_retry: now,
+                            attempts,
+                        },
                     );
                 }
             }
@@ -2237,6 +2382,20 @@ impl Mempool {
 
     /// Drops `txid` and unindexes its input spends.
     pub fn remove(&mut self, txid: &Txid) -> Option<MempoolEntry> {
+        self.remove_inner(txid, RemovalCause::Explicit, 0, 0)
+    }
+
+    /// The removal path every cause-specific caller funnels through:
+    /// unindexes the entry, unwinds descendant aggregates, and records
+    /// the lifecycle event. `now`/`height` are the caller's removal
+    /// context (0 where the path carries none).
+    fn remove_inner(
+        &mut self,
+        txid: &Txid,
+        cause: RemovalCause,
+        now: u32,
+        height: u32,
+    ) -> Option<MempoolEntry> {
         let entry = self.map.remove(txid)?;
         self.epoch += 1;
         self.unbroadcast.remove(txid);
@@ -2262,11 +2421,46 @@ impl Mempool {
         for ancestor in self.ancestors_of(&entry.tx) {
             self.adjust_descendant_totals(ancestor, -entry.modified_fee(), -(entry.vsize as i64));
         }
+        self.record_removal(&entry, cause, now, height);
         Some(entry)
+    }
+
+    /// Lifecycle bookkeeping for one removed entry: bump the per-cause
+    /// counter and append to the bounded ring.
+    fn record_removal(&mut self, entry: &MempoolEntry, cause: RemovalCause, now: u32, height: u32) {
+        match cause {
+            RemovalCause::Confirmed => self.lifecycle.confirmed += 1,
+            RemovalCause::BlockConflict => self.lifecycle.block_conflicts += 1,
+            RemovalCause::Replaced { .. } => self.lifecycle.replaced += 1,
+            RemovalCause::Evicted => self.lifecycle.evicted += 1,
+            RemovalCause::Expired => self.lifecycle.expired += 1,
+            RemovalCause::ReorgDrop => self.lifecycle.reorg_dropped += 1,
+            RemovalCause::Explicit => self.lifecycle.explicit += 1,
+        }
+        if self.lifecycle_ring.len() >= LIFECYCLE_RING_CAP {
+            self.lifecycle_ring.pop_front();
+        }
+        self.lifecycle_ring.push_back(LifecycleEvent {
+            txid: entry.tx.txid(),
+            cause,
+            fee: entry.fee,
+            vsize: entry.vsize,
+            admitted_at: entry.time,
+            removed_at: now,
+            removed_height: height,
+        });
     }
 
     /// Drops `txid` and every pooled descendant (depth-first).
     pub fn remove_recursive(&mut self, txid: &Txid) {
+        self.remove_recursive_inner(txid, RemovalCause::Explicit, 0, 0);
+    }
+
+    /// [`Self::remove_recursive`] carrying the removal's lifecycle
+    /// cause and context — every pooled descendant shares the root's
+    /// cause (a child can't outlive its parent in the pool, whatever
+    /// took the parent out).
+    fn remove_recursive_inner(&mut self, txid: &Txid, cause: RemovalCause, now: u32, height: u32) {
         // Children spend this tx's outputs — find them via the spends
         // index before removing.
         if let Some(entry) = self.map.get(txid) {
@@ -2281,10 +2475,10 @@ impl Mempool {
                 })
                 .collect();
             for child in children {
-                self.remove_recursive(&child);
+                self.remove_recursive_inner(&child, cause, now, height);
             }
         }
-        self.remove(txid);
+        self.remove_inner(txid, cause, now, height);
     }
 
     /// Core's `CTxMemPool::Expire`: drops every entry that has sat
@@ -2307,7 +2501,7 @@ impl Mempool {
         let before = self.map.len();
         for id in &stale {
             if self.map.contains_key(id) {
-                self.remove_recursive(id);
+                self.remove_recursive_inner(id, RemovalCause::Expired, now, 0);
             }
         }
         before - self.map.len()
@@ -2318,7 +2512,7 @@ impl Mempool {
     /// in-pool dependents must drop even though `tx` never made it in.
     /// The tx's outpoints are enumerable from the object, so its
     /// children are found via the spends index directly.
-    fn remove_dependents(&mut self, tx: &Transaction) {
+    fn remove_dependents(&mut self, tx: &Transaction, now: u32, height: u32) {
         let txid = tx.txid();
         let children: Vec<Txid> = (0..tx.outputs.len())
             .filter_map(|vout| {
@@ -2331,9 +2525,9 @@ impl Mempool {
             })
             .collect();
         for child in children {
-            self.remove_recursive(&child);
+            self.remove_recursive_inner(&child, RemovalCause::ReorgDrop, now, height);
         }
-        self.remove(&txid);
+        self.remove_inner(&txid, RemovalCause::ReorgDrop, now, height);
     }
 
     /// Marks `txid` as locally submitted but not yet requested by any
@@ -2357,6 +2551,28 @@ impl Mempool {
     #[must_use]
     pub fn unbroadcast_count(&self) -> usize {
         self.unbroadcast.len()
+    }
+
+    /// Cumulative lifecycle counters — `getmempoolinfo`'s `lifecycle`
+    /// object. Counts since pool start; the ring below holds only the
+    /// recent events.
+    #[must_use]
+    pub fn lifecycle_stats(&self) -> LifecycleStats {
+        self.lifecycle
+    }
+
+    /// The `last_n` most recent removal events, newest first — the
+    /// `getmempoolhistory` query: "what left my mempool lately, and
+    /// why" (what confirmed, what got RBF-bumped and by which tx, what
+    /// the trim evicted).
+    #[must_use]
+    pub fn lifecycle_events(&self, last_n: usize) -> Vec<LifecycleEvent> {
+        self.lifecycle_ring
+            .iter()
+            .rev()
+            .take(last_n)
+            .copied()
+            .collect()
     }
 
     /// Mempool-block projection (queue #32 — the mempool.space layer):
@@ -2443,9 +2659,7 @@ impl Mempool {
             return;
         }
         while self.broadcast_bytes + raw.len() > BROADCAST_POOL_BYTES {
-            let Some((&oldest, _)) =
-                self.broadcast.iter().min_by_key(|(_, e)| e.first_seen)
-            else {
+            let Some((&oldest, _)) = self.broadcast.iter().min_by_key(|(_, e)| e.first_seen) else {
                 break;
             };
             let old = self.broadcast.remove(&oldest).expect("present");
@@ -2454,7 +2668,12 @@ impl Mempool {
         self.broadcast_bytes += raw.len();
         self.broadcast.insert(
             txid,
-            BroadcastEntry { raw, first_seen: now, next_retry: now, attempts: 0 },
+            BroadcastEntry {
+                raw,
+                first_seen: now,
+                next_retry: now,
+                attempts: 0,
+            },
         );
     }
 
@@ -2557,14 +2776,16 @@ impl Mempool {
         // Core's `blockSinceLastRollingFeeBump = true`: a connected
         // block un-pauses the rolling-fee decay.
         self.block_since_rolling_fee_bump = true;
-        let mut dead: Vec<Txid> = Vec::new();
+        // Each entry leaves tagged with why: confirmed by the block
+        // itself, or double-spent by something the block confirmed.
+        let mut dead: Vec<(Txid, RemovalCause)> = Vec::new();
         for tx in &block.transactions {
             let txid = tx.txid();
             // Core's ClearPrioritisation — confirmation retires the
             // txid's delta slot.
             self.deltas.remove(&txid);
             if self.map.contains_key(&txid) {
-                dead.push(txid);
+                dead.push((txid, RemovalCause::Confirmed));
             }
             if tx.is_coinbase() {
                 continue;
@@ -2572,11 +2793,11 @@ impl Mempool {
             // Anything spending the same outpoint is now a double-spend.
             for input in &tx.inputs {
                 if let Some(&conflict) = self.spends.get(&input.previous_output) {
-                    dead.push(conflict);
+                    dead.push((conflict, RemovalCause::BlockConflict));
                 }
             }
         }
-        for id in &dead {
+        for (id, _) in &dead {
             // Feed the estimator before removal: (entry rate, wait).
             if let Some(entry) = self.map.get(id) {
                 let waited = conf_height.saturating_sub(entry.first_seen_height).max(1);
@@ -2584,8 +2805,8 @@ impl Mempool {
                     .observe(entry.fee * 1000 / entry.vsize.max(1) as i64, waited);
             }
         }
-        for id in dead {
-            self.remove_recursive(&id);
+        for (id, cause) in dead {
+            self.remove_recursive_inner(&id, cause, 0, conf_height);
         }
     }
 
@@ -2622,7 +2843,7 @@ impl Mempool {
                     // `removeRecursive`s it on failure so in-pool
                     // dependents don't outlive a lost parent.
                     self.orphans.remove(&tx.txid());
-                    self.remove_dependents(tx);
+                    self.remove_dependents(tx, now, cs.tree().tip().height);
                 }
             }
         }
@@ -4592,7 +4813,11 @@ mod tests {
         pool.set_require_standard(false);
         // Three txs: fat-fee, mid-fee, dust-fee — each spends its own
         // mature coinbase.
-        for (i, value) in [(1usize, 2_000_000_000i64), (2, 4_000_000_000), (3, 4_999_000_000)] {
+        for (i, value) in [
+            (1usize, 2_000_000_000i64),
+            (2, 4_000_000_000),
+            (3, 4_999_000_000),
+        ] {
             let tx = spend_tx(mature_outpoint(&blocks, i), value, SEQ_FINAL);
             pool.accept_tx(tx, &cs, NOW).unwrap();
         }
@@ -4622,8 +4847,14 @@ mod tests {
         // vout 1 the attacker's (2-party protocol shape).
         let mut v = spend_tx(mature_outpoint(&blocks, 1), 0, SEQ_RBF);
         v.outputs = vec![
-            TxOut { value: 2_400_000_000, script_pubkey: Script::new(vec![script::OP_1]) },
-            TxOut { value: 2_400_000_000, script_pubkey: Script::new(vec![script::OP_1]) },
+            TxOut {
+                value: 2_400_000_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            },
+            TxOut {
+                value: 2_400_000_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            },
         ];
         let v_id = v.txid();
         pool.accept_tx(v, &cs, NOW).unwrap();
@@ -4635,29 +4866,55 @@ mod tests {
             clean.set_require_standard(false);
             let mut v2 = spend_tx(mature_outpoint(&blocks, 1), 0, SEQ_RBF);
             v2.outputs = vec![
-                TxOut { value: 2_400_000_000, script_pubkey: Script::new(vec![script::OP_1]) },
-                TxOut { value: 2_400_000_000, script_pubkey: Script::new(vec![script::OP_1]) },
+                TxOut {
+                    value: 2_400_000_000,
+                    script_pubkey: Script::new(vec![script::OP_1]),
+                },
+                TxOut {
+                    value: 2_400_000_000,
+                    script_pubkey: Script::new(vec![script::OP_1]),
+                },
             ];
             let v2_id = v2.txid();
             clean.accept_tx(v2, &cs, NOW).unwrap();
             let bump = spend_tx(
-                OutPoint { txid: v2_id, vout: 0 }, 2_399_000_000, SEQ_FINAL);
-            assert!(clean.accept_tx(bump, &cs, NOW).is_ok(),
-                "un-pinned bump must be accepted");
+                OutPoint {
+                    txid: v2_id,
+                    vout: 0,
+                },
+                2_399_000_000,
+                SEQ_FINAL,
+            );
+            assert!(
+                clean.accept_tx(bump, &cs, NOW).is_ok(),
+                "un-pinned bump must be accepted"
+            );
         }
 
         // The attack: fan a tree of junk descendants off vout 1 —
         // each junk tx has 2 outputs, a work-queue of spendable
         // outpoints keeps ancestor depth shallow (a linear chain hits
         // the ancestor cap at 24 before pinning V).
-        let mut frontier = vec![(OutPoint { txid: v_id, vout: 1 }, 2_400_000_000i64)];
+        let mut frontier = vec![(
+            OutPoint {
+                txid: v_id,
+                vout: 1,
+            },
+            2_400_000_000i64,
+        )];
         for _ in 0..DESCENDANT_LIMIT {
             let (op, in_val) = frontier.remove(0);
             let out_val = in_val - 10_000;
             let mut junk = spend_tx(op, 0, SEQ_FINAL);
             junk.outputs = vec![
-                TxOut { value: out_val / 2, script_pubkey: Script::new(vec![script::OP_1]) },
-                TxOut { value: out_val - out_val / 2, script_pubkey: Script::new(vec![script::OP_1]) },
+                TxOut {
+                    value: out_val / 2,
+                    script_pubkey: Script::new(vec![script::OP_1]),
+                },
+                TxOut {
+                    value: out_val - out_val / 2,
+                    script_pubkey: Script::new(vec![script::OP_1]),
+                },
             ];
             let jid = junk.txid();
             pool.accept_tx(junk, &cs, NOW).unwrap();
@@ -4666,15 +4923,28 @@ mod tests {
         }
 
         // The pin: victim's own child off vout 0 — REJECTED.
-        let bump = spend_tx(OutPoint { txid: v_id, vout: 0 }, 2_399_000_000, SEQ_FINAL);
+        let bump = spend_tx(
+            OutPoint {
+                txid: v_id,
+                vout: 0,
+            },
+            2_399_000_000,
+            SEQ_FINAL,
+        );
         assert!(
-            matches!(pool.accept_tx(bump, &cs, NOW), Err(MempoolReject::PackageLimits)),
+            matches!(
+                pool.accept_tx(bump, &cs, NOW),
+                Err(MempoolReject::PackageLimits)
+            ),
             "the pin works: victim cannot fee-bump their own tx"
         );
         // The oracle catches it: V sits at the cap, every junk tx
         // reports its own descendant load.
         let risk = pool.pinning_risk(0);
-        assert!(risk.iter().any(|(t, n)| *t == v_id && *n == DESCENDANT_LIMIT));
+        assert!(
+            risk.iter()
+                .any(|(t, n)| *t == v_id && *n == DESCENDANT_LIMIT)
+        );
         // A margin of 0 flags only capped txs; margin 5 also catches
         // the near-cap spine of the attack tree.
         assert!(pool.pinning_risk(5).len() >= risk.len());
@@ -4719,5 +4989,193 @@ mod tests {
             matches!(pool.accept_tx(bump, &cs, NOW), Err(MempoolReject::Conflict)),
             "the pin works: modest bump priced out by the huge conflict"
         );
+    }
+
+    /// Lifecycle: admission verdicts are counted — accepts under
+    /// `accepted`, hard rejects under `rejected`, input-resolution
+    /// failures under `parked_orphans`.
+    #[test]
+    fn lifecycle_counts_admission_verdicts() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        let op = mature_outpoint(&blocks, 1);
+        pool.accept_tx(spend_tx(op, 4_999_000_000, SEQ_RBF), &cs, NOW)
+            .unwrap();
+        // Underpaying double-spend → rejected (fee rule).
+        let weak = spend_tx(op, 4_999_500_000, SEQ_RBF);
+        assert!(pool.accept_tx(weak, &cs, NOW).is_err());
+        // Unresolvable input → parked orphan.
+        let orphan = spend_tx(
+            OutPoint {
+                txid: Txid::ZERO,
+                vout: 0,
+            },
+            1_000,
+            SEQ_FINAL,
+        );
+        assert_eq!(
+            pool.accept_tx(orphan, &cs, NOW),
+            Err(MempoolReject::InputsMissingOrSpent)
+        );
+        let s = pool.lifecycle_stats();
+        assert_eq!(s.accepted, 1);
+        assert_eq!(s.rejected, 1);
+        assert_eq!(s.parked_orphans, 1);
+    }
+
+    /// Lifecycle: a replacement is counted once as an admission
+    /// (`replacements`) and once per torn-out entry (`replaced`), and
+    /// the ring event carries the replacing txid.
+    #[test]
+    fn lifecycle_records_replacement_linkage() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        let op = mature_outpoint(&blocks, 1);
+        // Parent + child package so one replacement tears out two
+        // entries — `replaced` counts entries, `replacements` the bump.
+        let parent = spend_tx(op, 4_999_000_000, SEQ_RBF); // 1k fee
+        let parent_id = pool.accept_tx(parent, &cs, NOW).unwrap();
+        let child = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            4_998_000_000,
+            SEQ_RBF,
+        ); // 1k fee
+        let child_id = pool.accept_tx(child, &cs, NOW).unwrap();
+
+        let bump = spend_tx(op, 4_997_000_000, SEQ_RBF); // 3k fee > 1k+1k+bump
+        let bump_id = pool.accept_tx(bump, &cs, NOW).unwrap();
+        let s = pool.lifecycle_stats();
+        assert_eq!(s.replacements, 1, "one admitted replacement");
+        assert_eq!(s.replaced, 2, "conflict + its descendant both left");
+        let events = pool.lifecycle_events(8);
+        // Both removals tag the bumper's txid. Depth-first removal
+        // records the child first, so the parent is the newest event.
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].txid, parent_id);
+        assert_eq!(events[1].txid, child_id);
+        for e in &events {
+            assert_eq!(e.cause, RemovalCause::Replaced { by: bump_id });
+            assert_eq!(e.removed_at, NOW);
+        }
+    }
+
+    /// Lifecycle: block-connect distinguishes confirmed entries from
+    /// entries double-spent by the block.
+    #[test]
+    fn lifecycle_distinguishes_confirmed_from_block_conflict() {
+        let (mut cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        let params = Network::Regtest.params();
+        let confirmed = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let confirmed_id = confirmed.txid();
+        pool.accept_tx(confirmed.clone(), &cs, NOW).unwrap();
+        let conflict_op = mature_outpoint(&blocks, 2);
+        let conflict = spend_tx(conflict_op, 4_999_000_000, SEQ_FINAL);
+        let conflict_id = conflict.txid();
+        pool.accept_tx(conflict, &cs, NOW).unwrap();
+
+        let mut block = block_on(&cs.tree().tip().header, 102, &params);
+        block.transactions = vec![
+            coinbase_tx(102),
+            confirmed,
+            spend_tx(conflict_op, 4_999_500_000, SEQ_FINAL),
+        ];
+        let (root, _) = block.merkle_root();
+        block.header.merkle_root = root;
+        while pow::check_proof_of_work(&block.block_hash(), block.header.bits, &params).is_err() {
+            block.header.nonce += 1;
+        }
+        cs.accept_block(&block, NOW + 200).unwrap();
+        pool.on_block_connected(&block, 102);
+
+        let s = pool.lifecycle_stats();
+        assert_eq!(s.confirmed, 1);
+        assert_eq!(s.block_conflicts, 1);
+        let events = pool.lifecycle_events(8);
+        let by_txid: HashMap<Txid, RemovalCause> =
+            events.iter().map(|e| (e.txid, e.cause)).collect();
+        assert_eq!(by_txid[&confirmed_id], RemovalCause::Confirmed);
+        assert_eq!(by_txid[&conflict_id], RemovalCause::BlockConflict);
+        // Height context is the confirmation height.
+        for e in &events {
+            assert_eq!(e.removed_height, 102);
+        }
+    }
+
+    /// Lifecycle: the expiry sweep tags entries `Expired`, including
+    /// descendants swept with a stale parent.
+    #[test]
+    fn lifecycle_counts_expiry() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        let parent_id = accept_chain(
+            &mut pool,
+            &cs,
+            mature_outpoint(&blocks, 1),
+            1,
+            4_999_000_000,
+        );
+        let expired_at = NOW + DEFAULT_MEMPOOL_EXPIRY_SECS + 1;
+        assert_eq!(pool.expire(expired_at), 2);
+        let s = pool.lifecycle_stats();
+        assert_eq!(s.expired, 2, "parent + descendant both expired");
+        let events = pool.lifecycle_events(8);
+        assert!(events.iter().all(|e| e.cause == RemovalCause::Expired));
+        assert!(events.iter().any(|e| e.txid == parent_id));
+    }
+
+    /// Lifecycle: the capacity trim tags the evicted cluster `Evicted`.
+    #[test]
+    fn lifecycle_counts_eviction() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        let weak = spend_tx(mature_outpoint(&blocks, 1), 4_999_999_000, SEQ_FINAL);
+        let weak_id = weak.txid();
+        pool.set_max_bytes(weak.encode().len() + 8);
+        pool.accept_tx(weak, &cs, NOW).unwrap();
+        // The rich tx forces the byte cap and evicts `weak`.
+        let rich = spend_tx(mature_outpoint(&blocks, 2), 1_000, SEQ_FINAL);
+        pool.accept_tx(rich, &cs, NOW).unwrap();
+        let s = pool.lifecycle_stats();
+        assert_eq!(s.evicted, 1);
+        let events = pool.lifecycle_events(8);
+        assert_eq!(events[0].txid, weak_id);
+        assert_eq!(events[0].cause, RemovalCause::Evicted);
+    }
+
+    /// Lifecycle: the ring is bounded at LIFECYCLE_RING_CAP — oldest
+    /// events drop first; counters are unaffected by the cap.
+    #[test]
+    fn lifecycle_ring_is_bounded() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        // Pre-fill the ring to capacity with synthetic events.
+        let filler = LifecycleEvent {
+            txid: Txid::ZERO,
+            cause: RemovalCause::Explicit,
+            fee: 0,
+            vsize: 0,
+            admitted_at: 0,
+            removed_at: 0,
+            removed_height: 0,
+        };
+        for _ in 0..LIFECYCLE_RING_CAP {
+            pool.lifecycle_ring.push_back(filler);
+        }
+        // One real removal must keep the ring at cap and drop the
+        // oldest filler.
+        let op = mature_outpoint(&blocks, 1);
+        let id = pool
+            .accept_tx(spend_tx(op, 4_999_000_000, SEQ_FINAL), &cs, NOW)
+            .unwrap();
+        pool.remove_recursive(&id);
+        assert_eq!(pool.lifecycle_ring.len(), LIFECYCLE_RING_CAP);
+        let events = pool.lifecycle_events(1);
+        assert_eq!(events[0].txid, id);
+        assert_eq!(events[0].cause, RemovalCause::Explicit);
+        assert_eq!(pool.lifecycle_stats().explicit, 1);
     }
 }

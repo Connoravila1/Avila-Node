@@ -25,6 +25,7 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 | 16 | 09-23 | Crash fault-injection on hash engine | Commit ordering survives torn writes | **2 findings, both fixed** | torn records decoded to wrong-but-valid coins (silent corruption) → +4B keyed record tag, tears now misses; coins-ahead-of-tip tear invisible → index-header watermark, open errors loudly. File-level sim; compact() still unsafe | [fault-inject](2026-09-23-fault-injection.md) |
 
 
+| 60 | 09-24 | Mempool tx-lifecycle / RBF ledger | Can the node answer "what happened to every tx" natively? | **adopted — closes queue #32** | Every removal path tags its cause (`RemovalCause`: confirmed, block-conflict, replaced{by}, evicted, expired, reorg-drop, explicit) — recorded inside `remove_inner`, the one funnel all removals pass through. `LifecycleStats` counters (accepted/rejected/parked_orphans/replacements + per-cause removals) ride in `getmempoolinfo.lifecycle`; a bounded 4096-deep ring backs `getmempoolhistory` (newest first, RBF events carry the replacing txid). 6 tests: verdict counting, replacement linkage (conflict+descendant both tagged), confirmed-vs-block-conflict, expiry, eviction, ring bound. | — |
 | 59 | 09-24 | Process sandboxing (minimal) | Can the node take a real OS-level defense without new risk? | **adopted — no_new_privs always-on** | `prctl(PR_SET_NO_NEW_PRIVS)` at sync start via the `prctl` crate (workspace forbids unsafe). A wire-parser compromise lands in a process that can never escalate via setuid/file caps — and the node never execve()s, so it costs nothing. seccomp syscall filtering and Landlock datadir scoping stay open (bigger dep surface). | — |
 | 58 | 09-24 | Fail-closed proof (unit) | Can "no clearnet when proxied" be tested, not assumed? | **yes — test shipped** | Mock SOCKS5 listener records connections; a routable candidate + refused proxy greeting yields: proxy saw the dial, zero peers established. A clearnet bypass would be observable as "proxy saw nothing". The 24h live packet-capture artifact stays open. | — |
 | 57 | 09-24 | Fail-closed proxy | Does `-proxy` actually cover all outbound traffic? | **fixed a real leak** | `SyncConfig.proxy` covered only `--connect` peers — `maintain_outbounds`' dial worker connected clearnet regardless, and `seed_from_dns` resolved locally. Now every automatic dial routes through the SOCKS5 proxy (no clearnet fallback — a dead proxy = no peers, not a leak) and DNS seeding is skipped under proxy (Core's `-onlynet=onion` model). | — |
@@ -232,7 +233,7 @@ first measurement that would kill or confirm it.
     First measurement: what fraction of fixture coins die within the
     sync window.
 
-32. ~~**Built-in mempool analytics.**~~ **done — #51 (projection shipped; tx-lifecycle/RBF tracking open).** The mempool.space layer native:
+32. ~~**Built-in mempool analytics.**~~ **done — #51 + #60.** The mempool.space layer native:
     mempool-block fee forecast, tx lifecycle/RBF tracking, pinning
     surface (compounds with #16). People stand up docker+mysql+electrs
     for this today.
