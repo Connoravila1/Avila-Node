@@ -208,7 +208,17 @@ fn copy_tree(src: &Path, dst: &Path, files: &mut Vec<String>) -> Result<(), Box<
     for e in std::fs::read_dir(src)? {
         let e = e?;
         let to = dst.join(e.file_name());
-        if e.file_type()?.is_dir() {
+        let file_type = e.file_type()?;
+        if file_type.is_symlink() {
+            // `fs::copy` dereferences a symlink and materializes
+            // whatever it points to as a plain file — a link pointing
+            // outside the tree (or at something unbounded, like a
+            // device file) would let a crafted datadir or backup pull
+            // in unrelated data instead of just copying the tree.
+            eprintln!("warning: skipping symlink {}", e.path().display());
+            continue;
+        }
+        if file_type.is_dir() {
             copy_tree(&e.path(), &to, files)?;
         } else {
             std::fs::copy(e.path(), &to)?;

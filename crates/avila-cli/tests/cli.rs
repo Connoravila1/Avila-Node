@@ -230,3 +230,60 @@ fn migrate_reports_truncated_index_files_instead_of_panicking() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+#[cfg(unix)]
+fn backup_skips_symlinks_instead_of_dereferencing_them() {
+    let root = scratch_dir("backup-symlink");
+    let config = write_config(&root);
+    let live = root.join("data").join("regtest");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(live.join("real.dat"), b"real-content").unwrap();
+    // Outside the datadir entirely — copy_tree following this would
+    // pull unrelated data into the backup under an innocuous name.
+    let secret = root.join("outside-secret.txt");
+    std::fs::write(&secret, b"outside-secret").unwrap();
+    std::os::unix::fs::symlink(&secret, live.join("link.dat")).unwrap();
+
+    let dest = root.join("backup_out");
+    let output = cli()
+        .args(["--config", config.to_str().unwrap(), "backup"])
+        .arg(&dest)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("skipping symlink"), "{stderr}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let target = stdout
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("Backed up ")
+                .and_then(|r| r.split_once(" file(s) to "))
+        })
+        .map(|(_, path)| PathBuf::from(path))
+        .expect("backup summary line");
+
+    assert_eq!(
+        std::fs::read(target.join("real.dat")).unwrap(),
+        b"real-content"
+    );
+    assert!(
+        !target.join("link.dat").exists(),
+        "the symlink must not be materialized in the backup"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(target.join("backup-manifest.json")).unwrap())
+            .unwrap();
+    let files: Vec<&str> = manifest["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(files.contains(&"real.dat"));
+    assert!(!files.contains(&"link.dat"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
