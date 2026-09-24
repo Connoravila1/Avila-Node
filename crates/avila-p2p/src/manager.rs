@@ -60,6 +60,24 @@ const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
 /// only the passive refill applies today.
 const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1000.0;
 
+/// Core's `HEADERS_DOWNLOAD_TIMEOUT_BASE` — the fixed floor of the
+/// overall deadline the headers-sync leader has to catch us up, on top
+/// of a per-estimated-missing-header allowance
+/// ([`HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER`]). Unlike
+/// [`crate::sync::HEADERS_RESPONSE_TIME`] (one outstanding request),
+/// this bounds the *whole* sync-from-this-leader effort, so a leader
+/// that keeps answering promptly but never actually catches us up —
+/// e.g. one stuck feeding an endlessly-abandoned low-work chain —
+/// still eventually loses leadership.
+const HEADERS_DOWNLOAD_TIMEOUT_BASE: Duration = Duration::from_secs(15 * 60);
+/// Core's `HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER` — additional allowance
+/// per header we estimate we're missing (from how stale our best
+/// header is relative to the network's target block spacing).
+const HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER: Duration = Duration::from_millis(1);
+/// Core's "caught up enough that the sync-peer timeout no longer
+/// applies" window: `m_best_header->Time() > now - 24h`.
+const RECENT_HEADER_WINDOW_SECS: u32 = 24 * 60 * 60;
+
 /// What one peer's removal meant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DisconnectReason {
@@ -240,6 +258,13 @@ pub struct PeerManager<S> {
     /// others get one locator to learn their view. Core's sync-peer
     /// discipline: N parallel header downloads fetch the same ranges.
     headers_leader: Option<u64>,
+    /// The current leader's overall deadline to catch us up (Core's
+    /// `Peer::m_headers_sync_timeout`) — armed lazily the first tick a
+    /// peer is observed as leader, cleared whenever leadership is.
+    /// Independent of any single outstanding request's timeout
+    /// ([`crate::sync::PeerSync::headers_timed_out`]): this bounds the
+    /// whole sync-from-this-leader effort.
+    headers_sync_deadline: Option<Instant>,
     /// Aggregate bound on block reservations across all peers —
     /// defaults to [`MAX_BLOCKS_IN_TRANSIT_TOTAL`].
     max_in_flight_total: usize,
@@ -354,6 +379,7 @@ impl<S: Read + Write> PeerManager<S> {
             next_id: 0,
             max_peers,
             headers_leader: None,
+            headers_sync_deadline: None,
             max_in_flight_total: MAX_BLOCKS_IN_TRANSIT_TOTAL,
             addrbook: AddrBook::new(),
             mempool: avila_mempool::Mempool::new(),
@@ -662,10 +688,17 @@ impl<S: Read + Write> PeerManager<S> {
             peers,
             addrbook,
             headers_leader,
+            headers_sync_deadline,
             mempool,
             outbound_nonces,
             ..
         } = self;
+        // Core's `m_num_preferred_download_peers - state.fPreferredDownload
+        // >= 1`: the sync-peer timeout below only ever fires an established
+        // peer if there's at least one *other* established peer to hand
+        // leadership to — never abandon our only source of headers just
+        // because it's slow.
+        let established_count = peers.values().filter(|p| p.session.established()).count();
         let mut announce_tip: Option<u64> = None;
         // txid/wtxid to relay at end of tick, and the peer it came from.
         let mut announce_tx: Option<(
@@ -690,6 +723,7 @@ impl<S: Read + Write> PeerManager<S> {
                             now,
                             addrbook,
                             headers_leader,
+                            headers_sync_deadline,
                             &mut announce_tip,
                             &mut announce_tx,
                             mempool,
@@ -711,6 +745,24 @@ impl<S: Read + Write> PeerManager<S> {
                     peer.ping_outstanding = Some((nonce, Instant::now()));
                 }
             }
+            // The current leader's overall catch-up deadline (Core's
+            // sync-peer timeout): armed lazily the first tick a peer is
+            // seen holding leadership (freshly armed, so never
+            // immediately exceeded), then checked every tick after.
+            // This is independent of `headers_timed_out` above — a
+            // leader that keeps answering every single request
+            // promptly, but never actually finishes catching us up
+            // (e.g. cycling through abandoned low-work syncs), would
+            // otherwise never trip that per-request timeout at all.
+            if *headers_leader == Some(id) {
+                let deadline = *headers_sync_deadline
+                    .get_or_insert_with(|| headers_download_deadline(cs, now));
+                let caught_up =
+                    cs.tree().tip().header.time > now.saturating_sub(RECENT_HEADER_WINDOW_SECS);
+                if !caught_up && Instant::now() > deadline && established_count > 1 {
+                    dead.push((id, DisconnectReason::Stalled));
+                }
+            }
             // Stall eviction: a block download that's gone quiet, or an
             // outstanding `getheaders` that has gone unanswered past
             // Core's `HEADERS_RESPONSE_TIME`. The latter matters even
@@ -729,6 +781,7 @@ impl<S: Read + Write> PeerManager<S> {
             self.drop_peer(id);
             if self.headers_leader == Some(id) {
                 self.headers_leader = None;
+                self.headers_sync_deadline = None;
             }
             events.push(NetEvent::Disconnected { peer: id, reason });
         }
@@ -966,6 +1019,7 @@ impl<S: Read + Write> PeerManager<S> {
         now: u32,
         addrbook: &mut AddrBook,
         headers_leader: &mut Option<u64>,
+        headers_sync_deadline: &mut Option<Instant>,
         announce_tip: &mut Option<u64>,
         announce_tx: &mut Option<(
             u64,
@@ -1011,6 +1065,17 @@ impl<S: Read + Write> PeerManager<S> {
                             && let Some(node) = cs.tree().get(&last.hash())
                         {
                             peer.synced_header_height = i64::from(node.height);
+                        }
+                        // This peer's low-work sync just ended without
+                        // proving enough work (abandoned, or ran out of
+                        // chain below the anti-DoS threshold) — if it
+                        // was leading headers sync, release leadership
+                        // right away rather than waiting for either
+                        // timeout, so `fill_queues` hands paging to
+                        // another peer on this same tick.
+                        if outcome.give_up_leadership && *headers_leader == Some(id) {
+                            *headers_leader = None;
+                            *headers_sync_deadline = None;
                         }
                         if let Some(next) = outcome.continuation {
                             // Only the headers leader keeps paging — Core
@@ -2071,6 +2136,21 @@ fn addr_v2_of(addr: &NetAddr, now: u32) -> AddrV2Entry {
         addr: bytes,
         port: addr.port,
     }
+}
+
+/// Core's sync-peer arming (`SendMessages`): estimates how many headers
+/// we're likely missing from how stale our best header's timestamp is
+/// relative to the network's target spacing, and grants the leader
+/// [`HEADERS_DOWNLOAD_TIMEOUT_BASE`] plus that many multiples of
+/// [`HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER`] to catch us up.
+fn headers_download_deadline(cs: &Chainstate, now: u32) -> Instant {
+    let params = cs.tree().params();
+    let best_header_time = cs.tree().tip().header.time;
+    let elapsed_secs = u64::from(now.saturating_sub(best_header_time));
+    let estimated_headers = elapsed_secs / params.pow_target_spacing.max(1);
+    let per_header =
+        HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER * u32::try_from(estimated_headers).unwrap_or(u32::MAX);
+    Instant::now() + HEADERS_DOWNLOAD_TIMEOUT_BASE + per_header
 }
 
 #[cfg(test)]
