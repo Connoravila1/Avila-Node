@@ -234,12 +234,16 @@ impl SortedRun {
 /// record bytes, so building the UTXO set is an index-only pass:
 /// sample every `stride`-th `(key -> file offset)` and seek-read coins
 /// on demand. ~15MB of index for 170M coins; zero bulk writes.
+#[derive(Debug)]
 pub struct SnapshotRun {
     f: std::sync::Mutex<File>,
     /// Sorted sparse index: key -> byte offset of that coin's wire body
     /// region (points at the coin's vout varint — the record start).
     sparse: Vec<([u8; 36], u64)>,
     count: u64,
+    /// File length — the read window must clamp at EOF (the last
+    /// group's window is always partial).
+    file_len: u64,
 }
 
 impl SnapshotRun {
@@ -248,10 +252,12 @@ impl SnapshotRun {
         sparse: Vec<([u8; 36], u64)>,
         count: u64,
     ) -> Self {
+        let file_len = snap.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
         Self {
             f: std::sync::Mutex::new(snap),
             sparse,
             count,
+            file_len,
         }
     }
 
@@ -283,8 +289,10 @@ impl SnapshotRun {
         let f = self.f.lock().ok()?;
         // The sparse offset points at a vout varint mid-group; the key
         // may sit anywhere in the following `stride` records. Walk
-        // record-by-record: vout compact-size + wire body.
-        f.read_exact_at(&mut buf, off).ok()?;
+        // record-by-record: vout compact-size + wire body. Clamp the
+        // window at EOF — the last group's read is always partial.
+        let n = (self.file_len - off).min(cap as u64) as usize;
+        f.read_exact_at(&mut buf[..n], off).ok()?;
         // txid is implicit (32B before each group) — but our offset is
         // mid-group, so the txid for THIS group isn't at `off`. We
         // store sparse entries at *vout varints* — recover txid by
@@ -298,20 +306,35 @@ impl SnapshotRun {
         let mut pos = 0usize;
         let mut cur_txid = [0u8; 32];
         // First record in window starts a txid group: read txid32+count.
+        if pos + 33 > n {
+            return None;
+        }
         cur_txid.copy_from_slice(&buf[pos..pos + 32]);
         pos += 32;
         let mut group_left = cs(&buf, &mut pos) as usize;
         loop {
             if group_left == 0 {
+                if pos + 33 > n {
+                    return None; // window/EOF — no full group header left
+                }
                 cur_txid.copy_from_slice(&buf[pos..pos + 32]);
                 pos += 32;
                 group_left = cs(&buf, &mut pos) as usize;
+                if group_left == 0 {
+                    return None; // zero-count group — past real data
+                }
+            }
+            if pos + 4 > n {
+                return None; // no room for vout + varints
             }
             let vout = cs(&buf, &mut pos) as u32;
             let body_start = pos;
             let mut varints = [0u64; 3];
             for v in varints.iter_mut() {
                 loop {
+                    if pos >= n {
+                        return None;
+                    }
                     let c = buf[pos];
                     *v = (*v << 7) | u64::from(c & 0x7f);
                     pos += 1;
@@ -325,8 +348,11 @@ impl SnapshotRun {
             let plen = match varints[2] {
                 0 | 1 => 20usize,
                 2 | 3 | 4 | 5 => 32usize,
-                n => (n - 6) as usize,
+                x => (x - 6) as usize,
             };
+            if pos + plen > n {
+                return None; // body runs past the read window
+            }
             if cur_txid == *op.txid.as_bytes() && vout == op.vout {
                 return crate::coinsdb::decode_coin(
                     &buf[body_start..pos + plen],
@@ -342,12 +368,142 @@ impl SnapshotRun {
             }
             pos += plen;
             group_left -= 1;
-            if pos + 128 > buf.len() {
+            if pos + 33 > n {
                 return None; // window exhausted
             }
         }
     }
+
+    /// Builds the sparse index by a sequential scan of a Core-format
+    /// snapshot file — the no-bundle path: anyone holding the public
+    /// snapshot can produce the index themselves (advice invariants).
+    /// `stride` groups per index entry; the bench's parallel indexer is
+    /// the fast path, this is the portable fallback.
+    ///
+    /// File layout after the 51-byte header: txid-grouped records of
+    /// `[txid32][count compactsize][vout cs + 3 Core-VARINTs + script]`.
+    /// Sparse keys are each sampled group's first outpoint.
+    pub fn index(path: &Path, stride: u32) -> io::Result<Self> {
+        let f = File::open(path)?;
+        let file_len = f.metadata()?.len();
+        let mut hdr = [0u8; 51];
+        f.read_exact_at(&mut hdr, 0)?;
+        if &hdr[..5] != b"utxo\xff" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a utxo snapshot (bad magic)",
+            ));
+        }
+        let mut coins_left = u64::from_le_bytes(hdr[43..51].try_into().unwrap());
+        let stride = stride.max(1) as u64;
+
+        // Sliding 1 MiB window over the coin stream — sequential I/O,
+        // positions tracked as absolute file offsets.
+        const WIN: usize = 1 << 20;
+        let mut buf = vec![0u8; WIN];
+        let mut win_off = 51u64;
+        let mut win_len = 0usize;
+        let mut pos = 51u64;
+        let need = |p: u64, f: &File, buf: &mut Vec<u8>, win_off: &mut u64, win_len: &mut usize| -> io::Result<()> {
+            if p < *win_off || p as usize + 256 > (*win_off as usize) + *win_len {
+                *win_off = p;
+                let n = (file_len - p).min(WIN as u64) as usize;
+                f.read_exact_at(&mut buf[..n], p)?;
+                *win_len = n;
+            }
+            Ok(())
+        };
+        let byte_at = |p: u64, f: &File, buf: &mut Vec<u8>, win_off: &mut u64, win_len: &mut usize| -> io::Result<u8> {
+            need(p, f, buf, win_off, win_len)?;
+            Ok(buf[(p - *win_off) as usize])
+        };
+        let read_cs = |p: &mut u64, f: &File, buf: &mut Vec<u8>, win_off: &mut u64, win_len: &mut usize| -> io::Result<u64> {
+            let c = byte_at(*p, f, buf, win_off, win_len)?;
+            *p += 1;
+            Ok(match c {
+                0xfd => {
+                    need(*p, f, buf, win_off, win_len)?;
+                    let v = u16::from_le_bytes(buf[(*p - *win_off) as usize..(*p - *win_off) as usize + 2].try_into().unwrap()) as u64;
+                    *p += 2;
+                    v
+                }
+                0xfe => {
+                    need(*p, f, buf, win_off, win_len)?;
+                    let v = u32::from_le_bytes(buf[(*p - *win_off) as usize..(*p - *win_off) as usize + 4].try_into().unwrap()) as u64;
+                    *p += 4;
+                    v
+                }
+                0xff => {
+                    need(*p, f, buf, win_off, win_len)?;
+                    let v = u64::from_le_bytes(buf[(*p - *win_off) as usize..(*p - *win_off) as usize + 8].try_into().unwrap());
+                    *p += 8;
+                    v
+                }
+                _ => c as u64,
+            })
+        };
+        // Core VARINT: continuation adds 1 per level.
+        let read_varint = |p: &mut u64, f: &File, buf: &mut Vec<u8>, win_off: &mut u64, win_len: &mut usize| -> io::Result<u64> {
+            let mut v = 0u64;
+            loop {
+                let c = byte_at(*p, f, buf, win_off, win_len)?;
+                *p += 1;
+                v = (v << 7) | u64::from(c & 0x7f);
+                if c & 0x80 != 0 {
+                    v += 1;
+                } else {
+                    return Ok(v);
+                }
+            }
+        };
+
+        let mut sparse: Vec<([u8; 36], u64)> = Vec::new();
+        let mut count = 0u64;
+        let mut groups = 0u64;
+        while coins_left > 0 {
+            need(pos, &f, &mut buf, &mut win_off, &mut win_len)?;
+            let group_off = pos;
+            let base = (pos - win_off) as usize;
+            let mut first_key = [0u8; 36];
+            first_key[..32].copy_from_slice(&buf[base..base + 32]);
+            pos += 32;
+            let cnt = read_cs(&mut pos, &f, &mut buf, &mut win_off, &mut win_len)?;
+            let save = pos;
+            let v0 = read_cs(&mut pos, &f, &mut buf, &mut win_off, &mut win_len)? as u32;
+            first_key[32..].copy_from_slice(&v0.to_le_bytes());
+            if groups.is_multiple_of(stride) {
+                sparse.push((first_key, group_off));
+            }
+            groups += 1;
+            pos = save;
+            for _ in 0..cnt {
+                let _vout = read_cs(&mut pos, &f, &mut buf, &mut win_off, &mut win_len)?;
+                let mut varints = [0u64; 3];
+                for v in varints.iter_mut() {
+                    *v = read_varint(&mut pos, &f, &mut buf, &mut win_off, &mut win_len)?;
+                }
+                let plen = match varints[2] {
+                    0 | 1 => 20u64,
+                    2 | 3 | 4 | 5 => 32u64,
+                    n => n - 6,
+                };
+                pos += plen;
+                count += 1;
+                coins_left -= 1;
+            }
+        }
+        Ok(Self {
+            f: std::sync::Mutex::new(f),
+            sparse,
+            count,
+            file_len,
+        })
+    }
+
+
 }
+
+
 
 /// Compact-size decode at buf[pos..] — returns value, advances pos.
 fn cs(buf: &[u8], pos: &mut usize) -> u64 {

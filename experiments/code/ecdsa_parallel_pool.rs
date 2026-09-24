@@ -13,7 +13,8 @@
                 self.experimental_active.fetch_add(1, Ordering::AcqRel);
                 q.drain(..count).collect::<Vec<_>>()
             };
-            let results = crate::experimental_advice::group(|| {
+            let estimate = jobs.iter().map(|job| job.tx.inputs.len()).sum();
+            let results = crate::experimental_advice::group(estimate, || {
                 let results: Vec<_> = jobs.iter().map(|job| {
                     check_input_scripts(&job.tx, &job.outs, job.flags)
                 }).collect();

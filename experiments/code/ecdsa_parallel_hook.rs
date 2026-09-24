@@ -326,11 +326,13 @@ pub fn group_capacity() -> usize {
 
 /// Run a bounded group of immutable transactions. The caller owns them until
 /// this function returns, and must not complete BlockCheck earlier.
-pub fn group<T>(mut work: impl FnMut() -> (T, bool)) -> T {
+pub fn group<T>(estimated_checks: usize, mut work: impl FnMut() -> (T, bool)) -> T {
     let Some(session) = SESSION.get() else {
         return work().0;
     };
-    let mode = if session.disabled.load(Ordering::Acquire) {
+    let mode = if session.disabled.load(Ordering::Acquire)
+        || (session.mode == Mode::Candidate && estimated_checks < session.minimum)
+    {
         Mode::Baseline
     } else {
         session.mode
@@ -407,7 +409,7 @@ pub fn transaction(
     if GROUP.with_borrow(|slot| slot.is_some()) {
         run()
     } else {
-        group(|| {
+        group(tx.inputs.len(), || {
             let result = run();
             let error = result.is_err();
             (result, error)

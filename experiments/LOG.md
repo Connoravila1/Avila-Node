@@ -25,6 +25,11 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 | 16 | 09-23 | Crash fault-injection on hash engine | Commit ordering survives torn writes | **2 findings, both fixed** | torn records decoded to wrong-but-valid coins (silent corruption) → +4B keyed record tag, tears now misses; coins-ahead-of-tip tear invisible → index-header watermark, open errors loudly. File-level sim; compact() still unsafe | [fault-inject](2026-09-23-fault-injection.md) |
 
 
+| 32 | 09-24 | Parallel ECDSA advice with bounded recovery | Does the replay gain survive eight workers, bad hints and durable state? | **qualified offline prototype; not enabled in production** | 3 repeats: mainnet Script CPU 25.05 → 19.29 s (−23.0%), elapsed 19.80 → 16.43 s (−17.0%); complete regtest CPU −7.2% RAM / −5.3% disk+reopen. All-corrupt advice retries 7,351/183,782 checks in 8 bounded groups, +2.5% CPU vs ordinary. 93 replay runs + 10 additional checks; invalid-spend rollback and UTXO hashes pass; 479 unit tests pass, 2 existing ignores. Tradeoffs: sampled summed RSS 59 → 180 MiB; framed sidecar 3.57 MB; two-pass preparation 54.38 s. Full mainnet IBD unmeasured. | [parallel-replay](2026-09-24-ecdsa-parallel-replay.md) |
+
+| 32 | 09-24 | Live network sync (signet) | Can the node sync against real peers? | **works — fetch scheduling is the limiter** | Signet, DNS-seeded: 208 blocks connected in 15.4s; resumed run reached 1124 blocks/66k headers in 640s (~1.7 blk/s — in-flight stays 0-96, scheduler conservative; validation never the bottleneck). Resume works. Mainnet-scale unproven. | [live-signet](2026-09-24-live-signet-sync.md) |
+| 33 | 09-24 | Delta overlay — snapshot as lowest UTXO layer | Can SnapshotRun serve as the read base under the delta? | **partial adopt — read shim done, tested** | `UtxoSet.snapshot` fourth layer; `SnapshotRun::index` portable fallback indexer. Overlay test found 2 real get() bugs: EOF window clamp + zero-count-group underflow on misses. 480 tests pass. activate integration (attach+snapverify+persist) deferred — touches Claude's patch area. | [delta-overlay](2026-09-24-delta-overlay-shim.md) |
+
 | 31 | 09-24 | Verification-transparency ledger | Can the node report its own trust state as a typed value? | **adopted** | `Chainstate::validation_report()` + `getvalidationreport` RPC: connected/header heights, snapshot base+commitment+replayed_height, assumed/unproven ranges, verified_fraction. Snapshot test: fresh→replay→verified 0.0→1.0; full node 1.0. | [validation-report](2026-09-24-validation-report.md) |
 
 | 30 | 09-24 | Speculative block pre-validation | Can a predicted mempool template pre-pay connect work? | **SUBSUMED by #20** | 625-block spend fixture, 512MiB cache: baseline 6.6s (script 6268ms) → verified-prediction 257ms (script 0ms, 25.7×); +prefetch 289ms — worse, read was already 9ms. Verified-tx cache captures the whole win; residual is apply+bookkeeping, no lever. Mainnet ~90% overlap untested — live-sync's job. | [predict](2026-09-24-spec-block-prediction.md) |
@@ -81,28 +86,28 @@ first measurement that would kill or confirm it.
    `activate_snapshot` streaming (no 170M materialization — OOMs at scale).
    First step: `UtxoSet` read-path shim + diff-test vs current backend.
 
-3. **ECDSA advice on real history.** #27's kernel win (1.8-2.3×) is
+2. **ECDSA advice on real history.** #27's kernel win (1.8-2.3×) is
    synthetic. First step: extract real sig-check traces from a historical
    segment and replay them through the advice machinery — tests sighash
    variants, codeseparator, and edge script forms the kernel bench skipped.
 
-4. **Built-in address index / electrum-style serving (profile).** Point a
+3. **Built-in address index / electrum-style serving (profile).** Point a
    wallet at your own node, no external indexer. Controversial storage cost
    is exactly what profiles are for — opt-in distro, consensus untouched.
    First step: cost model — index size + write overhead on the fixture.
 
-5. **Erlay-style tx reconciliation (BIP-330).** ~44% relay-bandwidth
+4. **Erlay-style tx reconciliation (BIP-330).** ~44% relay-bandwidth
    savings; Core hasn't shipped it (simplified recon-only variant is in
    Warnet testing upstream). Interop is the open question — today ~no peers
    speak it. First step: implement BIP-330 recon-only message handling and
    measure reconciliation rounds between two Avila nodes.
 
-6. **Differential fuzzing vs Core/Knots.** Continuous random-block/tx
+5. **Differential fuzzing vs Core/Knots.** Continuous random-block/tx
    generation with byte-exact comparison — turns "compatible" into a
    monitored property rather than a claim. First step: fuzz harness on the
    existing diff fixture generator, seeded corpus from past bugs.
 
-7. **Utreexo research program.** BIPs 181-183 now have assigned numbers;
+6. **Utreexo research program.** BIPs 181-183 now have assigned numbers;
    rustreexo 0.6.0 exists. Validate blocks against accumulator + proofs —
    ~KB of state vs 12GB UTXO set. Months, not days; needs bridge-node
    proof supply. First step: rustreexo spike — add/delete/prove round-trip
