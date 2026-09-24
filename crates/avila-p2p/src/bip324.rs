@@ -40,9 +40,15 @@ pub const MAX_GARBAGE_LEN: usize = 4095;
 pub const ELLIGATOR_SWIFT_LEN: usize = 64;
 /// `BIP324Cipher::IGNORE_BIT` — the header bit marking decoy packets.
 const IGNORE_BIT: u8 = 0x80;
-/// `V2Transport::MAX_CONTENTS_LEN` — `0x00 + 12-byte type + payload`
-/// bounded by `MAX_PROTOCOL_MESSAGE_LENGTH` (4 MiB).
-const MAX_CONTENTS_LEN: usize = 1 + 12 + 4 * 1024 * 1024;
+/// `V2Transport::MAX_CONTENTS_LEN` — `0x00 + 12-byte type + payload`,
+/// the payload bounded by `min(MAX_SIZE, MAX_PROTOCOL_MESSAGE_LENGTH)`.
+/// Core's `MAX_PROTOCOL_MESSAGE_LENGTH` (our
+/// [`crate::codec::MAX_MESSAGE_PAYLOAD`]) is the binding one at
+/// 4,000,000 bytes, *not* 4 MiB (`4 * 1024 * 1024` — about 194 KiB
+/// looser, which would let a peer's claimed packet length pass here
+/// only to be rejected later at the codec layer instead of dropped up
+/// front).
+const MAX_CONTENTS_LEN: usize = 1 + 12 + crate::codec::MAX_MESSAGE_PAYLOAD as usize;
 
 /// `ChaCha20::Nonce96` on the wire: `LE32(first) || LE64(second)`.
 fn nonce96(first: u32, second: u64) -> Nonce {
@@ -876,6 +882,43 @@ mod tests {
     /// `SHORT_IDS`' 29 entries) must not fail `feed()`, and a message
     /// decoded earlier in the *same* `feed()` call must not be
     /// discarded alongside it.
+    /// Core's `MAX_CONTENTS_LEN` is bounded by `MAX_PROTOCOL_MESSAGE_LENGTH`
+    /// (4,000,000 bytes), not 4 MiB (4,194,304) — about 194 KiB looser.
+    /// A contents length in that gap must be rejected here rather than
+    /// let through to fail later at the codec layer instead.
+    #[test]
+    fn oversized_contents_length_is_rejected_at_the_correct_bound() {
+        use std::io::{Read, Write};
+
+        const MAGIC: [u8; 4] = [0xfa, 0xbf, 0xb5, 0xda]; // regtest
+
+        assert_eq!(MAX_CONTENTS_LEN, 1 + 12 + 4_000_000);
+
+        let (mut a, mut b) = crate::testpipe::pair();
+        let pending = start_handshake(&mut a).unwrap();
+        let mut ch_b = respond_handshake(&mut b, MAGIC).unwrap();
+        let Handshake::V2(cipher_a, garbage_a) = finish_handshake(&mut a, pending, MAGIC).unwrap()
+        else {
+            panic!("v1 fallback on a v2 peer");
+        };
+        let mut ch_a = V2Channel::new(cipher_a, garbage_a);
+        a.write_all(&ch_a.handshake_tail()).unwrap();
+        let mut buf = [0u8; 4096];
+        let n = b.read(&mut buf).unwrap();
+        ch_b.feed(&buf[..n]).unwrap();
+
+        // One byte past the correct bound — still comfortably under the
+        // old (too loose) 4 MiB one, so this pins the tighter value.
+        let oversized = vec![0u8; MAX_CONTENTS_LEN + 1];
+        let packet = ch_a.cipher.encrypt_packet(&oversized, &[], false);
+        // The 3-byte encrypted length prefix alone is enough to trip
+        // the check — `feed` never needs the (multi-megabyte) body.
+        let err = ch_b
+            .feed(&packet[..LENGTH_LEN])
+            .expect_err("a contents length past MAX_CONTENTS_LEN must be rejected");
+        assert_eq!(err, "packet contents too large");
+    }
+
     #[test]
     fn feed_drops_an_undecodable_message_but_keeps_the_rest() {
         use std::io::{Read, Write};
