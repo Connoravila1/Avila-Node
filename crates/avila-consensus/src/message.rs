@@ -37,7 +37,9 @@ pub fn message_hash(message: &str) -> Hash256 {
 /// checksum, wrong prefix, bad length, or invalid scalar.
 #[must_use]
 pub fn decode_secret(wif: &str, secret_prefix: u8) -> Option<(secp256k1::SecretKey, bool)> {
-    let (version, payload) = crate::address::base58check_decode(wif)?;
+    // Core's `DecodeBase58Check(str, data, 34)` — 1 version + 32-byte
+    // secret + an optional trailing compressed-flag byte.
+    let (version, payload) = crate::address::base58check_decode(wif, 34)?;
     if version != secret_prefix {
         return None;
     }
@@ -198,5 +200,21 @@ mod tests {
         // A corrupted r/s either fails recovery or recovers a different
         // key — never verifies.
         assert!(!verify_message(&hash160(&pk.serialize()), &bad, "hi"));
+    }
+
+    /// `decode_secret` threads Core's 34-byte WIF cap into
+    /// `base58check_decode`, so a hostile multi-KiB string is rejected
+    /// almost immediately instead of costing O(n²) CPU.
+    #[test]
+    fn decode_secret_rejects_long_input_quickly() {
+        let params = Network::Regtest.params();
+        let long = "z".repeat(64 * 1024);
+        let start = std::time::Instant::now();
+        assert!(decode_secret(&long, params.base58_secret_prefix).is_none());
+        assert!(
+            start.elapsed().as_millis() < 50,
+            "took {:?}, expected well under 50ms",
+            start.elapsed()
+        );
     }
 }

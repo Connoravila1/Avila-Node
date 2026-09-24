@@ -81,7 +81,9 @@ impl ExtKey {
         pub_prefix: [u8; 4],
         priv_prefix: [u8; 4],
     ) -> Result<Self, ExtKeyError> {
-        let raw = crate::address::base58check_decode_body(text).ok_or(ExtKeyError::Encoding)?;
+        // Core's `DecodeBase58Check(str, data, BIP32_EXTKEY_SIZE)` — 78
+        // bytes caps the decode before the length check below ever runs.
+        let raw = crate::address::base58check_decode_body(text, 78).ok_or(ExtKeyError::Encoding)?;
         if raw.len() != 78 {
             return Err(ExtKeyError::Encoding);
         }
@@ -303,5 +305,23 @@ mod tests {
         let pub_key = ExtKey::decode(&xpub, XPUB, XPRV).unwrap();
         assert!(pub_key.derive(HARDENED).is_none());
         assert!(pub_key.derive(0).is_some());
+    }
+
+    /// `decode` threads Core's 78-byte (`BIP32_EXTKEY_SIZE`) cap into
+    /// `base58check_decode_body`, so a hostile multi-KiB string is
+    /// rejected almost immediately instead of costing O(n²) CPU.
+    #[test]
+    fn decode_rejects_long_input_quickly() {
+        let long = "z".repeat(64 * 1024);
+        let start = std::time::Instant::now();
+        assert_eq!(
+            ExtKey::decode(&long, XPUB, XPRV),
+            Err(ExtKeyError::Encoding)
+        );
+        assert!(
+            start.elapsed().as_millis() < 50,
+            "took {:?}, expected well under 50ms",
+            start.elapsed()
+        );
     }
 }

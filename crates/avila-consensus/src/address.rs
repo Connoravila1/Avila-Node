@@ -134,11 +134,17 @@ pub fn witness_address(hrp: &str, version: u8, program: &[u8]) -> String {
     out
 }
 
-/// Base58Check decode — the inverse of [`base58check`]. `None` on a
-/// non-base58 character or a checksum mismatch (Core's
-/// `DecodeBase58Check` behavior: no partial results).
-#[must_use]
-pub fn base58check_decode(s: &str) -> Option<(u8, Vec<u8>)> {
+/// Raw base58 decode into big-endian bytes, leading zeros kept as
+/// `0x00` — the shared core of [`base58check_decode`] and
+/// [`base58check_decode_body`]. Mirrors Core's `DecodeBase58`:
+/// `max_ret_len` bounds the running decoded length (zeros plus
+/// significant bytes so far), and decoding aborts the instant it would
+/// be exceeded. Without that check the multiply-by-58 pass below is
+/// O(n²) in the input length with no cap — a ~20k-character string
+/// already costs seconds of CPU, and Core's own limits (21/34/78
+/// bytes at the call sites below) keep the aborted cost at
+/// O(max_ret_len²) regardless of how long a hostile string is.
+fn base58_decode_bytes(s: &str, max_ret_len: usize) -> Option<Vec<u8>> {
     let mut zeros = 0usize;
     let mut num: Vec<u8> = Vec::new();
     let mut seen_nonzero = false;
@@ -146,6 +152,9 @@ pub fn base58check_decode(s: &str) -> Option<(u8, Vec<u8>)> {
         let digit = BASE58_ALPHABET.iter().position(|&b| b == c)? as u32;
         if !seen_nonzero && c == b'1' {
             zeros += 1;
+            if zeros > max_ret_len {
+                return None;
+            }
             continue;
         }
         seen_nonzero = true;
@@ -157,12 +166,28 @@ pub fn base58check_decode(s: &str) -> Option<(u8, Vec<u8>)> {
             carry = acc >> 8;
         }
         while carry > 0 {
+            if zeros + num.len() + 1 > max_ret_len {
+                return None;
+            }
             num.insert(0, (carry & 0xff) as u8);
             carry >>= 8;
         }
     }
     let mut data = vec![0u8; zeros];
     data.extend_from_slice(&num);
+    Some(data)
+}
+
+/// Base58Check decode — the inverse of [`base58check`]. `None` on a
+/// non-base58 character, an over-length decode, or a checksum mismatch
+/// (Core's `DecodeBase58Check` behavior: no partial results).
+/// `max_ret_len` caps the decoded body (version + payload, before the
+/// checksum is split off) — Core's own call-site limits: 21 for
+/// addresses (1 version + 20-byte hash), 34 for WIF secrets via
+/// `message::decode_secret`.
+#[must_use]
+pub fn base58check_decode(s: &str, max_ret_len: usize) -> Option<(u8, Vec<u8>)> {
+    let data = base58_decode_bytes(s, max_ret_len.saturating_add(4))?;
     if data.len() < 5 {
         return None;
     }
@@ -184,32 +209,12 @@ pub fn base58check_body(body: &[u8]) -> String {
 }
 
 /// Base58Check decode returning the complete body — for payloads whose
-/// version is wider than one byte (extended keys).
+/// version is wider than one byte (extended keys, capped at 78 bytes
+/// per Core's `BIP32_EXTKEY_SIZE`). See [`base58check_decode`] for
+/// `max_ret_len`.
 #[must_use]
-pub fn base58check_decode_body(s: &str) -> Option<Vec<u8>> {
-    let mut zeros = 0usize;
-    let mut num: Vec<u8> = Vec::new();
-    let mut seen_nonzero = false;
-    for c in s.bytes() {
-        let digit = BASE58_ALPHABET.iter().position(|&b| b == c)? as u32;
-        if !seen_nonzero && c == b'1' {
-            zeros += 1;
-            continue;
-        }
-        seen_nonzero = true;
-        let mut carry = digit;
-        for byte in num.iter_mut().rev() {
-            let acc = u32::from(*byte) * 58 + carry;
-            *byte = (acc & 0xff) as u8;
-            carry = acc >> 8;
-        }
-        while carry > 0 {
-            num.insert(0, (carry & 0xff) as u8);
-            carry >>= 8;
-        }
-    }
-    let mut data = vec![0u8; zeros];
-    data.extend_from_slice(&num);
+pub fn base58check_decode_body(s: &str, max_ret_len: usize) -> Option<Vec<u8>> {
+    let data = base58_decode_bytes(s, max_ret_len.saturating_add(4))?;
     if data.len() < 5 {
         return None;
     }
@@ -432,7 +437,7 @@ pub fn validate_address(s: &str, params: &Params) -> Result<AddressInfo, DestErr
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(hrp.as_bytes()));
 
     if !is_bech32 {
-        if let Some((version, payload)) = base58check_decode(s) {
+        if let Some((version, payload)) = base58check_decode(s, 21) {
             if payload.len() == 20 && version == params.base58_pubkey_prefix {
                 let mut script = Vec::with_capacity(25);
                 script.extend_from_slice(&[0x76, 0xa9, 0x14]);
@@ -584,7 +589,7 @@ pub fn validate_address(s: &str, params: &Params) -> Result<AddressInfo, DestErr
 /// network's prefixes nor a bech32/bech32m address for its hrp.
 #[must_use]
 pub fn address_to_script(address: &str, params: &Params) -> Option<Script> {
-    if let Some((version, payload)) = base58check_decode(address)
+    if let Some((version, payload)) = base58check_decode(address, 21)
         && payload.len() == 20
     {
         let mut script = Vec::with_capacity(25);
@@ -748,5 +753,25 @@ mod tests {
         // mismatch further into the string.
         let regtest = Network::Regtest.params();
         assert!(validate_address("aa€bcrt1q", &regtest).is_err());
+    }
+
+    /// Core's `DecodeBase58`/`DecodeBase58Check` abort as soon as the
+    /// decoded length exceeds `max_ret_len`, so a hostile multi-KiB
+    /// string never reaches the O(n²) multiply-by-58 pass. Before the
+    /// cap, 20k characters cost ~3s of CPU on the sync thread.
+    #[test]
+    fn base58check_decode_caps_cost_on_long_input() {
+        // No leading '1's and a non-trivial digit at every position:
+        // the running decode length grows every character, so this
+        // exercises the early-abort path rather than the zero-run
+        // fast path.
+        let long = "z".repeat(64 * 1024);
+        let start = std::time::Instant::now();
+        assert_eq!(base58check_decode(&long, 21), None);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 50,
+            "base58check_decode on a 64 KiB string took {elapsed:?}, expected well under 50ms"
+        );
     }
 }
