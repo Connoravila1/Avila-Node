@@ -121,6 +121,17 @@ pub fn serve(
     }))
 }
 
+/// Holds one connection slot and gives it back when the connection's
+/// thread ends — by panic too, which would otherwise leak the slot
+/// until the accept loop turned everyone away.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// The listener's accept loop — split out from [`serve`] so tests can
 /// drive it against a listener bound to an OS-chosen port (`serve`
 /// itself never hands the bound address back to the caller).
@@ -146,10 +157,10 @@ fn accept_loop(
                 let waiters = waiters.clone();
                 let status = status.clone();
                 let cancel = cancel.clone();
-                let conns = conns.clone();
+                let slot = Slot(conns.clone());
                 thread::spawn(move || {
+                    let _slot = slot;
                     handle(stream, queries, waiters, status, cancel);
-                    conns.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
