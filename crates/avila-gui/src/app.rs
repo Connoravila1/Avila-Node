@@ -9,7 +9,8 @@ use crate::prefs::{Prefs, ThemeChoice};
 use crate::rail::{self, Page};
 use crate::ribbon::View;
 use crate::session::{ActivityKind, Phase, RunSettings, Session};
-use crate::theme::{self, Palette, SIGNAL, font};
+use crate::theme::{self, Palette, font};
+use crate::toybox;
 use crate::widgets::{self, Kind, hatch};
 use crate::{brand, model};
 use avila_node::Node;
@@ -37,6 +38,9 @@ pub struct App {
     peer_sort: PeerSort,
     /// The Chain page's zoom into the ribbon.
     ribbon_view: View,
+    game: toybox::Game,
+    /// The preferences last put in force; any change re-applies them.
+    applied: Prefs,
 }
 
 impl App {
@@ -93,6 +97,8 @@ impl App {
             sky: Constellation::default(),
             peer_sort: PeerSort::default(),
             ribbon_view: View::default(),
+            game: toybox::Game::default(),
+            applied: prefs,
         }
     }
 
@@ -197,6 +203,9 @@ impl App {
                 let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
                 let (c, p) = (r.center(), ui.painter());
                 match phase {
+                    Phase::CaughtUp | Phase::Syncing if pal.hearts => {
+                        heart(p, c, 7.5, pal.signal);
+                    }
                     Phase::CaughtUp | Phase::Syncing => {
                         p.circle_filled(c, 9.0, pal.signal_alpha(0.22));
                         p.circle_filled(c, 5.0, pal.signal);
@@ -263,6 +272,11 @@ impl eframe::App for App {
             {
                 v.eclipse = vec![crate::model::Eclipse::DiversityCollapse];
             }
+            self.prefs.toybox |= pose.page == Page::Toybox || pose.skin != theme::Skin::Standard;
+            self.prefs.skin = pose.skin;
+            if pose.play && !self.game.animating() {
+                self.game.demo();
+            }
             self.page = pose.page;
             self.prefs.scale = pose.scale;
             if pose.select_peer && self.selected_peer.is_none() {
@@ -284,7 +298,7 @@ impl eframe::App for App {
             .exact_size(rail::WIDTH)
             .resizable(false)
             .show_separator_line(false)
-            .frame(Frame::new().fill(SIGNAL))
+            .frame(Frame::new().fill(pal.rail))
             .show(ui, |ui| {
                 rail::show(
                     ui,
@@ -292,6 +306,7 @@ impl eframe::App for App {
                     self.swirl.as_ref(),
                     network_name(network),
                     phase.live(),
+                    self.prefs.toybox,
                 );
             });
         egui::Panel::top("status")
@@ -360,21 +375,18 @@ impl eframe::App for App {
                                     &mut self.filter,
                                     self.prefs.hide_addresses,
                                 ),
-                                Page::Settings => {
-                                    let before = self.prefs;
-                                    let a = pages::settings::show(
-                                        ui,
-                                        &scene,
-                                        &mut self.run,
-                                        &mut self.prefs,
-                                        &self.node,
-                                        open_advanced,
-                                    );
-                                    if self.prefs != before {
-                                        self.prefs.apply(ui.ctx());
-                                    }
-                                    a
+                                Page::Toybox => {
+                                    toybox::show(ui, &scene, &mut self.game, &mut self.prefs);
+                                    None
                                 }
+                                Page::Settings => pages::settings::show(
+                                    ui,
+                                    &scene,
+                                    &mut self.run,
+                                    &mut self.prefs,
+                                    &self.node,
+                                    open_advanced,
+                                ),
                             };
                             if page_action.is_some() {
                                 action = page_action;
@@ -389,6 +401,15 @@ impl eframe::App for App {
             Some(Action::Open(page)) => self.page = page,
             None => {}
         }
+        // Preferences changed anywhere (Settings, the toybox, a shortcut)
+        // are put in force here, once.
+        if self.prefs != self.applied {
+            self.prefs.apply(&ctx);
+            self.applied = self.prefs;
+        }
+        if self.page == Page::Toybox && !self.prefs.toybox {
+            self.page = Page::Settings;
+        }
         // Smooth frames only while the new-block pulse runs; otherwise
         // just often enough for "seconds ago" to tick over.
         // Only the pages that draw the new-block pulse animate for it.
@@ -402,7 +423,8 @@ impl eframe::App for App {
             }
             .pulse()
             .is_some();
-        let settling = self.page == Page::Peers && self.sky.animating();
+        let settling = (self.page == Page::Peers && self.sky.animating())
+            || (self.page == Page::Toybox && self.game.animating());
         let benching = self.bench.as_ref().is_some_and(Bench::forcing);
         if self.capture.is_some() || pulsing || settling || benching {
             ctx.request_repaint();
@@ -427,6 +449,22 @@ impl eframe::App for App {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         visuals.panel_fill.to_normalized_gamma_f32()
     }
+}
+
+/// Julia mode's status light.
+fn heart(p: &egui::Painter, c: egui::Pos2, size: f32, color: egui::Color32) {
+    let r = size * 0.5;
+    p.circle_filled(c + vec2(-r * 0.95, -r * 0.35), r, color);
+    p.circle_filled(c + vec2(r * 0.95, -r * 0.35), r, color);
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            c + vec2(-size * 0.93, -r * 0.05),
+            c + vec2(size * 0.93, -r * 0.05),
+            c + vec2(0.0, size),
+        ],
+        color,
+        Stroke::NONE,
+    ));
 }
 
 /// Says, wherever it shows, that nothing on screen is real.

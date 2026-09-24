@@ -1,8 +1,8 @@
 //! The brand rail: the logo's orange field running down the window's
 //! edge, the swirl at its head, the pages beneath, and at its foot the
-//! network and whether the node is live.
+//! network and whether the node is live. (A toybox skin recolors it.)
 
-use crate::theme::{self, INK, SIGNAL, font};
+use crate::theme::{self, Palette, font};
 use eframe::egui::{
     Align2, Color32, CursorIcon, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, Ui,
     pos2, vec2,
@@ -17,10 +17,13 @@ pub enum Page {
     Chain,
     Peers,
     Activity,
+    /// Only on the rail while Settings turns the toybox on.
+    Toybox,
     Settings,
 }
 
 impl Page {
+    /// The node's own pages; the toybox joins them only when it's on.
     pub const ALL: [Self; 5] = [
         Self::Overview,
         Self::Chain,
@@ -36,6 +39,7 @@ impl Page {
             Self::Chain => "Chain",
             Self::Peers => "Peers",
             Self::Activity => "Activity",
+            Self::Toybox => "Toybox",
             Self::Settings => "Settings",
         }
     }
@@ -47,7 +51,9 @@ pub fn show(
     swirl: Option<&TextureHandle>,
     network: &str,
     live: bool,
+    toybox: bool,
 ) {
+    let pal = Palette::of(ui.ctx());
     let rect = ui.max_rect();
     let p = ui.painter().clone();
     let cx = rect.center().x;
@@ -57,13 +63,21 @@ pub fn show(
             tex.id(),
             mark,
             Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            INK,
+            pal.rail_ink,
         );
     }
-    let mut y = rect.top() + 92.0;
-    for item in Page::ALL {
-        let r = Rect::from_min_size(pos2(rect.left() + 9.0, y), vec2(rect.width() - 18.0, 58.0));
-        y += 62.0;
+    let mut pages: Vec<Page> = Page::ALL.to_vec();
+    if toybox {
+        pages.insert(pages.len() - 1, Page::Toybox);
+    }
+    // Items share what's left between the swirl and the foot.
+    let top = rect.top() + 92.0;
+    let pitch = ((rect.bottom() - 58.0 - top) / pages.len() as f32).clamp(50.0, 62.0);
+    for (i, item) in pages.into_iter().enumerate() {
+        let r = Rect::from_min_size(
+            pos2(rect.left() + 9.0, top + pitch * i as f32),
+            vec2(rect.width() - 18.0, pitch - 4.0),
+        );
         let resp = ui
             .interact(r, ui.id().with(item.label()), Sense::click())
             .on_hover_cursor(CursorIcon::PointingHand);
@@ -72,22 +86,23 @@ pub fn show(
         }
         let selected = *page == item;
         let (bg, fg) = if selected {
-            (INK, SIGNAL)
+            (pal.rail_active, pal.rail_active_ink)
         } else if resp.hovered() {
-            (INK.gamma_multiply(0.10), INK)
+            (pal.rail_ink.gamma_multiply(0.12), pal.rail_ink)
         } else {
-            (Color32::TRANSPARENT, INK)
+            (Color32::TRANSPARENT, pal.rail_ink)
         };
         p.rect_filled(r, 12, bg);
+        let middle = r.center().y;
         icon(
             &p,
             item,
-            pos2(r.center().x, r.top() + 21.0),
+            pos2(r.center().x, middle - 8.0),
             fg,
-            if selected { INK } else { SIGNAL },
+            if selected { pal.rail_active } else { pal.rail },
         );
         p.text(
-            pos2(r.center().x, r.top() + 43.0),
+            pos2(r.center().x, middle + 14.0),
             Align2::CENTER_CENTER,
             item.label(),
             font(theme::MEDIUM, 11.0),
@@ -97,7 +112,7 @@ pub fn show(
             p.rect_stroke(
                 r.expand(1.5),
                 13,
-                Stroke::new(1.5, INK),
+                Stroke::new(1.5, pal.rail_ink),
                 StrokeKind::Outside,
             );
         }
@@ -108,13 +123,13 @@ pub fn show(
         Align2::CENTER_CENTER,
         network,
         font(theme::STRONG, 10.5),
-        INK,
+        pal.rail_ink,
     );
     let dot = pos2(cx, foot - 17.0);
     if live {
-        p.circle_filled(dot, 4.0, INK);
+        p.circle_filled(dot, 4.0, pal.rail_ink);
     } else {
-        p.circle_stroke(dot, 3.5, Stroke::new(1.4, INK));
+        p.circle_stroke(dot, 3.5, Stroke::new(1.4, pal.rail_ink));
     }
 }
 
@@ -160,6 +175,16 @@ fn icon(p: &Painter, page: Page, c: Pos2, fg: Color32, bg: Color32) {
                     s,
                 );
             }
+        }
+        // A game pad.
+        Page::Toybox => {
+            let body = Rect::from_center_size(c, vec2(24.0, 13.0));
+            p.rect_stroke(body, 6, s, StrokeKind::Inside);
+            let pad = c + vec2(-5.5, 0.0);
+            p.line_segment([pad - vec2(3.0, 0.0), pad + vec2(3.0, 0.0)], s);
+            p.line_segment([pad - vec2(0.0, 3.0), pad + vec2(0.0, 3.0)], s);
+            p.circle_filled(c + vec2(4.5, 1.5), 1.6, fg);
+            p.circle_filled(c + vec2(7.5, -1.5), 1.6, fg);
         }
         // Two sliders.
         Page::Settings => {

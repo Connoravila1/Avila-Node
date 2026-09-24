@@ -5,11 +5,14 @@
 
 use crate::rail::Page;
 use crate::ribbon::Scale;
+use crate::theme::Skin;
 use eframe::egui::{self, ColorImage, Context, Event, Theme, UserData, ViewportCommand};
 use std::path::PathBuf;
 
 /// Frames to let layout, fonts and textures settle before each shot.
 const SETTLE: u32 = 14;
+/// Frames of a game playing itself before its shot.
+const PLAY_SETTLE: u32 = 300;
 
 /// How the app should be posed for one shot.
 #[derive(Clone, Copy, Debug)]
@@ -28,6 +31,10 @@ pub struct Pose {
     pub eclipse: bool,
     /// Open the Settings page's advanced section.
     pub advanced: bool,
+    /// Wear this toybox skin.
+    pub skin: Skin,
+    /// Let the game play itself for a while.
+    pub play: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -44,6 +51,8 @@ pub struct Capture {
     next: usize,
     wait: u32,
     requested: bool,
+    /// Whether the current shot has been posed yet.
+    posed: bool,
 }
 
 impl Capture {
@@ -64,6 +73,8 @@ impl Capture {
             zoom: None,
             eclipse: false,
             advanced: false,
+            skin: Skin::Standard,
+            play: false,
         };
         let mut shots = Vec::new();
         for theme in [Theme::Light, Theme::Dark] {
@@ -165,6 +176,52 @@ impl Capture {
                 FULL,
                 "-advanced",
             ),
+            (
+                Theme::Light,
+                Pose {
+                    play: true,
+                    ..pose(Page::Toybox)
+                },
+                FULL,
+                "-play",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    skin: Skin::Xp,
+                    ..pose(Page::Overview)
+                },
+                FULL,
+                "-xp",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    skin: Skin::Xp,
+                    ..pose(Page::Toybox)
+                },
+                FULL,
+                "-xp",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    skin: Skin::Julia,
+                    ..pose(Page::Overview)
+                },
+                FULL,
+                "-julia",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    skin: Skin::Julia,
+                    select_peer: true,
+                    ..pose(Page::Peers)
+                },
+                FULL,
+                "-julia",
+            ),
             (Theme::Dark, pose(Page::Overview), SMALL, "-small"),
             (Theme::Light, pose(Page::Peers), SMALL, "-small"),
         ] {
@@ -181,6 +238,7 @@ impl Capture {
             next: 0,
             wait: SETTLE,
             requested: false,
+            posed: false,
         })
     }
 
@@ -211,14 +269,16 @@ impl Capture {
                 eprintln!("capture: couldn't write {name}: {e}");
             }
             self.next += 1;
-            self.wait = SETTLE;
             self.requested = false;
+            self.posed = false;
         }
         let Some(shot) = self.shots.get(self.next).copied() else {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return None;
         };
-        if self.wait == SETTLE {
+        if !self.posed {
+            self.posed = true;
+            self.wait = if shot.pose.play { PLAY_SETTLE } else { SETTLE };
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(
                 shot.size[0],
                 shot.size[1],

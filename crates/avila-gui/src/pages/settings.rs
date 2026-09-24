@@ -256,6 +256,16 @@ fn appearance(ui: &mut Ui, s: &Scene, prefs: &mut Prefs) {
             ],
         );
         ui.end_row();
+        key(ui, s, "Toybox");
+        ui.vertical(|ui| {
+            ui.checkbox(&mut prefs.toybox, "Show it in the sidebar");
+            help(
+                ui,
+                s,
+                "A game and some silly skins. Nothing in it touches the node.",
+            );
+        });
+        ui.end_row();
         key(ui, s, "Size");
         let mut size = prefs.size;
         let options: Vec<(u32, &str)> = Prefs::SIZES

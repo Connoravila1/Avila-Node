@@ -9,7 +9,9 @@ use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle,
     Theme, Visuals,
 };
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// The logo's orange field, sampled from `assets/avila-node-logo.png`.
 pub const SIGNAL: Color32 = Color32::from_rgb(247, 139, 19);
@@ -43,6 +45,19 @@ pub struct Palette {
     /// Orange that reads as text on this canvas.
     pub signal_text: Color32,
     pub alert: Color32,
+    /// The side rail's field, its ink, and the selected item's.
+    pub rail: Color32,
+    pub rail_ink: Color32,
+    pub rail_active: Color32,
+    pub rail_active_ink: Color32,
+    /// The one main action on a screen.
+    pub primary: Color32,
+    pub on_primary: Color32,
+    /// Corner radius for buttons and toggles.
+    pub round: u8,
+    /// Toybox flourishes: a chunky progress-bar ribbon, heart-shaped dots.
+    pub chunky: bool,
+    pub hearts: bool,
 }
 
 impl Palette {
@@ -58,6 +73,15 @@ impl Palette {
         signal: SIGNAL,
         signal_text: Color32::from_rgb(168, 83, 0),
         alert: Color32::from_rgb(180, 35, 24),
+        rail: SIGNAL,
+        rail_ink: INK,
+        rail_active: INK,
+        rail_active_ink: SIGNAL,
+        primary: Color32::from_rgb(23, 24, 27),
+        on_primary: Color32::from_rgb(236, 237, 239),
+        round: 7,
+        chunky: false,
+        hearts: false,
     };
 
     pub const DARK: Self = Self {
@@ -72,15 +96,75 @@ impl Palette {
         signal: SIGNAL,
         signal_text: Color32::from_rgb(249, 160, 63),
         alert: Color32::from_rgb(255, 107, 94),
+        rail: SIGNAL,
+        rail_ink: INK,
+        rail_active: INK,
+        rail_active_ink: SIGNAL,
+        primary: Color32::from_rgb(236, 233, 228),
+        on_primary: Color32::from_rgb(19, 20, 22),
+        round: 7,
+        chunky: false,
+        hearts: false,
     };
 
-    /// The palette for whatever appearance `ctx` is currently showing.
+    /// Toybox: beige windows, a blue bar down the side, a green start
+    /// button, and a progress bar made of chunks. Proven is green here.
+    pub const XP: Self = Self {
+        dark: false,
+        canvas: Color32::from_rgb(236, 233, 216),
+        raised: Color32::from_rgb(255, 255, 255),
+        well: Color32::from_rgb(214, 211, 196),
+        hairline: Color32::from_rgb(172, 168, 153),
+        text: Color32::from_rgb(12, 12, 12),
+        muted: Color32::from_rgb(78, 78, 78),
+        faint: Color32::from_rgb(138, 136, 126),
+        signal: Color32::from_rgb(54, 169, 54),
+        signal_text: Color32::from_rgb(22, 116, 22),
+        alert: Color32::from_rgb(196, 0, 0),
+        rail: Color32::from_rgb(36, 94, 219),
+        rail_ink: Color32::from_rgb(255, 255, 255),
+        rail_active: Color32::from_rgb(19, 62, 168),
+        rail_active_ink: Color32::from_rgb(255, 255, 255),
+        primary: Color32::from_rgb(60, 154, 60),
+        on_primary: Color32::from_rgb(255, 255, 255),
+        round: 4,
+        chunky: true,
+        hearts: false,
+    };
+
+    /// Toybox: the whole node in pink. Proven is hot pink here.
+    pub const JULIA: Self = Self {
+        dark: false,
+        canvas: Color32::from_rgb(255, 228, 241),
+        raised: Color32::from_rgb(255, 245, 250),
+        well: Color32::from_rgb(255, 209, 232),
+        hairline: Color32::from_rgb(247, 168, 207),
+        text: Color32::from_rgb(74, 10, 45),
+        muted: Color32::from_rgb(160, 51, 107),
+        faint: Color32::from_rgb(217, 138, 180),
+        signal: Color32::from_rgb(224, 33, 138),
+        signal_text: Color32::from_rgb(194, 24, 110),
+        alert: Color32::from_rgb(176, 0, 32),
+        rail: Color32::from_rgb(224, 33, 138),
+        rail_ink: Color32::from_rgb(255, 255, 255),
+        rail_active: Color32::from_rgb(255, 255, 255),
+        rail_active_ink: Color32::from_rgb(224, 33, 138),
+        primary: Color32::from_rgb(224, 33, 138),
+        on_primary: Color32::from_rgb(255, 255, 255),
+        round: 17,
+        chunky: false,
+        hearts: true,
+    };
+
+    /// The palette for whatever appearance `ctx` is currently showing:
+    /// a toybox skin when one is on, else light or dark.
     #[must_use]
     pub fn of(ctx: &egui::Context) -> Self {
-        if ctx.global_style().visuals.dark_mode {
-            Self::DARK
-        } else {
-            Self::LIGHT
+        match Skin::current() {
+            Skin::Xp => Self::XP,
+            Skin::Julia => Self::JULIA,
+            Skin::Standard if ctx.global_style().visuals.dark_mode => Self::DARK,
+            Skin::Standard => Self::LIGHT,
         }
     }
 
@@ -89,6 +173,58 @@ impl Palette {
     #[must_use]
     pub fn signal_alpha(&self, alpha: f32) -> Color32 {
         self.signal.gamma_multiply(alpha)
+    }
+}
+
+/// A whole-app skin from the toybox. Skins are light-only and win over
+/// the theme setting while they're on.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum Skin {
+    #[default]
+    Standard,
+    Xp,
+    Julia,
+}
+
+/// The skin in force, read by [`Palette::of`] on every paint.
+static SKIN: AtomicU8 = AtomicU8::new(0);
+
+impl Skin {
+    #[must_use]
+    pub fn current() -> Self {
+        match SKIN.load(Ordering::Relaxed) {
+            1 => Self::Xp,
+            2 => Self::Julia,
+            _ => Self::Standard,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Standard => 0,
+            Self::Xp => 1,
+            Self::Julia => 2,
+        }
+    }
+}
+
+/// Puts `skin` in force, re-installing egui's own visuals to match.
+pub fn set_skin(ctx: &egui::Context, skin: Skin) {
+    if SKIN.swap(skin.code(), Ordering::Relaxed) == skin.code() {
+        return;
+    }
+    let pal = match skin {
+        Skin::Xp => Some(Palette::XP),
+        Skin::Julia => Some(Palette::JULIA),
+        Skin::Standard => None,
+    };
+    for theme in [Theme::Light, Theme::Dark] {
+        let base = match (pal, theme) {
+            (Some(p), _) => p,
+            (None, Theme::Dark) => Palette::DARK,
+            (None, Theme::Light) => Palette::LIGHT,
+        };
+        ctx.set_visuals_of(theme, visuals(&base));
     }
 }
 
@@ -235,11 +371,7 @@ fn visuals(pal: &Palette) -> Visuals {
     v.window_corner_radius = CornerRadius::same(10);
     v.menu_corner_radius = CornerRadius::same(8);
 
-    let hover = if pal.dark {
-        Color32::from_rgb(38, 41, 45)
-    } else {
-        Color32::from_rgb(214, 217, 221)
-    };
+    let hover = pal.well.lerp_to_gamma(pal.hairline, 0.45);
     let w = &mut v.widgets;
     for (state, fill, stroke) in [
         (

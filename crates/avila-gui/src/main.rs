@@ -13,6 +13,7 @@ mod rail;
 mod ribbon;
 mod session;
 mod theme;
+mod toybox;
 mod widgets;
 
 use std::error::Error;

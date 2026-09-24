@@ -313,6 +313,9 @@ pub fn show(
     for span in cov.proven.iter().filter(|s| s.blocks() > 0) {
         if let Some(r) = seg(*span, 2.0) {
             p.rect_filled(r, ends(r), pal.signal);
+            if pal.chunky {
+                chunks(&p, r, &pal);
+            }
         }
     }
     if let Some(r) = cov.assumed.and_then(|span| seg(span, 3.0)) {
@@ -518,6 +521,19 @@ pub fn show(
             ui.label(crate::widgets::hash_job(&hash, 11.5, &pal, Some(16)));
         }
     })
+}
+
+/// The XP skin's progress bar: a sheen along the top, and the fill cut
+/// into chunks.
+fn chunks(p: &eframe::egui::Painter, r: Rect, pal: &Palette) {
+    let sheen = Rect::from_min_size(r.min, vec2(r.width(), r.height() * 0.4));
+    p.rect_filled(sheen, 0, Color32::WHITE.gamma_multiply(0.22));
+    let mut x = r.left() + 9.0;
+    while x < r.right() - 1.0 {
+        let gap = Rect::from_x_y_ranges(x..=(x + 2.0).min(r.right()), r.y_range());
+        p.rect_filled(gap, 0, pal.well);
+        x += 11.0;
+    }
 }
 
 /// Applies this frame's scroll (zoom around the pointer), pinch, drag

@@ -123,8 +123,8 @@ pub fn button(ui: &mut Ui, text: &str, kind: Kind) -> Response {
                     0.0
                 };
                 (
-                    pal.text.lerp_to_gamma(pal.canvas, lift),
-                    pal.canvas,
+                    pal.primary.lerp_to_gamma(pal.canvas, lift),
+                    pal.on_primary,
                     Stroke::NONE,
                 )
             }
@@ -141,9 +141,9 @@ pub fn button(ui: &mut Ui, text: &str, kind: Kind) -> Response {
             ),
         };
         let p = ui.painter();
-        p.rect(rect, 7, fill, stroke, StrokeKind::Inside);
+        p.rect(rect, pal.round, fill, stroke, StrokeKind::Inside);
         p.galley(rect.center() - galley.size() / 2.0, galley, fg);
-        focus_ring(ui, &resp, rect, 9);
+        focus_ring(ui, &resp, rect, pal.round.saturating_add(2));
     }
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
@@ -163,7 +163,8 @@ pub fn segmented<T: Copy + PartialEq>(ui: &mut Ui, value: &mut T, options: &[(T,
     let widths: Vec<f32> = galleys.iter().map(|g| g.size().x + pad * 2.0).collect();
     let total = vec2(widths.iter().sum::<f32>() + 6.0, 34.0);
     let (track, _) = ui.allocate_exact_size(total, Sense::hover());
-    ui.painter().rect_filled(track, 8, pal.well);
+    ui.painter()
+        .rect_filled(track, pal.round.saturating_add(1), pal.well);
     let mut changed = false;
     let mut x = track.left() + 3.0;
     for ((option, galley), w) in options.iter().zip(galleys).zip(widths) {
@@ -182,17 +183,21 @@ pub fn segmented<T: Copy + PartialEq>(ui: &mut Ui, value: &mut T, options: &[(T,
         if selected {
             p.rect(
                 rect,
-                6,
+                pal.round.saturating_sub(1),
                 pal.raised,
                 Stroke::new(1.0, pal.hairline),
                 StrokeKind::Inside,
             );
         } else if resp.hovered() {
-            p.rect_filled(rect, 6, pal.hairline.gamma_multiply(0.5));
+            p.rect_filled(
+                rect,
+                pal.round.saturating_sub(1),
+                pal.hairline.gamma_multiply(0.5),
+            );
         }
         let color = if selected { pal.text } else { pal.muted };
         p.galley(rect.center() - galley.size() / 2.0, galley, color);
-        focus_ring(ui, &resp, rect, 8);
+        focus_ring(ui, &resp, rect, pal.round.saturating_add(1));
     }
     changed
 }

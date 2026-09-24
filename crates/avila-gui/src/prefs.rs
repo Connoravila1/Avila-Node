@@ -1,6 +1,7 @@
 //! What the interface remembers between launches: appearance only.
 
 use crate::ribbon::Scale;
+use crate::theme::{self, Skin};
 use clap::ValueEnum;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,15 @@ pub struct Prefs {
     /// Draw the Rhythm section as a clock instead of bars.
     #[serde(default)]
     pub rhythm_clock: bool,
+    /// Show the Toybox page (games and skins).
+    #[serde(default)]
+    pub toybox: bool,
+    /// A toybox skin; only worn while the toybox is on.
+    #[serde(default)]
+    pub skin: Skin,
+    /// Shitcoin Defense's best score.
+    #[serde(default)]
+    pub game_best: u32,
 }
 
 impl Default for Prefs {
@@ -44,6 +54,9 @@ impl Default for Prefs {
             scale: Scale::Blocks,
             hide_addresses: false,
             rhythm_clock: false,
+            toybox: false,
+            skin: Skin::Standard,
+            game_best: 0,
         }
     }
 }
@@ -84,6 +97,14 @@ impl Prefs {
             ThemeChoice::Dark => egui::ThemePreference::Dark,
         });
         ctx.set_zoom_factor(self.size);
+        theme::set_skin(
+            ctx,
+            if self.toybox {
+                self.skin
+            } else {
+                Skin::Standard
+            },
+        );
     }
 
     /// Snaps a stored size to the nearest offered one.
@@ -130,6 +151,9 @@ mod tests {
             scale: Scale::Work,
             hide_addresses: true,
             rhythm_clock: true,
+            toybox: true,
+            skin: Skin::Julia,
+            game_best: 42,
         };
         prefs.save(&mut storage);
         assert_eq!(
@@ -140,6 +164,9 @@ mod tests {
                 scale: Scale::Work,
                 hide_addresses: true,
                 rhythm_clock: true,
+                toybox: true,
+                skin: Skin::Julia,
+                game_best: 42,
             }
         );
         assert_eq!(storage.0.len(), 1);
