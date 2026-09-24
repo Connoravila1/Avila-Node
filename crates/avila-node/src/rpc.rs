@@ -4606,7 +4606,7 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
     (
         "getpinningrisk",
         &[("margin", Some("number"), false)],
-        "getpinningrisk ( margin )\n\nLists mempool transactions whose descendant package is at or near the descendant cap (BIP-431 pinning surface — such a tx cannot be CPFP-bumped).\n\nArguments:\n1. margin  (number, optional, default=5) Flag txs within this many descendants of the cap.\n\nResult:\n[ { \"txid\": \"hex\", \"descendants\": n }, ... ]\n",
+        "getpinningrisk ( margin )\n\nLists mempool transactions whose descendant package is at or near the descendant cap (BIP-431 pinning surface — such a tx cannot be CPFP-bumped). With a wallet loaded, \"mine\" marks entries that pay a watched script or spend a wallet coin — those are alerts, not just telemetry.\n\nArguments:\n1. margin  (number, optional, default=5) Flag txs within this many descendants of the cap.\n\nResult:\n[ { \"txid\": \"hex\", \"descendants\": n, \"mine\": bool }, ... ]\n",
     ),
     ("getmininginfo", &[], GETMININGINFO_HELP),
     ("getnettotals", &[], GETNETTOTALS_HELP),
@@ -7001,14 +7001,41 @@ pub(crate) fn dispatch(
             let margin = param(params, 0, "margin")
                 .and_then(Value::as_u64)
                 .map_or(5, |v| v as usize);
+            // Queue #16's wallet join: a flagged tx the wallet cares
+            // about (pays a watched script, or spends a wallet coin)
+            // is a pinning *alert*, not just telemetry.
+            let wallet = wallet.cloned();
             chain_query(method, queries, move |_, mgr| {
-                Ok(json!(
-                    mgr.mempool_ref()
-                        .pinning_risk(margin)
-                        .into_iter()
-                        .map(|(txid, n)| json!({"txid": txid.to_string(), "descendants": n}))
-                        .collect::<Vec<_>>()
-                ))
+                let pool = mgr.mempool_ref();
+                let w = wallet.as_ref().map(|w| match w.lock() {
+                    Ok(w) => w,
+                    Err(p) => p.into_inner(),
+                });
+                Ok(json!(pool
+                    .pinning_risk(margin)
+                    .into_iter()
+                    .map(|(txid, n)| {
+                        let mine = w.as_ref().is_some_and(|w| {
+                            pool.get(&txid).is_some_and(|tx| {
+                                tx.outputs.iter().any(|o| {
+                                    w.scripts.contains_key(o.script_pubkey.as_bytes())
+                                }) || tx.inputs.iter().any(|i| {
+                                    w.coins
+                                        .get(&(
+                                            i.previous_output.txid,
+                                            i.previous_output.vout,
+                                        ))
+                                        .is_some_and(|c| c.spent_height.is_none())
+                                })
+                            })
+                        });
+                        json!({
+                            "txid": txid.to_string(),
+                            "descendants": n,
+                            "mine": mine,
+                        })
+                    })
+                    .collect::<Vec<_>>()))
             })
         }
         "getmempoolblocks" => {
