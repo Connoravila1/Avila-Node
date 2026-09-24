@@ -298,10 +298,6 @@ pub struct Mempool {
     max_bytes: usize,
     /// Live serialized bytes in the pool — the `max_bytes` accounting.
     pool_bytes: usize,
-    /// (feerate sat/kvB, txid) ordered index — the eviction cursor.
-    /// A plain sorted index beats rescanning `map` for the minimum on
-    /// every at-capacity admission (Core's `setMemPoolEntryByFeeRate`).
-    by_rate: std::collections::BTreeMap<(i64, Txid), ()>,
     /// Min relay fee rate in sat/kvB.
     min_relay_fee: i64,
     /// Full-RBF: deployed Core accepts replacements regardless of
@@ -357,7 +353,6 @@ impl Mempool {
             max_entries: DEFAULT_MAX_ENTRIES,
             max_bytes: DEFAULT_MAX_BYTES,
             pool_bytes: 0,
-            by_rate: std::collections::BTreeMap::new(),
             min_relay_fee: DEFAULT_MIN_RELAY_FEE,
             full_rbf: true,
             block_reserved_weight: template::DEFAULT_BLOCK_RESERVED_WEIGHT,
@@ -1010,19 +1005,21 @@ impl Mempool {
                     self.max_bytes
                 ))
             } else {
-                let my_rate = fee * 1000 / vsize as i64;
-                match self
-                    .map
-                    .iter()
-                    .min_by_key(|(_, e)| e.fee * 1000 / e.vsize.max(1) as i64)
-                {
-                    Some((_, worst)) if my_rate > worst.fee * 1000 / worst.vsize.max(1) as i64 => {
-                        Ok(format!(
-                            "full; would evict rate {}",
-                            worst.fee * 1000 / worst.vsize.max(1) as i64
-                        ))
+                match self.worst_by_descendant_score() {
+                    Some(worst_id) => {
+                        let (worst_fee, worst_size) = self.descendant_score(&worst_id);
+                        if (fee as i128) * (worst_size as i128)
+                            > (worst_fee as i128) * (vsize as i128)
+                        {
+                            Ok(format!(
+                                "full; would evict {worst_id} (descendant-score rate {})",
+                                worst_fee * 1000 / worst_size.max(1) as i64
+                            ))
+                        } else {
+                            Err("mempool full".into())
+                        }
                     }
-                    _ => Err("mempool full".into()),
+                    None => Err("mempool full".into()),
                 }
             },
         );
@@ -1246,16 +1243,22 @@ impl Mempool {
         }
 
         // 9. Capacity: either cap (entries or serialized bytes — Core's
-        //    `-maxmempool` analog) trips the evict-the-worst path; the
-        //    candidate must outbid the victim to displace it.
+        //    `-maxmempool` analog) trips the evict-the-worst path. The
+        //    victim is picked by descendant score (Core's `TrimToSize`/
+        //    `CompareTxMemPoolEntryByDescendantScore`), not its own bare
+        //    feerate: a low-fee parent scores at its richest descendant
+        //    package's rate, so a merely-mediocre standalone tx is
+        //    evicted first instead of dragging a valuable child down
+        //    with its low-fee parent. The candidate isn't pooled yet, so
+        //    its own (fee, vsize) is its whole score for this
+        //    comparison — it has no descendants to fold in.
         let tx_size = tx.encode().len();
-        let my_rate = fee * 1000 / vsize.max(1) as i64;
         while self.map.len() >= self.max_entries || self.pool_bytes + tx_size > self.max_bytes {
-            // Cheapest pooled tx first — O(log n) off the sorted index.
-            let Some((&(worst_rate, worst_id), _)) = self.by_rate.first_key_value() else {
+            let Some(worst_id) = self.worst_by_descendant_score() else {
                 return Err(MempoolReject::Full);
             };
-            if my_rate <= worst_rate {
+            let (worst_fee, worst_size) = self.descendant_score(&worst_id);
+            if (fee as i128) * (worst_size as i128) <= (worst_fee as i128) * (vsize as i128) {
                 return Err(MempoolReject::Full);
             }
             // The evicted entry's descendants leave with it — Core's
@@ -1274,7 +1277,6 @@ impl Mempool {
         }
         self.wtxids.insert(tx.wtxid(), txid);
         self.pool_bytes += tx_size;
-        self.by_rate.insert((my_rate, txid), ());
         self.epoch += 1;
         self.map.insert(
             txid,
@@ -1429,6 +1431,56 @@ impl Mempool {
             .map(|e| e.vsize)
             .sum();
         (descendants.len(), vsize)
+    }
+
+    /// Core's `CompareTxMemPoolEntryByDescendantScore`'s per-entry score
+    /// (its `GetModFeeAndSize`): `(fee, vsize)` for whichever is the
+    /// higher feerate of the entry's own pair and its pair *with* every
+    /// current in-pool descendant folded in. A low-fee parent with a
+    /// rich descendant is scored at the descendants' rate rather than
+    /// its own, so trimming can't take the rich descendant down just to
+    /// evict a merely-mediocre parent. Returns a `(fee, size)` pair
+    /// rather than a ratio — callers compare two scores by cross-
+    /// multiplication instead of floating point.
+    fn descendant_score(&self, txid: &Txid) -> (i64, usize) {
+        let Some(entry) = self.map.get(txid) else {
+            return (0, 1);
+        };
+        let own = (entry.modified_fee(), entry.vsize);
+        let mut with_descendants = own;
+        for id in self.descendant_txids(txid) {
+            if let Some(e) = self.map.get(&id) {
+                with_descendants.0 = with_descendants.0.saturating_add(e.modified_fee());
+                with_descendants.1 = with_descendants.1.saturating_add(e.vsize);
+            }
+        }
+        // `with_descendants` rate > `own` rate, cross-multiplied to
+        // avoid floating point (Core's `f1`/`f2` comparison in doubles).
+        if (with_descendants.0 as i128) * (own.1 as i128)
+            > (own.0 as i128) * (with_descendants.1 as i128)
+        {
+            with_descendants
+        } else {
+            own
+        }
+    }
+
+    /// The lowest-scoring pooled entry by [`Self::descendant_score`] —
+    /// the eviction cursor for the capacity trim (Core's `TrimToSize`,
+    /// driven off its `descendant_score_index`). Ties break on txid so
+    /// the choice is deterministic. `O(n)` over the pool: only walked
+    /// when a candidate is admitted at capacity, not on every lookup —
+    /// Core's own index is `O(log n)` per removal, but a plain scan
+    /// avoids keeping a relationship-dependent score continuously
+    /// up to date as unrelated entries come and go.
+    fn worst_by_descendant_score(&self) -> Option<Txid> {
+        self.map.keys().copied().min_by(|&a, &b| {
+            let (fa, sa) = self.descendant_score(&a);
+            let (fb, sb) = self.descendant_score(&b);
+            ((fa as i128) * (sb as i128))
+                .cmp(&((fb as i128) * (sa as i128)))
+                .then_with(|| a.cmp(&b))
+        })
     }
 
     /// Parks a tx whose inputs don't resolve, bounded and expiring —
@@ -1630,8 +1682,6 @@ impl Mempool {
         self.epoch += 1;
         self.unbroadcast.remove(txid);
         self.wtxids.remove(&entry.tx.wtxid());
-        self.by_rate
-            .remove(&(entry.fee * 1000 / entry.vsize.max(1) as i64, *txid));
         self.pool_bytes = self.pool_bytes.saturating_sub(entry.size);
         for input in &entry.tx.inputs {
             self.spends.remove(&input.previous_output);
@@ -2516,6 +2566,52 @@ mod tests {
         let poor = spend_tx(mature_outpoint(&blocks, 1), 4_999_999_500, SEQ_FINAL);
         assert_eq!(pool.accept_tx(poor, &cs, NOW), Err(MempoolReject::Full));
         assert!(pool.pool_bytes + 8 <= cap);
+    }
+
+    #[test]
+    fn capacity_eviction_uses_descendant_score_not_own_rate() {
+        // Core's `TrimToSize`/`CompareTxMemPoolEntryByDescendantScore`:
+        // a low-fee parent `b` with a huge-fee child `c` scores at `c`'s
+        // rate, not its own — so at capacity, the worse *standalone* `a`
+        // is evicted instead, and `b`+`c` survive together. Ranking by
+        // each entry's own bare feerate alone (the bug) would instead
+        // pick `b` (lowest raw rate) and its eviction would drag the
+        // valuable `c` down with it, leaving the worse `a` untouched.
+        let (cs, blocks) = chainstate_at(102);
+        let mut pool = permissive_pool();
+        pool.set_max_entries(3);
+
+        let a = spend_tx(mature_outpoint(&blocks, 1), 4_999_995_000, SEQ_FINAL); // fee 5,000
+        let a_id = a.txid();
+        let b = spend_tx(mature_outpoint(&blocks, 2), 4_999_999_900, SEQ_FINAL); // fee 100
+        let b_id = b.txid();
+        let c = spend_tx(
+            OutPoint {
+                txid: b_id,
+                vout: 0,
+            },
+            4_989_999_900, // fee 10,000,000 off b's output
+            SEQ_FINAL,
+        );
+        let c_id = c.txid();
+        pool.accept_tx(a, &cs, NOW).unwrap();
+        pool.accept_tx(b, &cs, NOW).unwrap();
+        pool.accept_tx(c, &cs, NOW).unwrap();
+        assert_eq!(pool.len(), 3, "pool at capacity");
+
+        // `d`'s own rate clears `a`'s but is nowhere near `b`+`c`'s
+        // combined package rate — it should only ever need to beat `a`.
+        let d = spend_tx(mature_outpoint(&blocks, 3), 4_999_950_000, SEQ_FINAL); // fee 50,000
+        let d_id = d.txid();
+        assert_eq!(pool.accept_tx(d, &cs, NOW), Ok(d_id));
+
+        assert!(pool.get(&a_id).is_none(), "worse standalone tx evicted");
+        assert!(
+            pool.get(&b_id).is_some(),
+            "low-fee parent survives via its child's package rate"
+        );
+        assert!(pool.get(&c_id).is_some(), "rich child untouched");
+        assert!(pool.get(&d_id).is_some());
     }
 
     #[test]
