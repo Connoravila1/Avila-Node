@@ -175,6 +175,11 @@ pub enum MempoolReject {
     /// toward zero afterward.
     #[error("mempool min fee not met")]
     MempoolMinFeeNotMet,
+    /// BIP431 TRUC (`nVersion = 3`) topology rule failed — Core's
+    /// `SingleTRUCChecks`. Core's own wire-level reject reason is the
+    /// bare `"TRUC-violation"`; the detail carries the specific rule.
+    #[error("TRUC-violation: {0}")]
+    TrucViolation(&'static str),
 }
 
 /// Core's `DEFAULT_ANCESTOR_LIMIT` — a candidate may not bring its
@@ -913,6 +918,56 @@ impl Mempool {
 
         let ancestors = self.ancestors_of(tx);
 
+        // TRUC/BIP431 (Core's `SingleTRUCChecks`) — mirrors accept_tx's
+        // step 3.6, including folding an offered sibling eviction into
+        // `conflicts` before the disjointness/rule-5 gates below so this
+        // dry run reports the same outcome `accept_tx` would reach.
+        {
+            let mut direct_parent_ids: Vec<Txid> = Vec::new();
+            for input in &tx.inputs {
+                let pid = input.previous_output.txid;
+                if self.map.contains_key(&pid) && !direct_parent_ids.contains(&pid) {
+                    direct_parent_ids.push(pid);
+                }
+            }
+            let truc_parents: Vec<truc::ParentFacts> = direct_parent_ids
+                .iter()
+                .filter_map(|pid| {
+                    let parent = self.map.get(pid)?;
+                    let ancestor_count = self.ancestors_of(&parent.tx).len() + 1;
+                    let descendants = self
+                        .descendant_txids(pid)
+                        .iter()
+                        .filter_map(|did| {
+                            let d = self.map.get(did)?;
+                            Some((*did, self.ancestors_of(&d.tx).len() + 1))
+                        })
+                        .collect();
+                    Some(truc::ParentFacts {
+                        version: parent.tx.version,
+                        ancestor_count,
+                        descendants,
+                    })
+                })
+                .collect();
+            let direct_conflicts: HashSet<Txid> = conflicts.iter().copied().collect();
+            let outcome =
+                match truc::single_truc_checks(tx.version, vsize, &truc_parents, &direct_conflicts)
+                {
+                    truc::TrucOutcome::Ok => Ok("no TRUC violation".to_string()),
+                    truc::TrucOutcome::Reject(reason) => Err(format!("TRUC-violation: {reason}")),
+                    truc::TrucOutcome::ConsiderSiblingEviction { sibling, .. } => {
+                        if !conflicts.contains(&sibling) {
+                            conflicts.push(sibling);
+                        }
+                        Ok(format!("would evict sibling {sibling}"))
+                    }
+                };
+            if !push(&mut steps, "truc", outcome) {
+                return steps;
+            }
+        }
+
         if !conflicts.is_empty() {
             let replaced = self.set_being_replaced(&conflicts);
             if !push(
@@ -1257,6 +1312,60 @@ impl Mempool {
         //    is bounded, and no ancestor's descendant set may overflow
         //    by accepting it.
         let ancestors = self.ancestors_of(&tx);
+
+        // 3.6 TRUC/BIP431 (Core's `SingleTRUCChecks`): v3 transactions
+        //    never mix unconfirmed ancestry with non-v3 txs, are capped
+        //    at one unconfirmed ancestor and one descendant, and size
+        //    limits tighten once either side of that relationship is in
+        //    play. A parent's sole existing child in the plain,
+        //    non-reorg shape may be evicted instead of rejecting the new
+        //    tx outright — Core's opportunistic sibling eviction, which
+        //    applies to ordinary single-tx submission (not just
+        //    packages). The evicted sibling joins `conflicts` *before*
+        //    the disjointness/rule-5/fee checks below, so it's bound by
+        //    the same replacement economics as any other conflict —
+        //    Core gives it no free pass on BIP125 signaling or fees.
+        {
+            let mut direct_parent_ids: Vec<Txid> = Vec::new();
+            for input in &tx.inputs {
+                let pid = input.previous_output.txid;
+                if self.map.contains_key(&pid) && !direct_parent_ids.contains(&pid) {
+                    direct_parent_ids.push(pid);
+                }
+            }
+            let truc_parents: Vec<truc::ParentFacts> = direct_parent_ids
+                .iter()
+                .filter_map(|pid| {
+                    let parent = self.map.get(pid)?;
+                    let ancestor_count = self.ancestors_of(&parent.tx).len() + 1;
+                    let descendants = self
+                        .descendant_txids(pid)
+                        .iter()
+                        .filter_map(|did| {
+                            let d = self.map.get(did)?;
+                            Some((*did, self.ancestors_of(&d.tx).len() + 1))
+                        })
+                        .collect();
+                    Some(truc::ParentFacts {
+                        version: parent.tx.version,
+                        ancestor_count,
+                        descendants,
+                    })
+                })
+                .collect();
+            let direct_conflicts: HashSet<Txid> = conflicts.iter().copied().collect();
+            match truc::single_truc_checks(tx.version, vsize, &truc_parents, &direct_conflicts) {
+                truc::TrucOutcome::Ok => {}
+                truc::TrucOutcome::Reject(reason) => {
+                    return Err(MempoolReject::TrucViolation(reason));
+                }
+                truc::TrucOutcome::ConsiderSiblingEviction { sibling, .. } => {
+                    if !conflicts.contains(&sibling) {
+                        conflicts.push(sibling);
+                    }
+                }
+            }
+        }
 
         if !conflicts.is_empty() {
             let replaced = self.set_being_replaced(&conflicts);
@@ -2159,6 +2268,7 @@ fn standard_script_flags(
 
 pub mod policy;
 pub mod template;
+pub mod truc;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::missing_panics_doc)]
@@ -2904,6 +3014,184 @@ mod tests {
         assert_eq!(pool.expire(expired_at), 2);
         assert!(pool.get(&parent_id).is_none());
         assert!(pool.get(&child_id).is_none());
+    }
+
+    #[test]
+    fn truc_tx_over_max_vsize_is_rejected() {
+        // BIP431/Core's SingleTRUCChecks: TRUC_MAX_VSIZE = 10,000 vB for
+        // any v3 tx, standalone or not.
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        let mut tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        tx.version = 3;
+        tx.outputs[0].script_pubkey = Script::new(vec![0u8; 10_300]); // pushes ~vsize > 10,000
+        assert_eq!(
+            pool.accept_tx(tx, &cs, NOW),
+            Err(MempoolReject::TrucViolation("version=3 tx is too big"))
+        );
+    }
+
+    #[test]
+    fn truc_child_over_child_max_vsize_is_rejected() {
+        // TRUC_CHILD_MAX_VSIZE = 1,000 vB — tighter than the 10,000
+        // standalone cap once the tx has an unconfirmed (TRUC) parent.
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        let mut parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        parent.version = 3;
+        let parent_id = parent.txid();
+        pool.accept_tx(parent, &cs, NOW).unwrap();
+
+        let mut child = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            4_998_000_000,
+            SEQ_FINAL,
+        );
+        child.version = 3;
+        child.outputs[0].script_pubkey = Script::new(vec![0u8; 1_200]); // > 1,000 vB, < 10,000
+        assert_eq!(
+            pool.accept_tx(child, &cs, NOW),
+            Err(MempoolReject::TrucViolation(
+                "version=3 child tx is too big"
+            ))
+        );
+    }
+
+    #[test]
+    fn truc_non_v3_cannot_spend_v3_parent() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        let mut parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        parent.version = 3;
+        let parent_id = parent.txid();
+        pool.accept_tx(parent, &cs, NOW).unwrap();
+
+        // Ordinary v2 child of a v3 (TRUC) parent.
+        let child = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            4_998_000_000,
+            SEQ_FINAL,
+        );
+        assert_eq!(
+            pool.accept_tx(child, &cs, NOW),
+            Err(MempoolReject::TrucViolation(
+                "non-version=3 tx cannot spend from version=3 tx"
+            ))
+        );
+    }
+
+    #[test]
+    fn truc_v3_cannot_spend_non_v3_parent() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL); // v2
+        let parent_id = parent.txid();
+        pool.accept_tx(parent, &cs, NOW).unwrap();
+
+        let mut child = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            4_998_000_000,
+            SEQ_FINAL,
+        );
+        child.version = 3;
+        assert_eq!(
+            pool.accept_tx(child, &cs, NOW),
+            Err(MempoolReject::TrucViolation(
+                "version=3 tx cannot spend from non-version=3 tx"
+            ))
+        );
+    }
+
+    #[test]
+    fn truc_second_child_evicts_sibling_when_it_outpays_it() {
+        // A TRUC parent may have only one unconfirmed descendant; a
+        // second, unrelated child (not a direct double-spend of the
+        // first) may still land by evicting the sole existing sibling —
+        // Core's opportunistic sibling eviction — provided it clears the
+        // ordinary replacement fee rule against it.
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        let mut parent = fan_tx(mature_outpoint(&blocks, 1), 2, 2_000_000_000);
+        parent.version = 3;
+        let parent_id = parent.txid();
+        pool.accept_tx(parent, &cs, NOW).unwrap();
+
+        let mut child1 = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            1_999_999_000, // fee 1,000
+            SEQ_FINAL,
+        );
+        child1.version = 3;
+        let child1_id = child1.txid();
+        pool.accept_tx(child1, &cs, NOW).unwrap();
+
+        let mut child2 = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 1,
+            },
+            1_900_000_000, // fee 100,000,000 — comfortably outpays child1
+            SEQ_FINAL,
+        );
+        child2.version = 3;
+        let child2_id = child2.txid();
+        assert_eq!(pool.accept_tx(child2, &cs, NOW), Ok(child2_id));
+        assert!(pool.get(&child1_id).is_none(), "sibling evicted");
+        assert!(pool.get(&child2_id).is_some());
+        assert!(pool.get(&parent_id).is_some());
+    }
+
+    #[test]
+    fn truc_ancestor_limit_rejects_third_generation() {
+        // TRUC_ANCESTOR_LIMIT = 2 (the tx plus at most one unconfirmed
+        // ancestor) — a v3 grandchild of a v3 grandparent (both already
+        // pooled) has 2 unconfirmed ancestors, one too many.
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        let mut grandparent = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        grandparent.version = 3;
+        let gp_id = grandparent.txid();
+        pool.accept_tx(grandparent, &cs, NOW).unwrap();
+
+        let mut parent = spend_tx(
+            OutPoint {
+                txid: gp_id,
+                vout: 0,
+            },
+            4_998_000_000,
+            SEQ_FINAL,
+        );
+        parent.version = 3;
+        let parent_id = parent.txid();
+        pool.accept_tx(parent, &cs, NOW).unwrap();
+
+        let mut child = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            4_997_000_000,
+            SEQ_FINAL,
+        );
+        child.version = 3;
+        assert_eq!(
+            pool.accept_tx(child, &cs, NOW),
+            Err(MempoolReject::TrucViolation(
+                "tx would have too many ancestors"
+            ))
+        );
     }
 
     #[test]
