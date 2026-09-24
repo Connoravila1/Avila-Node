@@ -189,6 +189,22 @@ pub struct HeaderTree {
     children: HashMap<BlockHash, Vec<BlockHash>>,
 }
 
+// Steps taken by `insert`'s failed-ancestor check — test-only
+// instrumentation proving it's O(1) (a single `self.invalid.contains`
+// lookup) rather than O(depth) (the old `ancestor_is_invalid`, which
+// walked back to genesis on every insert whenever nothing was
+// actually invalid — O(n^2) hash lookups over a full header sync).
+// See `chain::tests::insert_after_a_long_valid_chain_is_o1`.
+//
+// Thread-local, not a shared atomic: `cargo test` runs different
+// `#[test]` functions concurrently on different threads, and a global
+// counter would pick up unrelated tests' `insert` calls running at
+// the same time.
+#[cfg(test)]
+thread_local! {
+    static ANCESTOR_CHECK_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl HeaderTree {
     /// Creates a tree containing exactly the network's genesis header at height 0. The
     /// genesis is the anchor, not a validated child: it is inserted unconditionally, as
@@ -399,55 +415,70 @@ impl HeaderTree {
 
     /// Marks `hash` failed — Core's `pindex->nStatus |= BLOCK_FAILED_VALID`, set by
     /// `AcceptBlock` on `CheckBlock`/`ContextualCheckBlock` failure and by
-    /// `InvalidChainFound` on `ConnectBlock` failure. Once marked, every descendant is
-    /// rejected at [`HeaderTree::insert`] (`bad-prevblk`) and a resubmission reports
+    /// `InvalidChainFound` on `ConnectBlock` failure — and eagerly propagates the flag to
+    /// every already-known descendant via the children index (Core's `BLOCK_FAILED_CHILD`,
+    /// applied right away here instead of lazily discovered per header).
+    ///
+    /// This eager propagation is what keeps [`HeaderTree::insert`]'s own failed-parent
+    /// gate an O(1) set lookup: a node can only ever be inserted once its direct parent is
+    /// already known and not failed, so by induction over insertion order, any node whose
+    /// ancestor is ever marked failed is itself marked failed no later than that
+    /// invalidation — never discovered lazily by a fresh header walking all the way back to
+    /// it. Once marked, resubmitting `hash` (or any propagated descendant) reports
     /// [`InsertStatus::AlreadyKnown`] while [`HeaderTree::is_failed`] reports `true`
     /// (Core's `duplicate-invalid`).
+    ///
+    /// `O(1)` when `hash` is already marked (and thus already fully propagated);
+    /// otherwise `O(known subtree of hash)` — paid once per invalidation, not per header.
     pub fn mark_invalid(&mut self, hash: BlockHash) {
-        self.invalid.insert(hash);
+        if !self.invalid.insert(hash) {
+            return;
+        }
+        let mut stack: Vec<BlockHash> = self.children(&hash).to_vec();
+        while let Some(h) = stack.pop() {
+            // Already marked ⇒ its own subtree was already propagated to
+            // when it was marked — no need to walk it again.
+            if self.invalid.insert(h) {
+                stack.extend_from_slice(self.children(&h));
+            }
+        }
     }
 
     /// `true` if `hash` carries the failed flag — either the block whose own validation
-    /// failed, or a descendant marked by a previous insertion-time ancestor walk.
+    /// failed, or a descendant [`HeaderTree::mark_invalid`] propagated it to.
     #[must_use]
     pub fn is_failed(&self, hash: &BlockHash) -> bool {
         self.invalid.contains(hash)
     }
 
-    /// `InvalidateBlock`'s subtree marking — `hash` takes `BLOCK_FAILED_VALID` and
-    /// every descendant `BLOCK_FAILED_CHILD`; this set tracks the mask, not the
-    /// individual flags. Descendants are found by a full index scan — the same
-    /// `mapBlockIndex` sweep Core runs, O(nodes × ancestor walk), so callers use
-    /// this for operator-initiated invalidation, not per-block paths.
+    /// `InvalidateBlock`'s subtree marking — `hash` takes `BLOCK_FAILED_VALID` and every
+    /// descendant `BLOCK_FAILED_CHILD`; this set tracks the mask, not the individual flags.
+    /// A thin wrapper over [`HeaderTree::mark_invalid`], which already propagates to every
+    /// descendant — kept as a separate name for the operator-initiated (`invalidateblock`)
+    /// call site, and to preserve the no-op-on-unknown-hash guard independent of any
+    /// future caller.
     pub(crate) fn mark_invalid_subtree(&mut self, hash: &BlockHash) {
-        let Some(target) = self.nodes.get(hash) else {
+        if !self.nodes.contains_key(hash) {
             return;
-        };
-        let base_height = target.height;
-        self.invalid.insert(*hash);
-        let descendants: Vec<BlockHash> = self
-            .nodes
-            .iter()
-            .filter(|(_, cand)| cand.height > base_height && self.is_ancestor(target, cand))
-            .map(|(h, _)| *h)
-            .collect();
-        self.invalid.extend(descendants);
+        }
+        self.mark_invalid(*hash);
     }
 
     /// `ResetBlockFailureFlags` — clears the failed flag on `hash` and all its
-    /// descendants (the index sweep), then on every ancestor (the `pprev` walk).
+    /// descendants (a children-index walk, mirroring [`HeaderTree::mark_invalid`]'s
+    /// propagation instead of a full-tree scan), then on every ancestor (the `pprev`
+    /// walk, unavoidably O(depth) — clearing ancestors is inherently a walk up).
     /// Other descendants of a flagged ancestor stay failed, matching Core.
     pub(crate) fn clear_invalid_subtree(&mut self, hash: &BlockHash) {
         let Some(target) = self.nodes.get(hash) else {
             return;
         };
-        let base_height = target.height;
-        let mut to_clear: Vec<BlockHash> = self
-            .nodes
-            .iter()
-            .filter(|(_, cand)| cand.height >= base_height && self.is_ancestor(target, cand))
-            .map(|(h, _)| *h)
-            .collect();
+        let mut to_clear = vec![*hash];
+        let mut stack: Vec<BlockHash> = self.children(hash).to_vec();
+        while let Some(h) = stack.pop() {
+            to_clear.push(h);
+            stack.extend_from_slice(self.children(&h));
+        }
         let mut cursor = Some(target.header.prev_block_hash);
         while let Some(h) = cursor {
             if self.invalid.contains(&h) {
@@ -513,31 +544,6 @@ impl HeaderTree {
         true
     }
 
-    /// Walks the ancestor chain of `cursor` toward genesis. Returns `true` when the walk
-    /// reaches a failed block — in which case every node passed on the way is marked
-    /// failed, matching `AcceptBlockHeader`'s `invalid_walk` marking of the blocks
-    /// between `pindexPrev` and the failed ancestor. `false` when the walk reaches the
-    /// tree boundary (genesis) without hitting a failed node.
-    pub(crate) fn ancestor_is_invalid(&mut self, mut cursor: BlockHash) -> bool {
-        let mut path = Vec::new();
-        let hit = loop {
-            if self.invalid.contains(&cursor) {
-                break true;
-            }
-            let Some(node) = self.nodes.get(&cursor) else {
-                break false;
-            };
-            path.push(cursor);
-            cursor = node.header.prev_block_hash;
-        };
-        if hit {
-            for hash in path {
-                self.invalid.insert(hash);
-            }
-        }
-        hit
-    }
-
     /// Validates `header` against the tree and inserts it.
     ///
     /// `now` is the caller's adjusted local time for the future-drift check — an explicit
@@ -553,18 +559,25 @@ impl HeaderTree {
     /// passes [`rules::check_block_time`] — median-time-past, then the BIP94 timewarp
     /// floor on `enforce_BIP94` networks at period-start heights, then the future-drift
     /// ceiling; and its `nVersion` meets every buried-deployment floor already active at
-    /// its height (`bad-version`, [`ChainError::BadVersion`]); and no ancestor of its
-    /// parent carries the failed flag (`bad-prevblk`). On success the node is
+    /// its height (`bad-version`, [`ChainError::BadVersion`]). On success the node is
     /// stored and the best tip moves to it iff its chainwork strictly exceeds the current
     /// tip's.
     ///
+    /// The direct-parent failed-flag check above is also the *only* failed-ancestor
+    /// check: it doesn't need to additionally walk the rest of the ancestry looking for
+    /// an indirectly-failed one, because [`HeaderTree::mark_invalid`] already propagates
+    /// the flag to every known descendant the moment a block is marked, and a node can
+    /// only ever be inserted once its direct parent already exists and isn't failed — so
+    /// by induction over insertion order, an indirectly-failed ancestor implies the
+    /// direct parent is already flagged too. This is what keeps `insert` O(1) in the
+    /// failed-ancestor check instead of O(depth) per header (Core's own `AcceptBlockHeader`
+    /// keeps the equivalent walk, `invalid_walk`, because `nStatus` propagation there is
+    /// itself lazy — this crate propagates eagerly in `mark_invalid` instead, at
+    /// invalidation time rather than at every descendant's insertion time).
+    ///
     /// # Errors
     ///
-    /// Returns the first failing [`ChainError`]. No header node is added on error; the
-    /// failed-ancestor walk behind [`ChainError::InvalidParent`] deliberately marks the
-    /// nodes it traverses failed before returning, exactly as `AcceptBlockHeader`'s
-    /// `invalid_walk` sets `BLOCK_FAILED_CHILD` on the blocks between the parent and the
-    /// failed ancestor.
+    /// Returns the first failing [`ChainError`]. No header node is added on error.
     pub fn insert(&mut self, header: &BlockHeader, now: u32) -> Result<InsertStatus, ChainError> {
         let hash = header.hash();
         if let Some(existing) = self.nodes.get(&hash) {
@@ -577,8 +590,13 @@ impl HeaderTree {
             .nodes
             .get(&header.prev_block_hash)
             .ok_or(ChainError::UnknownParent(header.prev_block_hash))?;
-        // `bad-prevblk` (direct parent): `AcceptBlockHeader` rejects before
-        // `ContextualCheckBlockHeader` when `pindexPrev` carries `BLOCK_FAILED_MASK`.
+        // `bad-prevblk` (direct parent, and — by `mark_invalid`'s eager
+        // propagation invariant — the *only* failed-ancestor check
+        // this needs; see `insert`'s doc comment): `AcceptBlockHeader`
+        // rejects before `ContextualCheckBlockHeader` when `pindexPrev`
+        // carries `BLOCK_FAILED_MASK`.
+        #[cfg(test)]
+        ANCESTOR_CHECK_STEPS.with(|c| c.set(c.get() + 1));
         if self.invalid.contains(&header.prev_block_hash) {
             return Err(ChainError::InvalidParent);
         }
@@ -620,13 +638,6 @@ impl HeaderTree {
             return Err(ChainError::BadVersion {
                 version: header.version,
             });
-        }
-        // `bad-prevblk` (failed ancestor): `AcceptBlockHeader`'s last gate walks
-        // `m_failed_blocks` for an ancestor of `pindexPrev`, marking the blocks between
-        // `BLOCK_FAILED_CHILD` as it goes — the ancestor walk here is the same check
-        // and leaves the same marks.
-        if self.ancestor_is_invalid(header.prev_block_hash) {
-            return Err(ChainError::InvalidParent);
         }
         let chainwork = parent
             .chainwork
@@ -939,6 +950,86 @@ mod tests {
             }
         }
         assert!(rejected, "no tested nonce produced InsufficientWork");
+    }
+
+    #[test]
+    fn insert_after_a_long_valid_chain_is_o1() {
+        // insert()'s failed-ancestor check must be O(1) — a single
+        // self.invalid.contains(&parent_hash) lookup — not O(depth).
+        // The old ancestor_is_invalid walked back to genesis on every
+        // insert whenever nothing was actually invalid, so a full
+        // header sync cost O(n^2) hash lookups (~4*10^11 for 935k
+        // mainnet headers — hours of CPU the tiny fixtures never
+        // showed).
+        let params = easy_params();
+        let mut tree = HeaderTree::new(params);
+        for i in 1..=3_000u32 {
+            let tip = *tree.tip();
+            let next = extend(&tip, &params, tip.header.time + 600, i);
+            tree.insert(&next, u32::MAX).unwrap();
+        }
+        let tip = *tree.tip();
+        let next = extend(&tip, &params, tip.header.time + 600, 3_001);
+
+        ANCESTOR_CHECK_STEPS.with(|c| c.set(0));
+        tree.insert(&next, u32::MAX).unwrap();
+        let steps = ANCESTOR_CHECK_STEPS.with(|c| c.get());
+        assert!(
+            steps <= 2,
+            "expected O(1) failed-ancestor-check steps after a 3,000-header chain, got {steps}"
+        );
+    }
+
+    #[test]
+    fn invalidate_propagates_to_descendants_then_reconsider_accepts_new_child() {
+        // Core's AcceptBlockHeader: a header whose parent carries
+        // BLOCK_FAILED_MASK is rejected bad-prevblk; ResetBlockFailureFlags
+        // clears a block, its descendants, and its ancestors.
+        let params = easy_params();
+        let mut tree = HeaderTree::new(params);
+        let genesis = *tree.tip();
+
+        // b -> d1 -> d2 -> d3: b already has 3 descendant headers.
+        let b = extend(&genesis, &params, genesis.header.time + 600, 1);
+        tree.insert(&b, u32::MAX).unwrap();
+        let b_node = *tree.get(&b.hash()).unwrap();
+        let d1 = extend(&b_node, &params, b.time + 600, 1);
+        tree.insert(&d1, u32::MAX).unwrap();
+        let d1_node = *tree.get(&d1.hash()).unwrap();
+        let d2 = extend(&d1_node, &params, d1.time + 600, 1);
+        tree.insert(&d2, u32::MAX).unwrap();
+        let d2_node = *tree.get(&d2.hash()).unwrap();
+        let d3 = extend(&d2_node, &params, d2.time + 600, 1);
+        tree.insert(&d3, u32::MAX).unwrap();
+        let d3_node = *tree.get(&d3.hash()).unwrap();
+
+        // invalidateblock b: propagates to d1, d2, d3 right away.
+        tree.mark_invalid_subtree(&b.hash());
+        assert!(tree.is_failed(&b.hash()));
+        assert!(tree.is_failed(&d1.hash()));
+        assert!(tree.is_failed(&d2.hash()));
+        assert!(tree.is_failed(&d3.hash()));
+
+        // A 4th header extending d3 is rejected — bad-prevblk, via the
+        // O(1) direct-parent check alone (d3 is already flagged).
+        let d4 = extend(&d3_node, &params, d3.time + 600, 1);
+        assert_eq!(tree.insert(&d4, u32::MAX), Err(ChainError::InvalidParent));
+
+        // reconsiderblock b: clears b, its descendants, and its
+        // ancestors (just genesis here, never failed).
+        tree.clear_invalid_subtree(&b.hash());
+        assert!(!tree.is_failed(&b.hash()));
+        assert!(!tree.is_failed(&d1.hash()));
+        assert!(!tree.is_failed(&d2.hash()));
+        assert!(!tree.is_failed(&d3.hash()));
+
+        // The same 4th header is now accepted.
+        assert_eq!(
+            tree.insert(&d4, u32::MAX),
+            Ok(InsertStatus::Added {
+                height: d3_node.height + 1
+            })
+        );
     }
 
     #[test]

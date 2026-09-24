@@ -2354,10 +2354,12 @@ impl Chainstate {
             return Ok(None);
         }
         // Activation pruning: `FindMostWorkChain` skips a candidate whose
-        // branch contains a failed block, marking the walked nodes
-        // `BLOCK_FAILED_CHILD`. `ancestor_is_invalid` is the same walk with the
-        // same marks — a failed-branch block parks rather than reconnecting.
-        if self.tree.ancestor_is_invalid(hash) {
+        // branch contains a failed block. A single `is_failed` check on
+        // `hash` itself suffices here — `HeaderTree::mark_invalid`
+        // eagerly propagates the flag to every known descendant the
+        // moment a block is marked, so a failed ancestor anywhere in
+        // `hash`'s branch already means `hash` itself is flagged too.
+        if self.tree.is_failed(&hash) {
             return Ok(None);
         }
         // Collect the branch back to its fork point with the connected chain.
