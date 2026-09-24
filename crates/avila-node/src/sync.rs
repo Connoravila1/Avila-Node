@@ -36,6 +36,11 @@ pub struct SyncConfig {
     /// one `a.b.c.d/plen asn` row per line; Core's bit-packed
     /// `asmap.dat` parsing is open. Empty/absent = no bucketing.
     pub asmap_path: Option<std::path::PathBuf>,
+    /// Fixed-size send cells in bytes (queue #17): pads every v2
+    /// link's outgoing queue to this multiple with decoy packets so
+    /// the wire write-size histogram is flat. 0 = Core's behavior
+    /// (natural sizes).
+    pub cell_bytes: usize,
     /// When set, the chainstate persists under this directory —
     /// re-running resumes from the stored snapshot instead of genesis.
     pub data_dir: Option<std::path::PathBuf>,
@@ -108,6 +113,7 @@ impl Default for SyncConfig {
             timeout: Duration::from_secs(120),
             proxy: None,
             asmap_path: None,
+            cell_bytes: 0,
             data_dir: None,
             dbcache: None,
             cancel: None,
@@ -320,6 +326,7 @@ pub fn run(
     let mut audit_failures = 0usize;
     let mut mgr = PeerManager::new(cfg.max_peers);
     mgr.set_proxy(cfg.proxy);
+    mgr.set_cell_bytes(cfg.cell_bytes);
     if let Some(path) = &cfg.asmap_path {
         match avila_p2p::asmap::AsMap::load_file(path) {
             Ok((map, skipped)) => {

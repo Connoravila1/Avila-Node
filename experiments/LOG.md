@@ -26,6 +26,7 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 
 
 | 62 | 09-24 | Recon-diff divergence alarm | Does the censorship signal separate from normal sync lag? | **adopted — queue #19 closed** | `ReconRound::close` now returns both diff directions — our misses AND `their_misses` (ids we hold that their pool lacked, previously decoded-then-discarded). Alarm: edge-triggered `NetEvent::ReconDivergence` at ≥10 rounds, ≥100 their-misses, ≥4:1 dominance over our misses — wide-but-balanced diffs (slow sync) don't fire. `recon_their_misses` in getpeerinfo; `recon_divergence` events in getevents + stderr log. Test proves edge-trigger, below-threshold silence both ways. | — |
+| 68 | 09-24 | Fixed-size send cells | Can the wire write-size histogram be flattened? | **adopted — queue #17 closed** | `set_cell_bytes` on session/manager + `--cell-bytes` on run/sync: `flush` pads the send queue to a cell multiple with decoy packets (v2 only — v1 has no ignorable type; fill<20B overshoots to the next boundary, preserving alignment). Test: every flush emits a cell-aligned byte count incl. a small ping after version; v1 stays unpadded. Kernel-level segment splitting is the observer-visible residual (documented). | — |
 | 67 | 09-24 | Documented observability surface | Is the event/telemetry surface consumable as an API? | **adopted — queue #33 closed** | `docs/OBSERVABILITY.md`: the full machine-readable layer as one documented surface — `getevents` ring (7 event kinds incl. eclipse_suspected, recon_divergence, cpu_throttled), `getpeerinfo` telemetry (cpu_ms, recon diffs, addr budgets, claims-vs-delivered), `getmempoolinfo` lifecycle+shadow, block receipts + validation report, swiftsync artifact RPCs, and the poll-drain consumption contract (1024-deep ring, newest-first). | [observability](../docs/OBSERVABILITY.md) |
 | 66 | 09-24 | UTXO-replay self-audit | Can the coins layer be audited like stored blocks? | **adopted — queue #15 closed** | `audit_utxo_segment(from, to)`: the reorg-safety invariant over connected segments — every undo-claimed-spent coin is dead, every live created coin matches its block output, and at tip every non-live created coin is provably spent (present in some undo). Provably-unspendable outputs and sub-tip segments handled honestly (nonlive-created half only asserts at tip). Periodic pass runs a ~2-week window each audit interval. Test: 120-block spend chain clean; a removed live coin → UndoMissing. | — |
 | 65 | 09-24 | Shadow-ruleset observatory | Can policy drift be measured live without gating? | **adopted — queue #8 mempool side shipped** | Every `accept_tx` also scores `shadow_standard` — a Knots-style strict envelope (42B datacarrier total, single nulldata output, no bare multisig) — recorded in `ShadowStats`, surfaced as `getmempoolinfo.shadow` {evaluated, divergent, by_reason}. Never gates: a divergence is a counter, not a verdict. Tests: datacarrier/bare-multisig/2-output cases diverge under shadow while the pool still accepts; strict-vs-ours unit coverage. Block-level shadowing stays open. | — |
@@ -153,7 +154,7 @@ first measurement that would kill or confirm it.
    also serve proofs. Purist gate: needs self-bridge or conventional
    fallback — a bridge can starve, never forge.
 
-7. **Stem-phase tx relay on top of recon.** Recon rounds are already
+7. ~~**Stem-phase tx relay on top of recon.**~~ **done — #64 (stem pending excluded from recon sketches until fluff).** Recon rounds are already
    the epidemic "fluff"; add a private stem path for N hops before the
    tx joins the reconciliation pool. Honest limits: propagation
    latency, known Dandelion deanonymization attacks.
@@ -162,7 +163,7 @@ first measurement that would kill or confirm it.
    under alternate rulesets (Knots policy, proposed softforks) — a
    continuous consensus-drift monitor. Must never gate acceptance.
 
-9. **Dual-engine lockstep mode.** Two independent validation paths,
+9. ~~**Dual-engine lockstep mode.**~~ **done — #63 (shadow-backend plumbing; fixture + live replay).** Two independent validation paths,
    divergence halts with alarm. Note: bitcoinkernel shares Core's code
    (common-mode bugs survive); true independence needs a second
    implementation lineage.
@@ -202,7 +203,7 @@ first measurement that would kill or confirm it.
     The node tells you when you're under attack; nobody ships this.
     Real value for LN operators.
 
-17. ~~**V2 traffic padding.**~~ **done — #47 (decoy injection; fixed-size cells still open).** The 2025 v2-transport analysis showed
+17. ~~**V2 traffic padding.**~~ **done — #47 + #68 (decoys + fixed-size cells).** The 2025 v2-transport analysis showed
     BIP324 encrypts content but leaks message *shape* via TCP payload
     lengths. BIP324's decoy/garbage mechanism exists for exactly this —
     nobody uses it. Experiment: fixed-size send cells + decoy traffic;
@@ -227,7 +228,7 @@ first measurement that would kill or confirm it.
     bucket peers by ASN (Kartograf-reproducible maps) instead of /16.
     A parity gap; well-specified, bounded.
 
-29. **First-class watch-only wallet.** Descriptor/xpub import, balance
+29. ~~**First-class watch-only wallet.**~~ **done — getwalletinfo + listtransactions shipped.** Descriptor/xpub import, balance
     and history, no keys on the node, answers through the Electrum
     server already shipped. Five+ separate projects (bwt, EPS,
     xpub-watcher, Fully Noded, eps-plugin) exist solely because this
@@ -257,7 +258,7 @@ first measurement that would kill or confirm it.
     + artifact bundles served to the operator's own light clients —
     your phone trusts your node.
 
-22. **Self-eclipse field test.** Build the attack: attacker nodes that
+22. ~~**Self-eclipse field test.**~~ **done — lab mount passes (coordinated all-attacker set flagged).** Build the attack: attacker nodes that
     monopolize all our outbound slots in a lab topology. Hypothesis:
     detection signals (header stall, peer homogeneity, route
     uniformity) fire within bounded time. Kill condition: our own
@@ -271,7 +272,7 @@ first measurement that would kill or confirm it.
     false positives. Kill: pinning is indistinguishable from
     legitimate high-descendant usage — the signal isn't separable.
 
-24. **Continuous dual-engine lockstep.** (fixture-scale proven — #50; live-shadow plumbing open) We already have two coins
+24. ~~**Continuous dual-engine lockstep.**~~ **done — #63.** (fixture-scale proven — #50; live-shadow plumbing open) We already have two coins
     engines (redb + hashstore) — run both permanently on live traffic,
     divergence = halt. Continuous consensus-equivalence as a running
     property. Kill: second-engine overhead impractical at steady state
@@ -292,7 +293,7 @@ first measurement that would kill or confirm it.
     red team inside the node. Kill: generated mutations aren't
     interesting enough to catch what a test suite misses.
 
-28. **Adversarial live-wire suite.** Hostile peers at max rate —
+28. ~~**Adversarial live-wire suite.**~~ **done — live-wire test (garbage/oversized/inv-flood) passes.** Hostile peers at max rate —
     malformed messages, floods, slowloris — measure per-peer budgets
     hold under sustained attack. Kill: a hostile peer can starve
     honest peers — find the hole now.

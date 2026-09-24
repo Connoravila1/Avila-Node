@@ -49,6 +49,10 @@ enum Command {
         /// (Core's -asmap; text rows `a.b.c.d/plen asn`).
         #[arg(long)]
         asmap: Option<std::path::PathBuf>,
+        /// Pad every v2 link's writes to this byte multiple with
+        /// decoy packets (queue #17 — flat traffic shape). 0 = off.
+        #[arg(long, default_value_t = 0)]
+        cell_bytes: usize,
         /// Bind the read-only JSON-RPC query surface to this address
         /// (e.g. 127.0.0.1:18443).
         #[arg(long)]
@@ -139,6 +143,10 @@ enum Command {
         /// (Core's -asmap; text rows `a.b.c.d/plen asn`).
         #[arg(long)]
         asmap: Option<std::path::PathBuf>,
+        /// Pad every v2 link's writes to this byte multiple with
+        /// decoy packets (queue #17 — flat traffic shape). 0 = off.
+        #[arg(long, default_value_t = 0)]
+        cell_bytes: usize,
         /// Persist the chainstate under the configured data directory,
         /// resuming where the last run stopped. Enabled by default;
         /// pass --no-store for an in-memory run.
@@ -430,6 +438,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             connect,
             proxy,
             asmap,
+            cell_bytes,
             rpc,
             txindex,
             blockfilterindex,
@@ -597,6 +606,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 timeout: Duration::from_secs(u64::MAX),
                 proxy,
                 asmap_path: asmap,
+                cell_bytes,
                 data_dir: Some(data_dir.clone()),
                 dbcache: dbcache.map(|mb| mb * 1024 * 1024),
                 cancel: Some(cancel),
@@ -641,6 +651,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             connect,
             proxy,
             asmap,
+            cell_bytes,
             store,
             prune_mb,
             txindex,
@@ -665,6 +676,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 timeout: Duration::from_secs(timeout_secs),
                 proxy,
                 asmap_path: asmap,
+                cell_bytes,
                 data_dir: store.then(|| config.network_data_dir()),
                 dbcache: None,
                 cancel: None,

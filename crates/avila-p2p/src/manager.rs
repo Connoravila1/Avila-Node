@@ -491,6 +491,8 @@ pub struct PeerManager<S> {
     /// When set, EVERY outbound connection routes through it; there
     /// is no clearnet fallback (fail-closed — queue #13).
     proxy: Option<SocketAddr>,
+    /// Fixed-size send cells — 0 disables. See `set_cell_bytes`.
+    cell_bytes: usize,
     /// Last time the eclipse-signal check ran (paced to ~60s).
     eclipse_checked_at: Instant,
     /// Named event ring (queue #33): every NetEvent the tick produces
@@ -604,6 +606,7 @@ impl<S: Read + Write> PeerManager<S> {
             event_ring: std::collections::VecDeque::with_capacity(1025),
             eclipse_checked_at: Instant::now(),
             proxy: None,
+            cell_bytes: 0,
             bans: crate::banman::BanList::new(),
             banlist_path: None,
             dial_tx: dial_channel.0,
@@ -865,6 +868,7 @@ impl<S: Read + Write> PeerManager<S> {
         let id = self.next_id;
         self.next_id += 1;
         session.set_clock(self.clock);
+        session.set_cell_bytes(self.cell_bytes);
         let now = Instant::now();
         // Self-connection detection (Core's `CheckIncomingNonce`):
         // remember the nonce on an outbound dial so a matching inbound
@@ -1252,6 +1256,17 @@ impl<S: Read + Write> PeerManager<S> {
     /// dead proxy means no outbound peers rather than a silent leak.
     pub fn set_proxy(&mut self, proxy: Option<SocketAddr>) {
         self.proxy = proxy;
+    }
+
+    /// Fixed-size send cells (queue #17): pads every v2 session's
+    /// outgoing queue to a cell multiple with decoy packets so wire
+    /// write-sizes carry no message-length histogram. 0 disables;
+    /// applies to live sessions and every session `add`ed later.
+    pub fn set_cell_bytes(&mut self, bytes: usize) {
+        self.cell_bytes = bytes;
+        for peer in self.peers.values_mut() {
+            peer.session.set_cell_bytes(bytes);
+        }
     }
 
     /// Loads an AS bucketing map — Erebus mitigation: outbound dialing

@@ -842,6 +842,7 @@ impl AvilaApp {
             timeout: Duration::from_secs(3600),
             proxy: self.sync.proxy_input.trim().parse().ok(),
             asmap_path: None,
+            cell_bytes: 0,
             data_dir: self
                 .sync
                 .store
