@@ -790,6 +790,12 @@ impl<S: Read + Write> PeerManager<S> {
             if !wants_tx {
                 continue;
             }
+            // BIP-330: a recon link doesn't get tx announcements — the
+            // next round reconciles the difference anyway, and skipping
+            // the inv is exactly where the bandwidth win lives.
+            if peer.recon.is_some() {
+                continue;
+            }
             let (inv_type, hash) = if peer.session.peer().is_some_and(|i| i.wtxid_relay) {
                 (
                     crate::message::InvType::Wtx,
