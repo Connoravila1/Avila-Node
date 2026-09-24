@@ -86,6 +86,23 @@ pub struct WatchedCoin {
     pub spent_by: Option<Txid>,
 }
 
+/// Opt-in signing material (queue #35): populated ONLY by
+/// `createdescriptorseed`/key import — the wallet stays watch-only
+/// (Core's `disable_private_keys` model) until the operator asks for
+/// a signer. Secrets are memory-resident ONLY: `watchlist.dat` never
+/// carries key material — a restart loses them until the encrypted
+/// vault lands; the operator's descriptor backup is the recovery.
+pub struct SignerState {
+    /// The signing provider — secrets + xprvs + expansion outputs.
+    pub provider: avila_consensus::descriptor::FlatProvider,
+    /// Private-material descriptor bodies — only surfaced by
+    /// explicitly-private RPCs, never logged.
+    pub descs_private: Vec<String>,
+    /// Seed entropy provenance: "os" (system CSPRNG) or "user"
+    /// (caller-supplied entropy, SHA256-folded).
+    pub provenance: String,
+}
+
 /// The wallet — persistent across restarts via `watchlist.dat`.
 pub struct WatchWallet {
     /// `watchlist.dat` path — writes are atomic (tmp + rename).
@@ -113,6 +130,9 @@ pub struct WatchWallet {
     /// BIP352 silent-payments watches — detected alongside descriptor
     /// scripts; the coin's script is the tweaked taproot output.
     pub silents: Vec<avila_consensus::silent::SilentAddress>,
+    /// Opt-in signer (queue #35) — `None` until the operator creates
+    /// or imports key material; memory-only, never persisted.
+    pub signer: Option<SignerState>,
     /// Dirty flag — set by any mutation, cleared by [`Self::persist`].
     dirty: bool,
 }
@@ -132,6 +152,7 @@ impl WatchWallet {
             gaps: Vec::new(),
             scan_floor: 0,
             silents: Vec::new(),
+            signer: None,
             dirty: false,
         };
         if let Ok(text) = std::fs::read_to_string(&w.path) {
@@ -344,6 +365,25 @@ impl WatchWallet {
         self.dirty = true;
     }
 
+    /// Installs the opt-in signer — the wallet remains watch-only in
+    /// every other respect; this just means `walletprocesspsbt` has
+    /// keys to reach for.
+    pub fn enable_signing(&mut self, signer: SignerState) {
+        self.signer = Some(signer);
+    }
+
+    /// Whether the wallet holds signing keys (opt-in signer active).
+    #[must_use]
+    pub fn is_signer(&self) -> bool {
+        self.signer.is_some()
+    }
+
+    /// The signer's provider, when installed — callers use it to sign.
+    #[must_use]
+    pub fn signer(&self) -> Option<&SignerState> {
+        self.signer.as_ref()
+    }
+
     /// Rewind the scan to `height` (exclusive of it — blocks at
     /// `height` are rescanned) then advance to the tip. Existing
     /// descriptor scripts survive the rewind, so coins found below
@@ -477,6 +517,7 @@ impl WatchWallet {
             gaps: Vec::new(),
             scan_floor: 0,
             silents: Vec::new(),
+            signer: None,
             dirty: false,
         };
         scratch

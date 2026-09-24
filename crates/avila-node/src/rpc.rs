@@ -10429,6 +10429,254 @@ pub(crate) fn dispatch(
             })
         }
         // Core's `listdescriptors` — the imported descriptor table.
+        // Avila-specific (no Core equivalent): create a descriptor
+        // seed — BIP32 master key from OS CSPRNG or caller-supplied
+        // entropy (queue #35/#37). Installs the opt-in signer AND
+        // registers the neutered (xpub) descriptors for watching —
+        // the wallet sees its own coins; secrets stay memory-only.
+        "createdescriptorseed" => {
+            let entropy_arg = param(params, 0, "entropy")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let wallet = wallet.cloned();
+            chain_query_deferred(method, queries, move |cs, _| {
+                let Some(wallet) = wallet else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    )));
+                };
+                let params = cs.tree().params();
+                // Entropy: caller hex (>=16B; exactly 32 used raw,
+                // otherwise SHA256-folded — the Coldcard convention)
+                // or the OS CSPRNG. Provenance is recorded either way.
+                let (seed, provenance) = match &entropy_arg {
+                    None => {
+                        let mut s = [0u8; 32];
+                        if let Err(e) = getrandom::fill(&mut s) {
+                            return QueryReply::Now(Err((
+                                RPC_MISC_ERROR,
+                                format!("entropy source failed: {e}"),
+                            )));
+                        }
+                        (s.to_vec(), "os")
+                    }
+                    Some(h) => match hex::decode(h.trim()) {
+                        Ok(b) if b.len() >= 32 => (b[..32].to_vec(), "user"),
+                        Ok(b) if b.len() >= 16 => {
+                            (avila_consensus::hash::sha256(&b).to_vec(), "user")
+                        }
+                        Ok(b) => {
+                            return QueryReply::Now(Err((
+                                RPC_INVALID_PARAMETER,
+                                format!("entropy must be >=16 bytes (got {})", b.len()),
+                            )));
+                        }
+                        Err(e) => {
+                            return QueryReply::Now(Err((
+                                RPC_INVALID_PARAMETER,
+                                format!("entropy must be hex: {e}"),
+                            )));
+                        }
+                    },
+                };
+                let Some(master) = avila_consensus::extended_key::ExtKey::from_seed(
+                    &seed,
+                    params.base58_ext_secret_prefix,
+                ) else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "master key derivation failed".into(),
+                    )));
+                };
+                // BIP84 account: m/84h/coinh/0h (coin type 0 mainnet,
+                // 1 everywhere else — SLIP-44).
+                const H: u32 = 0x8000_0000;
+                let coin: u32 = match params.network {
+                    avila_consensus::params::Network::Mainnet => 0,
+                    _ => 1,
+                };
+                let Some(account) = master
+                    .derive(84 | H)
+                    .and_then(|k| k.derive(coin | H))
+                    .and_then(|k| k.derive(H))
+                else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "account derivation failed".into(),
+                    )));
+                };
+                let fp = hex::encode(&master.fingerprint());
+                let origin = format!("{fp}/84h/{coin}h/0h");
+                let xprv = account.encode();
+                let Some(xpub) = account.neuter(params.base58_ext_pubkey_prefix) else {
+                    return QueryReply::Now(Err((RPC_MISC_ERROR, "neuter failed".into())));
+                };
+                let xpub = xpub.encode();
+                // Descriptors carry their checksums (Core's wire form).
+                let with_sum = |body: String| {
+                    format!(
+                        "{body}#{}",
+                        avila_consensus::descriptor::descriptor_checksum(&body)
+                    )
+                };
+                let priv_descs = [
+                    with_sum(format!("wpkh([{origin}]{xprv}/0/*)")),
+                    with_sum(format!("wpkh([{origin}]{xprv}/1/*)")),
+                ];
+                let watch_descs = [
+                    (with_sum(format!("wpkh([{origin}]{xpub}/0/*)")), false),
+                    (with_sum(format!("wpkh([{origin}]{xpub}/1/*)")), true),
+                ];
+                // Signing provider: parse the private descs (xprv
+                // roots), then expand a bounded lookahead collecting
+                // derived secrets + origins — `ExpandPrivate`.
+                let mut signing = avila_consensus::descriptor::FlatProvider::default();
+                let mut expanded = avila_consensus::descriptor::FlatProvider::default();
+                for d in &priv_descs {
+                    let (parsed, p, _) = match parse_descriptors(d, params, true) {
+                        Ok(v) => v,
+                        Err(e) => return QueryReply::Now(Err((RPC_INVALID_ADDRESS_OR_KEY, e))),
+                    };
+                    signing.keys.extend(p.keys);
+                    signing.xprvs.extend(p.xprvs);
+                    let mut cache = avila_consensus::descriptor::DeriveCache::new();
+                    for pos in 0..64u32 {
+                        let _ =
+                            parsed[0].expand_into(pos, &signing, &mut expanded, true, &mut cache);
+                    }
+                }
+                signing.keys.extend(expanded.keys);
+                signing.pubkeys.extend(expanded.pubkeys);
+                signing.origins.extend(expanded.origins);
+                signing.scripts.extend(expanded.scripts);
+                signing.tr_trees.extend(expanded.tr_trees);
+
+                let mut w = match wallet.lock() {
+                    Ok(w) => w,
+                    Err(_) => {
+                        return QueryReply::Now(Err((
+                            RPC_MISC_ERROR,
+                            "wallet lock poisoned".into(),
+                        )));
+                    }
+                };
+                // Track the neutered variants through the real import
+                // path — the wallet sees its own coins; the private
+                // versions never touch the watch side.
+                for (d, internal) in &watch_descs {
+                    let req = json!({
+                        "desc": d,
+                        "timestamp": "now",
+                        "active": true,
+                        "internal": internal,
+                        "range": [0, 999],
+                    });
+                    if let Err((code, msg, _)) = import_one_descriptor(&mut w, cs, &req) {
+                        return QueryReply::Now(Err((code, msg)));
+                    }
+                }
+                w.enable_signing(crate::watch::SignerState {
+                    provider: signing,
+                    descs_private: priv_descs.to_vec(),
+                    provenance: provenance.to_string(),
+                });
+                QueryReply::Now(Ok(json!({
+                    "master_fingerprint": fp,
+                    "xprv": master.encode(),
+                    "descriptors": watch_descs.iter().map(|(d, _)| d.clone()).collect::<Vec<_>>(),
+                    "entropy_source": provenance,
+                    "warning": "memory-only signer — restart clears key material; the xprv above is the only backup until the encrypted vault lands",
+                })))
+            })
+        }
+
+        // Opt-in signing (queue #35): sign a PSBT with the wallet's
+        // keys — every prevout claim verified against the node's own
+        // verified UTXO set, not trusted from the PSBT (the LSB-010
+        // fee-attack class solved structurally).
+        "walletprocesspsbt" => {
+            let psbt_b64 = param(params, 0, "psbt")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let wallet = wallet.cloned();
+            chain_query_deferred(method, queries, move |cs, _| {
+                let Some(wallet) = wallet else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    )));
+                };
+                let Some(psbt_b64) = psbt_b64 else {
+                    return QueryReply::Now(Err((
+                        RPC_INVALID_PARAMETER,
+                        "walletprocesspsbt requires a base64 psbt".into(),
+                    )));
+                };
+                let w = match wallet.lock() {
+                    Ok(w) => w,
+                    Err(_) => {
+                        return QueryReply::Now(Err((
+                            RPC_MISC_ERROR,
+                            "wallet lock poisoned".into(),
+                        )));
+                    }
+                };
+                let Some(signer) = w.signer() else {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        "wallet has no signing keys — run createdescriptorseed or import private material".into(),
+                    )));
+                };
+                let Some(bytes) = base64_decode_strict(psbt_b64.trim()) else {
+                    return QueryReply::Now(Err((
+                        RPC_DESERIALIZATION_ERROR,
+                        "psbt decode failed: invalid base64".into(),
+                    )));
+                };
+                let mut psbt = match avila_consensus::psbt::Psbt::decode(&bytes) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return QueryReply::Now(Err((
+                            RPC_DESERIALIZATION_ERROR,
+                            format!("psbt decode failed: {}", e.core_message()),
+                        )));
+                    }
+                };
+                // UTXO-verified prevouts: where our verified set has
+                // the coin, the PSBT's claimed value/script MUST match
+                // it exactly — a lying host can't claim a lower
+                // amount (the hardware-wallet fee attack). Where it
+                // doesn't (spent or foreign prevout) we can't verify —
+                // counted separately, never silently trusted.
+                let (verified, unverified) =
+                    match avila_consensus::sign::verify_and_fill_prevouts(cs.utxo(), &mut psbt) {
+                        Ok(v) => v,
+                        Err(msg) => return QueryReply::Now(Err((RPC_VERIFY_ERROR, msg))),
+                    };
+                let txdata = avila_consensus::sign::precompute_psbt_data(&psbt);
+                let mut complete = true;
+                for i in 0..psbt.tx.inputs.len() {
+                    complete &= avila_consensus::sign::sign_psbt_input(
+                        &signer.provider,
+                        &mut psbt,
+                        i,
+                        Some(&txdata),
+                        1,     // SIGHASH_ALL
+                        false, // real signatures, not the dummy creator
+                        None,
+                        false,
+                    );
+                }
+                QueryReply::Now(Ok(json!({
+                    "psbt": base64_encode(&psbt.encode()),
+                    "complete": complete,
+                    "inputs_verified": verified,
+                    "inputs_unverified": unverified,
+                })))
+            })
+        }
+
         "listdescriptors" => {
             let wallet = wallet.cloned();
             chain_query(method, queries, move |_, _| {
@@ -10886,6 +11134,11 @@ pub(crate) fn dispatch(
                         "height": w.chain.len() as i64 - 1,
                     },
                     "private_keys_enabled": false,
+                    // Opt-in signer (queue #35) — watch-only default
+                    // unchanged; when a signer is installed the wallet
+                    // can sign via walletprocesspsbt.
+                    "signing": w.is_signer(),
+                    "entropy_source": w.signer().map(|sg| sg.provenance.clone()),
                 }))
             })
         }

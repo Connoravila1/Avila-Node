@@ -300,12 +300,16 @@ first measurement that would kill or confirm it.
     hold under sustained attack. Kill: a hostile peer can starve
     honest peers — find the hole now.
 
-35. **Signing core.** The wallet becomes a signer: a real
-    `SigningProvider` over an encrypted-at-rest key store feeding the
-    existing `SignStep`/`SignPSBTInput` port — `signpsbt`,
-    `sendtoaddress`, `walletcreatefundedpsbt` become real. Descriptors
-    in, PSBT out; everything below builds on this. Kill: none —
-    foundational.
+35. **Signing core.** (partial — opt-in signer shipped) The wallet
+    becomes a signer: `createdescriptorseed` builds a BIP84 account
+    (OS CSPRNG or caller-supplied hex entropy — provenance recorded),
+    installs a memory-only `SignerState` (secrets NEVER hit
+    `watchlist.dat`), and tracks the neutered xpub descriptors via
+    the real import path. `walletprocesspsbt` signs with
+    `Creator::Real` — real RFC6979 low-R ECDSA + deterministic
+    schnorr. Verified: descriptor-derived keys sign and finalize a
+    spend. Open: `sendtoaddress`/funded-PSBT + coin selection,
+    encrypted-at-rest vault, `getnewaddress`.
 
 36. **UTXO-verified signing + signing receipts.** The differentiator:
     the signer checks every PSBT prevout claim against the node's own
