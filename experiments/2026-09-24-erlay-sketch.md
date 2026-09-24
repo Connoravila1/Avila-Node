@@ -43,12 +43,25 @@ of stepping by x² — syndromes were x¹,x³,x⁷,x¹⁵ not odd powers.
   (~100× faster). Honest exposure, same class as any expensive-verify
   message.
 
+## Update — protocol layer landed (same day)
+
+`crates/avila-p2p/src/recon.rs` + `Message` variants: the BIP-330
+wire set (`sendrecon`/`reqrecon`/`sketch`/`reconcildiff`/`reqbisec`),
+salted 32-bit short-ids (`SipHash-2-4` per-connection), and the round
+state machine (`open` → `answer` → `close`) with a full in-memory
+round test: 5k-element pools differing by 5 reconcile in one sketch
+exchange; over-capacity rounds never misattribute (phantom ids are
+filtered — the upstream spurious-decode contract, caught while
+testing: 200 *consecutive* extra ids gave a low-degree spurious
+explanation, which is exactly why BIP-330 verifies decoded ids
+against real pools and keeps the bisect path).
+
 ## Verdict
 
-The primitive is real and correct; remaining work is the BIP-330
-message layer (`sendrecon`/`reqrecon`/`sketch`/`reconcildiff`), salted
-short-ids, and reconciliation scheduling — plus interop reality: no
-live peers speak it yet, so it's intra-Avila + Knots-compat first.
+The primitive + round layer are real and tested; remaining work is
+manager/session integration (recon scheduling, `sendrecon` during
+negotiation, decoded-miss → `getdata`/`tx` wiring) — plus interop
+reality: no live peers speak it yet, so it's intra-Avila first.
 
-Worth noting: a pure-Rust, no-FFI minisketch is itself an artifact the
-ecosystem doesn't have — Core bundles the C++ library.
+Worth noting: a pure-Rust, no-FFI minisketch + recon layer is itself
+an artifact the ecosystem doesn't have — Core bundles the C++ library.
