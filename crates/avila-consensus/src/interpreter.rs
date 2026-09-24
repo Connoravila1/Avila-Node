@@ -635,13 +635,14 @@ const SECP256K1_HALF_ORDER: [u8; 32] = [
 /// `CPubKey::CheckLowS` — is the S component of a strict-DER signature (no
 /// sighash byte) at most `n/2`?
 ///
-/// Core delegates to libsecp256k1's lax DER parser (`ecdsa_signature_parse_der_lax`)
-/// + `signature_normalize`. The lax parser shares one `overflow` flag between R
-/// and S: if *either* component's raw bytes don't fit in 32 bytes, or the
-/// resulting 32-byte scalar is `>= n`, the whole 64-byte (R, S) buffer is
-/// zeroed rather than rejected — R's overflow zeroes S right along with it.
-/// A zeroed S is trivially `<= n/2`, so an overflow in *either* component
-/// reports *low* here, not just an overflowing S.
+/// Core delegates to libsecp256k1's lax DER parser
+/// (`ecdsa_signature_parse_der_lax`) together with `signature_normalize`.
+/// The lax parser shares one `overflow` flag between R and S: if either
+/// component's raw bytes don't fit in 32 bytes, or the resulting 32-byte
+/// scalar is `>= n`, the whole 64-byte (R, S) buffer is zeroed rather
+/// than rejected — R's overflow zeroes S right along with it. A zeroed S
+/// is trivially `<= n/2`, so an overflow in either component reports low
+/// here, not just an overflowing S.
 fn check_low_s(sig_der: &[u8]) -> bool {
     // Caller guarantees is_valid_signature_encoding held for sig_der||hashtype;
     // re-derive R's and S's slices from the DER layout.

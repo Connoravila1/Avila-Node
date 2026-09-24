@@ -2532,10 +2532,10 @@ impl Chainstate {
             if !self.have_body(&h) || self.tree.ancestor_is_invalid(h) {
                 continue;
             }
-            if let Some(node) = self.tree.get(&h) {
-                if node.chainwork > best.0 {
-                    best = (node.chainwork, h);
-                }
+            if let Some(node) = self.tree.get(&h)
+                && node.chainwork > best.0
+            {
+                best = (node.chainwork, h);
             }
             if let Some(kids) = children.remove(&h) {
                 stack.extend(kids);
