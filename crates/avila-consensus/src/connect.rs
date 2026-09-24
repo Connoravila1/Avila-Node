@@ -337,6 +337,40 @@ impl UtxoSet {
             Some(be) => be.iter_coins().into_iter().collect(),
             None => HashMap::new(),
         };
+        // The snapshot file is the lowest layer — everything above
+        // shadows it.
+        if let Some(snap) = &self.snapshot {
+            for (op, c) in snap.iter().unwrap_or_default() {
+                all.insert(op, c);
+            }
+        }
+        if let Some(base) = &self.base {
+            for (op, c) in base.iter() {
+                all.insert(op, c);
+            }
+        }
+        for (op, entry) in &self.map {
+            match entry {
+                Some(c) => {
+                    all.insert(*op, c.clone());
+                }
+                None => {
+                    all.remove(op);
+                }
+            }
+        }
+        all.into_iter().collect()
+    }
+
+    /// [`Self::iter`] without the snapshot layer — the mutable delta
+    /// alone. `state.dat` persists this view: the snapshot file is the
+    /// base and must not be serialized into it.
+    #[must_use]
+    pub fn iter_delta(&self) -> Vec<(OutPoint, Coin)> {
+        let mut all: HashMap<OutPoint, Coin> = match &self.backend {
+            Some(be) => be.iter_coins().into_iter().collect(),
+            None => HashMap::new(),
+        };
         if let Some(base) = &self.base {
             for (op, c) in base.iter() {
                 all.insert(op, c);

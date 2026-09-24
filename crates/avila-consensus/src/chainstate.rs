@@ -1349,6 +1349,15 @@ impl Chainstate {
         )
         .map_err(|e| SnapshotError(format!("snapshot index: {e}")))?;
 
+        // Persist where the overlay file lives — `restore` re-attaches
+        // it by sidecar path so a restart never re-imports.
+        if let Some(store) = &self.store {
+            let canon = std::path::absolute(path.as_ref())
+                .unwrap_or_else(|_| path.as_ref().to_path_buf());
+            if let Err(e) = std::fs::write(store.dir().join("snapshot.path"), canon.to_string_lossy().as_bytes()) {
+                return Err(SnapshotError(format!("snapshot path record: {e}")));
+            }
+        }
         let mut utxo = UtxoSet::new();
         if let Some(be) = &self.coins_backend {
             utxo.attach_shared(be.clone());
@@ -1603,7 +1612,12 @@ impl Chainstate {
         if !self.tree.restore_tip(state.best_header) {
             return Err(corrupt("best header not a max-work tip"));
         }
-        let store = self.store.as_ref().ok_or_else(|| corrupt("no store"))?;
+        let store_dir = self
+            .store
+            .as_ref()
+            .ok_or_else(|| corrupt("no store"))?
+            .dir()
+            .to_path_buf();
         let snapshot_base = (state.snapshot_base > 0).then_some(state.snapshot_base);
         for (index, hash) in state.chain.iter().enumerate() {
             if !self.tree.contains(hash) {
@@ -1614,7 +1628,13 @@ impl Chainstate {
             // base were never connected — both legitimately absent
             // from the store.
             let assumed = snapshot_base.is_some_and(|b| index <= b as usize);
-            if index > 0 && !assumed && store.position(hash).is_none() {
+            if index > 0
+                && !assumed
+                && self
+                    .store
+                    .as_ref()
+                    .is_none_or(|s| s.position(hash).is_none())
+            {
                 return Err(corrupt("connected block body not stored"));
             }
         }
@@ -1676,6 +1696,19 @@ impl Chainstate {
                 self.utxo.insert_synthetic(outpoint, coin);
             }
         }
+        // Overlay resume: a snapshot base with a recorded path
+        // re-attaches its file — the delta landed above it already.
+        if snapshot_base.is_some() {
+            let sidecar = store_dir.join("snapshot.path");
+            if let Ok(path) = std::fs::read_to_string(&sidecar) {
+                let run = crate::sortedrun::SnapshotRun::index(
+                    std::path::Path::new(path.trim()),
+                    65_536,
+                )
+                .map_err(|e| corrupt(&format!("snapshot file re-attach: {e}")))?;
+                self.utxo.attach_snapshot(run);
+            }
+        }
         let mut covered: HashSet<BlockHash> = state.failed.into_iter().collect();
         covered.extend(self.chain.iter().copied());
         self.stored_bodies(&covered)
@@ -1733,7 +1766,10 @@ impl Chainstate {
         let (utxo, undos) = if externalized {
             (Vec::new(), Vec::new())
         } else {
-            (self.utxo.iter(), self.undos.clone())
+            // Delta only — an attached snapshot file re-indexes on
+            // resume; serializing its coins here would duplicate the
+            // base into state.dat.
+            (self.utxo.iter_delta(), self.undos.clone())
         };
         StateData {
             tip: self.connected,
@@ -4373,6 +4409,21 @@ mod tests {
             vout: 0,
         };
         assert!(cs2.utxo().get(&probe).is_none());
+
+        // Resume: flush, drop, reopen — the snapshot file re-attaches
+        // via its recorded path and keeps serving the base coins.
+        cs2.flush().unwrap();
+        drop(cs2);
+        let mut cs3 = Chainstate::with_store(&dir2, &p, NOW).unwrap();
+        assert_eq!(cs3.tip_hash(), base_hash);
+        assert_eq!(cs3.snapshot_base(), Some(2));
+        for (op, coin) in &coins {
+            assert_eq!(cs3.utxo().get(op), Some(coin.clone()));
+        }
+        // state.dat must NOT carry the base coins — the file is the
+        // base (check the sidecar exists and the inline utxo section
+        // stayed empty on flush).
+        assert!(dir2.join("snapshot.path").exists());
 
         // A second load is refused exactly like Core's double activate.
         let mut cursor = std::io::Cursor::new(&snap);

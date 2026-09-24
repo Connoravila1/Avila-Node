@@ -500,6 +500,23 @@ impl SnapshotRun {
         })
     }
 
+    /// Every coin in the run, decoded — the full materialization for
+    /// `UtxoSet::iter`/`dumptxoutset`-style whole-set consumers.
+    /// Sequential read from just past the 51-byte header.
+    pub fn iter(&self) -> std::io::Result<Vec<(OutPoint, Coin)>> {
+        use std::io::Seek;
+        let mut f = self.f.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("snapshot lock: {e}"))
+        })?;
+        f.seek(io::SeekFrom::Start(51))?;
+        let mut out = Vec::with_capacity(self.count as usize);
+        crate::utxo_snapshot::read_coins(&mut *f, self.count, 0, |op, coin| {
+            out.push((op, coin));
+        })
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.0))?;
+        Ok(out)
+    }
+
 
 }
 

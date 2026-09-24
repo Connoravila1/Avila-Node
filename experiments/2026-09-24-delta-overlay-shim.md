@@ -47,11 +47,20 @@ via `write_snapshot`, indexes it, attaches: resolves both coins,
 spend → tombstone (`have`/`get`/`len` correct), recreate shadows,
 absent coin misses cleanly. All 480 lib tests pass.
 
-## What remains (the honest boundary)
+## Update — activation path landed (same day)
 
-`activate_snapshot` still materializes via `read_coins` → batched
-backend commits → `coinstats::compute` over the loaded set. The full
-integration — attach run + snapverify stream-hash + persistence
-semantics (the overlay must survive restart) — is the next step and is
-deliberately *not* in this commit: it touches the activation path Claude
-is patching.
+`activate_snapshot_overlay` is in: `check_snapshot_activation` +
+`commit_activated_snapshot` helpers share the guard/commit logic, the
+file streams once through `coinstats::compute_streaming` (file order IS
+the committed hash order — sorted-compute verified), `SnapshotRun::index`
+builds the sparse index, the run attaches as the lowest layer.
+`loadtxoutset` calls the overlay path.
+
+Verified: the same fixture file lands identical state through both
+paths — every snapshot coin resolves through the file, mutable-layer
+writes shadow correctly.
+
+Remaining honest boundary: **restart persistence** — the attached run
+must re-open on resume (path recorded in `state.dat`?). And a real
+170M-file validation still needs a real snapshot (no Core-format
+mainnet dump on disk).
