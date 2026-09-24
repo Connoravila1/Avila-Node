@@ -156,6 +156,14 @@ pub enum MempoolReject {
     /// out of proportion to a tx's byte size.
     #[error("bad-txns-too-many-sigops")]
     TooManySigops,
+    /// A `require_standard`-gated policy failure — Core's `IsStandardTx`,
+    /// `AreInputsStandard`, `IsWitnessStandard`, or the ephemeral-dust
+    /// zero-fee rule. Carries Core's own short reject reason (`"version"`,
+    /// `"scriptpubkey"`, `"dust"`, `"bad-txns-nonstandard-inputs"`, …).
+    /// With `require_standard` off, every check that can produce this is
+    /// skipped entirely.
+    #[error("{0}")]
+    NotStandard(&'static str),
 }
 
 /// Core's `DEFAULT_ANCESTOR_LIMIT` — a candidate may not bring its
@@ -307,6 +315,21 @@ pub struct Mempool {
     /// Sigop cost budgeted for the coinbase's own outputs when selecting
     /// a template — Core's `DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS`.
     coinbase_max_additional_sigops: u64,
+    /// Core's `require_standard` (`kernel::MemPoolOptions`): gates
+    /// `IsStandardTx`/`AreInputsStandard`/`IsWitnessStandard` and the
+    /// ephemeral-dust zero-fee rule. Core defaults this to `true` on
+    /// every network — `-acceptnonstdtxn` (default off) is the only way
+    /// to relax it, and mainnet refuses to relax it at all.
+    require_standard: bool,
+    /// Datacarrier (`OP_RETURN`) budget for `IsStandardTx` — Core's
+    /// `-datacarriersize`; `None` mirrors `-datacarrier=0` (no nulldata
+    /// outputs at all, matching Core's `datacarrier_bytes_left` default
+    /// of zero when disabled).
+    max_datacarrier_bytes: Option<usize>,
+    /// Core's `-permitbaremultisig` (default on).
+    permit_bare_multisig: bool,
+    /// Core's `-dustrelayfee` in sat/kvB.
+    dust_relay_fee: i64,
     /// Confirmation observations from connected blocks.
     estimator: FeeEstimator,
     /// `prioritisetransaction` accumulations by txid — Core's
@@ -339,6 +362,10 @@ impl Mempool {
             full_rbf: true,
             block_reserved_weight: template::DEFAULT_BLOCK_RESERVED_WEIGHT,
             coinbase_max_additional_sigops: template::DEFAULT_COINBASE_MAX_ADDITIONAL_SIGOPS,
+            require_standard: true,
+            max_datacarrier_bytes: Some(policy::MAX_OP_RETURN_RELAY),
+            permit_bare_multisig: policy::DEFAULT_PERMIT_BAREMULTISIG,
+            dust_relay_fee: policy::DUST_RELAY_TX_FEE,
             estimator: FeeEstimator::new(),
             deltas: HashMap::new(),
             unbroadcast: HashSet::new(),
@@ -478,6 +505,60 @@ impl Mempool {
             sigops.min(avila_consensus::check::MAX_BLOCK_SIGOPS_COST);
     }
 
+    /// Whether standardness (`IsStandardTx`/`AreInputsStandard`/
+    /// `IsWitnessStandard`/ephemeral-dust) is enforced — Core's
+    /// `require_standard`, on by default for every network.
+    #[must_use]
+    pub fn require_standard(&self) -> bool {
+        self.require_standard
+    }
+
+    /// Overrides `require_standard` — Core's `-acceptnonstdtxn` (negated).
+    /// Existing callers that build deliberately nonstandard test
+    /// transactions should flip this to `false` rather than reshaping
+    /// their fixtures; deployed Core itself refuses to relax this on
+    /// mainnet, so callers wiring this up per-network should keep that
+    /// restriction rather than exposing it as a mainnet knob.
+    pub fn set_require_standard(&mut self, on: bool) {
+        self.require_standard = on;
+    }
+
+    /// The `-datacarriersize` budget: `Some(n)` standard `OP_RETURN`
+    /// outputs may total at most `n` scriptPubKey bytes; `None` mirrors
+    /// `-datacarrier=0` (no nulldata outputs at all).
+    #[must_use]
+    pub fn max_datacarrier_bytes(&self) -> Option<usize> {
+        self.max_datacarrier_bytes
+    }
+
+    /// Overrides the datacarrier budget.
+    pub fn set_max_datacarrier_bytes(&mut self, bytes: Option<usize>) {
+        self.max_datacarrier_bytes = bytes;
+    }
+
+    /// Whether bare (non-P2SH) multisig outputs are standard — Core's
+    /// `-permitbaremultisig`.
+    #[must_use]
+    pub fn permit_bare_multisig(&self) -> bool {
+        self.permit_bare_multisig
+    }
+
+    /// Overrides `-permitbaremultisig`.
+    pub fn set_permit_bare_multisig(&mut self, on: bool) {
+        self.permit_bare_multisig = on;
+    }
+
+    /// The dust-relay feerate in sat/kvB — Core's `-dustrelayfee`.
+    #[must_use]
+    pub fn dust_relay_fee(&self) -> i64 {
+        self.dust_relay_fee
+    }
+
+    /// Overrides the dust-relay feerate.
+    pub fn set_dust_relay_fee(&mut self, sat_per_kvb: i64) {
+        self.dust_relay_fee = sat_per_kvb;
+    }
+
     /// Does `tx` signal BIP125 replaceability (any input sequence below
     /// `0xfffffffe`)?
     fn signals_rbf(tx: &Transaction) -> bool {
@@ -601,6 +682,33 @@ impl Mempool {
         ) {
             return steps;
         }
+        if self.require_standard {
+            if !push(
+                &mut steps,
+                "standard-tx",
+                policy::is_standard_tx(
+                    tx,
+                    self.max_datacarrier_bytes,
+                    self.permit_bare_multisig,
+                    self.dust_relay_fee,
+                )
+                .map(|()| "standard".to_string())
+                .map_err(str::to_string),
+            ) {
+                return steps;
+            }
+            if !push(
+                &mut steps,
+                "standard-tx-size",
+                if tx.size_without_witness() < policy::MIN_STANDARD_TX_NONWITNESS_SIZE {
+                    Err("tx-size-small".into())
+                } else {
+                    Ok(format!("{} non-witness bytes", tx.size_without_witness()))
+                },
+            ) {
+                return steps;
+            }
+        }
 
         let mut spent = Vec::with_capacity(tx.inputs.len());
         let mut missing = 0usize;
@@ -649,6 +757,29 @@ impl Mempool {
             },
         ) {
             return steps;
+        }
+        let spent_outs: Vec<_> = spent.iter().map(|c| c.out.clone()).collect();
+        if self.require_standard {
+            if !push(
+                &mut steps,
+                "standard-inputs",
+                policy::are_inputs_standard(tx, &spent_outs)
+                    .map(|()| "standard".to_string())
+                    .map_err(str::to_string),
+            ) {
+                return steps;
+            }
+            if tx.has_witness()
+                && !push(
+                    &mut steps,
+                    "standard-witness",
+                    policy::is_witness_standard(tx, &spent_outs)
+                        .map(|()| "standard".to_string())
+                        .map_err(str::to_string),
+                )
+            {
+                return steps;
+            }
         }
 
         // Sigop cost and the one true vsize — same computation and
@@ -791,6 +922,20 @@ impl Mempool {
             }
         };
 
+        if self.require_standard {
+            let modified_fee =
+                fee.saturating_add(self.deltas.get(&tx.txid()).copied().unwrap_or(0));
+            if !push(
+                &mut steps,
+                "ephemeral-dust",
+                policy::precheck_ephemeral(tx, self.dust_relay_fee, fee, modified_fee)
+                    .map(|()| "ok".to_string())
+                    .map_err(str::to_string),
+            ) {
+                return steps;
+            }
+        }
+
         if !conflicts.is_empty() {
             let conflict_fees: i64 = conflicts
                 .iter()
@@ -829,7 +974,6 @@ impl Mempool {
             }
         }
 
-        let spent_outs: Vec<_> = spent.iter().map(|c| c.out.clone()).collect();
         if !push(
             &mut steps,
             "scripts",
@@ -910,6 +1054,30 @@ impl Mempool {
             return Err(MempoolReject::TooHeavy);
         }
 
+        // 1.5 Standardness on the tx alone (Core's `IsStandardTx`, gated
+        //    by `require_standard`): version range, scriptSig size and
+        //    push-only-ness, output template and datacarrier/bare-multisig
+        //    limits, and the dust cap. Off by default only via
+        //    `set_require_standard(false)` — deployed Core defaults this
+        //    on for every network.
+        if self.require_standard {
+            policy::is_standard_tx(
+                &tx,
+                self.max_datacarrier_bytes,
+                self.permit_bare_multisig,
+                self.dust_relay_fee,
+            )
+            .map_err(MempoolReject::NotStandard)?;
+            // Core's CVE-2017-12842 mitigation (`tx-size-small`) is
+            // unconditional upstream; bundled under `require_standard`
+            // here so the existing sub-65-byte test fixtures keep
+            // working via the permissive setting instead of being
+            // padded out.
+            if tx.size_without_witness() < policy::MIN_STANDARD_TX_NONWITNESS_SIZE {
+                return Err(MempoolReject::NotStandard("tx-size-small"));
+            }
+        }
+
         // 2. Resolve inputs; index outpoint conflicts for BIP125.
         let mut spent = Vec::with_capacity(tx.inputs.len());
         let mut conflicts: Vec<Txid> = Vec::new();
@@ -923,6 +1091,21 @@ impl Mempool {
                 && !conflicts.contains(&conflict)
             {
                 conflicts.push(conflict);
+            }
+        }
+        let spent_outs: Vec<_> = spent.iter().map(|c| c.out.clone()).collect();
+
+        // 2.4 Standardness on the resolved inputs (Core's
+        //    `AreInputsStandard`/`IsWitnessStandard`, `require_standard`
+        //    -gated): non-standard or unknown-witness prevouts, oversized
+        //    P2SH redeem-script sigops, BIP54's legacy-sigop cap, and
+        //    non-standard witness shapes (P2WSH/tapscript stack limits,
+        //    annexes).
+        if self.require_standard {
+            policy::are_inputs_standard(&tx, &spent_outs).map_err(MempoolReject::NotStandard)?;
+            if tx.has_witness() {
+                policy::is_witness_standard(&tx, &spent_outs)
+                    .map_err(MempoolReject::NotStandard)?;
             }
         }
 
@@ -1013,6 +1196,16 @@ impl Mempool {
         let (_, fee) =
             check_tx_inputs(&tx, &overlay, next_height).map_err(MempoolReject::Inputs)?;
 
+        // 4.5 Ephemeral dust (Core's `PreCheckEphemeralTx`,
+        //    `require_standard`-gated): a tx creating dust must be
+        //    exactly 0-fee — Core's `AreInputsStandard`/dust cap above
+        //    already limit it to at most one dust output.
+        if self.require_standard {
+            let modified_fee = fee.saturating_add(self.deltas.get(&txid).copied().unwrap_or(0));
+            policy::precheck_ephemeral(&tx, self.dust_relay_fee, fee, modified_fee)
+                .map_err(MempoolReject::NotStandard)?;
+        }
+
         // 5. BIP125 fee rule: replacement must pay the conflicts' fees
         //    plus incremental relay for its own size.
         if !conflicts.is_empty() {
@@ -1041,9 +1234,8 @@ impl Mempool {
 
         // 7. Script checks: consensus flags at the next height plus
         //    Core's standardness set (policy — a tx failing only these
-        //    is still block-valid, just not relayed). `flags` was
-        //    already computed for the sigop cap and vsize above (2.5).
-        let spent_outs: Vec<_> = spent.iter().map(|c| c.out.clone()).collect();
+        //    is still block-valid, just not relayed). `flags` and
+        //    `spent_outs` were already computed above (2.4/2.5).
         check_input_scripts(&tx, &spent_outs, flags).map_err(MempoolReject::ScriptVerify)?;
         avila_consensus::sigchecker::mark_scripts_verified(tx.txid(), flags);
 
@@ -1718,6 +1910,7 @@ fn standard_script_flags(
         .union(ScriptFlags::DISCOURAGE_UPGRADABLE_TAPROOT_VERSION)
 }
 
+pub mod policy;
 pub mod template;
 
 #[cfg(test)]
@@ -1737,6 +1930,20 @@ mod tests {
     const SEQ_FINAL: u32 = 0xffff_ffff;
     const SEQ_RBF: u32 = 0xffff_fffd;
     const NOW: u32 = 1_700_000_000;
+
+    /// A pool with `require_standard` off. Every test in this module
+    /// predates fix 6 (standardness) and spends/creates the trivial
+    /// `OP_1` "anyone can spend" script for convenience — not a
+    /// standard output template — so they opt out of standardness
+    /// wholesale here rather than being rewritten to sign real standard
+    /// scripts. Tests that specifically exercise standardness construct
+    /// `Mempool::new()` directly (standard by default, matching
+    /// deployed Core) instead of calling this helper.
+    fn permissive_pool() -> Mempool {
+        let mut pool = Mempool::new();
+        pool.set_require_standard(false);
+        pool
+    }
 
     fn coinbase_tx(height: u32) -> Transaction {
         let mut script_sig = script::push_int(i64::from(height));
@@ -1875,7 +2082,8 @@ mod tests {
     #[test]
     fn valid_spend_is_accepted() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         let txid = tx.txid();
         assert_eq!(pool.accept_tx(tx, &cs, NOW).unwrap(), txid);
@@ -1885,7 +2093,8 @@ mod tests {
     #[test]
     fn missing_input_is_rejected() {
         let (cs, _b) = chainstate_at(5);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let fake = OutPoint {
             txid: Txid::ZERO,
             vout: 0,
@@ -1900,7 +2109,8 @@ mod tests {
     #[test]
     fn immature_coinbase_is_rejected() {
         let (cs, blocks) = chainstate_at(50);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         // h1 coinbase at tip h50 → depth 49 < 100.
         let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         assert!(matches!(
@@ -1914,7 +2124,8 @@ mod tests {
     #[test]
     fn dust_fee_fails_min_relay() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         // fee = 1 sat over ~250 vB → below 1 sat/vB.
         let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_999_999, SEQ_FINAL);
         assert_eq!(
@@ -1928,7 +2139,8 @@ mod tests {
         // Core's PreChecks: GetTransactionSigOpCost vs
         // MAX_STANDARD_TX_SIGOPS_COST (16,000), independent of tx size.
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let op = mature_outpoint(&blocks, 1);
         // 250 bare OP_CHECKMULTISIG opcodes in the sole output: legacy
         // sigop count (non-accurate, 20 each) * WITNESS_SCALE_FACTOR(4)
@@ -1967,7 +2179,7 @@ mod tests {
         // min-relay under the old, weight-only vsize but not the
         // correct, sigop-adjusted one.
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
         let mut tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_998_000, SEQ_FINAL);
         tx.outputs[0].script_pubkey = Script::new(vec![script::OP_CHECKMULTISIG; 100]);
         let txid = tx.txid();
@@ -1979,9 +2191,200 @@ mod tests {
     }
 
     #[test]
+    fn accept_tx_enforces_standardness_by_default() {
+        // Core defaults `require_standard` to true on every network
+        // (v31.1 moved it out of `CChainParams`; there's no per-chain
+        // default split any more). This suite's trivial bare-`OP_1`
+        // "anyone can spend" script is not a standard output template,
+        // so a real (non-permissive) pool rejects it — and the same tx
+        // is admitted once the permissive option is set, exactly as the
+        // rest of this module already relies on via `permissive_pool`.
+        let (cs, blocks) = chainstate_at(101);
+        let mut strict = Mempool::new();
+        assert!(strict.require_standard());
+        let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        assert_eq!(
+            strict.accept_tx(tx.clone(), &cs, NOW),
+            Err(MempoolReject::NotStandard("scriptpubkey"))
+        );
+
+        let mut permissive = permissive_pool();
+        assert!(!permissive.require_standard());
+        assert!(permissive.accept_tx(tx, &cs, NOW).is_ok());
+    }
+
+    #[test]
+    fn is_standard_tx_rejects_out_of_range_version() {
+        let tx = Transaction {
+            version: 4,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::NULL,
+                script_sig: Script::new(vec![]),
+                sequence: SEQ_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 900,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        assert_eq!(
+            policy::is_standard_tx(
+                &tx,
+                Some(policy::MAX_OP_RETURN_RELAY),
+                true,
+                policy::DUST_RELAY_TX_FEE
+            ),
+            Err("version")
+        );
+    }
+
+    #[test]
+    fn is_standard_tx_caps_bare_multisig_at_three_keys() {
+        // Solver accepts up to `MAX_PUBKEYS_PER_MULTISIG` (20) keys, but
+        // `IsStandard` additionally caps a *standard-shaped* bare
+        // multisig at 3 — a 1-of-4 is Solver-valid but policy-nonstandard
+        // regardless of `permit_bare_multisig`.
+        let mut spk = vec![script::OP_1];
+        for i in 0u8..4 {
+            let mut key = vec![0x02, i.wrapping_add(1)];
+            key.extend_from_slice(&[0u8; 31]);
+            spk.extend_from_slice(&script::push_slice(&key));
+        }
+        spk.push(script::OP_1 + 3); // OP_4: four keys follow.
+        spk.push(script::OP_CHECKMULTISIG);
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::NULL,
+                script_sig: Script::new(vec![]),
+                sequence: SEQ_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 900,
+                script_pubkey: Script::new(spk),
+            }],
+            lock_time: 0,
+        };
+        assert_eq!(
+            policy::is_standard_tx(
+                &tx,
+                Some(policy::MAX_OP_RETURN_RELAY),
+                true,
+                policy::DUST_RELAY_TX_FEE
+            ),
+            Err("scriptpubkey")
+        );
+    }
+
+    #[test]
+    fn is_standard_tx_rejects_more_than_one_dust_output() {
+        // Core's ephemeral-dust allowance tolerates a single below-dust
+        // output; a second one is always rejected regardless of fee.
+        let p2wpkh = |value: i64| TxOut {
+            value,
+            script_pubkey: Script::new({
+                let mut s = vec![script::OP_0, 0x14];
+                s.extend_from_slice(&[0u8; 20]);
+                s
+            }),
+        };
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::NULL,
+                script_sig: Script::new(vec![]),
+                sequence: SEQ_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: vec![p2wpkh(100), p2wpkh(100)],
+            lock_time: 0,
+        };
+        assert_eq!(
+            policy::is_standard_tx(
+                &tx,
+                Some(policy::MAX_OP_RETURN_RELAY),
+                true,
+                policy::DUST_RELAY_TX_FEE
+            ),
+            Err("dust")
+        );
+    }
+
+    #[test]
+    fn are_inputs_standard_caps_p2sh_redeem_sigops() {
+        // A redeem script's sigops are counted accurately, but a bare
+        // (unconditioned) OP_CHECKMULTISIG still costs the flat 20 —
+        // over MAX_P2SH_SIGOPS(15) on its own.
+        let redeem = Script::new(vec![script::OP_CHECKMULTISIG]);
+        let script_sig = Script::new(script::push_slice(redeem.as_bytes()));
+        let prevout = TxOut {
+            value: 1_000,
+            script_pubkey: Script::new({
+                let mut s = vec![script::OP_HASH160, 0x14];
+                s.extend_from_slice(&[0u8; 20]);
+                s.push(script::OP_EQUAL);
+                s
+            }),
+        };
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::NULL,
+                script_sig,
+                sequence: SEQ_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 900,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        assert_eq!(
+            policy::are_inputs_standard(&tx, &[prevout]),
+            Err("bad-txns-nonstandard-inputs")
+        );
+    }
+
+    #[test]
+    fn is_witness_standard_caps_p2wsh_stack_item_size() {
+        let prevout = TxOut {
+            value: 1_000,
+            script_pubkey: Script::new({
+                let mut s = vec![script::OP_0, 0x20];
+                s.extend_from_slice(&[0u8; 32]);
+                s
+            }),
+        };
+        let big_item = vec![0u8; 81]; // > MAX_STANDARD_P2WSH_STACK_ITEM_SIZE
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::NULL,
+                script_sig: Script::new(vec![]),
+                sequence: SEQ_FINAL,
+                witness: Witness::new(vec![big_item, vec![script::OP_1]]),
+            }],
+            outputs: vec![TxOut {
+                value: 900,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        assert_eq!(
+            policy::is_witness_standard(&tx, &[prevout]),
+            Err("bad-witness-nonstandard")
+        );
+    }
+
+    #[test]
     fn double_spend_without_rbf_is_rejected() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         // BIP125 signaling is still enforced when full-RBF is off —
         // deployed Core's -mempoolfullrbf=0 path.
         pool.set_full_rbf(false);
@@ -1997,7 +2400,8 @@ mod tests {
         // Deployed Core default (-mempoolfullrbf=1): neither side needs
         // BIP125 signaling — only the fee-bump rules bind.
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         assert!(pool.full_rbf());
         let op = mature_outpoint(&blocks, 1);
         let tx1 = spend_tx(op, 4_999_000_000, SEQ_FINAL); // 1M sat fee
@@ -2015,7 +2419,8 @@ mod tests {
         // Full-RBF waives signaling, not economics: an underpaying
         // replacement still fails.
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let op = mature_outpoint(&blocks, 1);
         let tx1 = spend_tx(op, 4_999_000_000, SEQ_FINAL); // 1M sat fee
         // Same inputs, barely more output — fee shrinks below bump.
@@ -2032,7 +2437,8 @@ mod tests {
         // replaced conflict while `x` is admitted still pointing at `p`'s
         // now-gone output — a dangling in-pool parent that can never confirm.
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let op = mature_outpoint(&blocks, 1);
         let p = spend_tx(op, 4_999_000_000, SEQ_RBF);
         let p_id = p.txid();
@@ -2065,7 +2471,8 @@ mod tests {
         // give 125 entries a single tx could evict by double-spending
         // each chain's root input — past the rule-5 cap.
         let (cs, blocks) = chainstate_at(105);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let mut roots_ops = Vec::new();
         for h in 1..=5 {
             let op = mature_outpoint(&blocks, h);
@@ -2089,7 +2496,8 @@ mod tests {
         // `-maxmempool`'s analog: a candidate that outbids the pool's
         // worst feerate displaces it when the byte cap binds.
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let small = spend_tx(mature_outpoint(&blocks, 1), 4_999_999_000, SEQ_FINAL);
         let cap = small.encode().len() + 8;
         pool.set_max_bytes(cap);
@@ -2113,7 +2521,8 @@ mod tests {
     #[test]
     fn rbf_replacement_with_adequate_bump() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let op = mature_outpoint(&blocks, 1);
         let tx1 = spend_tx(op, 4_999_000_000, SEQ_RBF); // 1M sat fee
         let tx2 = spend_tx(op, 4_998_000_000, SEQ_RBF); // 2M sat fee — covers bump
@@ -2128,7 +2537,8 @@ mod tests {
     #[test]
     fn unconfirmed_parent_chain_is_accepted() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         let parent_id = parent.txid();
         pool.accept_tx(parent, &cs, NOW).unwrap();
@@ -2147,7 +2557,8 @@ mod tests {
     #[test]
     fn orphan_parks_then_joins_when_parent_arrives() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         // Child arrives before its parent → parks as orphan.
         let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         let parent_id = parent.txid();
@@ -2174,7 +2585,8 @@ mod tests {
     #[test]
     fn orphan_pool_is_bounded() {
         let (cs, _b) = chainstate_at(5);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         // MAX_ORPHANS + 5 distinct missing-input txs — the cap binds.
         for i in 0..(MAX_ORPHANS + 5) {
             let tx = spend_tx(
@@ -2193,7 +2605,8 @@ mod tests {
     #[test]
     fn block_connected_purges_confirmed_and_conflicts() {
         let (mut cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let params = Network::Regtest.params();
         let confirmed = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         pool.accept_tx(confirmed.clone(), &cs, NOW).unwrap();
@@ -2244,7 +2657,8 @@ mod tests {
     #[test]
     fn ancestor_chain_is_capped_at_25() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let mut op = mature_outpoint(&blocks, 1);
         let mut value = 4_999_000_000i64;
         // 25 chained accepts — the 25th has 24 ancestors (within limit).
@@ -2268,7 +2682,8 @@ mod tests {
     #[test]
     fn descendant_fanout_is_capped_at_25() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         // One parent with 30 outputs, each child spends a distinct one.
         let parent = fan_tx(mature_outpoint(&blocks, 1), 30, 10_000_000);
         let pid = parent.txid();
@@ -2295,7 +2710,8 @@ mod tests {
     #[test]
     fn explain_traces_every_gate() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         let steps = pool.explain_tx(&tx, &cs, NOW);
         // Every gate passed, in order, and nothing was pooled.
@@ -2315,7 +2731,9 @@ mod tests {
     #[test]
     fn explain_reports_the_failing_gate() {
         let (cs, _b) = chainstate_at(5);
-        let pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
+        pool.set_require_standard(false);
         let tx = spend_tx(
             OutPoint {
                 txid: Txid::ZERO,
@@ -2336,7 +2754,8 @@ mod tests {
     #[test]
     fn template_connects_as_a_real_block() {
         let (mut cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let t1 = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         let t2 = spend_tx(mature_outpoint(&blocks, 2), 4_999_500_000, SEQ_FINAL);
         pool.accept_tx(t1, &cs, NOW).unwrap();
@@ -2371,7 +2790,8 @@ mod tests {
     #[test]
     fn template_orders_parents_before_children() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         let pid = parent.txid();
         let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 4_998_000_000, SEQ_FINAL);
@@ -2398,7 +2818,8 @@ mod tests {
         // child's package rate — the whole package lands ahead of a
         // standalone tx whose own rate sits between the two.
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         // parent: 1 sat/vB-ish (tiny fee); child: enormous fee.
         let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_900_000, SEQ_FINAL);
         let pid = parent.txid();
@@ -2435,7 +2856,8 @@ mod tests {
         // which the ancestor-feerate score uses — a prioritized child
         // pulls its parent forward too.
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_990_000, SEQ_FINAL);
         let pid = parent.txid();
         let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 4_999_000_000, SEQ_FINAL);
@@ -2469,7 +2891,7 @@ mod tests {
         // assembled block must still be checked before it's handed out
         // as a template.
         let (cs, _blocks) = chainstate_at(101);
-        let pool = Mempool::new();
+        let pool = permissive_pool();
         let huge_script = Script::new(vec![0u8; 1_100_000]);
         let err = pool
             .build_template(&cs, huge_script, NOW + 120)
@@ -2488,7 +2910,7 @@ mod tests {
         // can blow MAX_BLOCK_SIGOPS_COST even though its weight is
         // negligible and the pool is empty.
         let (cs, _blocks) = chainstate_at(101);
-        let pool = Mempool::new();
+        let pool = permissive_pool();
         let sigop_script = Script::new(vec![script::OP_CHECKMULTISIG; 2_000]);
         let err = pool
             .build_template(&cs, sigop_script, NOW + 120)
@@ -2502,7 +2924,8 @@ mod tests {
     #[test]
     fn mempool_persists_round_trip() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         let pid = parent.txid();
         let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 4_998_000_000, SEQ_FINAL);
@@ -2514,7 +2937,8 @@ mod tests {
         let path = dir.join("mempool.dat");
         assert_eq!(pool.save(&path).unwrap(), 2);
 
-        let mut fresh = Mempool::new();
+        let mut fresh = permissive_pool();
+        fresh.set_require_standard(false);
         let (imported, skipped) = fresh.load(&path, &cs, NOW + 60).unwrap();
         assert_eq!((imported, skipped), (2, 0));
         assert!(fresh.has_entry(&pid));
@@ -2527,7 +2951,8 @@ mod tests {
     #[test]
     fn mempool_load_resolves_parent_after_child() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let parent = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         let pid = parent.txid();
         let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 4_998_000_000, SEQ_FINAL);
@@ -2551,7 +2976,8 @@ mod tests {
         }
         drop(f);
 
-        let mut fresh = Mempool::new();
+        let mut fresh = permissive_pool();
+        fresh.set_require_standard(false);
         let (imported, skipped) = fresh.load(&path, &cs, NOW).unwrap();
         assert_eq!((imported, skipped), (2, 0), "passes resolve ordering");
         std::fs::remove_file(&path).unwrap();
@@ -2561,7 +2987,8 @@ mod tests {
     #[test]
     fn mempool_load_skips_spent_and_truncated() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         pool.accept_tx(tx.clone(), &cs, NOW).unwrap();
         let dir = std::env::temp_dir().join(format!("avila-mps-{}", std::process::id()));
@@ -2582,7 +3009,8 @@ mod tests {
         let mut cs2 = cs;
         cs2.accept_block(&block, NOW + 200).unwrap();
 
-        let mut fresh = Mempool::new();
+        let mut fresh = permissive_pool();
+        fresh.set_require_standard(false);
         let (imported, skipped) = fresh.load(&path, &cs2, NOW + 300).unwrap();
         assert_eq!((imported, skipped), (0, 1), "spent input → skipped");
 
@@ -2616,7 +3044,8 @@ mod tests {
     #[test]
     fn prioritise_unknown_txid_applies_at_admission() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         let txid = tx.txid();
         // Core: deltas land in mapDeltas before the tx is known and
@@ -2635,7 +3064,8 @@ mod tests {
     #[test]
     fn prioritise_pooled_tx_sets_accumulated_delta() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         let txid = tx.txid();
         pool.accept_tx(tx, &cs, NOW).unwrap();
@@ -2652,7 +3082,8 @@ mod tests {
     #[test]
     fn confirmation_clears_the_delta() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         let txid = tx.txid();
         pool.accept_tx(tx.clone(), &cs, NOW).unwrap();
@@ -2671,7 +3102,8 @@ mod tests {
     #[test]
     fn deltas_persist_through_save_load() {
         let (cs, blocks) = chainstate_at(101);
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
         let txid = tx.txid();
         pool.prioritise(&txid, 42_000);
@@ -2684,7 +3116,8 @@ mod tests {
         let path = dir.join("mempool.dat");
         pool.save(&path).unwrap();
 
-        let mut fresh = Mempool::new();
+        let mut fresh = permissive_pool();
+        fresh.set_require_standard(false);
         let (imported, skipped) = fresh.load(&path, &cs, NOW).unwrap();
         assert_eq!((imported, skipped), (1, 0));
         assert_eq!(fresh.entry(&txid).unwrap().fee_delta, 42_000);
@@ -2725,7 +3158,8 @@ mod tests {
         let gone = cs.take_disconnected();
         assert_eq!(gone, vec![b102.block_hash()]);
 
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         assert_eq!(
             pool.refill_from_disconnected(&gone, &cs, NOW, true, usize::MAX),
             1
@@ -2748,7 +3182,8 @@ mod tests {
 
         // While b102 is connected its outputs are UTXOs — a child
         // spending one is admissible to the pool.
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let child = spend_tx(
             OutPoint {
                 txid: losing_txid,
@@ -2805,7 +3240,8 @@ mod tests {
         let gone = cs.take_disconnected();
         assert_eq!(gone.len(), 12);
 
-        let mut pool = Mempool::new();
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
         let n = pool.refill_from_disconnected(&gone, &cs, NOW, false, 10);
         // Disconnect order is tip-first: h113's spend feeds first,
         // h103/h102's are past the cap.
