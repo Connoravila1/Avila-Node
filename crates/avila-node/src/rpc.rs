@@ -6568,6 +6568,9 @@ pub(crate) fn dispatch(
                                 "outbound-full-relay"
                             },
                             "transport_protocol_type": p.transport_protocol,
+                            // BIP330: whether this link negotiated
+                            // transaction reconciliation.
+                            "recon": p.recon,
                             // Core: hex of the BIP324 session id on v2,
                             // "" on v1.
                             "session_id": p
@@ -12098,6 +12101,15 @@ mod tests {
     use super::*;
     use avila_consensus::params::Network;
 
+    fn default_report() -> avila_consensus::chainstate::ValidationReport {
+        avila_consensus::chainstate::ValidationReport {
+            connected_height: 120,
+            header_height: 140,
+            snapshot: None,
+            verified_fraction: 1.0,
+        }
+    }
+
     fn snap() -> SyncProgress {
         SyncProgress {
             peers: 2,
@@ -12110,6 +12122,7 @@ mod tests {
             peer_details: Vec::new(),
             mempool: (5, 1, Some(2_000)),
             elapsed_secs: 42,
+            validation: default_report(),
         }
     }
 

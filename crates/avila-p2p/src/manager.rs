@@ -237,6 +237,8 @@ pub struct PeerSnapshot {
     /// `session_id` — the BIP324 session id, `None` on v1 like Core's
     /// empty string.
     pub v2_session_id: Option<[u8; 32]>,
+    /// BIP330 reconciliation negotiated on this link.
+    pub recon: bool,
 }
 
 /// A bounded set of peers sharing one [`Chainstate`].
@@ -500,6 +502,7 @@ impl<S: Read + Write> PeerManager<S> {
                     in_flight_hashes: peer.sync.in_flight_hashes().collect(),
                     transport_protocol: peer.session.transport_protocol(),
                     v2_session_id: peer.session.v2_session_id(),
+                    recon: peer.recon.is_some(),
                 }
             })
             .collect();

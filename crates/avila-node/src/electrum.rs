@@ -990,6 +990,15 @@ fn merkle_branch(txids: &[Txid], pos: usize) -> Vec<Txid> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    fn default_report() -> avila_consensus::chainstate::ValidationReport {
+        avila_consensus::chainstate::ValidationReport {
+            connected_height: 1,
+            header_height: 1,
+            snapshot: None,
+            verified_fraction: 1.0,
+        }
+    }
+
     use super::*;
     use crate::sync::SyncProgress;
     use avila_consensus::block::Block;
@@ -1083,6 +1092,7 @@ mod tests {
             peer_details: Vec::new(),
             mempool: (0, 0, None),
             elapsed_secs: 0,
+            validation: default_report(),
         }));
         let cancel = Arc::new(AtomicBool::new(false));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1191,6 +1201,7 @@ mod tests {
             peer_details: Vec::new(),
             mempool: (0, 0, None),
             elapsed_secs: 0,
+            validation: default_report(),
         }));
         let cancel = Arc::new(AtomicBool::new(false));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -30,8 +30,6 @@ pub struct Stats {
     pub checks: u64,
     pub produced: u64,
     pub producer_replays: u64,
-    pub producer_skipped_transactions: u64,
-    pub producer_skipped_checks: u64,
     pub producer_replay_checks: u64,
     pub producer_cache_hits: u64,
     pub producer_cache_overflow: u64,
@@ -66,8 +64,6 @@ impl Stats {
         self.checks += other.checks;
         self.produced += other.produced;
         self.producer_replays += other.producer_replays;
-        self.producer_skipped_transactions += other.producer_skipped_transactions;
-        self.producer_skipped_checks += other.producer_skipped_checks;
         self.producer_replay_checks += other.producer_replay_checks;
         self.producer_cache_hits += other.producer_cache_hits;
         self.producer_cache_overflow += other.producer_cache_overflow;
@@ -208,15 +204,6 @@ impl Drop for Worker {
 }
 
 type TraceFrame = ([u8; 32], Vec<[u8; 130]>);
-struct Completed {
-    result: Result<(), ScriptError>,
-    checks: u64,
-    false_checks: u64,
-}
-struct Reusable {
-    frame: ([u8; 32], Vec<u8>),
-    verdict: Completed,
-}
 struct Group {
     mode: Mode,
     hints: &'static [u8],
@@ -227,9 +214,6 @@ struct Group {
     pending_slots: Vec<(usize, usize)>,
     producer_retry: bool,
     provisional: u64,
-    tx_retry: Vec<bool>,
-    completed: Vec<Completed>,
-    reusable: Vec<Option<Reusable>>,
     ordinal: usize,
     pending: Vec<[u8; 130]>,
     trace: Vec<TraceFrame>,
@@ -249,9 +233,6 @@ impl Group {
             pending_slots: Vec::new(),
             producer_retry: false,
             provisional: 0,
-            tx_retry: Vec::new(),
-            completed: Vec::new(),
-            reusable: Vec::new(),
             ordinal: 0,
             pending: Vec::new(),
             trace: Vec::new(),
@@ -313,9 +294,6 @@ impl Group {
         self.stats.max_pending = self.stats.max_pending.max(records.len() as u64);
         if SESSION.get().unwrap().disabled.load(Ordering::Acquire) {
             self.producer_retry = true;
-            for (tx, _) in slots {
-                self.tx_retry[tx] = true;
-            }
             return;
         }
         match self.worker().and_then(|w| w.produce_many(&records)) {
@@ -326,16 +304,12 @@ impl Group {
                     self.generated[tx].1[ordinal] = hint;
                     self.remember(record, hint);
                     self.producer_retry |= hint == 255;
-                    self.tx_retry[tx] |= hint == 255;
                 }
             }
             Err(_) => {
                 self.stats.worker_errors += 1;
                 self.worker.take();
                 self.producer_retry = true;
-                for (tx, _) in slots {
-                    self.tx_retry[tx] = true;
-                }
                 SESSION
                     .get()
                     .unwrap()
@@ -561,21 +535,6 @@ pub fn group<T>(estimated_checks: usize, mut work: impl FnMut() -> (T, bool)) ->
         && (group.producer_retry || (script_error && group.provisional > 0))
     {
         let mut retry = Group::new(Mode::ProduceReplay);
-        // Reuse only results whose provisional equations all proved true.
-        // Position is safe here because work() replays the same immutable jobs
-        // in exactly the same order; no transaction-ID-only context cache.
-        retry.reusable = std::mem::take(&mut group.generated)
-            .into_iter()
-            .zip(std::mem::take(&mut group.completed))
-            .zip(std::mem::take(&mut group.tx_retry))
-            .map(|((frame, verdict), needs_retry)| {
-                if needs_retry {
-                    None
-                } else {
-                    Some(Reusable { frame, verdict })
-                }
-            })
-            .collect();
         retry.cache = std::mem::take(&mut group.cache);
         retry.worker = group.worker.take();
         GROUP.with_borrow_mut(|slot| *slot = Some(retry));
@@ -586,7 +545,7 @@ pub fn group<T>(estimated_checks: usize, mut work: impl FnMut() -> (T, bool)) ->
         let checks = exact.stats.checks;
         let false_checks = exact.stats.false_checks;
         exact.stats.producer_replays += 1;
-        exact.stats.producer_replay_checks += checks - exact.stats.producer_skipped_checks;
+        exact.stats.producer_replay_checks += checks;
         exact.stats.add(&group.stats);
         exact.stats.checks = checks;
         exact.stats.false_checks = false_checks;
@@ -655,29 +614,10 @@ pub fn transaction(
         return ordinary();
     }
     let mut run = || {
-        let mut before = (0, 0);
-        let reused = GROUP.with_borrow_mut(|slot| {
+        GROUP.with_borrow_mut(|slot| {
             let group = slot.as_mut().unwrap();
             group.jobs += 1;
             group.ordinal = 0;
-            if group.mode == Mode::ProduceReplay {
-                if let Some(reusable) = group
-                    .reusable
-                    .get_mut(group.jobs as usize - 1)
-                    .and_then(Option::take)
-                {
-                    group.stats.checks += reusable.verdict.checks;
-                    group.stats.false_checks += reusable.verdict.false_checks;
-                    group.stats.producer_skipped_checks += reusable.verdict.checks;
-                    group.stats.producer_skipped_transactions += 1;
-                    group.generated.push(reusable.frame);
-                    return Some(reusable.verdict.result);
-                }
-            }
-            if group.mode == Mode::ProduceBatch {
-                group.tx_retry.push(false);
-                before = (group.stats.checks, group.stats.false_checks);
-            }
             if group.mode != Mode::Baseline {
                 let key = if group.mode == Mode::Stream {
                     [0; 32]
@@ -703,23 +643,8 @@ pub fn transaction(
                     .get(&key)
                     .map_or(&[], Vec::as_slice);
             }
-            None
         });
-        if let Some(result) = reused {
-            return result;
-        }
-        let result = ordinary();
-        GROUP.with_borrow_mut(|slot| {
-            let group = slot.as_mut().unwrap();
-            if group.mode == Mode::ProduceBatch {
-                group.completed.push(Completed {
-                    result,
-                    checks: group.stats.checks - before.0,
-                    false_checks: group.stats.false_checks - before.1,
-                });
-            }
-        });
-        result
+        ordinary()
     };
     if GROUP.with_borrow(|slot| slot.is_some()) {
         run()
