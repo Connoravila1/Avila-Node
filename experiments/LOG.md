@@ -368,3 +368,20 @@ first measurement that would kill or confirm it.
     (rust-secp256k1 `musig` module — needs bump from our 0.29),
     silent-payments *send* (libsecp sender API), Payjoin sender
     (BIP78/77). Queue only after 35–37 land.
+
+## Exp6 — scripthash/address index cost model (measured)
+
+`scindex_bench` over `fixtures/signet-blocks-000000-000300.dat` (300
+real signet blocks, now that the bench recognizes signet magic):
+
+- Connect-time delta with the index on: **+3.6%** (0.05s baseline).
+- `scindex.dat` log: 31,581 bytes / 601 entries = **~53 B/entry**.
+- 601 unique script hashes over 300 blocks ≈ 2.0/block (signet is
+  mostly coinbases to fresh addresses — faucet-shaped).
+- In-memory ~42 B/entry (32B hash + (h, pos, txid) rows).
+
+Projection: signet-scale is trivial (~16 MB at 150k blocks); a
+mainnet-wide address index extrapolates to the multi-GB range — the
+cost model confirms the opt-in profile design. Bounded measurement,
+not a live full-chain run.
+

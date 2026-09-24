@@ -66,6 +66,7 @@ fn main() {
     let params = match &raw[..4] {
         [0xf9, 0xbe, 0xb4, 0xd9] => Network::Mainnet.params(),
         [0xfa, 0xbf, 0xb5, 0xda] => Network::Regtest.params(),
+        [0x0a, 0x03, 0xcf, 0x40] => Network::Signet.params(),
         other => panic!("unknown magic {other:02x?}"),
     };
     let (w0, _, _, _) = run(&raw, &params, false);
