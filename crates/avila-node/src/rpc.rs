@@ -4565,6 +4565,11 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         GETMEMPOOLENTRY_HELP,
     ),
     ("getmempoolinfo", &[], GETMEMPOOLINFO_HELP),
+    (
+        "getpinningrisk",
+        &[("margin", Some("number"), false)],
+        "getpinningrisk ( margin )\n\nLists mempool transactions whose descendant package is at or near the descendant cap (BIP-431 pinning surface — such a tx cannot be CPFP-bumped).\n\nArguments:\n1. margin  (number, optional, default=5) Flag txs within this many descendants of the cap.\n\nResult:\n[ { \"txid\": \"hex\", \"descendants\": n }, ... ]\n",
+    ),
     ("getmininginfo", &[], GETMININGINFO_HELP),
     ("getnettotals", &[], GETNETTOTALS_HELP),
     (
@@ -6872,6 +6877,19 @@ pub(crate) fn dispatch(
                 "fullrbf": pool.full_rbf(),
             }))
         }),
+        "getpinningrisk" => {
+            let margin = param(params, 0, "margin")
+                .and_then(Value::as_u64)
+                .map_or(5, |v| v as usize);
+            chain_query(method, queries, move |_, mgr| {
+                Ok(json!(mgr
+                    .mempool_ref()
+                    .pinning_risk(margin)
+                    .into_iter()
+                    .map(|(txid, n)| json!({"txid": txid.to_string(), "descendants": n}))
+                    .collect::<Vec<_>>()))
+            })
+        }
         "getchaintips" => chain_query(method, queries, |cs, _| {
             // A tip is an indexed node no other node points at as
             // parent — the same shape Core's setBlockIndexCandidates

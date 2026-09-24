@@ -2341,6 +2341,24 @@ impl Mempool {
         self.unbroadcast.len()
     }
 
+    /// Pinning-risk scan — BIP-431 descendant-limit detection: every
+    /// pooled tx whose descendant package is at or near the cap is
+    /// unbumpable by CPFP. Returns `(txid, descendant_count)` for
+    /// entries within `margin` of [`DESCENDANT_LIMIT`]. The oracle
+    /// half of the red-team attack in `redteam_descendant_limit_
+    /// pinning` — detects the attack signature generically, before a
+    /// wallet exists to label which txs are the operator's.
+    #[must_use]
+    pub fn pinning_risk(&self, margin: usize) -> Vec<(Txid, usize)> {
+        self.map
+            .keys()
+            .filter_map(|txid| {
+                let (count, _) = self.descendants_of(txid);
+                (count + margin >= DESCENDANT_LIMIT).then_some((*txid, count))
+            })
+            .collect()
+    }
+
     /// Records a locally submitted transaction in the broadcast pool —
     /// the bytes persist even if the entry is later evicted, so the
     /// node can re-admit and re-announce it without operator help.
@@ -4554,6 +4572,13 @@ mod tests {
             matches!(pool.accept_tx(bump, &cs, NOW), Err(MempoolReject::PackageLimits)),
             "the pin works: victim cannot fee-bump their own tx"
         );
+        // The oracle catches it: V sits at the cap, every junk tx
+        // reports its own descendant load.
+        let risk = pool.pinning_risk(0);
+        assert!(risk.iter().any(|(t, n)| *t == v_id && *n == DESCENDANT_LIMIT));
+        // A margin of 0 flags only capped txs; margin 5 also catches
+        // the near-cap spine of the attack tree.
+        assert!(pool.pinning_risk(5).len() >= risk.len());
     }
 
     /// RED TEAM — BIP-431 rule-3 pinning: the attacker replaces the
