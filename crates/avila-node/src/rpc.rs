@@ -906,6 +906,105 @@ fn reply_obj(result: Value, error: Option<(i64, String)>, id: &Option<Value>, v2
 /// queue until the missing bodies arrive or the deadline passes.
 /// `method` is carried on the query only so a panic inside `f` can be
 /// logged by name — it plays no role in dispatch itself.
+/// The shared funding path (queue #35): largest-first coin selection
+/// over the wallet's unspent coins, mempool-estimated feerate,
+/// internal-descriptor change above dust, RBF sequence, anti-fee-
+/// sniping locktime, Core-style random output order. Returns the
+/// unsigned tx + fee + change position — `sendtoaddress` signs and
+/// broadcasts; `walletcreatefundedpsbt` returns the PSBT.
+fn fund_spend(
+    w: &mut crate::watch::WatchWallet,
+    cs: &Chainstate,
+    feerate: i64,
+    dest_outputs: Vec<TxOut>,
+) -> Result<(Transaction, i64, Option<usize>), (i64, String)> {
+    let params = cs.tree().params();
+    w.advance(cs);
+    let amount: i64 = dest_outputs.iter().map(|o| o.value).sum();
+    // p2wpkh in ≈68 vB, out ≈31 vB, overhead ≈11 — change counted
+    // up front (Core's conservative estimate).
+    let mut chosen: Vec<(OutPoint, i64)> = Vec::new();
+    let mut coins: Vec<_> = w.unspent().map(|(op, c)| (op, c.value)).collect();
+    coins.sort_by_key(|c| std::cmp::Reverse(c.1));
+    let mut est_vsize = 11i64 + 31 * (dest_outputs.len() as i64 + 1);
+    for (op, v) in coins {
+        chosen.push((op, v));
+        est_vsize += 68;
+        let fee = (feerate * est_vsize) / 1000;
+        let total: i64 = chosen.iter().map(|(_, v)| v).sum();
+        if total >= amount + fee {
+            break;
+        }
+    }
+    let total: i64 = chosen.iter().map(|(_, v)| v).sum();
+    let fee = (feerate * est_vsize) / 1000;
+    if total < amount + fee {
+        return Err((RPC_WALLET_ERROR, "Insufficient funds".into()));
+    }
+    let change_value = total - amount - fee;
+    let mut outputs = dest_outputs;
+    let mut change_pos = None;
+    if change_value > 546 {
+        let Some(idx) = w
+            .descs
+            .iter()
+            .position(|d| d.active && d.internal && d.range.1 >= d.range.0)
+        else {
+            return Err((RPC_WALLET_ERROR, "no internal descriptor for change".into()));
+        };
+        let d = &w.descs[idx];
+        let pos = d.next_index;
+        if pos > d.range.1 {
+            return Err((RPC_WALLET_ERROR, "change range exhausted".into()));
+        }
+        let desc_text = d.desc.clone();
+        let (parsed, provider, _) = parse_descriptors(&desc_text, params, true)
+            .map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
+        let Some(scripts) = parsed[0].expand(pos, &provider) else {
+            return Err((RPC_WALLET_ERROR, "change derivation failed".into()));
+        };
+        let Some(change_spk) = scripts
+            .iter()
+            .find(|s| s.len() == 22 && s[0] == 0x00 && s[1] == 0x14)
+        else {
+            return Err((RPC_WALLET_ERROR, "no wpkh change script".into()));
+        };
+        outputs.push(TxOut {
+            value: change_value,
+            script_pubkey: Script::new(change_spk.clone()),
+        });
+        w.descs[idx].next_index = pos + 1;
+        change_pos = Some(outputs.len() - 1);
+    }
+    // Fingerprint-matched to Core's wallet: version 2, RBF-signalling
+    // sequence, anti-fee-sniping locktime, random output ordering
+    // (Core shuffles; BIP69 sorting is the OTHER fingerprint).
+    let inputs: Vec<TxIn> = chosen
+        .iter()
+        .map(|(op, _)| TxIn {
+            previous_output: *op,
+            script_sig: Script::new(Vec::new()),
+            sequence: 0xffff_fffd,
+            witness: Witness::default(),
+        })
+        .collect();
+    if outputs.len() == 2 {
+        let mut b = [0u8; 1];
+        let _ = getrandom::fill(&mut b);
+        if b[0] & 1 == 1 {
+            outputs.swap(0, 1);
+            change_pos = change_pos.map(|c| if c == 0 { 1 } else { 0 });
+        }
+    }
+    let tx = Transaction {
+        version: 2,
+        inputs,
+        outputs,
+        lock_time: cs.chain().len().saturating_sub(1) as u32,
+    };
+    Ok((tx, fee, change_pos))
+}
+
 /// Build the signer provider from private descriptors — parse each
 /// xprv root, then expand a bounded lookahead collecting derived
 /// secrets + origins (descriptor.rs's `ExpandPrivate`). Shared by
@@ -10723,114 +10822,24 @@ pub(crate) fn dispatch(
                         )));
                     }
                 };
-                let Some(signer_descs) = w.signer().map(|s| s.descs_private.clone()) else {
+                if w.signer().is_none() {
                     return QueryReply::Now(Err((
                         RPC_WALLET_ERROR,
                         "wallet has no signing keys".into(),
                     )));
-                };
-                let _ = signer_descs;
-                // Coin selection v1 (queue #38 owns the privacy-aware
-                // version): largest-first accumulation — honest and
-                // simple, and our txs already announce via stem.
-                w.advance(cs);
-                let feerate = mgr.mempool_ref().estimate_fee(6).unwrap_or(1000); // sat/kvB; 1 sat/vB floor
-                // p2wpkh in ≈68 vB, out ≈31 vB, overhead ≈11.
-                let mut chosen: Vec<(OutPoint, i64)> = Vec::new();
-                let mut coins: Vec<_> = w.unspent().map(|(op, c)| (op, c.value)).collect();
-                coins.sort_by_key(|c| std::cmp::Reverse(c.1));
-                // Overhead + dest + change — count the change output
-                // up front (Core's conservative estimate; overpays a
-                // hair when no change results).
-                let mut est_vsize = 11i64 + 62;
-                for (op, v) in coins {
-                    chosen.push((op, v));
-                    est_vsize += 68;
-                    let fee = (feerate * est_vsize) / 1000;
-                    let total: i64 = chosen.iter().map(|(_, v)| v).sum();
-                    if total >= amount + fee {
-                        break;
-                    }
                 }
-                let total: i64 = chosen.iter().map(|(_, v)| v).sum();
-                let fee = (feerate * est_vsize) / 1000;
-                if total < amount + fee {
-                    return QueryReply::Now(Err((RPC_WALLET_ERROR, "Insufficient funds".into())));
-                }
-                // Change above dust goes to the internal descriptor's
-                // next index (Core's change-addr convention).
-                let change_value = total - amount - fee;
-                let mut outputs = vec![TxOut {
-                    value: amount,
-                    script_pubkey: dest,
-                }];
-                if change_value > 546 {
-                    let Some(idx) = w
-                        .descs
-                        .iter()
-                        .position(|d| d.active && d.internal && d.range.1 >= d.range.0)
-                    else {
-                        return QueryReply::Now(Err((
-                            RPC_WALLET_ERROR,
-                            "no internal descriptor for change".into(),
-                        )));
-                    };
-                    let d = &w.descs[idx];
-                    let pos = d.next_index;
-                    let desc_text = d.desc.clone();
-                    let (parsed, provider, _) = match parse_descriptors(&desc_text, params, true) {
-                        Ok(v) => v,
-                        Err(e) => return QueryReply::Now(Err((RPC_INVALID_ADDRESS_OR_KEY, e))),
-                    };
-                    let Some(scripts) = parsed[0].expand(pos, &provider) else {
-                        return QueryReply::Now(Err((
-                            RPC_WALLET_ERROR,
-                            "change derivation failed".into(),
-                        )));
-                    };
-                    let Some(change_spk) = scripts
-                        .iter()
-                        .find(|s| s.len() == 22 && s[0] == 0x00 && s[1] == 0x14)
-                    else {
-                        return QueryReply::Now(Err((
-                            RPC_WALLET_ERROR,
-                            "no wpkh change script".into(),
-                        )));
-                    };
-                    outputs.push(TxOut {
-                        value: change_value,
-                        script_pubkey: Script::new(change_spk.clone()),
-                    });
-                    w.descs[idx].next_index = pos + 1;
-                }
-                // Fingerprint-matched to Core's wallet: version 2,
-                // RBF-signalling sequence, anti-fee-sniping locktime,
-                // random output ordering.
-                let inputs: Vec<TxIn> = chosen
-                    .iter()
-                    .map(|(op, _)| TxIn {
-                        previous_output: *op,
-                        script_sig: Script::new(Vec::new()),
-                        sequence: 0xffff_fffd,
-                        witness: Witness::default(),
-                    })
-                    .collect();
-                // BIP69-style ordering is NOT used — Core shuffles;
-                // match the dominant fingerprint (queue #38 measures).
-                let mut order: Vec<usize> = (0..outputs.len()).collect();
-                if outputs.len() == 2 {
-                    let mut b = [0u8; 1];
-                    let _ = getrandom::fill(&mut b);
-                    if b[0] & 1 == 1 {
-                        order.swap(0, 1);
-                    }
-                }
-                let outputs: Vec<TxOut> = order.iter().map(|&i| outputs[i].clone()).collect();
-                let tx = Transaction {
-                    version: 2,
-                    inputs,
-                    outputs,
-                    lock_time: cs.chain().len().saturating_sub(1) as u32,
+                let feerate = mgr.mempool_ref().estimate_fee(6).unwrap_or(1000); // sat/kvB
+                let (tx, _fee, _change_pos) = match fund_spend(
+                    &mut w,
+                    cs,
+                    feerate,
+                    vec![TxOut {
+                        value: amount,
+                        script_pubkey: dest,
+                    }],
+                ) {
+                    Ok(v) => v,
+                    Err(e) => return QueryReply::Now(Err(e)),
                 };
                 // Sign: PSBT → verified prevouts → Creator::Real → finalize.
                 let mut psbt = avila_consensus::psbt::Psbt::from_unsigned_tx(tx);
@@ -10881,6 +10890,105 @@ pub(crate) fn dispatch(
                 };
                 let bytes = final_tx.encode();
                 QueryReply::Now(admit_and_relay(cs, mgr, final_tx, bytes))
+            })
+        }
+
+        // Queue #35: build a funded PSBT — Core's walletcreatefundedpsbt
+        // shape (outputs object + options). Works on the WATCH wallet
+        // too: the output is for external signers, so signing keys
+        // aren't required — funding + change + fee only.
+        "walletcreatefundedpsbt" => {
+            let outputs_arg = param(params, 0, "outputs").cloned();
+            let locktime_arg = param(params, 1, "locktime").and_then(Value::as_i64);
+            let wallet = wallet.cloned();
+            chain_query_deferred(method, queries, move |cs, mgr| {
+                let Some(wallet) = wallet else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    )));
+                };
+                let params = cs.tree().params();
+                // outputs: [{"addr": amount}, ...] — merge all entries.
+                let mut dest_outputs: Vec<TxOut> = Vec::new();
+                let Some(entries) = outputs_arg.as_ref().and_then(Value::as_array) else {
+                    return QueryReply::Now(Err((
+                        RPC_INVALID_PARAMETER,
+                        "walletcreatefundedpsbt requires an outputs array".into(),
+                    )));
+                };
+                for entry in entries {
+                    let Some(obj) = entry.as_object() else {
+                        return QueryReply::Now(Err((
+                            RPC_INVALID_PARAMETER,
+                            "outputs entries must be {address: amount}".into(),
+                        )));
+                    };
+                    for (addr, amt_v) in obj {
+                        let Some(script) =
+                            avila_consensus::address::address_to_script(addr, params)
+                        else {
+                            return QueryReply::Now(Err((
+                                RPC_INVALID_ADDRESS_OR_KEY,
+                                format!("Invalid Bitcoin address: {addr}"),
+                            )));
+                        };
+                        let amt = match amount_from_value(amt_v) {
+                            Ok(a) if a > 0 => a,
+                            _ => {
+                                return QueryReply::Now(Err((
+                                    RPC_INVALID_PARAMETER,
+                                    "Invalid amount".into(),
+                                )));
+                            }
+                        };
+                        dest_outputs.push(TxOut {
+                            value: amt,
+                            script_pubkey: script,
+                        });
+                    }
+                }
+                if dest_outputs.is_empty() {
+                    return QueryReply::Now(Err((RPC_INVALID_PARAMETER, "no outputs".into())));
+                }
+                let mut w = match wallet.lock() {
+                    Ok(w) => w,
+                    Err(_) => {
+                        return QueryReply::Now(Err((
+                            RPC_MISC_ERROR,
+                            "wallet lock poisoned".into(),
+                        )));
+                    }
+                };
+                let feerate = mgr.mempool_ref().estimate_fee(6).unwrap_or(1000);
+                let (mut tx, fee, change_pos) = match fund_spend(&mut w, cs, feerate, dest_outputs)
+                {
+                    Ok(v) => v,
+                    Err(e) => return QueryReply::Now(Err(e)),
+                };
+                if let Some(lt) = locktime_arg.filter(|l| *l >= 0) {
+                    tx.lock_time = lt as u32;
+                }
+                let mut psbt = avila_consensus::psbt::Psbt::from_unsigned_tx(tx);
+                // Fill witness_utxo from the verified set so external
+                // signers see checked prevouts, not attacker claims.
+                let (verified, unverified) =
+                    match avila_consensus::sign::verify_and_fill_prevouts(cs.utxo(), &mut psbt) {
+                        Ok(v) => v,
+                        Err(msg) => return QueryReply::Now(Err((RPC_VERIFY_ERROR, msg))),
+                    };
+                if unverified > 0 {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        format!("{unverified} input(s) not in the verified UTXO set"),
+                    )));
+                }
+                QueryReply::Now(Ok(json!({
+                    "psbt": base64_encode(&psbt.encode()),
+                    "fee": Value::from(fee as f64 / 100_000_000.0),
+                    "changepos": change_pos.map(|c| json!(c)).unwrap_or(Value::from(-1)),
+                    "inputs_verified": verified,
+                })))
             })
         }
 
