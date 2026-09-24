@@ -349,7 +349,15 @@ first measurement that would kill or confirm it.
     construction is itself a tell. Kill: no policy meaningfully lowers
     measured identifiability — report that too.
 
-39. **Signer process boundary.** The key store + signer in a separate
+39. **Signer process boundary.** (shipped) `avila-node signer` is a
+    hidden subprocess: the node spawns it with the vault path +
+    passphrase over a stdin handshake, then pipes PSBTs as JSON-lines;
+    keys never exist in the node process. `signerspawn` installs the
+    boundary on the wallet; `walletprocesspsbt`/`sendtoaddress` verify
+    prevouts in-process then sign in the child; `signerlock` drops it.
+    Live-tested: a spawned child unlocked a real vault and produced a
+    final witness. Honest ceiling: same kernel — defense-in-depth, not
+    an airgap. The key store + signer in a separate
     process with a narrow IPC (PSBT in, signed PSBT out); the P2P
     process holds no key material. Same kernel — defense-in-depth, not
     airgap — but ahead of shipped Core multiprocess. Hypothesis: full

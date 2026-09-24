@@ -287,3 +287,139 @@ fn backup_skips_symlinks_instead_of_dereferencing_them() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Queue #39's live boundary: the `avila-node signer` subprocess
+/// unlocks a vault and signs a PSBT whose prevout script belongs to
+/// the vault's derived keys — all over the stdio pipe.
+#[test]
+fn signer_subprocess_signs_and_locks() {
+    use avila_consensus::extended_key::ExtKey;
+    use avila_consensus::params::Network;
+    use avila_consensus::psbt::Psbt;
+    use avila_consensus::transaction::{OutPoint, Script, Transaction, TxIn, TxOut, Witness};
+
+    let params = Network::Regtest.params();
+    // A deterministic seed → BIP84 account → private wpkh descriptor.
+    let seed = [9u8; 32];
+    let master = ExtKey::from_seed(&seed, params.base58_ext_secret_prefix).unwrap();
+    const H: u32 = 0x8000_0000;
+    let acct = master
+        .derive(84 | H)
+        .and_then(|k| k.derive(1 | H))
+        .and_then(|k| k.derive(H))
+        .unwrap();
+    let fp: String = master
+        .fingerprint()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let body = format!("wpkh([{fp}/84h/1h/0h]{}/0/*)", acct.encode());
+    let desc = format!(
+        "{body}#{}",
+        avila_consensus::descriptor::descriptor_checksum(&body)
+    );
+
+    // The prevout script for index 0 — expand the desc with the
+    // private provider (the child's provider is rebuilt the same way).
+    let provider = avila_node::watch::signer_provider_from_descs(std::slice::from_ref(&desc), &params).unwrap();
+    let (parsed, _, _) =
+        avila_consensus::descriptor::parse_descriptors(&desc, &params, true).unwrap();
+    let scripts = parsed[0].expand(0, &provider).unwrap();
+    let spk = scripts
+        .iter()
+        .find(|s| s.len() == 22 && s[0] == 0x00 && s[1] == 0x14)
+        .unwrap()
+        .clone();
+
+    // Seal a vault carrying the private desc.
+    let root = scratch_dir("signer-boundary");
+    let vault = root.join("signervault.dat");
+    let state = avila_node::watch::SignerState {
+        provider: provider.clone(),
+        descs_private: vec![desc],
+        descs_watch: Vec::new(),
+        provenance: "test".into(),
+        entropy_commitment: String::new(),
+    };
+    std::fs::write(&vault, avila_node::watch::vault_seal(&state, "pw").unwrap()).unwrap();
+
+    // Spawn the real subprocess and have it sign.
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_avila-node"));
+    let mut proc =
+        avila_node::signerproc::SignerProc::spawn(&exe, &vault, "pw", Network::Regtest).unwrap();
+    let tx = Transaction {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint {
+                txid: avila_consensus::hash::Txid::from_bytes([0x22; 32]),
+                vout: 0,
+            },
+            script_sig: Script::new(Vec::new()),
+            sequence: 0xffff_ffff,
+            witness: Witness::default(),
+        }],
+        outputs: vec![TxOut {
+            value: 25_000,
+            script_pubkey: Script::new(vec![0x51]),
+        }],
+        lock_time: 0,
+    };
+    let mut psbt = Psbt::from_unsigned_tx(tx);
+    let mut v = 50_000i64.to_le_bytes().to_vec();
+    avila_consensus::encode::write_var_bytes(&mut v, &spk);
+    psbt.inputs[0].set(vec![Psbt::IN_WITNESS_UTXO], v);
+    let b64 = base64(&psbt.encode());
+    let (signed_b64, complete) = proc.sign_psbt(&b64).unwrap();
+    assert!(complete, "child must sign the spend of its own key");
+    let signed = Psbt::decode(&unbase64(&signed_b64)).unwrap();
+    assert!(signed.inputs[0].get(Psbt::IN_FINAL_SCRIPTWITNESS).is_some());
+    proc.lock();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn base64(b: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in b.chunks(3) {
+        let n = c.iter().fold(0u32, |a, &x| (a << 8) | x as u32) << (8 * (3 - c.len()));
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn unbase64(s: &str) -> Vec<u8> {
+    fn v(b: u8) -> u32 {
+        match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            _ => 0,
+        }
+    }
+    let s = s.trim_end_matches('=');
+    let mut out = Vec::new();
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &b in s.as_bytes() {
+        acc = (acc << 6) | v(b);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}

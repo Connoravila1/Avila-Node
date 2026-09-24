@@ -29,6 +29,11 @@ struct Args {
 // worth the churn for a once-per-process enum.
 #[allow(clippy::large_enum_variant)]
 enum Command {
+    /// Sandboxed signer child (queue #39): spawned by the node over
+    /// stdin/stdout JSON-lines — keys never enter the node process.
+    /// Internal interface; invoked as `avila signer`.
+    #[command(hide = true)]
+    Signer,
     /// Validate configuration without starting services or creating data.
     CheckConfig,
     /// Inspect this build and configuration, NOT a running daemon.
@@ -412,6 +417,13 @@ fn migrate_report(dir: &Path, network: avila_core::Network) -> Vec<(String, File
 fn execute(args: Args) -> Result<(), Box<dyn Error>> {
     let config = load_config(args.config.as_deref())?;
     match args.command {
+        Command::Signer => {
+            // Process-level: ExitCode flows straight through.
+            return match signer_loop() {
+                ExitCode::SUCCESS => Ok(()),
+                _ => Err("signer subprocess failed".into()),
+            };
+        }
         Command::CheckConfig => {
             println!("Configuration valid: {}", config.get().network);
             println!(
@@ -916,6 +928,171 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+/// The signer subprocess (queue #39): stdin/stdout JSON-lines.
+/// Handshake `{"vault": path, "passphrase": pw, "network": name}`
+/// unlocks the vault and rebuilds the provider; each
+/// `{"sign_psbt": b64}` signs and replies; `{"lock": true}` exits.
+/// Errors reply `{"error": msg}` and keep serving — a poisoned line
+/// must not wedge the parent.
+fn signer_loop() -> ExitCode {
+    use std::io::{BufRead, BufReader, Write};
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut reader = BufReader::new(stdin.lock());
+
+    let mut reply = |v: serde_json::Value| {
+        let Ok(line) = serde_json::to_string(&v) else {
+            return;
+        };
+        let _ = out.write_all(line.as_bytes());
+        let _ = out.write_all(b"\n");
+        let _ = out.flush();
+    };
+
+    // Handshake — vault + passphrase + network.
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return ExitCode::FAILURE;
+    }
+    let hello: serde_json::Value = match serde_json::from_str(line.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            reply(serde_json::json!({"error": format!("bad handshake: {e}")}));
+            return ExitCode::FAILURE;
+        }
+    };
+    let vault_path = hello["vault"].as_str().unwrap_or_default().to_string();
+    let passphrase = hello["passphrase"].as_str().unwrap_or_default().to_string();
+    let network = match hello["network"].as_str().unwrap_or("main") {
+        "main" => avila_consensus::params::Network::Mainnet,
+        "testnet4" => avila_consensus::params::Network::Testnet4,
+        "signet" => avila_consensus::params::Network::Signet,
+        "regtest" => avila_consensus::params::Network::Regtest,
+        other => {
+            reply(serde_json::json!({"error": format!("unknown network: {other}")}));
+            return ExitCode::FAILURE;
+        }
+    };
+    let params = network.params();
+    let provider = std::fs::read(&vault_path)
+        .map_err(|e| format!("vault read: {e}"))
+        .and_then(|b| avila_node::watch::vault_open(&b, &passphrase))
+        .and_then(|v| avila_node::watch::signer_provider_from_descs(&v.descs_private, &params));
+    let provider = match provider {
+        Ok(p) => p,
+        Err(e) => {
+            reply(serde_json::json!({"error": e}));
+            return ExitCode::FAILURE;
+        }
+    };
+    reply(serde_json::json!({"ok": true}));
+
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let req: serde_json::Value = match serde_json::from_str(buf.trim()) {
+            Ok(v) => v,
+            Err(e) => {
+                reply(serde_json::json!({"error": format!("bad request: {e}")}));
+                continue;
+            }
+        };
+        if req.get("lock").and_then(|v| v.as_bool()) == Some(true) {
+            reply(serde_json::json!({"ok": true}));
+            return ExitCode::SUCCESS;
+        }
+        if let Some(b64) = req.get("sign_psbt").and_then(|v| v.as_str()) {
+            let res = base64_decode(b64)
+                .ok_or_else(|| "invalid base64".to_string())
+                .and_then(|b| {
+                    avila_consensus::psbt::Psbt::decode(&b)
+                        .map_err(|e| e.core_message().to_string())
+                })
+                .map(|mut psbt| {
+                    let txdata = avila_consensus::sign::precompute_psbt_data(&psbt);
+                    let mut complete = true;
+                    for i in 0..psbt.tx.inputs.len() {
+                        complete &= avila_consensus::sign::sign_psbt_input(
+                            &provider,
+                            &mut psbt,
+                            i,
+                            Some(&txdata),
+                            1,
+                            false,
+                            None,
+                            true,
+                        );
+                    }
+                    serde_json::json!({
+                        "psbt": base64_encode(&psbt.encode()),
+                        "complete": complete,
+                    })
+                });
+            match res {
+                Ok(v) => reply(v),
+                Err(e) => reply(serde_json::json!({"error": e})),
+            }
+            continue;
+        }
+        reply(serde_json::json!({"error": "unknown request"}));
+    }
+    ExitCode::SUCCESS
+}
+
+/// Minimal base64 for the signer pipe — the rpc module's helpers are
+/// private; these two are deliberately small.
+fn base64_encode(b: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in b.chunks(3) {
+        let n = c.iter().fold(0u32, |a, &x| (a << 8) | x as u32) << (8 * (3 - c.len()));
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(b: u8) -> Option<u32> {
+        match b {
+            b'A'..=b'Z' => Some((b - b'A') as u32),
+            b'a'..=b'z' => Some((b - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((b - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let s = s.trim_end_matches('=');
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &b in s.as_bytes() {
+        acc = (acc << 6) | val(b)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 fn main() -> ExitCode {

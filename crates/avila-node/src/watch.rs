@@ -193,6 +193,34 @@ pub fn resolve_entropy(
 /// feeding ChaCha20Poly1305. The plaintext is the signer's private
 /// descriptors + provenance records (NOT the watch list — secrets
 /// never share a file with watch state).
+/// Build the signer provider from private descriptors — parse each
+/// xprv root, then expand a bounded lookahead collecting derived
+/// secrets + origins (descriptor.rs's `ExpandPrivate`). Shared by
+/// `createdescriptorseed`, `signerload`, and the `avila signer`
+/// subprocess (queue #39's boundary).
+pub fn signer_provider_from_descs(
+    descs_private: &[String],
+    params: &avila_consensus::params::Params,
+) -> Result<avila_consensus::descriptor::FlatProvider, String> {
+    let mut signing = avila_consensus::descriptor::FlatProvider::default();
+    let mut expanded = avila_consensus::descriptor::FlatProvider::default();
+    for d in descs_private {
+        let (parsed, p, _) = avila_consensus::descriptor::parse_descriptors(d, params, true)?;
+        signing.keys.extend(p.keys);
+        signing.xprvs.extend(p.xprvs);
+        let mut cache = avila_consensus::descriptor::DeriveCache::new();
+        for pos in 0..64u32 {
+            let _ = parsed[0].expand_into(pos, &signing, &mut expanded, true, &mut cache);
+        }
+    }
+    signing.keys.extend(expanded.keys);
+    signing.pubkeys.extend(expanded.pubkeys);
+    signing.origins.extend(expanded.origins);
+    signing.scripts.extend(expanded.scripts);
+    signing.tr_trees.extend(expanded.tr_trees);
+    Ok(signing)
+}
+
 const VAULT_MAGIC: &[u8; 8] = b"AVLAVLT1";
 /// Argon2id params — memory-hard at wallet scale (64 MiB, 3 lanes,
 /// 2 passes): a stolen vault resists commodity GPU grinding far
@@ -418,6 +446,9 @@ pub struct WatchWallet {
     /// Opt-in signer (queue #35) — `None` until the operator creates
     /// or imports key material; memory-only, never persisted.
     pub signer: Option<SignerState>,
+    /// Queue #39 boundary — keys live in the spawned `avila signer`
+    /// subprocess; this handle is the pipe to it.
+    pub boundary: Option<crate::signerproc::SignerProc>,
     /// Dirty flag — set by any mutation, cleared by [`Self::persist`].
     dirty: bool,
 }
@@ -438,6 +469,7 @@ impl WatchWallet {
             scan_floor: 0,
             silents: Vec::new(),
             signer: None,
+            boundary: None,
             dirty: false,
         };
         if let Ok(text) = std::fs::read_to_string(&w.path) {
@@ -658,9 +690,23 @@ impl WatchWallet {
     }
 
     /// Drop the signer — `signerlock`; secrets leave memory with the
-    /// state (the vault holds the recoverable form).
+    /// state (the vault holds the recoverable form). The boundary
+    /// child exits with it.
     pub fn disable_signing(&mut self) {
         self.signer = None;
+        if let Some(mut b) = self.boundary.take() {
+            b.lock();
+        }
+    }
+
+    /// Install the subprocess boundary — signing routes through it.
+    pub fn set_boundary(&mut self, proc: crate::signerproc::SignerProc) {
+        self.boundary = Some(proc);
+    }
+
+    /// The boundary pipe, if the signer is out-of-process.
+    pub fn boundary_mut(&mut self) -> Option<&mut crate::signerproc::SignerProc> {
+        self.boundary.as_mut()
     }
 
     /// Whether the wallet holds signing keys (opt-in signer active).
@@ -815,6 +861,7 @@ impl WatchWallet {
             scan_floor: 0,
             silents: Vec::new(),
             signer: None,
+            boundary: None,
             dirty: false,
         };
         scratch

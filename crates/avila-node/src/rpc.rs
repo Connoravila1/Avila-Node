@@ -1038,33 +1038,6 @@ fn prevout_receipts(checks: &[avila_consensus::sign::PrevoutCheck]) -> Vec<Value
         .collect()
 }
 
-/// Build the signer provider from private descriptors — parse each
-/// xprv root, then expand a bounded lookahead collecting derived
-/// secrets + origins (descriptor.rs's `ExpandPrivate`). Shared by
-/// `createdescriptorseed` and `signerload`.
-fn signer_provider_from_descs(
-    descs_private: &[String],
-    params: &avila_consensus::params::Params,
-) -> Result<avila_consensus::descriptor::FlatProvider, String> {
-    let mut signing = avila_consensus::descriptor::FlatProvider::default();
-    let mut expanded = avila_consensus::descriptor::FlatProvider::default();
-    for d in descs_private {
-        let (parsed, p, _) = parse_descriptors(d, params, true)?;
-        signing.keys.extend(p.keys);
-        signing.xprvs.extend(p.xprvs);
-        let mut cache = avila_consensus::descriptor::DeriveCache::new();
-        for pos in 0..64u32 {
-            let _ = parsed[0].expand_into(pos, &signing, &mut expanded, true, &mut cache);
-        }
-    }
-    signing.keys.extend(expanded.keys);
-    signing.pubkeys.extend(expanded.pubkeys);
-    signing.origins.extend(expanded.origins);
-    signing.scripts.extend(expanded.scripts);
-    signing.tr_trees.extend(expanded.tr_trees);
-    Ok(signing)
-}
-
 /// Core's `BroadcastTransaction` tail — mempool admission +
 /// unbroadcast/broadcast-pool marking + stem-hopped relay announce.
 /// Shared by `sendrawtransaction` (after its caller policy bounds) and
@@ -10772,7 +10745,7 @@ pub(crate) fn dispatch(
                     (with_sum(format!("wpkh([{origin}]{xpub}/0/*)")), false),
                     (with_sum(format!("wpkh([{origin}]{xpub}/1/*)")), true),
                 ];
-                let signing = match signer_provider_from_descs(&priv_descs, params) {
+                let signing = match crate::watch::signer_provider_from_descs(&priv_descs, params) {
                     Ok(s) => s,
                     Err(e) => return QueryReply::Now(Err((RPC_INVALID_ADDRESS_OR_KEY, e))),
                 };
@@ -10889,17 +10862,16 @@ pub(crate) fn dispatch(
                     Ok(v) => v,
                     Err(e) => return QueryReply::Now(Err(e)),
                 };
-                // Sign: PSBT → verified prevouts → Creator::Real → finalize.
+                // Sign: PSBT → verified prevouts → signer (in-process
+                // or the #39 subprocess boundary) → finalize.
                 let mut psbt = avila_consensus::psbt::Psbt::from_unsigned_tx(tx);
-                let signer_provider = match w.signer() {
-                    Some(s) => s.provider.clone(),
-                    None => {
-                        return QueryReply::Now(Err((
-                            RPC_WALLET_ERROR,
-                            "wallet has no signing keys".into(),
-                        )));
-                    }
-                };
+                let has_boundary = w.boundary.is_some();
+                if !has_boundary && w.signer().is_none() {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        "wallet has no signing keys".into(),
+                    )));
+                }
                 let checks =
                     match avila_consensus::sign::verify_and_fill_prevouts(cs.utxo(), &mut psbt) {
                         Ok(v) => v,
@@ -10912,20 +10884,57 @@ pub(crate) fn dispatch(
                         format!("{unverified} input(s) not in the verified UTXO set"),
                     )));
                 }
-                let txdata = avila_consensus::sign::precompute_psbt_data(&psbt);
-                let mut complete = true;
-                for i in 0..psbt.tx.inputs.len() {
-                    complete &= avila_consensus::sign::sign_psbt_input(
-                        &signer_provider,
-                        &mut psbt,
-                        i,
-                        Some(&txdata),
-                        1,
-                        false,
-                        None,
-                        true,
-                    );
-                }
+                let complete = if has_boundary {
+                    let b64 = base64_encode(&psbt.encode());
+                    let Some(boundary) = w.boundary_mut() else {
+                        return QueryReply::Now(Err((
+                            RPC_WALLET_ERROR,
+                            "signer boundary dropped".into(),
+                        )));
+                    };
+                    let (signed_b64, complete) = match boundary.sign_psbt(&b64) {
+                        Ok(v) => v,
+                        Err(msg) => return QueryReply::Now(Err((RPC_WALLET_ERROR, msg))),
+                    };
+                    let Some(bytes) = base64_decode_strict(&signed_b64) else {
+                        return QueryReply::Now(Err((
+                            RPC_WALLET_ERROR,
+                            "signer returned malformed psbt".into(),
+                        )));
+                    };
+                    psbt = match avila_consensus::psbt::Psbt::decode(&bytes) {
+                        Ok(pv) => pv,
+                        Err(e) => {
+                            return QueryReply::Now(Err((
+                                RPC_DESERIALIZATION_ERROR,
+                                e.core_message().to_string(),
+                            )));
+                        }
+                    };
+                    complete
+                } else {
+                    let txdata = avila_consensus::sign::precompute_psbt_data(&psbt);
+                    let mut complete = true;
+                    for i in 0..psbt.tx.inputs.len() {
+                        let Some(signer) = w.signer() else {
+                            return QueryReply::Now(Err((
+                                RPC_WALLET_ERROR,
+                                "signer dropped".into(),
+                            )));
+                        };
+                        complete &= avila_consensus::sign::sign_psbt_input(
+                            &signer.provider,
+                            &mut psbt,
+                            i,
+                            Some(&txdata),
+                            1,
+                            false,
+                            None,
+                            true,
+                        );
+                    }
+                    complete
+                };
                 if !complete {
                     return QueryReply::Now(Err((
                         RPC_WALLET_ERROR,
@@ -11098,7 +11107,7 @@ pub(crate) fn dispatch(
                         "walletprocesspsbt requires a base64 psbt".into(),
                     )));
                 };
-                let w = match wallet.lock() {
+                let mut w = match wallet.lock() {
                     Ok(w) => w,
                     Err(_) => {
                         return QueryReply::Now(Err((
@@ -11107,12 +11116,14 @@ pub(crate) fn dispatch(
                         )));
                     }
                 };
-                let Some(signer) = w.signer() else {
+                let has_boundary = w.boundary.is_some();
+                if !has_boundary && w.signer().is_none() {
                     return QueryReply::Now(Err((
                         RPC_WALLET_ERROR,
-                        "wallet has no signing keys — run createdescriptorseed or import private material".into(),
+                        "wallet has no signing keys — run createdescriptorseed or signerspawn"
+                            .into(),
                     )));
-                };
+                }
                 let Some(bytes) = base64_decode_strict(psbt_b64.trim()) else {
                     return QueryReply::Now(Err((
                         RPC_DESERIALIZATION_ERROR,
@@ -11141,26 +11152,66 @@ pub(crate) fn dispatch(
                     };
                 let verified = checks.iter().filter(|c| c.status != "unverified").count();
                 let unverified = checks.iter().filter(|c| c.status == "unverified").count();
-                let txdata = avila_consensus::sign::precompute_psbt_data(&psbt);
-                let mut complete = true;
-                for i in 0..psbt.tx.inputs.len() {
-                    complete &= avila_consensus::sign::sign_psbt_input(
-                        &signer.provider,
-                        &mut psbt,
-                        i,
-                        Some(&txdata),
-                        1,     // SIGHASH_ALL
-                        false, // real signatures, not the dummy creator
-                        None,
-                        false,
-                    );
-                }
+                let complete = if has_boundary {
+                    // Queue #39: prevouts verified above; signing
+                    // happens in the subprocess — keys never here.
+                    let b64 = base64_encode(&psbt.encode());
+                    let Some(boundary) = w.boundary_mut() else {
+                        return QueryReply::Now(Err((
+                            RPC_WALLET_ERROR,
+                            "signer boundary dropped".into(),
+                        )));
+                    };
+                    let (signed_b64, complete) = match boundary.sign_psbt(&b64) {
+                        Ok(v) => v,
+                        Err(msg) => return QueryReply::Now(Err((RPC_WALLET_ERROR, msg))),
+                    };
+                    let Some(bytes) = base64_decode_strict(&signed_b64) else {
+                        return QueryReply::Now(Err((
+                            RPC_WALLET_ERROR,
+                            "signer returned malformed psbt".into(),
+                        )));
+                    };
+                    psbt = match avila_consensus::psbt::Psbt::decode(&bytes) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return QueryReply::Now(Err((
+                                RPC_DESERIALIZATION_ERROR,
+                                e.core_message().to_string(),
+                            )));
+                        }
+                    };
+                    complete
+                } else {
+                    let txdata = avila_consensus::sign::precompute_psbt_data(&psbt);
+                    let mut complete = true;
+                    for i in 0..psbt.tx.inputs.len() {
+                        let Some(signer) = w.signer() else {
+                            return QueryReply::Now(Err((
+                                RPC_WALLET_ERROR,
+                                "signer dropped".into(),
+                            )));
+                        };
+                        complete &= avila_consensus::sign::sign_psbt_input(
+                            &signer.provider,
+                            &mut psbt,
+                            i,
+                            Some(&txdata),
+                            1,     // SIGHASH_ALL
+                            false, // real signatures, not the dummy creator
+                            None,
+                            false,
+                        );
+                    }
+                    complete
+                };
                 QueryReply::Now(Ok(json!({
                     "psbt": base64_encode(&psbt.encode()),
                     "complete": complete,
                     "inputs_verified": verified,
                     "inputs_unverified": unverified,
                     "prevout_receipts": prevout_receipts(&checks),
+                    "signer": if has_boundary { "subprocess" } else { "in-process" },
                 })))
             })
         }
@@ -11242,7 +11293,7 @@ pub(crate) fn dispatch(
                     (with_sum(format!("wpkh([{origin}]{xpub}/0/*)")), false),
                     (with_sum(format!("wpkh([{origin}]{xpub}/1/*)")), true),
                 ];
-                let signing = match signer_provider_from_descs(&priv_descs, params) {
+                let signing = match crate::watch::signer_provider_from_descs(&priv_descs, params) {
                     Ok(sv) => sv,
                     Err(e) => return QueryReply::Now(Err((RPC_INVALID_ADDRESS_OR_KEY, e))),
                 };
@@ -11364,8 +11415,9 @@ pub(crate) fn dispatch(
                 let vault = crate::watch::vault_open(&blob, &passphrase)
                     .map_err(|e| (RPC_WALLET_ERROR, e))?;
                 let params = cs.tree().params();
-                let provider = signer_provider_from_descs(&vault.descs_private, params)
-                    .map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
+                let provider =
+                    crate::watch::signer_provider_from_descs(&vault.descs_private, params)
+                        .map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
                 // Re-import the neutered watch descs — idempotent if
                 // they're already tracked (import rejects exact dups).
                 let mut imported = 0usize;
@@ -11408,9 +11460,65 @@ pub(crate) fn dispatch(
                 let mut w = wallet
                     .lock()
                     .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
-                let had = w.signer().is_some();
+                let had = w.signer().is_some() || w.boundary.is_some();
                 w.disable_signing();
                 Ok(json!({ "locked": had }))
+            })
+        }
+
+        // Queue #39: move signing out of the node process — spawn the
+        // `avila signer` child holding the vault's keys; signing routes
+        // through the pipe afterwards.
+        "signerspawn" => {
+            let passphrase = param(params, 0, "passphrase")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let exe = param(params, 1, "exe")
+                .and_then(Value::as_str)
+                .map(std::path::PathBuf::from);
+            let wallet = wallet.cloned();
+            chain_query(method, queries, move |cs, _| {
+                let Some(wallet) = wallet else {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    ));
+                };
+                let Some(passphrase) = passphrase.filter(|p| !p.is_empty()) else {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "signerspawn requires a passphrase".into(),
+                    ));
+                };
+                let exe = match exe {
+                    Some(e) => e,
+                    None => std::env::current_exe().map_err(|e| (RPC_MISC_ERROR, e.to_string()))?,
+                };
+                let mut w = wallet
+                    .lock()
+                    .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                if w.signer().is_some() || w.boundary.is_some() {
+                    return Err((
+                        RPC_WALLET_ERROR,
+                        "signer already loaded — signerlock first".into(),
+                    ));
+                }
+                let vault = w.vault_path();
+                if !vault.exists() {
+                    return Err((
+                        RPC_WALLET_ERROR,
+                        "no vault — signerexport (or createdescriptorseed + export) first".into(),
+                    ));
+                }
+                let proc = crate::signerproc::SignerProc::spawn(
+                    &exe,
+                    &vault,
+                    &passphrase,
+                    cs.tree().params().network,
+                )
+                .map_err(|e| (RPC_WALLET_ERROR, e))?;
+                w.set_boundary(proc);
+                Ok(json!({ "spawned": true, "boundary": "process" }))
             })
         }
 

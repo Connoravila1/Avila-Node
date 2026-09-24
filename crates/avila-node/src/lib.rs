@@ -12,6 +12,7 @@ pub mod electrum;
 pub mod events;
 mod next_block;
 pub mod rpc;
+pub mod signerproc;
 pub mod sv2;
 pub mod sync;
 pub mod time;
