@@ -220,6 +220,36 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// Runs headers-first sync until `cfg.target_height` connects or
 /// `cfg.timeout` elapses. `progress` is invoked after each tick with a
 /// live snapshot.
+/// How often (in newly connected blocks) the self-audit samples the
+/// stored chain — every ~2 weeks of mainnet history, or a cheap
+/// interval during IBD.
+const AUDIT_INTERVAL: u32 = 2016;
+
+/// Re-verify `n` random connected blocks' internal proofs; returns the
+/// failure count. Heights are sampled by a seeded xorshift — the audit
+/// must not be adversarially predictable or an attacker could corrupt
+/// only un-sampled regions.
+fn audit_sample(cs: &Chainstate, n: usize, seed: u64) -> usize {
+    let tip = cs.chain().len() as u32;
+    if tip == 0 {
+        return 0;
+    }
+    let mut rng = seed ^ 0x9E3779B97F4A7C15;
+    let mut bad = 0;
+    for _ in 0..n {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let h = (rng % u64::from(tip)) as u32;
+        if let Some(hash) = cs.chain().get(h as usize).copied()
+            && cs.audit_block(&hash).is_err()
+        {
+            bad += 1;
+        }
+    }
+    bad
+}
+
 pub fn run(
     params: &Params,
     cfg: &SyncConfig,
@@ -258,6 +288,8 @@ pub fn run(
     // `state.dat` checkpoint cadence — blocks between flushes during
     // sync. The value bounds post-crash replay depth, not correctness.
     let mut last_flush = resumed_height;
+    let mut last_audit = resumed_height;
+    let mut audit_failures = 0usize;
     let mut mgr = PeerManager::new(cfg.max_peers);
     // The whole p2p time domain — dial-path ban checks, version
     // `timestamp`s, conntime/lastsend/lastrecv and the last_* peer
@@ -435,6 +467,20 @@ pub fn run(
         if cfg.data_dir.is_some() && last_flush + FLUSH_INTERVAL <= connected {
             last_flush = connected;
             cs.flush().map_err(SyncError::Store)?;
+        }
+        // Self-audit (queue #15): every AUDIT_INTERVAL connected
+        // blocks, re-verify a random sample's internal proofs
+        // (decode + merkle + witness commitment). Catches disk rot
+        // and bitflips in stored blocks — a failure is loud.
+        if connected.saturating_sub(last_audit) >= AUDIT_INTERVAL {
+            last_audit = connected;
+            let bad = audit_sample(&cs, 8, connected as u64);
+            audit_failures += bad;
+            if bad > 0 {
+                eprintln!(
+                    "self-audit: {bad} of 8 sampled blocks FAILED integrity checks                      ({audit_failures} cumulative) — storage may be corrupt"
+                );
+            }
         }
         // Snapshot background validation — Core's scheduler-driven ibd
         // chainstate: replay pre-base bodies into the proof UTXO set.

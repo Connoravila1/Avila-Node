@@ -168,6 +168,19 @@ impl BlockRejection {
 /// snapshot (header index, connected chain, undo records, coins view, failed
 /// set) atomically behind them, and reopening restores the snapshot then
 /// replays only the bodies it does not cover — resumable import without
+/// What a self-audit found wrong with a stored block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditFailure {
+    /// Body unreadable or absent from the store.
+    Missing,
+    /// Recomputed merkle root doesn't match the header.
+    MerkleMismatch,
+    /// Recomputed witness commitment doesn't match the coinbase's.
+    WitnessMismatch,
+    /// Stored header isn't in the tree.
+    NoNode,
+}
+
 /// re-downloading *or* re-validating.
 pub struct Chainstate {
     tree: HeaderTree,
@@ -1774,6 +1787,34 @@ impl Chainstate {
             return self.tree.params().genesis_block();
         }
         None
+    }
+
+    /// Self-audit (queue #15): re-verify one stored block's internal
+    /// proofs — decode, merkle root, witness commitment — catching
+    /// disk rot or corruption in the block store without needing
+    /// historical UTXO state.
+    ///
+    /// # Errors
+    /// `AuditFailure` describing the mismatch class.
+    pub fn audit_block(&self, hash: &BlockHash) -> Result<(), AuditFailure> {
+        let node = self.tree.get(hash).ok_or(AuditFailure::NoNode)?;
+        let block = self.body(hash).ok_or(AuditFailure::Missing)?;
+        let (root, mutated) = block.merkle_root();
+        if mutated || root != node.header.merkle_root {
+            return Err(AuditFailure::MerkleMismatch);
+        }
+        if let Some(pos) = block.witness_commitment_output() {
+            let committed: [u8; 32] = block.transactions[0].outputs[pos]
+                .script_pubkey
+                .as_bytes()
+                .get(6..38)
+                .and_then(|w| <[u8; 32]>::try_from(w).ok())
+                .ok_or(AuditFailure::WitnessMismatch)?;
+            if block.expected_witness_commitment() != Some(committed) {
+                return Err(AuditFailure::WitnessMismatch);
+            }
+        }
+        Ok(())
     }
 
     /// The snapshot of the current validation state for `state.dat`.
@@ -5558,5 +5599,22 @@ mod tests {
             ]
         );
         assert_eq!(cs.tip_hash(), b3.block_hash());
+    }
+
+    /// Self-audit (queue #15): every connected block's internal proofs
+    /// re-verify; an unknown hash reports a failure rather than Ok.
+    #[test]
+    fn audit_block_verifies_stored_blocks() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        let mut parent = genesis_header();
+        for h in 1..=5u32 {
+            let b = block_on(&parent, vec![coinbase_tx(h, subsidy(h))], &params);
+            cs.accept_block(&b, NOW).unwrap();
+            assert_eq!(cs.audit_block(&b.block_hash()), Ok(()));
+            parent = b.header;
+        }
+        let bogus = BlockHash::from_bytes([0xAB; 32]);
+        assert_eq!(cs.audit_block(&bogus), Err(AuditFailure::NoNode));
     }
 }
