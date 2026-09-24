@@ -361,6 +361,24 @@ impl HashStore {
         let idx_gen = u64::from_le_bytes(hdr[56..64].try_into().unwrap());
         let dat_gen = u64::from_le_bytes(dhdr[12..20].try_into().unwrap());
         let gen_ok = Self::reconcile_generations(dir, idx_gen, dat_gen)?;
+        // `reconcile_generations` may have just renamed a surviving
+        // `.new` file over `coins.idx` or `coins.dat` to finish a torn
+        // compact swap. `idx`/`dat` above were opened *before* that —
+        // on a rename, a file descriptor keeps pointing at the old
+        // inode, not the path's new target, so those handles would now
+        // be writing into an unlinked file that vanishes once they
+        // close (the tip would advance while the coins it describes
+        // silently disappear). Reopen from the — now reconciled —
+        // canonical paths, exactly like `compact` reopens after its own
+        // renames.
+        let idx = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&idx_path)?;
+        let dat = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dat_path)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             k0,
@@ -1204,6 +1222,71 @@ mod tests {
                 assert_eq!(got.as_ref(), Some(want), "round {round} lost {o:?}");
             }
             assert_eq!(s.iter_coins().len(), oracle.len(), "round {round} iter");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A crash mid-`compact()` can land after one rename but before the
+    /// other, leaving `coins.idx`/`coins.dat` at different generations —
+    /// `reconcile_generations` finishes that swap on open by renaming
+    /// the surviving `.new` file into place. Before this fix, `open`'s
+    /// file handles were opened *before* that rename ran, so they kept
+    /// writing into the now-unlinked pre-reconcile file: the data
+    /// looked committed (tip advanced, `sync` succeeded) but vanished
+    /// once the handle closed.
+    #[test]
+    fn open_reopens_after_torn_compact_reconcile() {
+        let d = dir("torn-open");
+        let s = HashStore::open(&d).unwrap();
+        let mut dirty = HashMap::new();
+        for i in 0..20u32 {
+            dirty.insert(op(i), Some(coin(i as i64, 1)));
+        }
+        s.commit_coins(&dirty, Some(1)).unwrap();
+        s.sync().unwrap();
+        // A real compact leaves a consistent generation-1 pair on disk.
+        s.compact().unwrap();
+        drop(s);
+
+        // Simulate a compact torn between its two renames: fresh
+        // generation-2 files exist (reconciliation never inspects more
+        // than the generation stamp, so cloning the current, already
+        // self-consistent pair and only patching the generation bytes
+        // is a faithful, valid "freshly compacted" pair), and only the
+        // idx side's rename "landed" before the crash.
+        let mut idx_new = std::fs::read(d.join("coins.idx")).unwrap();
+        idx_new[56..64].copy_from_slice(&2u64.to_le_bytes());
+        let mut dat_new = std::fs::read(d.join("coins.dat")).unwrap();
+        dat_new[12..20].copy_from_slice(&2u64.to_le_bytes());
+        std::fs::write(d.join("coins.idx.new"), &idx_new).unwrap();
+        std::fs::write(d.join("coins.dat.new"), &dat_new).unwrap();
+        std::fs::rename(d.join("coins.idx.new"), d.join("coins.idx")).unwrap();
+        // coins.dat.new (generation 2) is left behind, un-renamed —
+        // exactly the intermediate state a crash between compact's two
+        // renames leaves: idx at generation 2, dat still at generation 1.
+
+        // Open must reconcile (rename coins.dat.new -> coins.dat) and
+        // then commit through handles that see that reconciled file.
+        let s = HashStore::open(&d).unwrap();
+        let mut more = HashMap::new();
+        more.insert(op(99), Some(coin(999, 2)));
+        s.commit_coins(&more, Some(2)).unwrap();
+        s.sync().unwrap();
+        drop(s);
+
+        // A fresh open reads coins.dat/coins.idx straight from disk —
+        // if the commit above landed in an unlinked pre-reconcile file,
+        // it's gone now.
+        let s = HashStore::open(&d).unwrap();
+        assert_eq!(
+            s.get(&crate::coinsdb::key_of(&op(99))).unwrap().out.value,
+            999
+        );
+        for i in 0..20u32 {
+            assert!(
+                s.get(&crate::coinsdb::key_of(&op(i))).is_some(),
+                "lost pre-existing coin {i}"
+            );
         }
         let _ = std::fs::remove_dir_all(&d);
     }
