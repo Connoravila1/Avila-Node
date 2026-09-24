@@ -5178,6 +5178,28 @@ pub(crate) fn dispatch(
                 "chainstates": chainstates,
             }))
         }),
+        // Avila-specific (no Core equivalent): the node's own
+        // verification coverage — verified vs proven vs assumed heights.
+        "getvalidationreport" => chain_query(queries, |cs, _| {
+            let r = cs.validation_report();
+            let snapshot = r.snapshot.map(|s| {
+                json!({
+                    "base_height": s.base_height,
+                    "base_hash": s.base_hash,
+                    "expected_utxo_hash": s.expected_utxo_hash,
+                    "replayed_height": s.replayed_height,
+                    "assumed_heights": [1, s.base_height],
+                    "unproven_heights": [s.replayed_height + 1, s.base_height],
+                    "verified": s.verified,
+                })
+            });
+            Ok(json!({
+                "connected_height": r.connected_height,
+                "header_height": r.header_height,
+                "verified_fraction": r.verified_fraction,
+                "snapshot": snapshot,
+            }))
+        }),
         "getdeploymentinfo" => {
             // RPCHelpMan: 0–1 args.
             if params.as_array().is_some_and(|a| a.len() > 1) {

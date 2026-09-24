@@ -1,0 +1,1731 @@
+{
+  "date": "2026-09-23 America/New_York (2026-09-24 UTC)",
+  "scope": "Synthetic ECDSA kernel only; not a historical-block or full-IBD measurement.",
+  "authoritative_run": "measured-v3",
+  "summary": [
+    {
+      "mode": "bad_hint1_fallback",
+      "batch_size": 8192,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 201.22161840820314,
+        "min": 200.9848344116211,
+        "max": 206.6737518310547
+      },
+      "wall_us_per_sig": {
+        "median": 268.110699,
+        "min": 237.558794,
+        "max": 463.360412
+      }
+    },
+    {
+      "mode": "bad_y33_fallback",
+      "batch_size": 8192,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 183.5990325317383,
+        "min": 183.4027368774414,
+        "max": 184.0599319458008
+      },
+      "wall_us_per_sig": {
+        "median": 199.628183,
+        "min": 197.835553,
+        "max": 326.644246
+      }
+    },
+    {
+      "mode": "batch_hint1",
+      "batch_size": 8,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 123.72930657958983,
+        "min": 118.4536015625,
+        "max": 124.9032749633789
+      },
+      "wall_us_per_sig": {
+        "median": 158.475111,
+        "min": 125.309363,
+        "max": 169.652985
+      }
+    },
+    {
+      "mode": "batch_hint1",
+      "batch_size": 32,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 114.55655993652344,
+        "min": 113.09526995849609,
+        "max": 118.60974072265626
+      },
+      "wall_us_per_sig": {
+        "median": 124.07313,
+        "min": 123.31796,
+        "max": 136.407737
+      }
+    },
+    {
+      "mode": "batch_hint1",
+      "batch_size": 128,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 100.43326525878906,
+        "min": 99.67133850097656,
+        "max": 100.8162333984375
+      },
+      "wall_us_per_sig": {
+        "median": 146.866569,
+        "min": 129.001571,
+        "max": 175.794894
+      }
+    },
+    {
+      "mode": "batch_hint1",
+      "batch_size": 512,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 84.30482623291016,
+        "min": 80.48253204345703,
+        "max": 87.7776947631836
+      },
+      "wall_us_per_sig": {
+        "median": 98.109727,
+        "min": 92.888712,
+        "max": 173.79338
+      }
+    },
+    {
+      "mode": "batch_hint1",
+      "batch_size": 2048,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 74.7607582397461,
+        "min": 72.69395196533203,
+        "max": 76.84670910644532
+      },
+      "wall_us_per_sig": {
+        "median": 84.611302,
+        "min": 78.030791,
+        "max": 130.281319
+      }
+    },
+    {
+      "mode": "batch_hint1",
+      "batch_size": 8192,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 70.06248126220703,
+        "min": 69.84861248779298,
+        "max": 70.19950360107423
+      },
+      "wall_us_per_sig": {
+        "median": 87.593426,
+        "min": 70.7545,
+        "max": 94.302474
+      }
+    },
+    {
+      "mode": "batch_y33",
+      "batch_size": 8,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 106.3417886352539,
+        "min": 104.12697088623047,
+        "max": 109.13547741699219
+      },
+      "wall_us_per_sig": {
+        "median": 109.475731,
+        "min": 108.089799,
+        "max": 132.969661
+      }
+    },
+    {
+      "mode": "batch_y33",
+      "batch_size": 32,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 99.74651434326172,
+        "min": 98.0637158203125,
+        "max": 100.85326959228516
+      },
+      "wall_us_per_sig": {
+        "median": 102.819629,
+        "min": 100.722816,
+        "max": 132.387344
+      }
+    },
+    {
+      "mode": "batch_y33",
+      "batch_size": 128,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 85.85191229248046,
+        "min": 84.14579931640625,
+        "max": 87.53289190673829
+      },
+      "wall_us_per_sig": {
+        "median": 114.909274,
+        "min": 89.55885,
+        "max": 155.473789
+      }
+    },
+    {
+      "mode": "batch_y33",
+      "batch_size": 512,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 66.70162512207031,
+        "min": 66.60433410644531,
+        "max": 72.80309912109375
+      },
+      "wall_us_per_sig": {
+        "median": 68.821063,
+        "min": 67.508303,
+        "max": 101.621854
+      }
+    },
+    {
+      "mode": "batch_y33",
+      "batch_size": 2048,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 59.36011853027344,
+        "min": 59.334330993652344,
+        "max": 61.43037408447265
+      },
+      "wall_us_per_sig": {
+        "median": 68.206047,
+        "min": 61.106564,
+        "max": 80.754681
+      }
+    },
+    {
+      "mode": "batch_y33",
+      "batch_size": 8192,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 56.108656372070314,
+        "min": 55.04348785400391,
+        "max": 57.0827211303711
+      },
+      "wall_us_per_sig": {
+        "median": 66.026409,
+        "min": 58.115287,
+        "max": 94.999787
+      }
+    },
+    {
+      "mode": "generate_synthetic",
+      "batch_size": 0,
+      "samples": 1,
+      "cpu_us_per_sig": {
+        "median": 127.42294763183592,
+        "min": 127.42294763183592,
+        "max": 127.42294763183592
+      },
+      "wall_us_per_sig": {
+        "median": 142.720268,
+        "min": 142.720268,
+        "max": 142.720268
+      }
+    },
+    {
+      "mode": "individual_batch_inverse",
+      "batch_size": 8,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 126.52837622070312,
+        "min": 121.94664990234375,
+        "max": 129.11885687255858
+      },
+      "wall_us_per_sig": {
+        "median": 171.787022,
+        "min": 133.769343,
+        "max": 186.096865
+      }
+    },
+    {
+      "mode": "individual_batch_inverse",
+      "batch_size": 32,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 125.10142114257813,
+        "min": 122.68521185302734,
+        "max": 127.28354467773437
+      },
+      "wall_us_per_sig": {
+        "median": 136.380022,
+        "min": 125.73688,
+        "max": 178.360716
+      }
+    },
+    {
+      "mode": "individual_batch_inverse",
+      "batch_size": 128,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 123.9787212524414,
+        "min": 122.24465399169921,
+        "max": 126.29250177001954
+      },
+      "wall_us_per_sig": {
+        "median": 152.418247,
+        "min": 124.498017,
+        "max": 155.296229
+      }
+    },
+    {
+      "mode": "individual_batch_inverse",
+      "batch_size": 512,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 124.35195062255859,
+        "min": 121.53932037353516,
+        "max": 132.36218908691407
+      },
+      "wall_us_per_sig": {
+        "median": 136.181384,
+        "min": 124.65478,
+        "max": 192.176594
+      }
+    },
+    {
+      "mode": "individual_batch_inverse",
+      "batch_size": 2048,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 125.39951373291017,
+        "min": 124.7166444091797,
+        "max": 127.29917681884767
+      },
+      "wall_us_per_sig": {
+        "median": 128.029669,
+        "min": 126.28648,
+        "max": 218.268078
+      }
+    },
+    {
+      "mode": "individual_batch_inverse",
+      "batch_size": 8192,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 127.43041027832031,
+        "min": 126.42855743408204,
+        "max": 128.92645599365233
+      },
+      "wall_us_per_sig": {
+        "median": 165.736572,
+        "min": 134.46546,
+        "max": 275.601928
+      }
+    },
+    {
+      "mode": "ordinary",
+      "batch_size": 1,
+      "samples": 3,
+      "cpu_us_per_sig": {
+        "median": 127.56172003173828,
+        "min": 127.20428765869141,
+        "max": 129.61342590332032
+      },
+      "wall_us_per_sig": {
+        "median": 140.604026,
+        "min": 133.965789,
+        "max": 153.163791
+      }
+    },
+    {
+      "mode": "produce_advice",
+      "batch_size": 0,
+      "samples": 1,
+      "cpu_us_per_sig": {
+        "median": 130.59533868408204,
+        "min": 130.59533868408204,
+        "max": 130.59533868408204
+      },
+      "wall_us_per_sig": {
+        "median": 143.140406,
+        "min": 143.140406,
+        "max": 143.140406
+      }
+    }
+  ],
+  "final_run": {
+    "experiment": "ECDSA nonce-point advice and deterministic batch inversion",
+    "scope": "synthetic signature kernel; not historical blocks, Script validation, or full IBD",
+    "trust": "advice is untrusted; fresh local random coefficients; probabilistic batch acceptance; ordinary per-signature fallback; separate batch-inversion path needs no advice and retains deterministic individual checks",
+    "git_head": "6470fc2e4308c2124d6f49d4ad461cfc5913c0bd",
+    "compiler": "cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+    "platform": "Linux-7.0.0-31-generic-x86_64-with-glibc2.43",
+    "cpuinfo": "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 190\nmodel name\t: Intel(R) Core(TM) i3-N305\nstepping\t: 0\nmicrocode\t: 0x21\ncpu MHz\t\t: 2497.385\ncache size\t: 6144 KB\nphysical id\t: 0\nsiblings\t: 8\ncore id\t\t: 0\ncpu cores\t: 8\napicid\t\t: 0\ninitial apicid\t: 0\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 32\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l2 cdp_l2 ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdt_a rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs rfds bhi spectre_v2_user vmscape\nbogomips\t: 3609.60\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 39 bits physical, 48 bits virtual\npower management:",
+    "crate": {
+      "name": "secp256k1-sys",
+      "version": "0.10.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "d4387882333d3aa8cb20530a17c69a3752e97837832f34f6dccc760e715001d9",
+      "dependencies": [
+        "cc"
+      ]
+    },
+    "source_sha256": "818a876583ec40145df6054ab9a5691f9ea334983c0f07506e7729d30667abab",
+    "runner_sha256": "8502c34a2c4cc1048b3474334434b1604443a84d3997e93985ba64f2bec13ee5",
+    "vendor_c_h_sha256": "3a284fb04618353879dc2e37b52889f55a0ec07bd96843c87cf2fa2c43bcf50d",
+    "sanitizer_scope": "AddressSanitizer, UndefinedBehaviorSanitizer, and libsecp VERIFY assertions; LeakSanitizer disabled because the managed runner uses ptrace",
+    "commands": [
+      {
+        "label": "build",
+        "argv": [
+          "cc",
+          "-std=c99",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-Wno-unused-function",
+          "-Wno-unused-parameter",
+          "-D_POSIX_C_SOURCE=200809L",
+          "-include",
+          "stdio.h",
+          "-DECMULT_WINDOW_SIZE=15",
+          "-DECMULT_GEN_PREC_BITS=4",
+          "-I${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1",
+          "-I${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src",
+          "-I${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/include",
+          "${REPO}/experiments/code/ecdsa_advice.c",
+          "${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src/precomputed_ecmult.c",
+          "${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src/precomputed_ecmult_gen.c",
+          "-O3",
+          "-o",
+          "${REPO}/target/ecdsa-advice/measured-v3/probe"
+        ],
+        "seconds": 8.819048552017193,
+        "returncode": 0
+      },
+      {
+        "label": "build-checked",
+        "argv": [
+          "cc",
+          "-std=c99",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-Wno-unused-function",
+          "-Wno-unused-parameter",
+          "-D_POSIX_C_SOURCE=200809L",
+          "-include",
+          "stdio.h",
+          "-DECMULT_WINDOW_SIZE=15",
+          "-DECMULT_GEN_PREC_BITS=4",
+          "-I${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1",
+          "-I${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src",
+          "-I${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/include",
+          "${REPO}/experiments/code/ecdsa_advice.c",
+          "${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src/precomputed_ecmult.c",
+          "${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src/precomputed_ecmult_gen.c",
+          "-O1",
+          "-g",
+          "-DVERIFY",
+          "-fsanitize=address,undefined",
+          "-fno-omit-frame-pointer",
+          "-o",
+          "${REPO}/target/ecdsa-advice/measured-v3/probe-checked"
+        ],
+        "seconds": 12.841587883012835,
+        "returncode": 0
+      },
+      {
+        "label": "selftest",
+        "argv": [
+          "${REPO}/target/ecdsa-advice/measured-v3/probe-checked",
+          "256",
+          "1"
+        ],
+        "seconds": 7.7487103149760514,
+        "returncode": 0
+      },
+      {
+        "label": "benchmark",
+        "argv": [
+          "${REPO}/target/ecdsa-advice/measured-v3/probe",
+          "16384",
+          "3"
+        ],
+        "seconds": 151.40671120700426,
+        "returncode": 0
+      }
+    ],
+    "measurements": [
+      {
+        "mode": "generate_synthetic",
+        "count": 16384,
+        "batch_size": 0,
+        "rep": 0,
+        "wall_seconds": 2.338328879,
+        "cpu_seconds": 2.087697574,
+        "us_per_sig": 142.720268,
+        "accepted": 16384
+      },
+      {
+        "mode": "produce_advice",
+        "count": 16384,
+        "batch_size": 0,
+        "rep": 0,
+        "wall_seconds": 2.345212419,
+        "cpu_seconds": 2.139674029,
+        "us_per_sig": 143.140406,
+        "accepted": 16384
+      },
+      {
+        "mode": "selftest",
+        "status": "pass",
+        "cancellation_attack_demonstrated": true,
+        "rare_x_ge_n": true,
+        "fallback_masks_match": true,
+        "batch_inverse_masks_match": true
+      },
+      {
+        "mode": "ordinary",
+        "count": 16384,
+        "batch_size": 1,
+        "rep": 0,
+        "wall_seconds": 2.509435557,
+        "cpu_seconds": 2.089971221,
+        "us_per_sig": 153.163791,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 0,
+        "wall_seconds": 2.191676923,
+        "cpu_seconds": 1.997973912,
+        "us_per_sig": 133.769343,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 0,
+        "wall_seconds": 2.053068596,
+        "cpu_seconds": 1.940743808,
+        "us_per_sig": 125.309363,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 0,
+        "wall_seconds": 1.793650383,
+        "cpu_seconds": 1.706016291,
+        "us_per_sig": 109.475731,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 0,
+        "wall_seconds": 2.060073042,
+        "cpu_seconds": 2.010074511,
+        "us_per_sig": 125.73688,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 0,
+        "wall_seconds": 2.032814168,
+        "cpu_seconds": 1.852952903,
+        "us_per_sig": 124.07313,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 0,
+        "wall_seconds": 1.650242617,
+        "cpu_seconds": 1.60667592,
+        "us_per_sig": 100.722816,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 0,
+        "wall_seconds": 2.039775509,
+        "cpu_seconds": 2.002856411,
+        "us_per_sig": 124.498017,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 0,
+        "wall_seconds": 2.113561736,
+        "cpu_seconds": 1.63301521,
+        "us_per_sig": 129.001571,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 0,
+        "wall_seconds": 1.467332201,
+        "cpu_seconds": 1.378644776,
+        "us_per_sig": 89.55885,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 0,
+        "wall_seconds": 2.231195789,
+        "cpu_seconds": 2.037382359,
+        "us_per_sig": 136.181384,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 0,
+        "wall_seconds": 1.521888656,
+        "cpu_seconds": 1.318625805,
+        "us_per_sig": 92.888712,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 0,
+        "wall_seconds": 1.127564302,
+        "cpu_seconds": 1.092839426,
+        "us_per_sig": 68.821063,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 0,
+        "wall_seconds": 2.069077681,
+        "cpu_seconds": 2.043357502,
+        "us_per_sig": 126.28648,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 0,
+        "wall_seconds": 1.386271571,
+        "cpu_seconds": 1.224880263,
+        "us_per_sig": 84.611302,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 0,
+        "wall_seconds": 1.117487877,
+        "cpu_seconds": 0.972556182,
+        "us_per_sig": 68.206047,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 0,
+        "wall_seconds": 2.715428002,
+        "cpu_seconds": 2.087819842,
+        "us_per_sig": 165.736572,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 0,
+        "wall_seconds": 1.545051728,
+        "cpu_seconds": 1.147903693,
+        "us_per_sig": 94.302474,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 0,
+        "wall_seconds": 0.952160863,
+        "cpu_seconds": 0.935243303,
+        "us_per_sig": 58.115287,
+        "accepted": 16384
+      },
+      {
+        "mode": "bad_hint1_fallback",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 0,
+        "wall_seconds": 3.892163286,
+        "cpu_seconds": 3.292935527,
+        "us_per_sig": 237.558794,
+        "accepted": 16384
+      },
+      {
+        "mode": "bad_y33_fallback",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 0,
+        "wall_seconds": 3.241337701,
+        "cpu_seconds": 3.015637925,
+        "us_per_sig": 197.835553,
+        "accepted": 16384
+      },
+      {
+        "mode": "ordinary",
+        "count": 16384,
+        "batch_size": 1,
+        "rep": 1,
+        "wall_seconds": 2.19489548,
+        "cpu_seconds": 2.084115049,
+        "us_per_sig": 133.965789,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 1,
+        "wall_seconds": 2.203082097,
+        "cpu_seconds": 2.071405485,
+        "us_per_sig": 134.46546,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 1,
+        "wall_seconds": 1.081776685,
+        "cpu_seconds": 0.901832505,
+        "us_per_sig": 66.026409,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 1,
+        "wall_seconds": 1.159241721,
+        "cpu_seconds": 1.150148667,
+        "us_per_sig": 70.7545,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 1,
+        "wall_seconds": 2.097638097,
+        "cpu_seconds": 2.054545633,
+        "us_per_sig": 128.029669,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 1,
+        "wall_seconds": 1.001169944,
+        "cpu_seconds": 0.972133679,
+        "us_per_sig": 61.106564,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 1,
+        "wall_seconds": 1.278456482,
+        "cpu_seconds": 1.191017709,
+        "us_per_sig": 78.030791,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 1,
+        "wall_seconds": 2.042343916,
+        "cpu_seconds": 1.991300225,
+        "us_per_sig": 124.65478,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 1,
+        "wall_seconds": 1.106056034,
+        "cpu_seconds": 1.09124541,
+        "us_per_sig": 67.508303,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 1,
+        "wall_seconds": 1.607429763,
+        "cpu_seconds": 1.381250273,
+        "us_per_sig": 98.109727,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 1,
+        "wall_seconds": 2.544373417,
+        "cpu_seconds": 2.069176349,
+        "us_per_sig": 155.296229,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 1,
+        "wall_seconds": 1.88267355,
+        "cpu_seconds": 1.406597731,
+        "us_per_sig": 114.909274,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 1,
+        "wall_seconds": 2.406261872,
+        "cpu_seconds": 1.651773168,
+        "us_per_sig": 146.866569,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 1,
+        "wall_seconds": 2.922261973,
+        "cpu_seconds": 2.049661684,
+        "us_per_sig": 178.360716,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 1,
+        "wall_seconds": 1.684596797,
+        "cpu_seconds": 1.634246891,
+        "us_per_sig": 102.819629,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 1,
+        "wall_seconds": 2.020441464,
+        "cpu_seconds": 1.876894678,
+        "us_per_sig": 123.31796,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 1,
+        "wall_seconds": 3.049011038,
+        "cpu_seconds": 2.115483351,
+        "us_per_sig": 186.096865,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 1,
+        "wall_seconds": 2.178574927,
+        "cpu_seconds": 1.788075662,
+        "us_per_sig": 132.969661,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 1,
+        "wall_seconds": 2.779594511,
+        "cpu_seconds": 2.027180959,
+        "us_per_sig": 169.652985,
+        "accepted": 16384
+      },
+      {
+        "mode": "bad_hint1_fallback",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 1,
+        "wall_seconds": 4.392725696,
+        "cpu_seconds": 3.296814996,
+        "us_per_sig": 268.110699,
+        "accepted": 16384
+      },
+      {
+        "mode": "bad_y33_fallback",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 1,
+        "wall_seconds": 3.270708152,
+        "cpu_seconds": 3.008086549,
+        "us_per_sig": 199.628183,
+        "accepted": 16384
+      },
+      {
+        "mode": "ordinary",
+        "count": 16384,
+        "batch_size": 1,
+        "rep": 2,
+        "wall_seconds": 2.303656366,
+        "cpu_seconds": 2.12358637,
+        "us_per_sig": 140.604026,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 2,
+        "wall_seconds": 2.814558564,
+        "cpu_seconds": 2.073040916,
+        "us_per_sig": 171.787022,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 2,
+        "wall_seconds": 2.596456211,
+        "cpu_seconds": 2.046415257,
+        "us_per_sig": 158.475111,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 2,
+        "wall_seconds": 1.770943264,
+        "cpu_seconds": 1.742303865,
+        "us_per_sig": 108.089799,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 2,
+        "wall_seconds": 2.234450288,
+        "cpu_seconds": 2.085413596,
+        "us_per_sig": 136.380022,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 2,
+        "wall_seconds": 2.23490437,
+        "cpu_seconds": 1.943301992,
+        "us_per_sig": 136.407737,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 2,
+        "wall_seconds": 2.169034247,
+        "cpu_seconds": 1.652379969,
+        "us_per_sig": 132.387344,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 2,
+        "wall_seconds": 2.497220564,
+        "cpu_seconds": 2.031267369,
+        "us_per_sig": 152.418247,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 2,
+        "wall_seconds": 2.88022355,
+        "cpu_seconds": 1.645498618,
+        "us_per_sig": 175.794894,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 2,
+        "wall_seconds": 2.547282558,
+        "cpu_seconds": 1.434138901,
+        "us_per_sig": 155.473789,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 2,
+        "wall_seconds": 3.148621324,
+        "cpu_seconds": 2.168622106,
+        "us_per_sig": 192.176594,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 2,
+        "wall_seconds": 2.847430737,
+        "cpu_seconds": 1.438149751,
+        "us_per_sig": 173.79338,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 2,
+        "wall_seconds": 1.664972456,
+        "cpu_seconds": 1.192805976,
+        "us_per_sig": 101.621854,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 2,
+        "wall_seconds": 3.576104184,
+        "cpu_seconds": 2.085669713,
+        "us_per_sig": 218.268078,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 2,
+        "wall_seconds": 2.134529132,
+        "cpu_seconds": 1.259056482,
+        "us_per_sig": 130.281319,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 2,
+        "wall_seconds": 1.323084687,
+        "cpu_seconds": 1.006475249,
+        "us_per_sig": 80.754681,
+        "accepted": 16384
+      },
+      {
+        "mode": "individual_batch_inverse",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 2,
+        "wall_seconds": 4.515461985,
+        "cpu_seconds": 2.112331055,
+        "us_per_sig": 275.601928,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 2,
+        "wall_seconds": 1.435130695,
+        "cpu_seconds": 1.144399667,
+        "us_per_sig": 87.593426,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 2,
+        "wall_seconds": 1.556476512,
+        "cpu_seconds": 0.919284226,
+        "us_per_sig": 94.999787,
+        "accepted": 16384
+      },
+      {
+        "mode": "bad_hint1_fallback",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 2,
+        "wall_seconds": 7.591696987,
+        "cpu_seconds": 3.38614275,
+        "us_per_sig": 463.360412,
+        "accepted": 16384
+      },
+      {
+        "mode": "bad_y33_fallback",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 2,
+        "wall_seconds": 5.35173933,
+        "cpu_seconds": 3.004870441,
+        "us_per_sig": 326.644246,
+        "accepted": 16384
+      }
+    ],
+    "sanitized_selftest": [
+      {
+        "mode": "generate_synthetic",
+        "count": 256,
+        "batch_size": 0,
+        "rep": 0,
+        "wall_seconds": 0.338064369,
+        "cpu_seconds": 0.306569623,
+        "us_per_sig": 1320.563941,
+        "accepted": 256
+      },
+      {
+        "mode": "produce_advice",
+        "count": 256,
+        "batch_size": 0,
+        "rep": 0,
+        "wall_seconds": 0.298015226,
+        "cpu_seconds": 0.27607036,
+        "us_per_sig": 1164.121977,
+        "accepted": 256
+      },
+      {
+        "mode": "selftest",
+        "status": "pass",
+        "cancellation_attack_demonstrated": true,
+        "rare_x_ge_n": true,
+        "fallback_masks_match": true,
+        "batch_inverse_masks_match": true
+      }
+    ],
+    "binary_sha256": "17bd11daaa3fefdfda1922f24e0dc7cf4fa45aab57de727918def82a84abe4a5"
+  },
+  "preliminary_run": {
+    "experiment": "untrusted nonce-point advice for ECDSA batch verification",
+    "scope": "synthetic signature kernel; not historical blocks, Script validation, or full IBD",
+    "trust": "advice is untrusted; fresh local random coefficients; probabilistic batch acceptance; ordinary per-signature fallback",
+    "git_head": "6470fc2e4308c2124d6f49d4ad461cfc5913c0bd",
+    "compiler": "cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+    "platform": "Linux-7.0.0-31-generic-x86_64-with-glibc2.43",
+    "cpuinfo": "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 190\nmodel name\t: Intel(R) Core(TM) i3-N305\nstepping\t: 0\nmicrocode\t: 0x21\ncpu MHz\t\t: 2499.965\ncache size\t: 6144 KB\nphysical id\t: 0\nsiblings\t: 8\ncore id\t\t: 0\ncpu cores\t: 8\napicid\t\t: 0\ninitial apicid\t: 0\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 32\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l2 cdp_l2 ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdt_a rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs rfds bhi spectre_v2_user vmscape\nbogomips\t: 3609.60\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 39 bits physical, 48 bits virtual\npower management:",
+    "crate": {
+      "name": "secp256k1-sys",
+      "version": "0.10.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "d4387882333d3aa8cb20530a17c69a3752e97837832f34f6dccc760e715001d9",
+      "dependencies": [
+        "cc"
+      ]
+    },
+    "source_sha256": "996a8f4fa21c2a74a7cd462254c621d686a497c43444d9948aa67d564568acad",
+    "runner_sha256": "badd10a2ee8b7d815fbffd28e654692ebf8c1909cfd2976acc4cd6629509b1b0",
+    "vendor_c_h_sha256": "3a284fb04618353879dc2e37b52889f55a0ec07bd96843c87cf2fa2c43bcf50d",
+    "sanitizer_scope": "AddressSanitizer, UndefinedBehaviorSanitizer, and libsecp VERIFY assertions; LeakSanitizer disabled because the managed runner uses ptrace",
+    "commands": [
+      {
+        "label": "build",
+        "argv": [
+          "cc",
+          "-std=c99",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-Wno-unused-function",
+          "-Wno-unused-parameter",
+          "-D_POSIX_C_SOURCE=200809L",
+          "-include",
+          "stdio.h",
+          "-DECMULT_WINDOW_SIZE=15",
+          "-DECMULT_GEN_PREC_BITS=4",
+          "-I${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1",
+          "-I${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src",
+          "-I${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/include",
+          "${REPO}/experiments/code/ecdsa_advice.c",
+          "${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src/precomputed_ecmult.c",
+          "${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src/precomputed_ecmult_gen.c",
+          "-O3",
+          "-o",
+          "${REPO}/target/ecdsa-advice/measured-v2/probe"
+        ],
+        "seconds": 7.411420579999685,
+        "returncode": 0
+      },
+      {
+        "label": "build-checked",
+        "argv": [
+          "cc",
+          "-std=c99",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-Wno-unused-function",
+          "-Wno-unused-parameter",
+          "-D_POSIX_C_SOURCE=200809L",
+          "-include",
+          "stdio.h",
+          "-DECMULT_WINDOW_SIZE=15",
+          "-DECMULT_GEN_PREC_BITS=4",
+          "-I${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1",
+          "-I${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src",
+          "-I${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/include",
+          "${REPO}/experiments/code/ecdsa_advice.c",
+          "${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src/precomputed_ecmult.c",
+          "${CARGO_HOME}/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src/precomputed_ecmult_gen.c",
+          "-O1",
+          "-g",
+          "-DVERIFY",
+          "-fsanitize=address,undefined",
+          "-fno-omit-frame-pointer",
+          "-o",
+          "${REPO}/target/ecdsa-advice/measured-v2/probe-checked"
+        ],
+        "seconds": 9.434517791029066,
+        "returncode": 0
+      },
+      {
+        "label": "selftest",
+        "argv": [
+          "${REPO}/target/ecdsa-advice/measured-v2/probe-checked",
+          "256",
+          "1"
+        ],
+        "seconds": 5.102352956018876,
+        "returncode": 0
+      },
+      {
+        "label": "benchmark",
+        "argv": [
+          "${REPO}/target/ecdsa-advice/measured-v2/probe",
+          "16384",
+          "3"
+        ],
+        "seconds": 65.50452174298698,
+        "returncode": 0
+      }
+    ],
+    "measurements": [
+      {
+        "mode": "generate_synthetic",
+        "count": 16384,
+        "batch_size": 0,
+        "rep": 0,
+        "wall_seconds": 1.831919755,
+        "cpu_seconds": 1.813385676,
+        "us_per_sig": 111.811508,
+        "accepted": 16384
+      },
+      {
+        "mode": "produce_advice",
+        "count": 16384,
+        "batch_size": 0,
+        "rep": 0,
+        "wall_seconds": 1.899147993,
+        "cpu_seconds": 1.857720461,
+        "us_per_sig": 115.914794,
+        "accepted": 16384
+      },
+      {
+        "mode": "selftest",
+        "status": "pass",
+        "cancellation_attack_demonstrated": true,
+        "rare_x_ge_n": true,
+        "fallback_masks_match": true
+      },
+      {
+        "mode": "ordinary",
+        "count": 16384,
+        "batch_size": 1,
+        "rep": 0,
+        "wall_seconds": 1.815002847,
+        "cpu_seconds": 1.792479803,
+        "us_per_sig": 110.778982,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 0,
+        "wall_seconds": 1.74271187,
+        "cpu_seconds": 1.715490792,
+        "us_per_sig": 106.366691,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 0,
+        "wall_seconds": 1.559129797,
+        "cpu_seconds": 1.531487052,
+        "us_per_sig": 95.161731,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 0,
+        "wall_seconds": 1.696950695,
+        "cpu_seconds": 1.680976996,
+        "us_per_sig": 103.573651,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 0,
+        "wall_seconds": 1.485458887,
+        "cpu_seconds": 1.483141858,
+        "us_per_sig": 90.665215,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 0,
+        "wall_seconds": 1.573560782,
+        "cpu_seconds": 1.510481012,
+        "us_per_sig": 96.042528,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 0,
+        "wall_seconds": 1.400097217,
+        "cpu_seconds": 1.316810369,
+        "us_per_sig": 85.455152,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 0,
+        "wall_seconds": 1.311724404,
+        "cpu_seconds": 1.300512623,
+        "us_per_sig": 80.061304,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 0,
+        "wall_seconds": 1.154399866,
+        "cpu_seconds": 1.047642889,
+        "us_per_sig": 70.458976,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 0,
+        "wall_seconds": 1.359670552,
+        "cpu_seconds": 1.133657585,
+        "us_per_sig": 82.987705,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 0,
+        "wall_seconds": 1.020687446,
+        "cpu_seconds": 0.905228531,
+        "us_per_sig": 62.297818,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 0,
+        "wall_seconds": 1.116156265,
+        "cpu_seconds": 1.095717095,
+        "us_per_sig": 68.124772,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 0,
+        "wall_seconds": 0.870531036,
+        "cpu_seconds": 0.854978863,
+        "us_per_sig": 53.132998,
+        "accepted": 16384
+      },
+      {
+        "mode": "ordinary",
+        "count": 16384,
+        "batch_size": 1,
+        "rep": 1,
+        "wall_seconds": 2.087174131,
+        "cpu_seconds": 2.030496194,
+        "us_per_sig": 127.390999,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 1,
+        "wall_seconds": 0.875203233,
+        "cpu_seconds": 0.87089544,
+        "us_per_sig": 53.418166,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 1,
+        "wall_seconds": 1.216002243,
+        "cpu_seconds": 1.113669736,
+        "us_per_sig": 74.218887,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 1,
+        "wall_seconds": 1.005560399,
+        "cpu_seconds": 0.957703094,
+        "us_per_sig": 61.374536,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 1,
+        "wall_seconds": 1.228776289,
+        "cpu_seconds": 1.162018655,
+        "us_per_sig": 74.998553,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 1,
+        "wall_seconds": 1.165059117,
+        "cpu_seconds": 1.067551244,
+        "us_per_sig": 71.109565,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 1,
+        "wall_seconds": 1.535429129,
+        "cpu_seconds": 1.305855437,
+        "us_per_sig": 93.715157,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 1,
+        "wall_seconds": 1.781256099,
+        "cpu_seconds": 1.305008166,
+        "us_per_sig": 108.719244,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 1,
+        "wall_seconds": 2.017034347,
+        "cpu_seconds": 1.560988609,
+        "us_per_sig": 123.110007,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 1,
+        "wall_seconds": 1.759559765,
+        "cpu_seconds": 1.558177206,
+        "us_per_sig": 107.395005,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 1,
+        "wall_seconds": 3.411390915,
+        "cpu_seconds": 1.778896977,
+        "us_per_sig": 208.214778,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 1,
+        "wall_seconds": 1.75617636,
+        "cpu_seconds": 1.647180168,
+        "us_per_sig": 107.188499,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 1,
+        "wall_seconds": 2.16285335,
+        "cpu_seconds": 1.878341712,
+        "us_per_sig": 132.010092,
+        "accepted": 16384
+      },
+      {
+        "mode": "ordinary",
+        "count": 16384,
+        "batch_size": 1,
+        "rep": 2,
+        "wall_seconds": 2.303176024,
+        "cpu_seconds": 1.985253826,
+        "us_per_sig": 140.574708,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 2,
+        "wall_seconds": 2.113015408,
+        "cpu_seconds": 1.89814839,
+        "us_per_sig": 128.968226,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 8,
+        "rep": 2,
+        "wall_seconds": 1.681111168,
+        "cpu_seconds": 1.650313579,
+        "us_per_sig": 102.606883,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 2,
+        "wall_seconds": 2.087518761,
+        "cpu_seconds": 1.786000453,
+        "us_per_sig": 127.412034,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 32,
+        "rep": 2,
+        "wall_seconds": 1.915266643,
+        "cpu_seconds": 1.561249085,
+        "us_per_sig": 116.898599,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 2,
+        "wall_seconds": 1.705255023,
+        "cpu_seconds": 1.533164374,
+        "us_per_sig": 104.080507,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 128,
+        "rep": 2,
+        "wall_seconds": 1.573650916,
+        "cpu_seconds": 1.319789655,
+        "us_per_sig": 96.04803,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 2,
+        "wall_seconds": 1.61784504,
+        "cpu_seconds": 1.309706526,
+        "us_per_sig": 98.745425,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 512,
+        "rep": 2,
+        "wall_seconds": 1.15990875,
+        "cpu_seconds": 1.061632158,
+        "us_per_sig": 70.795212,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 2,
+        "wall_seconds": 1.474699005,
+        "cpu_seconds": 1.177309419,
+        "us_per_sig": 90.008484,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 2048,
+        "rep": 2,
+        "wall_seconds": 0.989103552,
+        "cpu_seconds": 0.925174851,
+        "us_per_sig": 60.37009,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_hint1",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 2,
+        "wall_seconds": 1.420014761,
+        "cpu_seconds": 1.081057456,
+        "us_per_sig": 86.670823,
+        "accepted": 16384
+      },
+      {
+        "mode": "batch_y33",
+        "count": 16384,
+        "batch_size": 8192,
+        "rep": 2,
+        "wall_seconds": 1.042009883,
+        "cpu_seconds": 0.853446294,
+        "us_per_sig": 63.599236,
+        "accepted": 16384
+      }
+    ],
+    "sanitized_selftest": [
+      {
+        "mode": "generate_synthetic",
+        "count": 256,
+        "batch_size": 0,
+        "rep": 0,
+        "wall_seconds": 0.289736364,
+        "cpu_seconds": 0.281996819,
+        "us_per_sig": 1131.782672,
+        "accepted": 256
+      },
+      {
+        "mode": "produce_advice",
+        "count": 256,
+        "batch_size": 0,
+        "rep": 0,
+        "wall_seconds": 0.254990682,
+        "cpu_seconds": 0.252752426,
+        "us_per_sig": 996.057352,
+        "accepted": 256
+      },
+      {
+        "mode": "selftest",
+        "status": "pass",
+        "cancellation_attack_demonstrated": true,
+        "rare_x_ge_n": true,
+        "fallback_masks_match": true
+      }
+    ],
+    "binary_sha256": "7779444aa473d128f526a41709e99f8bae58267d66e033a0ea6dea2460463557"
+  },
+  "unsuccessful_attempts": [
+    {
+      "stage": "initial manual compilation",
+      "reason": "Rust-vendored source lacks stdio inclusion and POSIX clock feature exposure; runner now supplies both explicitly."
+    },
+    {
+      "stage": "initial sanitized run",
+      "commands": [
+        {
+          "label": "build",
+          "returncode": 0
+        },
+        {
+          "label": "build-checked",
+          "returncode": 0
+        },
+        {
+          "label": "selftest",
+          "returncode": 1
+        }
+      ],
+      "reason": "LeakSanitizer exited with its unsupported-under-ptrace error. Subsequent tests disabled leak detection only, retaining ASan, UBSan and libsecp VERIFY."
+    }
+  ],
+  "unmeasured": [
+    "Historical Script and activation rules",
+    "Full IBD",
+    "Network transport and helper association metadata",
+    "Peak RSS and energy",
+    "Cryptographic implementation assurance beyond these scoped tests"
+  ]
+}

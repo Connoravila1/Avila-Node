@@ -296,6 +296,40 @@ pub enum BackgroundStatus {
     Verified,
 }
 
+/// Typed verification coverage — the node's own trust state. Heights
+/// are split into *verified* (script-checked by this node), *proven*
+/// (snapshot prefix replayed by background validation), and *assumed*
+/// (prefix taken on the assumeutxo commitment, replay pending).
+#[derive(Clone, Debug)]
+pub struct ValidationReport {
+    /// Highest fully-validated height — every script in `0..=h` checked.
+    pub connected_height: u32,
+    /// Header-verified tip (PoW + structure; bodies may be unchecked).
+    pub header_height: u32,
+    /// Snapshot coverage — present iff an assumeutxo snapshot is active.
+    pub snapshot: Option<SnapshotCoverage>,
+    /// Share of the connected chain whose state was verified or proven
+    /// locally — `1.0` on a full-validation node.
+    pub verified_fraction: f64,
+}
+
+/// The snapshot portion of a [`ValidationReport`].
+#[derive(Clone, Debug)]
+pub struct SnapshotCoverage {
+    /// Snapshot base height — the assumed prefix is `1..=base_height`.
+    pub base_height: u32,
+    /// Display-order hex of the base block hash.
+    pub base_hash: String,
+    /// The chainparams-pinned `hash_serialized_3` commitment the
+    /// replayed set must equal — the sole trust anchor.
+    pub expected_utxo_hash: String,
+    /// Heights `1..=replayed_height` proven by background replay.
+    pub replayed_height: u32,
+    /// `true` once the replay reached the base and matched the
+    /// commitment — the prefix is then proven, not assumed.
+    pub verified: bool,
+}
+
 /// The transaction index behind `-txindex`: every retained block's
 /// txids mapped to its hash, plus an append log (`txindex.dat`) that
 /// makes the index resumable — records are `blockhash || count ||
@@ -2768,6 +2802,57 @@ impl Chainstate {
         self.background.as_ref().map(|bg| bg.next - 1)
     }
 
+    /// The node's own verification coverage — which heights were checked
+    /// locally versus taken on an assumeutxo commitment, with the
+    /// background-replay progress that converts assumed into proven.
+    /// Surfaced by `getvalidationreport`; the honest answer to "what did
+    /// this node actually verify?".
+    #[must_use]
+    pub fn validation_report(&self) -> ValidationReport {
+        let connected_height = self.chain().len().saturating_sub(1) as u32;
+        let header_height = self.tree().tip().height;
+        let snapshot = self.snapshot_base.map(|base| {
+            let au = self
+                .tree
+                .params()
+                .assumeutxo_data
+                .iter()
+                .find(|d| d.height == base);
+            let replayed_height = if self.snapshot_verified {
+                base
+            } else {
+                self.background_height().unwrap_or(0)
+            };
+            SnapshotCoverage {
+                base_height: base,
+                base_hash: au.map(|d| d.blockhash.to_string()).unwrap_or_default(),
+                expected_utxo_hash: au
+                    .map(|d| d.hash_serialized.to_string())
+                    .unwrap_or_default(),
+                replayed_height,
+                verified: self.snapshot_verified,
+            }
+        });
+        // Heights strictly above the base were connected normally;
+        // heights the replay reached are proven. Only the unreplayed
+        // prefix is taken on the commitment.
+        let verified_heights = match &snapshot {
+            Some(s) => (connected_height - s.base_height) + s.replayed_height,
+            None => connected_height,
+        };
+        let verified_fraction = if connected_height == 0 {
+            1.0
+        } else {
+            verified_heights as f64 / connected_height as f64
+        };
+        ValidationReport {
+            connected_height,
+            header_height,
+            snapshot,
+            verified_fraction,
+        }
+    }
+
     /// `ActivateBestChain` — while a stored-body, non-failed branch outworks
     /// the connected tip (or ties it as the `preciousblock`), reorg to the
     /// heaviest such candidate and rescan. A candidate that fails to connect
@@ -4279,6 +4364,105 @@ mod tests {
         assert_eq!(cs.background_height(), None);
         assert_eq!(cs.tip_hash(), base_hash);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The validation report distinguishes assumed from verified state:
+    /// a fresh snapshot reports the whole prefix assumed, the replay
+    /// converts it to proven, and a plain node reports full coverage.
+    #[test]
+    fn validation_report_covers_snapshot() {
+        use crate::params::AssumeutxoData;
+        use crate::utxo_snapshot::{read_metadata, sorted_coins, write_snapshot};
+        let mut p = params();
+        let mut src = Chainstate::new(&p);
+        let mut blocks = Vec::new();
+        let mut parent = genesis_header();
+        for h in 1..=3u32 {
+            let b = block_on(&parent, vec![coinbase_tx(h, subsidy(h))], &p);
+            src.accept_block(&b, NOW).unwrap();
+            parent = b.header;
+            blocks.push(b);
+        }
+        let base_hash = blocks[1].block_hash();
+        let mut utxo = src.utxo().clone();
+        let undo3 = src.undo(3).unwrap();
+        connect::disconnect_block(&blocks[2], &mut utxo, &undo3).unwrap();
+        let stats = crate::coinstats::compute(
+            &utxo,
+            2,
+            base_hash,
+            crate::coinstats::CoinStatsHashType::HashSerialized,
+        );
+        let coins = sorted_coins(&utxo);
+        let mut snap = Vec::new();
+        write_snapshot(
+            &mut snap,
+            p.message_start,
+            &base_hash,
+            coins.len() as u64,
+            &coins,
+        )
+        .unwrap();
+        p.assumeutxo_data = Box::leak(Box::new([AssumeutxoData {
+            height: 2,
+            hash_serialized: Box::leak(stats.hash_serialized.unwrap().to_string().into_boxed_str()),
+            n_chain_tx: 3,
+            blockhash: Box::leak(base_hash.to_string().into_boxed_str()),
+        }]));
+        let dir = store_dir("validation-report");
+        let mut cs = Chainstate::with_store(&dir, &p, NOW).unwrap();
+        for b in &blocks {
+            cs.tree.insert(&b.header, NOW).unwrap();
+        }
+        let mut cursor = std::io::Cursor::new(&snap);
+        let meta = read_metadata(&mut cursor, p.message_start).unwrap();
+        cs.activate_snapshot(&mut cursor, &meta, false).unwrap();
+
+        // Freshly activated: the whole 1..=2 prefix is assumed, nothing
+        // proven yet, coverage 0.
+        let r = cs.validation_report();
+        assert_eq!(r.connected_height, 2);
+        assert!(!cs.snapshot_verified());
+        let s = r.snapshot.expect("snapshot coverage");
+        assert_eq!(s.base_height, 2);
+        assert_eq!(s.base_hash, base_hash.to_string());
+        assert_eq!(
+            s.expected_utxo_hash,
+            stats.hash_serialized.unwrap().to_string()
+        );
+        assert_eq!(s.replayed_height, 0);
+        assert!(!s.verified);
+        assert_eq!(r.verified_fraction, 0.0);
+
+        // Bodies arrive and the replay proves the prefix.
+        for b in [&blocks[0], &blocks[1]] {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        assert_eq!(cs.background_step(10), Ok(BackgroundStatus::Verified));
+        let r = cs.validation_report();
+        let s = r.snapshot.expect("snapshot coverage");
+        assert!(s.verified);
+        assert_eq!(s.replayed_height, 2);
+        assert_eq!(r.verified_fraction, 1.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node with no snapshot reports full local verification.
+    #[test]
+    fn validation_report_full_node() {
+        let p = params();
+        let dir = store_dir("validation-report-full");
+        let mut cs = Chainstate::with_store(&dir, &p, NOW).unwrap();
+        let blocks = probe_chain(4, &[], &p);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        let r = cs.validation_report();
+        assert_eq!(r.connected_height, 4);
+        assert!(r.snapshot.is_none());
+        assert_eq!(r.verified_fraction, 1.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
