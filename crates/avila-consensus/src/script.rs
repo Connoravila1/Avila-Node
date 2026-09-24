@@ -548,15 +548,19 @@ impl Script {
         bytes.len() > MAX_SCRIPT_SIZE || bytes.first() == Some(&OP_RETURN)
     }
 
-    /// Core's `CScript::HasValidOps` — every opcode byte must decode
-    /// and be at most `MAX_OPCODE` (`OP_NOP10`, 0xb9). Display-layer
-    /// gate: Core refuses to show P2SH/segwit wrap addresses for
-    /// scripts containing invalid opcodes.
+    /// Core's `CScript::HasValidOps` — every opcode byte must decode,
+    /// be at most `MAX_OPCODE` (`OP_NOP10`, 0xb9), and every pushed
+    /// item must be at most `MAX_SCRIPT_ELEMENT_SIZE` (520) bytes.
+    /// Display-layer gate: Core refuses to show P2SH/segwit wrap
+    /// addresses for scripts containing invalid opcodes or oversized
+    /// pushes.
     #[must_use]
     pub fn has_valid_ops(&self) -> bool {
         self.instructions().all(|i| match i {
             Ok(Instruction::Op(op)) => op <= OP_NOP10,
-            Ok(Instruction::Push(_)) => true,
+            Ok(Instruction::Push(data)) => {
+                data.len() <= crate::interpreter::MAX_SCRIPT_ELEMENT_SIZE
+            }
             Err(_) => false,
         })
     }
@@ -1185,6 +1189,21 @@ mod tests {
             count_witness_sig_ops(&script_sig, &script_pubkey, &witness, ScriptFlags::NONE),
             0
         );
+    }
+
+    #[test]
+    fn has_valid_ops_rejects_oversized_pushes() {
+        // Core's `CScript::HasValidOps` rejects a push whose item exceeds
+        // `MAX_SCRIPT_ELEMENT_SIZE` (520), not just a bad opcode or a
+        // failed decode.
+        let at_limit = script(&push_slice(&vec![0xaa; 520]));
+        assert!(at_limit.has_valid_ops());
+        let over_limit = script(&push_slice(&vec![0xaa; 521]));
+        assert!(!over_limit.has_valid_ops());
+        // A well-formed script otherwise still passes.
+        assert!(script(&[OP_1, OP_CHECKSIG]).has_valid_ops());
+        // An opcode above MAX_OPCODE (OP_NOP10, 0xb9) still fails.
+        assert!(!script(&[0xba]).has_valid_ops());
     }
 
     #[test]
