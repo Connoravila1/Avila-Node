@@ -1745,15 +1745,24 @@ fn expand_descriptor(
             }
             let mut script = Vec::new();
             if *checksig_add {
+                // `multi_a`/`sortedmulti_a` are tapscript-only: Core's
+                // `MultiADescriptor::MakeScripts` converts every key to
+                // its `XOnlyPubKey` first and only then sorts (for
+                // `sortedmulti_a`) — sorting the 33-byte compressed
+                // keys and truncating afterward gives a different
+                // order whenever a key's parity byte and its x-only
+                // value disagree on ordering, which changes the
+                // tapscript, leaf hash, and address.
+                let mut xonly: Vec<Vec<u8>> =
+                    pubkeys.iter().map(|k| k[k.len() - 32..].to_vec()).collect();
                 if *sorted {
-                    pubkeys.sort();
+                    xonly.sort();
                 }
-                let first = &pubkeys[0];
-                let x0 = &first[first.len() - 32..];
-                script.extend_from_slice(&script::push_slice(x0));
+                let first = &xonly[0];
+                script.extend_from_slice(&script::push_slice(first));
                 script.push(script::OP_CHECKSIG);
-                for k in &pubkeys[1..] {
-                    script.extend_from_slice(&script::push_slice(&k[k.len() - 32..]));
+                for k in &xonly[1..] {
+                    script.extend_from_slice(&script::push_slice(k));
                     script.push(0xba); // OP_CHECKSIGADD
                 }
                 push_script_num(&mut script, *threshold);
@@ -2601,6 +2610,39 @@ mod tests {
         assert_eq!(
             to_addrs(&format!("wsh(sortedmulti(1,{K},{K}))#6q3gsfav"), 0, 0),
             ["bcrt1qhks8dknwck5c2jwme24akwysfw0z5c902wyzdqa53750aargwcds784rlk".to_string()]
+        );
+    }
+
+    /// Core's `MultiADescriptor::MakeScripts` converts every key to its
+    /// `XOnlyPubKey` before sorting for `sortedmulti_a` — sorting the
+    /// 33-byte compressed keys and truncating afterward gives a
+    /// different order whenever a key's parity byte and its x-only
+    /// value disagree, changing the tapscript, leaf hash, and address.
+    ///
+    /// SORT_A has odd parity (0x03) and the *smaller* x; SORT_B has
+    /// even parity (0x02) and the *larger* x. Comparing full keys is
+    /// decided entirely by the parity byte (0x02 < 0x03 regardless of
+    /// x), so it always ranks SORT_B first — the opposite of the
+    /// x-only order. `multi_a` given the keys already in x-order is
+    /// the ground truth `sortedmulti_a` must reproduce however its
+    /// arguments are ordered.
+    #[test]
+    fn sortedmulti_a_sorts_xonly_keys_not_full_keys() {
+        const SORT_A: &str = "03c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+        const SORT_B: &str = "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
+        let expand_addr = |text: &str| -> String {
+            let (descs, provider, _) = parse_descriptors(text, &regtest(), false).unwrap();
+            let scripts = descs[0].expand(0, &provider).unwrap();
+            script_address(&Script::new(scripts[0].clone()), &regtest()).unwrap()
+        };
+        let ground_truth = expand_addr(&format!("tr({K},multi_a(2,{SORT_A},{SORT_B}))"));
+        assert_eq!(
+            expand_addr(&format!("tr({K},sortedmulti_a(2,{SORT_B},{SORT_A}))")),
+            ground_truth
+        );
+        assert_eq!(
+            expand_addr(&format!("tr({K},sortedmulti_a(2,{SORT_A},{SORT_B}))")),
+            ground_truth
         );
     }
 
