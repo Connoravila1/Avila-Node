@@ -40,6 +40,16 @@ pub const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 /// `getdata` gets its in-flight slots reclaimed.
 pub const BLOCK_STALLING_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Core's `HEADERS_RESPONSE_TIME` — how long an outstanding `getheaders`
+/// may go unanswered before the peer is treated as unresponsive. Core
+/// uses this to gate re-sending `getheaders` to the *same* peer
+/// (`MaybeSendGetHeaders`); here, where only the headers leader keeps
+/// paging, it is also what lets the manager reclaim leadership from a
+/// leader that has otherwise gone quiet on headers (while still, say,
+/// answering pings) instead of freezing sync until it disconnects for
+/// some unrelated reason.
+pub const HEADERS_RESPONSE_TIME: Duration = Duration::from_secs(120);
+
 /// What [`PeerSync::on_headers`] reports.
 #[derive(Clone, Debug)]
 pub struct HeadersOutcome {
@@ -86,8 +96,10 @@ pub struct PeerSync {
     in_flight: VecDeque<(BlockHash, Instant)>,
     /// Hashes already requested from any source — dedup guard.
     wanted: HashSet<BlockHash>,
-    /// A `getheaders` we sent that hasn't been answered.
-    headers_in_flight: bool,
+    /// When the `getheaders` we currently have outstanding was sent —
+    /// `None` once answered (even by an empty page). Core's
+    /// `m_last_getheaders_timestamp`.
+    headers_in_flight: Option<Instant>,
     /// Headers applied from this peer so far (a boundless-increment counter
     /// is fine — it's pure bookkeeping).
     headers_applied: usize,
@@ -121,7 +133,7 @@ impl PeerSync {
         Self {
             in_flight: VecDeque::new(),
             wanted: HashSet::new(),
-            headers_in_flight: false,
+            headers_in_flight: None,
             headers_applied: 0,
             blocks_received: 0,
         }
@@ -152,7 +164,28 @@ impl PeerSync {
     /// Whether a `getheaders` is outstanding.
     #[must_use]
     pub fn awaiting_headers(&self) -> bool {
+        self.headers_in_flight.is_some()
+    }
+
+    /// `true` once an outstanding `getheaders` has gone unanswered past
+    /// [`HEADERS_RESPONSE_TIME`] — the peer is still connected (it may
+    /// even be answering pings) but has stopped cooperating on headers.
+    /// The caller should reassign headers leadership and disconnect (or
+    /// otherwise penalize) this peer so another one can continue paging.
+    #[must_use]
+    pub fn headers_timed_out(&self) -> bool {
         self.headers_in_flight
+            .is_some_and(|t| t.elapsed() > HEADERS_RESPONSE_TIME)
+    }
+
+    /// Test-only: back-dates an outstanding `getheaders` so it reads as
+    /// timed out, without an actual multi-minute sleep. A no-op if
+    /// nothing is outstanding.
+    #[cfg(test)]
+    pub(crate) fn force_headers_timeout(&mut self) {
+        if let Some(sent_at) = &mut self.headers_in_flight {
+            *sent_at = Instant::now() - HEADERS_RESPONSE_TIME - Duration::from_secs(1);
+        }
     }
 
     /// Total headers this peer has contributed to the index.
@@ -172,7 +205,7 @@ impl PeerSync {
     /// `FindNextBlocksToDownload`/`SendMessages` flow.
     #[must_use]
     pub fn request_headers(&mut self, cs: &Chainstate) -> Message {
-        self.headers_in_flight = true;
+        self.headers_in_flight = Some(Instant::now());
         Message::GetHeaders(GetHeaders {
             locator: cs.tree().locator(),
             stop: BlockHash::ZERO,
@@ -196,7 +229,7 @@ impl PeerSync {
         headers: &[BlockHeader],
         now: u32,
     ) -> Result<HeadersOutcome, SyncError> {
-        self.headers_in_flight = false;
+        self.headers_in_flight = None;
         let mut added = 0usize;
         let mut known = 0usize;
         let mut fetchable = Vec::new();

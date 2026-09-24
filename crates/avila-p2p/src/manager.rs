@@ -652,8 +652,19 @@ impl<S: Read + Write> PeerManager<S> {
                     peer.ping_outstanding = Some((nonce, Instant::now()));
                 }
             }
-            // Stall eviction.
+            // Stall eviction: a block download that's gone quiet, or an
+            // outstanding `getheaders` that has (Core's
+            // `HEADERS_RESPONSE_TIME`). The latter matters even for a
+            // peer that's otherwise alive and answering pings — without
+            // it a headers leader that simply stops replying to
+            // `getheaders` would freeze header sync until it
+            // disconnects for some unrelated reason, since only the
+            // leader is allowed to keep paging. Dropping it here clears
+            // `headers_leader` below and `fill_queues` hands leadership
+            // to another established peer on the next tick.
             if peer.sync.stalled() {
+                dead.push((id, DisconnectReason::Stalled));
+            } else if peer.sync.headers_timed_out() {
                 dead.push((id, DisconnectReason::Stalled));
             }
         }
@@ -2284,6 +2295,50 @@ mod tests {
         }
         mgr.tick(&mut cs, NOW);
         assert_eq!(cs.chain().len(), 5);
+    }
+
+    /// A headers leader that stops answering `getheaders` — while
+    /// staying connected — must not freeze sync forever: once its
+    /// outstanding request times out (Core's `HEADERS_RESPONSE_TIME`),
+    /// the manager drops it and hands leadership to another peer.
+    #[test]
+    fn unresponsive_headers_leader_is_replaced() {
+        let (mut mgr, mut peer_a, id_a) = managed_peer();
+        let mut cs = regtest();
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        testpipe::drain(&mut peer_a, MAGIC); // A's initial getheaders — A leads
+        assert_eq!(mgr.headers_leader, Some(id_a));
+
+        let (mut peer_b, id_b) = add_peer(&mut mgr);
+        handshake_peer(&mut mgr, &mut peer_b, &mut cs);
+        testpipe::drain(&mut peer_b, MAGIC); // B's own initial getheaders
+
+        // A never answers. Force its outstanding request to look
+        // expired rather than actually sleeping past HEADERS_RESPONSE_TIME.
+        mgr.peers
+            .get_mut(&id_a)
+            .expect("A is connected")
+            .sync
+            .force_headers_timeout();
+
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                NetEvent::Disconnected {
+                    peer,
+                    reason: DisconnectReason::Stalled
+                } if *peer == id_a
+            )),
+            "{events:?}"
+        );
+        assert_eq!(mgr.headers_leader, Some(id_b), "leadership must pass to B");
+
+        let sent = testpipe::drain(&mut peer_b, MAGIC);
+        assert!(
+            sent.iter().any(|m| matches!(m, Message::GetHeaders(_))),
+            "B should be paged for headers once it takes over leadership: {sent:?}"
+        );
     }
 
     #[test]
