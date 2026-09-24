@@ -141,3 +141,29 @@ first measurement that would kill or confirm it.
 
 10. **Multi-route sync.** Disjoint transports cross-checking headers —
     eclipse detection by construction.
+
+11. **Process-level sandboxing.** seccomp/capability separation: the
+    P2P stack can't write the datadir, the validator can't open
+    sockets, RPC gets its own boundary. Nobody ships OS-level
+    containment in a node. Measurable: publish the syscall whitelist,
+    test what a compromised wire parser can actually reach.
+
+12. **Eclipse detection (not just resistance).** Watch the signatures —
+    stalled header progress, suspiciously-uniform peer agreement,
+    work plateau — and cross-check disjoint routes to prove it. Lab
+    experiment: mount a real eclipse, measure detection time.
+
+13. **Fail-closed privacy profile.** Tor unreachable → tx broadcast
+    stops, Electrum stops, RPC stays localhost. Privacy failure
+    becomes impossible-by-configuration, not merely unlikely. Nobody
+    ships this because it's annoying; it's the only honest privacy
+    promise.
+
+14. **Per-peer adversarial accounting.** Formal per-peer budgets —
+    bytes, CPU, memory, queue slots — as a *tested contract*: fuzz the
+    boundaries, prove no hostile peer exceeds allocation under any
+    input sequence.
+
+15. **Continuous self-audit.** Background re-verification of random
+    historical segments, forever — correctness as an ongoing property,
+    catching disk rot and bitflips. Each pass appends receipt evidence.
