@@ -1300,33 +1300,40 @@ impl Chainstate {
         let (base, base_height, au) =
             self.check_snapshot_activation(meta, mempool_nonempty)?;
 
-        // Verify pass — one sequential read feeding the commitment
-        // hasher in file order (the file's cursor order IS the
-        // hash_serialized order; a mis-ordered file just won't match).
-        let mut file = std::fs::File::open(&path).map_err(|e| {
-            SnapshotError(format!("snapshot open {}: {e}", path.as_ref().display()))
-        })?;
-        // The coins stream starts after the metadata header — the
-        // indexer parses it itself, the hasher must skip it.
-        let params = *self.tree.params();
-        let _ = crate::utxo_snapshot::read_metadata(&mut file, params.message_start)
-            .map_err(|e| SnapshotError(format!("snapshot header: {e:?}")))?;
-        let stats = crate::coinstats::compute_streaming(
-            {
-                let (tx, rx) = std::sync::mpsc::sync_channel(4096);
-                let count = meta.coins_count;
-                let bh = base_height;
-                std::thread::spawn(move || {
-                    let _ = crate::utxo_snapshot::read_coins(&mut file, count, bh, |op, coin| {
-                        let _ = tx.send((op, coin));
-                    });
-                });
-                rx.into_iter()
+        // Single sequential pass — `index_with` builds the sparse
+        // group index AND streams every decoded coin to the
+        // hasher (file order IS the committed hash order; a
+        // mis-ordered file just won't match). Two channels: the
+        // coins feed `compute_streaming` on a worker thread.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(OutPoint, Coin)>(4096);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let bh = base_height;
+        let hasher = std::thread::spawn(move || {
+            let stats = crate::coinstats::compute_streaming(
+                rx.into_iter(),
+                i64::from(bh),
+                base,
+                crate::coinstats::CoinStatsHashType::HashSerialized,
+            );
+            let _ = done_tx.send(stats);
+        });
+        let run = crate::sortedrun::SnapshotRun::index_with(
+            path.as_ref(),
+            // Sparse-index stride — a group every ~64K records keeps
+            // lookups within a short scan of the target.
+            65_536,
+            &mut |op, coin| {
+                let _ = tx.send((op, coin));
             },
-            i64::from(base_height),
-            base,
-            crate::coinstats::CoinStatsHashType::HashSerialized,
-        );
+        )
+        .map_err(|e| SnapshotError(format!("snapshot index: {e}")))?;
+        drop(tx);
+        let stats = done_rx
+            .recv()
+            .map_err(|_| SnapshotError("hash worker dropped".to_string()))?;
+        hasher
+            .join()
+            .map_err(|_| SnapshotError("hash worker panicked".to_string()))?;
         let got = stats
             .hash_serialized
             .map(|h| crate::hash::format_display_hex(h.as_bytes()))
@@ -1338,16 +1345,6 @@ impl Chainstate {
             )));
         }
         debug_assert_eq!(stats.txouts, meta.coins_count);
-
-        // Index pass — second sequential read building the sparse
-        // group index, then attach as the immutable lowest layer.
-        let run = crate::sortedrun::SnapshotRun::index(
-            path.as_ref(),
-            // Sparse-index stride — a group every ~64K records keeps
-            // lookups within a short scan of the target.
-            65_536,
-        )
-        .map_err(|e| SnapshotError(format!("snapshot index: {e}")))?;
 
         // Persist where the overlay file lives — `restore` re-attaches
         // it by sidecar path so a restart never re-imports.

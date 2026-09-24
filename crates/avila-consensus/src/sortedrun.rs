@@ -384,6 +384,18 @@ impl SnapshotRun {
     /// `[txid32][count compactsize][vout cs + 3 Core-VARINTs + script]`.
     /// Sparse keys are each sampled group's first outpoint.
     pub fn index(path: &Path, stride: u32) -> io::Result<Self> {
+        Self::index_with(path, stride, &mut |_, _| {})
+    }
+
+    /// [`Self::index`] that also emits every decoded coin — the single
+    /// pass activation uses to feed the commitment hasher while the
+    /// sparse index builds (one sequential read, zero materialization
+    /// pressure beyond the caller's sink).
+    pub fn index_with(
+        path: &Path,
+        stride: u32,
+        sink: &mut dyn FnMut(OutPoint, Coin),
+    ) -> io::Result<Self> {
         let f = File::open(path)?;
         let file_len = f.metadata()?.len();
         let mut hdr = [0u8; 51];
@@ -477,7 +489,7 @@ impl SnapshotRun {
             groups += 1;
             pos = save;
             for _ in 0..cnt {
-                let _vout = read_cs(&mut pos, &f, &mut buf, &mut win_off, &mut win_len)?;
+                let vout = read_cs(&mut pos, &f, &mut buf, &mut win_off, &mut win_len)? as u32;
                 let mut varints = [0u64; 3];
                 for v in varints.iter_mut() {
                     *v = read_varint(&mut pos, &f, &mut buf, &mut win_off, &mut win_len)?;
@@ -487,6 +499,44 @@ impl SnapshotRun {
                     2 | 3 | 4 | 5 => 32u64,
                     n => n - 6,
                 };
+                // `need` only guarantees 256B — large scripts need an
+                // explicit cover of the whole record span.
+                if pos + plen > win_off + win_len as u64 {
+                    win_off = pos;
+                    let n = ((file_len - pos).min(WIN as u64)) as usize;
+                    if plen as usize > n {
+                        // Script spans past the window — refill with a
+                        // big-enough buffer starting here.
+                        let want = plen as usize;
+                        if buf.len() < want {
+                            buf.resize(want, 0);
+                        }
+                        let n = ((file_len - pos).min(want as u64)) as usize;
+                        f.read_exact_at(&mut buf[..n], pos)?;
+                        win_len = n;
+                    } else {
+                        f.read_exact_at(&mut buf[..n], pos)?;
+                        win_len = n;
+                    }
+                }
+                let sbase = (pos - win_off) as usize;
+                let send = sbase + plen as usize;
+                let mut cur: &[u8] = &buf[sbase..send.min(win_len)];
+                let script = crate::utxo_snapshot::decompress_script(&mut cur, varints[2])?;
+                sink(
+                    OutPoint {
+                        txid: crate::hash::Txid::from_bytes(first_key[..32].try_into().unwrap()),
+                        vout,
+                    },
+                    Coin {
+                        out: crate::transaction::TxOut {
+                            value: crate::utxo_snapshot::decompress_amount(varints[1]) as i64,
+                            script_pubkey: script,
+                        },
+                        height: (varints[0] >> 1) as u32,
+                        coinbase: varints[0] & 1 == 1,
+                    },
+                );
                 pos += plen;
                 count += 1;
                 coins_left -= 1;
