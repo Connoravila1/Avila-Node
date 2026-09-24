@@ -152,6 +152,10 @@ struct PeerEntry<S> {
     /// `Peer::m_addr_token_timestamp` — when the bucket was last
     /// refilled, so the refill amount is `elapsed * rate`.
     addr_token_timestamp: Instant,
+    /// `Peer::m_getaddr_recvd` — whether this peer has already been
+    /// answered once; a later `getaddr` on the same connection is
+    /// silently ignored.
+    getaddr_recvd: bool,
 }
 
 /// A read-only view of one connected peer — the manager's state is
@@ -610,6 +614,7 @@ impl<S: Read + Write> PeerManager<S> {
                 // slow passive refill.
                 addr_token_bucket: 1.0,
                 addr_token_timestamp: now,
+                getaddr_recvd: false,
             },
         );
         Some(id)
@@ -1187,12 +1192,21 @@ impl<S: Read + Write> PeerManager<S> {
                 }
             }
             SessionEvent::Message(Message::GetAddr) => {
-                let entries = addrbook
-                    .sample()
-                    .iter()
-                    .map(|a| addr_v2_of(a, now))
-                    .collect();
-                let _ = peer.session.send(&Message::AddrV2(entries));
+                // Core answers `getaddr` only on inbound connections —
+                // an outbound-only (e.g. NATed) node would otherwise let
+                // an attacker seed our addrman with tagged addresses and
+                // read them back over the link it dialed, fingerprinting
+                // us — and only once per connection, to bound reply
+                // spam and addr-stamping of later INV announcements.
+                if peer.inbound && !peer.getaddr_recvd {
+                    peer.getaddr_recvd = true;
+                    let entries = addrbook
+                        .sample()
+                        .iter()
+                        .map(|a| addr_v2_of(a, now))
+                        .collect();
+                    let _ = peer.session.send(&Message::AddrV2(entries));
+                }
             }
             SessionEvent::Message(Message::Addr(entries)) => {
                 Self::process_addr(peer, addrbook, &entries, now, |e| Some((e.addr, e.time)));
@@ -2786,7 +2800,9 @@ mod tests {
 
     #[test]
     fn getaddr_serves_gossiped_peers() {
-        let (mut mgr, mut peer, _id) = managed_peer();
+        // Core answers `getaddr` only on inbound connections.
+        let mut mgr = PeerManager::new(8);
+        let (mut peer, _id) = add_inbound_peer(&mut mgr).expect("slot");
         let mut cs = regtest();
         handshake(&mut mgr, &mut peer, &mut cs);
         testpipe::drain(&mut peer, MAGIC);
@@ -2808,6 +2824,64 @@ mod tests {
             }
             _ => panic!("no addrv2 reply in {sent:?}"),
         }
+    }
+
+    /// An outbound peer's `getaddr` is ignored outright — Core's
+    /// asymmetric fingerprinting defense (`IsInboundConn()` gate).
+    #[test]
+    fn getaddr_from_outbound_peer_is_ignored() {
+        let (mut mgr, mut peer, _id) = managed_peer();
+        let mut cs = regtest();
+        handshake(&mut mgr, &mut peer, &mut cs);
+        // Settle the Established-time getheaders(es): a manager-level
+        // reply queued during one tick's dispatch only reaches the wire
+        // on the *next* tick's poll (its flush runs before it reads),
+        // so an extra tick+drain here keeps that noise out of `sent`
+        // below rather than changing what it can prove.
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer, MAGIC);
+
+        testpipe::inject(&mut peer, MAGIC, &Message::GetAddr);
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let sent = testpipe::drain(&mut peer, MAGIC);
+        assert!(
+            !sent
+                .iter()
+                .any(|m| matches!(m, Message::AddrV2(_) | Message::Addr(_))),
+            "an outbound peer must never receive an addr reply: {sent:?}"
+        );
+    }
+
+    /// A second `getaddr` on the same (inbound) connection is ignored —
+    /// Core's "only send one GetAddr response per connection" guard
+    /// against reply spam and addr-stamping later INV announcements.
+    #[test]
+    fn repeated_getaddr_is_answered_only_once() {
+        let mut mgr = PeerManager::new(8);
+        let (mut peer, _id) = add_inbound_peer(&mut mgr).expect("slot");
+        let mut cs = regtest();
+        handshake(&mut mgr, &mut peer, &mut cs);
+        mgr.tick(&mut cs, NOW); // settle the Established-time getheaders(es)
+        testpipe::drain(&mut peer, MAGIC);
+
+        testpipe::inject(&mut peer, MAGIC, &Message::GetAddr);
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let first = testpipe::drain(&mut peer, MAGIC);
+        assert!(
+            first.iter().any(|m| matches!(m, Message::AddrV2(_))),
+            "the first getaddr must be answered: {first:?}"
+        );
+
+        testpipe::inject(&mut peer, MAGIC, &Message::GetAddr);
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let second = testpipe::drain(&mut peer, MAGIC);
+        assert!(
+            !second.iter().any(|m| matches!(m, Message::AddrV2(_))),
+            "a repeated getaddr on the same connection must be ignored: {second:?}"
+        );
     }
 
     /// Dead endpoints must never block the tick: dials run on worker
