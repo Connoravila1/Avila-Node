@@ -582,7 +582,11 @@ fn coin<const SER: bool, const STRICT: bool>(
                 // read as "need more bytes" for megabytes.
                 return Err(PErr::Bad("script above MAX_SCRIPT_SIZE"));
             }
-            let raw = take(b, p, usize::try_from(len).map_err(|_| PErr::Bad("script size"))?)?;
+            let raw = take(
+                b,
+                p,
+                usize::try_from(len).map_err(|_| PErr::Bad("script size"))?,
+            )?;
             if SER {
                 if len > MAX_SCRIPT_SIZE {
                     // Core: "Overly long script, replace with a short
@@ -765,7 +769,9 @@ fn resync(
             }
             match group_shaped::<false, true>(&win[p..lim], base_height, &mut scratch, same_code) {
                 Ok(g) => {
-                    if prev.is_some_and(|t| g.txid <= t) || bounds.is_some_and(|(_, hi)| g.txid >= *hi) {
+                    if prev.is_some_and(|t| g.txid <= t)
+                        || bounds.is_some_and(|(_, hi)| g.txid >= *hi)
+                    {
                         continue 'cand;
                     }
                     prev = Some(g.txid);
@@ -826,7 +832,13 @@ fn tight(chain: &[Head]) -> Tight {
     let tail = &chain[1..];
     let pre = tail
         .windows(2)
-        .map(|w| w[0].txid.iter().zip(&w[1].txid).take_while(|(a, b)| a == b).count())
+        .map(|w| {
+            w[0].txid
+                .iter()
+                .zip(&w[1].txid)
+                .take_while(|(a, b)| a == b)
+                .count()
+        })
         .min()
         .unwrap_or(0)
         .min(16);
@@ -869,13 +881,26 @@ fn read_window(f: &File, off: u64, len: usize) -> io::Result<(Vec<u8>, usize)> {
 
 /// A group boundary at or after `at`, found by [`resync`] in a window
 /// that grows until the earliest candidate is decided.
-fn boundary_near(f: &File, file_len: u64, at: u64, base_height: u32, same_code: bool) -> io::Result<u64> {
+fn boundary_near(
+    f: &File,
+    file_len: u64,
+    at: u64,
+    base_height: u32,
+    same_code: bool,
+) -> io::Result<u64> {
     let mut len = PROBE;
     loop {
         let (buf, s) = read_window(f, at, len)?;
         let win = &buf[s..];
         let eof = at + win.len() as u64 >= file_len;
-        match resync(win, 0, base_height, eof.then_some(win.len()), None, same_code) {
+        match resync(
+            win,
+            0,
+            base_height,
+            eof.then_some(win.len()),
+            None,
+            same_code,
+        ) {
             Sync::At { at: k, .. } => return Ok(at + k as u64),
             Sync::More if len < MAX_GROUP => len *= 4,
             _ => return Err(invalid("no group boundary found")),
@@ -976,7 +1001,14 @@ pub struct ScanOut {
     pub bytes_read: u64,
 }
 
-fn check_end(hdr: &Header, file_len: u64, end: u64, coins: u64, last_n: u64, groups: u64) -> io::Result<()> {
+fn check_end(
+    hdr: &Header,
+    file_len: u64,
+    end: u64,
+    coins: u64,
+    last_n: u64,
+    groups: u64,
+) -> io::Result<()> {
     if end != file_len {
         return Err(invalid("snapshot does not end at a group boundary"));
     }
@@ -1028,7 +1060,10 @@ pub fn scan(
             .map(|&x| sc.spawn(move || boundary_near(f, file_len, x, base_height, same_code)))
             .collect();
         hs.into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Err(invalid("resync worker panicked"))))
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(invalid("resync worker panicked")))
+            })
             .collect()
     });
     let mut starts = vec![HEADER_LEN];
@@ -1047,10 +1082,15 @@ pub fn scan(
         let hs: Vec<_> = starts
             .iter()
             .zip(&stops)
-            .map(|(&a, &b)| sc.spawn(move || scan_region(path, direct, file_len, a, b, base_height, bucket)))
+            .map(|(&a, &b)| {
+                sc.spawn(move || scan_region(path, direct, file_len, a, b, base_height, bucket))
+            })
             .collect();
         hs.into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Err(invalid("scan worker panicked"))))
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(invalid("scan worker panicked")))
+            })
             .collect()
     });
     let mut out = ScanOut {
@@ -1069,7 +1109,15 @@ pub fn scan(
             Ok(r) if r.first == end => r,
             _ => {
                 out.fallbacks += 1;
-                scan_region(path, direct, file_len, end, stops[i].max(end), base_height, bucket)?
+                scan_region(
+                    path,
+                    direct,
+                    file_len,
+                    end,
+                    stops[i].max(end),
+                    base_height,
+                    bucket,
+                )?
             }
         };
         if let (Some(a), Some(b)) = (last_txid, r.first_txid)
@@ -1385,7 +1433,12 @@ fn verify_interval(
     base_height: u32,
     bucket: u64,
 ) -> io::Result<Interval> {
-    let mut s = Stream::new(open_snapshot(path, direct)?, file_len, a.off, align_up(b.off));
+    let mut s = Stream::new(
+        open_snapshot(path, direct)?,
+        file_len,
+        a.off,
+        align_up(b.off),
+    );
     let mut sha = a.state;
     let mut ser = Vec::with_capacity(SER_CHUNK + (64 << 10));
     let mut coins = 0u64;
@@ -1499,7 +1552,15 @@ pub fn verify_hinted(
                         if j >= n {
                             return mine;
                         }
-                        let r = verify_interval(path, direct, file_len, &hs_[j], &hs_[j + 1], base_height, bucket);
+                        let r = verify_interval(
+                            path,
+                            direct,
+                            file_len,
+                            &hs_[j],
+                            &hs_[j + 1],
+                            base_height,
+                            bucket,
+                        );
                         let failed = r.is_err();
                         mine.push((j, r));
                         if failed {
@@ -1686,10 +1747,21 @@ impl ZeroScan {
                             while let Ok((buf, s)) = this.read_window(at, len) {
                                 let win = &buf[s..];
                                 let eof = at + win.len() as u64 >= this.file_len;
-                                match resync(win, 0, this.base_height, eof.then_some(win.len()), None, this.same_code) {
+                                match resync(
+                                    win,
+                                    0,
+                                    this.base_height,
+                                    eof.then_some(win.len()),
+                                    None,
+                                    this.same_code,
+                                ) {
                                     Sync::At { at: p, .. } => {
                                         if p < win.len()
-                                            && let Ok(g) = group::<false>(&win[p..], this.base_height, &mut Vec::new())
+                                            && let Ok(g) = group::<false>(
+                                                &win[p..],
+                                                this.base_height,
+                                                &mut Vec::new(),
+                                            )
                                         {
                                             v.push((g.txid, at + p as u64));
                                         }
@@ -1703,7 +1775,9 @@ impl ZeroScan {
                     })
                 })
                 .collect();
-            ws.into_iter().flat_map(|w| w.join().unwrap_or_default()).collect()
+            ws.into_iter()
+                .flat_map(|w| w.join().unwrap_or_default())
+                .collect()
         });
         found.sort_by_key(|&(_, o)| o);
         found.dedup_by_key(|&mut (_, o)| o);
@@ -1813,7 +1887,14 @@ impl ZeroScan {
                 } else {
                     (from + win.len() as u64 >= self.file_len).then_some(win.len())
                 };
-                resync(win, 0, self.base_height, end, Some((&lo.txid, &hi.txid)), self.same_code)
+                resync(
+                    win,
+                    0,
+                    self.base_height,
+                    end,
+                    Some((&lo.txid, &hi.txid)),
+                    self.same_code,
+                )
             };
             if start == Sync::More && len < MAX_GROUP {
                 len *= 4;
@@ -2044,8 +2125,16 @@ mod tests {
                         // One transaction's outputs share a height; the
                         // counter fixture mimics `snapshot_bench gen`,
                         // which draws one per coin.
-                        height: if counter_txids { r.below(935_001) as u32 } else { group_height },
-                        coinbase: if counter_txids { r.below(10) == 0 } else { group_cb },
+                        height: if counter_txids {
+                            r.below(935_001) as u32
+                        } else {
+                            group_height
+                        },
+                        coinbase: if counter_txids {
+                            r.below(10) == 0
+                        } else {
+                            group_cb
+                        },
                     },
                 ));
                 vout += 1 + r.below(2) as u32;
@@ -2063,7 +2152,11 @@ mod tests {
         (file, coins)
     }
 
-    pub(super) fn fixture_pub(groups: usize, seed: u64, counter: bool) -> (Vec<u8>, Vec<(OutPoint, Coin)>) {
+    pub(super) fn fixture_pub(
+        groups: usize,
+        seed: u64,
+        counter: bool,
+    ) -> (Vec<u8>, Vec<(OutPoint, Coin)>) {
         fixture(groups, seed, counter)
     }
 
@@ -2155,7 +2248,12 @@ mod tests {
         // A dropped hint still verifies — hints are only split points.
         let mut fewer = hints.clone();
         fewer.hints.remove(3);
-        assert_eq!(verify_hinted(&t.0, false, 4, 935_000, &fewer, 1024).unwrap().hash, v.hash);
+        assert_eq!(
+            verify_hinted(&t.0, false, 4, 935_000, &fewer, 1024)
+                .unwrap()
+                .hash,
+            v.hash
+        );
         // A forged first hint is refused outright.
         let mut bad = hints.clone();
         bad.hints[0].state.total = 1;
@@ -2264,7 +2362,11 @@ mod resync_probe {
                 let win = &file[from..from + 32_768];
                 if let Sync::At { at, .. } = resync(win, 0, 935_000, None, None, !counter) {
                     found += 1;
-                    assert!(bounds.contains(&(from + at)), "seed {seed}: {} is not a boundary", from + at);
+                    assert!(
+                        bounds.contains(&(from + at)),
+                        "seed {seed}: {} is not a boundary",
+                        from + at
+                    );
                 }
             }
             assert!(found > 100, "seed {seed}: resync found only {found}");

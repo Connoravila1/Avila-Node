@@ -34,8 +34,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "verify" => {
-            let (o, hints) =
-                snapverify::verify_stream(Path::new(arg(1)?), true, arg(2)?.parse()?, 64 << 20, BUCKET)?;
+            let (o, hints) = snapverify::verify_stream(
+                Path::new(arg(1)?),
+                true,
+                arg(2)?.parse()?,
+                64 << 20,
+                BUCKET,
+            )?;
             let secs = t.elapsed().as_secs_f64();
             std::fs::write(arg(3)?, hints.encode())?;
             println!(
