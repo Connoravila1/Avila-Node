@@ -1534,7 +1534,12 @@ impl Chainstate {
             for (op, coin) in state.utxo {
                 batch.insert(op, Some(coin));
                 if batch.len() >= 100_000 {
-                    be.commit(&batch, &[], state.height)?;
+                    // Intermediate chunk: leave the meta tip alone, like
+                    // `activate_snapshot`'s bounded-batch import — only
+                    // the final chunk below should stamp `state.height`,
+                    // so a crash mid-migration never reports a tip whose
+                    // coins aren't all committed yet.
+                    be.commit_partial(&batch)?;
                     batch.clear();
                 }
             }
@@ -4787,6 +4792,105 @@ mod tests {
         let mut expected = utxo6;
         expected.sort_by_key(|(o, _)| (o.txid, o.vout));
         assert_eq!(resumed, expected);
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `restore`'s v3-inline-to-coinsdb migration commits `state.utxo`
+    /// in 100,000-entry chunks. If an intermediate chunk stamped the
+    /// backend's meta tip at `state.height` (the old bug), an
+    /// interruption between that commit and the final one would leave
+    /// coinsdb believing `state.height` is fully migrated while most
+    /// of its coins are still missing. The fix uses `commit_partial`
+    /// (tip untouched) for every chunk but the last.
+    ///
+    /// Simulates the interruption without a real crash: `state.undos`
+    /// carries one entry that indexes past `self.chain`'s end, so the
+    /// undo-vec construction panics right after the coin loop
+    /// finishes (one 100,000-entry intermediate chunk committed, 1
+    /// leftover entry never reaching the final chunk) but before the
+    /// final, tip-stamping commit would run.
+    #[test]
+    fn coinsdb_migration_intermediate_chunks_do_not_stamp_the_tip() {
+        let params = params();
+        let dir = store_dir("coinsdb-migrate-crash");
+        let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        // A real height-1 block, its body stored, but small enough that
+        // the write-back cache never flushes it to the backend — the
+        // backend starts this test genuinely unmigrated at height 0,
+        // distinct from the height-1 target the malformed state below
+        // asks `restore` to migrate to.
+        let a1 = block_on(&genesis_header(), vec![coinbase_tx(1, subsidy(1))], &params);
+        cs.accept_block(&a1, NOW).unwrap();
+        let old_tip_height = cs.coins_backend.as_ref().unwrap().tip_height();
+        assert_eq!(old_tip_height, 0, "fresh backend starts unmigrated");
+
+        // 100,001 synthetic coins: one more than the chunk size, so the
+        // loop commits exactly one full intermediate chunk via
+        // `commit_partial` before the final chunk (1 entry) would run.
+        let utxo: Vec<(OutPoint, Coin)> = (0..100_001u32)
+            .map(|i| {
+                let mut txid_bytes = [0u8; 32];
+                txid_bytes[..4].copy_from_slice(&i.to_le_bytes());
+                (
+                    OutPoint {
+                        txid: crate::hash::Txid::from_bytes(txid_bytes),
+                        vout: 0,
+                    },
+                    Coin {
+                        out: TxOut {
+                            value: 1,
+                            script_pubkey: Script::new(vec![script::OP_1]),
+                        },
+                        height: 1,
+                        coinbase: false,
+                    },
+                )
+            })
+            .collect();
+
+        let genesis_hash = genesis_header().hash();
+        let a1_hash = a1.block_hash();
+        let state = StateData {
+            tip: a1_hash,
+            height: 1,
+            headers: vec![genesis_header(), a1.header],
+            best_header: a1_hash,
+            chain: vec![genesis_hash, a1_hash],
+            // `self.chain` only has room for `chain[0..=1]` — this
+            // extra bogus entry makes `self.chain[i + 1]` (i = 1)
+            // index past the end.
+            undos: vec![BlockUndo::default(), BlockUndo::default()],
+            utxo,
+            failed: Vec::new(),
+            tx_meta: Vec::new(),
+            snapshot_base: 0,
+            externalized: false,
+            snapshot_verified: true,
+        };
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cs.restore(state, NOW)));
+        assert!(
+            result.is_err(),
+            "the malformed undo vec should have panicked (index out of bounds)"
+        );
+
+        // Interrupted between the intermediate chunk and the final
+        // commit: the backend's tip must not have advanced to the
+        // height-1 target — that would claim completeness of a coin
+        // set still 1 entry short.
+        let be = cs.coins_backend.clone().unwrap();
+        assert_eq!(
+            be.tip_height(),
+            old_tip_height,
+            "an interrupted migration must not stamp the tip early"
+        );
+        assert_eq!(
+            be.coins_len(),
+            100_000,
+            "the one committed intermediate chunk should still be present"
+        );
         drop(cs);
         std::fs::remove_dir_all(&dir).unwrap();
     }
