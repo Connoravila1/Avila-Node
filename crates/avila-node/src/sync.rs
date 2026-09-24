@@ -551,6 +551,17 @@ pub fn run(
                     "self-audit: {bad} of 8 sampled blocks FAILED integrity checks                      ({audit_failures} cumulative) — storage may be corrupt"
                 );
             }
+            // UTXO-replay audit (queue #15): a ~2-week window ending
+            // at the tip — every created coin is live-or-provably-
+            // spent and every undo-claimed dead coin is dead. The
+            // same rot class as the block audit, one layer deeper.
+            let from = connected.saturating_sub(2015).max(1);
+            if let Err(e) = cs.audit_utxo_segment(from, connected) {
+                audit_failures += 1;
+                eprintln!(
+                    "self-audit: UTXO segment {from}..{connected} FAILED ({e:?}) —                      coins state may be corrupt ({audit_failures} cumulative)"
+                );
+            }
         }
         // SwiftSync checkpoint: the transient window ends when the
         // chain is fully connected — release the hold so normal

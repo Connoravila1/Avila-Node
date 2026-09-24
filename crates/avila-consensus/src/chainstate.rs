@@ -179,6 +179,15 @@ pub enum AuditFailure {
     WitnessMismatch,
     /// Stored header isn't in the tree.
     NoNode,
+    /// An undo record claims a coin was spent, yet it's live — the
+    /// spend never landed or the set drifted (queue #15).
+    SpentCoinLive,
+    /// A live coin's value/script disagrees with the block output
+    /// that created it (queue #15).
+    CoinMismatch,
+    /// A created coin is neither live nor provably spent by a later
+    /// block's undo — a reorg could not restore it (queue #15).
+    UndoMissing,
 }
 
 /// re-downloading *or* re-validating.
@@ -1848,6 +1857,93 @@ impl Chainstate {
                 .ok_or(AuditFailure::WitnessMismatch)?;
             if block.expected_witness_commitment() != Some(committed) {
                 return Err(AuditFailure::WitnessMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    /// UTXO-replay audit (queue #15) over the connected segment
+    /// `from..=to` (`to` clamped to the tip): the reorg-safety
+    /// invariant checked against the live set — every coin an undo
+    /// record claims was spent is actually dead, every live coin the
+    /// segment created matches the block's output data, and when the
+    /// segment reaches the tip, every non-live created coin is
+    /// provably spent (present in some undo). A failed check is
+    /// storage rot a reorg would turn into state corruption — the
+    /// block-integrity audit can't see it.
+    ///
+    /// Segments ending below the tip can't prove the created-nonlive
+    /// half (a later block may legitimately spend the coin) — that
+    /// half only asserts when `to == tip`.
+    pub fn audit_utxo_segment(&self, from: u32, to: u32) -> Result<(), AuditFailure> {
+        let tip = self.chain.len() as u32 - 1;
+        if from == 0 || from > to {
+            return Err(AuditFailure::NoNode);
+        }
+        let to = to.min(tip);
+        // Outpoints provably spent inside the segment — undo `spent`
+        // entries pair with the block's inputs by position.
+        let mut spent: HashSet<crate::transaction::OutPoint> = HashSet::new();
+        for h in from..=to {
+            let hash = &self.chain[h as usize];
+            let Some(block) = self.body(hash) else {
+                continue;
+            };
+            let Some(undo) = self.undo(h) else {
+                continue;
+            };
+            for (tx, tu) in block.transactions.iter().zip(&undo.txs) {
+                for (input, coin) in tx.inputs.iter().zip(&tu.spent) {
+                    let _ = coin;
+                    spent.insert(input.previous_output);
+                    // Spend-consistency: nothing an undo claims dead
+                    // may be live on the active chain.
+                    if self.utxo.get(&input.previous_output).is_some() {
+                        return Err(AuditFailure::SpentCoinLive);
+                    }
+                }
+                for (op, _) in &tu.overwritten {
+                    spent.insert(*op);
+                }
+            }
+        }
+        // Created-coin integrity: live coins must match the block's
+        // output; non-live ones must be provably spent — but only
+        // when the segment reaches the tip (later spends are
+        // otherwise unverifiable from this window).
+        for h in from..=to {
+            let hash = &self.chain[h as usize];
+            let Some(block) = self.body(hash) else {
+                continue;
+            };
+            for tx in &block.transactions {
+                let txid = tx.txid();
+                for (vout, out) in tx.outputs.iter().enumerate() {
+                    let op = crate::transaction::OutPoint {
+                        txid,
+                        vout: vout as u32,
+                    };
+                    match self.utxo.get(&op) {
+                        Some(coin) => {
+                            if coin.out.value != out.value
+                                || coin.out.script_pubkey.as_bytes() != out.script_pubkey.as_bytes()
+                            {
+                                return Err(AuditFailure::CoinMismatch);
+                            }
+                        }
+                        None => {
+                            // Provably-unspendable outputs never enter
+                            // the set (they're spendable in the block
+                            // but skipped at `put`) — not a spend.
+                            if !out.script_pubkey.is_unspendable()
+                                && !spent.contains(&op)
+                                && to == tip
+                            {
+                                return Err(AuditFailure::UndoMissing);
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -5943,6 +6039,34 @@ mod tests {
         assert_eq!(
             cs.verify_hints(&bad),
             crate::swiftsync::HintsVerdict::SurvivorMismatch
+        );
+    }
+
+    /// UTXO-replay audit (queue #15): a healthy chain audits clean;
+    /// erasing a live coin (simulated storage rot) is caught as an
+    /// undo violation.
+    #[test]
+    fn audit_utxo_segment_catches_drift() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        for b in spend_chain(120, &params) {
+            cs.accept_block(&b, NOW).unwrap();
+        }
+        // Full range + a mid-segment window both audit clean —
+        // mid-segment skips only the created-nonlive half (later
+        // spends are legitimately unknown to it).
+        assert_eq!(cs.audit_utxo_segment(1, 120), Ok(()));
+        assert_eq!(cs.audit_utxo_segment(50, 100), Ok(()));
+        assert_eq!(cs.audit_utxo_segment(0, 10), Err(AuditFailure::NoNode));
+
+        // Rot: remove a still-live coin — nothing in any undo covers
+        // its disappearance, so the audit must flag it.
+        let live_op = cs.utxo().iter().first().expect("live coin").0;
+        cs.utxo_mut().spend_coin(&live_op).expect("was live");
+        assert_eq!(
+            cs.audit_utxo_segment(1, 120),
+            Err(AuditFailure::UndoMissing),
+            "a vanished live coin is storage rot the audit must catch"
         );
     }
 }
