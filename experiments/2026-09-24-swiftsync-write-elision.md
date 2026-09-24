@@ -126,3 +126,50 @@ the aggregate is exact, fraud is detectable, and the write win is
 2/3 of coin ops. The remaining build is the sync-path integration
 (hints producer RPC + consumer mode that keeps coins transient until
 checkpoint).
+
+---
+
+## Pass 3 — protocol machinery shipped (09-24)
+
+The aggregate + hints machinery is now in the consensus crate, not
+just the bench:
+
+- **`src/swiftsync.rs`**: `TagAgg` (256-bit wrapping-sum multiset
+  hash), `coin_tag` (outpoint||coin commitment), `Hints` wire format
+  (`AHS1 || height || aggregate || count || sorted outpoints`),
+  `HintsVerdict`.
+- **`UtxoSet` integration** (`connect.rs`): `enable_swiftsync` starts
+  tracking `agg == Σ coin_tag(live)`; the invariant is maintained
+  inside the three real mutation paths — `put` (tagged set-delta),
+  `spend` (tombstone path), `remove_entry` (single sub of the visible
+  coin, untagged tombstone to avoid double-subtracting a shadowed
+  lower coin). `unoverlay(commit)` replays through `put` so reorg
+  simulation adoptions note their tags; flushes don't touch the
+  aggregate (they move the set, not its contents).
+- **`swift_hold`** keeps `over_budget` false for the window —
+  transient IBD is the actual optimization — released by
+  `release_swiftsync_hold` at the checkpoint; tracking continues
+  after (flushes preserve the invariant).
+- **`emit_hints`/`verify_hints`**: producer artifact + consumer
+  verdict (`Verified`/`AggregateMismatch`/`SurvivorMismatch`). Wrong
+  hints can only waste the optimization — the node writes its own
+  live set either way.
+- **`Chainstate`**: `enable_swiftsync`/`release_swiftsync_hold`/
+  `swiftsync_agg`/`emit_hints`/`verify_hints` passthroughs +
+  `AVILA_SWIFTSYNC=1` opt-in inside `enable_coinsdb`.
+
+Tests: `agg == Σ tags(live)` asserted after every mutation class
+(create, spend, recreate-over-tombstone, live overwrite, lower-layer
+spend, shadow put, `remove_entry`, overlay-commit, overlay-discard);
+hints emit→encode→decode→verify round-trip; dropped survivor →
+`SurvivorMismatch`; fabricated aggregate → `AggregateMismatch`;
+malformed files reject without panic; the hold suppresses a real
+backend's flush pressure and a real flush leaves the aggregate
+untouched.
+
+Still open: the consumer-side sync integration (checkpoint verify +
+release inside the IBD loop), the hints-file RPC surface
+(`gettxouthints`-style), and the never-keep-full-coins variant that
+would shrink the transient map (the 682MiB-at-signet cost — for
+mainnet IBD this design needs a spool or a smaller per-coin
+footprint).

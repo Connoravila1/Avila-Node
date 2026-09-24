@@ -2035,8 +2035,47 @@ impl Chainstate {
         let backend = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open(dir)?);
         self.utxo.attach_shared(backend.clone());
         self.utxo.set_budget(cache_bytes);
+        // `AVILA_SWIFTSYNC=1` — transient-IBD mode: tag aggregate
+        // tracks every mutation and the window never flushes (the
+        // measured 67% write elision; RAM cost ~682MiB at signet
+        // scale — see `crate::swiftsync`).
+        if std::env::var("AVILA_SWIFTSYNC").as_deref() == Ok("1") {
+            self.utxo.enable_swiftsync();
+        }
         self.coins_backend = Some(backend);
         Ok(())
+    }
+
+    /// Turns on SwiftSync tracking on the coins view — see
+    /// [`UtxoSet::enable_swiftsync`].
+    pub fn enable_swiftsync(&mut self) {
+        self.utxo.enable_swiftsync();
+    }
+
+    /// Ends the transient window — normal flushing resumes; the
+    /// aggregate keeps tracking.
+    pub fn release_swiftsync_hold(&mut self) {
+        self.utxo.release_swiftsync_hold();
+    }
+
+    /// The running coin-tag aggregate, `None` when tracking is off.
+    #[must_use]
+    pub fn swiftsync_agg(&self) -> Option<crate::swiftsync::TagAgg> {
+        self.utxo.swiftsync_agg()
+    }
+
+    /// Emits the producer-side hints artifact for the set at
+    /// `height` — see [`UtxoSet::emit_hints`].
+    #[must_use]
+    pub fn emit_hints(&self, height: u32) -> crate::swiftsync::Hints {
+        self.utxo.emit_hints(height)
+    }
+
+    /// Verifies a peer's hints file against the live set — see
+    /// [`UtxoSet::verify_hints`].
+    #[must_use]
+    pub fn verify_hints(&self, hints: &crate::swiftsync::Hints) -> crate::swiftsync::HintsVerdict {
+        self.utxo.verify_hints(hints)
     }
 
     /// Commits the dirty coins cache plus the in-memory undo tail to
