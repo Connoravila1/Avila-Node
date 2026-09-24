@@ -20,6 +20,8 @@ avila-consensus.workspace = true
 avila-core.workspace = true
 avila-node.workspace = true
 clap.workspace = true
+libc = "0.2"
+seccompiler = "0.4.0"
 serde_json.workspace = true
 signal-hook.workspace = true
 

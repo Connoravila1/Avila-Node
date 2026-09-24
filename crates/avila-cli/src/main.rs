@@ -988,6 +988,14 @@ fn signer_loop() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Sandbox the loop (queue #11): everything the signer needs past
+    // this point is read/write on the pipes + allocator syscalls —
+    // no open, no sockets, no execve. An unlisted syscall kills the
+    // child; the parent sees a closed pipe.
+    if let Err(e) = install_signer_seccomp() {
+        reply(serde_json::json!({"error": format!("seccomp: {e}")}));
+        return ExitCode::FAILURE;
+    }
     reply(serde_json::json!({"ok": true}));
 
     let mut buf = String::new();
@@ -1044,6 +1052,58 @@ fn signer_loop() -> ExitCode {
         reply(serde_json::json!({"error": "unknown request"}));
     }
     ExitCode::SUCCESS
+}
+
+/// seccomp whitelist for the signer loop — installed AFTER the vault
+/// is read and the provider built, so file access is never reachable
+/// at signing time. Read/write on the pipes, allocator, sync, exit —
+/// nothing else. x86_64 Linux; other arches get no filter (logged).
+fn install_signer_seccomp() -> Result<(), String> {
+    use seccompiler::{SeccompAction, SeccompFilter, SeccompRule, TargetArch, apply_filter};
+    use std::collections::BTreeMap;
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        return Err("seccomp whitelist is x86_64-only".into());
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let allowed: &[i64] = &[
+            libc::SYS_read,
+            libc::SYS_write,
+            libc::SYS_close,
+            libc::SYS_futex,
+            libc::SYS_sched_yield,
+            libc::SYS_mmap,
+            libc::SYS_mprotect,
+            libc::SYS_munmap,
+            libc::SYS_madvise,
+            libc::SYS_brk,
+            libc::SYS_rt_sigaction,
+            libc::SYS_rt_sigprocmask,
+            libc::SYS_rt_sigreturn,
+            libc::SYS_sigaltstack,
+            libc::SYS_exit,
+            libc::SYS_exit_group,
+            libc::SYS_getrandom,
+            libc::SYS_clock_gettime,
+            libc::SYS_getpid,
+        ];
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        for &nr in allowed {
+            rules.insert(nr, Vec::new());
+        }
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+            TargetArch::x86_64,
+        )
+        .map_err(|e| e.to_string())?;
+        let bpf: seccompiler::BpfProgram = filter
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| e.to_string())?;
+        apply_filter(&bpf).map_err(|e| e.to_string())
+    }
 }
 
 /// Minimal base64 for the signer pipe — the rpc module's helpers are

@@ -321,7 +321,9 @@ fn signer_subprocess_signs_and_locks() {
 
     // The prevout script for index 0 — expand the desc with the
     // private provider (the child's provider is rebuilt the same way).
-    let provider = avila_node::watch::signer_provider_from_descs(std::slice::from_ref(&desc), &params).unwrap();
+    let provider =
+        avila_node::watch::signer_provider_from_descs(std::slice::from_ref(&desc), &params)
+            .unwrap();
     let (parsed, _, _) =
         avila_consensus::descriptor::parse_descriptors(&desc, &params, true).unwrap();
     let scripts = parsed[0].expand(0, &provider).unwrap();
