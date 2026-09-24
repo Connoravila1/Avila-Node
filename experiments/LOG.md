@@ -191,7 +191,7 @@ first measurement that would kill or confirm it.
     boundaries, prove no hostile peer exceeds allocation under any
     input sequence.
 
-15. ~~**Continuous self-audit.**~~ **done — #54 (stored-block integrity; UTXO-replay auditing open).** Background re-verification of random
+15. ~~**Continuous self-audit.**~~ **done — #54 + #66 (UTXO-replay layer now covered).** Background re-verification of random
     historical segments, forever — correctness as an ongoing property,
     catching disk rot and bitflips. Each pass appends receipt evidence.
 
