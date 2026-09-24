@@ -77,6 +77,9 @@ fn main() -> Result<(), String> {
                 NetEvent::ReconDivergence {
                     peer, their_misses, ..
                 } => println!("peer {peer}: {their_misses} recon their-misses — filtered view?"),
+                NetEvent::CpuThrottled { peer, rate_ns } => {
+                    println!("peer {peer}: cpu-throttled at {rate_ns}ns/s")
+                }
                 NetEvent::Announced { .. } | NetEvent::TipAdvanced(_) => {}
             }
         }

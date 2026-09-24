@@ -6930,6 +6930,11 @@ pub(crate) fn dispatch(
                             "recon_rounds": p.recon_rounds,
                             "recon_misses": p.recon_misses,
                             "recon_their_misses": p.recon_their_misses,
+                            // Per-peer dispatch CPU (PEER_BUDGETS):
+                            // cumulative ms and the decayed per-second
+                            // rate — the throttle input.
+                            "cpu_ms": p.cpu_ms,
+                            "cpu_rate_ms": p.cpu_rate_ms,
                             // Core: hex of the BIP324 session id on v2,
                             // "" on v1.
                             "session_id": p
@@ -7205,6 +7210,11 @@ pub(crate) fn dispatch(
                             "rounds": rounds,
                             "their_misses": their_misses,
                             "our_misses": our_misses,
+                        }),
+                        avila_p2p::manager::NetEvent::CpuThrottled { peer, rate_ns } => json!({
+                            "event": "cpu_throttled",
+                            "peer": peer,
+                            "rate_ns": rate_ns,
                         }),
                     })
                     .collect();

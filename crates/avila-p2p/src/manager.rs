@@ -154,6 +154,15 @@ pub enum NetEvent {
     TipAdvanced(u32),
     /// Eclipse indicators fired — advisory, not proof (queue #12).
     EclipseSuspected(Vec<EclipseSignal>),
+    /// A peer dominated dispatch CPU (>50% share, >200ms/s sustained)
+    /// and lost this tick's poll — backpressure throttling, not a
+    /// disconnect (queue #14).
+    CpuThrottled {
+        /// The manager-assigned peer id.
+        peer: u64,
+        /// Its decayed dispatch rate this window, ns/s.
+        rate_ns: u64,
+    },
     /// A peer announced blocks we don't have (headers may need fetching).
     Announced {
         /// The peer id.
@@ -235,6 +244,19 @@ struct PeerEntry<S> {
     cfilter_token_bucket: f64,
     /// Refill checkpoint for `cfilter_token_bucket`.
     cfilter_token_timestamp: Instant,
+    /// Cumulative nanoseconds spent inside `dispatch` on this peer's
+    /// events — the per-peer CPU accounting PEER_BUDGETS tracks.
+    cpu_ns: u64,
+    /// Dispatch nanos accrued in the current accounting window —
+    /// folded into `cpu_ewma_ns` once a second.
+    cpu_window_ns: u64,
+    /// Window start for `cpu_window_ns`.
+    cpu_window_start: Instant,
+    /// Exponentially-decayed per-second dispatch cost — the throttle
+    /// input: a peer saturating the poll loop's CPU budget loses its
+    /// next poll (socket backpressure slows it; no disconnect —
+    /// a sync leader legitimately dominates during IBD).
+    cpu_rate_ns: u64,
     /// `Peer::m_getaddr_recvd` — whether this peer has already been
     /// answered once; a later `getaddr` on the same connection is
     /// silently ignored.
@@ -377,6 +399,10 @@ pub struct PeerSnapshot {
     pub v2_session_id: Option<[u8; 32]>,
     /// BIP330 reconciliation negotiated on this link.
     pub recon: bool,
+    /// Cumulative ms spent dispatching this peer's messages.
+    pub cpu_ms: u64,
+    /// Decayed per-second dispatch cost, ms — the throttle input.
+    pub cpu_rate_ms: u64,
     /// Completed recon rounds on this link and the cumulative miss
     /// count — a persistently-wide diff is a censorship/eclipse signal.
     pub recon_rounds: u64,
@@ -706,6 +732,8 @@ impl<S: Read + Write> PeerManager<S> {
                     transport_protocol: peer.session.transport_protocol(),
                     v2_session_id: peer.session.v2_session_id(),
                     recon: peer.recon.is_some(),
+                    cpu_ms: peer.cpu_ns / 1_000_000,
+                    cpu_rate_ms: peer.cpu_rate_ns / 1_000_000,
                     recon_rounds: peer.recon_rounds,
                     recon_misses: peer.recon_misses,
                     recon_their_misses: peer.recon_their_misses,
@@ -870,6 +898,10 @@ impl<S: Read + Write> PeerManager<S> {
                 addr_token_bucket: 1.0,
                 cfilter_token_bucket: CFILTER_TOKEN_BUCKET,
                 cfilter_token_timestamp: Instant::now(),
+                cpu_ns: 0,
+                cpu_window_ns: 0,
+                cpu_window_start: Instant::now(),
+                cpu_rate_ns: 0,
                 addr_token_timestamp: now,
                 getaddr_recvd: false,
                 recon: None,
@@ -910,6 +942,7 @@ impl<S: Read + Write> PeerManager<S> {
         // leadership to — never abandon our only source of headers just
         // because it's slow.
         let established_count = peers.values().filter(|p| p.session.established()).count();
+        let total_cpu_rate: u64 = peers.values().map(|p| p.cpu_rate_ns).sum();
         let mut announce_tip: Option<u64> = None;
         // txid/wtxid to relay at end of tick, and the peer it came from.
         let mut announce_tx: Option<(
@@ -918,6 +951,18 @@ impl<S: Read + Write> PeerManager<S> {
             avila_consensus::hash::Wtxid,
         )> = None;
         for (&id, peer) in peers.iter_mut() {
+            // CPU throttle (PEER_BUDGETS): a peer burning >50% of
+            // total dispatch CPU at >200ms/s loses this tick's poll —
+            // socket backpressure slows it while others proceed. No
+            // disconnect: the sync leader legitimately dominates
+            // during IBD.
+            if peer.cpu_rate_ns > 200_000_000 && peer.cpu_rate_ns * 2 > total_cpu_rate {
+                events.push(NetEvent::CpuThrottled {
+                    peer: id,
+                    rate_ns: peer.cpu_rate_ns,
+                });
+                continue;
+            }
             if let Err(e) = peer.session.check_handshake_timeout() {
                 dead.push((id, DisconnectReason::Session(e.to_string())));
                 continue;
@@ -926,6 +971,7 @@ impl<S: Read + Write> PeerManager<S> {
                 Ok(peer_events) => {
                     for event in peer_events {
                         peer.last_rx = Instant::now();
+                        let t0 = Instant::now();
                         Self::dispatch(
                             id,
                             peer,
@@ -944,9 +990,24 @@ impl<S: Read + Write> PeerManager<S> {
                             serve_filters,
                             outbound_nonces,
                         );
+                        // Per-peer CPU accounting (PEER_BUDGETS):
+                        // time inside dispatch lands on this peer's
+                        // cumulative + window counters.
+                        let spent = t0.elapsed().as_nanos() as u64;
+                        peer.cpu_ns += spent;
+                        peer.cpu_window_ns += spent;
                     }
                 }
                 Err(e) => dead.push((id, DisconnectReason::Session(e.to_string()))),
+            }
+            // Fold the window into the decayed per-second rate; a
+            // peer dominating dispatch CPU is skipped for a poll —
+            // socket backpressure throttles it, no disconnect (the
+            // sync leader legitimately dominates during IBD).
+            if peer.cpu_window_start.elapsed() >= Duration::from_secs(1) {
+                peer.cpu_rate_ns = peer.cpu_rate_ns / 2 + peer.cpu_window_ns;
+                peer.cpu_window_ns = 0;
+                peer.cpu_window_start = Instant::now();
             }
             // Periodic liveness ping.
             if peer.session.established() && peer.last_ping.elapsed() > PING_INTERVAL {
@@ -4605,5 +4666,49 @@ mod tests {
             PeerManager::<End>::recon_alarm_check(peer, id, &mut events);
         }
         assert_eq!(events.len(), 1, "edge-triggered — no refire");
+    }
+
+    /// PEER_BUDGETS CPU accounting (queue #14): a peer burning >50%
+    /// of total dispatch CPU at >200ms/s loses its poll — the
+    /// `CpuThrottled` event fires and its buffered input waits,
+    /// while a quiet peer is still served.
+    #[test]
+    fn cpu_throttle_skips_dominant_peer_only() {
+        let (mut mgr, mut a, ida) = managed_peer();
+        let mut cs = crate::testchain::regtest();
+        handshake(&mut mgr, &mut a, &mut cs);
+        testpipe::drain(&mut a, MAGIC);
+        let (mut b, _idb) = add_peer(&mut mgr);
+        handshake_peer(&mut mgr, &mut b, &mut cs);
+        testpipe::drain(&mut b, MAGIC);
+
+        // Peer A dominated last window: 500ms/s, >50% of the total.
+        mgr.peers.get_mut(&ida).unwrap().cpu_rate_ns = 500_000_000;
+
+        // A pings us — the throttled peer's poll is skipped, so the
+        // ping sits unread and no pong comes back.
+        testpipe::inject(&mut a, MAGIC, &Message::Ping(7));
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                NetEvent::CpuThrottled { peer, .. } if *peer == ida
+            )),
+            "dominant peer must fire CpuThrottled: {events:?}"
+        );
+        let sent_a = testpipe::drain(&mut a, MAGIC);
+        assert!(
+            !sent_a.iter().any(|m| matches!(m, Message::Pong(7))),
+            "throttled peer must not be served: {sent_a:?}"
+        );
+
+        // Peer B stayed quiet — its ping is answered normally.
+        testpipe::inject(&mut b, MAGIC, &Message::Ping(9));
+        mgr.tick(&mut cs, NOW);
+        let sent_b = testpipe::drain(&mut b, MAGIC);
+        assert!(
+            sent_b.iter().any(|m| matches!(m, Message::Pong(9))),
+            "quiet peer must still be served: {sent_b:?}"
+        );
     }
 }
