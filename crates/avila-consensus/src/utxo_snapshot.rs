@@ -85,7 +85,8 @@ pub(crate) fn compress_script(script: &Script) -> (u64, Vec<u8>) {
 
 /// `Coin`'s serialized form: `VARINT(height*2 + coinbase)` then the
 /// compressed `CTxOut` (compressed amount + compressed script).
-fn write_coin(out: &mut Vec<u8>, coin: &Coin) {
+#[doc(hidden)]
+pub fn write_coin(out: &mut Vec<u8>, coin: &Coin) {
     write_varint(out, u64::from(coin.height) * 2 + u64::from(coin.coinbase));
     debug_assert!(coin.out.value >= 0, "UTXO coins are never negative");
     write_varint(out, compress_amount(coin.out.value.max(0) as u64));

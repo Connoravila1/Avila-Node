@@ -335,6 +335,17 @@ pub struct CoinsBackend {
 }
 
 impl CoinsBackend {
+    /// Pre-size the hash engine for a known-future insert count —
+    /// skips the doubling-resize rewrite chain on bulk loads (the
+    /// snapshot path declares `coins_count` in its metadata). redb
+    /// manages its own tree growth; a no-op there.
+    pub fn reserve_coins(&self, additional: u64) -> std::io::Result<()> {
+        match &self.hash {
+            Some(h) => h.reserve(additional),
+            None => Ok(()),
+        }
+    }
+
     /// Opens (creating) the database at `dir/coinsdb.redb`. An
     /// existing database decodes under its stored format/engine
     /// (absent markers → Legacy + Redb); a fresh one defaults to

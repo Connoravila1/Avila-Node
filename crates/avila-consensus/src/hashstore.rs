@@ -684,6 +684,17 @@ impl HashStore {
         Ok(delta)
     }
 
+    /// Pre-size the index for a known-future count — one grow instead
+    /// of ~17 doubling rewrites when the caller knows the total (the
+    /// snapshot's `coins_count` metadata). No-op when capacity suffices.
+    pub fn reserve(&self, additional: u64) -> io::Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("hashstore lock poisoned"))?;
+        self.maybe_grow_locked(&mut inner, additional)
+    }
+
     /// Rewrites `coins.dat` in slot order: occupied slots walked
     /// 0..cap, each record appended to a fresh log at its slot's
     /// position. Restores read locality — a probe cluster's records

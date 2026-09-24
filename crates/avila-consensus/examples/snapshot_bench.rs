@@ -175,6 +175,48 @@ fn main() {
     let mut sample_ops: Vec<OutPoint> = Vec::new();
     let t = Instant::now();
     match mode.as_str() {
+        // `gen <path> <count>` — stream a Core-format snapshot file:
+        // sorted txids (big-endian counter suffix), 1-2 vouts each,
+        // realistic script mix. RAM-bounded — writes groups as it goes.
+        "gen" => {
+            let path = args.next().expect("gen <path> <count>");
+            let count: u64 = args.next().expect("count").parse().unwrap();
+            let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+            let mut w = std::io::BufWriter::with_capacity(
+                1 << 24,
+                std::fs::File::create(&path).expect("create"),
+            );
+            use std::io::Write;
+            w.write_all(b"utxo\xff").unwrap();
+            w.write_all(&2u16.to_le_bytes()).unwrap();
+            w.write_all(&[0xf9, 0xbe, 0xb4, 0xd9]).unwrap(); // mainnet magic
+            w.write_all(&[0xabu8; 32]).unwrap(); // base blockhash
+            w.write_all(&count.to_le_bytes()).unwrap();
+            let mut written = 0u64;
+            let mut tx_i = 0u64;
+            let mut buf = Vec::with_capacity(512);
+            while written < count {
+                // txid: ascending — byte-sorted by construction.
+                let mut txid = [0u8; 32];
+                txid[24..].copy_from_slice(&tx_i.to_be_bytes());
+                tx_i += 1;
+                let n_out = 1 + rng.below(2); // 1-2 outputs
+                let group = (count - written).min(n_out);
+                buf.clear();
+                buf.extend_from_slice(&txid);
+                avila_consensus::encode::write_compact_size(&mut buf, group);
+                for v in 0..group {
+                    avila_consensus::encode::write_compact_size(&mut buf, v);
+                    let (_, coin) = synth_coin(&mut rng, 935_000);
+                    avila_consensus::utxo_snapshot::write_coin(&mut buf, &coin);
+                    written += 1;
+                }
+                w.write_all(&buf).unwrap();
+            }
+            w.flush().unwrap();
+            println!("gen: {written} coins -> {path}");
+            return;
+        }
         "file" => {
             // Push-based path — mirrors `Chainstate::load_snapshot`.
             let path = args
@@ -192,6 +234,12 @@ fn main() {
                 "snapshot: base={} coins={}",
                 meta.base_blockhash, meta.coins_count
             );
+            // Pre-size: the metadata declares the count — one index
+            // grow now instead of ~17 doubling rewrites mid-stream.
+            let t_rs = Instant::now();
+            be.reserve_coins(meta.coins_count)
+                .unwrap_or_else(|e| panic!("reserve: {e}"));
+            println!("reserve({}) took {:.0?}", meta.coins_count, t_rs.elapsed());
             let mut count = 0u64;
             let mut since_flush = 0u64;
             let mut ferr: Option<String> = None;
