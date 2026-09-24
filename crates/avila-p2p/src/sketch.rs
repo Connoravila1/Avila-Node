@@ -181,10 +181,19 @@ impl Sketch {
         out
     }
 
+    /// The largest sketch we'll accept on the wire — 4× the biggest
+    /// sketch we ever send (`capacity` clamps to 512). A peer's frame
+    /// is 4 MB, which is ~1M syndromes: without this cap Berlekamp-
+    /// Massey decodes an adversary-sized input before any budget trips.
+    pub const MAX_WIRE_FIELDS: usize = 2048;
+
     /// Reads a sketch from its serialized form.
     #[must_use]
     pub fn deserialize(bytes: &[u8]) -> Option<Self> {
-        if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        if bytes.is_empty()
+            || !bytes.len().is_multiple_of(4)
+            || bytes.len() / 4 > Self::MAX_WIRE_FIELDS
+        {
             return None;
         }
         Some(Self {

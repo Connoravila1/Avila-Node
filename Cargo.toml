@@ -21,6 +21,8 @@ repository = "https://github.com/Connoravila1/Avila-Node"
 publish = false
 
 [workspace.dependencies]
+libc = "0.2"
+prctl = "1.0"
 avila-core = { path = "crates/avila-core" }
 avila-consensus = { path = "crates/avila-consensus" }
 avila-mempool = { path = "crates/avila-mempool" }

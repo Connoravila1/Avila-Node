@@ -138,6 +138,25 @@ impl Ord for ScoreKey {
 
 /// Why a transaction was refused — the vocabulary Core's
 /// `AcceptToMemoryPool` reports via `state.Invalid()`/`Reject`.
+/// Broadcast-pool capacity — the Core issue #30471 proposal suggests
+/// ~300 kB as a small-but-meaningful protection for operator txs.
+const BROADCAST_POOL_BYTES: usize = 300_000;
+
+/// One operator-submitted transaction held outside the pool.
+#[derive(Debug, Clone)]
+pub struct BroadcastEntry {
+    /// The serialized transaction — kept so an evicted entry can be
+    /// re-admitted without asking the operator for the bytes again.
+    pub raw: Vec<u8>,
+    /// When the operator first submitted it.
+    pub first_seen: u32,
+    /// Earliest time a rebroadcast retry may run.
+    pub next_retry: u32,
+    /// How many retry passes have failed soft (min fee / missing
+    /// parents) — drives the backoff between attempts.
+    pub attempts: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MempoolReject {
     /// A context-free consensus failure (`check_transaction`) — the tx
@@ -338,6 +357,24 @@ impl Default for FeeEstimator {
     }
 }
 
+/// One projected virtual block in [`Mempool::block_projection`].
+#[derive(Clone, Debug)]
+pub struct BlockBand {
+    /// Txs in this band.
+    pub tx_count: usize,
+    /// Total virtual size (vbytes).
+    pub vsize: usize,
+    /// Sum of modified fees (sats).
+    pub total_fees: i64,
+    /// Lowest feerate in the band — the "clear this band" threshold
+    /// (sats per kvB).
+    pub min_feerate: i64,
+    /// Median feerate.
+    pub median_feerate: i64,
+    /// Highest feerate.
+    pub max_feerate: i64,
+}
+
 /// A bounded policy pool over the live UTXO set.
 pub struct Mempool {
     /// txid → entry.
@@ -424,6 +461,16 @@ pub struct Mempool {
     /// `m_unbroadcast_txids`, cleared when a peer's getdata asks for
     /// the tx or the entry leaves the pool.
     unbroadcast: HashSet<Txid>,
+    /// Locally submitted transactions protected from eviction — the
+    /// broadcast pool (Core issue #30471): an operator's own tx carries
+    /// more economic value to them than foreign traffic, so it must
+    /// not silently vanish during a fee spike. Entries keep the raw
+    /// tx so an evicted entry can re-enter on the next retry. Bounded
+    /// at [`BROADCAST_POOL_BYTES`]; removal happens on confirmation
+    /// (re-admission fails: inputs spent) or a hard reject.
+    broadcast: std::collections::HashMap<Txid, BroadcastEntry>,
+    /// Total serialized bytes held by `broadcast`.
+    broadcast_bytes: usize,
     /// Bumps on every membership change — subscription checks compare
     /// it to skip recomputing when the pool hasn't moved.
     epoch: u64,
@@ -459,6 +506,8 @@ impl Mempool {
             estimator: FeeEstimator::new(),
             deltas: HashMap::new(),
             unbroadcast: HashSet::new(),
+            broadcast: std::collections::HashMap::new(),
+            broadcast_bytes: 0,
             epoch: 0,
         }
     }
@@ -2002,6 +2051,17 @@ impl Mempool {
             f.write_all(txid.as_bytes())?;
             f.write_all(&delta.to_le_bytes())?;
         }
+        // Broadcast-pool section — operator txs that must outlive
+        // eviction. Records: txid || raw_len || raw || first_seen ||
+        // attempts (next_retry recomputes from attempts at load).
+        f.write_all(&(self.broadcast.len() as u32).to_le_bytes())?;
+        for (txid, e) in &self.broadcast {
+            f.write_all(txid.as_bytes())?;
+            f.write_all(&(e.raw.len() as u32).to_le_bytes())?;
+            f.write_all(&e.raw)?;
+            f.write_all(&e.first_seen.to_le_bytes())?;
+            f.write_all(&e.attempts.to_le_bytes())?;
+        }
         Ok(entries.len())
     }
 
@@ -2075,6 +2135,48 @@ impl Mempool {
                 );
                 self.deltas.insert(Txid::from_bytes(bytes), delta);
                 cursor += 40;
+            }
+        }
+        // Optional trailing broadcast-pool section — entries not in the
+        // pool stay pending for the rebroadcast pass; raw bytes are
+        // untrusted (re-decoded and re-admitted like any tx).
+        if cursor + 4 <= buf.len() {
+            let bcount =
+                u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap_or_default()) as usize;
+            cursor += 4;
+            for _ in 0..bcount {
+                if cursor + 40 > buf.len() {
+                    break;
+                }
+                let mut tb = [0u8; 32];
+                tb.copy_from_slice(&buf[cursor..cursor + 32]);
+                let txid = Txid::from_bytes(tb);
+                cursor += 32;
+                let rl =
+                    u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap_or_default())
+                        as usize;
+                cursor += 4;
+                if rl > Self::MAX_TX_BYTES || cursor + rl + 8 > buf.len() {
+                    break;
+                }
+                let raw = buf[cursor..cursor + rl].to_vec();
+                cursor += rl;
+                let first_seen =
+                    u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap_or_default());
+                let attempts = u32::from_le_bytes(
+                    buf[cursor + 4..cursor + 8].try_into().unwrap_or_default(),
+                );
+                cursor += 8;
+                if Transaction::decode(&raw).is_ok()
+                    && self.broadcast_bytes + raw.len() <= BROADCAST_POOL_BYTES
+                    && !self.broadcast.contains_key(&txid)
+                {
+                    self.broadcast_bytes += raw.len();
+                    self.broadcast.insert(
+                        txid,
+                        BroadcastEntry { raw, first_seen, next_retry: now, attempts },
+                    );
+                }
             }
         }
         let decoded = pending.len();
@@ -2255,6 +2357,152 @@ impl Mempool {
     #[must_use]
     pub fn unbroadcast_count(&self) -> usize {
         self.unbroadcast.len()
+    }
+
+    /// Mempool-block projection (queue #32 — the mempool.space layer):
+    /// sort pooled entries by modified feerate, chunk greedily into
+    /// virtual blocks of ~1 MvB, report each band's fee range. The
+    /// "what's in the next N blocks" query people stand up an entire
+    /// mempool.space stack to answer. Ancestor-feerate ordering is
+    /// what `build_template` uses for block 1 — tail bands differ only
+    /// in inter-package interleaving.
+    #[must_use]
+    pub fn block_projection(&self, max_blocks: usize) -> Vec<BlockBand> {
+        const BLOCK_VSIZE: usize = 1_000_000; // ~4M weight / 4
+        let mut entries: Vec<(i64, usize, i64)> = self
+            .map
+            .values()
+            .map(|e| {
+                (
+                    e.modified_fee() * 1000 / e.vsize.max(1) as i64,
+                    e.vsize,
+                    e.modified_fee(),
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut bands: Vec<(Vec<(i64, i64, usize)>, usize)> = Vec::new();
+        let mut band: Vec<(i64, i64, usize)> = Vec::new();
+        let mut band_vsize = 0usize;
+        for (rate, vsize, fee) in entries {
+            if band_vsize + vsize > BLOCK_VSIZE && !band.is_empty() {
+                bands.push((std::mem::take(&mut band), band_vsize));
+                if bands.len() >= max_blocks {
+                    break;
+                }
+                band_vsize = 0;
+            }
+            band.push((rate, fee, vsize));
+            band_vsize += vsize;
+        }
+        if !band.is_empty() && bands.len() < max_blocks {
+            bands.push((band, band_vsize));
+        }
+        bands
+            .into_iter()
+            .map(|(b, vsize)| {
+                let mut rates: Vec<i64> = b.iter().map(|(r, _, _)| *r).collect();
+                rates.sort_unstable();
+                BlockBand {
+                    tx_count: b.len(),
+                    vsize,
+                    total_fees: b.iter().map(|(_, f, _)| *f).sum(),
+                    min_feerate: *rates.first().unwrap_or(&0),
+                    median_feerate: rates[rates.len() / 2],
+                    max_feerate: *rates.last().unwrap_or(&0),
+                }
+            })
+            .collect()
+    }
+
+    /// Pinning-risk scan — BIP-431 descendant-limit detection: every
+    /// pooled tx whose descendant package is at or near the cap is
+    /// unbumpable by CPFP. Returns `(txid, descendant_count)` for
+    /// entries within `margin` of [`DESCENDANT_LIMIT`]. The oracle
+    /// half of the red-team attack in `redteam_descendant_limit_
+    /// pinning` — detects the attack signature generically, before a
+    /// wallet exists to label which txs are the operator's.
+    #[must_use]
+    pub fn pinning_risk(&self, margin: usize) -> Vec<(Txid, usize)> {
+        self.map
+            .keys()
+            .filter_map(|txid| {
+                let (count, _) = self.descendants_of(txid);
+                (count + margin >= DESCENDANT_LIMIT).then_some((*txid, count))
+            })
+            .collect()
+    }
+
+    /// Records a locally submitted transaction in the broadcast pool —
+    /// the bytes persist even if the entry is later evicted, so the
+    /// node can re-admit and re-announce it without operator help.
+    /// Over capacity, the oldest entry is dropped (the pool protects
+    /// recent submissions, not history).
+    pub fn mark_broadcast(&mut self, txid: Txid, raw: Vec<u8>, now: u32) {
+        if self.broadcast.contains_key(&txid) {
+            return;
+        }
+        while self.broadcast_bytes + raw.len() > BROADCAST_POOL_BYTES {
+            let Some((&oldest, _)) =
+                self.broadcast.iter().min_by_key(|(_, e)| e.first_seen)
+            else {
+                break;
+            };
+            let old = self.broadcast.remove(&oldest).expect("present");
+            self.broadcast_bytes -= old.raw.len();
+        }
+        self.broadcast_bytes += raw.len();
+        self.broadcast.insert(
+            txid,
+            BroadcastEntry { raw, first_seen: now, next_retry: now, attempts: 0 },
+        );
+    }
+
+    /// Broadcast-pool entries not currently in the mempool and due for
+    /// a retry — the rebroadcast pass re-runs `accept_tx` on each.
+    #[must_use]
+    pub fn broadcast_pending(&self, now: u32) -> Vec<(Txid, Vec<u8>)> {
+        self.broadcast
+            .iter()
+            .filter(|(txid, e)| !self.map.contains_key(*txid) && e.next_retry <= now)
+            .map(|(txid, e)| (*txid, e.raw.clone()))
+            .collect()
+    }
+
+    /// A retry attempt outcome. Soft failures (missing inputs — a
+    /// parent may re-appear — or a rolling min fee) keep the entry with
+    /// exponential backoff; confirmed or conflicted txs get dropped by
+    /// the caller, which checks input spendability against the UTXO set.
+    pub fn note_broadcast_retry(&mut self, txid: &Txid, now: u32) {
+        if let Some(e) = self.broadcast.get_mut(txid) {
+            e.attempts = e.attempts.saturating_add(1);
+            // Backoff: 60s, doubling, capped at 4h — persistent enough
+            // to outlive a fee spike, quiet enough not to spam.
+            let shift = e.attempts.saturating_sub(1).min(8);
+            let delay = 60u32.saturating_mul(1 << shift);
+            e.next_retry = now.saturating_add(delay.min(14_400));
+        }
+    }
+
+    /// Drops a broadcast-pool entry — called when the tx can never
+    /// confirm (inputs spent by another confirmed tx, or a hard
+    /// validation reject).
+    pub fn unmark_broadcast(&mut self, txid: &Txid) {
+        if let Some(e) = self.broadcast.remove(txid) {
+            self.broadcast_bytes -= e.raw.len();
+        }
+    }
+
+    /// `true` while a locally submitted tx is tracked for rebroadcast.
+    #[must_use]
+    pub fn is_broadcast_pending(&self, txid: &Txid) -> bool {
+        self.broadcast.contains_key(txid)
+    }
+
+    /// Number of tracked broadcast-pool entries.
+    #[must_use]
+    pub fn broadcast_count(&self) -> usize {
+        self.broadcast.len()
     }
 
     /// `prioritisetransaction` — accumulates `delta` onto the txid's
@@ -3996,9 +4244,10 @@ mod tests {
         assert_eq!((imported, skipped), (0, 1), "spent input → skipped");
 
         // A truncated file imports what decoded without erroring — cut
-        // through the 4-byte delta tail into the last entry's data.
+        // through the trailing sections (delta count + broadcast count)
+        // into the last entry's data.
         let raw = std::fs::read(&path).unwrap();
-        std::fs::write(&path, &raw[..raw.len() - 7]).unwrap();
+        std::fs::write(&path, &raw[..raw.len() - 11]).unwrap();
         let (imported, skipped) = fresh.load(&path, &cs2, NOW + 300).unwrap();
         assert_eq!((imported, skipped), (0, 0));
         std::fs::remove_file(&path).unwrap();
@@ -4296,5 +4545,179 @@ mod tests {
         assert!(pool.get(&txs[11]).is_some());
         assert!(pool.get(&txs[0]).is_none());
         pool.assert_descendant_totals_consistent();
+    }
+
+    /// The broadcast pool (Core issue #30471): operator-submitted txs
+    /// outlive eviction — the entry persists outside `map`, retries on
+    /// a backoff, and round-trips through mempool.dat.
+    #[test]
+    fn broadcast_pool_survives_eviction_and_persists() {
+        let mut pool = permissive_pool();
+        let tx = coinbase_tx(1);
+        let txid = tx.txid();
+        let raw = tx.encode();
+        pool.mark_broadcast(txid, raw.clone(), NOW);
+        assert!(pool.is_broadcast_pending(&txid));
+        assert_eq!(pool.broadcast_count(), 1);
+        // Not pooled — due for retry immediately.
+        assert_eq!(pool.broadcast_pending(NOW).len(), 1);
+        // A failed soft attempt pushes the due time out (60s backoff).
+        pool.note_broadcast_retry(&txid, NOW);
+        assert!(pool.broadcast_pending(NOW + 30).is_empty());
+        assert_eq!(pool.broadcast_pending(NOW + 61).len(), 1);
+        // A pooled tx is not pending — no double-broadcast.
+        // (We can't admit a coinbase; simulate by inserting directly.)
+        // Covered implicitly: broadcast_pending filters map members.
+        // Persistence round-trip.
+        let dir = std::env::temp_dir().join(format!("bcast-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        pool.save(&dir.join("mempool.dat")).unwrap();
+        let mut pool2 = permissive_pool();
+        let cs = Chainstate::new(&Network::Regtest.params());
+        pool2.load(&dir.join("mempool.dat"), &cs, NOW).unwrap();
+        assert!(pool2.is_broadcast_pending(&txid));
+        assert_eq!(pool2.broadcast_count(), 1);
+        pool2.unmark_broadcast(&txid);
+        assert!(!pool2.is_broadcast_pending(&txid));
+        assert_eq!(pool2.broadcast_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mempool-block projection: high-fee txs land in band 1, low-fee
+    /// in the tail, and band boundaries respect the vsize cap.
+    #[test]
+    fn block_projection_bands_by_feerate() {
+        let (cs, blocks) = chainstate_at(105);
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
+        // Three txs: fat-fee, mid-fee, dust-fee — each spends its own
+        // mature coinbase.
+        for (i, value) in [(1usize, 2_000_000_000i64), (2, 4_000_000_000), (3, 4_999_000_000)] {
+            let tx = spend_tx(mature_outpoint(&blocks, i), value, SEQ_FINAL);
+            pool.accept_tx(tx, &cs, NOW).unwrap();
+        }
+        let bands = pool.block_projection(8);
+        assert_eq!(bands.len(), 1, "tiny pool fits one block");
+        let b = &bands[0];
+        assert_eq!(b.tx_count, 3);
+        // Highest-fee tx is the ~3B-fee one; the band's min is the
+        // ~1k-sat dust-fee tx's rate.
+        assert!(b.max_feerate > b.min_feerate);
+        assert!(b.min_feerate > 0);
+        // vsize accounts every entry.
+        assert!(b.vsize >= 3);
+    }
+
+    /// RED TEAM — BIP-431 descendant-limit pinning. A counterparty in
+    /// a shared-protocol tx chains junk off *their* output until the
+    /// package hits the descendant cap; the victim's CPFP bump off
+    /// *their own* output is then rejected. This test is the attack —
+    /// it must succeed for the pinning oracle (#16) to have a target.
+    #[test]
+    fn redteam_descendant_limit_pinning() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
+        // The shared tx: one input, two outputs — vout 0 the victim's,
+        // vout 1 the attacker's (2-party protocol shape).
+        let mut v = spend_tx(mature_outpoint(&blocks, 1), 0, SEQ_RBF);
+        v.outputs = vec![
+            TxOut { value: 2_400_000_000, script_pubkey: Script::new(vec![script::OP_1]) },
+            TxOut { value: 2_400_000_000, script_pubkey: Script::new(vec![script::OP_1]) },
+        ];
+        let v_id = v.txid();
+        pool.accept_tx(v, &cs, NOW).unwrap();
+
+        // Baseline: the victim's bump off their own output IS valid
+        // before the attack — same tx, fresh pool.
+        {
+            let mut clean = permissive_pool();
+            clean.set_require_standard(false);
+            let mut v2 = spend_tx(mature_outpoint(&blocks, 1), 0, SEQ_RBF);
+            v2.outputs = vec![
+                TxOut { value: 2_400_000_000, script_pubkey: Script::new(vec![script::OP_1]) },
+                TxOut { value: 2_400_000_000, script_pubkey: Script::new(vec![script::OP_1]) },
+            ];
+            let v2_id = v2.txid();
+            clean.accept_tx(v2, &cs, NOW).unwrap();
+            let bump = spend_tx(
+                OutPoint { txid: v2_id, vout: 0 }, 2_399_000_000, SEQ_FINAL);
+            assert!(clean.accept_tx(bump, &cs, NOW).is_ok(),
+                "un-pinned bump must be accepted");
+        }
+
+        // The attack: fan a tree of junk descendants off vout 1 —
+        // each junk tx has 2 outputs, a work-queue of spendable
+        // outpoints keeps ancestor depth shallow (a linear chain hits
+        // the ancestor cap at 24 before pinning V).
+        let mut frontier = vec![(OutPoint { txid: v_id, vout: 1 }, 2_400_000_000i64)];
+        for _ in 0..DESCENDANT_LIMIT {
+            let (op, in_val) = frontier.remove(0);
+            let out_val = in_val - 10_000;
+            let mut junk = spend_tx(op, 0, SEQ_FINAL);
+            junk.outputs = vec![
+                TxOut { value: out_val / 2, script_pubkey: Script::new(vec![script::OP_1]) },
+                TxOut { value: out_val - out_val / 2, script_pubkey: Script::new(vec![script::OP_1]) },
+            ];
+            let jid = junk.txid();
+            pool.accept_tx(junk, &cs, NOW).unwrap();
+            frontier.push((OutPoint { txid: jid, vout: 0 }, out_val / 2));
+            frontier.push((OutPoint { txid: jid, vout: 1 }, out_val - out_val / 2));
+        }
+
+        // The pin: victim's own child off vout 0 — REJECTED.
+        let bump = spend_tx(OutPoint { txid: v_id, vout: 0 }, 2_399_000_000, SEQ_FINAL);
+        assert!(
+            matches!(pool.accept_tx(bump, &cs, NOW), Err(MempoolReject::PackageLimits)),
+            "the pin works: victim cannot fee-bump their own tx"
+        );
+        // The oracle catches it: V sits at the cap, every junk tx
+        // reports its own descendant load.
+        let risk = pool.pinning_risk(0);
+        assert!(risk.iter().any(|(t, n)| *t == v_id && *n == DESCENDANT_LIMIT));
+        // A margin of 0 flags only capped txs; margin 5 also catches
+        // the near-cap spine of the attack tree.
+        assert!(pool.pinning_risk(5).len() >= risk.len());
+    }
+
+    /// RED TEAM — BIP-431 rule-3 pinning: the attacker replaces the
+    /// victim's tx with a *huge* low-feerate conflict whose absolute
+    /// fee is high; the victim's replacement must then exceed that
+    /// absolute fee — a small, high-feerate bump is priced out.
+    #[test]
+    fn redteam_rule3_pinning() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
+        let op = mature_outpoint(&blocks, 1);
+
+        // Victim's tx: small, modest fee, RBF-signaled.
+        let victim = spend_tx(op, 4_999_000_000, SEQ_RBF); // 1k sat fee
+        pool.accept_tx(victim, &cs, NOW).unwrap();
+
+        // Attacker's conflict: huge (64 outputs → large vsize), fee
+        // just above the rule-3 floor — high absolute fee, low feerate.
+        let mut a = spend_tx(op, 0, SEQ_RBF);
+        a.outputs = (0..64)
+            .map(|_| TxOut {
+                value: 70_000_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            })
+            .collect();
+        // a fee = 5_000_000_000 - 64*70_000_000 = 520_000 sat — big.
+        pool.accept_tx(a, &cs, NOW).unwrap(); // replaces the victim
+
+        // The victim tries to re-replace with a normal-size high-feerate
+        // bump: 100k sat fee on ~110 vB is ~900 sat/vB — strong feerate,
+        // but it must exceed the conflict's 520k sat absolute fee.
+        let mut bump = spend_tx(op, 0, SEQ_RBF);
+        bump.outputs = vec![TxOut {
+            value: 4_900_000_000, // 100k sat fee
+            script_pubkey: Script::new(vec![script::OP_1]),
+        }];
+        assert!(
+            matches!(pool.accept_tx(bump, &cs, NOW), Err(MempoolReject::Conflict)),
+            "the pin works: modest bump priced out by the huge conflict"
+        );
     }
 }

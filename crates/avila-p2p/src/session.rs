@@ -201,6 +201,14 @@ pub struct PeerSession<S> {
     /// BIP324 channel state when this session speaks v2; `None` for
     /// the legacy cleartext wire.
     v2: Option<crate::bip324::V2Channel>,
+    /// Seeded xorshift state for decoy-injection rolls — v2 links emit
+    /// random-length decoy packets so wire byte-lengths don't
+    /// fingerprint message types (the 2025 v2-transport analysis
+    /// classified commands from TCP payload sizes alone).
+    decoy_rng: u64,
+    /// Decoy modulus — a decoy rides ~1-in-N sends (4 default; 1 in
+    /// tests forces every send).
+    decoy_rate: u64,
 }
 
 impl<S: Read + Write> PeerSession<S> {
@@ -317,6 +325,12 @@ impl<S: Read + Write> PeerSession<S> {
             send_budget,
             clock: wall_epoch,
             v2: None,
+            decoy_rng: {
+                let mut seed = [0u8; 8];
+                let _ = getrandom::fill(&mut seed);
+                u64::from_le_bytes(seed) | 1
+            },
+            decoy_rate: 4,
             recon_salt,
         }
     }
@@ -449,6 +463,19 @@ impl<S: Read + Write> PeerSession<S> {
         self.telemetry.bytes_sent += frame.len() as u64;
         self.telemetry.last_send = (self.clock)();
         self.send_buf.extend(frame);
+        // Decoy injection (v2 only): ~1-in-4 sends get a random-length
+        // decoy packet appended — observers see a length histogram
+        // with real message sizes buried in noise.
+        if let Some(channel) = self.v2.as_mut() {
+            self.decoy_rng ^= self.decoy_rng << 13;
+            self.decoy_rng ^= self.decoy_rng >> 7;
+            self.decoy_rng ^= self.decoy_rng << 17;
+            if self.decoy_rng % self.decoy_rate == 0 {
+                let dlen = (self.decoy_rng % 2049) as usize;
+                let decoy = channel.encode_decoy(dlen);
+                self.send_buf.extend(decoy);
+            }
+        }
         Ok(())
     }
 

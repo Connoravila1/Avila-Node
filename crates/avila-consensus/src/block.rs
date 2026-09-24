@@ -635,4 +635,67 @@ mod tests {
         assert_eq!(MAX_BLOCK_WEIGHT, 4_000_000);
         assert_eq!(WITNESS_SCALE_FACTOR, 4);
     }
+
+    /// Self-fuzzing canary (queue #27): every mutation of a real block
+    /// that still decodes must re-encode to byte-identical bytes — a
+    /// decoder that silently misdecodes produces a block whose
+    /// `encode()` differs from its input. This is the standing red
+    /// team inside the node: mutation classes = bit flips, truncations,
+    /// extensions, and splices, driven by a seeded xorshift so the run
+    /// is deterministic.
+    #[test]
+    fn mutated_blocks_never_misdecode() {
+        let original = MAINNET_BLOCK_000170;
+        assert!(Block::decode(original).is_ok());
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut decoded = 0usize;
+        for i in 0..4000 {
+            let mut m = original.to_vec();
+            match next() % 4 {
+                0 => {
+                    // bit flip
+                    let pos = (next() as usize) % m.len();
+                    m[pos] ^= 1 << (next() % 8);
+                }
+                1 => {
+                    // truncate
+                    let keep = 80 + (next() as usize) % (m.len() - 80);
+                    m.truncate(keep);
+                }
+                2 => {
+                    // extend with junk
+                    let extra = (next() % 512) as usize;
+                    for _ in 0..extra {
+                        m.push(next() as u8);
+                    }
+                }
+                _ => {
+                    // splice a random window
+                    let pos = (next() as usize) % m.len();
+                    let len = (next() as usize % 64).min(m.len() - pos);
+                    for j in 0..len {
+                        m[pos + j] = next() as u8;
+                    }
+                }
+            }
+            if let Ok(b) = Block::decode(&m) {
+                decoded += 1;
+                assert_eq!(
+                    b.encode(),
+                    m,
+                    "mutation {i} decoded but did not round-trip — the                      decoder silently misdecoded input"
+                );
+            }
+        }
+        // Sanity: the fuzzer must actually be producing decodable
+        // mutants — a zero here means the mutations are too aggressive
+        // to exercise anything.
+        assert!(decoded > 0, "no mutants survived decode — harness broken");
+    }
 }

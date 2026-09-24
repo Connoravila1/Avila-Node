@@ -23,6 +23,7 @@
 //! validates — the wire format and the rule check stay separate.
 
 pub mod addrman;
+pub mod asmap;
 pub mod banman;
 pub mod bip324;
 pub mod codec;

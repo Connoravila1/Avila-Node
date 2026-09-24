@@ -904,6 +904,64 @@ mod tests {
         BlockHash::from_bytes([seed; 32])
     }
 
+    /// Dual-engine lockstep (queue #24): the same commit stream
+    /// replayed through Engine::Redb and Engine::Hash must produce
+    /// identical reads — sampled after every commit and over the full
+    /// set at the end. A divergence = a backend bug surfaced, which is
+    /// the production-halt condition this fixture models.
+    #[test]
+    fn dual_engine_lockstep() {
+        let dir_r = test_dir("lockstep-redb");
+        let dir_h = test_dir("lockstep-hash");
+        let be_r = CoinsBackend::open_with_engine(&dir_r, Engine::Redb).unwrap();
+        let be_h = CoinsBackend::open_with_engine(&dir_h, Engine::Hash).unwrap();
+
+        let mut rng: u64 = 0xDEADBEEFCAFEF00D;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        // Live outpoints so commits mix creates and deletes.
+        let mut live: Vec<OutPoint> = Vec::new();
+        for round in 0..300u32 {
+            let mut dirty: HashMap<OutPoint, Option<Coin>> = HashMap::new();
+            // creates
+            for _ in 0..(next() % 40) {
+                let o = op((next() % 251) as u8, (next() % 5) as u32);
+                if dirty.contains_key(&o) {
+                    continue;
+                }
+                dirty.insert(o, Some(coin((next() % 100_000) as i64, round)));
+                live.push(o);
+            }
+            // deletes from the live set
+            for _ in 0..(next() % 20).min(live.len() as u64) {
+                let i = (next() as usize) % live.len();
+                dirty.insert(live.swap_remove(i), None);
+            }
+            be_r.commit(&dirty, &[], round).unwrap();
+            be_h.commit(&dirty, &[], round).unwrap();
+            // sampled post-commit reads must agree
+            for o in dirty.keys().take(40) {
+                assert_eq!(
+                    be_r.get(o),
+                    be_h.get(o),
+                    "engine divergence at round {round} on {o:?}"
+                );
+            }
+        }
+        // full-set equality
+        let mut a = be_r.iter_coins();
+        let mut b = be_h.iter_coins();
+        a.sort_by_key(|(o, _)| (*o.txid.as_bytes(), o.vout));
+        b.sort_by_key(|(o, _)| (*o.txid.as_bytes(), o.vout));
+        assert_eq!(a, b, "final sets diverge");
+        let _ = std::fs::remove_dir_all(&dir_r);
+        let _ = std::fs::remove_dir_all(&dir_h);
+    }
+
     #[test]
     fn open_fresh_and_meta() {
         let dir = test_dir("fresh");

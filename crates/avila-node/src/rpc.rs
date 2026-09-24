@@ -4296,6 +4296,16 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
     ),
     ("getbalances", &[], GETBALANCES_HELP),
     (
+        "getwalletinfo",
+        &[],
+        "getwalletinfo\n\nWatch-wallet status: descriptor count, coin tracking, scan floor, gaps.\n",
+    ),
+    (
+        "listtransactions",
+        &[("count", Some("number"), false), ("skip", Some("number"), false)],
+        "listtransactions ( count skip )\n\nWatch-wallet history — receives and spends per tracked coin, newest first.\n",
+    ),
+    (
         "restorewallet",
         &[
             ("filename", Some("string"), true),
@@ -4565,6 +4575,21 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         GETMEMPOOLENTRY_HELP,
     ),
     ("getmempoolinfo", &[], GETMEMPOOLINFO_HELP),
+    (
+        "getevents",
+        &[("count", Some("number"), false)],
+        "getevents ( count )\n\nReturns the node's recent event stream — connections, disconnects, tip advances, announcements — newest first.\n\nArguments:\n1. count  (number, optional, default=100, max=1024)\n\nResult:\n[ { \"event\": \"connected|disconnected|tip_advanced|announced\", ... }, ... ]\n",
+    ),
+    (
+        "getmempoolblocks",
+        &[("nblocks", Some("number"), false)],
+        "getmempoolblocks ( nblocks )\n\nProjects the mempool into virtual blocks by modified-feerate order — the mempool.space 'next blocks' view, native.\n\nArguments:\n1. nblocks  (number, optional, default=8, max=64) How many projected blocks to return.\n\nResult:\n[ { \"block\": n, \"txs\": n, \"vsize\": n, \"totalfee\": btc, \"minfeerate\": btc/kvB, \"medianfeerate\": btc/kvB, \"maxfeerate\": btc/kvB }, ... ]\n",
+    ),
+    (
+        "getpinningrisk",
+        &[("margin", Some("number"), false)],
+        "getpinningrisk ( margin )\n\nLists mempool transactions whose descendant package is at or near the descendant cap (BIP-431 pinning surface — such a tx cannot be CPFP-bumped).\n\nArguments:\n1. margin  (number, optional, default=5) Flag txs within this many descendants of the cap.\n\nResult:\n[ { \"txid\": \"hex\", \"descendants\": n }, ... ]\n",
+    ),
     ("getmininginfo", &[], GETMININGINFO_HELP),
     ("getnettotals", &[], GETNETTOTALS_HELP),
     (
@@ -6763,6 +6788,12 @@ pub(crate) fn dispatch(
                             // BIP330: whether this link negotiated
                             // transaction reconciliation.
                             "recon": p.recon,
+                            // Recon telemetry — rounds run and the
+                            // cumulative diff size; a peer persistently
+                            // missing most of our pool is a censorship
+                            // or eclipse signal (queue #19).
+                            "recon_rounds": p.recon_rounds,
+                            "recon_misses": p.recon_misses,
                             // Core: hex of the BIP324 session id on v2,
                             // "" on v1.
                             "session_id": p
@@ -6872,6 +6903,80 @@ pub(crate) fn dispatch(
                 "fullrbf": pool.full_rbf(),
             }))
         }),
+        "getpinningrisk" => {
+            let margin = param(params, 0, "margin")
+                .and_then(Value::as_u64)
+                .map_or(5, |v| v as usize);
+            chain_query(method, queries, move |_, mgr| {
+                Ok(json!(mgr
+                    .mempool_ref()
+                    .pinning_risk(margin)
+                    .into_iter()
+                    .map(|(txid, n)| json!({"txid": txid.to_string(), "descendants": n}))
+                    .collect::<Vec<_>>()))
+            })
+        }
+        "getmempoolblocks" => {
+            let n = param(params, 0, "nblocks")
+                .and_then(Value::as_u64)
+                .map_or(8, |v| v.min(64) as usize);
+            chain_query(method, queries, move |_, mgr| {
+                Ok(json!(mgr
+                    .mempool_ref()
+                    .block_projection(n)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, b)| json!({
+                        "block": i + 1,
+                        "txs": b.tx_count,
+                        "vsize": b.vsize,
+                        "totalfee": value_from_amount(b.total_fees),
+                        "minfeerate": value_from_amount(b.min_feerate),
+                        "medianfeerate": value_from_amount(b.median_feerate),
+                        "maxfeerate": value_from_amount(b.max_feerate),
+                    }))
+                    .collect::<Vec<_>>()))
+            })
+        }
+        "getevents" => {
+            let n = param(params, 0, "count")
+                .and_then(Value::as_u64)
+                .map_or(100, |v| v.min(1024) as usize);
+            chain_query(method, queries, move |_, mgr| {
+                let events: Vec<Value> = mgr
+                    .recent_events()
+                    .iter()
+                    .rev()
+                    .take(n)
+                    .map(|e| match e {
+                        avila_p2p::manager::NetEvent::Connected { peer, info } => json!({
+                            "event": "connected",
+                            "peer": peer,
+                            "subver": info.user_agent,
+                        }),
+                        avila_p2p::manager::NetEvent::Disconnected { peer, reason } => json!({
+                            "event": "disconnected",
+                            "peer": peer,
+                            "reason": format!("{reason:?}"),
+                        }),
+                        avila_p2p::manager::NetEvent::TipAdvanced(h) => json!({
+                            "event": "tip_advanced",
+                            "height": h,
+                        }),
+                        avila_p2p::manager::NetEvent::Announced { peer, missing } => json!({
+                            "event": "announced",
+                            "peer": peer,
+                            "missing": missing.len(),
+                        }),
+                        avila_p2p::manager::NetEvent::EclipseSuspected(signals) => json!({
+                            "event": "eclipse_suspected",
+                            "signals": signals.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>(),
+                        }),
+                    })
+                    .collect();
+                Ok(json!(events))
+            })
+        }
         "getchaintips" => chain_query(method, queries, |cs, _| {
             // A tip is an indexed node no other node points at as
             // parent — the same shape Core's setBlockIndexCandidates
@@ -7141,15 +7246,23 @@ pub(crate) fn dispatch(
                 match mgr.mempool().accept_tx(tx, cs, now) {
                     Ok(_) => {
                         // Admitted — relay an inv to every tx-accepting
-                        // peer (Core's RelayTransaction path) and track
-                        // it as unbroadcast until a peer's getdata
-                        // acknowledges the announcement.
+                        // peer (Core's RelayTransaction path), track it
+                        // as unbroadcast until a peer's getdata
+                        // acknowledges the announcement, and protect it
+                        // in the broadcast pool so a fee-spike eviction
+                        // can't make the operator's own tx vanish
+                        // (Core issue #30471).
                         mgr.mempool().mark_unbroadcast(&txid);
-                        mgr.announce_tx(txid, wtxid);
+                        mgr.mempool().mark_broadcast(txid, bytes.clone(), now);
+                        // Origin privacy: locally submitted txs take a
+                        // single stem hop before general announce —
+                        // observers see us relay, not originate.
+                        mgr.stem_announce(txid, wtxid);
                         Ok(json!(txid.to_string()))
                     }
                     Err(avila_mempool::MempoolReject::AlreadyKnown) => {
                         mgr.mempool().mark_unbroadcast(&txid);
+                        mgr.mempool().mark_broadcast(txid, bytes.clone(), now);
                         Ok(json!(txid.to_string()))
                     }
                     // Consensus and input failures carry Core's
@@ -10453,6 +10566,97 @@ pub(crate) fn dispatch(
                 }))
             })
         }
+        // Watch-wallet status — descriptor count, scan progress,
+        // gaps. The watch-only analogue of Core's `getwalletinfo`.
+        "getwalletinfo" => {
+            let wallet = wallet.cloned();
+            chain_query(method, queries, move |cs, _mgr| {
+                let Some(wallet) = wallet else {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    ));
+                };
+                let mut w = wallet
+                    .lock()
+                    .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                w.advance(cs);
+                let unspent = w.unspent().count();
+                let last = w.chain.last().copied();
+                Ok(json!({
+                    "walletname": "avila-watch",
+                    "walletversion": 1,
+                    "descriptors": w.descs.len(),
+                    "coins_tracked": w.coins.len(),
+                    "coins_unspent": unspent,
+                    "scan_floor": w.scan_floor,
+                    "gaps": w.gaps.iter().map(|(a, b)| json!([a, b])).collect::<Vec<_>>(),
+                    "lastprocessedblock": {
+                        "hash": last.map(|h| h.to_string()).unwrap_or_default(),
+                        "height": w.chain.len() as i64 - 1,
+                    },
+                    "private_keys_enabled": false,
+                }))
+            })
+        }
+        // Wallet history — synthesized from the per-coin lifecycle:
+        // each coin is a "receive", each spent coin contributes a
+        // "send" under its spender's txid. `count`/`skip` window the
+        // newest-first list like Core.
+        "listtransactions" => {
+            let arr = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let count = arr.first().and_then(Value::as_i64).unwrap_or(10);
+            let skip = arr.get(1).and_then(Value::as_i64).unwrap_or(0);
+            let wallet = wallet.cloned();
+            chain_query(method, queries, move |cs, _mgr| {
+                let Some(wallet) = wallet else {
+                    return Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    ));
+                };
+                let mut w = wallet
+                    .lock()
+                    .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
+                w.advance(cs);
+                let tip = w.chain.len() as u32;
+                let mut rows: Vec<Value> = Vec::new();
+                for ((txid, vout), coin) in &w.coins {
+                    rows.push(json!({
+                        "category": "receive",
+                        "txid": txid.to_string(),
+                        "vout": vout,
+                        "amount": value_from_amount(coin.value),
+                        "blockhash": coin.block.to_string(),
+                        "blockheight": coin.height,
+                        "confirmations": tip.saturating_sub(coin.height),
+                    }));
+                    if let (Some(sh), Some(sp)) = (coin.spent_height, coin.spent_by) {
+                        rows.push(json!({
+                            "category": "send",
+                            "txid": sp.to_string(),
+                            "vout": vout,
+                            "amount": value_from_amount(-coin.value),
+                            "blockheight": sh,
+                            "blockhash": w.chain.get(sh as usize).map(|h| h.to_string()),
+                            "confirmations": tip.saturating_sub(sh),
+                        }));
+                    }
+                }
+                rows.sort_by_key(|r| {
+                    std::cmp::Reverse(
+                        r["blockheight"].as_i64().unwrap_or(0),
+                    )
+                });
+                let skip = skip.max(0) as usize;
+                let out: Vec<Value> = rows
+                    .into_iter()
+                    .skip(skip)
+                    .take(count.max(0) as usize)
+                    .collect();
+                Ok(json!(out))
+            })
+        }
         // Core's `listreceivedbyaddress` — receipts grouped by address;
         // spent coins still count (Core reports them in txids).
         "listreceivedbyaddress" => {
@@ -12461,6 +12665,8 @@ mod tests {
             mempool: (5, 1, Some(2_000)),
             elapsed_secs: 42,
             validation: default_report(),
+            profile: Default::default(),
+            next_block: None,
         }
     }
 

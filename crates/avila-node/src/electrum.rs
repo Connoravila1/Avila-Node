@@ -1245,6 +1245,8 @@ mod tests {
             mempool: (0, 0, None),
             elapsed_secs: 0,
             validation: default_report(),
+            profile: Default::default(),
+            next_block: None,
         }));
         let cancel = Arc::new(AtomicBool::new(false));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1354,6 +1356,8 @@ mod tests {
             mempool: (0, 0, None),
             elapsed_secs: 0,
             validation: default_report(),
+            profile: Default::default(),
+            next_block: None,
         }));
         let cancel = Arc::new(AtomicBool::new(false));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1493,6 +1497,8 @@ mod tests {
             mempool: (0, 0, None),
             elapsed_secs: 0,
             validation: default_report(),
+            profile: Default::default(),
+            next_block: None,
         }))
     }
 

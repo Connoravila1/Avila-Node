@@ -1,12 +1,16 @@
+#![recursion_limit = "512"]
+
 //! Coordinator shared by the headless executable and egui application.
 //!
 //! Full-node startup currently fails explicitly: persistent services are not
 //! wired yet. There is no mock validator or success-returning placeholder.
 //! Live peer sync is available through [`sync::run`].
 
+mod chain_profile;
 pub mod config;
 pub mod electrum;
 pub mod events;
+mod next_block;
 pub mod rpc;
 pub mod sv2;
 pub mod sync;

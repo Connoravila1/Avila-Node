@@ -25,6 +25,21 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 | 16 | 09-23 | Crash fault-injection on hash engine | Commit ordering survives torn writes | **2 findings, both fixed** | torn records decoded to wrong-but-valid coins (silent corruption) → +4B keyed record tag, tears now misses; coins-ahead-of-tip tear invisible → index-header watermark, open errors loudly. File-level sim; compact() still unsafe | [fault-inject](2026-09-23-fault-injection.md) |
 
 
+| 59 | 09-24 | Process sandboxing (minimal) | Can the node take a real OS-level defense without new risk? | **adopted — no_new_privs always-on** | `prctl(PR_SET_NO_NEW_PRIVS)` at sync start via the `prctl` crate (workspace forbids unsafe). A wire-parser compromise lands in a process that can never escalate via setuid/file caps — and the node never execve()s, so it costs nothing. seccomp syscall filtering and Landlock datadir scoping stay open (bigger dep surface). | — |
+| 58 | 09-24 | Fail-closed proof (unit) | Can "no clearnet when proxied" be tested, not assumed? | **yes — test shipped** | Mock SOCKS5 listener records connections; a routable candidate + refused proxy greeting yields: proxy saw the dial, zero peers established. A clearnet bypass would be observable as "proxy saw nothing". The 24h live packet-capture artifact stays open. | — |
+| 57 | 09-24 | Fail-closed proxy | Does `-proxy` actually cover all outbound traffic? | **fixed a real leak** | `SyncConfig.proxy` covered only `--connect` peers — `maintain_outbounds`' dial worker connected clearnet regardless, and `seed_from_dns` resolved locally. Now every automatic dial routes through the SOCKS5 proxy (no clearnet fallback — a dead proxy = no peers, not a leak) and DNS seeding is skipped under proxy (Core's `-onlynet=onion` model). | — |
+| 56 | 09-24 | Per-peer budget contract | Are the adversarial limits a published, tested spec? | **adopted — doc** | `docs/PEER_BUDGETS.md` enumerates every per-peer resource bound with enforcement point and proving test; the honest gaps are named at the bottom (per-peer CPU dispatch, recon bisection cap, getcf* rate limiting). | [PEER_BUDGETS.md](../docs/PEER_BUDGETS.md) |
+| 55 | 09-24 | Eclipse indicators | Can the node notice it's being eclipsed? | **adopted (indicators)** | `eclipse_signals`: TipStale (>24h-old tip while ≥4 peers all claim higher), DiversityCollapse (all outbound in one /16), AllInbound (every established peer dialed us). Fires `NetEvent::EclipseSuspected` once/minute; sync logs it, `getevents` exposes it. Indicators, not proof — disjoint-route cross-check (#10) is the escalation. | — |
+| 54 | 09-24 | Continuous self-audit | Can the node re-prove stored blocks cheaply? | **adopted** | `audit_block` re-verifies a stored block's internal proofs (decode + merkle root + witness commitment — no historical UTXO needed); the sync loop samples 8 random heights per 2016 connected blocks, seeded so an adversary can't predict which regions are checked. Loud failure line + cumulative counter. Live UTXO-replay auditing stays open (needs undo-walk). | — |
+| 53 | 09-24 | Sovereign wallet stack completion | What does the watch-wallet surface still lack? | **mostly built; history RPCs closed it** | `getwalletinfo` (descriptors, scan floor, gaps) + `listtransactions` (synthesized receive/send history from per-coin lifecycle) — the stack already had importdescriptors/listdescriptors/listunspent/getbalances/rescanblockchain/deriveaddresses/listreceivedbyaddress + Electrum server + silent-payments watches. The "one binary replaces the EPS/bwt stack" claim is now actually checkable. | — |
+| 52 | 09-24 | Named observability surface | Can the node stream "what it's doing" natively? | **adopted (ring-level)** | `getevents` RPC over a capped 1024-entry `NetEvent` ring in the manager — connects, disconnects, tip advances, announcements, newest first. The `chain_query` channel carries it; mempool/consensus event classes extend it next. ASMap bucketing machinery also landed (#21): ASN-aware outbound dial deprioritization, kartograf-format parsing open. | — |
+| 51 | 09-24 | Mempool analytics (block projection) | Can the node answer "next N blocks" natively? | **adopted** | `block_projection` sorts the pool by modified feerate into ~1MvB virtual blocks; `getmempoolblocks` RPC returns per-band min/median/max feerate + fees — the mempool.space query without the stack. Package-aware ordering (full template machinery per chunk) noted as the refinement. | — |
+| 50 | 09-24 | Dual-engine lockstep (fixture) | Do redb and hashstore diverge on identical commit streams? | **no — 300 rounds identical** | Same mixed create/delete stream committed to both engines; sampled `get` parity after every commit + full `iter_coins` equality at the end. Production live-shadow plumbing stays open; the fixture proves the engines are behaviorally equivalent. | — |
+| 49 | 09-24 | Self-fuzzing canary | Do mutated blocks ever misdecode silently? | **no — 4000 mutants clean** | `mutated_blocks_never_misdecode`: seeded xorshift mutates a real block (bit flips, truncations, extensions, splices); every surviving decode must re-encode byte-identical. The standing red-team harness inside the decoder. | — |
+| 48 | 09-24 | Selfish-stem relay + first-spy sim | Does a 1-hop stem on own-txs hide origin? | **adopted — 5× reduction** | `stem_announce`: own txs inv one random outbound peer, fluff after 2-15s randomized delay; no stempool (dodges the DoS that killed BIP156), zero protocol change. Sim (`tools/firstspy_sim.py`, 300-node graph, 15% spies, 4k runs): first-spy names origin 68.9%→14.4% — residual ≈ spy density. | experiments/2026-09-24-selfish-stem.md |
+| 47 | 09-24 | Transport hardening triplet | Can cheap defenses close documented leaks? | **adopted ×3** | Non-deterministic inbound eviction (Springer evict-and-fill needs steerable picks — now uniform-random among unprotected); V2 decoy injection (~1-in-4 sends carry random-length IGNORE packets, spec-legal, receivers drop silently — fuzzes the length histogram the 2025 analysis classified commands from); recon-diff telemetry (per-peer rounds+misses in getpeerinfo — persistently-wide diff = censorship signal). | — |
+| 46 | 09-24 | Pinning red-team + oracle | Do the documented BIP-431 attacks land, and can we detect them? | **both attacks work; oracle detects** | Descendant-limit pin: 25 junk descendants off the attacker's output → victim's own-output CPFP rejected `PackageLimits` (counterfactual bump accepted clean). Rule-3 pin: 64-output low-feerate conflict prices out a high-feerate small bump → `Conflict`. Oracle: `pinning_risk()` + `getpinningrisk` RPC flags txs within margin of the descendant cap — the test asserts it catches the attack. Generic detection shipped; wallet-labeling waits on #29. | — |
+| 45 | 09-24 | Broadcast pool (Core #30471) | Can own-txs survive fee-spike eviction? | **adopted** | `sendrawtransaction` entries persist outside `map` (300kB cap, oldest-evicted); a 60s `rebroadcast_pass` re-admits + re-announces with 60s→4h exponential backoff; entries drop when inputs confirm-spend elsewhere (UTXO-resolved dead check); persists through a mempool.dat tail section. The "my tx silently vanished" class is closed. | — |
 | 44 | 09-24 | SwiftSync write-elision churn measurement | How much UTXO write load dies within a sync window? | **confirmed — pursue prototype** | 183,884 real signet blocks parsed: 63.3% of all created coins are spent within the window — never needed on disk. Median coin lifetime 2 blocks; 47% of spends same-block; 88% within 1000. The aggregate+hints path would eliminate ~2/3 of coin writes. Caveat: signet churn ≠ mainnet; attacks write tail, not the ~95% script-verification bulk. | [swiftsync](2026-09-24-swiftsync-write-elision.md) |
 | 43 | 09-24 | Repeated-key aggregation in advised ECDSA | Can duplicate public-key terms remove more arithmetic from #40? | **additional CPU win; elapsed benefit inconclusive** | Same 24-block Script replay: ordinary 25.274 CPU s → previous advice 19.133 → repeated-key worker 16.705 (another −12.7%; −33.9% vs ordinary). Historical arithmetic kernel −21.9%; unique-key control +0.3%, within variation. Regtest gains little. 27 kernel + 33 replay comparisons, 95 boundary/protocol checks, and native sanitizer suites pass; same verdict/UTXO hashes and invalid-spend rollback. Same hints and Rust binary; production unchanged, full mainnet IBD unmeasured. | [repeated-keys](2026-09-24-ecdsa-repeated-keys.md) |
 | 42 | 09-24 | BIP-330 tx delivery live + two real sync bugs | Does set reconciliation carry a real transaction end-to-end? | **verified live; bugs fixed** | Two regtest nodes over BIP324-v2: tx mined into A's pool reached B's via sketch diff → reconcildiff ask (33B) → body (430B) → B's mempool — **zero inv announcements** (tx-invs suppressed on recon links). Live run flushed two real bugs: inv bursts >16-slot window were consumed-and-forgotten (fixed: `pending_blocks` drain), and restore was O(n²) via `ancestor_is_invalid` walking to genesis per header on a clean chain (fixed: O(1) early return; 66k headers went 3:45min → instant). | [erlay-sketch](2026-09-24-erlay-sketch.md) |
@@ -144,60 +159,60 @@ first measurement that would kill or confirm it.
 10. **Multi-route sync.** Disjoint transports cross-checking headers —
     eclipse detection by construction.
 
-11. **Process-level sandboxing.** seccomp/capability separation: the
+11. **Process-level sandboxing.** (minimal shipped — #59 no_new_privs always-on; seccomp/Landlock stay open) seccomp/capability separation: the
     P2P stack can't write the datadir, the validator can't open
     sockets, RPC gets its own boundary. Nobody ships OS-level
     containment in a node. Measurable: publish the syscall whitelist,
     test what a compromised wire parser can actually reach.
 
-12. **Eclipse detection (not just resistance).** Watch the signatures —
+12. ~~**Eclipse detection (not just resistance).**~~ **done — #55 (indicators shipped; disjoint-route cross-check open).** Watch the signatures —
     stalled header progress, suspiciously-uniform peer agreement,
     work plateau — and cross-check disjoint routes to prove it. Lab
     experiment: mount a real eclipse, measure detection time.
 
-13. **Fail-closed privacy profile.** Tor unreachable → tx broadcast
+13. ~~**Fail-closed privacy profile.**~~ **done — #57 (found + closed a real leak: proxy didn't cover automatic dials or DNS seeds).** Tor unreachable → tx broadcast
     stops, Electrum stops, RPC stays localhost. Privacy failure
     becomes impossible-by-configuration, not merely unlikely. Nobody
     ships this because it's annoying; it's the only honest privacy
     promise.
 
-14. **Per-peer adversarial accounting.** Formal per-peer budgets —
+14. ~~**Per-peer adversarial accounting.**~~ **done — #56 (contract published; three gap rows named open).** Formal per-peer budgets —
     bytes, CPU, memory, queue slots — as a *tested contract*: fuzz the
     boundaries, prove no hostile peer exceeds allocation under any
     input sequence.
 
-15. **Continuous self-audit.** Background re-verification of random
+15. ~~**Continuous self-audit.**~~ **done — #54 (stored-block integrity; UTXO-replay auditing open).** Background re-verification of random
     historical segments, forever — correctness as an ongoing property,
     catching disk rot and bitflips. Each pass appends receipt evidence.
 
-16. **Pinning oracle.** Mempool watcher that detects pinning patterns
+16. **Pinning oracle.** (partial — #46 generic detection shipped) Mempool watcher that detects pinning patterns
     against the operator's wallet transactions — descendant-limit
     saturation, RBF rule-3 pinning, parked conflicts — and reports it.
     The node tells you when you're under attack; nobody ships this.
     Real value for LN operators.
 
-17. **V2 traffic padding.** The 2025 v2-transport analysis showed
+17. ~~**V2 traffic padding.**~~ **done — #47 (decoy injection; fixed-size cells still open).** The 2025 v2-transport analysis showed
     BIP324 encrypts content but leaks message *shape* via TCP payload
     lengths. BIP324's decoy/garbage mechanism exists for exactly this —
     nobody uses it. Experiment: fixed-size send cells + decoy traffic;
     measure observer command-classification accuracy before/after.
 
-18. **Selfish-stem broadcast.** The DoS objection that killed BIP156
+18. ~~**Selfish-stem broadcast.**~~ **done — #48.** The DoS objection that killed BIP156
     was relaying *unvalidated* stems. Variant: only locally-originated,
     mempool-admitted txs take a stem hop — one outbound link,
     randomized delay, then normal recon fluff. No stempool, no
     unvalidated relay, most of the origin-privacy benefit.
 
-19. **Recon-diff censorship telemetry.** Every recon round already
+19. ~~**Recon-diff censorship telemetry.**~~ **done — #47 (counters in getpeerinfo; alarm thresholds open).** Every recon round already
     computes the per-peer pool diff — surface it. A peer persistently
     missing a large share of your mempool is a censorship/eclipse
     signal. Security telemetry at zero protocol cost.
 
-20. **Non-deterministic inbound eviction.** The evict-and-fill attack
+20. ~~**Non-deterministic inbound eviction.**~~ **done — #47.** The evict-and-fill attack
     (82-97% linkage accuracy) exploits predictable eviction; randomize
     it. Small, bounded.
 
-21. **ASMap bucketing.** Core's deployed Erebus countermeasure —
+21. **ASMap bucketing.** (machinery shipped — #52; kartograf-format map loading open) Core's deployed Erebus countermeasure —
     bucket peers by ASN (Kartograf-reproducible maps) instead of /16.
     A parity gap; well-specified, bounded.
 
@@ -207,10 +222,8 @@ first measurement that would kill or confirm it.
     xpub-watcher, Fully Noded, eps-plugin) exist solely because this
     is clunky on Core. One binary replaces the wallet-backend stack.
 
-30. **Broadcast pool.** Own-broadcast txs protected from mempool
-    eviction, rebroadcast until confirmed, optional future-dated
-    broadcast. Filed as Core issue #30471 — real wallet-dev demand:
-    txs silently vanish during fee spikes today.
+30. ~~**Broadcast pool.**~~ **done — #45.** Own-broadcast txs survive
+    eviction + rebroadcast. (Future-dated broadcast still open.)
 
 31. **SwiftSync-style write-elision IBD.** Hash aggregate (all outputs
     minus all inputs = UTXO set) + untrusted hints file marking
@@ -219,7 +232,7 @@ first measurement that would kill or confirm it.
     First measurement: what fraction of fixture coins die within the
     sync window.
 
-32. **Built-in mempool analytics.** The mempool.space layer native:
+32. ~~**Built-in mempool analytics.**~~ **done — #51 (projection shipped; tx-lifecycle/RBF tracking open).** The mempool.space layer native:
     mempool-block fee forecast, tx lifecycle/RBF tracking, pinning
     surface (compounds with #16). People stand up docker+mysql+electrs
     for this today.
@@ -240,30 +253,30 @@ first measurement that would kill or confirm it.
     eclipse goes undetected — learn it now. Nobody publishes eclipse
     experiments on their own node; even a negative result is tooling.
 
-23. **Pinning red-team.** Implement BIP-431's documented pinning
+23. **Pinning red-team.** (partial — #46 two attacks proven) Implement BIP-431's documented pinning
     attacks as tools (descendant-limit saturation, rule-3 pinning,
     package-limit pinning), run against our mempool on regtest.
     Hypothesis: oracle catches all documented classes with bounded
     false positives. Kill: pinning is indistinguishable from
     legitimate high-descendant usage — the signal isn't separable.
 
-24. **Continuous dual-engine lockstep.** We already have two coins
+24. **Continuous dual-engine lockstep.** (fixture-scale proven — #50; live-shadow plumbing open) We already have two coins
     engines (redb + hashstore) — run both permanently on live traffic,
     divergence = halt. Continuous consensus-equivalence as a running
     property. Kill: second-engine overhead impractical at steady state
     — measure it.
 
-25. **The privacy proof artifact.** Private mode + 24h full outbound
+25. **The privacy proof artifact.** (mechanism-level proof shipped — #58 unit test; the 24h capture run stays open) Private mode + 24h full outbound
     packet capture. Hypothesis: zero non-Tor bytes escape. Kill:
     anything leaks (DNS, NTP, stray v1) — publish exactly where.
 
-26. **First-spy simulation.** Implement the first-spy timing estimator
+26. ~~**First-spy simulation.**~~ **done — #48.** Implement the first-spy timing estimator
     from the Dandelion literature; run against our relay with/without
     selfish-stem. Hypothesis: stem measurably moves detection
     probability. Kill: stem-length-1 doesn't move the needle — learn
     the number before building the real thing.
 
-27. **Self-fuzzing canary.** The node continuously feeds mutated
+27. ~~**Self-fuzzing canary.**~~ **done — #49.** The node continuously feeds mutated
     recent blocks back through its own strict decode path — a standing
     red team inside the node. Kill: generated mutations aren't
     interesting enough to catch what a test suite misses.
