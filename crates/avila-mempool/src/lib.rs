@@ -38,6 +38,11 @@ pub const MAX_STANDARD_TX_SIGOPS_COST: u64 = avila_consensus::check::MAX_BLOCK_S
 /// cover its own relay at this rate on top of the conflicting tx's fee.
 pub const INCREMENTAL_RELAY_FEE: i64 = 100; // sat/kvB
 
+/// Core's `ROLLING_FEE_HALFLIFE` — the time (12 hours) for the rolling
+/// minimum fee to decay by half; the pool halves that halflife again
+/// under half its byte cap, and again under a quarter.
+pub const ROLLING_FEE_HALFLIFE_SECS: f64 = 12.0 * 60.0 * 60.0;
+
 /// Bound on pool entries — a belt alongside the `DEFAULT_MAX_BYTES`
 /// suspenders; either cap trips the evict-lowest-feerate path.
 pub const DEFAULT_MAX_ENTRIES: usize = 25_000;
@@ -164,6 +169,12 @@ pub enum MempoolReject {
     /// skipped entirely.
     #[error("{0}")]
     NotStandard(&'static str),
+    /// Below Core's rolling `CTxMemPool::GetMinFee` floor — a second,
+    /// independent gate from [`Self::MinRelayFee`] that only ever binds
+    /// once a size-based trim has evicted something, decaying back
+    /// toward zero afterward.
+    #[error("mempool min fee not met")]
+    MempoolMinFeeNotMet,
 }
 
 /// Core's `DEFAULT_ANCESTOR_LIMIT` — a candidate may not bring its
@@ -326,6 +337,18 @@ pub struct Mempool {
     permit_bare_multisig: bool,
     /// Core's `-dustrelayfee` in sat/kvB.
     dust_relay_fee: i64,
+    /// Core's `rollingMinimumFeeRate` (sat/kvB) — the extra floor
+    /// `min_mempool_fee` enforces on top of `min_relay_fee`, raised
+    /// whenever a size-based trim evicts something and decaying back
+    /// toward zero afterward. Zero until the pool has ever trimmed.
+    rolling_min_fee: f64,
+    /// Core's `lastRollingFeeUpdate` — the `now` at which
+    /// `rolling_min_fee` was last set; decay is computed as elapsed
+    /// time since this point.
+    last_rolling_fee_update: u32,
+    /// Core's `blockSinceLastRollingFeeBump` — decay is paused (the raw
+    /// `rolling_min_fee` applies unchanged) until a block connects.
+    block_since_rolling_fee_bump: bool,
     /// Confirmation observations from connected blocks.
     estimator: FeeEstimator,
     /// `prioritisetransaction` accumulations by txid — Core's
@@ -361,6 +384,9 @@ impl Mempool {
             max_datacarrier_bytes: Some(policy::MAX_OP_RETURN_RELAY),
             permit_bare_multisig: policy::DEFAULT_PERMIT_BAREMULTISIG,
             dust_relay_fee: policy::DUST_RELAY_TX_FEE,
+            rolling_min_fee: 0.0,
+            last_rolling_fee_update: 0,
+            block_since_rolling_fee_bump: false,
             estimator: FeeEstimator::new(),
             deltas: HashMap::new(),
             unbroadcast: HashSet::new(),
@@ -435,6 +461,53 @@ impl Mempool {
     /// Overrides the min-relay fee rate (sat/kvB) — an operator knob.
     pub fn set_min_relay_fee(&mut self, sat_per_kvb: i64) {
         self.min_relay_fee = sat_per_kvb;
+    }
+
+    /// Core's `rollingMinimumFeeRate` decayed to `now` — the raw
+    /// internal rate a lazy `CTxMemPool::GetMinFee` call would have left
+    /// the field holding, before the final `max` with the incremental
+    /// relay fee and before its "already decayed away" hard zero.
+    /// Recomputed fresh from [`Self::last_rolling_fee_update`] each call
+    /// rather than cached in place (Core mutates the field on every
+    /// `GetMinFee`; a pure recompute observes identically at any given
+    /// `now` since exponential decay composes across sub-intervals).
+    fn rolling_rate_now(&self, now: u32) -> f64 {
+        if !self.block_since_rolling_fee_bump || self.rolling_min_fee <= 0.0 {
+            return self.rolling_min_fee;
+        }
+        let elapsed = f64::from(now.saturating_sub(self.last_rolling_fee_update));
+        let mut halflife = ROLLING_FEE_HALFLIFE_SECS;
+        if self.pool_bytes < self.max_bytes / 4 {
+            halflife /= 4.0;
+        } else if self.pool_bytes < self.max_bytes / 2 {
+            halflife /= 2.0;
+        }
+        let decayed = self.rolling_min_fee / 2f64.powf(elapsed / halflife);
+        if decayed < INCREMENTAL_RELAY_FEE as f64 / 2.0 {
+            0.0
+        } else {
+            decayed
+        }
+    }
+
+    /// The rolling minimum feerate (sat/kvB) a transaction's fee must
+    /// clear on top of [`Self::min_relay_fee`] — Core's `CTxMemPool::
+    /// GetMinFee`. Zero until a size-based trim has ever evicted
+    /// something; then decays back toward zero over
+    /// [`ROLLING_FEE_HALFLIFE_SECS`] (faster while the pool is well
+    /// under its byte cap), floored at [`INCREMENTAL_RELAY_FEE`] while
+    /// it hasn't fully decayed away.
+    #[must_use]
+    pub fn min_mempool_fee(&self, now: u32) -> i64 {
+        if !self.block_since_rolling_fee_bump || self.rolling_min_fee <= 0.0 {
+            return self.rolling_min_fee.round() as i64;
+        }
+        let rate = self.rolling_rate_now(now);
+        if rate <= 0.0 {
+            0
+        } else {
+            (rate.round() as i64).max(INCREMENTAL_RELAY_FEE)
+        }
     }
 
     /// Overrides the entry cap — an operator knob.
@@ -619,7 +692,7 @@ impl Mempool {
         &self,
         tx: &Transaction,
         cs: &avila_consensus::chainstate::Chainstate,
-        _now: u32,
+        now: u32,
     ) -> Vec<PolicyStep> {
         fn push(
             steps: &mut Vec<PolicyStep>,
@@ -991,6 +1064,22 @@ impl Mempool {
             return steps;
         }
 
+        let modified_fee = fee.saturating_add(self.deltas.get(&tx.txid()).copied().unwrap_or(0));
+        let mempool_min_fee = self.min_mempool_fee(now);
+        if !push(
+            &mut steps,
+            "mempool-min-fee",
+            if modified_fee * 1000 < mempool_min_fee * vsize as i64 {
+                Err(format!(
+                    "mempool min fee not met: {modified_fee} sat for {vsize} vB (floor {mempool_min_fee} sat/kvB)"
+                ))
+            } else {
+                Ok(format!("{modified_fee} sat for {vsize} vB"))
+            },
+        ) {
+            return steps;
+        }
+
         push(
             &mut steps,
             "capacity",
@@ -1192,13 +1281,17 @@ impl Mempool {
         }
         let (_, fee) =
             check_tx_inputs(&tx, &overlay, next_height).map_err(MempoolReject::Inputs)?;
+        // Core's `GetModifiedFee` for a not-yet-pooled tx: a
+        // `prioritisetransaction` delta recorded before the tx arrived
+        // applies immediately (mirrors the same lookup at entry
+        // construction, step 11 below).
+        let modified_fee = fee.saturating_add(self.deltas.get(&txid).copied().unwrap_or(0));
 
         // 4.5 Ephemeral dust (Core's `PreCheckEphemeralTx`,
         //    `require_standard`-gated): a tx creating dust must be
         //    exactly 0-fee — Core's `AreInputsStandard`/dust cap above
         //    already limit it to at most one dust output.
         if self.require_standard {
-            let modified_fee = fee.saturating_add(self.deltas.get(&txid).copied().unwrap_or(0));
             policy::precheck_ephemeral(&tx, self.dust_relay_fee, fee, modified_fee)
                 .map_err(MempoolReject::NotStandard)?;
         }
@@ -1242,6 +1335,16 @@ impl Mempool {
             return Err(MempoolReject::MinRelayFee);
         }
 
+        // 8.5 Rolling mempool-min-fee floor (Core's `CTxMemPool::
+        //    GetMinFee`) — a *second*, independent floor from the static
+        //    min-relay-fee above: it's zero until a size-based trim ever
+        //    evicts something, then decays back toward zero over
+        //    `ROLLING_FEE_HALFLIFE_SECS`.
+        let mempool_min_fee = self.min_mempool_fee(now);
+        if modified_fee * 1000 < mempool_min_fee * vsize as i64 {
+            return Err(MempoolReject::MempoolMinFeeNotMet);
+        }
+
         // 9. Capacity: either cap (entries or serialized bytes — Core's
         //    `-maxmempool` analog) trips the evict-the-worst path. The
         //    victim is picked by descendant score (Core's `TrimToSize`/
@@ -1253,6 +1356,10 @@ impl Mempool {
         //    its own (fee, vsize) is its whole score for this
         //    comparison — it has no descendants to fold in.
         let tx_size = tx.encode().len();
+        // The highest-rate cluster removed during this trim, tracked so
+        // the rolling-fee bump below uses the whole pass's high-water
+        // mark — Core's `maxFeeRateRemoved`, not each individual removal.
+        let mut removed_high: Option<(i64, usize)> = None;
         while self.map.len() >= self.max_entries || self.pool_bytes + tx_size > self.max_bytes {
             let Some(worst_id) = self.worst_by_descendant_score() else {
                 return Err(MempoolReject::Full);
@@ -1261,9 +1368,30 @@ impl Mempool {
             if (fee as i128) * (worst_size as i128) <= (worst_fee as i128) * (vsize as i128) {
                 return Err(MempoolReject::Full);
             }
+            let removed = self.cluster_totals(&worst_id);
+            let better = removed_high.is_none_or(|(rf, rs)| {
+                (removed.0 as i128) * (rs as i128) > (rf as i128) * (removed.1 as i128)
+            });
+            if better {
+                removed_high = Some(removed);
+            }
             // The evicted entry's descendants leave with it — Core's
             // TrimToSize drops clusters, not lone txs.
             self.remove_recursive(&worst_id);
+        }
+        // Core's `TrackPackageRemoved`: the rolling floor only ever
+        // rises here, to the priciest thing this trim gave up plus one
+        // incremental relay fee — never lowered except by time decay.
+        // Compared against the *decayed-to-now* rate, not the raw stored
+        // field, since nothing else keeps that field's decay current.
+        if let Some((removed_fee, removed_size)) = removed_high {
+            let removed_rate = removed_fee * 1000 / removed_size.max(1) as i64;
+            let bumped = removed_rate.saturating_add(INCREMENTAL_RELAY_FEE);
+            if bumped as f64 > self.rolling_rate_now(now) {
+                self.rolling_min_fee = bumped as f64;
+                self.last_rolling_fee_update = now;
+                self.block_since_rolling_fee_bump = false;
+            }
         }
 
         // 10. BIP125 replacement: drop the conflicts (their descendants
@@ -1433,10 +1561,29 @@ impl Mempool {
         (descendants.len(), vsize)
     }
 
+    /// `(fee, vsize)` of `txid` together with every one of its current
+    /// in-pool descendants — Core's `GetModFeesWithDescendants`/
+    /// `GetSizeWithDescendants`. Missing/unpooled `txid` reports as
+    /// `(0, 1)` (a harmless, never-winning score; `1` avoids a zero
+    /// denominator in rate comparisons).
+    fn cluster_totals(&self, txid: &Txid) -> (i64, usize) {
+        let Some(entry) = self.map.get(txid) else {
+            return (0, 1);
+        };
+        let mut totals = (entry.modified_fee(), entry.vsize);
+        for id in self.descendant_txids(txid) {
+            if let Some(e) = self.map.get(&id) {
+                totals.0 = totals.0.saturating_add(e.modified_fee());
+                totals.1 = totals.1.saturating_add(e.vsize);
+            }
+        }
+        totals
+    }
+
     /// Core's `CompareTxMemPoolEntryByDescendantScore`'s per-entry score
-    /// (its `GetModFeeAndSize`): `(fee, vsize)` for whichever is the
-    /// higher feerate of the entry's own pair and its pair *with* every
-    /// current in-pool descendant folded in. A low-fee parent with a
+    /// (its `GetModFeeAndSize`): whichever is the higher feerate of the
+    /// entry's own `(fee, vsize)` and its [`Self::cluster_totals`] (self
+    /// plus every current in-pool descendant). A low-fee parent with a
     /// rich descendant is scored at the descendants' rate rather than
     /// its own, so trimming can't take the rich descendant down just to
     /// evict a merely-mediocre parent. Returns a `(fee, size)` pair
@@ -1447,13 +1594,7 @@ impl Mempool {
             return (0, 1);
         };
         let own = (entry.modified_fee(), entry.vsize);
-        let mut with_descendants = own;
-        for id in self.descendant_txids(txid) {
-            if let Some(e) = self.map.get(&id) {
-                with_descendants.0 = with_descendants.0.saturating_add(e.modified_fee());
-                with_descendants.1 = with_descendants.1.saturating_add(e.vsize);
-            }
-        }
+        let with_descendants = self.cluster_totals(txid);
         // `with_descendants` rate > `own` rate, cross-multiplied to
         // avoid floating point (Core's `f1`/`f2` comparison in doubles).
         if (with_descendants.0 as i128) * (own.1 as i128)
@@ -1783,6 +1924,9 @@ impl Mempool {
     /// `removeForBlock`-lite: confirmed txs leave the pool, and so do
     /// conflicts that can no longer confirm.
     pub fn on_block_connected(&mut self, block: &avila_consensus::block::Block, conf_height: u32) {
+        // Core's `blockSinceLastRollingFeeBump = true`: a connected
+        // block un-pauses the rolling-fee decay.
+        self.block_since_rolling_fee_bump = true;
         let mut dead: Vec<Txid> = Vec::new();
         for tx in &block.transactions {
             let txid = tx.txid();
@@ -2561,10 +2705,17 @@ mod tests {
         assert_eq!(pool.accept_tx(rich, &cs, NOW), Ok(rich_id));
         assert!(pool.get(&weak_id).is_none());
         assert!(pool.get(&rich_id).is_some());
-        // …but an equal-or-lower feerate bounces off the full pool.
+        // …but an equal-or-lower feerate bounces off the full pool —
+        // now via the rolling min-fee floor fix 8 raised when `weak` was
+        // trimmed (Core's `TrackPackageRemoved`: evicted rate +
+        // incremental relay fee), which binds before capacity is even
+        // reconsidered for a rate this far under `rich`'s.
         // (h1's outpoint freed when `weak` was evicted.)
         let poor = spend_tx(mature_outpoint(&blocks, 1), 4_999_999_500, SEQ_FINAL);
-        assert_eq!(pool.accept_tx(poor, &cs, NOW), Err(MempoolReject::Full));
+        assert_eq!(
+            pool.accept_tx(poor, &cs, NOW),
+            Err(MempoolReject::MempoolMinFeeNotMet)
+        );
         assert!(pool.pool_bytes + 8 <= cap);
     }
 
@@ -2612,6 +2763,57 @@ mod tests {
         );
         assert!(pool.get(&c_id).is_some(), "rich child untouched");
         assert!(pool.get(&d_id).is_some());
+    }
+
+    #[test]
+    fn rolling_min_fee_rejects_until_it_decays() {
+        // Core's `CTxMemPool::GetMinFee`: a size-based trim raises the
+        // rolling floor to the evicted entry's rate plus the
+        // incremental relay fee; a later, otherwise-fine tx below that
+        // floor is rejected until decay (paced by connected blocks, not
+        // wall-clock alone) brings the floor back down.
+        let (cs, blocks) = chainstate_at(102);
+        let mut pool = permissive_pool();
+        let sized = spend_tx(mature_outpoint(&blocks, 1), 4_999_999_000, SEQ_FINAL);
+        pool.set_max_bytes(sized.encode().len() + 8);
+
+        let weak = spend_tx(mature_outpoint(&blocks, 1), 4_999_999_000, SEQ_FINAL); // fee 1,000
+        pool.accept_tx(weak, &cs, NOW).unwrap();
+        assert_eq!(pool.min_mempool_fee(NOW), 0, "no trim yet — no extra floor");
+
+        // A huge-fee tx of a different outpoint forces the byte cap and
+        // evicts `weak`, raising the rolling floor.
+        let rich = spend_tx(mature_outpoint(&blocks, 2), 1_000, SEQ_FINAL);
+        pool.accept_tx(rich, &cs, NOW).unwrap();
+        let floor = pool.min_mempool_fee(NOW);
+        assert!(floor > 0, "trim must raise the rolling floor");
+
+        // `mid` clears the (0.1 sat/vB) min-relay-fee comfortably but
+        // not the new rolling floor.
+        let mid = spend_tx(mature_outpoint(&blocks, 3), 4_999_999_500, SEQ_FINAL); // fee 500
+        assert_eq!(
+            pool.accept_tx(mid.clone(), &cs, NOW),
+            Err(MempoolReject::MempoolMinFeeNotMet)
+        );
+
+        // Decay is paused until a block connects (Core's
+        // `blockSinceLastRollingFeeBump`) — a wall-clock jump alone
+        // doesn't move the floor.
+        assert_eq!(pool.min_mempool_fee(NOW + 30 * 24 * 60 * 60), floor);
+        let params = Network::Regtest.params();
+        let tip = cs.tree().tip();
+        let fake_block = block_on(&tip.header, tip.height + 1, &params);
+        pool.on_block_connected(&fake_block, tip.height + 1);
+
+        // Many halflives after that, the floor has decayed away and the
+        // same tx is admitted — lift the byte cap first so only the
+        // rolling-fee recovery is under test, not capacity (the pool is
+        // still pinned to one entry's worth of bytes from the setup
+        // above, and `mid`'s fee alone could never outbid `rich`'s).
+        pool.set_max_bytes(DEFAULT_MAX_BYTES);
+        let much_later = NOW + 30 * 24 * 60 * 60;
+        assert_eq!(pool.min_mempool_fee(much_later), 0);
+        assert!(pool.accept_tx(mid, &cs, much_later).is_ok());
     }
 
     #[test]
