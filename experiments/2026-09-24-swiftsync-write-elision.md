@@ -69,9 +69,29 @@ skipped — script validation still runs on every input; only the
   the aggregate can't answer membership queries; SwiftSync keeps a
   compact live set, it just doesn't flush the dead.
 
+## Fixture bench — where the win binds
+
+`connect_bench` on the 625-block regtest fixture:
+
+- **512MiB / 8MiB cache: zero backend writes** — the entire live set
+  (~13k coins) fits in the write-back cache; nothing ever flushes.
+  Storage share of connect time: ~3% either way. Scripts are 96%.
+- **1MiB cache: 2 commits, 13,791 puts, 2,008 dels** — ~15% of backend
+  writes were later deleted. Intra-flush elision already eats
+  same-window churn; the 15% is the cross-window residue.
+
+Honest reading: **the win binds only when the live set exceeds cache**
+— mainnet IBD (170M coins vs ~0.5-4GB dbcache) flushes constantly, and
+the signet churn data says ~63% of that flush traffic is doomed
+coins. On a fixture small enough to cache, there is nothing to save.
+That is the correct scoping: this is a mainnet-IBD optimization, not
+a general speedup — same class as assumeutxo.
+
 ## Verdict
 
 **Hypothesis confirmed; pursue the prototype.** 63% write elimination
-on real network data is worth the machinery. Next step: a bench that
-replays the fixture with the aggregate path — measure actual
-wall-clock and disk-bytes deltas vs. the current backend.
+on real network data is worth the machinery — but the payoff lives at
+mainnet scale. Design note for the prototype: the hints file is
+untrusted survivor data — wrong hints just fail the aggregate check
+at the checkpoint and fall back to the normal path. Nothing about
+consensus is skipped.
