@@ -161,9 +161,11 @@ pub(crate) fn decode_coin(b: &[u8], fmt: CoinFormat) -> Option<Coin> {
 /// `Compact` records decode through a byte-slice reader — the varints
 /// are Core's `VARINT` (MSB-first base-128), not CompactSize.
 fn decode_coin_compact(r: &mut &[u8]) -> Option<Coin> {
-    let code = crate::utxo_snapshot::read_varint(r).ok()?;
-    let amount = crate::utxo_snapshot::read_varint(r).ok()?;
-    let size_id = crate::utxo_snapshot::read_varint(r).ok()?;
+    // Bounded like Core's wire types: `Coin::code` and
+    // `ScriptCompression::nSize` are `uint32_t`; amounts are `uint64_t`.
+    let code = crate::utxo_snapshot::read_varint(r, u64::from(u32::MAX)).ok()?;
+    let amount = crate::utxo_snapshot::read_varint(r, u64::MAX).ok()?;
+    let size_id = crate::utxo_snapshot::read_varint(r, u64::from(u32::MAX)).ok()?;
     let script = crate::utxo_snapshot::decompress_script(r, size_id).ok()?;
     Some(Coin {
         out: crate::transaction::TxOut {

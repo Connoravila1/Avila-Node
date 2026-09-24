@@ -281,14 +281,19 @@ fn read_metadata_inner(
     })
 }
 
-/// `VARINT`'s inverse — `ReadVarInt` in `NONNEGATIVE_SIGNED` mode:
+/// `VARINT`'s inverse — `ReadVarInt<I>` in `NONNEGATIVE_SIGNED` mode:
 /// MSB-first base-128, `n = (n << 7) | (b & 0x7f)`, with the extra
-/// `n++` Core applies per continuation byte.
-pub(crate) fn read_varint(r: &mut impl std::io::Read) -> std::io::Result<u64> {
+/// `n++` Core applies per continuation byte. Bounded by `max` — the
+/// destination type's maximum, exactly like Core (`n > max >> 7`
+/// before folding in each byte, `n == max` before each `n++`), not by
+/// `u64::MAX` unconditionally: `Coin`'s `code` and `ScriptCompression`'s
+/// `nSize` are `uint32_t` on the wire, so a value only representable
+/// past `u32::MAX` is exactly as invalid to Core as a truncated stream.
+pub(crate) fn read_varint(r: &mut impl std::io::Read, max: u64) -> std::io::Result<u64> {
     let mut buf = [0u8; 1];
     let mut n = 0u64;
     loop {
-        if n > u64::MAX >> 7 {
+        if n > max >> 7 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "ReadVarInt(): size too large",
@@ -297,12 +302,13 @@ pub(crate) fn read_varint(r: &mut impl std::io::Read) -> std::io::Result<u64> {
         r.read_exact(&mut buf)?;
         n = (n << 7) | u64::from(buf[0] & 0x7f);
         if buf[0] & 0x80 != 0 {
-            n = n.checked_add(1).ok_or_else(|| {
-                std::io::Error::new(
+            if n == max {
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "ReadVarInt(): too-large value",
-                )
-            })?;
+                ));
+            }
+            n += 1;
         } else {
             return Ok(n);
         }
@@ -497,9 +503,11 @@ pub fn read_coins<R: std::io::Read>(
         for _ in 0..coins_per_txid {
             let outpoint_vout =
                 read_compact_size_from(r).map_err(|_| truncated(coins_processed))?;
-            let code = read_varint(r).map_err(|_| truncated(coins_processed))?;
-            let amount_raw = read_varint(r).map_err(|_| truncated(coins_processed))?;
-            let size_id = read_varint(r).map_err(|_| truncated(coins_processed))?;
+            let code =
+                read_varint(r, u64::from(u32::MAX)).map_err(|_| truncated(coins_processed))?;
+            let amount_raw = read_varint(r, u64::MAX).map_err(|_| truncated(coins_processed))?;
+            let size_id =
+                read_varint(r, u64::from(u32::MAX)).map_err(|_| truncated(coins_processed))?;
             let script = decompress_script(r, size_id).map_err(|_| truncated(coins_processed))?;
             let coin = Coin {
                 out: crate::transaction::TxOut {
@@ -666,5 +674,25 @@ mod tests {
         assert_eq!(got[0].1.out.value, 5_000);
         assert_eq!(got[0].1.out.script_pubkey.as_bytes(), script.as_bytes());
         assert_eq!(got[0].1.height, 100);
+    }
+
+    /// Core's `ReadVarInt<uint32_t>` (used for `Coin::code` and
+    /// `ScriptCompression::nSize`) must reject a value past `u32::MAX`
+    /// even though the identical bytes decode fine as a `u64` (the
+    /// bound amounts use).
+    #[test]
+    fn read_varint_bounds_by_destination_type() {
+        let max = u64::from(u32::MAX);
+        let mut buf = Vec::new();
+        write_varint(&mut buf, max);
+        assert_eq!(read_varint(&mut &buf[..], max).unwrap(), max);
+
+        let mut buf = Vec::new();
+        write_varint(&mut buf, max + 1);
+        assert!(
+            read_varint(&mut &buf[..], max).is_err(),
+            "must reject past u32::MAX"
+        );
+        assert_eq!(read_varint(&mut &buf[..], u64::MAX).unwrap(), max + 1);
     }
 }
