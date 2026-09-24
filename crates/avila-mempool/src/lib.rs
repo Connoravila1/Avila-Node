@@ -1609,9 +1609,9 @@ impl Mempool {
                 // arrived applies now (Core reads mapDeltas at
                 // admission into the entry's nFeeDelta).
                 fee_delta: self.deltas.get(&txid).copied().unwrap_or(0),
-                // No descendants yet — just itself, until an ancestor
-                // propagation step below (for some *other*, later tx)
-                // or a future child's own admission adds to this.
+                // Just itself for now — a pre-existing descendant (the
+                // reorg re-add case below) or a future child's own
+                // admission adds to this.
                 fees_with_descendants: modified_fee,
                 size_with_descendants: vsize,
             },
@@ -1623,8 +1623,37 @@ impl Mempool {
         // `ANCESTOR_LIMIT` (25), so this is a handful of `O(log n)`
         // `BTreeSet` operations, not a walk over the whole pool.
         self.resync_score_index(txid, None);
-        for ancestor in ancestors {
-            self.adjust_descendant_totals(ancestor, modified_fee, vsize as i64);
+        for ancestor in &ancestors {
+            self.adjust_descendant_totals(*ancestor, modified_fee, vsize as i64);
+        }
+        // Reorg re-add: this entry can already have in-pool descendants
+        // — a child that stayed pooled while this tx was mined, now
+        // finding itself pointed at a pooled parent again once the
+        // block disconnects and this tx comes back through
+        // `reinsert_disconnected` (Core's `UpdateTransactionsFromBlock`/
+        // `UpdateForDescendants`). A cheap `spends`-index check per
+        // output first, so ordinary admission — where nothing yet
+        // spends the brand-new txid — never pays for the descendant
+        // walk below; each pre-existing descendant is counted once,
+        // into this entry's own aggregates and every one of its
+        // ancestors', even if more than one re-added tx in the same
+        // batch shares it.
+        let outputs_len = self.map.get(&txid).map_or(0, |e| e.tx.outputs.len());
+        let has_existing_descendant =
+            (0..outputs_len as u32).any(|vout| self.spends.contains_key(&OutPoint { txid, vout }));
+        if has_existing_descendant {
+            let mut extra_fee = 0i64;
+            let mut extra_size = 0i64;
+            for id in self.descendant_txids(&txid) {
+                if let Some(e) = self.map.get(&id) {
+                    extra_fee = extra_fee.saturating_add(e.modified_fee());
+                    extra_size = extra_size.saturating_add(e.vsize as i64);
+                }
+            }
+            self.adjust_descendant_totals(txid, extra_fee, extra_size);
+            for ancestor in &ancestors {
+                self.adjust_descendant_totals(*ancestor, extra_fee, extra_size);
+            }
         }
         // Newly pooled outputs may un-orphan parked children — Core's
         // ProcessOrphanTx recursion. Repeat until no orphan resolves:
@@ -4118,6 +4147,68 @@ mod tests {
             1
         );
         assert!(pool.get(&spend_txid).is_some());
+        pool.assert_descendant_totals_consistent();
+    }
+
+    #[test]
+    fn reorg_readd_folds_in_a_child_that_stayed_pooled() {
+        // Core's `UpdateTransactionsFromBlock`/`UpdateForDescendants`: a
+        // reorg can re-add a tx (via `reinsert_disconnected`) that
+        // already has an in-pool descendant — a child that spent its
+        // output while it was still confirmed and stayed pooled
+        // straight through the disconnect. Without folding that child's
+        // fee/vsize into the newly re-added parent's aggregates (and
+        // every one of the parent's own ancestors'), the parent's
+        // descendant score is undercounted until the child is later
+        // removed, at which point subtracting the child's contribution
+        // pushes the parent's aggregates below its own true totals.
+        let (mut cs, blocks) = chainstate_at(101);
+        let params = Network::Regtest.params();
+        let op = mature_outpoint(&blocks, 1);
+        let p = spend_tx(op, 4_999_000_000, SEQ_FINAL);
+        let p_id = p.txid();
+        let b102 = block_with(&blocks[100].header, 102, p, &params);
+        cs.accept_block(&b102, NOW).unwrap();
+
+        // While b102 is connected, P's output is a UTXO — C is
+        // admissible with no pooled ancestors at all.
+        let mut pool = permissive_pool();
+        let c = spend_tx(
+            OutPoint {
+                txid: p_id,
+                vout: 0,
+            },
+            4_998_000_000,
+            SEQ_FINAL,
+        );
+        let c_id = c.txid();
+        pool.accept_tx(c, &cs, NOW).unwrap();
+        assert_eq!(pool.len(), 1);
+
+        // A heavier, non-conflicting rival chain disconnects b102 — P
+        // becomes unconfirmed again and is re-added through the real
+        // reorg path, landing on top of C, which stayed pooled
+        // throughout.
+        let c102 = block_on(&blocks[100].header, 102, &params);
+        let c103 = block_on(&c102.header, 103, &params);
+        cs.accept_block(&c102, NOW).unwrap();
+        cs.accept_block(&c103, NOW).unwrap();
+        let gone = cs.take_disconnected();
+        assert_eq!(gone, vec![b102.block_hash()]);
+
+        assert_eq!(
+            pool.refill_from_disconnected(&gone, &cs, NOW, true, usize::MAX),
+            1
+        );
+        assert!(pool.get(&p_id).is_some());
+        assert!(pool.get(&c_id).is_some());
+        pool.assert_descendant_totals_consistent();
+
+        // Removing C afterward must not leave P's aggregates
+        // over- or under-counted.
+        pool.remove_recursive(&c_id);
+        assert!(pool.get(&c_id).is_none());
+        assert!(pool.get(&p_id).is_some());
         pool.assert_descendant_totals_consistent();
     }
 
