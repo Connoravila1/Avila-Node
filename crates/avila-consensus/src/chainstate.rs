@@ -1047,6 +1047,16 @@ impl Chainstate {
         self.scripthashindex.is_some()
     }
 
+    /// Index size: `(unique script hashes, total history entries)` —
+    /// the cost-model numbers for the opt-in profile.
+    pub fn scripthash_index_stats(&self) -> Option<(usize, usize)> {
+        let idx = self.scripthashindex.as_ref()?;
+        Some((
+            idx.by_script.len(),
+            idx.by_script.values().map(Vec::len).sum(),
+        ))
+    }
+
     /// Whether `-blockfilterindex` is active — `getindexinfo` reports
     /// `basic block filter index` under it.
     #[must_use]
