@@ -15,9 +15,9 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use avila_consensus::block::Block;
 use avila_consensus::encode::write_var_bytes;
@@ -42,6 +42,24 @@ const MSG_SUBMIT_SOLUTION: u8 = 0x76;
 
 /// Highest Sv2 version this TP speaks.
 const MAX_VERSION: u16 = 2;
+
+/// Hard cap on concurrent Sv2 connections — a loopback template
+/// channel serves a handful of local proxies at most; past this the
+/// listener drops new sockets rather than spawning unbounded threads.
+const MAX_CONNECTIONS: usize = 16;
+
+/// A connection that hasn't completed `SetupConnection` within this
+/// window is dropped. Only a per-`read` timeout bounded any single
+/// read; nothing bounded the connection's lifetime, so an unauthenticated
+/// peer that stays silent (or trickles bytes) could hold a thread —
+/// and a slot under [`MAX_CONNECTIONS`] — open indefinitely.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Set to `1` to let [`serve`] bind a non-loopback address. Plaintext
+/// Sv2 framing (no Noise `NX` yet, see the module doc) is only safe on
+/// loopback; this is an explicit, operator-chosen override for anyone
+/// who has already put something else (a VPN, an SSH tunnel) in front.
+const ALLOW_NONLOOPBACK_ENV: &str = "AVILA_SV2_ALLOW_NONLOOPBACK";
 
 /// A served template — everything needed to rebuild the block from a
 /// `SubmitSolution` coinbase.
@@ -116,42 +134,105 @@ fn merkle_path(txids: &[[u8; 32]]) -> Vec<[u8; 32]> {
     path
 }
 
-/// Serves the Sv2 TP protocol on `addr`. Plaintext framing; bind
-/// loopback-only unless Noise lands.
+/// Serves the Sv2 TP protocol on `addr`. Plaintext framing; refuses to
+/// bind a non-loopback address unless [`ALLOW_NONLOOPBACK_ENV`] opts
+/// in, since plaintext is only legal for loopback until Noise lands
+/// (see the module doc).
+///
+/// # Errors
+/// `io::Error` if the listener cannot bind, or (`PermissionDenied`) if
+/// `addr` isn't loopback and the opt-in isn't set.
 pub fn serve(
     addr: SocketAddr,
     queries: QuerySender,
     cancel: Arc<AtomicBool>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
+    let allow_nonloopback = std::env::var(ALLOW_NONLOOPBACK_ENV).as_deref() == Ok("1");
+    if refuses_bind(&addr, allow_nonloopback) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "sv2: refusing to bind non-loopback {addr} — plaintext framing has no Noise \
+                 encryption yet; set {ALLOW_NONLOOPBACK_ENV}=1 to override"
+            ),
+        ));
+    }
     let listener = TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
     Ok(thread::spawn(move || {
-        while !cancel.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let queries = queries.clone();
-                    let cancel = cancel.clone();
-                    thread::spawn(move || handle(stream, queries, cancel));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(_) => thread::sleep(Duration::from_millis(50)),
-            }
-        }
+        accept_loop(listener, queries, cancel);
     }))
 }
 
-fn handle(mut stream: TcpStream, queries: QuerySender, cancel: Arc<AtomicBool>) {
+/// Whether [`serve`] should refuse to bind `addr` — split out as a
+/// pure function so the opt-in decision is unit-testable without
+/// mutating the process environment (`std::env::set_var` requires
+/// `unsafe` and touches every thread's env, so `serve` itself reads
+/// the flag but this function decides).
+fn refuses_bind(addr: &SocketAddr, allow_nonloopback: bool) -> bool {
+    !addr.ip().is_loopback() && !allow_nonloopback
+}
+
+/// The listener's accept loop — split out from [`serve`] so tests can
+/// drive it against a listener bound to an OS-chosen port (`serve`
+/// itself never hands the bound address back to the caller).
+fn accept_loop(listener: TcpListener, queries: QuerySender, cancel: Arc<AtomicBool>) {
+    let conns = Arc::new(AtomicUsize::new(0));
+    while !cancel.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if conns.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                    // Over the cap — drop the socket rather than spawn
+                    // another unbounded thread.
+                    drop(stream);
+                    continue;
+                }
+                conns.fetch_add(1, Ordering::Relaxed);
+                let queries = queries.clone();
+                let cancel = cancel.clone();
+                let conns = conns.clone();
+                thread::spawn(move || {
+                    handle(stream, queries, cancel);
+                    conns.fetch_sub(1, Ordering::Relaxed);
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+fn handle(stream: TcpStream, queries: QuerySender, cancel: Arc<AtomicBool>) {
+    handle_with_timeout(stream, queries, cancel, HANDSHAKE_TIMEOUT);
+}
+
+/// [`handle`]'s body, with the handshake deadline as a parameter so
+/// tests can exercise it without a real 10-second wait.
+fn handle_with_timeout(
+    mut stream: TcpStream,
+    queries: QuerySender,
+    cancel: Arc<AtomicBool>,
+    handshake_timeout: Duration,
+) {
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .ok();
     let mut templates: HashMap<u64, ServedTemplate> = HashMap::new();
     let mut next_id: u64 = 1;
     let mut subscribed = false;
+    let mut setup_done = false;
+    let handshake_deadline = Instant::now() + handshake_timeout;
     let mut last_tip = [0u8; 32];
     loop {
         if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        if !setup_done && Instant::now() > handshake_deadline {
+            // Never completed SetupConnection — drop it rather than
+            // hold the thread (and its MAX_CONNECTIONS slot) open on
+            // an unauthenticated peer indefinitely.
             return;
         }
         let mut hdr = [0u8; 6];
@@ -215,6 +296,7 @@ fn handle(mut stream: TcpStream, queries: QuerySender, cancel: Arc<AtomicBool>) 
                 if send(&mut stream, MSG_SETUP_SUCCESS, &p).is_err() {
                     return;
                 }
+                setup_done = true;
             }
             MSG_COINBASE_OUTPUT_CONSTRAINTS => {
                 if payload.len() < 6 {
@@ -495,5 +577,104 @@ mod tests {
         assert_eq!(buf.len(), 8 + 1 + 5);
         assert_eq!(buf[8], 5);
         assert_eq!(&buf[9..], &script[..]);
+    }
+
+    #[test]
+    fn refuses_bind_requires_loopback_or_opt_in() {
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let remote: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        assert!(!refuses_bind(&loopback, false));
+        assert!(refuses_bind(&remote, false));
+        assert!(!refuses_bind(&remote, true), "the opt-in must allow it");
+    }
+
+    /// `serve` itself must refuse a non-loopback address by default —
+    /// the module comment's "loopback-only until Noise lands" rule,
+    /// enforced rather than just documented.
+    #[test]
+    fn serve_refuses_nonloopback_by_default() {
+        let (qtx, _qrx) = std::sync::mpsc::channel::<crate::rpc::ChainQuery>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let remote: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let err = serve(remote, qtx.clone(), cancel.clone()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        // The default (loopback) case must still work.
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let handle = serve(loopback, qtx, cancel.clone()).unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+
+    /// The accept loop must not spawn unbounded per-connection
+    /// threads — past `MAX_CONNECTIONS` a new socket is dropped
+    /// outright rather than served.
+    #[test]
+    fn accept_loop_enforces_connection_cap() {
+        let (qtx, _qrx) = std::sync::mpsc::channel::<crate::rpc::ChainQuery>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let cancel2 = cancel.clone();
+        thread::spawn(move || accept_loop(listener, qtx, cancel2));
+
+        // Open MAX_CONNECTIONS + a few more — every one past the cap
+        // must be closed immediately (a read on it hits EOF) instead
+        // of served.
+        let mut conns: Vec<TcpStream> = (0..MAX_CONNECTIONS + 4)
+            .map(|_| TcpStream::connect(addr).unwrap())
+            .collect();
+        thread::sleep(Duration::from_millis(500));
+
+        let mut accepted = 0;
+        let mut rejected = 0;
+        for conn in &mut conns {
+            conn.set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let mut buf = [0u8; 1];
+            match conn.read(&mut buf) {
+                Ok(0) => rejected += 1,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    accepted += 1;
+                }
+                other => panic!("unexpected read result: {other:?}"),
+            }
+        }
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(rejected, 4, "accepted={accepted} rejected={rejected}");
+        assert_eq!(accepted, MAX_CONNECTIONS);
+    }
+
+    /// A connection that never completes `SetupConnection` must not
+    /// hold its thread (and a `MAX_CONNECTIONS` slot) open forever —
+    /// past the handshake deadline it's dropped.
+    #[test]
+    fn handshake_deadline_drops_silent_connections() {
+        let (qtx, _qrx) = std::sync::mpsc::channel::<crate::rpc::ChainQuery>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // A blocking listener — exactly one connection is expected, so
+        // there's no need for accept_loop's nonblocking poll here.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (q, c) = (qtx, cancel.clone());
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_with_timeout(stream, q, c, Duration::from_millis(150));
+        });
+
+        let mut conn = TcpStream::connect(addr).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // Say nothing — never send SetupConnection.
+        let mut buf = [0u8; 1];
+        let n = conn.read(&mut buf).unwrap_or(0);
+        assert_eq!(
+            n, 0,
+            "a silent connection must be dropped once the handshake deadline passes"
+        );
+        cancel.store(true, Ordering::Relaxed);
     }
 }
