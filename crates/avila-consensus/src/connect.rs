@@ -1301,7 +1301,7 @@ fn connect_block_inner(
             // avoids a second full signature-verification pass.
             if !tx.is_coinbase()
                 && ctx.script_checks
-                && !crate::sigchecker::scripts_verified(&tx.txid(), flags)
+                && !crate::sigchecker::scripts_verified(&tx.wtxid(), flags)
             {
                 let spent_outs: Vec<TxOut> = spent.iter().map(|c| c.out.clone()).collect();
                 if ctx.script_pool.is_some() {
@@ -1955,6 +1955,66 @@ mod tests {
         };
         spend.inputs[0].witness = Witness::new(vec![witness_script]);
         chain.extend(vec![coinbase(103, SUBSIDY), spend]).unwrap();
+    }
+
+    #[test]
+    fn verified_cache_keyed_by_wtxid_rejects_witness_swap() {
+        // Regression: the script-verified cache used to be keyed by txid.
+        // The txid only commits to the non-witness serialization, so a tx
+        // "verified" (e.g. at mempool acceptance) and then rebroadcast in a
+        // block with the *same txid* but a swapped, hash-mismatching witness
+        // used to skip re-verification entirely and connect. The cache must
+        // be keyed by wtxid, which does commit to the witness.
+        let mut chain = Chain::new(easy_params());
+        let cb_outs = chain.grow_to(101);
+        // A P2WSH coin whose witness script is a lone OP_1.
+        let witness_script = vec![script::OP_1];
+        let program = crate::hash::sha256(&witness_script);
+        let mut wsh = vec![script::OP_0, 0x20];
+        wsh.extend_from_slice(&program);
+        let setup = Transaction {
+            version: 1,
+            inputs: vec![txin(cb_outs[0], vec![], SEQUENCE_FINAL)],
+            outputs: vec![txout(1_000, wsh.clone())],
+            lock_time: 0,
+        };
+        let block102 = chain.extend(vec![coinbase(102, SUBSIDY), setup]).unwrap();
+        let wsh_out = OutPoint {
+            txid: block102.transactions[1].txid(),
+            vout: 0,
+        };
+
+        // The "mempool" tx: a correct witness satisfying the P2WSH program.
+        let mut good = Transaction {
+            version: 1,
+            inputs: vec![txin(wsh_out, vec![], SEQUENCE_FINAL)],
+            outputs: vec![txout(999, ANYONE.to_vec())],
+            lock_time: 0,
+        };
+        good.inputs[0].witness = Witness::new(vec![witness_script]);
+        let spent_outs = vec![txout(1_000, wsh)];
+        let flags = block_script_flags(&chain.params, 103, &BlockHash::ZERO);
+        check_input_scripts(&good, &spent_outs, flags).unwrap();
+        // Simulate mempool acceptance caching the pass (under a superset of
+        // any block's consensus flags, as Core's standardness flags are).
+        crate::sigchecker::mark_scripts_verified(good.wtxid(), ScriptFlags::from_bits(u32::MAX));
+
+        // Same txid (identical non-witness fields), but a different witness
+        // whose hash doesn't match the committed program.
+        let mut evil = good.clone();
+        evil.inputs[0].witness = Witness::new(vec![vec![script::OP_1, script::OP_1]]);
+        assert_eq!(evil.txid(), good.txid());
+        assert_ne!(evil.wtxid(), good.wtxid());
+
+        let before = chain.utxo.clone();
+        let err = chain
+            .extend(vec![coinbase(103, SUBSIDY), evil])
+            .unwrap_err();
+        assert!(
+            matches!(err, ConnectError::ScriptVerify(_)),
+            "expected a script-verify rejection, got {err:?}"
+        );
+        assert_eq!(chain.utxo, before, "failed connect must roll back cleanly");
     }
 
     #[test]

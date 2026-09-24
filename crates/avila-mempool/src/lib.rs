@@ -1237,7 +1237,7 @@ impl Mempool {
         //    is still block-valid, just not relayed). `flags` and
         //    `spent_outs` were already computed above (2.4/2.5).
         check_input_scripts(&tx, &spent_outs, flags).map_err(MempoolReject::ScriptVerify)?;
-        avila_consensus::sigchecker::mark_scripts_verified(tx.txid(), flags);
+        avila_consensus::sigchecker::mark_scripts_verified(tx.wtxid(), flags);
 
         // 8. Min relay fee (Core: fee >= GetVirtualTransactionSize *
         //    minRelayTxFee / 1000).

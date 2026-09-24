@@ -3442,7 +3442,7 @@ mod tests {
                     .map(|i| cs.utxo().get(&i.previous_output).unwrap().out)
                     .collect();
                 crate::sigchecker::check_input_scripts(tx, &outs, flags).unwrap();
-                crate::sigchecker::mark_scripts_verified(tx.txid(), flags);
+                crate::sigchecker::mark_scripts_verified(tx.wtxid(), flags);
             }
             cs.accept_block(block, NOW)
                 .unwrap_or_else(|e| panic!("accept {e:?}"));
@@ -3458,16 +3458,16 @@ mod tests {
     fn verified_cache_flag_containment() {
         // A tx verified under a flag-set that does NOT contain the
         // block's flags must not be skipped — containment, not equality.
-        let txid = crate::hash::Txid::from_bytes([7; 32]);
-        crate::sigchecker::mark_scripts_verified(txid, crate::script::ScriptFlags::P2SH);
+        let wtxid = crate::hash::Wtxid::from_bytes([7; 32]);
+        crate::sigchecker::mark_scripts_verified(wtxid, crate::script::ScriptFlags::P2SH);
         let strict = crate::script::ScriptFlags::P2SH
             .union(crate::script::ScriptFlags::WITNESS)
             .union(crate::script::ScriptFlags::TAPROOT);
-        assert!(!crate::sigchecker::scripts_verified(&txid, strict));
+        assert!(!crate::sigchecker::scripts_verified(&wtxid, strict));
         // Verified under strict, queried under subset — a real hit.
-        crate::sigchecker::mark_scripts_verified(txid, strict);
+        crate::sigchecker::mark_scripts_verified(wtxid, strict);
         assert!(crate::sigchecker::scripts_verified(
-            &txid,
+            &wtxid,
             crate::script::ScriptFlags::P2SH
         ));
     }

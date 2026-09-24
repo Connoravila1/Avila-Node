@@ -85,7 +85,7 @@ fn main() {
                     .map(|i| cs.utxo().get(&i.previous_output).expect("in-fx utxo").out)
                     .collect();
                 check_input_scripts(tx, &outs, flags).expect("mempool verify");
-                mark_scripts_verified(tx.txid(), flags);
+                mark_scripts_verified(tx.wtxid(), flags);
             }
         }
         let t0 = Instant::now();

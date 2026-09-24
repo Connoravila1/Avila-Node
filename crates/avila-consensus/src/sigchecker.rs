@@ -802,13 +802,18 @@ pub static VERIFY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// never adds a requirement). Core's mempool does the same dedup via
 /// its script-check cache.
 ///
-/// Keyed by txid — the txid commits to the full tx (inputs, outputs,
-/// sequences), and the spent outpoints uniquely determine the coins
-/// read, so a cached pass is sound for the same tx under any height.
+/// Keyed by **wtxid**, not txid — the txid only commits to the
+/// non-witness serialization, so two txs with the same txid can carry
+/// different witnesses (e.g. a P2WSH spend with a swapped, invalid
+/// witness). A cache keyed by txid would let a block smuggle in an
+/// unverified witness under an already-verified txid. The wtxid
+/// commits to the full tx including witness data (Core's
+/// CheckInputScripts: "only pass in things ... clearly committed to
+/// by tx' witness hash"), so a cached pass under `Wtxid` is sound.
 /// FIFO eviction, bounded.
 struct VerifiedCache {
-    map: std::collections::HashMap<crate::hash::Txid, u32>,
-    order: std::collections::VecDeque<crate::hash::Txid>,
+    map: std::collections::HashMap<crate::hash::Wtxid, u32>,
+    order: std::collections::VecDeque<crate::hash::Wtxid>,
 }
 
 static VERIFIED: std::sync::LazyLock<std::sync::Mutex<VerifiedCache>> =
@@ -823,9 +828,9 @@ const VERIFIED_CAP: usize = 50_000;
 
 /// Records a tx's scripts as verified under `flags` (call after a
 /// successful `check_input_scripts`, e.g. mempool acceptance).
-pub fn mark_scripts_verified(txid: crate::hash::Txid, flags: crate::script::ScriptFlags) {
+pub fn mark_scripts_verified(wtxid: crate::hash::Wtxid, flags: crate::script::ScriptFlags) {
     let mut c = VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
-    if c.map.contains_key(&txid) {
+    if c.map.contains_key(&wtxid) {
         return;
     }
     if c.order.len() >= VERIFIED_CAP {
@@ -833,15 +838,15 @@ pub fn mark_scripts_verified(txid: crate::hash::Txid, flags: crate::script::Scri
             c.map.remove(&old);
         }
     }
-    c.order.push_back(txid);
-    c.map.insert(txid, flags.bits());
+    c.order.push_back(wtxid);
+    c.map.insert(wtxid, flags.bits());
 }
 
 /// True when the tx's scripts were verified under a flag-set that
 /// contains `flags` (block_flags ⊆ verified_flags → skip is sound).
-pub fn scripts_verified(txid: &crate::hash::Txid, flags: crate::script::ScriptFlags) -> bool {
+pub fn scripts_verified(wtxid: &crate::hash::Wtxid, flags: crate::script::ScriptFlags) -> bool {
     let c = VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
-    match c.map.get(txid) {
+    match c.map.get(wtxid) {
         Some(&verified) if flags.bits() & !verified == 0 => {
             VERIFIED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true
