@@ -512,6 +512,12 @@ impl HeaderTree {
     /// between `pindexPrev` and the failed ancestor. `false` when the walk reaches the
     /// tree boundary (genesis) without hitting a failed node.
     pub(crate) fn ancestor_is_invalid(&mut self, mut cursor: BlockHash) -> bool {
+        // Empty failure set: no ancestor can be marked — the walk would
+        // reach genesis and return false anyway. Restores run this per
+        // header; without the fast path the whole replay is O(n²).
+        if self.invalid.is_empty() {
+            return false;
+        }
         let mut path = Vec::new();
         let hit = loop {
             if self.invalid.contains(&cursor) {
