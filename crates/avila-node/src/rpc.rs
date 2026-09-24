@@ -5127,6 +5127,11 @@ pub(crate) fn dispatch(
                     }
                 },
             };
+            // CVerifyDB::VerifyDB: `nCheckLevel = max(0, min(4,
+            // nCheckLevel))`. A negative level isn't "skip
+            // verification" (avila's own verify_tip's shortcut) — Core
+            // clamps it up to 0 and still runs the level-0 checks.
+            let level = level.clamp(0, 4);
             let depth = match arr.get(1) {
                 None | Some(Value::Null) => 6, // -checkdepth default (29.x)
                 Some(v) => match v.as_i64() {
@@ -5139,9 +5144,26 @@ pub(crate) fn dispatch(
                     }
                 },
             };
-            // Core applies no range gate on either value — VerifyDB
-            // clamps depth to the tip and level < 0 checks nothing.
             chain_query(method, queries, move |cs, _| {
+                // Same VerifyDB rule for nblocks: <=0 or past the tip
+                // means the whole chain. Clamped here against the
+                // state this query actually sees rather than trusting
+                // a height read before the query was queued.
+                //
+                // Architectural note: this still runs the whole
+                // re-verification on the sync loop's single thread —
+                // the only place `Chainstate` is reachable — so a deep
+                // verifychain call blocks block sync and every other
+                // chain RPC for as long as it takes. Unlike addnode's
+                // DNS lookup, there's no way to precompute this off
+                // that thread: the check needs the live chainstate
+                // itself, not just a value derived from it.
+                let tip = cs.chain().len() as i64 - 1;
+                let depth = if depth <= 0 || depth > tip {
+                    tip
+                } else {
+                    depth
+                };
                 Ok(json!(cs.verify_tip(level, depth)))
             })
         }
@@ -14672,9 +14694,11 @@ mod tests {
         assert_eq!(r, json!([]));
     }
 
-    /// `verifychain` — the bool result plus Core's arg contract: no
-    /// range gate on checklevel/nblocks, -3 type errors per position,
-    /// -1 for non-integral or excess args.
+    /// `verifychain` — the bool result plus Core's arg contract: -3
+    /// type errors per position, -1 for non-integral or excess args.
+    /// checklevel/nblocks take any value without erroring (Core clamps
+    /// rather than rejects) — see `verifychain_clamps_checklevel` for
+    /// the clamp itself.
     #[test]
     fn verifychain_dispatch_contract() {
         let queries = query_server(Chainstate::new(&Network::Regtest.params()));
@@ -14722,6 +14746,97 @@ mod tests {
             );
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
+    }
+
+    /// A negative checklevel must clamp to 0 (Core's `max(0, min(4,
+    /// level))` in `CVerifyDB::VerifyDB`) rather than skip verification
+    /// outright — the gap only shows up once there's something to
+    /// fail: a genesis-only chain "verifies" either way.
+    #[test]
+    fn verifychain_clamps_checklevel() {
+        let params = Network::Regtest.params();
+        let dir = std::env::temp_dir().join(format!(
+            "avila-rpc-verifychain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = crate::time::time() as u32;
+        let cs = Chainstate::with_store(&dir, &params, now).unwrap();
+        let queries = query_server(cs);
+        let snap = snap();
+        let addr = "bcrt1q9mc2hc2f6x2lsxh7xnuu3fdjj628hvjatzgxcr"; // real regtest P2WPKH
+
+        let (r, e) = dispatch(
+            "generatetoaddress",
+            &json!([2, addr]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r.as_array().unwrap().len(), 2);
+
+        // Sanity: the freshly mined chain verifies at every level.
+        let (r, e) = dispatch(
+            "verifychain",
+            &json!([4, 0]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, json!(true));
+
+        // Bodies gone from under the live store (Core's
+        // ReadBlockFromDisk failure) — a non-negative level fails at
+        // the body-presence check regardless of how high it is.
+        std::fs::remove_file(dir.join("blk00000.dat")).unwrap();
+        let (r, e) = dispatch(
+            "verifychain",
+            &json!([0, 0]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, json!(false), "level 0 must still check bodies");
+
+        // The bug: -1 used to take avila's own "check_level < 0" early
+        // return in verify_tip and report true unconditionally. Once
+        // clamped to 0 in rpc.rs before it ever reaches verify_tip, it
+        // must fail exactly like level 0 just did.
+        let (r, e) = dispatch(
+            "verifychain",
+            &json!([-1, 0]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(
+            r,
+            json!(false),
+            "checklevel -1 must clamp to 0, not skip verification"
+        );
+
+        drop(queries);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Node-admin quartet: `getchainstates` shape, `pruneblockchain`'s
