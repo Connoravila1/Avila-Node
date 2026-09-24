@@ -58,21 +58,35 @@ pub fn show(
     let pulse = s.pulse().map(|f| (deliverer, f));
     let now = s.session.now();
     let mut outcome = Outcome::default();
+    const SKY: f32 = 380.0;
     if ui.available_width() >= 900.0 {
         ui.horizontal_top(|ui| {
             let w = ui.available_width() - SIDE - 32.0;
             ui.allocate_ui_with_layout(vec2(w, 0.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(w);
-                outcome = sky.show(ui, &peers, *selected, pulse, now, 380.0, s.swirl);
+                outcome = sky.show(ui, &peers, *selected, pulse, now, SKY, s.swirl);
+                ui.add_space(8.0);
+                constellation::legend(ui);
             });
             ui.add_space(32.0);
-            ui.allocate_ui_with_layout(vec2(SIDE, 0.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(SIDE);
-                panel(ui, s, &peers, selected);
-            });
+            ui.allocate_ui_with_layout(
+                vec2(SIDE, SKY + 40.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_width(SIDE);
+                    egui::ScrollArea::vertical()
+                        .id_salt("peer-panel")
+                        .max_height(SKY + 40.0)
+                        .min_scrolled_height(SKY + 40.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| panel(ui, s, &peers, selected));
+                },
+            );
         });
     } else {
         outcome = sky.show(ui, &peers, *selected, pulse, now, 320.0, s.swirl);
+        ui.add_space(8.0);
+        constellation::legend(ui);
         ui.add_space(12.0);
         panel(ui, s, &peers, selected);
     }
@@ -81,8 +95,6 @@ pub fn show(
     } else if outcome.clicked_empty {
         *selected = None;
     }
-    ui.add_space(8.0);
-    constellation::legend(ui);
     shared_groups(ui, s, &peers);
     ui.add_space(22.0);
     table(ui, s, &peers, selected);
@@ -179,33 +191,39 @@ fn detail(ui: &mut Ui, s: &Scene, p: &PeerView) -> bool {
     heading(ui, s, "Transport");
     match &p.session_id {
         Some(id) => {
-            ui.label(
-                RichText::new("Encrypted with BIP324")
-                    .size(14.0)
-                    .color(pal.text),
-            );
-            ui.add_space(4.0);
             ui.horizontal_top(|ui| {
                 randomart(ui, id, &pal);
-                ui.add_space(10.0);
+                ui.add_space(12.0);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    for pair in fingerprint::hex_groups(id).chunks(2) {
-                        ui.label(
-                            RichText::new(pair.join(" "))
-                                .font(mono(11.5))
-                                .color(pal.muted),
-                        );
-                    }
+                    ui.label(
+                        RichText::new("Encrypted · BIP324")
+                            .size(13.5)
+                            .color(pal.text),
+                    );
                     ui.add_space(4.0);
-                    if widgets::button(ui, "Copy id", Kind::Quiet).clicked() {
-                        ui.ctx().copy_text(fingerprint::hex_groups(id).concat());
+                    let groups = fingerprint::hex_groups(id);
+                    let hex = groups
+                        .chunks(2)
+                        .map(|pair| pair.join(" "))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let resp = ui
+                        .add(
+                            egui::Label::new(RichText::new(hex).font(mono(11.5)).color(pal.muted))
+                                .sense(Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::Copy)
+                        .on_hover_text("Copy the session id");
+                    if resp.clicked() {
+                        ui.ctx().copy_text(groups.concat());
                     }
                 });
             });
+            ui.add_space(2.0);
             ui.label(
                 RichText::new(
-                    "Both ends derive this session id. If the other side’s matches — its getpeerinfo shows the same hex — nobody is in the middle.",
+                    "Both ends derive the same id. If the other side’s getpeerinfo shows it too, nobody is in the middle.",
                 )
                 .size(12.5)
                 .color(pal.faint),
@@ -213,8 +231,8 @@ fn detail(ui: &mut Ui, s: &Scene, p: &PeerView) -> bool {
         }
         None => {
             ui.label(
-                RichText::new("Plaintext (v1). Anyone on the path can read this connection.")
-                    .size(14.0)
+                RichText::new("Plaintext (v1): anyone on the path can read this connection.")
+                    .size(13.5)
                     .color(pal.muted),
             );
         }
@@ -222,17 +240,16 @@ fn detail(ui: &mut Ui, s: &Scene, p: &PeerView) -> bool {
 
     heading(ui, s, "Relay");
     let relay = if p.recon {
-        "Reconciles transactions with Erlay (BIP330): sets are compared instead of announcing each one."
+        "Reconciles transactions with Erlay (BIP330)"
     } else {
-        "Announces transactions one by one (no Erlay on this link)."
+        "Announces each transaction (no Erlay on this link)"
     };
     ui.label(RichText::new(relay).size(13.5).color(pal.text));
     let offers = services(p.services);
     if !offers.is_empty() {
-        ui.add_space(2.0);
         ui.label(
-            RichText::new(format!("Offers: {}", offers.join(", ")))
-                .size(13.0)
+            RichText::new(format!("Offers {}", offers.join(", ").to_lowercase()))
+                .size(12.5)
                 .color(pal.muted),
         );
     }
@@ -241,35 +258,33 @@ fn detail(ui: &mut Ui, s: &Scene, p: &PeerView) -> bool {
     traffic(ui, s, p);
 
     heading(ui, s, "Record");
-    facts(ui, "peer-record", |ui| {
-        let ping = match (p.ping_ms, p.ping_min_ms) {
-            (Some(ms), Some(min)) => format!("{ms:.0} ms (best {min:.0} ms)"),
-            (Some(ms), None) => format!("{ms:.0} ms"),
-            _ => "—".into(),
-        };
-        let delivered = match p.last_block {
-            Some(h) => format!("{} · latest {}", p.blocks_served, thousands(h.into())),
-            None => p.blocks_served.to_string(),
-        };
-        let height = p
-            .their_height
-            .filter(|h| *h > 0)
-            .map_or("—".into(), |h| thousands(h as u64));
-        for (k, v) in [
-            ("Ping", ping),
-            ("Blocks delivered", delivered),
-            ("Height at connect", height),
-        ] {
-            key(ui, s, k);
-            ui.label(RichText::new(v).font(mono(12.5)).color(pal.text));
-            ui.end_row();
-        }
-    });
+    let ping = match (p.ping_ms, p.ping_min_ms) {
+        (Some(ms), Some(min)) => format!("Ping {ms:.0} ms, best {min:.0} ms"),
+        (Some(ms), None) => format!("Ping {ms:.0} ms"),
+        _ => "No ping yet".into(),
+    };
+    let delivered = match p.last_block {
+        Some(h) => format!(
+            "{} blocks delivered, latest {}",
+            p.blocks_served,
+            thousands(h.into())
+        ),
+        None => format!("{} blocks delivered", p.blocks_served),
+    };
+    let height = p
+        .their_height
+        .filter(|h| *h > 0)
+        .map_or("Height at connect unknown".into(), |h| {
+            format!("At height {} when it connected", thousands(h as u64))
+        });
+    for line in [ping, delivered, height] {
+        ui.label(RichText::new(line).size(13.0).color(pal.text));
+    }
     closed
 }
 
 fn heading(ui: &mut Ui, s: &Scene, text: &str) {
-    ui.add_space(14.0);
+    ui.add_space(12.0);
     ui.label(
         RichText::new(text)
             .font(font(theme::MEDIUM, 12.5))
@@ -282,7 +297,7 @@ fn facts(ui: &mut Ui, id: &str, rows: impl FnOnce(&mut Ui)) {
     egui::Grid::new(id)
         .num_columns(2)
         .spacing([20.0, 7.0])
-        .min_col_width(120.0)
+        .min_col_width(150.0)
         .show(ui, rows);
 }
 
@@ -341,6 +356,8 @@ fn shade(pal: &Palette, purpose: Purpose) -> Color32 {
     pal.text.gamma_multiply(ALPHA[purpose as usize])
 }
 
+/// Two bars, received and sent, split by purpose; hover a segment for
+/// its bytes.
 fn traffic(ui: &mut Ui, s: &Scene, p: &PeerView) {
     let pal = s.pal;
     let w = ui.available_width().min(SIDE);
@@ -355,8 +372,7 @@ fn traffic(ui: &mut Ui, s: &Scene, p: &PeerView) {
             });
         });
         let (rect, _) = ui.allocate_exact_size(vec2(w, 9.0), Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, 3, pal.well);
+        ui.painter().rect_filled(rect, 3, pal.well);
         if total > 0 {
             let mut x = rect.left();
             for purpose in Purpose::ALL {
@@ -366,43 +382,27 @@ fn traffic(ui: &mut Ui, s: &Scene, p: &PeerView) {
                 }
                 let seg = rect.width() * (n as f64 / total as f64) as f32;
                 let r = Rect::from_x_y_ranges(x..=(x + seg).min(rect.right()), rect.y_range());
-                painter.rect_filled(r, 0, shade(&pal, purpose));
+                ui.painter().rect_filled(r, 0, shade(&pal, purpose));
+                ui.interact(r, ui.id().with((label, purpose as usize)), Sense::hover())
+                    .on_hover_text(format!("{}: {}", purpose.label(), bytes(n)));
                 x += seg;
             }
         }
-        ui.add_space(4.0);
+        ui.add_space(3.0);
     }
-    // The key, with both directions per purpose.
-    egui::Grid::new("traffic-key")
-        .num_columns(3)
-        .spacing([14.0, 4.0])
-        .show(ui, |ui| {
-            for purpose in Purpose::ALL {
-                let (r, t) = (
-                    p.traffic.recv[purpose as usize],
-                    p.traffic.sent[purpose as usize],
-                );
-                if r == 0 && t == 0 {
-                    continue;
-                }
-                ui.horizontal(|ui| {
-                    let (sw, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-                    ui.painter().rect_filled(sw, 2, shade(&pal, purpose));
-                    ui.label(RichText::new(purpose.label()).size(12.5).color(pal.text));
-                });
-                ui.label(
-                    RichText::new(format!("↓ {}", bytes(r)))
-                        .font(mono(11.5))
-                        .color(pal.muted),
-                );
-                ui.label(
-                    RichText::new(format!("↑ {}", bytes(t)))
-                        .font(mono(11.5))
-                        .color(pal.muted),
-                );
-                ui.end_row();
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        for purpose in Purpose::ALL {
+            let used = p.traffic.recv[purpose as usize] + p.traffic.sent[purpose as usize];
+            if used == 0 {
+                continue;
             }
-        });
+            let (sw, _) = ui.allocate_exact_size(vec2(9.0, 9.0), Sense::hover());
+            ui.painter().rect_filled(sw, 2, shade(&pal, purpose));
+            ui.label(RichText::new(purpose.label()).size(12.0).color(pal.muted));
+            ui.add_space(6.0);
+        }
+    });
 }
 
 /// Outbound peers sharing a network group are the one thing here worth

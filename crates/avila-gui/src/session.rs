@@ -505,9 +505,14 @@ impl Session {
                     .iter()
                     .find(|(height, _)| *height == h)
                     .map(|(_, hash)| hash.clone());
+                let from = next
+                    .established()
+                    .find(|p| p.last_block == Some(h))
+                    .map(|p| format!(", delivered by {}", peer_name(p)))
+                    .unwrap_or_default();
                 self.log(
                     ActivityKind::Blocks,
-                    format!("Connected block {}", thousands(h.into())),
+                    format!("Connected block {}{from}", thousands(h.into())),
                     hash,
                     t,
                 );

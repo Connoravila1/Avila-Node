@@ -504,12 +504,12 @@ pub fn legend(ui: &mut Ui) {
             ui.label(RichText::new(text).size(12.5).color(pal.muted));
             ui.add_space(8.0);
         }
-        ui.label(
-            RichText::new("Closer is a faster ping; bigger dots delivered more blocks.")
-                .size(12.5)
-                .color(pal.faint),
-        );
     });
+    ui.label(
+        RichText::new("Closer means a faster ping; bigger dots delivered more blocks.")
+            .size(12.5)
+            .color(pal.faint),
+    );
 }
 
 #[cfg(test)]
