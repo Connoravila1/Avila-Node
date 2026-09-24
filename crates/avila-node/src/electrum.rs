@@ -342,7 +342,7 @@ fn pump_notifications(
             let note = json!({
                 "jsonrpc": "2.0",
                 "method": "blockchain.scripthash.subscribe",
-                "params": [hex::encode(&sh), status],
+                "params": [format_scripthash(&sh), status],
             });
             send(state, &note);
         }
@@ -946,14 +946,28 @@ fn chain_value(
     }
 }
 
+/// Parses a scripthash from its wire hex form. Like a tx/block hash,
+/// the protocol carries `sha256(scriptPubKey)` byte-reversed in hex
+/// (protocol-basics.html#script-hashes) — reverse back to the raw
+/// digest order every internal comparison uses (see [`format_scripthash`]
+/// for the inverse).
 fn parse_scripthash(s: &str) -> Option<[u8; 32]> {
-    let b = hex::decode(s).ok()?;
+    let mut b = hex::decode(s).ok()?;
     if b.len() != 32 {
         return None;
     }
+    b.reverse();
     let mut a = [0u8; 32];
     a.copy_from_slice(&b);
     Some(a)
+}
+
+/// Formats a raw-order scripthash for the wire — the inverse of
+/// [`parse_scripthash`].
+fn format_scripthash(sh: &[u8; 32]) -> String {
+    let mut reversed = *sh;
+    reversed.reverse();
+    hex::encode(&reversed)
 }
 
 /// The SPV merkle branch for `txids[pos]` — sibling hashes leafward
@@ -1126,7 +1140,7 @@ mod tests {
         assert!(r["result"].is_array());
 
         send(
-            json!({"jsonrpc":"2.0","id":2,"method":"blockchain.scripthash.get_history","params":[hex::encode(&spk_sh)]}),
+            json!({"jsonrpc":"2.0","id":2,"method":"blockchain.scripthash.get_history","params":[format_scripthash(&spk_sh)]}),
         );
         let r = read(&mut rd);
         let hist = r["result"].as_array().unwrap();
@@ -1134,7 +1148,7 @@ mod tests {
         assert_eq!(hist[0]["height"], 1);
 
         send(
-            json!({"jsonrpc":"2.0","id":3,"method":"blockchain.scripthash.get_balance","params":[hex::encode(&spk_sh)]}),
+            json!({"jsonrpc":"2.0","id":3,"method":"blockchain.scripthash.get_balance","params":[format_scripthash(&spk_sh)]}),
         );
         let r = read(&mut rd);
         assert_eq!(r["result"]["confirmed"], 5_000_000_000i64, "reply: {r}");
@@ -1236,7 +1250,7 @@ mod tests {
         let watch_spk = vec![0x51u8, 0x02];
         let watch_sh = sha256(&watch_spk);
         send(
-            json!({"jsonrpc":"2.0","id":1,"method":"blockchain.scripthash.subscribe","params":[hex::encode(&watch_sh)]}),
+            json!({"jsonrpc":"2.0","id":1,"method":"blockchain.scripthash.subscribe","params":[format_scripthash(&watch_sh)]}),
         );
         let r = read(&mut rd);
         assert!(r["result"].is_null(), "fresh script: {r}");
@@ -1280,11 +1294,37 @@ mod tests {
             let m: Value = serde_json::from_str(&line).unwrap();
             if m["method"] == "blockchain.scripthash.subscribe" {
                 assert!(m["params"][1].is_string(), "push: {m}");
+                // The pushed scripthash must echo back in the same
+                // reversed wire form the client subscribed with.
+                assert_eq!(
+                    m["params"][0],
+                    json!(format_scripthash(&watch_sh)),
+                    "push: {m}"
+                );
                 got_push = true;
                 break;
             }
         }
         assert!(got_push, "mempool tx must fire the subscription");
         cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// The Electrum protocol doc's own worked example: the P2PKH
+    /// script for `1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa` has scripthash
+    /// `8b01df4e368ea28f8dc0423bcf7a4923e3a12d307c875e47a0cfbf90b5c39161`
+    /// (protocol-basics.html#script-hashes) — `sha256(scriptPubKey)`
+    /// with the bytes reversed for the wire, exactly like a tx hash.
+    #[test]
+    fn scripthash_matches_protocol_spec_example() {
+        let params = Network::Mainnet.params();
+        let script = avila_consensus::address::address_to_script(
+            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+            &params,
+        )
+        .unwrap();
+        let raw = sha256(script.as_bytes());
+        let wire = "8b01df4e368ea28f8dc0423bcf7a4923e3a12d307c875e47a0cfbf90b5c39161";
+        assert_eq!(format_scripthash(&raw), wire);
+        assert_eq!(parse_scripthash(wire), Some(raw));
     }
 }
