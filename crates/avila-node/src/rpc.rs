@@ -923,8 +923,24 @@ fn fund_spend(
     let amount: i64 = dest_outputs.iter().map(|o| o.value).sum();
     // p2wpkh in ≈68 vB, out ≈31 vB, overhead ≈11 — change counted
     // up front (Core's conservative estimate).
+    // Maturity gate (Core's IsImmatureCoinBase): coinbases are
+    // spendable only past 100 confirmations — the wallet must not
+    // pick what consensus rejects as premature.
+    let tip_h = cs.tree().tip().height;
+    let mature = |c: &crate::watch::WatchedCoin| -> bool {
+        !c.coinbase
+            || cs
+                .tree()
+                .get(&c.block)
+                .map(|n| tip_h.saturating_sub(n.height) + 1 >= 100)
+                .unwrap_or(false)
+    };
     let mut chosen: Vec<(OutPoint, i64)> = Vec::new();
-    let mut coins: Vec<_> = w.unspent().map(|(op, c)| (op, c.value)).collect();
+    let mut coins: Vec<_> = w
+        .unspent()
+        .filter(|(_, c)| mature(c))
+        .map(|(op, c)| (op, c.value))
+        .collect();
     coins.sort_by_key(|c| std::cmp::Reverse(c.1));
     let mut est_vsize = 11i64 + 31 * (dest_outputs.len() as i64 + 1);
     for (op, v) in coins {
@@ -16047,6 +16063,124 @@ mod tests {
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r.as_array().unwrap().len(), 3, "{r}");
+    }
+
+    /// The wallet e2e (queue #35's missing harness): a real dispatch
+    /// path against a live regtest chainstate — descriptor seed →
+    /// address → funded by generatetoaddress → spend into the mempool
+    /// → vault export/lock/load → mnemonic restore.
+    #[test]
+    fn wallet_e2e_fund_spend_vault_mnemonic() {
+        let params = Network::Regtest.params();
+        let queries = query_server(Chainstate::new(&params));
+        let snap = snap();
+        let wallet_path = std::env::temp_dir().join(format!(
+            "avila-rpc-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let wallet: SharedWallet = Arc::new(Mutex::new(crate::watch::WatchWallet::open(
+            wallet_path.clone(),
+        )));
+        let call = |m: &str, params: &Value| -> (Value, Option<(i64, String)>) {
+            dispatch(
+                m,
+                params,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                Some(&wallet),
+                None,
+            )
+        };
+
+        // Seed → signer active, mnemonic + commitment returned.
+        let (r, e) = call("createdescriptorseed", &Value::Null);
+        assert!(e.is_none(), "{e:?}");
+        let mnemonic = r["mnemonic"].as_str().unwrap().to_string();
+        assert_eq!(mnemonic.split_whitespace().count(), 24);
+        assert_eq!(r["entropy_commitment"].as_str().unwrap().len(), 64);
+
+        // Address → 101 blocks mature a coinbase (regtest COINBASE_MATURITY=100).
+        let (r, e) = call("getnewaddress", &Value::Null);
+        assert!(e.is_none(), "{e:?}");
+        let addr = r.as_str().unwrap().to_string();
+        let (_, e) = call("generatetoaddress", &json!([101, addr]));
+        assert!(e.is_none(), "{e:?}");
+
+        // Funded: the spendable coinbase is ours.
+        let (r, e) = call("listunspent", &json!([1, 9_999_999]));
+        assert!(e.is_none(), "{e:?}");
+        assert!(!r.as_array().unwrap().is_empty(), "{r}");
+
+        // Spend to ourselves — into the mempool via admit_and_relay.
+        let (r, _e) = call("getnewaddress", &Value::Null);
+        let dest = r.as_str().unwrap().to_string();
+        let (r, e) = call("sendtoaddress", &json!([dest, "1.0"]));
+        assert!(e.is_none(), "{e:?}");
+        let txid = r.as_str().unwrap().to_string();
+        assert_eq!(txid.len(), 64);
+        let (r, e) = call("getrawmempool", &Value::Null);
+        assert!(e.is_none(), "{e:?}");
+        assert!(r.as_array().unwrap().iter().any(|t| t == &txid), "{r}");
+
+        // Funded-PSBT path returns checked prevouts.
+        let (r, e) = call(
+            "walletcreatefundedpsbt",
+            &json!([[{ addr.clone(): "0.5" }]]),
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert!(r["psbt"].as_str().unwrap().len() > 8);
+        assert!(r["inputs_verified"].as_i64().unwrap() >= 1);
+
+        // Vault cycle: export → lock → (wallet is watch-only) → load.
+        let (_r, e) = call("signerexport", &json!(["pw"]));
+        assert!(e.is_none(), "{e:?}");
+        let (r, e) = call("signerlock", &Value::Null);
+        assert_eq!(r["locked"], json!(true), "{e:?}");
+        let (_, e) = call("getnewaddress", &Value::Null);
+        // Watch side still works — getnewaddress needs no keys.
+        assert!(e.is_none(), "{e:?}");
+        let (_, e) = call("sendtoaddress", &json!([addr.clone(), "1.0"]));
+        assert!(e.is_some(), "locked signer must not send");
+        let (r, e) = call("signerload", &json!(["wrong-pw"]));
+        assert!(e.is_some(), "{r}");
+        let (r, e) = call("signerload", &json!(["pw"]));
+        assert_eq!(r["loaded"], json!(true), "{e:?}");
+
+        // Mnemonic restore — second wallet instance.
+        let wallet2_path = std::env::temp_dir().join(format!(
+            "avila-rpc-e2e2-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let wallet2: SharedWallet = Arc::new(Mutex::new(crate::watch::WatchWallet::open(
+            wallet2_path.clone(),
+        )));
+        let call2 = |m: &str, params: &Value| -> (Value, Option<(i64, String)>) {
+            dispatch(
+                m,
+                params,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                Some(&wallet2),
+                None,
+            )
+        };
+        let (r, e) = call2("signerimport", &json!([mnemonic]));
+        assert_eq!(r["descs_imported"], json!(2), "{e:?}");
+
+        let _ = std::fs::remove_dir_all(&wallet_path);
+        let _ = std::fs::remove_dir_all(&wallet2_path);
     }
 
     /// `decoderawtransaction` — the regtest genesis coinbase decodes
