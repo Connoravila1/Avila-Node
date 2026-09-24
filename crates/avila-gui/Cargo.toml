@@ -16,7 +16,6 @@ avila-consensus.workspace = true
 avila-p2p.workspace = true
 clap.workspace = true
 eframe.workspace = true
-egui_extras.workspace = true
 serde.workspace = true
 
 [lints]
