@@ -476,6 +476,18 @@ pub fn run(
                         "eclipse indicators: {signals:?} — advisory only, cross-check routes"
                     );
                 }
+                NetEvent::ReconDivergence {
+                    peer,
+                    rounds,
+                    their_misses,
+                    our_misses,
+                } => {
+                    eprintln!(
+                        "recon divergence: peer {peer} missed {their_misses} circulating txs \
+                         over {rounds} rounds (we missed {our_misses} from them) — \
+                         filtered view, advisory only"
+                    );
+                }
                 _ => {}
             }
         }

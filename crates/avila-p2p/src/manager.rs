@@ -161,6 +161,19 @@ pub enum NetEvent {
         /// Announced block hashes we lack.
         missing: Vec<BlockHash>,
     },
+    /// A recon peer persistently misses the circulating tx set —
+    /// telemetry, not a verdict: heavy filtering and a slow-syncing
+    /// peer look alike from here (queue #19).
+    ReconDivergence {
+        /// The peer id.
+        peer: u64,
+        /// Completed reconciliation rounds at fire time.
+        rounds: u64,
+        /// Cumulative ids we held that their pool lacked.
+        their_misses: u64,
+        /// Cumulative ids they held that our pool lacked.
+        our_misses: u64,
+    },
 }
 
 struct PeerEntry<S> {
@@ -245,6 +258,13 @@ struct PeerEntry<S> {
     /// signal worth surfacing (queue #19).
     pub recon_rounds: u64,
     pub recon_misses: u64,
+    /// Ids we held that the peer's pool lacked — the divergence half
+    /// of the diff. Persistently high = the peer isn't seeing the
+    /// circulating set.
+    pub recon_their_misses: u64,
+    /// The divergence alarm already fired for this connection — the
+    /// event is edge-triggered, not per-round.
+    recon_alarm_sent: bool,
     /// When the next initiated round may start.
     next_recon: Instant,
     /// An in-progress bisected close: our half-pools and the misses
@@ -286,6 +306,8 @@ struct ReconBisect {
     got_lo: bool,
     /// Misses accumulated across both halves.
     misses: Vec<u32>,
+    /// The peer's misses across both halves (the divergence signal).
+    their_misses: u64,
 }
 
 /// A read-only view of one connected peer — the manager's state is
@@ -359,6 +381,9 @@ pub struct PeerSnapshot {
     /// count — a persistently-wide diff is a censorship/eclipse signal.
     pub recon_rounds: u64,
     pub recon_misses: u64,
+    /// Cumulative ids we held that the peer's pool lacked — a
+    /// persistently-wide *their-side* diff is the filtering signal.
+    pub recon_their_misses: u64,
 }
 
 /// A bounded set of peers sharing one [`Chainstate`].
@@ -683,6 +708,7 @@ impl<S: Read + Write> PeerManager<S> {
                     recon: peer.recon.is_some(),
                     recon_rounds: peer.recon_rounds,
                     recon_misses: peer.recon_misses,
+                    recon_their_misses: peer.recon_their_misses,
                 }
             })
             .collect();
@@ -851,6 +877,8 @@ impl<S: Read + Write> PeerManager<S> {
                 recon_map: std::collections::HashMap::new(),
                 recon_rounds: 0,
                 recon_misses: 0,
+                recon_their_misses: 0,
+                recon_alarm_sent: false,
                 next_recon: Instant::now(),
                 recon_bisect: None,
             },
@@ -1472,6 +1500,27 @@ impl<S: Read + Write> PeerManager<S> {
 
     /// One peer's event → replies and chainstate effects.
     #[allow(clippy::too_many_arguments)]
+    /// Queue #19's divergence alarm — edge-triggered: after enough
+    /// rounds, a peer missing much of the circulating set while never
+    /// feeding us much back is seeing a filtered view. Fires once per
+    /// connection; the counters themselves stay live for `getpeerinfo`.
+    fn recon_alarm_check(peer: &mut PeerEntry<S>, id: u64, events: &mut Vec<NetEvent>) {
+        if peer.recon_alarm_sent
+            || peer.recon_rounds < 10
+            || peer.recon_their_misses < 100
+            || peer.recon_their_misses < peer.recon_misses.saturating_mul(4)
+        {
+            return;
+        }
+        peer.recon_alarm_sent = true;
+        events.push(NetEvent::ReconDivergence {
+            peer: id,
+            rounds: peer.recon_rounds,
+            their_misses: peer.recon_their_misses,
+            our_misses: peer.recon_misses,
+        });
+    }
+
     fn dispatch(
         id: u64,
         peer: &mut PeerEntry<S>,
@@ -1786,9 +1835,10 @@ impl<S: Read + Write> PeerManager<S> {
                         (&bs.hi, false)
                     };
                     if let Some(round) = peer.recon_round.as_ref()
-                        && let Some(misses) = round.close_bisected(&reply_sk, half)
+                        && let Some((misses, their_misses)) = round.close_bisected(&reply_sk, half)
                     {
                         bs.misses.extend(misses);
+                        bs.their_misses += their_misses.len() as u64;
                     }
                     if is_lo {
                         bs.got_lo = true;
@@ -1798,6 +1848,8 @@ impl<S: Read + Write> PeerManager<S> {
                         peer.recon_round = None;
                         peer.recon_rounds += 1;
                         peer.recon_misses += bs.misses.len() as u64;
+                        peer.recon_their_misses += bs.their_misses;
+                        Self::recon_alarm_check(peer, id, events);
                         if !bs.misses.is_empty() {
                             let _ = peer.session.send(&Message::ReconcilDiff {
                                 ask_parents: 0,
@@ -1810,16 +1862,17 @@ impl<S: Read + Write> PeerManager<S> {
                 let (our_ids, _) = recon_pool(mempool, salt);
                 match peer.recon_round.take() {
                     Some(round) => match round.close(&reply_sk, &our_ids) {
-                        Some(misses) if !misses.is_empty() => {
+                        Some((misses, their_misses)) => {
                             peer.recon_rounds += 1;
                             peer.recon_misses += misses.len() as u64;
-                            let _ = peer.session.send(&Message::ReconcilDiff {
-                                ask_parents: 0,
-                                short_ids: misses,
-                            });
-                        }
-                        Some(_) => {
-                            peer.recon_rounds += 1;
+                            peer.recon_their_misses += their_misses.len() as u64;
+                            Self::recon_alarm_check(peer, id, events);
+                            if !misses.is_empty() {
+                                let _ = peer.session.send(&Message::ReconcilDiff {
+                                    ask_parents: 0,
+                                    short_ids: misses,
+                                });
+                            }
                         }
                         // Over-capacity merge — ask the responder to
                         // bisect its pool; replies come back as two
@@ -1831,6 +1884,7 @@ impl<S: Read + Write> PeerManager<S> {
                                 hi,
                                 got_lo: false,
                                 misses: Vec::new(),
+                                their_misses: 0,
                             });
                             peer.recon_round = Some(round);
                             let _ = peer.session.send(&Message::ReqBisec);
@@ -2604,11 +2658,8 @@ fn dial_via(
     version: Version,
     want_v2: bool,
 ) -> DialOutcome {
-    let stream = crate::proxy::socks5_connect(
-        &proxy,
-        &crate::proxy::SocksTarget::Ip(addr),
-        DIAL_TIMEOUT,
-    )?;
+    let stream =
+        crate::proxy::socks5_connect(&proxy, &crate::proxy::SocksTarget::Ip(addr), DIAL_TIMEOUT)?;
     stream.set_nodelay(true)?;
     if want_v2 {
         stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
@@ -4353,10 +4404,8 @@ mod tests {
                 BUDGET,
             )
             .expect("session");
-            let remote = crate::addrman::net_addr_of(
-                format!("203.0.113.{i}:8333").parse().unwrap(),
-                0,
-            );
+            let remote =
+                crate::addrman::net_addr_of(format!("203.0.113.{i}:8333").parse().unwrap(), 0);
             let id = mgr.add_outbound_to(session, remote).expect("slot");
             ends.push((peer_end, id));
         }
@@ -4511,5 +4560,51 @@ mod tests {
         let msgs_b = testpipe::drain(&mut b, MAGIC);
         assert!(inv(&msgs_a) + inv(&msgs_b) >= 1, "fluff announce went out");
         assert!(mgr.stem_pending.is_empty());
+    }
+
+    /// Queue #19: the divergence alarm fires once, only past every
+    /// threshold — rounds, absolute their-side misses, and dominance
+    /// over our-side misses.
+    #[test]
+    fn recon_divergence_alarm_is_edge_triggered() {
+        let (mut mgr, _peer_end, id) = managed_peer();
+        let mut events = Vec::new();
+        {
+            let peer = mgr.peers.get_mut(&id).unwrap();
+            // Just short of the round count — wide diff alone is silent.
+            peer.recon_rounds = 9;
+            peer.recon_their_misses = 999;
+            PeerManager::<End>::recon_alarm_check(peer, id, &mut events);
+            assert!(events.is_empty());
+            // A balanced diff isn't censorship either — their misses
+            // must dominate ours 4:1.
+            peer.recon_rounds = 10;
+            peer.recon_their_misses = 120;
+            peer.recon_misses = 40;
+            PeerManager::<End>::recon_alarm_check(peer, id, &mut events);
+            assert!(events.is_empty());
+            // Every threshold crossed — fires once.
+            peer.recon_their_misses = 400;
+            peer.recon_misses = 50;
+            PeerManager::<End>::recon_alarm_check(peer, id, &mut events);
+        }
+        assert!(
+            matches!(
+                events[0],
+                NetEvent::ReconDivergence {
+                    peer: p,
+                    rounds: 10,
+                    their_misses: 400,
+                    our_misses: 50,
+                } if p == id
+            ),
+            "{events:?}"
+        );
+        {
+            let peer = mgr.peers.get_mut(&id).unwrap();
+            peer.recon_their_misses = 10_000;
+            PeerManager::<End>::recon_alarm_check(peer, id, &mut events);
+        }
+        assert_eq!(events.len(), 1, "edge-triggered — no refire");
     }
 }

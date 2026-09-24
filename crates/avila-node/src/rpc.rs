@@ -6871,6 +6871,7 @@ pub(crate) fn dispatch(
                             // or eclipse signal (queue #19).
                             "recon_rounds": p.recon_rounds,
                             "recon_misses": p.recon_misses,
+                            "recon_their_misses": p.recon_their_misses,
                             // Core: hex of the BIP324 session id on v2,
                             // "" on v1.
                             "session_id": p
@@ -7011,31 +7012,33 @@ pub(crate) fn dispatch(
                     Ok(w) => w,
                     Err(p) => p.into_inner(),
                 });
-                Ok(json!(pool
-                    .pinning_risk(margin)
-                    .into_iter()
-                    .map(|(txid, n)| {
-                        let mine = w.as_ref().is_some_and(|w| {
-                            pool.get(&txid).is_some_and(|tx| {
-                                tx.outputs.iter().any(|o| {
-                                    w.scripts.contains_key(o.script_pubkey.as_bytes())
-                                }) || tx.inputs.iter().any(|i| {
-                                    w.coins
-                                        .get(&(
-                                            i.previous_output.txid,
-                                            i.previous_output.vout,
-                                        ))
-                                        .is_some_and(|c| c.spent_height.is_none())
+                Ok(json!(
+                    pool.pinning_risk(margin)
+                        .into_iter()
+                        .map(|(txid, n)| {
+                            let mine = w.as_ref().is_some_and(|w| {
+                                pool.get(&txid).is_some_and(|tx| {
+                                    tx.outputs
+                                        .iter()
+                                        .any(|o| w.scripts.contains_key(o.script_pubkey.as_bytes()))
+                                        || tx.inputs.iter().any(|i| {
+                                            w.coins
+                                                .get(&(
+                                                    i.previous_output.txid,
+                                                    i.previous_output.vout,
+                                                ))
+                                                .is_some_and(|c| c.spent_height.is_none())
+                                        })
                                 })
+                            });
+                            json!({
+                                "txid": txid.to_string(),
+                                "descendants": n,
+                                "mine": mine,
                             })
-                        });
-                        json!({
-                            "txid": txid.to_string(),
-                            "descendants": n,
-                            "mine": mine,
                         })
-                    })
-                    .collect::<Vec<_>>()))
+                        .collect::<Vec<_>>()
+                ))
             })
         }
         "getmempoolblocks" => {
@@ -7132,6 +7135,18 @@ pub(crate) fn dispatch(
                         avila_p2p::manager::NetEvent::EclipseSuspected(signals) => json!({
                             "event": "eclipse_suspected",
                             "signals": signals.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>(),
+                        }),
+                        avila_p2p::manager::NetEvent::ReconDivergence {
+                            peer,
+                            rounds,
+                            their_misses,
+                            our_misses,
+                        } => json!({
+                            "event": "recon_divergence",
+                            "peer": peer,
+                            "rounds": rounds,
+                            "their_misses": their_misses,
+                            "our_misses": our_misses,
                         }),
                     })
                     .collect();

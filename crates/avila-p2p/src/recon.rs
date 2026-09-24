@@ -111,10 +111,7 @@ impl ReconRound {
         for &id in our_ids {
             sketch.add(id);
         }
-        (
-            Self { _private: () },
-            Message::ReqRecon(sketch.serialize()),
-        )
+        (Self { _private: () }, Message::ReqRecon(sketch.serialize()))
     }
 
     /// Responder side (stateless — needs only the responder's own
@@ -144,25 +141,39 @@ impl ReconRound {
                 responder_misses.push(id);
             }
         }
-        Some((reply, RoundOutcome {
-            responder_misses,
-            initiator_misses,
-        }))
+        Some((
+            reply,
+            RoundOutcome {
+                responder_misses,
+                initiator_misses,
+            },
+        ))
     }
 
     /// Initiator side, bisected close: merge the responder's half
     /// `sketch` against our matching half-pool — same decode as
     /// [`Self::close`] but the caller supplies the bisected subset.
     #[must_use]
-    pub fn close_bisected(&self, reply_sketch_bytes: &[u8], our_half_ids: &[u32]) -> Option<Vec<u32>> {
+    pub fn close_bisected(
+        &self,
+        reply_sketch_bytes: &[u8],
+        our_half_ids: &[u32],
+    ) -> Option<(Vec<u32>, Vec<u32>)> {
         self.close(reply_sketch_bytes, our_half_ids)
     }
 
     /// Initiator side, closing the round: merge the responder's `sketch`
-    /// reply and decode — our misses are the ids in neither the diff's
-    /// already-attributed set nor our own pool.
+    /// reply and decode the symmetric difference. Returns both
+    /// directions — `(our_misses, their_misses)` — ids we lack that
+    /// they hold, and ids they lack that we hold. The second half is
+    /// the divergence signal: a peer persistently missing the
+    /// circulating set isn't syncing, it's filtered (queue #19).
     #[must_use]
-    pub fn close(&self, reply_sketch_bytes: &[u8], our_ids: &[u32]) -> Option<Vec<u32>> {
+    pub fn close(
+        &self,
+        reply_sketch_bytes: &[u8],
+        our_ids: &[u32],
+    ) -> Option<(Vec<u32>, Vec<u32>)> {
         let mut merged = Sketch::deserialize(reply_sketch_bytes)?;
         let mut ours = Sketch::new(merged.capacity());
         for &id in our_ids {
@@ -171,7 +182,15 @@ impl ReconRound {
         merged.merge(&ours);
         let diff = merged.decode()?;
         let ours_set: std::collections::HashSet<u32> = our_ids.iter().copied().collect();
-        Some(diff.into_iter().filter(|id| !ours_set.contains(id)).collect())
+        let (mut our_misses, mut their_misses) = (Vec::new(), Vec::new());
+        for id in diff {
+            if ours_set.contains(&id) {
+                their_misses.push(id);
+            } else {
+                our_misses.push(id);
+            }
+        }
+        Some((our_misses, their_misses))
     }
 }
 
@@ -239,9 +258,11 @@ mod tests {
         let Message::Sketch(reply_sk) = reply else {
             panic!("expected sketch")
         };
-        let misses = round.close(&reply_sk, &a).expect("decode");
+        let (misses, their_misses) = round.close(&reply_sk, &a).expect("decode");
         assert_eq!(misses.len(), 2);
         assert!(misses.contains(&0x1111));
+        // The peer's side of the diff: the 3 A-only ids it lacks.
+        assert_eq!(their_misses.len(), 3);
     }
 
     #[test]
@@ -249,22 +270,32 @@ mod tests {
         // 200 extras can't fit cap 8 — bisect by the top bit and each
         // half decodes (extras all share the top bit set, so one half
         // carries the whole diff; the other is clean).
-        let a = pool(0, 1_000, &(0..200).map(|i| 0x80000001 + i).collect::<Vec<_>>());
+        let a = pool(
+            0,
+            1_000,
+            &(0..200).map(|i| 0x80000001 + i).collect::<Vec<_>>(),
+        );
         let b = pool(0, 1_000, &[]);
         let (round, _req) = ReconRound::open(&a, 8);
         let _ = round;
         let (sk_lo, sk_hi) = bisect_reply(&b, 31, 8);
         let (a_lo, a_hi) = bisect(&a, 31);
-        let Message::Sketch(lo_bytes) = sk_lo else { panic!() };
-        let Message::Sketch(_hi_bytes) = sk_hi else { panic!() };
-        let lo_misses = ReconRound::respond(&lo_bytes, &a_lo)
-            .map(|(_, o)| o.initiator_misses);
+        let Message::Sketch(lo_bytes) = sk_lo else {
+            panic!()
+        };
+        let Message::Sketch(_hi_bytes) = sk_hi else {
+            panic!()
+        };
+        let lo_misses = ReconRound::respond(&lo_bytes, &a_lo).map(|(_, o)| o.initiator_misses);
         // Lo half: identical sets → empty diff.
         assert_eq!(lo_misses, Some(vec![]));
         // Hi half carries all 200 — still over cap at 8; decode fails
         // or returns phantoms the pool filter drops. Recurse one more
         // bit and it resolves cleanly:
-        let (b_hh_lo, b_hh_hi) = bisect(&b.into_iter().filter(|i| i >> 31 == 1).collect::<Vec<_>>(), 30);
+        let (b_hh_lo, b_hh_hi) = bisect(
+            &b.into_iter().filter(|i| i >> 31 == 1).collect::<Vec<_>>(),
+            30,
+        );
         let (a_hh_lo, a_hh_hi) = bisect(&a_hi, 30);
         let mut misses = Vec::new();
         for (b_half, a_half) in [(b_hh_lo, a_hh_lo), (b_hh_hi, a_hh_hi)] {
@@ -291,7 +322,11 @@ mod tests {
         // real pools and falls back to reqbisec). What must never
         // happen is a wrong *attribution*: an id claimed as one side's
         // miss that the other side does not actually hold.
-        let a = pool(0, 1_000, &(0..200).map(|i| 0xFFFF0000 + i).collect::<Vec<_>>());
+        let a = pool(
+            0,
+            1_000,
+            &(0..200).map(|i| 0xFFFF0000 + i).collect::<Vec<_>>(),
+        );
         let b = pool(0, 1_000, &[]);
         let a_set: std::collections::HashSet<u32> = a.iter().copied().collect();
         let b_set: std::collections::HashSet<u32> = b.iter().copied().collect();

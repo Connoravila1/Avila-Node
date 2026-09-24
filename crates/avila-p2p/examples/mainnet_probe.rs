@@ -68,6 +68,12 @@ fn main() -> Result<(), String> {
                 NetEvent::Disconnected { peer, reason } => {
                     println!("peer {peer} gone: {reason:?}")
                 }
+                NetEvent::EclipseSuspected(signals) => {
+                    println!("eclipse indicators: {signals:?}")
+                }
+                NetEvent::ReconDivergence {
+                    peer, their_misses, ..
+                } => println!("peer {peer}: {their_misses} recon their-misses — filtered view?"),
                 NetEvent::Announced { .. } | NetEvent::TipAdvanced(_) => {}
             }
         }

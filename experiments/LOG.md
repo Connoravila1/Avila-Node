@@ -25,6 +25,7 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 | 16 | 09-23 | Crash fault-injection on hash engine | Commit ordering survives torn writes | **2 findings, both fixed** | torn records decoded to wrong-but-valid coins (silent corruption) → +4B keyed record tag, tears now misses; coins-ahead-of-tip tear invisible → index-header watermark, open errors loudly. File-level sim; compact() still unsafe | [fault-inject](2026-09-23-fault-injection.md) |
 
 
+| 62 | 09-24 | Recon-diff divergence alarm | Does the censorship signal separate from normal sync lag? | **adopted — queue #19 closed** | `ReconRound::close` now returns both diff directions — our misses AND `their_misses` (ids we hold that their pool lacked, previously decoded-then-discarded). Alarm: edge-triggered `NetEvent::ReconDivergence` at ≥10 rounds, ≥100 their-misses, ≥4:1 dominance over our misses — wide-but-balanced diffs (slow sync) don't fire. `recon_their_misses` in getpeerinfo; `recon_divergence` events in getevents + stderr log. Test proves edge-trigger, below-threshold silence both ways. | — |
 | 61 | 09-24 | Per-block verification receipts | Can every connect produce machine-checkable evidence? | **adopted — queue #5 core shipped** | `connect_block_full` returns a `BlockReceipt` per connect: script_flags enforced, fees/sigops, checks queued vs verified-cache skips, spent/created counts, wall_ns, and `delta_commitment` — SHA-256 over the exact UTXO transition (per-tx: txid, spends, creates, block order), replayable by construction. Journal ring (2016) in Chainstate covers all three real connect paths — tip extension, reorg `simulate_branch` (the sim IS the connect), and assumeutxo background replay. `getblockreceipts`/`getblockreceipt` RPCs. 4 tests: field correctness, replay determinism, delta sensitivity, both-sides-of-reorg journaling. A standalone replay-verifier tool + bundle export stays open. | — |
 | 60 | 09-24 | Mempool tx-lifecycle / RBF ledger | Can the node answer "what happened to every tx" natively? | **adopted — closes queue #32** | Every removal path tags its cause (`RemovalCause`: confirmed, block-conflict, replaced{by}, evicted, expired, reorg-drop, explicit) — recorded inside `remove_inner`, the one funnel all removals pass through. `LifecycleStats` counters (accepted/rejected/parked_orphans/replacements + per-cause removals) ride in `getmempoolinfo.lifecycle`; a bounded 4096-deep ring backs `getmempoolhistory` (newest first, RBF events carry the replacing txid). 6 tests: verdict counting, replacement linkage (conflict+descendant both tagged), confirmed-vs-block-conflict, expiry, eviction, ring bound. | — |
 | 59 | 09-24 | Process sandboxing (minimal) | Can the node take a real OS-level defense without new risk? | **adopted — no_new_privs always-on** | `prctl(PR_SET_NO_NEW_PRIVS)` at sync start via the `prctl` crate (workspace forbids unsafe). A wire-parser compromise lands in a process that can never escalate via setuid/file caps — and the node never execve()s, so it costs nothing. seccomp syscall filtering and Landlock datadir scoping stay open (bigger dep surface). | — |
@@ -187,7 +188,7 @@ first measurement that would kill or confirm it.
     historical segments, forever — correctness as an ongoing property,
     catching disk rot and bitflips. Each pass appends receipt evidence.
 
-16. **Pinning oracle.** (partial — #46 generic detection shipped) Mempool watcher that detects pinning patterns
+16. ~~**Pinning oracle.**~~ **done — #46 + wallet-labeling.** Mempool watcher that detects pinning patterns
     against the operator's wallet transactions — descendant-limit
     saturation, RBF rule-3 pinning, parked conflicts — and reports it.
     The node tells you when you're under attack; nobody ships this.
@@ -205,7 +206,7 @@ first measurement that would kill or confirm it.
     randomized delay, then normal recon fluff. No stempool, no
     unvalidated relay, most of the origin-privacy benefit.
 
-19. ~~**Recon-diff censorship telemetry.**~~ **done — #47 (counters in getpeerinfo; alarm thresholds open).** Every recon round already
+19. ~~**Recon-diff censorship telemetry.**~~ **done — #47 + #62.** Every recon round already
     computes the per-peer pool diff — surface it. A peer persistently
     missing a large share of your mempool is a censorship/eclipse
     signal. Security telemetry at zero protocol cost.

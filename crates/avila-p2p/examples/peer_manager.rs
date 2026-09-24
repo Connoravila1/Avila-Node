@@ -68,6 +68,12 @@ fn main() -> Result<(), String> {
                 NetEvent::Announced { peer, missing } => {
                     println!("peer {peer} announced {} blocks we lack", missing.len())
                 }
+                NetEvent::EclipseSuspected(signals) => {
+                    println!("eclipse indicators: {signals:?}")
+                }
+                NetEvent::ReconDivergence {
+                    peer, their_misses, ..
+                } => println!("peer {peer}: {their_misses} recon their-misses — filtered view?"),
             }
         }
         let tip = cs.chain().len() as i64 - 1;
