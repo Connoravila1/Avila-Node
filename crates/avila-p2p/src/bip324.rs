@@ -752,7 +752,13 @@ impl V2Channel {
             }
             match decode_message_type(&contents) {
                 Some((cmd, payload)) => out.push((cmd, payload.to_vec())),
-                None => return Err("undecodable message type"),
+                // Core's `ReceiveMsgBytes`: "Message deserialization
+                // failed. Drop the message but don't disconnect the
+                // peer" — an unparseable message *type* means this one
+                // packet is unusable, not that the transport itself
+                // desynchronized (the AEAD tag already authenticated
+                // it). Skip it and keep decoding the rest of `bytes`.
+                None => {}
             }
         }
         Ok(out)
@@ -862,5 +868,54 @@ mod tests {
 
     fn enc_zeros() -> Vec<u8> {
         vec![0u8; 16]
+    }
+
+    /// Core's `ReceiveMsgBytes`: "Message deserialization failed. Drop
+    /// the message but don't disconnect the peer." A packet whose
+    /// message-type byte doesn't decode (short id 200 is well past
+    /// `SHORT_IDS`' 29 entries) must not fail `feed()`, and a message
+    /// decoded earlier in the *same* `feed()` call must not be
+    /// discarded alongside it.
+    #[test]
+    fn feed_drops_an_undecodable_message_but_keeps_the_rest() {
+        use std::io::{Read, Write};
+
+        const MAGIC: [u8; 4] = [0xfa, 0xbf, 0xb5, 0xda]; // regtest
+
+        let (mut a, mut b) = crate::testpipe::pair();
+        let pending = start_handshake(&mut a).unwrap();
+        let mut ch_b = respond_handshake(&mut b, MAGIC).unwrap();
+        let Handshake::V2(cipher_a, garbage_a) = finish_handshake(&mut a, pending, MAGIC).unwrap()
+        else {
+            panic!("v1 fallback on a v2 peer");
+        };
+        let mut ch_a = V2Channel::new(cipher_a, garbage_a);
+        a.write_all(&ch_a.handshake_tail()).unwrap();
+
+        // Get b past the handshake (its peer's garbage/terminator/
+        // version packet) before sending anything meaningful.
+        let mut buf = [0u8; 4096];
+        let n = b.read(&mut buf).unwrap();
+        let handshake_msgs = ch_b.feed(&buf[..n]).unwrap();
+        assert!(handshake_msgs.is_empty());
+
+        // One packet with an out-of-range short id (undecodable), then
+        // one ordinary `ping`, encrypted back to back exactly as they'd
+        // arrive batched in a single socket read.
+        let bad = ch_a.cipher.encrypt_packet(&[200, 1, 2, 3], &[], false);
+        let good = ch_a
+            .cipher
+            .encrypt_packet(&encode_message_type("ping"), &[], false);
+        let mut combined = bad;
+        combined.extend_from_slice(&good);
+
+        let msgs = ch_b
+            .feed(&combined)
+            .expect("an undecodable message type must not fail the whole feed() call");
+        assert_eq!(
+            msgs,
+            vec![("ping".to_string(), Vec::new())],
+            "the bad packet is dropped; the good one decoded in the same call must survive"
+        );
     }
 }
