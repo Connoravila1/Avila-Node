@@ -267,7 +267,12 @@ first measurement that would kill or confirm it.
     eclipse goes undetected — learn it now. Nobody publishes eclipse
     experiments on their own node; even a negative result is tooling.
 
-23. **Pinning red-team.** (partial — #46 two attacks proven) Implement BIP-431's documented pinning
+23. **Pinning red-team.** (#46 descendant-limit + rule-3, plus
+    eviction-cap shipped) Three BIP-431 vectors now proven: the
+    descendant-limit pin, the rule-3 absolute-fee pin, and the
+    multi-party eviction-cap pin (4 shared txs × full junk trees → a
+    sweep replacement must evict 101 > MAX_REPLACEMENT_CANDIDATES →
+    `TooManyReplacements`). Implement BIP-431's documented pinning
     attacks as tools (descendant-limit saturation, rule-3 pinning,
     package-limit pinning), run against our mempool on regtest.
     Hypothesis: oracle catches all documented classes with bounded

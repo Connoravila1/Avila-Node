@@ -5036,6 +5036,88 @@ mod tests {
         );
     }
 
+    /// BIP-431 eviction-cap pin (rule 5): a descendant cap per tx
+    /// (25) bounds a single-conflict pin, so the real attack is
+    /// multi-party — each of four shared coinjoin-style txs carries a
+    /// full junk tree off the attacker's output; one "sweep"
+    /// replacement of the victim's four inputs would evict
+    /// 4×26 > `MAX_REPLACEMENT_CANDIDATES` entries. Rejected.
+    #[test]
+    fn redteam_eviction_cap_pinning() {
+        let (cs, blocks) = chainstate_at(110);
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
+
+        // Four shared txs — each spends a mature outpoint, vout 0 is
+        // the victim's bumpable share, vout 1 the attacker's pin base.
+        let mut shared: Vec<(Txid, i64)> = Vec::new();
+        for i in 0..4usize {
+            let mut v = spend_tx(mature_outpoint(&blocks, i + 1), 0, SEQ_RBF);
+            v.outputs = vec![
+                TxOut {
+                    value: 2_400_000_000,
+                    script_pubkey: Script::new(vec![script::OP_1]),
+                },
+                TxOut {
+                    value: 2_400_000_000,
+                    script_pubkey: Script::new(vec![script::OP_1]),
+                },
+            ];
+            shared.push((pool.accept_tx(v, &cs, NOW).unwrap(), 2_400_000_000));
+        }
+
+        // Junk trees under each shared tx — 25 under the first (the
+        // descendant cap), 24 under the rest → evictions 101 > 100.
+        for (k, (vid, base)) in shared.iter().enumerate() {
+            let target = if k == 0 { 25 } else { 24 };
+            let mut frontier = vec![(
+                OutPoint {
+                    txid: *vid,
+                    vout: 1,
+                },
+                *base,
+            )];
+            let mut planted = 0usize;
+            while planted < target {
+                let (fop, in_val) = frontier.remove(0);
+                let out_val = in_val - 10_000;
+                let mut junk = spend_tx(fop, 0, SEQ_FINAL);
+                junk.outputs = vec![
+                    TxOut {
+                        value: out_val / 2,
+                        script_pubkey: Script::new(vec![script::OP_1]),
+                    },
+                    TxOut {
+                        value: out_val - out_val / 2,
+                        script_pubkey: Script::new(vec![script::OP_1]),
+                    },
+                ];
+                let jid = junk.txid();
+                pool.accept_tx(junk, &cs, NOW).unwrap();
+                frontier.push((OutPoint { txid: jid, vout: 0 }, out_val / 2));
+                frontier.push((OutPoint { txid: jid, vout: 1 }, out_val - out_val / 2));
+                planted += 1;
+            }
+        }
+
+        // The pin: replacing all four shared txs (the victim's four
+        // inputs in one sweep) tears out 4 × (1 + 24) = 100 — plus the
+        // 4 conflicts themselves = 104 > 100 entries. The pool rejects.
+        // The sweep conflicts with every shared tx by spending their
+        // input outpoints directly (multi-party replacement).
+        let ops: Vec<OutPoint> = (0..4).map(|i| mature_outpoint(&blocks, i + 1)).collect();
+        let mut bump = spend_many(&ops, 0, SEQ_RBF);
+        bump.outputs = vec![TxOut {
+            value: 4_000_000_000,
+            script_pubkey: Script::new(vec![script::OP_1]),
+        }];
+        let res = pool.accept_tx(bump, &cs, NOW);
+        assert!(
+            matches!(res, Err(MempoolReject::TooManyReplacements)),
+            "the pin works: replacement evicts >{MAX_REPLACEMENT_CANDIDATES} entries"
+        );
+    }
+
     /// Lifecycle: admission verdicts are counted — accepts under
     /// `accepted`, hard rejects under `rejected`, input-resolution
     /// failures under `parked_orphans`.
