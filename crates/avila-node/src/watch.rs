@@ -86,6 +86,108 @@ pub struct WatchedCoin {
     pub spent_by: Option<Txid>,
 }
 
+/// The resolved seed + its provenance — [`resolve_entropy`]'s output.
+pub struct ResolvedEntropy {
+    /// The 32-byte BIP32 seed.
+    pub seed: Vec<u8>,
+    /// "os" | "user" | "dice" | "mixed:os+user" | "mixed:os+dice".
+    pub provenance: String,
+    /// `sha256(raw entropy input)` — the commit-before-generate
+    /// record; re-rolling the same dice recomputes it, so provenance
+    /// is checkable, not just asserted.
+    pub commitment: String,
+    /// Non-fatal caveats (too-few rolls, skewed distribution).
+    pub warnings: Vec<String>,
+}
+
+/// `createdescriptorseed`'s entropy ceremony (queue #37): caller
+/// hex, Coldcard-convention dice rolls (SHA256 over the ASCII digits;
+/// ≥50 rolls for 128 bits, ≥99 for 256; a face over 30% of rolls is
+/// a skew warning), or the OS CSPRNG — `mix` XOR-folds OS entropy
+/// into the caller's, so no single bad source decides the seed.
+/// The commitment records `sha256(input)` *before* derivation.
+///
+/// # Errors
+/// Invalid hex, dice characters outside `1..=6`, or too little
+/// material (<16 bytes hex / <10 rolls) is a hard error.
+pub fn resolve_entropy(
+    entropy_hex: Option<&str>,
+    dice: Option<&str>,
+    mix: bool,
+) -> Result<ResolvedEntropy, String> {
+    let mut warnings = Vec::new();
+    let (mut seed, source, input_commit) = if let Some(rolls) = dice {
+        let rolls = rolls.trim();
+        if rolls.len() < 10 {
+            return Err(format!(
+                "dice entropy needs >=10 rolls ({} given)",
+                rolls.len()
+            ));
+        }
+        if rolls.len() < 50 {
+            warnings.push(format!(
+                "{} rolls is under the 128-bit floor (50 D6 rolls); use 99 for 256-bit",
+                rolls.len()
+            ));
+        } else if rolls.len() < 99 {
+            warnings.push(format!(
+                "{} rolls covers 128 bits; 99 rolls gives the full 256",
+                rolls.len()
+            ));
+        }
+        let mut faces = [0u32; 7];
+        let mut digits = String::with_capacity(rolls.len());
+        for ch in rolls.chars() {
+            if !('1'..='6').contains(&ch) {
+                return Err(format!("dice rolls must be digits 1-6 (got '{ch}')"));
+            }
+            faces[ch as usize - '0' as usize] += 1;
+            digits.push(ch);
+        }
+        if faces
+            .iter()
+            .any(|&c| (c as f64) > rolls.len() as f64 * 0.30)
+        {
+            warnings.push("skewed roll distribution (>30% one face) — biased dice?".into());
+        }
+        // Coldcard: SHA256 over the ASCII digits — cross-verifiable
+        // with the firmware's own derivation.
+        let raw = avila_consensus::hash::sha256(digits.as_bytes());
+        (raw.to_vec(), "dice", digits.as_bytes().to_vec())
+    } else if let Some(h) = entropy_hex {
+        let b = hex::decode(h.trim()).map_err(|e| format!("entropy must be hex: {e}"))?;
+        if b.len() < 16 {
+            return Err(format!("entropy must be >=16 bytes (got {})", b.len()));
+        }
+        let seed = if b.len() == 32 {
+            b.clone()
+        } else {
+            avila_consensus::hash::sha256(&b).to_vec()
+        };
+        (seed, "user", b)
+    } else {
+        let mut s = [0u8; 32];
+        getrandom::fill(&mut s).map_err(|e| format!("entropy source failed: {e}"))?;
+        (s.to_vec(), "os", s.to_vec())
+    };
+    let provenance = if mix && source != "os" {
+        let mut os = [0u8; 32];
+        getrandom::fill(&mut os).map_err(|e| format!("entropy source failed: {e}"))?;
+        for (a, b) in seed.iter_mut().zip(os.iter()) {
+            *a ^= b;
+        }
+        format!("mixed:os+{source}")
+    } else {
+        source.to_string()
+    };
+    Ok(ResolvedEntropy {
+        seed,
+        provenance,
+        commitment: hex::encode(&avila_consensus::hash::sha256(&input_commit)),
+        warnings,
+    })
+}
+
 /// Opt-in signing material (queue #35): populated ONLY by
 /// `createdescriptorseed`/key import — the wallet stays watch-only
 /// (Core's `disable_private_keys` model) until the operator asks for
@@ -98,9 +200,13 @@ pub struct SignerState {
     /// Private-material descriptor bodies — only surfaced by
     /// explicitly-private RPCs, never logged.
     pub descs_private: Vec<String>,
-    /// Seed entropy provenance: "os" (system CSPRNG) or "user"
-    /// (caller-supplied entropy, SHA256-folded).
+    /// Seed entropy provenance: "os" (system CSPRNG), "user",
+    /// "dice", or "mixed:…" when OS entropy was XOR-folded in.
     pub provenance: String,
+    /// `sha256(raw entropy input)` — commit-before-generate: the
+    /// record exists before derivation, so the seed's origin is
+    /// checkable rather than asserted (queue #37).
+    pub entropy_commitment: String,
 }
 
 /// The wallet — persistent across restarts via `watchlist.dat`.
@@ -1040,5 +1146,54 @@ mod tests {
             !w.coins.contains_key(&(orphan_txid, 0)),
             "the orphaned block's coin must not be recorded as confirmed"
         );
+    }
+
+    /// Queue #37 — the entropy ceremony's provable surface: Coldcard-
+    /// convention dice derivation (SHA256 over ASCII digits), the
+    /// commit-before-generate record, and XOR mixing.
+    #[test]
+    fn resolve_entropy_dice_is_coldcard_compatible() {
+        // 50 ones — the 128-bit floor. Seed = SHA256("111…1").
+        let rolls = "1".repeat(50);
+        let r = resolve_entropy(None, Some(&rolls), false).unwrap();
+        assert_eq!(r.provenance, "dice");
+        let expect_seed = avila_consensus::hash::sha256(rolls.as_bytes()).to_vec();
+        assert_eq!(r.seed, expect_seed, "seed must be SHA256(rolls)");
+        // Commitment = sha256(raw input) — recomputable by anyone
+        // re-rolling the same dice.
+        assert_eq!(
+            r.commitment,
+            hex::encode(&avila_consensus::hash::sha256(rolls.as_bytes()))
+        );
+        assert!(r.warnings.iter().any(|w| w.contains("99")));
+        // Skewed distribution warns — all-one faces is maximal skew.
+        assert!(r.warnings.iter().any(|w| w.contains("skewed")));
+    }
+
+    #[test]
+    fn resolve_entropy_rejects_and_mixes() {
+        assert!(resolve_entropy(None, Some("111"), false).is_err()); // <10 rolls
+        assert!(resolve_entropy(None, Some("0000000000"), false).is_err()); // bad digits
+        assert!(resolve_entropy(Some("abcd"), None, false).is_err()); // <16 bytes
+        // Exactly-32 hex passes through raw; shorter folds via SHA256.
+        let raw32 = "ab".repeat(32);
+        let r = resolve_entropy(Some(&raw32), None, false).unwrap();
+        assert_eq!(r.seed, hex::decode(&raw32).unwrap());
+        assert_eq!(r.provenance, "user");
+        let short = "ab".repeat(16);
+        let r2 = resolve_entropy(Some(&short), None, false).unwrap();
+        assert_eq!(
+            r2.seed,
+            avila_consensus::hash::sha256(&hex::decode(&short).unwrap()).to_vec()
+        );
+        // Mixing XOR-folds OS entropy — provenance says so, and the
+        // seed differs from the unmixed derivation.
+        let rolls = "123456".repeat(17); // 102 rolls
+        let mixed = resolve_entropy(None, Some(&rolls), true).unwrap();
+        assert_eq!(mixed.provenance, "mixed:os+dice");
+        let plain = resolve_entropy(None, Some(&rolls), false).unwrap();
+        assert_ne!(mixed.seed, plain.seed);
+        // Commitment still binds to the user's input, not the OS half.
+        assert_eq!(mixed.commitment, plain.commitment);
     }
 }

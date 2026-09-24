@@ -10523,6 +10523,12 @@ pub(crate) fn dispatch(
             let entropy_arg = param(params, 0, "entropy")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let dice_arg = param(params, 1, "dice")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let mix_arg = param(params, 2, "mix")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let wallet = wallet.cloned();
             chain_query_deferred(method, queries, move |cs, _| {
                 let Some(wallet) = wallet else {
@@ -10532,39 +10538,19 @@ pub(crate) fn dispatch(
                     )));
                 };
                 let params = cs.tree().params();
-                // Entropy: caller hex (>=16B; exactly 32 used raw,
-                // otherwise SHA256-folded — the Coldcard convention)
-                // or the OS CSPRNG. Provenance is recorded either way.
-                let (seed, provenance) = match &entropy_arg {
-                    None => {
-                        let mut s = [0u8; 32];
-                        if let Err(e) = getrandom::fill(&mut s) {
-                            return QueryReply::Now(Err((
-                                RPC_MISC_ERROR,
-                                format!("entropy source failed: {e}"),
-                            )));
-                        }
-                        (s.to_vec(), "os")
-                    }
-                    Some(h) => match hex::decode(h.trim()) {
-                        Ok(b) if b.len() >= 32 => (b[..32].to_vec(), "user"),
-                        Ok(b) if b.len() >= 16 => {
-                            (avila_consensus::hash::sha256(&b).to_vec(), "user")
-                        }
-                        Ok(b) => {
-                            return QueryReply::Now(Err((
-                                RPC_INVALID_PARAMETER,
-                                format!("entropy must be >=16 bytes (got {})", b.len()),
-                            )));
-                        }
-                        Err(e) => {
-                            return QueryReply::Now(Err((
-                                RPC_INVALID_PARAMETER,
-                                format!("entropy must be hex: {e}"),
-                            )));
-                        }
-                    },
+                // The entropy ceremony (queue #37): hex, dice rolls
+                // (Coldcard convention), or OS CSPRNG — `mix` XOR-folds
+                // OS entropy in so no single bad source decides.
+                let resolved = match crate::watch::resolve_entropy(
+                    entropy_arg.as_deref(),
+                    dice_arg.as_deref(),
+                    mix_arg,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => return QueryReply::Now(Err((RPC_INVALID_PARAMETER, e))),
                 };
+                let seed = resolved.seed.clone();
+                let provenance = resolved.provenance.clone();
                 let Some(master) = avila_consensus::extended_key::ExtKey::from_seed(
                     &seed,
                     params.base58_ext_secret_prefix,
@@ -10664,13 +10650,16 @@ pub(crate) fn dispatch(
                 w.enable_signing(crate::watch::SignerState {
                     provider: signing,
                     descs_private: priv_descs.to_vec(),
-                    provenance: provenance.to_string(),
+                    provenance: provenance.clone(),
+                    entropy_commitment: resolved.commitment.clone(),
                 });
                 QueryReply::Now(Ok(json!({
                     "master_fingerprint": fp,
                     "xprv": master.encode(),
                     "descriptors": watch_descs.iter().map(|(d, _)| d.clone()).collect::<Vec<_>>(),
                     "entropy_source": provenance,
+                    "entropy_commitment": resolved.commitment,
+                    "warnings": resolved.warnings,
                     "warning": "memory-only signer — restart clears key material; the xprv above is the only backup until the encrypted vault lands",
                 })))
             })

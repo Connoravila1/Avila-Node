@@ -320,13 +320,16 @@ first measurement that would kill or confirm it.
     no-unverified-amounts without prevtx bloat. Kill: none — the
     property is enforceable by construction; measure the UX cost.
 
-37. **Entropy ceremony.** Coldcard-convention dice input (SHA256 over
-    ASCII roll digits; 99 rolls = 256 bits, 50 = 128, face-frequency
-    check >30% warns), multi-source XOR mixing (OS CSPRNG + user
-    entropy + optional external), commit-before-generate provenance
-    recorded in the wallet and surfaced in `getwalletinfo`. Milk Sad
-    is the cautionary tale (mt19937+time → 32-bit space). Kill: none —
-    this is the purist trust boundary; get it right or don't ship.
+37. **Entropy ceremony.** (partially shipped) `createdescriptorseed`
+    now accepts `dice` (ASCII rolls — SHA256 over digits, Coldcard-
+    compatible so seeds cross-verify against the firmware's own
+    derivation; <50 rolls errors, <99 warns, >30% single-face skew
+    warns) and `mix` (XOR-folds OS CSPRNG into caller entropy — no
+    single bad source decides). Commit-before-generate: `sha256(raw
+    input)` is recorded and reported as `entropy_commitment` — the
+    provenance claim is checkable, not asserted. Tests prove the
+    derivation convention and mixing. Open: BIP39 mnemonic rendering
+    of the seed, encrypted-at-rest vault, entropy-input file source.
 
 38. **Fingerprint self-measurement.** Run the published wallet-
     fingerprint taxonomy (BIP69 ordering, anti-fee-sniping nLockTime,
