@@ -189,8 +189,15 @@ impl WatchWallet {
     }
 
     /// Scan a single gap block that reacquisition fetched — records
-    /// the txs and drops `height` from `gaps`. Returns true when the
-    /// gap closed.
+    /// the txs and drops `height` from `gaps`. `hash` was captured
+    /// when the gap opened; a reorg between then and the body's
+    /// arrival can orphan it, and scanning an orphaned block would
+    /// record its coins as confirmed while the active chain's real
+    /// block at `height` never gets scanned. So `hash` must still be
+    /// the active chain's block at `height` — otherwise the gap is
+    /// left in place (to retry once a current hash is captured) and
+    /// this returns `false` without touching wallet state. Returns
+    /// `true` when the gap closed.
     pub fn scan_gap_height(
         &mut self,
         cs: &Chainstate,
@@ -198,6 +205,9 @@ impl WatchWallet {
         height: u32,
         hash: BlockHash,
     ) -> bool {
+        if cs.chain().get(height as usize) != Some(&hash) {
+            return false;
+        }
         self.scan_block(cs, block, height, hash);
         self.gaps
             .retain(|(lo, hi)| !(height >= *lo && height <= *hi));
@@ -939,5 +949,55 @@ mod tests {
         // The refound coins match the original scan exactly.
         assert_eq!(w.unspent().count(), 4);
         assert!(w.coins.values().all(|c| c.spent_height.is_none()));
+    }
+
+    #[test]
+    fn scan_gap_height_rejects_orphaned_capture() {
+        // A gap's (height, hash) is captured when the body first goes
+        // missing; if a reorg replaces that height before the body
+        // reacquires, scanning the late-arriving (now orphaned) block
+        // must neither record its coins as confirmed nor close the
+        // gap — it has to be retried with the current hash.
+        let params = Network::Regtest.params();
+        let mut cs = chain_of(4);
+        let mut w = WatchWallet::open(PathBuf::from("/nonexistent/watchlist.dat"));
+        w.track(tracked(WATCHED), 0);
+        w.advance(&cs);
+        assert_eq!(w.unspent().count(), 4);
+
+        // Simulate the gap exactly like `gap_reacquisition_rescans_arrived_bodies`,
+        // but capture the (about to be orphaned) hash and body first —
+        // this is what a reacquisition request keys its getdata on.
+        let orphan_hash = cs.chain()[2];
+        let orphan_block = cs.body(&orphan_hash).unwrap();
+        let orphan_txid = orphan_block.transactions[0].txid();
+        w.coins.remove(&(orphan_txid, 0));
+        w.gaps.push((2, 2));
+        assert_eq!(w.missing_heights(), vec![2]);
+
+        // Reorg away height 2 onward via a longer side chain from
+        // height 1 — mirrors `reorg_drops_orphans_and_unspends`.
+        let fork_hdr = cs.tree().get(&cs.chain()[1]).unwrap().header;
+        let mut side = fork_hdr;
+        for height in 2..=5u32 {
+            let mut cb = coinbase_tx(height, 50 * 100_000_000);
+            let mut sig = cb.inputs[0].script_sig.as_bytes().to_vec();
+            sig.push(0xcc);
+            cb.inputs[0].script_sig = Script::new(sig);
+            let b = block_on(&side, vec![cb], &params);
+            side = b.header;
+            cs.accept_block(&b, NOW).unwrap();
+        }
+        assert_ne!(cs.chain()[2], orphan_hash, "height 2 must have reorged");
+
+        // The stale (height, hash) capture's body arrives late —
+        // scan_gap_height must refuse it, not fold it in.
+        let closed = w.scan_gap_height(&cs, &orphan_block, 2, orphan_hash);
+        assert!(!closed, "an orphaned capture must not close the gap");
+        assert_eq!(w.missing_heights(), vec![2], "the gap must be retried");
+        assert!(
+            !w.coins.contains_key(&(orphan_txid, 0)),
+            "the orphaned block's coin must not be recorded as confirmed"
+        );
     }
 }
