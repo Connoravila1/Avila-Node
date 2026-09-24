@@ -10692,8 +10692,22 @@ pub(crate) fn dispatch(
                     Ok(r) => r,
                     Err(e) => return QueryReply::Now(Err((RPC_INVALID_PARAMETER, e))),
                 };
-                let seed = resolved.seed.clone();
+                let entropy = resolved.seed.clone();
                 let provenance = resolved.provenance.clone();
+                // BIP39 over the entropy: the 24 words are the
+                // canonical backup — any BIP39 wallet derives the same
+                // master from to_seed(""). Dice/hex/OS entropy all
+                // funnel through the words.
+                let mnemonic = match bip39::Mnemonic::from_entropy(&entropy) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        return QueryReply::Now(Err((
+                            RPC_MISC_ERROR,
+                            format!("mnemonic render failed: {e}"),
+                        )));
+                    }
+                };
+                let seed = mnemonic.to_seed("");
                 let Some(master) = avila_consensus::extended_key::ExtKey::from_seed(
                     &seed,
                     params.base58_ext_secret_prefix,
@@ -10780,6 +10794,7 @@ pub(crate) fn dispatch(
                 });
                 QueryReply::Now(Ok(json!({
                     "master_fingerprint": fp,
+                    "mnemonic": mnemonic.to_string(),
                     "xprv": master.encode(),
                     "descriptors": watch_descs.iter().map(|(d, _)| d.clone()).collect::<Vec<_>>(),
                     "entropy_source": provenance,
@@ -11130,6 +11145,129 @@ pub(crate) fn dispatch(
                     "inputs_verified": verified,
                     "inputs_unverified": unverified,
                     "prevout_receipts": prevout_receipts(&checks),
+                })))
+            })
+        }
+
+        // Recovery path (queue #37 tail): restore the signer from a
+        // BIP39 mnemonic — the words createdescriptorseed emits are
+        // the canonical backup.
+        "signerimport" => {
+            let words = param(params, 0, "mnemonic")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let wallet = wallet.cloned();
+            chain_query_deferred(method, queries, move |cs, _| {
+                let Some(wallet) = wallet else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "watch-only wallet is not available on this node".into(),
+                    )));
+                };
+                let Some(words) = words else {
+                    return QueryReply::Now(Err((
+                        RPC_INVALID_PARAMETER,
+                        "signerimport requires a mnemonic".into(),
+                    )));
+                };
+                let params = cs.tree().params();
+                let mnemonic = match bip39::Mnemonic::parse_normalized(words.trim()) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        return QueryReply::Now(Err((
+                            RPC_INVALID_PARAMETER,
+                            format!("invalid mnemonic: {e}"),
+                        )));
+                    }
+                };
+                let seed = mnemonic.to_seed("");
+                let Some(master) = avila_consensus::extended_key::ExtKey::from_seed(
+                    &seed,
+                    params.base58_ext_secret_prefix,
+                ) else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "master key derivation failed".into(),
+                    )));
+                };
+                const H: u32 = 0x8000_0000;
+                let coin: u32 = match params.network {
+                    avila_consensus::params::Network::Mainnet => 0,
+                    _ => 1,
+                };
+                let Some(account) = master
+                    .derive(84 | H)
+                    .and_then(|k| k.derive(coin | H))
+                    .and_then(|k| k.derive(H))
+                else {
+                    return QueryReply::Now(Err((
+                        RPC_MISC_ERROR,
+                        "account derivation failed".into(),
+                    )));
+                };
+                let fp = hex::encode(&master.fingerprint());
+                let xprv = account.encode();
+                let Some(neut) = account.neuter(params.base58_ext_pubkey_prefix) else {
+                    return QueryReply::Now(Err((RPC_MISC_ERROR, "neuter failed".into())));
+                };
+                let xpub = neut.encode();
+                let origin = format!("{fp}/84h/{coin}h/0h");
+                let with_sum = |body: String| {
+                    format!(
+                        "{body}#{}",
+                        avila_consensus::descriptor::descriptor_checksum(&body)
+                    )
+                };
+                let priv_descs = [
+                    with_sum(format!("wpkh([{origin}]{xprv}/0/*)")),
+                    with_sum(format!("wpkh([{origin}]{xprv}/1/*)")),
+                ];
+                let watch_descs = [
+                    (with_sum(format!("wpkh([{origin}]{xpub}/0/*)")), false),
+                    (with_sum(format!("wpkh([{origin}]{xpub}/1/*)")), true),
+                ];
+                let signing = match signer_provider_from_descs(&priv_descs, params) {
+                    Ok(sv) => sv,
+                    Err(e) => return QueryReply::Now(Err((RPC_INVALID_ADDRESS_OR_KEY, e))),
+                };
+                let mut w = match wallet.lock() {
+                    Ok(w) => w,
+                    Err(_) => {
+                        return QueryReply::Now(Err((
+                            RPC_MISC_ERROR,
+                            "wallet lock poisoned".into(),
+                        )));
+                    }
+                };
+                if w.signer().is_some() {
+                    return QueryReply::Now(Err((
+                        RPC_WALLET_ERROR,
+                        "signer already loaded — signerlock first".into(),
+                    )));
+                }
+                let mut imported = 0usize;
+                for (d, internal) in &watch_descs {
+                    let req = json!({
+                        "desc": d,
+                        "timestamp": "now",
+                        "active": true,
+                        "internal": internal,
+                        "range": [0, 999],
+                    });
+                    if import_one_descriptor(&mut w, cs, &req).is_ok() {
+                        imported += 1;
+                    }
+                }
+                w.enable_signing(crate::watch::SignerState {
+                    provider: signing,
+                    descs_private: priv_descs.to_vec(),
+                    descs_watch: watch_descs.iter().map(|(d, _)| d.clone()).collect(),
+                    provenance: "bip39-import".into(),
+                    entropy_commitment: String::new(),
+                });
+                QueryReply::Now(Ok(json!({
+                    "master_fingerprint": fp,
+                    "descs_imported": imported,
                 })))
             })
         }

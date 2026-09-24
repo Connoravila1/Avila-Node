@@ -1417,4 +1417,17 @@ mod tests {
         // Truncated blob → error, not panic.
         assert!(vault_open(&blob[..40], "correct horse").is_err());
     }
+
+    /// BIP39: the 24 words encode the entropy; parse+to_seed is
+    /// deterministic — the mnemonic IS the backup.
+    #[test]
+    fn bip39_mnemonic_roundtrips_entropy() {
+        let entropy = [7u8; 32];
+        let m = bip39::Mnemonic::from_entropy(&entropy).unwrap();
+        assert_eq!(m.word_count(), 24);
+        let words = m.to_string();
+        let m2 = bip39::Mnemonic::parse_normalized(&words).unwrap();
+        assert_eq!(m.to_seed(""), m2.to_seed(""));
+        assert_eq!(m2.to_entropy(), entropy.to_vec());
+    }
 }
