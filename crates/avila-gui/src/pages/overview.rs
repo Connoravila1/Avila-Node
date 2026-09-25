@@ -17,6 +17,7 @@ pub fn show(ui: &mut Ui, s: &Scene, scale: &mut Scale) -> Option<Action> {
     let Some(view) = &s.session.view else {
         return idle(ui, s);
     };
+    sync_banner(ui, s, view);
     hero(ui, s, view, scale);
     ui.add_space(30.0);
     readouts(ui, s, view);
@@ -61,6 +62,62 @@ fn idle(ui: &mut Ui, s: &Scene) -> Option<Action> {
         None,
     );
     action
+}
+
+/// The sync banner: until the tip is caught up, say plainly what the
+/// node is doing and how far it has come — headers, then blocks, with
+/// a pace-based ETA once one exists.
+fn sync_banner(ui: &mut Ui, s: &Scene, v: &NodeView) {
+    if v.caught_up() {
+        return;
+    }
+    let pal = s.pal;
+    let target = v
+        .best_peer_height()
+        .unwrap_or(v.headers)
+        .max(v.headers)
+        .max(1);
+    let headers_done = v.headers >= target;
+    let (text, frac) = if !headers_done {
+        (
+            format!(
+                "Getting block headers — {} of ~{}",
+                thousands(v.headers.into()),
+                thousands(target.into()),
+            ),
+            f64::from(v.headers) / f64::from(target),
+        )
+    } else {
+        let mut text = format!(
+            "Downloading and verifying blocks — {} of {}",
+            thousands(v.connected.into()),
+            thousands(target.into()),
+        );
+        if let Some(p) = s.session.per_min(|x| x.connected).filter(|p| *p >= 1.0) {
+            let secs = f64::from(v.behind()) / p * 60.0;
+            text.push_str(&format!(
+                " · {} a minute · about {} to go",
+                thousands(p as u64),
+                span(secs as u64),
+            ));
+        }
+        (text, f64::from(v.connected) / f64::from(target))
+    };
+    ui.label(
+        RichText::new(text)
+            .font(font(theme::MEDIUM, 15.0))
+            .color(pal.text),
+    );
+    ui.add_space(6.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
+    ui.painter().rect_filled(rect, 3.0, pal.well);
+    let fill = rect.width() * frac.clamp(0.0, 1.0) as f32;
+    ui.painter().rect_filled(
+        Rect::from_min_size(rect.min, vec2(fill, 6.0)),
+        3.0,
+        pal.signal,
+    );
+    ui.add_space(24.0);
 }
 
 fn hero(ui: &mut Ui, s: &Scene, v: &NodeView, scale: &mut Scale) {

@@ -111,8 +111,14 @@ impl App {
         }
         // Networks with DNS seeds (or an explicit peer list) start right
         // away, as a node should; tests never touch the network.
+        // First launch shows the welcome sheet instead of syncing
+        // silently — a new user picks prune/verify/proxy and presses
+        // Start. Returning launches autostart as before.
         let autostart = !cfg!(test)
-            && (demo || network != avila_core::Network::Regtest || !run.connect.trim().is_empty());
+            && (demo
+                || (prefs.welcomed
+                    && (network != avila_core::Network::Regtest
+                        || !run.connect.trim().is_empty())));
         Self {
             node,
             session,
@@ -183,38 +189,45 @@ impl App {
                 network,
                 swirl: self.swirl.as_ref(),
             };
-            action = match self.page {
-                Page::Overview => pages::overview::show(ui, &scene, &mut self.prefs.scale),
-                Page::Chain => pages::chain::show(
-                    ui,
-                    &scene,
-                    &mut self.prefs.scale,
-                    &mut self.ribbon_view,
-                    &mut self.prefs.rhythm_clock,
-                ),
-                Page::Peers => pages::peers::show(
-                    ui,
-                    &scene,
-                    &mut self.selected_peer,
-                    &mut self.sky,
-                    &mut self.peer_sort,
-                    self.prefs.hide_addresses,
-                ),
-                Page::Activity => {
-                    pages::activity::show(ui, &scene, &mut self.filter, self.prefs.hide_addresses)
+            action = if !self.prefs.welcomed && !self.session.demo {
+                pages::welcome::show(ui, &scene, &mut self.run)
+            } else {
+                match self.page {
+                    Page::Overview => pages::overview::show(ui, &scene, &mut self.prefs.scale),
+                    Page::Chain => pages::chain::show(
+                        ui,
+                        &scene,
+                        &mut self.prefs.scale,
+                        &mut self.ribbon_view,
+                        &mut self.prefs.rhythm_clock,
+                    ),
+                    Page::Peers => pages::peers::show(
+                        ui,
+                        &scene,
+                        &mut self.selected_peer,
+                        &mut self.sky,
+                        &mut self.peer_sort,
+                        self.prefs.hide_addresses,
+                    ),
+                    Page::Activity => pages::activity::show(
+                        ui,
+                        &scene,
+                        &mut self.filter,
+                        self.prefs.hide_addresses,
+                    ),
+                    Page::Toybox => {
+                        toybox::show(ui, &scene, &mut self.game, &mut self.prefs);
+                        None
+                    }
+                    Page::Settings => pages::settings::show(
+                        ui,
+                        &scene,
+                        &mut self.run,
+                        &mut self.prefs,
+                        &self.node,
+                        open_advanced,
+                    ),
                 }
-                Page::Toybox => {
-                    toybox::show(ui, &scene, &mut self.game, &mut self.prefs);
-                    None
-                }
-                Page::Settings => pages::settings::show(
-                    ui,
-                    &scene,
-                    &mut self.run,
-                    &mut self.prefs,
-                    &self.node,
-                    open_advanced,
-                ),
             };
         });
         action
@@ -588,7 +601,10 @@ impl eframe::App for App {
         }
 
         match action {
-            Some(Action::Start) => self.start(),
+            Some(Action::Start) => {
+                self.prefs.welcomed = true;
+                self.start();
+            }
             Some(Action::Stop) => self.session.stop(),
             Some(Action::Open(page)) => self.page = page,
             None => {}

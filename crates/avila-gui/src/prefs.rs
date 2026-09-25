@@ -46,6 +46,10 @@ pub struct Prefs {
     /// silently reverting to direct connections.
     #[serde(default)]
     pub proxy: String,
+    /// The first-run sheet was shown — returning launches may
+    /// autostart; a brand-new user sees the walkthrough instead.
+    #[serde(default)]
+    pub welcomed: bool,
     /// Shitcoin Defense's best score.
     #[serde(default)]
     pub game_best: u32,
@@ -62,6 +66,7 @@ impl Default for Prefs {
             toybox: false,
             skin: Skin::Standard,
             proxy: String::new(),
+            welcomed: false,
             game_best: 0,
         }
     }
@@ -164,6 +169,7 @@ mod tests {
             skin: Skin::Julia,
             game_best: 42,
             proxy: "127.0.0.1:9050".into(),
+            welcomed: true,
         };
         prefs.save(&mut storage);
         assert_eq!(
@@ -178,6 +184,7 @@ mod tests {
                 skin: Skin::Julia,
                 game_best: 42,
                 proxy: "127.0.0.1:9050".into(),
+                welcomed: true,
             }
         );
         assert_eq!(storage.0.len(), 1);

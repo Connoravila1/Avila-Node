@@ -6,6 +6,7 @@ pub mod chain;
 pub mod overview;
 pub mod peers;
 pub mod settings;
+pub mod welcome;
 
 use crate::session::Session;
 use crate::theme::Palette;
