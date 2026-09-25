@@ -570,3 +570,21 @@ First real mainnet run (`avila-gui --config config/mainnet.toml`,
   [16, 1024]. A bisect event doubles-hints so the next round skips
   the bisect trip. Still to measure on a live node with a real
   mempool — capacity waste only matters once pool diffs are real.
+
+- Proof-carrying block transport — codec layer (#6 first piece):
+  `utxproof` P2P message carries a block hash + an opaque spend
+  bundle whose byte format is owned by consensus
+  (`utreexo::encode_spend_bundle`/`decode_spend_bundle`: compact-size
+  spend count bounded at 1M, per-input `(outpoint, coin)` records via
+  the existing compact-coin codec, then the rustreexo `Proof`
+  serialization runs to payload end). The frame-level 4 MiB cap and
+  `d.finish()` trailing-byte rejection bound the wire side; the
+  consensus decoder rejects malformed coins and bad proofs before
+  any trust. P2P stays opaque — no coin encoding duplicated in the
+  transport crate. Tests: round-trip, truncated hash, over-declared
+  var-length, trailing garbage (167 p2p tests, 544 consensus all
+  green). Not yet: negotiation, serving path (needs an in-memory
+  forest at connect time — proofs can't be generated post-hoc for
+  spent leaves), fetch-side consume wiring, real-connection test.
+  Honest status: scaffold only — nothing sends or consumes
+  `utxproof` yet.
