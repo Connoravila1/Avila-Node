@@ -656,3 +656,25 @@ First real mainnet run (`avila-gui --config config/mainnet.toml`,
   ambiguity about what a number means. Locked in by
   `resume_reports_progress_phases` (asserts the event sequence and
   counts on a synthetic 100-body parked backlog).
+
+- **IBD pace fixed: the ~570ms/block overhead was a broken skip-list
+  transcription, not validation cost (queue: real mainnet IBD).**
+  Per-block instrumentation (`accept_ns`/`reorg_ns`/`seg_ns`/
+  `sim_checks_ns`) on a live datadir copy isolated ~55ms inside
+  `script_checks` → `is_ancestor` → `get_ancestor`, which walked
+  `prev` pointers linearly — ~800k hash lookups per connect at
+  968k-header scale (~460ms/blk). Implementing Core's `pskip` skip
+  list exposed a transcription bug: `GetSkipHeight` written as
+  `InvertLowestOne(InvertLowestOne(h-1)) - 1` where Core has `+ 1`
+  (chain.cpp: "max 110 steps to go back up to 2^18 blocks"). The
+  `-1` variant produced degenerate skip pointers — measured 2057
+  hops for a 20k→1 descent and ~200k hops/blk at probe scale.
+  With `+1`: worst case 15 hops over all 2^18 descents, ~70 hops
+  for a real 968k→150k probe. Result on the real datadir copy:
+  `script_checks` 55ms/blk → ~30µs/blk; total `accept_block`
+  ~570ms/blk → ~3-11ms/blk (~100×). `connect_block` (real
+  validation, ~0.6-6.5ms) is now the dominant cost — as it should
+  be. Guard rails: `get_ancestor_full_descent_is_log_n` asserts
+  <500 steps for 5 full-depth descents over a 20k chain; the
+  `ancestor_steps` diagnostic counter and `sim_checks` timing
+  bucket remain for live verification.

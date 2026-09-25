@@ -851,13 +851,28 @@ pub fn run(
         }
         if hb_at.elapsed() >= std::time::Duration::from_secs(30) {
             hb_at = std::time::Instant::now();
+            let t = avila_consensus::connect::connect_timing();
+            let ms = |ns: u64| ns / 1_000_000;
             eprintln!(
-                "sync: peers={} connected={} headers={} buffered={} in_flight={}",
+                "sync: peers={} connected={} headers={} buffered={} in_flight={} | connect_ms/blk total={} read={} apply={} scripts={} drain={} bip30={} other={} accept_cum={} reorg_cum={} (n={})",
                 mgr.len(),
                 connected,
                 cs.tree().tip().height,
                 mgr.presync_height().unwrap_or(0),
-                mgr.in_flight()
+                mgr.in_flight(),
+                t.total_ns
+                    .checked_div(t.blocks.max(1))
+                    .map_or(0, |n| n / 1_000_000),
+                ms(t.read_ns),
+                ms(t.apply_ns),
+                ms(t.script_ns),
+                ms(t.drain_ns),
+                ms(t.bip30_ns),
+                ms(t.total_ns
+                    .saturating_sub(t.read_ns + t.apply_ns + t.script_ns + t.bip30_ns)),
+                ms(t.accept_ns),
+                ms(t.reorg_ns),
+                t.blocks,
             );
         }
         let snapshot = SyncProgress {

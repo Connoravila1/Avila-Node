@@ -54,6 +54,12 @@ pub struct HeaderNode {
     /// never-connected side-branch tips keep it unknown, which is how
     /// `getchaintxstats` decides `txcount` is "known".
     pub n_chain_tx: u64,
+    /// Core's `pskip` — a pointer part-way down the ancestry, chosen by
+    /// [`get_skip_height`] so ancestor queries descend in O(log n) jumps
+    /// instead of O(n) `pprev` steps. Built at insert from the parent's
+    /// already-linked skip pointer; `None` near genesis where the skip
+    /// height is nonpositive.
+    pub skip: Option<BlockHash>,
 }
 
 impl HeaderNode {
@@ -205,6 +211,41 @@ thread_local! {
     static ANCESTOR_CHECK_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+// Diagnostic: `get_ancestor` descent hops — proves the skip list keeps
+// ancestor probes O(log n); without `pskip` this was O(depth), the
+// ~400ms/blk `script_checks` path the real IBD profile exposed.
+thread_local! {
+    static ANCESTOR_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Total `get_ancestor` steps taken on this thread — callers reset by
+/// snapshotting the counter before a measured stretch.
+#[must_use]
+pub fn ancestor_steps() -> u64 {
+    ANCESTOR_STEPS.with(|c| c.get())
+}
+
+/// Core's `CBlockIndex::GetSkipHeight`: the height a node's `pskip`
+/// jumps to — a sparse bit-reversal of `height` so longer hops land
+/// on rarer heights (the "inverted lowest one" skip list, not the old
+/// even `SKIPLIST_INTERVAL` grid). Always non-negative for `height >= 2`;
+/// `0` means "points at genesis".
+fn get_skip_height(height: u32) -> i64 {
+    let invert_lowest_one = |n: i64| n & (n - 1);
+    if height < 2 {
+        return 0;
+    }
+    let h = i64::from(height);
+    // chain.cpp `GetSkipHeight`: "+1" on the odd branch — the -1 variant
+    // loses the "max 110 steps over 2^18" property and degrades descents
+    // to ~O(sqrt n).
+    if height & 1 == 1 {
+        invert_lowest_one(invert_lowest_one(h - 1)) + 1
+    } else {
+        invert_lowest_one(h)
+    }
+}
+
 impl HeaderTree {
     /// Creates a tree containing exactly the network's genesis header at height 0. The
     /// genesis is the anchor, not a validated child: it is inserted unconditionally, as
@@ -221,6 +262,7 @@ impl HeaderTree {
             // the chain total (Core asserts genesis nChainTx == 1).
             n_tx: 1,
             n_chain_tx: 1,
+            skip: None,
         };
         let mut nodes = HashMap::new();
         nodes.insert(hash, node);
@@ -368,7 +410,24 @@ impl HeaderTree {
     pub fn get_ancestor(&self, from: &BlockHash, height: u32) -> Option<&HeaderNode> {
         let mut node = self.nodes.get(from)?;
         while node.height > height {
-            node = self.nodes.get(&node.header.prev_block_hash)?;
+            ANCESTOR_STEPS.with(|c| c.set(c.get() + 1));
+            // Core's `CBlockIndex::GetAncestor`: prefer the skip pointer
+            // when it lands on or safely above the target; the
+            // `skip_prev` test rejects jumps that would overshoot what
+            // a single further skip step would already cover.
+            let skip_h = get_skip_height(node.height);
+            let skip_prev_h = get_skip_height(node.height - 1);
+            let skip_node = node.skip.and_then(|s| self.nodes.get(&s));
+            node = match skip_node {
+                Some(s) if i64::from(s.height) == i64::from(height) => s,
+                Some(s)
+                    if i64::from(s.height) > i64::from(height)
+                        && !(skip_prev_h < skip_h - 2 && skip_prev_h >= i64::from(height)) =>
+                {
+                    s
+                }
+                _ => self.nodes.get(&node.header.prev_block_hash)?,
+            };
         }
         Some(node)
     }
@@ -643,15 +702,30 @@ impl HeaderTree {
             .chainwork
             .checked_add(Work::from_compact(header.bits))
             .ok_or(ChainError::ChainWorkOverflow)?;
+        let new_height_u32 = parent
+            .height
+            .checked_add(1)
+            .ok_or(ChainError::HeightOverflow)?;
+        // `CBlockIndex::BuildSkip`: the new node's skip pointer is its
+        // parent's ancestor at this node's skip height — O(log n) off
+        // the parent's already-linked skip chain. `skip_h == 0` is a
+        // real pointer (to genesis — Core sets `pskip` to it, which is
+        // what makes power-of-2 heights jump the whole chain); only a
+        // *negative* skip height means "no skip".
+        let skip_h = get_skip_height(new_height_u32);
+        let skip = if skip_h >= 0 {
+            self.get_ancestor(&header.prev_block_hash, skip_h as u32)
+                .map(|n| n.hash())
+        } else {
+            None
+        };
         let node = HeaderNode {
             header: *header,
-            height: parent
-                .height
-                .checked_add(1)
-                .ok_or(ChainError::HeightOverflow)?,
+            height: new_height_u32,
             chainwork,
             n_tx: 0,       // body not yet seen — Core's nTx starts unset
             n_chain_tx: 0, // unknown until ConnectTip — Core's nChainTx
+            skip,
         };
         self.nodes.insert(hash, node);
         self.children
@@ -977,6 +1051,37 @@ mod tests {
         assert!(
             steps <= 2,
             "expected O(1) failed-ancestor-check steps after a 3,000-header chain, got {steps}"
+        );
+    }
+
+    #[test]
+    fn get_ancestor_full_descent_is_log_n() {
+        // Core's `pskip` skip list: a tip→genesis `GetAncestor` must
+        // take O(log n) hops, not O(n). The pre-skip implementation
+        // walked `prev` one height at a time — ~800k hash lookups per
+        // `script_checks` probe at mainnet scale (~450ms/blk IBD tax).
+        let params = easy_params();
+        let mut tree = HeaderTree::new(params);
+        for i in 1..=20_000u32 {
+            let tip = *tree.tip();
+            let next = extend(&tip, &params, tip.header.time + 600, i);
+            tree.insert(&next, u32::MAX).unwrap();
+        }
+        let tip = *tree.tip();
+
+        let before = ancestor_steps();
+        for target in [1u32, 500, 5_000, 10_000, 19_999] {
+            let a = tree.get_ancestor(&tip.hash(), target).unwrap();
+            assert_eq!(a.height, target);
+        }
+        let steps = ancestor_steps() - before;
+        // log2(20_000) ≈ 15; the bit-clearing skip chain bounds the
+        // walk to ~2·popcount·log…, and Core's pskip descents of a
+        // full-height chain stay within a few tens of hops. 500 is a
+        // generous guard rail — the linear walk would report ~50k.
+        assert!(
+            steps < 500,
+            "expected O(log n) ancestor descents, got {steps} steps"
         );
     }
 

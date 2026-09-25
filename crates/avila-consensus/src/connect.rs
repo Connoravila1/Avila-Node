@@ -1295,9 +1295,39 @@ pub struct ConnectTiming {
     /// pipeline's true cost under `enable_speculative_connect`
     /// (connect_block returns before the wait; the wait lands here).
     pub drain_ns: u64,
+    /// `accept_block` wall time — everything outside connect_block:
+    /// header insert, body store, descendant scan, reorg simulate.
+    pub accept_ns: u64,
+    /// `maybe_reorg` calls (branch walk + simulate + commit) — the
+    /// per-accept overhead that dominates when bodies are re-offered.
+    pub reorg_ns: u64,
+    /// Sub-segments inside `maybe_reorg`: fork walk, overlay+simulate,
+    /// unoverlay, commit bookkeeping, post-commit body reads, and the
+    /// tail (receipt/drain/flush).
+    pub seg_ns: [u64; 6],
+    /// Inside `simulate_branch`: cumulative body reads and
+    /// `script_checks` (assumevalid ancestor probes).
+    pub sim_body_ns: u64,
+    pub sim_checks_ns: u64,
+    /// Inside `script_checks`: the two `is_ancestor` descents and the
+    /// `block_proof_equivalent_time` tail.
+    pub checks_parts_ns: [u64; 3],
 }
 
-static TIMING: [AtomicU64; 7] = [
+static TIMING: [AtomicU64; 20] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -1309,6 +1339,24 @@ static TIMING: [AtomicU64; 7] = [
 
 fn tick(i: usize, start: std::time::Instant) {
     TIMING[i].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// `maybe_reorg` sub-segment buckets — TIMING[9 + i]. Re-arms `t`
+/// so a single Instant can delimit consecutive segments.
+pub(crate) fn seg_tick(i: usize, t: &mut std::time::Instant) {
+    tick(9 + i, *t);
+    *t = std::time::Instant::now();
+}
+
+/// `accept_block`'s outer wall time and the maybe_reorg share of it —
+/// TIMING[7]/[8]. Called from `chainstate`, which owns both.
+pub(crate) fn accept_tick(start: std::time::Instant) {
+    tick(7, start);
+}
+
+/// Wall time inside `maybe_reorg` — TIMING[8].
+pub(crate) fn reorg_tick(start: std::time::Instant) {
+    tick(8, start);
 }
 
 /// Speculative-drain timing — `chainstate::drain_pending_to` waits on
@@ -1450,7 +1498,36 @@ pub fn connect_timing() -> ConnectTiming {
         script_ns: TIMING[4].load(Ordering::Relaxed),
         bip30_ns: TIMING[5].load(Ordering::Relaxed),
         drain_ns: TIMING[6].load(Ordering::Relaxed),
+        accept_ns: TIMING[7].load(Ordering::Relaxed),
+        reorg_ns: TIMING[8].load(Ordering::Relaxed),
+        seg_ns: [
+            TIMING[9].load(Ordering::Relaxed),
+            TIMING[10].load(Ordering::Relaxed),
+            TIMING[11].load(Ordering::Relaxed),
+            TIMING[12].load(Ordering::Relaxed),
+            TIMING[13].load(Ordering::Relaxed),
+            TIMING[14].load(Ordering::Relaxed),
+        ],
+        sim_body_ns: TIMING[15].load(Ordering::Relaxed),
+        sim_checks_ns: TIMING[16].load(Ordering::Relaxed),
+        checks_parts_ns: [
+            TIMING[17].load(Ordering::Relaxed),
+            TIMING[18].load(Ordering::Relaxed),
+            TIMING[19].load(Ordering::Relaxed),
+        ],
     }
+}
+
+/// `script_checks` parts — TIMING[17]/[18]/[19] (av-descent,
+/// best-descent, proof-equivalent-time).
+pub(crate) fn checks_tick(i: usize, start: std::time::Instant) {
+    tick(17 + i, start);
+}
+
+/// `simulate_branch` inner probes — TIMING[15]/[16] (body reads vs
+/// `script_checks` assumevalid walks).
+pub(crate) fn sim_tick(i: usize, start: std::time::Instant) {
+    tick(15 + i, start);
 }
 
 /// docs for the script boundary).

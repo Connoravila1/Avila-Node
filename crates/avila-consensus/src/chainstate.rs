@@ -132,6 +132,29 @@ pub struct ChainTxStats {
     pub tx_rate: Option<f64>,
 }
 
+/// RAII stopwatch feeding the connect-timing buckets — functions with
+/// many exit paths (`accept_block`, `maybe_reorg`) record on all of
+/// them, including early returns.
+struct ScopeTick {
+    start: std::time::Instant,
+    sink: fn(std::time::Instant),
+}
+
+impl ScopeTick {
+    fn new(sink: fn(std::time::Instant)) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            sink,
+        }
+    }
+}
+
+impl Drop for ScopeTick {
+    fn drop(&mut self) {
+        (self.sink)(self.start);
+    }
+}
+
 /// Why [`Chainstate::chain_tx_stats`] failed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Error)]
 pub enum TxStatsError {
@@ -1754,6 +1777,12 @@ impl Chainstate {
         }
         let mut seen = 0usize;
         let mut leftover: Vec<(BlockHash, crate::store::BlockPos)> = Vec::new();
+        // Startup must not grind for hours: a large connectable backlog
+        // (e.g. wedge-accumulated parked bodies) at ~500ms/block would
+        // hold `open` hostage. Time-box the replay — remaining bodies
+        // stay stored and drain through the live tick, which reports
+        // progress (and connect timing) instead of hiding inside open.
+        let replay_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         for round in 0..2 {
             let src = if round == 0 {
                 std::mem::take(&mut pending)
@@ -1761,6 +1790,10 @@ impl Chainstate {
                 std::mem::take(&mut leftover)
             };
             for (hash, pos) in src {
+                if std::time::Instant::now() > replay_deadline {
+                    leftover.push((hash, pos));
+                    continue;
+                }
                 seen += 1;
                 if round == 0 && seen.is_multiple_of(100) {
                     let tip = cs.chain.len() as u32 - 1;
@@ -1781,11 +1814,16 @@ impl Chainstate {
                 // pays for `maybe_reorg`: a branch walk back to the
                 // active chain that costs O(gap) per body — O(n²) over
                 // a wedge-accumulated backlog. The header node answers
-                // the parent check without even decoding the body.
-                let parent_ok = cs
-                    .tree
-                    .get(&hash)
-                    .is_some_and(|n| n.header.prev_block_hash == cs.tip_hash());
+                // the parent check without even decoding the body. A
+                // hash *absent* from the tree is offered anyway — its
+                // parent is unknowable without decoding, and
+                // `accept_block` inserts the header itself (the
+                // snapshot-corruption/post-flush fallback replays
+                // depend on exactly that).
+                let parent_ok = match cs.tree.get(&hash) {
+                    Some(n) => n.header.prev_block_hash == cs.tip_hash(),
+                    None => true,
+                };
                 if !parent_ok {
                     leftover.push((hash, pos));
                     continue;
@@ -2852,10 +2890,19 @@ impl Chainstate {
             return true;
         };
         let best = self.tree.tip();
-        if !self.tree.is_ancestor(pindex, av)
-            || !self.tree.is_ancestor(pindex, best)
+        let t0 = std::time::Instant::now();
+        let anc_av = self.tree.is_ancestor(pindex, av);
+        crate::connect::checks_tick(0, t0);
+        let t1 = std::time::Instant::now();
+        let anc_best = self.tree.is_ancestor(pindex, best);
+        crate::connect::checks_tick(1, t1);
+        let t2 = std::time::Instant::now();
+        let proof_time = HeaderTree::block_proof_equivalent_time(best, pindex, best, params);
+        crate::connect::checks_tick(2, t2);
+        if !anc_av
+            || !anc_best
             || best.chainwork < params.minimum_chain_work
-            || HeaderTree::block_proof_equivalent_time(best, pindex, best, params) <= TWO_WEEKS
+            || proof_time <= TWO_WEEKS
         {
             return true;
         }
@@ -2881,6 +2928,7 @@ impl Chainstate {
     /// index entry — except `BLOCK_MUTATED`-class rejections, which never mark
     /// — so descendants of a marked block can never activate.
     pub fn accept_block(&mut self, block: &Block, now: u32) -> Result<Acceptance, BlockRejection> {
+        let _guard = ScopeTick::new(crate::connect::accept_tick);
         let params = *self.tree.params();
         // `ProcessNewBlock` runs `CheckBlock` before `AcceptBlock`: on failure
         // the block index is never touched and the block is never marked —
@@ -3081,6 +3129,8 @@ impl Chainstate {
         hash: BlockHash,
         params: &Params,
     ) -> Result<Option<bool>, ConnectError> {
+        let _guard = ScopeTick::new(crate::connect::reorg_tick);
+        let mut t_seg = std::time::Instant::now();
         let Some(new_node) = self.tree.get(&hash) else {
             return Err(ConnectError::Internal("reorg on unknown header"));
         };
@@ -3147,6 +3197,7 @@ impl Chainstate {
         if branch_hashes.iter().any(|h| !self.have_body(h)) {
             return Ok(None);
         }
+        crate::connect::seg_tick(0, &mut t_seg);
 
         // Simulate on an overlay: the live set moves into the overlay's
         // base layer (an O(1) `mem::take`, not the old O(utxo) clone) —
@@ -3161,7 +3212,9 @@ impl Chainstate {
                     return Err(err);
                 }
             };
+        crate::connect::seg_tick(1, &mut t_seg);
         self.utxo.unoverlay(sim, true);
+        crate::connect::seg_tick(2, &mut t_seg);
 
         // Commit. `disconnected` records whether any connected block was rolled
         // back — false when the branch merely extended the tip (a stored-body
@@ -3201,7 +3254,9 @@ impl Chainstate {
         } else {
             self.undos.clear();
         }
+        crate::connect::seg_tick(3, &mut t_seg);
         let bodies: Vec<Option<Block>> = branch_hashes.iter().map(|bh| self.body(bh)).collect();
+        crate::connect::seg_tick(4, &mut t_seg);
         if let Some(index) = &mut self.filterindex {
             for (i, (b, u)) in bodies.iter().zip(new_undos.iter()).enumerate() {
                 if let Some(b) = b {
@@ -3256,6 +3311,7 @@ impl Chainstate {
         self.undos.extend(new_undos.into_iter().skip(split));
         self.connected = hash;
         self.drive_utreexo();
+        crate::connect::seg_tick(5, &mut t_seg);
         Ok(Some(disconnected))
     }
 
@@ -3382,14 +3438,19 @@ impl Chainstate {
         let mut new_undos = Vec::with_capacity(branch_hashes.len());
         let mut new_receipts = Vec::with_capacity(branch_hashes.len());
         for branch_hash in branch_hashes {
+            let t_body = std::time::Instant::now();
             let Some(block) = self.body(branch_hash) else {
                 return Err(ConnectError::Internal("missing branch block body"));
             };
+            crate::connect::sim_tick(0, t_body);
+            let t_checks = std::time::Instant::now();
+            let checks = self.script_checks(branch_hash, params);
+            crate::connect::sim_tick(1, t_checks);
             let ctx = ConnectContext {
                 params,
                 tree: &self.tree,
                 block_hash: *branch_hash,
-                script_checks: self.script_checks(branch_hash, params),
+                script_checks: checks,
                 script_pool: None,
             };
             match connect::connect_block_full(&block, sim, &ctx) {
