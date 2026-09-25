@@ -173,6 +173,12 @@ pub struct SyncProgress {
     /// Configured block-store prune budget — `Some` means the node
     /// runs in prune mode (`pruneblockchain` is meaningful).
     pub prune_bytes: Option<u64>,
+    /// The SOCKS5 proxy, when configured — the RPC thread needs to
+    /// know this WITHOUT a chain query so `addnode`-on-a-hostname can
+    /// decide whether local DNS resolution is safe (audit P2P-13:
+    /// under a proxy the name must resolve remotely, so the eager
+    /// `to_socket_addrs` on the RPC thread would itself be the leak).
+    pub proxy: Option<std::net::SocketAddr>,
     /// Work and time along the best header chain (see [`ChainProfile`]).
     pub profile: std::sync::Arc<ChainProfile>,
     /// The block the mempool would produce next; `None` unless
@@ -690,6 +696,7 @@ pub fn run(
         }
         let snapshot = SyncProgress {
             peers: mgr.len(),
+            proxy: mgr.proxy(),
             connected_height: connected,
             header_height: cs.tree().tip().height,
             in_flight: mgr.in_flight(),

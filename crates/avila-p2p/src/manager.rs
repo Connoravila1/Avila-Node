@@ -2781,13 +2781,13 @@ impl PeerManager<TcpStream> {
                 && !host.is_empty()
                 && host.len() <= 253
             {
-                    let key = DialKey::Domain(host.trim_matches(&['[', ']'][..]).to_string(), port);
-                    if self.pending_dials.contains_key(&key) {
-                        continue;
-                    }
-                    self.addnode_dial.insert(node.clone(), Instant::now());
-                    self.queue_dial(key, use_v2, magic, start_height, &mut dialed);
+                let key = DialKey::Domain(host.trim_matches(&['[', ']'][..]).to_string(), port);
+                if self.pending_dials.contains_key(&key) {
                     continue;
+                }
+                self.addnode_dial.insert(node.clone(), Instant::now());
+                self.queue_dial(key, use_v2, magic, start_height, &mut dialed);
+                continue;
             }
             if let Ok(addrs) = node.as_str().to_socket_addrs() {
                 let socks: Vec<SocketAddr> = addrs.collect();

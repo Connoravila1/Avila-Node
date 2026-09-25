@@ -343,7 +343,11 @@ fn signer_subprocess_signs_and_locks() {
         provenance: "test".into(),
         entropy_commitment: String::new(),
     };
-    std::fs::write(&vault, avila_node::watch::vault_seal(&state, &[], "pw").unwrap()).unwrap();
+    std::fs::write(
+        &vault,
+        avila_node::watch::vault_seal(&state, &[], "pw").unwrap(),
+    )
+    .unwrap();
 
     // Spawn the real subprocess and have it sign.
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_avila-node"));

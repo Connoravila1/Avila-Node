@@ -238,9 +238,8 @@ fn probe_datadir_lock(dir: &Path) -> Result<Option<std::fs::File>, String> {
     else {
         return Ok(None);
     };
-    lock.try_lock().map_err(|_| {
-        format!("{} is locked — stop the node first", dir.display())
-    })?;
+    lock.try_lock()
+        .map_err(|_| format!("{} is locked — stop the node first", dir.display()))?;
     Ok(Some(lock))
 }
 
@@ -520,6 +519,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     next_block: None,
                     eclipse: Vec::new(),
                     prune_bytes: None,
+                    proxy: None,
                 }));
             let (query_tx, query_rx) = std::sync::mpsc::channel();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

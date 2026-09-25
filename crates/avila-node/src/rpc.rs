@@ -13773,7 +13773,10 @@ pub(crate) fn dispatch(
             // (`connect_via` + SocksTarget::Domain), so the name never
             // reaches local DNS.
             let literal_sock: Option<std::net::SocketAddr> = node.as_str().parse().ok();
-            let resolved = (command == "onetry")
+            // Audit P2P-13 fix: resolve locally ONLY when no proxy is
+            // configured — under `-proxy` the earlier unconditional
+            // `to_socket_addrs` was itself the DNS leak.
+            let resolved = (command == "onetry" && snap.proxy.is_none())
                 .then(|| literal_sock.or_else(|| node.as_str().to_socket_addrs().ok()?.next()))
                 .flatten();
             let node_host = node.clone();
@@ -14717,6 +14720,7 @@ mod tests {
             next_block: None,
             eclipse: Vec::new(),
             prune_bytes: None,
+            proxy: None,
         }
     }
 

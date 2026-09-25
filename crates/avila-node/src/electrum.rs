@@ -1356,6 +1356,7 @@ mod tests {
             next_block: None,
             eclipse: Vec::new(),
             prune_bytes: None,
+            proxy: None,
         }));
         let cancel = Arc::new(AtomicBool::new(false));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1469,6 +1470,7 @@ mod tests {
             next_block: None,
             eclipse: Vec::new(),
             prune_bytes: None,
+            proxy: None,
         }));
         let cancel = Arc::new(AtomicBool::new(false));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1612,6 +1614,7 @@ mod tests {
             next_block: None,
             eclipse: Vec::new(),
             prune_bytes: None,
+            proxy: None,
         }))
     }
 
