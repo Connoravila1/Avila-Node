@@ -560,3 +560,13 @@ First real mainnet run (`avila-gui --config config/mainnet.toml`,
     coverage.
   - Not yet: reorg/undo (rustreexo's UpdateData makes it possible),
     proof serving (MemForest bridge), p2p bundle transport (#6).
+
+- Erlay follow-through — adaptive sketch capacity (#4 first piece):
+  capacity was `pool_len/64` — sized by OUR set, not the diff a
+  sketch actually decodes. A 40k pool round-tripped a 512-symbol
+  sketch (~2 KiB) for a steady-state diff of tens. Now a per-peer
+  `recon_diff_hint` records the largest decoded diff (fast rise,
+  half-decay per quiet round) and capacity = `2*hint + 32` clamped
+  [16, 1024]. A bisect event doubles-hints so the next round skips
+  the bisect trip. Still to measure on a live node with a real
+  mempool — capacity waste only matters once pool diffs are real.

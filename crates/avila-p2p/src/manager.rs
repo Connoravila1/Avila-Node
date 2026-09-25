@@ -47,6 +47,22 @@ const RECON_FIRST_DELAY: Duration = Duration::from_secs(10);
 /// The pool's salted short-ids plus the reverse map — `short_id` keys
 /// this link's sketch; the map resolves `reconcildiff` asks back to
 /// bodies.
+/// Pure hint update — the new hint is the larger of the observed diff
+/// and half the old hint (fast rise, gradual decay).
+/// Sketch capacity for a link's next round — sized by the observed
+/// diff, not the pool: a round that decoded N differences sizes the
+/// next at `2N + 32`, min 16 (a sketch under the diff can't decode and
+/// costs a bisect round-trip), capped at 1024 (a wider diff than that
+/// is cheaper to bisect or inv-announce anyway).
+fn recon_capacity(hint: u32) -> usize {
+    (hint.saturating_mul(2) as usize + 32).clamp(16, 1024)
+}
+
+fn recon_hint_update(hint: u32, diff: u64) -> u32 {
+    let observed = u32::try_from(diff).unwrap_or(u32::MAX);
+    observed.max(hint / 2)
+}
+
 fn recon_pool(
     mempool: &avila_mempool::Mempool,
     salt: u64,
@@ -329,6 +345,11 @@ struct PeerEntry<S> {
     /// collected so far — `lo` is consumed by the first `sketch`, `hi`
     /// by the second (fixed reply order).
     recon_bisect: Option<ReconBisect>,
+    /// Largest diff this link has produced so far (decays per round):
+    /// the sketch-capacity hint — a round observed at size N sizes the
+    /// next at `2N + margin`, so capacity tracks the actual diff
+    /// rather than the whole pool's size.
+    recon_diff_hint: u32,
 }
 
 impl<S> PeerEntry<S> {
@@ -975,6 +996,7 @@ impl<S: Read + Write> PeerManager<S> {
                 recon_alarm_sent: false,
                 next_recon: Instant::now(),
                 recon_bisect: None,
+                recon_diff_hint: 0,
             },
         );
         Some(id)
@@ -1432,6 +1454,13 @@ impl<S: Read + Write> PeerManager<S> {
     }
 
     /// BIP330 scheduled rounds: for every established link that
+    /// Folds an observed diff size into the per-peer capacity hint —
+    /// rises immediately to cover a big round, decays by half per
+    /// quiet round so a burst doesn't pin capacity high forever.
+    fn recon_observe(peer: &mut PeerEntry<S>, diff: u64) {
+        peer.recon_diff_hint = recon_hint_update(peer.recon_diff_hint, diff);
+    }
+
     /// negotiated `sendrecon` and is due, open a sketch round over the
     /// current pool. Failed/finished rounds clear on the next due tick.
     fn recon_pass(&mut self) {
@@ -1448,7 +1477,7 @@ impl<S: Read + Write> PeerManager<S> {
             let pending: std::collections::HashSet<_> =
                 self.stem_pending.iter().map(|(t, _, _)| *t).collect();
             let (our_ids, our_map) = recon_pool(&self.mempool, salt, &pending);
-            let capacity = (our_ids.len() / 64).clamp(8, 512);
+            let capacity = recon_capacity(peer.recon_diff_hint);
             let (round, req) = crate::recon::ReconRound::open(&our_ids, capacity);
             peer.recon_round = Some(round);
             peer.recon_map = our_map;
@@ -2167,6 +2196,12 @@ impl<S: Read + Write> PeerManager<S> {
                         peer.recon_rounds += 1;
                         peer.recon_misses += bs.misses.len() as u64;
                         peer.recon_their_misses += bs.their_misses;
+                        // The round needed bisecting — capacity was
+                        // under the real diff: observe the measured
+                        // total, and make sure the hint outgrows it.
+                        let observed = bs.misses.len() as u64 + bs.their_misses;
+                        Self::recon_observe(peer, observed);
+                        peer.recon_diff_hint = peer.recon_diff_hint.max(observed as u32 * 2);
                         Self::recon_alarm_check(peer, id, events);
                         if !bs.misses.is_empty() {
                             let _ = peer.session.send(&Message::ReconcilDiff {
@@ -2184,6 +2219,10 @@ impl<S: Read + Write> PeerManager<S> {
                             peer.recon_rounds += 1;
                             peer.recon_misses += misses.len() as u64;
                             peer.recon_their_misses += their_misses.len() as u64;
+                            Self::recon_observe(
+                                peer,
+                                misses.len() as u64 + their_misses.len() as u64,
+                            );
                             Self::recon_alarm_check(peer, id, events);
                             if !misses.is_empty() {
                                 let _ = peer.session.send(&Message::ReconcilDiff {
@@ -2232,7 +2271,7 @@ impl<S: Read + Write> PeerManager<S> {
                 };
                 let salt = link.our_salt ^ link.their_salt;
                 let (our_ids, _) = recon_pool(mempool, salt, stem_exclude);
-                let capacity = (our_ids.len() / 64).clamp(8, 512);
+                let capacity = recon_capacity(peer.recon_diff_hint);
                 let (lo, hi) = crate::recon::bisect_reply(&our_ids, 31, capacity);
                 let _ = peer.session.send(&lo);
                 let _ = peer.session.send(&hi);
@@ -5508,5 +5547,25 @@ mod tests {
         let (ids, _) = recon_pool(mgr.mempool_ref(), salt, &empty);
         assert!(ids.contains(&short), "fluffed tx must reconcile");
         let _ = ida;
+    }
+    /// Adaptive sketch capacity: the hint tracks the largest observed
+    /// diff, decays by half per quiet round, and capacity sizes at
+    /// `2*hint + 32` inside [16, 1024].
+    #[test]
+    fn recon_capacity_tracks_observed_diff() {
+        assert_eq!(recon_capacity(0), 32);
+        // A cold round on a wide diff jumps the hint straight up...
+        let h = recon_hint_update(0, 300);
+        assert_eq!(h, 300);
+        assert_eq!(recon_capacity(h), 632);
+        // ...and quiet rounds decay it toward the real diff size.
+        let h = recon_hint_update(h, 40);
+        assert_eq!(h, 150);
+        let h = recon_hint_update(h, 40);
+        assert_eq!(h, 75);
+        // A fresh spike re-rises immediately.
+        assert_eq!(recon_hint_update(h, 900), 900);
+        // And the cap still bounds absurd observations.
+        assert_eq!(recon_capacity(u32::MAX), 1024);
     }
 }
