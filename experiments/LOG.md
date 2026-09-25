@@ -390,3 +390,36 @@ mainnet-wide address index extrapolates to the multi-GB range — the
 cost model confirms the opt-in profile design. Bounded measurement,
 not a live full-chain run.
 
+
+## Security audit remediation (AUDIT-2026-09-24)
+
+External audit of `2bf8bab` (+`d661e72`): 3 critical, 16 high, ~25
+medium, plus lows/slop. All findings fixed and verified:
+
+- **Criticals**: `getdata` streaming serve with byte budget (was:
+  whole-request materialization, any peer could OOM the node);
+  entropy commitment domain-separated (was: commitment == seed, and
+  `signerload` echoed it); dice floor 10→50 rolls + `mix` defaults on.
+- **Highs**: walletprocesspsbt refuses unverified inputs; coin
+  selection excludes mempool-spent + immature coinbases; wallet fee
+  ceiling (0.10 BTC/kvB); `listreceivedbyaddress` no longer panics on
+  silent-payment coins; SP scan keys moved to the vault (watchlist
+  keeps public material only); vault+watchlist 0600 + fsync +
+  overwrite guard; `createdescriptorseed` refuses a loaded signer;
+  pre-auth header parser panic closed (Unicode case-fold length
+  bug) + duplicate-CL rejected; RPC slot leak on panic (drop guard);
+  Electrum subscription rescan now change-gated, per-connection pump
+  lifetime + sub cap; reqrecon rate-limited; BIP35 `mempool` is
+  inbound-only + capped; outbound netgroup diversity without asmap;
+  per-command traffic counters bounded; misbehavior now discourages.
+- **Mediums/lows**: addrman per-source insert quota (P2P-6); stem
+  hop is per-epoch (P2P-7); zeroize on all key-bearing types;
+  argon2 off the sync thread; named-param validation; PSBT sighash
+  honored; testmempoolaccept maxfeerate; pinning-risk `mine` gated;
+  addnode hostname never hits local DNS under `-proxy`.
+- Deferred: the ~1k-line RPC boilerplate dedup (slop, zero security
+  value — tracked separately); unsalted swiftsync tags (audit itself
+  flags safe-today).
+
+Commits: `fd54db4` (criticals+highs), `a623909` (mediums+lows),
+`1acc2b5` (P2P-13 residual). Workspace release tests green.
