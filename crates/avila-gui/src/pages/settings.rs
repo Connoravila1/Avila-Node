@@ -240,6 +240,21 @@ fn advanced(ui: &mut Ui, s: &Scene, run: &mut RunSettings) {
         });
         ui.end_row();
 
+        key(ui, s, "Verification");
+        ui.vertical(|ui| {
+            widgets::checkbox(
+                ui,
+                &mut run.full_verify,
+                "Verify every historical signature",
+            );
+            help(
+                ui,
+                s,
+                "Check all input scripts from genesis (assumevalid=0). Slower to sync; every block's receipt shows its checks ran.",
+            );
+        });
+        ui.end_row();
+
         key(ui, s, "Electrum server");
         ui.vertical(|ui| {
             field(ui, &mut run.electrum, "Off", 220.0);

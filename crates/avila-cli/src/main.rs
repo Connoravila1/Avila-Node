@@ -82,6 +82,11 @@ enum Command {
         /// force cleartext.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         v2transport: bool,
+        /// Skip script checks before this block (Core's -assumevalid).
+        /// Pass 0 to verify every historical signature — the full-
+        /// verification choice.
+        #[arg(long)]
+        assumevalid: Option<String>,
         /// Total peer slots, inbound + outbound (Core's
         /// -maxconnections; default 8).
         #[arg(long)]
@@ -476,6 +481,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             peerblockfilters,
             maxmempool,
             v2transport,
+            assumevalid,
             maxconnections,
             dbcache,
             listen,
@@ -496,7 +502,18 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 avila_core::Network::Signet => ConsensusNet::Signet,
                 avila_core::Network::Regtest => ConsensusNet::Regtest,
             };
-            let params = consensus_net.params();
+            let mut params = consensus_net.params();
+            if let Some(av) = &assumevalid {
+                // Core's -assumevalid: 0 disables the script-check
+                // skip; a hash moves the checkpoint.
+                params.assume_valid = if av == "0" {
+                    None
+                } else {
+                    Some(av.parse().map_err(|_| {
+                        format!("-assumevalid: “{av}” is not a block hash (or 0 to verify all)")
+                    })?)
+                };
+            }
             let status: avila_node::rpc::SharedStatus =
                 std::sync::Arc::new(std::sync::RwLock::new(SyncProgress {
                     peers: 0,

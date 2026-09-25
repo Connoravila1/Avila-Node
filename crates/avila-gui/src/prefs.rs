@@ -21,7 +21,7 @@ pub enum ThemeChoice {
     System,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Prefs {
     pub theme: ThemeChoice,
     /// Interface scale, one of [`Prefs::SIZES`].
@@ -41,6 +41,11 @@ pub struct Prefs {
     /// A toybox skin; only worn while the toybox is on.
     #[serde(default)]
     pub skin: Skin,
+    /// SOCKS5 proxy `host:port` from the last run's settings —
+    /// private operation stays chosen across restarts rather than
+    /// silently reverting to direct connections.
+    #[serde(default)]
+    pub proxy: String,
     /// Shitcoin Defense's best score.
     #[serde(default)]
     pub game_best: u32,
@@ -56,6 +61,7 @@ impl Default for Prefs {
             rhythm_clock: false,
             toybox: false,
             skin: Skin::Standard,
+            proxy: String::new(),
             game_best: 0,
         }
     }
@@ -86,11 +92,11 @@ impl Prefs {
             .unwrap_or_default()
     }
 
-    pub fn save(self, storage: &mut dyn eframe::Storage) {
+    pub fn save(&self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, KEY, &self.normalized());
     }
 
-    pub fn apply(self, ctx: &egui::Context) {
+    pub fn apply(&self, ctx: &egui::Context) {
         ctx.set_theme(match self.theme {
             ThemeChoice::System => egui::ThemePreference::System,
             ThemeChoice::Light => egui::ThemePreference::Light,
@@ -108,13 +114,16 @@ impl Prefs {
     }
 
     /// Snaps a stored size to the nearest offered one.
-    fn normalized(self) -> Self {
+    fn normalized(&self) -> Self {
         let size = Self::SIZES
             .iter()
             .map(|(s, _)| *s)
             .min_by(|a, b| (a - self.size).abs().total_cmp(&(b - self.size).abs()))
             .unwrap_or(1.0);
-        Self { size, ..self }
+        Self {
+            size,
+            ..self.clone()
+        }
     }
 }
 
@@ -154,6 +163,7 @@ mod tests {
             toybox: true,
             skin: Skin::Julia,
             game_best: 42,
+            proxy: "127.0.0.1:9050".into(),
         };
         prefs.save(&mut storage);
         assert_eq!(
@@ -167,6 +177,7 @@ mod tests {
                 toybox: true,
                 skin: Skin::Julia,
                 game_best: 42,
+                proxy: "127.0.0.1:9050".into(),
             }
         );
         assert_eq!(storage.0.len(), 1);

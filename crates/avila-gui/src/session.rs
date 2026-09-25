@@ -52,6 +52,9 @@ pub struct RunSettings {
     pub peerblockfilters: bool,
     /// Run an Electrum server at this `host:port` (empty: off).
     pub electrum: String,
+    /// Verify every historical signature — no assumevalid checkpoint
+    /// skip. Slower sync; the receipts prove every check ran.
+    pub full_verify: bool,
 }
 
 impl RunSettings {
@@ -76,6 +79,7 @@ impl RunSettings {
             blockfilterindex: false,
             peerblockfilters: false,
             electrum: String::new(),
+            full_verify: false,
         }
     }
 
@@ -336,6 +340,34 @@ impl Session {
         if self.running {
             return;
         }
+        // Privacy settings are binding, not advisory: a proxy field
+        // that doesn't parse must NOT silently become "connect
+        // directly", and a mistyped peer list must not fall back to
+        // DNS seeds. Refuse the start — the settings page already
+        // shows exactly which entry is wrong.
+        let bad: Vec<String> = settings
+            .connect
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty() && p.parse::<SocketAddr>().is_err())
+            .map(str::to_string)
+            .collect();
+        let proxy = settings.proxy.trim();
+        let bad_proxy = !proxy.is_empty() && proxy.parse::<SocketAddr>().is_err();
+        if !bad.is_empty() || bad_proxy {
+            let what = if bad_proxy {
+                format!("proxy “{proxy}” is not a host:port address")
+            } else {
+                format!("peer “{}” is not a host:port address", bad[0])
+            };
+            self.log(
+                ActivityKind::Node,
+                format!("Not starting: {what} — fix or clear it rather than connect unsafely."),
+                None,
+                self.now(),
+            );
+            return;
+        }
         self.running = true;
         self.stopping = false;
         self.ended = None;
@@ -359,7 +391,12 @@ impl Session {
             self.sim = Some(sim);
             return;
         }
-        let params = params(network);
+        let mut params = params(network);
+        // "Verify every signature" — assumevalid=0: the checkpoint
+        // skip is off and receipts show checks_enabled on every block.
+        if settings.full_verify {
+            params.assume_valid = None;
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         let cfg = SyncConfig {
             connect: settings.connect_addrs(),

@@ -88,7 +88,11 @@ impl App {
         let keep_prefs = capture.is_none() && skin.is_none();
         prefs.apply(ctx);
         let network = node.config().get().network;
-        let run = RunSettings::new(network);
+        let mut run = RunSettings::new(network);
+        // The proxy choice persists — privacy stays binding across
+        // restarts instead of silently reverting to direct dials.
+        run.proxy = prefs.proxy.clone();
+        let applied = prefs.clone();
         let mut session = Session::new(demo);
         // The node's own journal opens the activity log.
         for record in node.events().entries() {
@@ -128,7 +132,7 @@ impl App {
             peer_sort: PeerSort::default(),
             ribbon_view: View::default(),
             game: toybox::Game::default(),
-            applied: prefs,
+            applied,
             xp: xp::Xp::default(),
             history: Vec::new(),
             ahead: Vec::new(),
@@ -587,7 +591,7 @@ impl eframe::App for App {
         // are put in force here, once.
         if self.prefs != self.applied {
             self.prefs.apply(&ctx);
-            self.applied = self.prefs;
+            self.applied = self.prefs.clone();
         }
         if self.page == Page::Toybox && !self.prefs.toybox {
             self.page = Page::Settings;
@@ -635,6 +639,7 @@ impl eframe::App for App {
         // A capture run poses the app, and a skin from the environment is
         // for one run; neither may overwrite real choices.
         if self.keep_prefs {
+            self.prefs.proxy = self.run.proxy.trim().to_string();
             self.prefs.save(storage);
         }
     }
