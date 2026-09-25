@@ -1013,7 +1013,14 @@ impl<S: Read + Write> PeerManager<S> {
             // socket backpressure slows it while others proceed. No
             // disconnect: the sync leader legitimately dominates
             // during IBD.
-            if peer.cpu_rate_ns > 200_000_000 && peer.cpu_rate_ns * 2 > total_cpu_rate {
+            if peer.cpu_rate_ns > 200_000_000
+                && peer.cpu_rate_ns * 2 > total_cpu_rate
+                // The headers leader legitimately dominates during
+                // presync — throttling it starves the one socket we
+                // must keep draining, and the remote side closes a
+                // connection it can't write to.
+                && *headers_leader != Some(id)
+            {
                 events.push(NetEvent::CpuThrottled {
                     peer: id,
                     rate_ns: peer.cpu_rate_ns,
@@ -1205,12 +1212,14 @@ impl<S: Read + Write> PeerManager<S> {
             out.push(EclipseSignal::TipStale);
         }
 
-        // DiversityCollapse: outbound set concentrated in one /16.
+        // DiversityCollapse: outbound set concentrated in one network
+        // group — the same key outbound selection buckets by (v4 /16,
+        // v6 /32, unroutable each their own).
         if outbound.len() >= 4 {
-            let mut groups: HashMap<[u8; 2], usize> = HashMap::new();
+            let mut groups: HashMap<Vec<u8>, usize> = HashMap::new();
             for p in &outbound {
                 if let Some(r) = p.remote {
-                    *groups.entry([r.ip[0], r.ip[1]]).or_default() += 1;
+                    *groups.entry(crate::addrman::net_group(&r.ip)).or_default() += 1;
                 }
             }
             if groups.len() == 1 {
@@ -1594,15 +1603,45 @@ impl<S: Read + Write> PeerManager<S> {
     /// `getdata` for indexed-but-unfetched blocks no peer has reserved.
     /// Peers that stall or leave simply stop holding reservations, so an
     /// interrupted download resumes through this pass automatically.
+    /// The headers leader's buffered presync height — the tree tip
+    /// doesn't move while presync runs, so this is the visible
+    /// progress signal during early IBD.
+    pub fn presync_height(&self) -> Option<u64> {
+        self.headers_leader
+            .and_then(|id| self.peers.get(&id))
+            .and_then(|p| p.sync.presync_height())
+    }
+
     fn fill_queues(&mut self, cs: &Chainstate) {
         // Leaderless and connected: the first established peer resumes
         // headers paging from our tip (locator-based, so cheap).
         if self.headers_leader.is_none()
-            && let Some((&id, peer)) = self.peers.iter_mut().find(|(_, p)| p.session.established())
+            && let Some(id) = {
+                // Prefer a peer that's already answered headers — a
+                // proven responder over an arbitrary established peer.
+                let proven = self
+                    .peers
+                    .iter()
+                    .filter(|(_, p)| p.session.established() && p.synced_header_height > 0)
+                    .max_by_key(|(_, p)| p.synced_header_height)
+                    .map(|(id, _)| *id);
+                proven.or_else(|| {
+                    self.peers
+                        .iter()
+                        .find(|(_, p)| p.session.established())
+                        .map(|(id, _)| *id)
+                })
+            }
+            && let Some(peer) = self.peers.get_mut(&id)
         {
             self.headers_leader = Some(id);
-            let req = peer.sync.request_headers(cs);
-            let _ = peer.session.send(&req);
+            // A peer with a live presync resumes it from its buffered
+            // tip — re-asking from the tree tip would draw a page whose
+            // discontinuity abandons the buffered work.
+            if !peer.sync.awaiting_headers() {
+                let req = peer.sync.resume_headers(cs);
+                let _ = peer.session.send(&req);
+            }
         }
         let mut reserved: std::collections::HashSet<BlockHash> = self
             .peers
@@ -1757,7 +1796,12 @@ impl<S: Read + Write> PeerManager<S> {
             }
             SessionEvent::Message(Message::Headers(headers)) => {
                 peer.last_announce = Some(i64::from(now));
-                match peer.sync.on_headers(cs, &headers, now) {
+                match peer.sync.on_headers(
+                    cs,
+                    &headers,
+                    now,
+                    headers_leader.is_none_or(|l| l == id),
+                ) {
                     Ok(outcome) => {
                         // Height of the last header this page indexed —
                         // Core's `synced_headers` (last common point this
@@ -1831,10 +1875,10 @@ impl<S: Read + Write> PeerManager<S> {
                     Ok(outcome) => {
                         peer.last_useful = Instant::now();
                         let connected_height =
-                            if let avila_consensus::chainstate::Acceptance::Connected {
+                            if let Some(avila_consensus::chainstate::Acceptance::Connected {
                                 height,
                                 ..
-                            } = outcome.acceptance
+                            }) = outcome.acceptance
                             {
                                 peer.synced_block_height = i64::from(height);
                                 Some(height)
@@ -1844,9 +1888,10 @@ impl<S: Read + Write> PeerManager<S> {
                         if let Some(h) = connected_height {
                             mempool.on_block_connected(&block, h);
                         }
-                        if let avila_consensus::chainstate::Acceptance::Connected {
-                            reorged, ..
-                        } = outcome.acceptance
+                        if let Some(avila_consensus::chainstate::Acceptance::Connected {
+                            reorged,
+                            ..
+                        }) = outcome.acceptance
                         {
                             if reorged {
                                 // The disconnected branch's txs are
@@ -4833,6 +4878,47 @@ mod tests {
         );
     }
 
+    /// The regression behind the /16 grouping fix: outbound peers as
+    /// IPv6-mapped IPv4 (`::ffff:a.b.c.d`) share the mapped prefix, so
+    /// a naive `ip[0..2]` group key collapses *every* v4-only set into
+    /// one group — DiversityCollapse must not fire on real diversity.
+    #[test]
+    fn v4_mapped_peers_in_distinct_sixteens_do_not_collapse() {
+        let mut mgr = PeerManager::new(8);
+        let mut cs = regtest();
+        let mut ends = Vec::new();
+        // Four outbound peers, each in a different v4 /16.
+        for i in 0..4u8 {
+            let (us_end, peer_end) = testpipe::pair();
+            let session = PeerSession::initiate(
+                us_end,
+                MAGIC,
+                build_version(9, 0, NetAddr::unspecified(), i64::from(NOW)),
+                BUDGET,
+            )
+            .expect("session");
+            let remote = crate::addrman::net_addr_of(
+                format!("{}.{}.{}.{}:8333", 20 + i, 30 + i, 40 + i, 50 + i)
+                    .parse()
+                    .unwrap(),
+                0,
+            );
+            let id = mgr.add_outbound_to(session, remote).expect("slot");
+            ends.push((peer_end, id));
+        }
+        for (end, _) in &mut ends {
+            testpipe::inject(end, MAGIC, &Message::Version(peer_version(5)));
+            testpipe::inject(end, MAGIC, &Message::Verack);
+        }
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let signals = mgr.eclipse_signals(&cs, NOW);
+        assert!(
+            !signals.contains(&EclipseSignal::DiversityCollapse),
+            "four distinct /16s must not read as one group: {signals:?}"
+        );
+    }
+
     /// TipStale must NOT fire while headers still trail what peers
     /// claim — during sync the tip is old by definition, so staleness
     /// then means "catching up", not "eclipsed". Claimed heights far
@@ -5048,38 +5134,61 @@ mod tests {
     /// PEER_BUDGETS CPU accounting (queue #14): a peer burning >50%
     /// of total dispatch CPU at >200ms/s loses its poll — the
     /// `CpuThrottled` event fires and its buffered input waits,
-    /// while a quiet peer is still served.
+    /// while a quiet peer is still served. The headers leader is
+    /// exempt: presync legitimately dominates, and starving its
+    /// socket invites the remote side to close the one connection
+    /// feeding header sync.
     #[test]
     fn cpu_throttle_skips_dominant_peer_only() {
         let (mut mgr, mut a, ida) = managed_peer();
         let mut cs = crate::testchain::regtest();
         handshake(&mut mgr, &mut a, &mut cs);
         testpipe::drain(&mut a, MAGIC);
-        let (mut b, _idb) = add_peer(&mut mgr);
+        let (mut b, idb) = add_peer(&mut mgr);
         handshake_peer(&mut mgr, &mut b, &mut cs);
         testpipe::drain(&mut b, MAGIC);
 
-        // Peer A dominated last window: 500ms/s, >50% of the total.
-        mgr.peers.get_mut(&ida).unwrap().cpu_rate_ns = 500_000_000;
+        // Peer B (not the headers leader — A was elected first)
+        // dominated last window: 500ms/s, >50% of the total.
+        mgr.peers.get_mut(&idb).unwrap().cpu_rate_ns = 500_000_000;
 
-        // A pings us — the throttled peer's poll is skipped, so the
+        // B pings us — the throttled peer's poll is skipped, so the
         // ping sits unread and no pong comes back.
-        testpipe::inject(&mut a, MAGIC, &Message::Ping(7));
+        testpipe::inject(&mut b, MAGIC, &Message::Ping(7));
         let events = mgr.tick(&mut cs, NOW);
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                NetEvent::CpuThrottled { peer, .. } if *peer == ida
+                NetEvent::CpuThrottled { peer, .. } if *peer == idb
             )),
             "dominant peer must fire CpuThrottled: {events:?}"
         );
-        let sent_a = testpipe::drain(&mut a, MAGIC);
+        let sent_b = testpipe::drain(&mut b, MAGIC);
         assert!(
-            !sent_a.iter().any(|m| matches!(m, Message::Pong(7))),
-            "throttled peer must not be served: {sent_a:?}"
+            !sent_b.iter().any(|m| matches!(m, Message::Pong(7))),
+            "throttled peer must not be served: {sent_b:?}"
         );
 
-        // Peer B stayed quiet — its ping is answered normally.
+        // The headers leader is exempt — even at the same burn rate
+        // its poll still runs.
+        mgr.peers.get_mut(&idb).unwrap().cpu_rate_ns = 0;
+        mgr.peers.get_mut(&ida).unwrap().cpu_rate_ns = 500_000_000;
+        testpipe::inject(&mut a, MAGIC, &Message::Ping(7));
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                NetEvent::CpuThrottled { peer, .. } if *peer == ida
+            )),
+            "headers leader must be exempt from throttling: {events:?}"
+        );
+        let sent_a = testpipe::drain(&mut a, MAGIC);
+        assert!(
+            sent_a.iter().any(|m| matches!(m, Message::Pong(7))),
+            "leader must still be served: {sent_a:?}"
+        );
+
+        // Peer B quiet again — its ping is answered normally.
         testpipe::inject(&mut b, MAGIC, &Message::Ping(9));
         mgr.tick(&mut cs, NOW);
         let sent_b = testpipe::drain(&mut b, MAGIC);

@@ -348,6 +348,12 @@ impl HeadersSyncState {
     /// `true` once this state has nothing left to do — the caller should
     /// drop it (Core's `HeadersSyncState::State::FINAL`).
     #[must_use]
+    /// How far the buffered candidate chain has grown — the presync's
+    /// own progress counter while nothing is committed to the tree.
+    pub fn buffered_height(&self) -> u64 {
+        self.current_height
+    }
+
     pub fn is_final(&self) -> bool {
         self.phase == Phase::Final
     }

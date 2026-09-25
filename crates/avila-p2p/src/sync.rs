@@ -88,8 +88,10 @@ pub struct HeadersOutcome {
 /// What [`PeerSync::on_block`] reports.
 #[derive(Clone, Debug)]
 pub struct BlockOutcome {
-    /// `accept_block`'s verdict.
-    pub acceptance: Acceptance,
+    /// `accept_block`'s verdict — `None` when the block never reached
+    /// validation because its parent isn't in the tree (orphan): an
+    /// announcement ahead of our headers, deferred rather than punished.
+    pub acceptance: Option<Acceptance>,
     /// Whether this block was one we had in flight from this peer.
     pub was_in_flight: bool,
 }
@@ -217,6 +219,21 @@ impl PeerSync {
             .chain(self.wanted.iter())
     }
 
+    /// The request that resumes this peer's header sync — its buffered
+    /// presync tip when one is live, the tree locator otherwise.
+    /// Electing a peer with `request_headers` would re-ask from genesis
+    /// and the reply's discontinuity against the presync's last-received
+    /// header would abandon it; this keeps the buffered work instead.
+    #[must_use]
+    pub fn resume_headers(&mut self, cs: &Chainstate) -> Message {
+        if let Some(state) = &self.headers_sync {
+            self.headers_in_flight = Some(Instant::now());
+            state.next_headers_request(cs)
+        } else {
+            self.request_headers(cs)
+        }
+    }
+
     /// Whether a `getheaders` is outstanding.
     #[must_use]
     pub fn awaiting_headers(&self) -> bool {
@@ -276,6 +293,13 @@ impl PeerSync {
     /// up handling the batch.
     ///
     /// A batch that doesn't yet carry [`headerssync`](crate::headerssync)'s
+    /// The buffered tip of an in-progress presync, if one is running —
+    /// the tree stays put while it runs, so this is the honest progress
+    /// signal during early header sync.
+    pub fn presync_height(&self) -> Option<u64> {
+        self.headers_sync.as_ref().map(|s| s.buffered_height())
+    }
+
     /// anti-DoS work threshold is diverted into a per-peer presync/redownload
     /// instead of reaching [`Chainstate::accept_header`] directly — see that
     /// module for why. Once a peer's low-work sync is in progress, every
@@ -301,6 +325,7 @@ impl PeerSync {
         cs: &mut Chainstate,
         headers: &[BlockHeader],
         now: u32,
+        allow_low_work: bool,
     ) -> Result<HeadersOutcome, SyncError> {
         self.headers_in_flight = None;
 
@@ -349,10 +374,17 @@ impl PeerSync {
         // that doesn't carry enough claimed work must never reach
         // `accept_header` directly, or a cheap low-difficulty chain could
         // grow the header tree without bound.
-        if !already_known_enough
-            && let Some(outcome) = self.try_low_work_headers_sync(cs, &params, headers, now)
-        {
-            return Ok(outcome);
+        if !already_known_enough {
+            // One presync at a time: a non-leader's low-work page is
+            // ignored rather than buffered — buffered presyncs on peers
+            // whose continuations are suppressed would sit stale and
+            // poison any later leadership handoff.
+            if !allow_low_work {
+                return Ok(HeadersOutcome::default());
+            }
+            if let Some(outcome) = self.try_low_work_headers_sync(cs, &params, headers, now) {
+                return Ok(outcome);
+            }
         }
 
         let (added, known, fetchable) = self.accept_headers(cs, headers, now)?;
@@ -724,10 +756,16 @@ impl PeerSync {
             Ok(acceptance) => {
                 self.blocks_received += 1;
                 Ok(BlockOutcome {
-                    acceptance,
+                    acceptance: Some(acceptance),
                     was_in_flight,
                 })
             }
+            Err(avila_consensus::chainstate::BlockRejection::Header(
+                avila_consensus::chain::ChainError::UnknownParent(_),
+            )) => Ok(BlockOutcome {
+                acceptance: None,
+                was_in_flight,
+            }),
             Err(rej) => Err(SyncError::InvalidBlock(rej.to_string())),
         }
     }
@@ -1093,7 +1131,7 @@ mod tests {
         let blocks = chain_blocks(&cs, 5);
         let headers: Vec<BlockHeader> = blocks.iter().map(|b| b.header).collect();
         let mut sync = PeerSync::new();
-        let out = sync.on_headers(&mut cs, &headers, NOW).unwrap();
+        let out = sync.on_headers(&mut cs, &headers, NOW, true).unwrap();
         assert_eq!(out.added, 5);
         assert_eq!(out.known, 0);
         assert!(out.continuation.is_none()); // partial page — peer is done
@@ -1112,7 +1150,7 @@ mod tests {
         let blocks = chain_blocks(&cs, 3);
         let headers: Vec<BlockHeader> = blocks.iter().map(|b| b.header).collect();
         let mut sync = PeerSync::new();
-        let out = sync.on_headers(&mut cs, &headers, NOW).unwrap();
+        let out = sync.on_headers(&mut cs, &headers, NOW, true).unwrap();
         assert!(out.continuation.is_none());
     }
 
@@ -1153,7 +1191,7 @@ mod tests {
 
         // Presync, page 1: below the floor on its own — diverted, and
         // asks for more (this page was full).
-        let out = sync.on_headers(&mut cs, page1, NOW).unwrap();
+        let out = sync.on_headers(&mut cs, page1, NOW, true).unwrap();
         assert_eq!((out.added, out.known), (0, 0));
         assert!(
             out.continuation.is_some(),
@@ -1167,7 +1205,7 @@ mod tests {
 
         // Presync, page 2: the full chain's claimed work now clears the
         // floor, promoting presync to redownload — still nothing stored.
-        let out = sync.on_headers(&mut cs, page2, NOW).unwrap();
+        let out = sync.on_headers(&mut cs, page2, NOW, true).unwrap();
         assert_eq!((out.added, out.known), (0, 0));
         assert!(
             out.continuation.is_some(),
@@ -1178,14 +1216,14 @@ mod tests {
         // Redownload, page 1: re-verifies the same range against the
         // commitments taken during presync; buffered, not yet released
         // (this page's own work hasn't cleared the floor again yet).
-        let out = sync.on_headers(&mut cs, page1, NOW).unwrap();
+        let out = sync.on_headers(&mut cs, page1, NOW, true).unwrap();
         assert_eq!((out.added, out.known), (0, 0));
         assert!(out.continuation.is_some());
         assert_eq!(cs.tree().len(), 1);
 
         // Redownload, page 2: crosses the floor again partway through,
         // releasing the entire verified chain for real acceptance.
-        let out = sync.on_headers(&mut cs, page2, NOW).unwrap();
+        let out = sync.on_headers(&mut cs, page2, NOW, true).unwrap();
         assert_eq!(out.added, headers.len());
         assert!(out.continuation.is_none(), "the sync is complete");
         assert_eq!(cs.tree().len(), headers.len() + 1);
@@ -1215,7 +1253,7 @@ mod tests {
         // be accepted normally — `known` counts every one of them —
         // rather than diverted into a presync that could never succeed.
         let headers: Vec<BlockHeader> = blocks.iter().map(|b| b.header).collect();
-        let out = sync.on_headers(&mut cs, &headers, NOW).unwrap();
+        let out = sync.on_headers(&mut cs, &headers, NOW, true).unwrap();
         assert_eq!(out.known, headers.len());
         assert_eq!(out.added, 0);
         assert!(!out.give_up_leadership);
@@ -1284,14 +1322,14 @@ mod tests {
         let mut sync = PeerSync::new();
 
         // Presync page 1: below the floor on its own.
-        let out = sync.on_headers(&mut cs, page1, NOW).unwrap();
+        let out = sync.on_headers(&mut cs, page1, NOW, true).unwrap();
         assert_eq!((out.added, out.known), (0, 0));
         assert!(out.continuation.is_some());
         assert_eq!(cs.tree().len(), 1, "nothing stored during presync");
 
         // Presync page 2: the chain's claimed work now clears the floor
         // mid-page, promoting presync to redownload.
-        let out = sync.on_headers(&mut cs, page2, NOW).unwrap();
+        let out = sync.on_headers(&mut cs, page2, NOW, true).unwrap();
         assert_eq!((out.added, out.known), (0, 0));
         assert!(out.continuation.is_some());
         assert_eq!(
@@ -1302,7 +1340,7 @@ mod tests {
 
         // Redownload page 1: re-verifies against presync's commitments;
         // buffered, not released yet.
-        let out = sync.on_headers(&mut cs, page1, NOW).unwrap();
+        let out = sync.on_headers(&mut cs, page1, NOW, true).unwrap();
         assert_eq!((out.added, out.known), (0, 0));
         assert!(out.continuation.is_some());
         assert_eq!(cs.tree().len(), 1);
@@ -1311,7 +1349,7 @@ mod tests {
         // the whole verified chain (heights 1..=4000). The regression
         // this test pins: since this wire page was itself full, an
         // ordinary continuation must follow.
-        let out = sync.on_headers(&mut cs, page2, NOW).unwrap();
+        let out = sync.on_headers(&mut cs, page2, NOW, true).unwrap();
         assert_eq!(out.added, 4000);
         assert_eq!(cs.tree().len(), 4001);
         assert_eq!(cs.tree().tip().height, 4000);
@@ -1325,7 +1363,7 @@ mod tests {
         // The peer answers that ordinary continuation with the real
         // remaining headers — accepted through the normal path (already
         // proven work, no low-work sync involved).
-        let out = sync.on_headers(&mut cs, page3, NOW).unwrap();
+        let out = sync.on_headers(&mut cs, page3, NOW, true).unwrap();
         assert_eq!(out.added, 31);
         assert!(out.continuation.is_none(), "a non-full page ends the sync");
         assert_eq!(cs.tree().tip().height, 4031);
@@ -1340,13 +1378,13 @@ mod tests {
         // A page starting at block 3 — its prev (h2) isn't in the tree.
         let stray = vec![blocks[3].header];
         assert_eq!(
-            sync.on_headers(&mut cs, &stray, NOW).unwrap_err(),
+            sync.on_headers(&mut cs, &stray, NOW, true).unwrap_err(),
             SyncError::DiscontinuousHeaders
         );
         // Internally discontinuous page: h1 then h3.
         let broken = vec![blocks[0].header, blocks[2].header];
         assert_eq!(
-            sync.on_headers(&mut cs, &broken, NOW).unwrap_err(),
+            sync.on_headers(&mut cs, &broken, NOW, true).unwrap_err(),
             SyncError::DiscontinuousHeaders
         );
     }

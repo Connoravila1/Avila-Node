@@ -94,7 +94,7 @@ fn main() {
                 }
                 SessionEvent::Message(Message::Headers(headers)) => {
                     let n = headers.len();
-                    match sync.on_headers(&mut cs, &headers, now()) {
+                    match sync.on_headers(&mut cs, &headers, now(), true) {
                         Ok(outcome) => {
                             println!(
                                 "headers page: {n} received, {} new, tip now h{}",

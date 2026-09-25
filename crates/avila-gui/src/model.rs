@@ -13,6 +13,9 @@ pub struct NodeView {
     pub connected: u32,
     /// Best header height: proof-of-work checked, bodies may be pending.
     pub headers: u32,
+    /// Headers buffered in the leader's presync — progress the tree
+    /// tip can't show while the anti-DoS check runs.
+    pub headers_buffered: u32,
     /// The last few connected blocks `(height, display hash)`, newest last.
     pub recent: Vec<(u32, String)>,
     pub peers: Vec<PeerView>,
@@ -124,6 +127,7 @@ impl From<&SyncProgress> for NodeView {
         Self {
             connected: p.connected_height,
             headers: p.header_height,
+            headers_buffered: p.headers_buffered,
             recent: p
                 .recent
                 .iter()

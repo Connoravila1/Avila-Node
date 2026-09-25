@@ -57,7 +57,7 @@ fn pump<S: std::io::Read + std::io::Write>(
             }
             SessionEvent::Message(Message::Headers(headers)) => {
                 let outcome = sync
-                    .on_headers(cs, &headers, now_secs())
+                    .on_headers(cs, &headers, now_secs(), true)
                     .map_err(|e| e.to_string())?;
                 if let Some(next) = outcome.continuation {
                     session.send(&next).map_err(|e| e.to_string())?;

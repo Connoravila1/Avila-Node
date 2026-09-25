@@ -185,7 +185,11 @@ pub struct SyncProgress {
     /// [`SyncConfig::preview_next_block`] is set and the pool has
     /// transactions.
     pub next_block: Option<std::sync::Arc<NextBlock>>,
-    /// Eclipse indicators as of the latest check (queue #12) —
+    /// Buffered headers in the leader's presync — the tree tip stays
+    /// put while the anti-DoS check runs, so during early IBD this is
+    /// the only honest progress counter (0 = none buffered).
+    pub headers_buffered: u32,
+    /// Eclipse indicators of the latest check (queue #12) —
     /// advisory, re-evaluated every 30 seconds; empty when nothing
     /// looks wrong, so a cleared condition clears here too.
     pub eclipse: Vec<EclipseSignal>,
@@ -700,6 +704,7 @@ pub fn run(
             proxy: mgr.proxy(),
             connected_height: connected,
             header_height: cs.tree().tip().height,
+            headers_buffered: mgr.presync_height().unwrap_or(0) as u32,
             in_flight: mgr.in_flight(),
             established_total,
             disconnects,

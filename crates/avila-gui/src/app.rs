@@ -71,6 +71,21 @@ impl App {
         close: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let ctx = &cc.egui_ctx;
+        // A signal lands whenever it lands — the window may be idle and
+        // not repainting, so a watcher thread turns it into a viewport
+        // close (which itself wakes the event loop) rather than a flag
+        // only polled from ui().
+        {
+            let wake_ctx = ctx.clone();
+            let flag = close.clone();
+            std::thread::spawn(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                while !flag.load(Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                wake_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            });
+        }
         theme::install_fonts(ctx, Skin::Standard);
         theme::install_style(ctx);
         let mut prefs = Prefs::load(cc.storage);
@@ -126,7 +141,7 @@ impl App {
                     && (network != avila_core::Network::Regtest
                         || !run.connect.trim().is_empty())));
         let show_tour = !demo && !prefs.welcomed;
-        Self {
+        let mut s = Self {
             node,
             session,
             // `AVILA_GUI_PAGE=peers` opens on that page (for development).
@@ -160,7 +175,15 @@ impl App {
             seen: Page::default(),
             restart: false,
             decorated: None,
+        };
+        // The compositor may never send a frame callback while the
+        // window is occluded — a node must sync anyway, so the worker
+        // starts here, not on the first repaint.
+        if autostart {
+            s.autostart = false;
+            s.start();
         }
+        s
     }
 
     fn network(&self) -> avila_core::Network {

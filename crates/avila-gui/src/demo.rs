@@ -206,6 +206,7 @@ impl Demo {
         NodeView {
             connected,
             headers,
+            headers_buffered: 0,
             recent: (connected.saturating_sub(11)..=connected)
                 .map(|h| (h, block_hash(h)))
                 .collect(),
