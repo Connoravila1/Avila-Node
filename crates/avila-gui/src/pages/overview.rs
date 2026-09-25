@@ -28,6 +28,11 @@ pub fn show(ui: &mut Ui, s: &Scene, scale: &mut Scale) -> Option<Action> {
 
 fn idle(ui: &mut Ui, s: &Scene) -> Option<Action> {
     match (s.session.phase(), &s.session.ended) {
+        (Phase::Starting, _) => widgets::empty(
+            ui,
+            "Starting up",
+            "The node is opening its store and restoring state — the chain appears here the moment startup finishes.",
+        ),
         (Phase::Connecting, _) => widgets::empty(
             ui,
             "Looking for peers",
@@ -68,10 +73,74 @@ fn idle(ui: &mut Ui, s: &Scene) -> Option<Action> {
 /// node is doing and how far it has come — headers, then blocks, with
 /// a pace-based ETA once one exists.
 fn sync_banner(ui: &mut Ui, s: &Scene, v: &NodeView) {
+    use avila_node::sync::Phase as NPhase;
+    let pal = s.pal;
+    // Startup phases come first: they are the node's own words about
+    // what it's doing — showing sync counters here would lie (a stale
+    // tip can sit unchanged for a whole backlog replay). Determinate
+    // where the node reports totals, indeterminate where it can't.
+    let startup: Option<(String, Option<f64>)> = match v.phase {
+        NPhase::Opening => Some(("Opening the block store…".into(), None)),
+        NPhase::RestoringHeaders { done, total } => Some((
+            format!(
+                "Restoring headers — {} of {}",
+                thousands(done),
+                thousands(total)
+            ),
+            (total > 0).then(|| done as f64 / total as f64),
+        )),
+        NPhase::VerifyingChain { done, total } => Some((
+            format!(
+                "Verifying the saved chain — {} of {}",
+                thousands(done),
+                thousands(total)
+            ),
+            (total > 0).then(|| done as f64 / total as f64),
+        )),
+        NPhase::ReconcilingBackend => Some(("Reconciling the coins database…".into(), None)),
+        NPhase::ReplayingBodies { done, total, tip } => Some((
+            format!(
+                "Replaying saved blocks — {} of {} · connected through {}",
+                thousands(done),
+                thousands(total),
+                thousands(tip.into())
+            ),
+            (total > 0).then(|| done as f64 / total as f64),
+        )),
+        _ => None,
+    };
+    if let Some((text, frac)) = startup {
+        ui.label(
+            RichText::new(text)
+                .font(font(theme::MEDIUM, 15.0))
+                .color(pal.text),
+        );
+        ui.add_space(6.0);
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
+        ui.painter().rect_filled(rect, 3.0, pal.well);
+        let frac = frac.unwrap_or_else(|| {
+            // Indeterminate: a slow sliding pulse so the bar always moves.
+            let t = ui.ctx().input(|i| i.time);
+            ui.ctx().request_repaint();
+            (t.sin() + 1.0) / 2.0 * 0.6 + 0.2
+        });
+        let fill = rect.width() * frac.clamp(0.0, 1.0) as f32;
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.min, vec2(fill, 6.0)),
+            3.0,
+            pal.signal,
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Startup — no network traffic is expected yet.")
+                .size(12.5)
+                .color(pal.muted),
+        );
+        return;
+    }
     if v.caught_up() {
         return;
     }
-    let pal = s.pal;
     let target = v
         .best_peer_height()
         .unwrap_or(v.headers)

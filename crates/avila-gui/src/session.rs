@@ -157,6 +157,11 @@ impl RunSettings {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
     Idle,
+    /// Node process is up but still in its startup path (store scan,
+    /// header restore, chain verify, stored-body replay). Distinct from
+    /// `Connecting` so the UI never claims "finding peers" while the
+    /// node hasn't reached the network yet.
+    Starting,
     Connecting,
     Syncing,
     CaughtUp,
@@ -170,6 +175,7 @@ impl Phase {
     pub fn label(self) -> &'static str {
         match self {
             Self::Idle => "Not running",
+            Self::Starting => "Starting",
             Self::Connecting => "Finding peers",
             Self::Syncing => "Syncing",
             Self::CaughtUp => "Up to date",
@@ -181,7 +187,10 @@ impl Phase {
 
     #[must_use]
     pub fn live(self) -> bool {
-        matches!(self, Self::Connecting | Self::Syncing | Self::CaughtUp)
+        matches!(
+            self,
+            Self::Starting | Self::Connecting | Self::Syncing | Self::CaughtUp
+        )
     }
 }
 
@@ -317,14 +326,27 @@ impl Session {
         }
         if self.running {
             return match &self.view {
-                Some(v) if v.established().next().is_some() => {
-                    if v.caught_up() {
-                        Phase::CaughtUp
-                    } else {
-                        Phase::Syncing
+                Some(v) => match v.phase {
+                    avila_node::sync::Phase::Opening
+                    | avila_node::sync::Phase::RestoringHeaders { .. }
+                    | avila_node::sync::Phase::VerifyingChain { .. }
+                    | avila_node::sync::Phase::ReconcilingBackend
+                    | avila_node::sync::Phase::ReplayingBodies { .. } => Phase::Starting,
+                    _ => {
+                        if v.established().next().is_some() {
+                            if v.caught_up() {
+                                Phase::CaughtUp
+                            } else {
+                                Phase::Syncing
+                            }
+                        } else {
+                            Phase::Connecting
+                        }
                     }
-                }
-                _ => Phase::Connecting,
+                },
+                // Running but no snapshot yet — the node is still on its
+                // opening steps; "starting", not "finding peers".
+                None => Phase::Starting,
             };
         }
         match &self.ended {
@@ -438,14 +460,18 @@ impl Session {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let mut last: Option<Instant> = None;
+            // The progress callback must be 'static + Send (sync::run
+            // shares it with the startup-phase sink), so it owns a
+            // cloned sender — the original stays for the Done report.
+            let txp = tx.clone();
             // catch_unwind so a sync-worker panic still reports back —
             // without it the session reads "running" forever with a
             // dead pipeline underneath.
             let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                avila_node::sync::run(&params, &cfg, |p| {
+                avila_node::sync::run(&params, &cfg, move |p| {
                     if last.is_none_or(|l| l.elapsed() >= REPORT_EVERY) {
                         last = Some(Instant::now());
-                        let _ = tx.send(Msg::Progress(Box::new(p.clone())));
+                        let _ = txp.send(Msg::Progress(Box::new(p.clone())));
                     }
                 })
             }));

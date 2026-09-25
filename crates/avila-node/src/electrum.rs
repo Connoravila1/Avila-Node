@@ -1341,6 +1341,7 @@ mod tests {
         });
 
         let status: SharedStatus = Arc::new(RwLock::new(SyncProgress {
+            phase: crate::sync::Phase::Syncing,
             peers: 0,
             connected_height: 1,
             header_height: 1,
@@ -1457,6 +1458,7 @@ mod tests {
         });
 
         let status: SharedStatus = Arc::new(RwLock::new(SyncProgress {
+            phase: crate::sync::Phase::Syncing,
             peers: 0,
             connected_height: 1,
             header_height: 1,
@@ -1603,6 +1605,7 @@ mod tests {
 
     fn empty_status() -> SharedStatus {
         Arc::new(RwLock::new(SyncProgress {
+            phase: crate::sync::Phase::Syncing,
             peers: 0,
             connected_height: 0,
             header_height: 0,

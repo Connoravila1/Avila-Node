@@ -80,12 +80,21 @@ pub fn show(
     hide: bool,
 ) -> Option<Action> {
     let Some(v) = &s.session.view else {
-        widgets::empty(
-            ui,
-            "No peers",
-            "The node isn’t running. Start it to connect to the network.",
-        );
-        return start_offer(ui, s);
+        if s.session.running() {
+            widgets::empty(
+                ui,
+                "Starting up",
+                "The node is still opening its store and restoring state; peers appear once it reaches the network.",
+            );
+        } else {
+            widgets::empty(
+                ui,
+                "No peers",
+                "The node isn’t running. Start it to connect to the network.",
+            );
+            return start_offer(ui, s);
+        }
+        return None;
     };
     let mut peers: Vec<&PeerView> = v.peers.iter().collect();
     peers.sort_by_key(|p| {
@@ -96,7 +105,11 @@ pub fn show(
         )
     });
     if peers.is_empty() {
-        let body = if s.network == avila_core::Network::Regtest {
+        use avila_node::sync::Phase as NPhase;
+        let starting = !matches!(v.phase, NPhase::FindingPeers | NPhase::Syncing);
+        let body = if starting {
+            "The node is still in its startup path — it starts dialing once restore finishes."
+        } else if s.network == avila_core::Network::Regtest {
             "Regtest has no DNS seeds. Add a peer’s address under Settings, then restart the node."
         } else {
             "The node is asking DNS seeds for addresses; peers usually answer within seconds."

@@ -286,6 +286,11 @@ pub struct Chainstate {
     /// forest; it appends spend bundles to `proofs.dat`. SyncSender
     /// backpressure caps outstanding records.
     proof_bridge: Option<std::sync::mpsc::SyncSender<crate::utreexo::BridgeMsg>>,
+    /// Startup progress sink — `resume`/`restore` milestones push
+    /// [`ProgressEvent`]s through it so a UI or RPC status can show the
+    /// real phase (header reinsert, chain verify, body replay) instead
+    /// of a frozen tip. `None` keeps the old silent behavior.
+    progress: Option<Box<dyn FnMut(ProgressEvent) + Send>>,
     /// Read handle on `proofs.dat` — serves peer `utxproof` requests
     /// without touching the worker.
     proof_reader: Option<crate::utreexo::ProofReader>,
@@ -346,6 +351,27 @@ pub enum BackgroundStatus {
     /// The replay reached the base and its content hash matched the
     /// chainparams value — the snapshot is now proven, not assumed.
     Verified,
+}
+
+/// A startup-phase progress milestone pushed through the optional sink
+/// set by [`Chainstate::set_progress_sink`]. Startup — header reinsert,
+/// stored-chain verification, backend reconcile, and the stored-body
+/// replay — can run for minutes with a large backlog; without these
+/// events a UI can only show a frozen pre-restore tip and call it
+/// "syncing", which is exactly the ambiguity the sink exists to kill.
+#[derive(Clone, Copy, Debug)]
+pub enum ProgressEvent {
+    /// Block-store index scan finished; `bodies` records found on disk.
+    StoreIndexed { bodies: usize },
+    /// Reinserting persisted headers into the in-memory tree.
+    RestoreHeaders { done: usize, total: usize },
+    /// Re-verifying the persisted active-chain index (hash checks).
+    ChainVerify { done: usize, total: usize },
+    /// Rewinding the coins backend to the snapshot tip.
+    ReconcileBackend { tip: u32 },
+    /// Replaying stored-but-unconnected bodies — `tip` is the live
+    /// connected height, so the sink can show forward motion.
+    ReplayBodies { done: usize, total: usize, tip: u32 },
 }
 
 /// Typed verification coverage — the node's own trust state. Heights
@@ -935,6 +961,7 @@ impl Chainstate {
             script_pool: None,
             pending_scripts: std::collections::VecDeque::new(),
             receipts: std::collections::VecDeque::new(),
+            progress: None,
             proof_bridge: None,
             proof_reader: None,
             utreexo_acc: None,
@@ -1646,15 +1673,44 @@ impl Chainstate {
         now: u32,
         cache_bytes: usize,
     ) -> std::io::Result<Self> {
+        Self::with_store_coinsdb_progress(dir, params, now, cache_bytes, None)
+    }
+
+    /// [`Self::with_store_coinsdb`] with a startup progress sink — see
+    /// [`ProgressEvent`] for the milestones it reports.
+    pub fn with_store_coinsdb_progress(
+        dir: &Path,
+        params: &Params,
+        now: u32,
+        cache_bytes: usize,
+        progress: Option<Box<dyn FnMut(ProgressEvent) + Send>>,
+    ) -> std::io::Result<Self> {
         eprintln!("open: block store scan");
         let store = BlockStore::open(dir, params.message_start)?;
         eprintln!("open: store indexed");
         let mut cs = Self::new(params);
+        cs.progress = progress;
+        cs.emit(ProgressEvent::StoreIndexed {
+            bodies: store.positions().len(),
+        });
         cs.store = Some(store);
         eprintln!("open: coinsdb");
         cs.enable_coinsdb(dir, cache_bytes)?;
         eprintln!("open: resume");
         cs.resume(dir, now)
+    }
+
+    /// Installs (or clears) the startup progress sink — events are only
+    /// emitted by the open/restore/replay path, so set it before
+    /// constructing via [`Self::with_store_coinsdb_progress`].
+    pub fn set_progress_sink(&mut self, sink: Option<Box<dyn FnMut(ProgressEvent) + Send>>) {
+        self.progress = sink;
+    }
+
+    fn emit(&mut self, event: ProgressEvent) {
+        if let Some(sink) = &mut self.progress {
+            sink(event);
+        }
     }
 
     /// The resume half of `with_store*`: read `state.dat` if present,
@@ -1706,6 +1762,14 @@ impl Chainstate {
             };
             for (hash, pos) in src {
                 seen += 1;
+                if round == 0 && seen.is_multiple_of(100) {
+                    let tip = cs.chain.len() as u32 - 1;
+                    cs.emit(ProgressEvent::ReplayBodies {
+                        done: seen,
+                        total: pending_total,
+                        tip,
+                    });
+                }
                 if round == 0 && seen.is_multiple_of(2000) {
                     eprintln!(
                         "restore: replay {seen}/{pending_total} (tip {})",
@@ -1780,6 +1844,12 @@ impl Chainstate {
             self.tree
                 .insert(header, now)
                 .map_err(|e| corrupt(&format!("header reinsert: {e}")))?;
+            if i % 5000 == 0 {
+                self.emit(ProgressEvent::RestoreHeaders {
+                    done: i,
+                    total: state.headers.len(),
+                });
+            }
             if i % 50000 == 0 {
                 eprintln!("restore: headers {i}/{}", state.headers.len());
             }
@@ -1812,6 +1882,12 @@ impl Chainstate {
             .to_path_buf();
         let snapshot_base = (state.snapshot_base > 0).then_some(state.snapshot_base);
         for (index, hash) in state.chain.iter().enumerate() {
+            if index.is_multiple_of(50000) {
+                self.emit(ProgressEvent::ChainVerify {
+                    done: index,
+                    total: state.chain.len(),
+                });
+            }
             if !self.tree.contains(hash) {
                 return Err(corrupt("connected block unindexed"));
             }
@@ -1862,6 +1938,7 @@ impl Chainstate {
             // Crash window: the backend may have committed past this
             // snapshot's tip — rewind via the stored undos + bodies.
             eprintln!("restore: reconciling backend (state tip {})", state.height);
+            self.emit(ProgressEvent::ReconcileBackend { tip: state.height });
             self.reconcile_backend(state.height)?;
             eprintln!("restore: backend reconciled");
         } else if let Some(be) = &self.coins_backend {

@@ -153,9 +153,38 @@ impl Default for SyncConfig {
     }
 }
 
-/// A snapshot of sync progress, reported after each tick.
+/// What the node is doing right now — published from the first moment
+/// of `run`, so a consumer can always answer "which phase, and how far
+/// through it" instead of inferring life from a frozen tip counter.
+/// The startup variants carry live counters; the network variants are
+/// disambiguated by `peers`/`in_flight` on the same snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Phase {
+    /// Process up; opening/indexing the block store.
+    #[default]
+    Opening,
+    /// Reinserting persisted headers into the in-memory tree.
+    RestoringHeaders { done: u64, total: u64 },
+    /// Re-verifying the persisted active-chain index.
+    VerifyingChain { done: u64, total: u64 },
+    /// Reconciling the coins backend with the snapshot tip.
+    ReconcilingBackend,
+    /// Reconnecting stored-but-unconnected bodies — `tip` is the live
+    /// connected height so progress is visible per block.
+    ReplayingBodies { done: u64, total: u64, tip: u32 },
+    /// Startup complete, sync loop running, no peers yet.
+    FindingPeers,
+    /// Peers connected; headers/blocks flowing.
+    Syncing,
+}
+
+/// A snapshot of sync progress, published on every tick and at every
+/// startup-phase milestone.
 #[derive(Clone, Debug)]
 pub struct SyncProgress {
+    /// The node's current phase — see [`Phase`]. A consumer must never
+    /// infer the phase from counters; this field is the source of truth.
+    pub phase: Phase,
     /// Live peer count.
     pub peers: usize,
     /// Connected (fully validated) chain height.
@@ -207,6 +236,41 @@ pub struct SyncProgress {
     /// advisory, re-evaluated every 30 seconds; empty when nothing
     /// looks wrong, so a cleared condition clears here too.
     pub eclipse: Vec<EclipseSignal>,
+}
+
+impl SyncProgress {
+    /// The pre-chainstate snapshot: every counter zeroed, `phase`
+    /// carrying all the meaning. Published at process start and on
+    /// each startup milestone so a consumer never has to infer life
+    /// from a frozen tip.
+    fn starting(cfg: &SyncConfig) -> Self {
+        Self {
+            phase: Phase::Opening,
+            peers: 0,
+            connected_height: 0,
+            header_height: 0,
+            in_flight: 0,
+            established_total: 0,
+            disconnects: 0,
+            utreexo_height: None,
+            recent: Vec::new(),
+            peer_details: Vec::new(),
+            mempool: (0, 0, None),
+            elapsed_secs: 0,
+            validation: avila_consensus::chainstate::ValidationReport {
+                connected_height: 0,
+                header_height: 0,
+                snapshot: None,
+                verified_fraction: 0.0,
+            },
+            prune_bytes: cfg.prune_bytes,
+            proxy: cfg.proxy,
+            profile: std::sync::Arc::new(ChainProfile::default()),
+            next_block: None,
+            headers_buffered: 0,
+            eclipse: Vec::new(),
+        }
+    }
 }
 
 /// The outcome of a finished (or timed-out) sync run.
@@ -335,7 +399,7 @@ fn audit_sample(cs: &Chainstate, n: usize, seed: u64) -> usize {
 pub fn run(
     params: &Params,
     cfg: &SyncConfig,
-    mut progress: impl FnMut(&SyncProgress),
+    progress: impl FnMut(&SyncProgress) + Send + 'static,
 ) -> Result<SyncReport, SyncError> {
     // Process-level sandboxing (queue #11): `no_new_privs` before any
     // network work — a compromised process can never gain privileges
@@ -343,13 +407,71 @@ pub fn run(
     // never execve()s anything, so this is free defense-in-depth.
     // Finer-grained seccomp/Landlock filtering stays open.
     sandbox_self();
+    // One shared publisher for the whole run — startup phases and the
+    // tick loop report through the same path, so a consumer always sees
+    // the CURRENT phase rather than a stale counter. `started_epoch`
+    // hasn't been stamped yet at open; uptime starts at 0 regardless.
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(progress));
+    let live = std::sync::Arc::new(std::sync::Mutex::new(SyncProgress::starting(cfg)));
+    let publish = {
+        let progress = std::sync::Arc::clone(&progress);
+        let live = std::sync::Arc::clone(&live);
+        let status = cfg.status.clone();
+        move |phase: Phase| {
+            let snap = {
+                let Ok(mut s) = live.lock() else { return };
+                s.phase = phase;
+                s.clone()
+            };
+            if let Some(status) = &status
+                && let Ok(mut w) = status.write()
+            {
+                *w = snap.clone();
+            }
+            if let Ok(mut p) = progress.lock() {
+                p(&snap);
+            }
+        }
+    };
+    publish(Phase::Opening);
+    let sink = {
+        let publish = publish.clone();
+        Box::new(move |ev: avila_consensus::chainstate::ProgressEvent| {
+            let phase = match ev {
+                avila_consensus::chainstate::ProgressEvent::StoreIndexed { .. } => Phase::Opening,
+                avila_consensus::chainstate::ProgressEvent::RestoreHeaders { done, total } => {
+                    Phase::RestoringHeaders {
+                        done: done as u64,
+                        total: total as u64,
+                    }
+                }
+                avila_consensus::chainstate::ProgressEvent::ChainVerify { done, total } => {
+                    Phase::VerifyingChain {
+                        done: done as u64,
+                        total: total as u64,
+                    }
+                }
+                avila_consensus::chainstate::ProgressEvent::ReconcileBackend { .. } => {
+                    Phase::ReconcilingBackend
+                }
+                avila_consensus::chainstate::ProgressEvent::ReplayBodies { done, total, tip } => {
+                    Phase::ReplayingBodies {
+                        done: done as u64,
+                        total: total as u64,
+                        tip,
+                    }
+                }
+            };
+            publish(phase);
+        }) as Box<dyn FnMut(avila_consensus::chainstate::ProgressEvent) + Send>
+    };
     let mut cs = match &cfg.data_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir).map_err(SyncError::Store)?;
             let dbcache = cfg
                 .dbcache
                 .unwrap_or(avila_consensus::connect::DEFAULT_CACHE_BUDGET);
-            Chainstate::with_store_coinsdb(dir, params, unix_now(), dbcache)
+            Chainstate::with_store_coinsdb_progress(dir, params, unix_now(), dbcache, Some(sink))
                 .map_err(SyncError::Store)?
         }
         None => Chainstate::new(params),
@@ -739,6 +861,11 @@ pub fn run(
             );
         }
         let snapshot = SyncProgress {
+            phase: if mgr.is_empty() {
+                Phase::FindingPeers
+            } else {
+                Phase::Syncing
+            },
             peers: mgr.len(),
             proxy: mgr.proxy(),
             connected_height: connected,
@@ -887,7 +1014,9 @@ pub fn run(
                 eprintln!("prune failed: {e}");
             }
         }
-        progress(&snapshot);
+        if let Ok(mut p) = progress.lock() {
+            p(&snapshot);
+        }
         if run_progress >= cfg.target_height {
             break;
         }

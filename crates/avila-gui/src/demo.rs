@@ -204,6 +204,7 @@ impl Demo {
         let mempool = 21_400.0 + 1_900.0 * (e / 170.0).sin() + 55.0 * since_block.min(240.0);
 
         NodeView {
+            phase: avila_node::sync::Phase::Syncing,
             connected,
             headers,
             headers_buffered: 0,

@@ -367,16 +367,50 @@ impl App {
         let network = network_name(self.shown_network());
         match &self.session.view {
             Some(v) => {
-                let peers = v.established().count();
-                format!(
-                    "Block {} · {} peer{} · {network} · up {}",
-                    model::thousands(v.connected.into()),
-                    peers,
-                    if peers == 1 { "" } else { "s" },
-                    model::span(v.uptime_secs)
-                )
+                use avila_node::sync::Phase as NPhase;
+                // Startup phases report what the node is actually doing —
+                // counters like "Block 133,875 · 0 peers" would lie while
+                // the node is still replaying its backlog.
+                match v.phase {
+                    NPhase::Opening => format!("Opening the block store · {network}"),
+                    NPhase::RestoringHeaders { done, total } => format!(
+                        "Restoring headers — {} of {} · {network}",
+                        model::thousands(done),
+                        model::thousands(total)
+                    ),
+                    NPhase::VerifyingChain { done, total } => format!(
+                        "Verifying the saved chain — {} of {} · {network}",
+                        model::thousands(done),
+                        model::thousands(total)
+                    ),
+                    NPhase::ReconcilingBackend => {
+                        format!("Reconciling the coins database · {network}")
+                    }
+                    NPhase::ReplayingBodies { done, total, tip } => format!(
+                        "Replaying saved blocks — {} of {}, at height {} · {network}",
+                        model::thousands(done),
+                        model::thousands(total),
+                        model::thousands(tip.into())
+                    ),
+                    _ => {
+                        let peers = v.established().count();
+                        format!(
+                            "Block {} · {} peer{} · {network} · up {}",
+                            model::thousands(v.connected.into()),
+                            peers,
+                            if peers == 1 { "" } else { "s" },
+                            model::span(v.uptime_secs)
+                        )
+                    }
+                }
             }
-            None => network.to_owned(),
+            None => {
+                if self.session.running() {
+                    format!("Starting up · {network}")
+                } else {
+                    network.to_owned()
+                }
+            }
         }
     }
 
@@ -436,7 +470,7 @@ impl App {
                         p.circle_filled(c, 9.0, pal.signal_alpha(0.22));
                         p.circle_filled(c, 5.0, pal.signal);
                     }
-                    Phase::Connecting => {
+                    Phase::Connecting | Phase::Starting => {
                         p.circle_stroke(c, 5.0, Stroke::new(1.6, pal.text));
                     }
                     Phase::Stopping => {

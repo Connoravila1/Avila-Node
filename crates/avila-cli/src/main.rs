@@ -535,6 +535,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             }
             let status: avila_node::rpc::SharedStatus =
                 std::sync::Arc::new(std::sync::RwLock::new(SyncProgress {
+                    phase: avila_node::sync::Phase::Opening,
                     utreexo_height: None,
                     peers: 0,
                     connected_height: 0,
@@ -706,7 +707,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 config.get().network
             );
             let mut last_print = Instant::now();
-            let result = run_sync(&params, &cfg, |p| {
+            let result = run_sync(&params, &cfg, move |p| {
                 if last_print.elapsed() >= Duration::from_secs(5) {
                     last_print = Instant::now();
                     println!(
@@ -784,7 +785,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             println!("Syncing {network} (target height {blocks}, {max_peers} peers max)...");
             let mut last = (u32::MAX, u32::MAX);
             let mut last_print = Instant::now() - Duration::from_secs(2);
-            let report = run_sync(&params, &cfg, |p| {
+            let report = run_sync(&params, &cfg, move |p| {
                 let cur = (p.header_height, p.connected_height);
                 if cur != last && last_print.elapsed() >= Duration::from_secs(1) {
                     println!(

@@ -8,6 +8,11 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
 pub struct NodeView {
+    /// The node's own report of what it's doing — startup phases
+    /// (restore, verify, backlog replay) are real values here, never
+    /// inferred from counters, so the UI can never silently call
+    /// "replaying 13,000 blocks" the same thing as "syncing".
+    pub phase: avila_node::sync::Phase,
     /// Fully validated height — every script up to here checked (or,
     /// under a snapshot, checked on top of the assumed set).
     pub connected: u32,
@@ -125,6 +130,7 @@ impl From<&SyncProgress> for NodeView {
     fn from(p: &SyncProgress) -> Self {
         let v = &p.validation;
         Self {
+            phase: p.phase,
             connected: p.connected_height,
             headers: p.header_height,
             headers_buffered: p.headers_buffered,

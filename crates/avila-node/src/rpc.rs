@@ -14705,6 +14705,7 @@ mod tests {
 
     fn snap() -> SyncProgress {
         SyncProgress {
+            phase: crate::sync::Phase::Syncing,
             peers: 2,
             connected_height: 120,
             header_height: 140,
