@@ -558,6 +558,10 @@ pub struct PeerManager<S> {
     proxy_failures: u32,
     /// Fixed-size send cells — 0 disables. See `set_cell_bytes`.
     cell_bytes: usize,
+    /// Whether new sessions advertise `sendutxproof` — we consume
+    /// utreexo spend bundles (shadow connect). See
+    /// [`Self::set_utxproof_consumer`].
+    ask_utxproof: bool,
     /// Last time the eclipse-signal check ran (paced to ~60s).
     eclipse_checked_at: Instant,
     /// Named event ring (queue #33): every NetEvent the tick produces
@@ -684,6 +688,7 @@ impl<S: Read + Write> PeerManager<S> {
             proxy: None,
             proxy_failures: 0,
             cell_bytes: 0,
+            ask_utxproof: false,
             discouraged: std::collections::HashMap::new(),
             bans: crate::banman::BanList::new(),
             banlist_path: None,
@@ -944,6 +949,7 @@ impl<S: Read + Write> PeerManager<S> {
         self.next_id += 1;
         session.set_clock(self.clock);
         session.set_cell_bytes(self.cell_bytes);
+        session.ask_utxproof(self.ask_utxproof);
         let now = Instant::now();
         // Self-connection detection (Core's `CheckIncomingNonce`):
         // remember the nonce on an outbound dial so a matching inbound
@@ -1412,6 +1418,15 @@ impl<S: Read + Write> PeerManager<S> {
         for peer in self.peers.values_mut() {
             peer.session.set_cell_bytes(bytes);
         }
+    }
+
+    /// Whether sessions advertise `sendutxproof` — on when the node
+    /// runs the utreexo shadow consumer and wants bundles served.
+    /// Applies to sessions registered after this call (sessions
+    /// already handshaked are unchanged — same semantics as Core's
+    /// `-v2transport` which only affects new links).
+    pub fn set_utxproof_consumer(&mut self, on: bool) {
+        self.ask_utxproof = on;
     }
 
     /// Loads an AS bucketing map — Erebus mitigation: outbound dialing
@@ -1913,6 +1928,7 @@ impl<S: Read + Write> PeerManager<S> {
                     wtxid_relay: false,
                     addrv2: false,
                     recon: None,
+                    utxproof: false,
                 });
                 if let Some(their) = info.recon.clone() {
                     peer.recon = Some(crate::recon::ReconPeer {
@@ -2145,6 +2161,36 @@ impl<S: Read + Write> PeerManager<S> {
                 PeerSync::serve_getdata(cs, Some(mempool), &reqs, |reply| {
                     peer.session.send(reply).is_ok()
                 });
+                // `sendutxproof` peers get the bridge's spend bundle
+                // after each served block — proofs can't be generated
+                // post-hoc, so only blocks this node connected while
+                // bridged carry one.
+                if peer.session.peer().is_some_and(|i| i.utxproof) {
+                    for req in &reqs {
+                        if !matches!(
+                            req.inv_type,
+                            crate::message::InvType::Block | crate::message::InvType::WitnessBlock
+                        ) {
+                            continue;
+                        }
+                        match cs.proof_bundle(&req.hash) {
+                            Ok(Some(bundle)) => {
+                                let _ = peer.session.send(&Message::UtxoProof {
+                                    block_hash: req.hash,
+                                    bundle,
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+            SessionEvent::Message(Message::UtxoProof { block_hash, bundle }) => {
+                // A proof bundle feeds the shadow accumulator — decode
+                // + ordering live in chainstate; a bundle for a block
+                // we never asked about is still harmless state.
+                cs.offer_bundle(block_hash, bundle);
             }
             SessionEvent::Message(Message::NotFound(invs)) => {
                 // The peer can't serve these — release the slots so the

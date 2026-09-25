@@ -116,6 +116,17 @@ enum Command {
         /// docs/STRATUM_V2.md).
         #[arg(long)]
         sv2tp: Option<SocketAddr>,
+        /// Utreexo shadow consumer: ask peers for `utxproof` spend
+        /// bundles and connect each block through the accumulator
+        /// path (no-UTXO validation shape) alongside conventional
+        /// connect. Intra-Avila protocol — other impls don't serve it.
+        #[arg(long)]
+        utreexo: bool,
+        /// Utreexo proof bridge: maintain a proving forest and record
+        /// a spend bundle per connected block (`proofs.dat`), served
+        /// to peers that sent `sendutxproof`.
+        #[arg(long)]
+        utreexo_bridge: bool,
         /// Authenticated RPC user (Core's -rpcuser); pairs with
         /// --rpcpassword. Adds a Basic-auth credential alongside the
         /// cookie.
@@ -493,6 +504,8 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             listen,
             electrum,
             sv2tp,
+            utreexo,
+            utreexo_bridge,
             rpcuser,
             rpcpassword,
             rpcwhitelist,
@@ -680,6 +693,8 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 v2transport,
                 listen,
                 electrum,
+                utreexo,
+                utreexo_bridge,
                 status: Some(status),
                 queries: Some(std::sync::Arc::new(std::sync::Mutex::new(query_rx))),
                 waiters: Some(waiters),
@@ -751,6 +766,8 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 v2transport,
                 listen: None,
                 electrum: None,
+                utreexo: false,
+                utreexo_bridge: false,
                 status: None,
                 queries: None,
                 waiters: None,

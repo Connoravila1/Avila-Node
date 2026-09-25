@@ -175,6 +175,303 @@ impl UtxoAccumulator {
     }
 }
 
+/// A bridge node: maintains a full [`rustreexo::mem_forest::MemForest`]
+/// alongside the conventional UTXO set so every connected block's
+/// spend bundle can be proven *at the moment its leaves are still
+/// live*. Bundles append to `proofs.dat` (`[32B block hash][varbytes
+/// bundle]`); the index is shared with [`ProofReader`].
+///
+/// Post-hoc serving is impossible — once a leaf is deleted the forest
+/// can't prove it — so the bridge only knows blocks it connected (or
+/// replayed) itself. `MemForest` is `Rc`-backed (`!Send`), so the
+/// bridge runs on a dedicated worker thread: chainstate sends each
+/// connected `(block, undo)` over a channel — proving stays off the
+/// consensus path entirely and never shares the caller's thread state.
+pub struct ProofBridge {
+    /// Proving forest — kept in lockstep with connected blocks the
+    /// worker has applied. `None` when stale (post-restart, or a reorg
+    /// un-deleted coins the forest already dropped — MemForest has no
+    /// rollback, so recording pauses rather than serve wrong proofs).
+    forest: Option<rustreexo::mem_forest::MemForest<BitcoinNodeHash>>,
+    /// `proofs.dat` — append-only bundle log (worker-owned).
+    file: std::fs::File,
+    /// `hash -> (offset, rec_len)` into `file`, shared with readers.
+    /// A record lands in the index only after `write_all`+`sync_data`,
+    /// so readers never see a partial bundle.
+    index: std::sync::Arc<
+        std::sync::RwLock<std::collections::HashMap<crate::hash::BlockHash, (u64, u64)>>,
+    >,
+    /// Height the forest corresponds to — the last block it applied.
+    tip: u32,
+}
+
+/// The serving half of the bridge — `Send`/`Sync` (a read handle plus
+/// the shared index); chainstate holds this and answers peer requests
+/// while the worker forest lives on its own thread.
+pub struct ProofReader {
+    /// Second `File` handle on `proofs.dat` — `read_exact_at` needs no
+    /// cursor coordination with the appending writer.
+    file: std::fs::File,
+    index: std::sync::Arc<
+        std::sync::RwLock<std::collections::HashMap<crate::hash::BlockHash, (u64, u64)>>,
+    >,
+}
+
+/// Work items for the bridge worker thread.
+pub enum BridgeMsg {
+    /// A block committed to the connected chain — prove its spends,
+    /// append the bundle, apply adds+dels.
+    Record {
+        hash: crate::hash::BlockHash,
+        height: u32,
+        block: Block,
+        undo: crate::connect::BlockUndo,
+    },
+    /// The chain disconnected blocks — the forest can no longer prove
+    /// (its deleted leaves were un-deleted); recording pauses.
+    Stale,
+}
+
+const PROOF_MAGIC: &[u8; 8] = b"AVUPROOF";
+
+impl ProofBridge {
+    /// Opens `dir/proofs.dat` (creating it), indexes existing bundles,
+    /// then spawns the bridge worker: the `Rc`-backed forest is built
+    /// *inside* the thread (the type is `!Send`, so it never crosses
+    /// a boundary). Returns the serving reader, the work channel, and
+    /// the worker handle — dropping the sender shuts the worker down.
+    ///
+    /// # Errors
+    /// `io::Error` on file errors or a malformed log (bad tails
+    /// truncate rather than fail — same crash policy as the blk files).
+    pub fn spawn(
+        dir: &Path,
+    ) -> io::Result<(
+        ProofReader,
+        std::sync::mpsc::SyncSender<BridgeMsg>,
+        std::thread::JoinHandle<()>,
+    )> {
+        let path = dir.join("proofs.dat");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        let mut index = std::collections::HashMap::new();
+        let len = file.metadata()?.len();
+        if len == 0 {
+            use std::io::Write as _;
+            file.write_all(PROOF_MAGIC)?;
+        } else {
+            let mut buf = vec![0u8; len as usize];
+            file.read_exact_at(&mut buf, 0)?;
+            if buf[..8] != *PROOF_MAGIC {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "proofs.dat: bad magic",
+                ));
+            }
+            let mut off = 8usize;
+            while off + 33 <= buf.len() {
+                let Ok(arr) = <[u8; 32]>::try_from(&buf[off..off + 32]) else {
+                    break;
+                };
+                let hash = crate::hash::BlockHash::from_bytes(arr);
+                let mut d = crate::encode::Decoder::new(&buf[off + 32..]);
+                let Ok(blen) = d.read_compact_size() else {
+                    break;
+                };
+                let rec_len = 32 + (buf.len() - off - 32 - d.remaining()) + blen as usize;
+                let end = off + rec_len;
+                if end > buf.len() {
+                    break; // torn tail — index only complete records
+                }
+                index.insert(hash, (off as u64, (rec_len - 32) as u64));
+                off = end;
+            }
+            // Truncate any partial tail so appends start at a record
+            // boundary (a torn write from a crash is unreachable bytes).
+            if off as u64 != len {
+                file.set_len(off as u64)?;
+            }
+        }
+        let index = std::sync::Arc::new(std::sync::RwLock::new(index));
+        let reader = ProofReader {
+            file: std::fs::File::open(&path)?,
+            index: std::sync::Arc::clone(&index),
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let handle = std::thread::spawn(move || {
+            let bridge = Self {
+                forest: Some(rustreexo::mem_forest::MemForest::new()),
+                file,
+                index,
+                tip: u32::MAX,
+            };
+            bridge.run(rx);
+        });
+        Ok((reader, tx, handle))
+    }
+
+    /// The worker loop — owns `self`, applies `Record` messages until
+    /// the channel closes (sender drop = clean shutdown).
+    pub fn run(mut self, rx: std::sync::mpsc::Receiver<BridgeMsg>) {
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                BridgeMsg::Record {
+                    hash,
+                    height,
+                    block,
+                    undo,
+                } => {
+                    if let Err(e) = self.record(&hash, &block, &undo, height) {
+                        eprintln!("bridge: record h{height}: {e}");
+                    }
+                }
+                BridgeMsg::Stale => {
+                    self.forest = None;
+                }
+            }
+        }
+    }
+
+    /// Records a just-connected block: proves its spend set against
+    /// the current forest, appends the bundle, then applies adds+dels.
+    /// No-op when the forest is stale. Returns `false` when nothing
+    /// was recorded.
+    ///
+    /// # Errors
+    /// `io::Error` on disk failure; proof failure would mean the
+    /// bridge's forest diverged from the real UTXO set — a bug, not
+    /// data — so it returns `InvalidData`.
+    pub fn record(
+        &mut self,
+        hash: &crate::hash::BlockHash,
+        block: &Block,
+        undo: &crate::connect::BlockUndo,
+        height: u32,
+    ) -> io::Result<bool> {
+        let Some(forest) = &mut self.forest else {
+            return Ok(false);
+        };
+        {
+            let index = self
+                .index
+                .read()
+                .map_err(|_| io::Error::other("bridge index poisoned"))?;
+            if index.contains_key(hash) && self.tip == height {
+                return Ok(false); // already recorded at this tip
+            }
+        }
+        // Spends: non-coinbase inputs zipped with undo records (input
+        // order — `TxUndo.spent` is built in the same order).
+        let mut spends: Vec<(OutPoint, Coin)> = Vec::new();
+        for (tx, tu) in block.transactions.iter().zip(&undo.txs) {
+            if tx.is_coinbase() {
+                continue;
+            }
+            for (inp, coin) in tx.inputs.iter().zip(&tu.spent) {
+                spends.push((inp.previous_output, coin.clone()));
+            }
+        }
+        let del_hashes: Vec<BitcoinNodeHash> =
+            spends.iter().map(|(op, c)| leaf_for(op, c)).collect();
+        // Adds: outputs not flagged unspendable and not re-spent inside
+        // the same block — mirror of `connect_block_proven`'s set.
+        let mut intra_spent: std::collections::HashSet<OutPoint> = std::collections::HashSet::new();
+        for tx in &block.transactions {
+            if tx.is_coinbase() {
+                continue;
+            }
+            for inp in &tx.inputs {
+                intra_spent.insert(inp.previous_output);
+            }
+        }
+        let mut adds: Vec<(OutPoint, Coin)> = Vec::new();
+        for tx in &block.transactions {
+            let txid = tx.txid();
+            let coinbase = tx.is_coinbase();
+            for (vout, out) in tx.outputs.iter().enumerate() {
+                if out.script_pubkey.is_unspendable() {
+                    continue;
+                }
+                let op = OutPoint {
+                    txid,
+                    vout: vout as u32,
+                };
+                if intra_spent.contains(&op) {
+                    continue;
+                }
+                adds.push((
+                    op,
+                    Coin {
+                        out: out.clone(),
+                        height,
+                        coinbase,
+                    },
+                ));
+            }
+        }
+        let add_hashes: Vec<BitcoinNodeHash> = adds.iter().map(|(op, c)| leaf_for(op, c)).collect();
+        let proof = if del_hashes.is_empty() {
+            Proof::default() // coinbase-only blocks spend nothing
+        } else {
+            forest.prove(&del_hashes).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bridge prove divergence: {e}"),
+                )
+            })?
+        };
+        let bundle = encode_spend_bundle(&spends, &proof);
+        let mut rec = Vec::with_capacity(32 + 9 + bundle.len());
+        rec.extend_from_slice(hash.as_bytes());
+        crate::encode::write_compact_size(&mut rec, bundle.len() as u64);
+        rec.extend_from_slice(&bundle);
+        use std::io::Write as _;
+        let off = self.file.metadata()?.len();
+        self.file.write_all(&rec)?;
+        self.file.sync_data()?;
+        self.index
+            .write()
+            .map_err(|_| io::Error::other("bridge index poisoned"))?
+            .insert(*hash, (off, rec.len() as u64 - 32));
+        forest
+            .modify(&add_hashes, &del_hashes)
+            .map_err(|e| io::Error::other(format!("bridge forest: {e}")))?;
+        self.tip = height;
+        Ok(true)
+    }
+}
+
+impl ProofReader {
+    /// The stored bundle for `hash`, if the bridge recorded one.
+    ///
+    /// # Errors
+    /// `io::Error` on read failure; `Ok(None)` when absent.
+    pub fn bundle(&self, hash: &crate::hash::BlockHash) -> io::Result<Option<Vec<u8>>> {
+        let rec = {
+            let index = self
+                .index
+                .read()
+                .map_err(|_| io::Error::other("bridge index poisoned"))?;
+            index.get(hash).copied()
+        };
+        let Some((off, rec_len)) = rec else {
+            return Ok(None);
+        };
+        let mut buf = vec![0u8; rec_len as usize];
+        self.file.read_exact_at(&mut buf, off + 32)?; // skip the hash
+        // The record stores `varint len || bundle` — serve only the
+        // bundle bytes (the length prefix is this file's framing).
+        let mut d = crate::encode::Decoder::new(&buf);
+        d.read_compact_size()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "proofs.dat: bad record"))?;
+        Ok(Some(buf.split_off(buf.len() - d.remaining())))
+    }
+}
+
 /// Errors the proven-connect path can produce.
 #[derive(Debug)]
 pub enum ProvenConnectError {

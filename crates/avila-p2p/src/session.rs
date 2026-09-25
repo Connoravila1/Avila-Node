@@ -77,6 +77,9 @@ pub struct PeerInfo {
     /// `sendrecon` during the handshake — `None` means the link runs
     /// ordinary inv/getdata tx relay only.
     pub recon: Option<crate::message::SendRecon>,
+    /// Whether the peer sent `sendutxproof` — it wants `utxproof`
+    /// bundles appended to served blocks (Avila intra-net).
+    pub utxproof: bool,
 }
 
 /// Wire telemetry for one session — what `getpeerinfo` reports. Bytes
@@ -207,6 +210,10 @@ pub struct PeerSession<S> {
     /// The salt we advertised in `sendrecon` — derived from the session
     /// id + our version nonce so each link's short-ids differ.
     recon_salt: u64,
+    /// Whether our handshake advertises `sendutxproof` — we consume
+    /// proof bundles (utreexo shadow mode). Serving stays unconditional
+    /// on the bridge side; this flag is the opt-in ask.
+    ask_utxproof: bool,
     /// Whether we initiated the connection (Core's outbound vs inbound).
     outbound: bool,
     peer: Option<PeerInfo>,
@@ -358,7 +365,16 @@ impl<S: Read + Write> PeerSession<S> {
             decoy_rate: 4,
             cell_bytes: 0,
             recon_salt,
+            ask_utxproof: false,
         }
+    }
+
+    /// Whether this session advertises `sendutxproof` in the handshake
+    /// burst — set when the node consumes proof bundles (utreexo
+    /// shadow). Serving bundles is a separate, unconditional bridge
+    /// function; this flag asks the peer to send them to *us*.
+    pub fn ask_utxproof(&mut self, on: bool) {
+        self.ask_utxproof = on;
     }
 
     /// The salt this session advertised in `sendrecon` — the manager
@@ -650,6 +666,7 @@ impl<S: Read + Write> PeerSession<S> {
                     wtxid_relay: false,
                     addrv2: false,
                     recon: None,
+                    utxproof: false,
                 });
                 // ProcessMessage(VERSION)'s reply burst: inbound answers
                 // with our version first, then negotiation + verack.
@@ -666,6 +683,9 @@ impl<S: Read + Write> PeerSession<S> {
                     // entropy so a peer cannot precompute short-ids.
                     salt: self.recon_salt,
                 }))?;
+                if self.ask_utxproof {
+                    self.send(&Message::SendUtxProof)?;
+                }
                 self.send(&Message::Verack)?;
                 self.state = Handshake::AwaitVerack;
                 Ok(Some(SessionEvent::Message(Message::Version(v))))
@@ -704,6 +724,15 @@ impl<S: Read + Write> PeerSession<S> {
                 }
                 if let Some(p) = &mut self.peer {
                     p.recon = Some(r);
+                }
+                Ok(None)
+            }
+            (_, Message::SendUtxProof) => {
+                if self.state == Handshake::Done {
+                    return Err(SessionError::LateNegotiation);
+                }
+                if let Some(p) = &mut self.peer {
+                    p.utxproof = true;
                 }
                 Ok(None)
             }

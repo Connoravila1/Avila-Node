@@ -281,6 +281,24 @@ pub struct Chainstate {
     /// a height can appear twice when a reorg replaced it — both
     /// receipts are true events. Bounded by [`Self::RECEIPT_CAP`].
     receipts: std::collections::VecDeque<BlockReceipt>,
+    /// Utreexo proof bridge — connected `(block, undo)` records stream
+    /// to a worker thread owning the (`Rc`-backed, `!Send`) proving
+    /// forest; it appends spend bundles to `proofs.dat`. SyncSender
+    /// backpressure caps outstanding records.
+    proof_bridge: Option<std::sync::mpsc::SyncSender<crate::utreexo::BridgeMsg>>,
+    /// Read handle on `proofs.dat` — serves peer `utxproof` requests
+    /// without touching the worker.
+    proof_reader: Option<crate::utreexo::ProofReader>,
+    /// Utreexo shadow consumer (`--utreexo`): a `UtxoAccumulator`
+    /// replaying the connected chain through `connect_block_proven`
+    /// against peer-served bundles — the no-UTXO validation shape,
+    /// run beside the conventional connect for cross-checking.
+    utreexo_acc: Option<crate::utreexo::UtxoAccumulator>,
+    /// Bundles arrived ahead of their block (or whose block is not the
+    /// shadow cursor's next height yet), keyed by block hash.
+    pending_bundles: HashMap<BlockHash, Vec<u8>>,
+    /// Height the shadow accumulator has applied through; 0 = genesis.
+    acc_height: u32,
 }
 
 /// The background validation replay beneath an active snapshot — a
@@ -917,6 +935,11 @@ impl Chainstate {
             script_pool: None,
             pending_scripts: std::collections::VecDeque::new(),
             receipts: std::collections::VecDeque::new(),
+            proof_bridge: None,
+            proof_reader: None,
+            utreexo_acc: None,
+            pending_bundles: HashMap::new(),
+            acc_height: 0,
         }
     }
 
@@ -2522,6 +2545,155 @@ impl Chainstate {
         }
     }
 
+    /// Turns on the utreexo proof bridge (`--utreexo-bridge`): opens
+    /// `proofs.dat`, spawns the proving-forest worker, then streams a
+    /// catch-up record for every already-connected block — undo data
+    /// carries exactly the coins a proof must commit. The channel is
+    /// bounded so the worker paces a deep replay.
+    ///
+    /// # Errors
+    ///
+    /// `io::Error` on `proofs.dat` open/index failure.
+    pub fn enable_proof_bridge(&mut self, dir: &Path) -> std::io::Result<()> {
+        let (reader, tx, _worker) = crate::utreexo::ProofBridge::spawn(dir)?;
+        self.proof_reader = Some(reader);
+        self.proof_bridge = Some(tx.clone());
+        for h in 1..self.chain.len() as u32 {
+            let hash = self.chain[h as usize];
+            if let (Some(block), Some(undo)) = (self.body(&hash), self.undo(h))
+                && tx
+                    .send(crate::utreexo::BridgeMsg::Record {
+                        hash,
+                        height: h,
+                        block,
+                        undo,
+                    })
+                    .is_err()
+            {
+                break; // worker died
+            }
+        }
+        Ok(())
+    }
+
+    /// The stored utxproof bundle for `hash`, if the bridge recorded
+    /// one — the p2p layer serves it to peers who asked.
+    ///
+    /// # Errors
+    /// `io::Error` on read failure; `Ok(None)` when absent.
+    pub fn proof_bundle(&self, hash: &BlockHash) -> std::io::Result<Option<Vec<u8>>> {
+        match &self.proof_reader {
+            Some(r) => r.bundle(hash),
+            None => Ok(None),
+        }
+    }
+
+    /// Turns on the utreexo shadow consumer (`--utreexo`): opens the
+    /// accumulator and replays any bundles already known. The shadow
+    /// cursor advances only in connected-chain order — a missing bundle
+    /// stalls it (a bridge can starve us, never bypass checks).
+    ///
+    /// # Errors
+    /// `io::Error` on `utreexo.stump` open failure.
+    pub fn enable_utreexo_shadow(&mut self, dir: &Path) -> std::io::Result<()> {
+        self.utreexo_acc = Some(crate::utreexo::UtxoAccumulator::open(dir)?);
+        self.acc_height = 0;
+        self.drive_utreexo();
+        Ok(())
+    }
+
+    /// A `utxproof` bundle arrived for `hash`. Decodes defensively —
+    /// malformed bundles are dropped, never a consensus signal — and
+    /// stashes the rest until the shadow cursor reaches their height.
+    pub fn offer_bundle(&mut self, hash: BlockHash, bundle: Vec<u8>) {
+        if self.utreexo_acc.is_none() {
+            return;
+        }
+        /// Bundles for blocks far past the shadow cursor can't drive it
+        /// anyway — cap the stash so a spamming peer can't grow it
+        /// without bound (each entry ≤ 4 MB by the wire cap).
+        const PENDING_CAP: usize = 2048;
+        if self.pending_bundles.len() >= PENDING_CAP {
+            return;
+        }
+        self.pending_bundles.insert(hash, bundle);
+        self.drive_utreexo();
+    }
+
+    /// Applies pending bundles to the shadow accumulator in connected
+    /// order. Runs `connect_block_proven` — a real consensus connect
+    /// against only the bundle's coins — so the shadow path is genuine
+    /// validation, just sourced from proofs instead of the UTXO set.
+    fn drive_utreexo(&mut self) {
+        // Each step is a full proven connect — script checks included —
+        // on the sync thread; keep the burst small so shadow progress
+        // never starves the real pipeline.
+        const DRIVE_CAP: u32 = 8;
+        let mut steps = 0u32;
+        while self.utreexo_acc.is_some() && steps < DRIVE_CAP {
+            let next = self.acc_height + 1;
+            let Some(&hash) = self.chain.get(next as usize) else {
+                break;
+            };
+            let Some(bundle) = self.pending_bundles.remove(&hash) else {
+                break; // no proof for the next height — shadow stalls here
+            };
+            let Some((spends, proof)) = crate::utreexo::decode_spend_bundle(&bundle) else {
+                eprintln!("utreexo: malformed bundle for {hash} — dropping");
+                continue;
+            };
+            let Some(block) = self.body(&hash) else {
+                // Body not in yet — keep the bundle and wait.
+                self.pending_bundles.insert(hash, bundle);
+                break;
+            };
+            let ctx = ConnectContext {
+                params: &self.tree.params().clone(),
+                tree: &self.tree,
+                block_hash: hash,
+                script_checks: self.script_checks(&hash, self.tree.params()),
+                script_pool: None,
+            };
+            let Some(acc) = self.utreexo_acc.as_mut() else {
+                break;
+            };
+            match crate::utreexo::connect_block_proven(&block, acc, &spends, &proof, &ctx) {
+                Ok(_) => {
+                    self.acc_height = next;
+                    steps += 1;
+                    if next.is_multiple_of(500) {
+                        let (leaves, roots) = acc.stats();
+                        eprintln!("utreexo: shadow tip h{next} leaves={leaves} roots={roots}");
+                    }
+                }
+                Err(e) => {
+                    // A bundle that fails proves nothing — the shadow
+                    // stops here rather than skip it (which would lie
+                    // about coverage).
+                    eprintln!("utreexo: shadow stalled at h{next} {hash}: {e}");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Records a connected block in the proof bridge, if enabled.
+    /// Reorg-disconnected blocks leave the forest unrecoverable —
+    /// `record` is skipped for them and the bridge is marked stale.
+    /// Queues a connected block for the proof-bridge worker, if the
+    /// bridge is enabled. `send` paces a deep replay — a full channel
+    /// means the worker is grinding, not that we should drop data.
+    fn bridge_record(&mut self, hash: &BlockHash, block: &Block, undo: &BlockUndo, height: u32) {
+        if let Some(tx) = &self.proof_bridge {
+            let _ = tx.send(crate::utreexo::BridgeMsg::Record {
+                hash: *hash,
+                height,
+                block: block.clone(),
+                undo: undo.clone(),
+            });
+        }
+    }
+
     /// `ConnectBlock`'s `fScriptChecks` decision for the block at `hash`
     /// (validation.cpp): `true` = run `CheckInputScripts`. Script checks may be
     /// skipped only when every condition holds:
@@ -2676,6 +2848,7 @@ impl Chainstate {
                         index.append(height, block, &undo);
                     }
                     self.chain.push(hash);
+                    self.bridge_record(&hash, block, &undo, height);
                     self.undos.push(undo);
                     self.connected = hash;
                     self.tree.note_connected(&hash);
@@ -2697,6 +2870,7 @@ impl Chainstate {
                         // earned at connect.
                         self.note_receipt(receipt);
                     }
+                    self.drive_utreexo();
                     // This block's own body may have been the missing
                     // link for an already-stored, already-bodied child
                     // (Core: `ReceivedBlockTransactions` continues its
@@ -2924,8 +3098,24 @@ impl Chainstate {
             self.flush_coins_with(&low, self.chain.len() as u32 - 1)
                 .map_err(|_| ConnectError::Internal("coinsdb reorg flush"))?;
         }
+        if disconnected {
+            // A rollback un-deletes coins the forest already dropped —
+            // MemForest has no rollback, so the bridge can no longer
+            // prove new blocks. Bundles on disk stay servable.
+            if let Some(tx) = &self.proof_bridge {
+                let _ = tx.send(crate::utreexo::BridgeMsg::Stale);
+            }
+        } else {
+            for (i, (b, u)) in bodies.iter().zip(new_undos.iter()).enumerate() {
+                if let Some(b) = b {
+                    let bh = self.chain[fork_height as usize + 1 + i];
+                    self.bridge_record(&bh, b, u, fork_height + 1 + i as u32);
+                }
+            }
+        }
         self.undos.extend(new_undos.into_iter().skip(split));
         self.connected = hash;
+        self.drive_utreexo();
         Ok(Some(disconnected))
     }
 
@@ -6131,5 +6321,107 @@ mod tests {
             Err(AuditFailure::UndoMissing),
             "a vanished live coin is storage rot the audit must catch"
         );
+    }
+    #[test]
+    fn bridge_bundle_replays_chain_without_utxo() {
+        let dir = std::env::temp_dir().join(format!("bridge-it-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut cs = Chainstate::new(&params());
+        cs.enable_proof_bridge(&dir).unwrap();
+        // Grow past coinbase maturity.
+        let mut tip = cs.connected;
+        let mut blocks = Vec::new();
+        for h in 1..=crate::connect::COINBASE_MATURITY + 2 {
+            let block = block_on(
+                &cs.tree.get(&tip).unwrap().header,
+                vec![coinbase_tx(h, subsidy(h))],
+                &params(),
+            );
+            tip = block.block_hash();
+            blocks.push(block.clone());
+            let acc = cs.accept_block(&block, NOW).unwrap();
+            if h <= 3 {
+                eprintln!(
+                    "h{h} -> {acc:?} connected={} bridge={}",
+                    cs.connected,
+                    cs.proof_bridge.is_some()
+                );
+            }
+        }
+        // One spending block on top.
+        let h = crate::connect::COINBASE_MATURITY + 3;
+        let fund = blocks[0].transactions[0].txid();
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: fund,
+                    vout: 0,
+                },
+                script_sig: Script::new(vec![]),
+                sequence: SEQUENCE_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: subsidy(1) - 1000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let spend_block = block_on(
+            &cs.tree.get(&tip).unwrap().header,
+            vec![coinbase_tx(h, subsidy(h)), spend],
+            &params(),
+        );
+        blocks.push(spend_block.clone());
+        cs.accept_block(&spend_block, NOW).unwrap();
+
+        // Every connected block produced a bundle — the worker is
+        // async, so poll with a deadline (103 tiny regtest blocks
+        // drain in well under a second).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        for block in &blocks {
+            let hash = block.block_hash();
+            loop {
+                match cs.proof_bundle(&hash).unwrap() {
+                    Some(_) => break,
+                    None => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "no bundle for {hash} after 30s"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+            }
+        }
+
+        // The consumer side: a bare accumulator replays the whole
+        // chain from bundles alone — no UTXO set anywhere.
+        std::fs::create_dir_all(dir.join("acc")).unwrap();
+        let mut acc = crate::utreexo::UtxoAccumulator::open(&dir.join("acc")).unwrap();
+        for (i, block) in blocks.iter().enumerate() {
+            let hash = block.block_hash();
+            let bundle = cs.proof_bundle(&hash).unwrap().unwrap();
+            let (spends, proof) = crate::utreexo::decode_spend_bundle(&bundle).unwrap();
+            let ctx = ConnectContext {
+                params: &params(),
+                tree: &cs.tree,
+                block_hash: hash,
+                script_checks: true,
+                script_pool: None,
+            };
+            crate::utreexo::connect_block_proven(block, &mut acc, &spends, &proof, &ctx)
+                .unwrap_or_else(|e| panic!("proven connect h{}: {e}", i + 1));
+        }
+        // The spend block's bundle must name its one real spend.
+        let bundle = cs.proof_bundle(&spend_block.block_hash()).unwrap().unwrap();
+        let (spends, _proof) = crate::utreexo::decode_spend_bundle(&bundle).unwrap();
+        assert_eq!(spends.len(), 1);
+        assert_eq!(spends[0].0.txid, fund);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

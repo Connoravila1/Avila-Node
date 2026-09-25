@@ -252,6 +252,9 @@ pub enum Message {
     WtxidRelay,
     /// `sendaddrv2` — peer understands BIP155 addresses.
     SendAddrV2,
+    /// `sendutxproof` — peer wants `utxproof` bundles appended to
+    /// served blocks (Avila intra-net; ignored elsewhere).
+    SendUtxProof,
     /// `feefilter` — minimum feerate the peer accepts, sat/kvB.
     FeeFilter(u64),
     /// `getaddr` — request for known peers.
@@ -461,6 +464,7 @@ impl Message {
             Self::SendHeaders => "sendheaders",
             Self::WtxidRelay => "wtxidrelay",
             Self::SendAddrV2 => "sendaddrv2",
+            Self::SendUtxProof => "sendutxproof",
             Self::FeeFilter(_) => "feefilter",
             Self::GetAddr => "getaddr",
             Self::Addr(_) => "addr",
@@ -597,6 +601,7 @@ impl Message {
             | Self::SendHeaders
             | Self::WtxidRelay
             | Self::SendAddrV2
+            | Self::SendUtxProof
             | Self::GetAddr
             | Self::Mempool
             | Self::ReqBisec => {}
@@ -671,6 +676,7 @@ impl Message {
             "sendheaders" => Self::SendHeaders,
             "wtxidrelay" => Self::WtxidRelay,
             "sendaddrv2" => Self::SendAddrV2,
+            "sendutxproof" => Self::SendUtxProof,
             "getaddr" => Self::GetAddr,
             "mempool" => Self::Mempool,
             "feefilter" => Self::FeeFilter(d.read_u64_le().map_err(|e| payload_err(name, e))?),

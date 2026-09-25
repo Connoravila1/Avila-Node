@@ -91,6 +91,15 @@ pub struct SyncConfig {
     /// `--electrum addr`: bind the Electrum-protocol server there and
     /// maintain the scripthash index (`scindex.dat`) it serves from.
     pub electrum: Option<SocketAddr>,
+    /// `--utreexo`: run the utreexo shadow consumer — ask peers for
+    /// `utxproof` bundles and connect each block through
+    /// `connect_block_proven` against a ~1 KiB accumulator, in
+    /// parallel with the conventional UTXO path.
+    pub utreexo: bool,
+    /// `--utreexo-bridge`: maintain a proving forest and record a
+    /// spend bundle per connected block (`proofs.dat`), served to
+    /// peers who sent `sendutxproof`.
+    pub utreexo_bridge: bool,
     /// When set, publish each tick's progress into this snapshot so a
     /// query surface (RPC, GUI) can read it without blocking sync.
     pub status: Option<crate::rpc::SharedStatus>,
@@ -134,6 +143,8 @@ impl Default for SyncConfig {
             v2transport: true,
             listen: None,
             electrum: None,
+            utreexo: false,
+            utreexo_bridge: false,
             status: None,
             queries: None,
             waiters: None,
@@ -358,6 +369,18 @@ pub fn run(
         cs.enable_scripthashindex(cfg.data_dir.as_deref())
             .map_err(SyncError::Store)?;
     }
+    if let Some(dir) = &cfg.data_dir {
+        if cfg.utreexo_bridge {
+            cs.enable_proof_bridge(dir).map_err(SyncError::Store)?;
+        }
+        if cfg.utreexo {
+            cs.enable_utreexo_shadow(dir).map_err(SyncError::Store)?;
+        }
+    } else if cfg.utreexo || cfg.utreexo_bridge {
+        return Err(SyncError::Config(
+            "-utreexo/-utreexo-bridge require a data directory".into(),
+        ));
+    }
     let resumed_height = cs.chain().len() as u32 - 1;
     // `state.dat` checkpoint cadence — blocks between flushes during
     // sync. The value bounds post-crash replay depth, not correctness.
@@ -394,6 +417,7 @@ pub fn run(
     // fields — reads the node clock, so `setmocktime` shifts them too.
     mgr.set_clock(crate::time::time);
     mgr.set_v2transport(cfg.v2transport);
+    mgr.set_utxproof_consumer(cfg.utreexo);
     // The index we just enabled is what makes BIP157 serving
     // legitimate — advertise NODE_COMPACT_FILTERS only then.
     mgr.set_serve_filters(cfg.blockfilterindex && cfg.peerblockfilters);
