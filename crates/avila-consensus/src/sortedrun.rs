@@ -312,17 +312,21 @@ impl SnapshotRun {
             Err(i) => i - 1,
         };
         let off = self.sparse[lo_idx].1;
-        // The window must contain up to `stride` whole coin records
-        // starting from an arbitrary group boundary — use a generous
-        // bound: stride * max compressed coin (~75B) + group margin.
-        let cap = 1 << 17; // 128KB covers ~256 groups of typical coins
-        let mut buf = vec![0u8; cap];
+        // The window must reach far enough to either find the coin or
+        // pass a group whose key exceeds the target — that span is
+        // bounded exactly by the NEXT sparse entry (a group start, so
+        // its key sorts past any coin answerable from this entry).
+        // Anything shorter risks a false miss for a coin that IS in
+        // the snapshot; index granularity, not a byte cap, bounds the
+        // read.
+        let off_hi = if lo_idx + 1 < self.sparse.len() {
+            self.sparse[lo_idx + 1].1
+        } else {
+            self.file_len
+        };
+        let n = (off_hi - off).min(usize::MAX as u64) as usize;
+        let mut buf = vec![0u8; n];
         let f = self.f.lock().ok()?;
-        // The sparse offset points at a vout varint mid-group; the key
-        // may sit anywhere in the following `stride` records. Walk
-        // record-by-record: vout compact-size + wire body. Clamp the
-        // window at EOF — the last group's read is always partial.
-        let n = (self.file_len - off).min(cap as u64) as usize;
         f.read_exact_at(&mut buf[..n], off).ok()?;
         // txid is implicit (32B before each group) — but our offset is
         // mid-group, so the txid for THIS group isn't at `off`. We
@@ -399,9 +403,6 @@ impl SnapshotRun {
             }
             pos += plen;
             group_left -= 1;
-            if pos + 33 > n {
-                return None; // window exhausted
-            }
         }
     }
 
@@ -545,7 +546,7 @@ impl SnapshotRun {
             let cnt = read_cs(&mut pos, &f, &mut buf, &mut win_off, &mut win_len)?;
             let save = pos;
             let v0 = read_cs(&mut pos, &f, &mut buf, &mut win_off, &mut win_len)? as u32;
-            first_key[32..].copy_from_slice(&v0.to_le_bytes());
+            first_key[32..].copy_from_slice(&v0.to_be_bytes());
             if groups.is_multiple_of(stride) {
                 sparse.push((first_key, group_off));
             }
@@ -767,6 +768,143 @@ mod tests {
         let mut b = RunBuilder::create_with_stride(&path, 4).unwrap();
         b.push(&OutPoint { txid, vout: 256 }, &coin(1)).unwrap();
         assert!(b.push(&OutPoint { txid, vout: 1 }, &coin(2)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sparse index entry must bound the scan window by the NEXT
+    /// entry, never a fixed byte count: a fixed 128 KiB window returns
+    /// false misses for coins living megabytes past their index entry,
+    /// which at mainnet scale (multi-MB strides) silently reports ~all
+    /// real snapshot coins absent. One entry at the head + a file far
+    /// larger than any window exercises exactly that.
+    #[test]
+    fn sparse_window_reaches_coins_past_any_fixed_cap() {
+        let dir = std::env::temp_dir().join(format!("srun-wide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snap.dat");
+
+        // ~300 groups of ~8 KiB scripts → ~2.4 MiB of coin bytes.
+        let big = |v: i64| Coin {
+            out: TxOut {
+                value: v,
+                script_pubkey: Script::new(vec![0x51; 8192]),
+            },
+            height: 800_000,
+            coinbase: false,
+        };
+        let mut coins: Vec<(OutPoint, Coin)> =
+            (0..300u64).map(|i| (op(i, 0), big(i as i64))).collect();
+        coins.sort_by_key(|(o, _)| crate::utxo_snapshot::outpoint_key(o));
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        crate::utxo_snapshot::write_snapshot(
+            &mut w,
+            [0; 4],
+            &crate::hash::BlockHash::from_bytes([0; 32]),
+            coins.len() as u64,
+            &coins,
+        )
+        .unwrap();
+        use std::io::Write;
+        w.flush().unwrap();
+
+        // One entry, pointing at the first group's start — everything
+        // else lives past any plausible fixed window.
+        let mut first_key = [0u8; 36];
+        first_key[..32].copy_from_slice(coins[0].0.txid.as_bytes());
+        let sparse = vec![(first_key, 51u64)];
+        let run = SnapshotRun::from_index(
+            std::fs::File::open(&path).unwrap(),
+            sparse,
+            coins.len() as u64,
+        );
+
+        for (o, c) in &coins {
+            let got = run.get(o).expect("coin past the old 128KiB cap must hit");
+            assert_eq!(got.out.value, c.out.value);
+        }
+        assert!(run.get(&op(9_999, 0)).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The snapverify scan/hint paths emit sparse entries keyed by
+    /// group-start (txid, vout=0) at a FILE-BYTE stride, while
+    /// `index_with` keys every stride-th group's real first outpoint.
+    /// The overlay must answer identically from either index — this
+    /// cross-checks offsets, key form, and miss semantics on the same
+    /// bytes.
+    #[test]
+    fn snapverify_index_answers_identically_to_index_with() {
+        let dir = std::env::temp_dir().join(format!("srun-qvfy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snap.dat");
+
+        // Mixed shapes: multi-vout groups, varied script sizes,
+        // enough groups that several index entries exist per file.
+        let mut coins: Vec<(OutPoint, Coin)> = Vec::new();
+        for g in 0..60u64 {
+            let txid = op(g, 0).txid;
+            let vouts = 1 + (g % 4) as u32;
+            for v in 0..vouts {
+                coins.push((
+                    OutPoint { txid, vout: v },
+                    Coin {
+                        out: TxOut {
+                            value: (g * 10 + v as u64) as i64,
+                            script_pubkey: Script::new(vec![0x51; (g % 7) as usize * 500]),
+                        },
+                        height: 800_000,
+                        coinbase: g == 0,
+                    },
+                ));
+            }
+        }
+        coins.sort_by_key(|(o, _)| crate::utxo_snapshot::outpoint_key(o));
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        crate::utxo_snapshot::write_snapshot(
+            &mut w,
+            [0; 4],
+            &crate::hash::BlockHash::from_bytes([0; 32]),
+            coins.len() as u64,
+            &coins,
+        )
+        .unwrap();
+        use std::io::Write;
+        w.flush().unwrap();
+
+        // Authoritative index + the snapverify-derived index.
+        let reference = SnapshotRun::index_with(&path, 4, &mut |_, _| {}).unwrap();
+        let (out, _hints) =
+            crate::snapverify::verify_stream(&path, false, 800_000, 8 << 10, 2 << 10).unwrap();
+        let sparse: Vec<([u8; 36], u64)> = out
+            .sparse
+            .iter()
+            .map(|(t, o)| {
+                let mut k = [0u8; 36];
+                k[..32].copy_from_slice(t);
+                (k, *o)
+            })
+            .collect();
+        assert!(!sparse.is_empty(), "verifier must emit an index");
+        let under_test =
+            SnapshotRun::from_index(std::fs::File::open(&path).unwrap(), sparse, out.coins);
+
+        for (o, _) in &coins {
+            assert_eq!(
+                reference.get(o).map(|c| c.out.value),
+                under_test.get(o).map(|c| c.out.value),
+                "lookup divergence at {o:?}"
+            );
+        }
+        for miss in [op(500, 0), op(30, 99), op(0, 7)] {
+            assert_eq!(
+                under_test.get(&miss).is_none(),
+                reference.get(&miss).is_none()
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

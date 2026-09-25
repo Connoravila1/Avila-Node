@@ -1383,51 +1383,81 @@ impl Chainstate {
         use crate::utxo_snapshot::SnapshotError;
         let (base, base_height, au) = self.check_snapshot_activation(meta, mempool_nonempty)?;
 
-        // Single sequential pass — `index_with` builds the sparse
-        // group index AND streams every decoded coin to the
-        // hasher (file order IS the committed hash order; a
-        // mis-ordered file just won't match). Two channels: the
-        // coins feed `compute_streaming` on a worker thread.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(OutPoint, Coin)>(4096);
-        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-        let bh = base_height;
-        let hasher = std::thread::spawn(move || {
-            let stats = crate::coinstats::compute_streaming(
-                rx.into_iter(),
-                i64::from(bh),
-                base,
-                crate::coinstats::CoinStatsHashType::HashSerialized,
-            );
-            let _ = done_tx.send(stats);
-        });
-        let run = crate::sortedrun::SnapshotRun::index_with(
-            path.as_ref(),
-            // Sparse-index stride — a group every ~64K records keeps
-            // lookups within a short scan of the target.
-            65_536,
-            &mut |op, coin| {
-                let _ = tx.send((op, coin));
-            },
-        )
-        .map_err(|e| SnapshotError(format!("snapshot index: {e}")))?;
-        drop(tx);
-        let stats = done_rx
-            .recv()
-            .map_err(|_| SnapshotError("hash worker dropped".to_string()))?;
-        hasher
-            .join()
-            .map_err(|_| SnapshotError("hash worker panicked".to_string()))?;
-        let got = stats
-            .hash_serialized
-            .map(|h| crate::hash::format_display_hex(h.as_bytes()))
-            .unwrap_or_default();
+        // One pass produces BOTH the verified content hash and the
+        // sparse overlay index. With a `<file>.avhints` sidecar,
+        // `verify_hinted` splits the SHA chain across cores — the
+        // midstates are untrusted (each interval is recomputed from
+        // the file's own bytes and must reproduce its boundary hint
+        // exactly), so a bad sidecar fails closed into the sequential
+        // pass. `verify_stream` walks once and emits the hints for
+        // next activation; both emit the sparse group index inline.
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(16);
+        // Sparse index granularity in FILE bytes: the overlay reader
+        // bounds each lookup's scan window by the next index entry, so
+        // this is the worst-case miss read. 64 KiB gives ~145k entries
+        // on a 9.3 GiB snapshot (~6 MiB RAM) — a miss costs one 64 KiB
+        // window read instead of paging the whole region.
+        let bucket = 64 << 10;
+        let hints_path = path.as_ref().with_extension("avhints");
+        let out = match std::fs::read(&hints_path)
+            .ok()
+            .and_then(|b| crate::snapverify::Hints::decode(&b).ok())
+            .and_then(|h| {
+                crate::snapverify::verify_hinted(
+                    path.as_ref(),
+                    false,
+                    threads,
+                    base_height,
+                    &h,
+                    bucket,
+                )
+                .ok()
+            }) {
+            Some(out) => out,
+            None => {
+                let (out, hints) = crate::snapverify::verify_stream(
+                    path.as_ref(),
+                    false,
+                    base_height,
+                    64 << 20,
+                    bucket,
+                )
+                .map_err(|e| SnapshotError(format!("snapshot verify: {e}")))?;
+                // Hints are a derived artifact of this exact file —
+                // persisting beside the snapshot makes later
+                // activations parallel. Content-bound, so a stale
+                // sidecar for a different file is rejected above.
+                let _ = std::fs::write(&hints_path, hints.encode());
+                out
+            }
+        };
+        let got = crate::hash::format_display_hex(&out.hash);
         if got != au.hash_serialized {
             return Err(SnapshotError(format!(
                 "Bad snapshot content hash: expected {}, got {got}",
                 au.hash_serialized
             )));
         }
-        debug_assert_eq!(stats.txouts, meta.coins_count);
+        debug_assert_eq!(out.coins, meta.coins_count);
+        // The verifier's sparse index keys groups by txid; the overlay
+        // reader wants (txid, vout) keys — group starts get vout 0,
+        // which sorts below every real output of the group and is the
+        // correct binary-search landing for any coin in it.
+        let sparse: Vec<([u8; 36], u64)> = out
+            .sparse
+            .iter()
+            .map(|(t, o)| {
+                let mut k = [0u8; 36];
+                k[..32].copy_from_slice(t);
+                (k, *o)
+            })
+            .collect();
+        let snap_file = std::fs::File::open(path.as_ref())
+            .map_err(|e| SnapshotError(format!("snapshot open: {e}")))?;
+        let run = crate::sortedrun::SnapshotRun::from_index(snap_file, sparse, out.coins);
 
         // Persist where the overlay file lives — `restore` re-attaches
         // it by sidecar path so a restart never re-imports.

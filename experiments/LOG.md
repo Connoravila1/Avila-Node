@@ -513,3 +513,29 @@ First real mainnet run (`avila-gui --config config/mainnet.toml`,
   (8333) for every outbound — now a per-connection random u64 so
   outbound sessions are distinguishable and our self-connect check
   works as designed.
+
+- Snapshot activation fused verify+index (#1 queued candidate):
+  `activate_snapshot_overlay` now runs `snapverify::verify_stream`
+  (or `verify_hinted` when a `<file>.avhints` sidecar exists — first
+  activation writes it; midstates are recomputed per interval so a
+  bad sidecar only fails closed). ONE pass yields the hash check AND
+  the sparse overlay index — the old path built them as
+  index_with + compute_streaming on the same read.
+  - 170M real fixture (9.3 GB): stream 12.8 s, hinted 11.0 s
+    (8 threads, busy box — idle estimates ~3-4 s); 25M: 2.1 s/1.8 s.
+    Identical hash both paths; old path ~25 s index alone.
+  - Two latent `SnapshotRun::get` bugs found by a new
+    index-equivalence test (`snapverify_index_answers_identically_`
+    `to_index_with`, `sparse_window_reaches_coins_past_any_fixed_cap`):
+    * fixed 128 KiB read window vs stride-65536-group sparse entries
+      (~7 MiB gaps on mainnet) → false misses for ~97% of coins;
+      window now bounds at the next sparse entry / EOF.
+    * `pos + 33 > n` early-exit assumed every next record was a group
+      header — dropped records within ~33 B of a window end.
+    * `index_with` wrote sparse-key vouts little-endian vs the
+      big-endian `outpoint_key` search form — wrong ordering for any
+      group whose first vout ≠ 0.
+  - Impact: without these fixes a real activate_snapshot_overlay run
+    would have attached an index that silently answered "absent" for
+    most snapshot coins — consensus-visible corruption once
+    background validation spends them.
