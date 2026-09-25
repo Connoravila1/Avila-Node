@@ -1767,7 +1767,14 @@ impl<S: Read + Write> PeerManager<S> {
             .fetch_index
             .last()
             .is_none_or(|(h, _)| *h < cs.tree().tip().height);
-        if self.fetch_index.is_empty() || stale >= 2048 || index_short {
+        // `index_short` only justifies a rebuild when headers actually
+        // grew since the last one — if the index still can't reach the
+        // tip (a taller side-branch node outranks it), rebuilding every
+        // tick just re-sorts ~1M headers forever at ~100% CPU.
+        if self.fetch_index.is_empty()
+            || stale >= 2048
+            || (index_short && header_count != self.fetch_index_headers)
+        {
             self.fetch_index = cs
                 .tree()
                 .headers_by_height()
@@ -1810,19 +1817,32 @@ impl<S: Read + Write> PeerManager<S> {
         // the active chain frozen behind stored data. Replay a bounded
         // batch straight from the store each tick; height order keeps
         // parents ahead of children within the batch.
+        // Replay advances strictly through the tip: a stored body can only
+        // connect when its parent is `cs.tip_hash()`. Anything else — a
+        // side-branch header, an orphan whose parent never connected — is
+        // skipped via the header node WITHOUT decoding the body. The old
+        // window re-offered every stored orphan to `accept_block` every
+        // tick (decode + validate + duplicate store append, forever): the
+        // pegged-CPU / disk-read / no-progress wedge.
         let mut replayed = 0usize;
         for (_, h) in self.fetch_index[start..].iter().take(1024) {
             if replayed >= 256 {
                 break;
             }
             if cs.have_body(h)
+                && cs
+                    .tree()
+                    .get(h)
+                    .is_some_and(|n| n.header.prev_block_hash == cs.tip_hash())
                 && let Some(block) = cs.body(h)
             {
                 match cs.accept_block(&block, now) {
                     Ok(avila_consensus::chainstate::Acceptance::Connected { .. }) => {
                         replayed += 1;
                     }
-                    Ok(_) => {}
+                    Ok(other) => {
+                        eprintln!("replay: {h} -> {other:?}");
+                    }
                     Err(e) => {
                         // A stored body failing replay is loud signal —
                         // the freeze diagnosis path. Bounded: the same

@@ -208,7 +208,10 @@ fn size_hist() {
     let mut cum = 0u64;
     for (sz, c) in &h {
         cum += c;
-        println!("{sz:>4}B  {c:>8}  cum {:.2}%", 100.0 * cum as f64 / 2_000_000.0);
+        println!(
+            "{sz:>4}B  {c:>8}  cum {:.2}%",
+            100.0 * cum as f64 / 2_000_000.0
+        );
     }
 }
 

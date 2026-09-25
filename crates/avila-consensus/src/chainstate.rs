@@ -1679,44 +1679,78 @@ impl Chainstate {
                     if let Some(be) = &cs.coins_backend {
                         cs.utxo.attach_shared(be.clone());
                     }
-                    cs.stored_bodies(&HashSet::new())?
+                    cs.stored_positions(&HashSet::new())
                 }
             },
-            _ => cs.stored_bodies(&HashSet::new())?,
+            _ => cs.stored_positions(&HashSet::new()),
         };
-        // Bodies stored out of order are orphans until their parent lands —
-        // loop until a pass makes no progress. A body that keeps failing a
-        // non-orphan gate is a permanently-invalid stored block (it was
-        // written before its connect attempt), not a reason to keep retrying.
-        while !pending.is_empty() {
-            let mut progress = false;
-            pending.retain(|block| match cs.accept_block(block, now) {
-                Ok(_) => {
-                    progress = true;
-                    false
+        // Bodies stored out of order are orphans until their parent lands.
+        // Height order puts every parent ahead of its children — one linear
+        // pass connects everything the store recorded, replacing the old
+        // quadratic retain-per-round loop that re-offered the whole set once
+        // per progress step. Bodies decode lazily one at a time: a large
+        // stored backlog costs O(position) memory, not O(sum of all body
+        // bytes) — the all-at-once Vec<Block> collect was the startup OOM.
+        pending.sort_by_key(|(hash, _)| cs.tree.get(hash).map(|n| n.height).unwrap_or(u32::MAX));
+        let pending_total = pending.len();
+        if pending_total > 0 {
+            eprintln!("restore: replaying {pending_total} stored bodies");
+        }
+        let mut seen = 0usize;
+        let mut leftover: Vec<(BlockHash, crate::store::BlockPos)> = Vec::new();
+        for round in 0..2 {
+            let src = if round == 0 {
+                std::mem::take(&mut pending)
+            } else {
+                std::mem::take(&mut leftover)
+            };
+            for (hash, pos) in src {
+                seen += 1;
+                if round == 0 && seen.is_multiple_of(2000) {
+                    eprintln!(
+                        "restore: replay {seen}/{pending_total} (tip {})",
+                        cs.chain.len() - 1
+                    );
                 }
-                Err(BlockRejection::Header(ChainError::UnknownParent(_))) => true,
-                Err(_) => false,
-            });
-            if !progress {
-                break;
+                let Ok(block) = cs
+                    .store
+                    .as_ref()
+                    .ok_or_else(|| std::io::Error::other("no store"))?
+                    .read(pos)
+                else {
+                    continue; // torn/undecodable stored record — skip it
+                };
+                match cs.accept_block(&block, now) {
+                    Ok(_) => {}
+                    Err(BlockRejection::Header(ChainError::UnknownParent(_))) => {
+                        leftover.push((hash, pos));
+                    }
+                    // A body that keeps failing a non-orphan gate is a
+                    // permanently-invalid stored block (it was written before
+                    // its connect attempt) — drop it, don't retry.
+                    Err(_) => {}
+                }
             }
         }
         Ok(cs)
     }
 
-    /// Every stored body in file order except hashes in `skip` — the replay
-    /// set for both the no-snapshot path (`skip` empty) and the snapshot path
-    /// (`skip` = connected ∪ failed).
-    fn stored_bodies(&self, skip: &HashSet<BlockHash>) -> std::io::Result<Vec<Block>> {
+    /// Every stored body's position in file order except hashes in `skip` —
+    /// the replay index for both the no-snapshot path (`skip` empty) and the
+    /// snapshot path (`skip` = connected ∪ failed). Positions only: callers
+    /// decode lazily in connect order so a large stored set stays bounded in
+    /// memory.
+    fn stored_positions(
+        &self,
+        skip: &HashSet<BlockHash>,
+    ) -> Vec<(BlockHash, crate::store::BlockPos)> {
         let Some(store) = &self.store else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         store
             .positions()
             .into_iter()
             .filter(|(hash, _)| !skip.contains(hash))
-            .map(|(_, pos)| store.read(pos))
             .collect()
     }
 
@@ -1730,7 +1764,11 @@ impl Chainstate {
     ///
     /// `io::Error` when the snapshot is internally inconsistent or disagrees
     /// with the header rules or the store — the caller falls back to replay.
-    fn restore(&mut self, state: StateData, now: u32) -> std::io::Result<Vec<Block>> {
+    fn restore(
+        &mut self,
+        state: StateData,
+        now: u32,
+    ) -> std::io::Result<Vec<(BlockHash, crate::store::BlockPos)>> {
         let corrupt = |msg: &str| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("state.dat: {msg}"))
         };
@@ -1871,7 +1909,7 @@ impl Chainstate {
         }
         let mut covered: HashSet<BlockHash> = state.failed.into_iter().collect();
         covered.extend(self.chain.iter().copied());
-        self.stored_bodies(&covered)
+        Ok(self.stored_positions(&covered))
     }
 
     /// `true` if `hash`'s body is available — in memory or in the store.
@@ -2982,15 +3020,20 @@ impl Chainstate {
         if self.tree.is_failed(&hash) {
             return Ok(None);
         }
-        // Collect the branch back to its fork point with the connected chain.
-        let chain_set: HashSet<BlockHash> = self.chain.iter().copied().collect();
+        // Collect the branch back to its fork point with the connected
+        // chain. `self.chain` is height-ordered, so membership is an O(1)
+        // slot compare — the old `HashSet` rebuild made every reorg check
+        // O(chain length) even when the walk found the fork in one hop.
         let mut branch_hashes = Vec::new();
         let mut cursor = hash;
-        while !chain_set.contains(&cursor) {
-            branch_hashes.push(cursor);
+        loop {
             let Some(node) = self.tree.get(&cursor) else {
                 return Err(ConnectError::Internal("branch walk left the tree"));
             };
+            if self.chain.get(node.height as usize) == Some(&cursor) {
+                break; // reached the active chain
+            }
+            branch_hashes.push(cursor);
             cursor = node.header.prev_block_hash;
         }
         let fork = cursor;
@@ -3193,6 +3236,15 @@ impl Chainstate {
         };
         let mut best = (start.chainwork, hash);
         let mut stack: Vec<BlockHash> = self.tree.children(&hash).to_vec();
+        // Bounded walk: callers run this after every connected block, so a
+        // large stored-body backlog (a restart replay, a stalled sync that
+        // kept downloading) turns an unbounded DFS into O(backlog) work per
+        // connect — quadratic overall — and hands `maybe_reorg` a
+        // branch-length simulation with no intermediate flush. A cap keeps
+        // each call cheap; the caller's NEXT connect re-walks from the new
+        // tip, so progress continues incrementally at a bounded cost.
+        const MAX_VISITS: usize = 2048;
+        let mut visited = 0usize;
         while let Some(h) = stack.pop() {
             #[cfg(test)]
             NODES_VISITED.with(|c| c.set(c.get() + 1));
@@ -3203,6 +3255,10 @@ impl Chainstate {
                 && node.chainwork > best.0
             {
                 best = (node.chainwork, h);
+            }
+            visited += 1;
+            if visited >= MAX_VISITS {
+                break;
             }
             stack.extend_from_slice(self.tree.children(&h));
         }
