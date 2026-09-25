@@ -291,6 +291,17 @@ impl PeerSync {
         }
     }
 
+    /// Ages one in-flight entry — mid-queue staleness coverage for
+    /// `release_older_than` (the straggler the front check misses).
+    #[cfg(test)]
+    pub(crate) fn backdate_in_flight(&mut self, hash: &BlockHash, age: Duration) {
+        for (h, at) in self.in_flight.iter_mut() {
+            if h == hash {
+                *at = Instant::now() - age;
+            }
+        }
+    }
+
     /// Total headers this peer has contributed to the index.
     #[must_use]
     pub fn headers_applied(&self) -> usize {
@@ -820,6 +831,29 @@ impl PeerSync {
             self.wanted.remove(&inv.hash);
         }
         released
+    }
+
+    /// Releases individual in-flight requests older than `timeout` —
+    /// the frontier `stalled()` check only sees the queue front, so a
+    /// peer that keeps serving other hashes can pin one block forever
+    /// (live wedge: the tip's next block reserved 6+ minutes while the
+    /// peer served everything else). Freed hashes return to the pool
+    /// and the next `fill_queues` assigns them to answering peers.
+    /// A late delivery still counts via `on_block` — release only
+    /// means "someone else may also fetch it now".
+    pub fn release_older_than(&mut self, timeout: Duration) -> usize {
+        let stale: Vec<BlockHash> = self
+            .in_flight
+            .iter()
+            .filter(|(_, at)| at.elapsed() > timeout)
+            .map(|(h, _)| *h)
+            .collect();
+        let n = stale.len();
+        for hash in stale {
+            self.wanted.remove(&hash);
+            self.clear_in_flight(&hash);
+        }
+        n
     }
 
     /// `true` if the oldest in-flight block request has gone unanswered
@@ -1557,6 +1591,33 @@ mod tests {
         let req = sync.want_blocks(&cs, &hashes);
         match req {
             Some(Message::GetData(want)) => assert_eq!(want.len(), 2),
+            other => panic!("expected getdata, got {other:?}"),
+        }
+    }
+
+    /// A hash buried mid-queue can outlive every front-of-queue stall
+    /// check while the peer keeps serving everything else — the h147629
+    /// wedge. `release_older_than` frees just the straggler so another
+    /// peer re-requests it, and the freed hash must be re-requestable.
+    #[test]
+    fn stale_mid_queue_reservation_is_released() {
+        let cs = regtest();
+        let blocks = chain_blocks(&cs, 6);
+        let mut sync = PeerSync::new();
+        let hashes: Vec<BlockHash> = blocks.iter().map(|b| b.block_hash()).collect();
+        let _ = sync.want_blocks(&cs, &hashes);
+        assert_eq!(sync.in_flight(), 6);
+        // The third hash sits mid-queue and never arrives; everything
+        // else is fresh — `stalled()` (front-only) correctly stays false.
+        sync.backdate_in_flight(&hashes[2], Duration::from_secs(60));
+        assert!(!sync.stalled());
+        assert_eq!(sync.release_older_than(Duration::from_secs(16)), 1);
+        assert_eq!(sync.in_flight(), 5);
+        assert!(sync.reserved_hashes().all(|h| *h != hashes[2]));
+        // The freed hash is requestable again — the whole point.
+        let req = sync.want_blocks(&cs, &hashes[2..3]);
+        match req {
+            Some(Message::GetData(want)) => assert_eq!(want[0].hash, hashes[2]),
             other => panic!("expected getdata, got {other:?}"),
         }
     }

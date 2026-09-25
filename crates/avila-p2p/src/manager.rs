@@ -24,7 +24,7 @@ use crate::message::{AddrV2Entry, Message, NODE_P2P_V2, NetAddr, Version};
 use crate::session::{
     HANDSHAKE_TIMEOUT, PeerInfo, PeerSession, SessionError, SessionEvent, build_version, wall_epoch,
 };
-use crate::sync::{MAX_BLOCKS_IN_TRANSIT_PER_PEER, PeerSync};
+use crate::sync::{BLOCK_STALLING_TIMEOUT, MAX_BLOCKS_IN_TRANSIT_PER_PEER, PeerSync};
 
 /// Maximum simultaneous peers — small by design; more arrive when
 /// connection scheduling matures.
@@ -1156,6 +1156,11 @@ impl<S: Read + Write> PeerManager<S> {
             // leader is allowed to keep paging. Dropping it here clears
             // `headers_leader` below and `fill_queues` hands leadership
             // to another established peer on the next tick.
+            // Per-hash staleness first: `stalled()` only watches the
+            // queue front, so a peer that keeps answering other requests
+            // can pin one hash forever — release stragglers back to the
+            // pool so another peer picks them up next fill.
+            peer.sync.release_older_than(BLOCK_STALLING_TIMEOUT * 8);
             if peer.sync.headers_timed_out() {
                 dead.push((id, DisconnectReason::Stalled));
             } else if peer.sync.stalled() {

@@ -4882,22 +4882,33 @@ mod tests {
         )
         .unwrap();
         let events = events.lock().unwrap();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, ProgressEvent::StoreIndexed { bodies } if *bodies >= 140)));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, ProgressEvent::RestoreHeaders { total, .. } if *total >= 141)));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, ProgressEvent::ChainVerify { total, .. } if *total == 41)));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::StoreIndexed { bodies } if *bodies >= 140))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::RestoreHeaders { total, .. } if *total >= 141))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::ChainVerify { total, .. } if *total == 41))
+        );
         // The 100-body backlog hits exactly one milestone; its tip still
         // shows the connected frontier — the gap at 41 means these bodies
         // can only ever park, and the replay must say so rather than
         // pretend the counter moved.
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, ProgressEvent::ReplayBodies { done: 100, total: 100, tip: 40 })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProgressEvent::ReplayBodies {
+                done: 100,
+                total: 100,
+                tip: 40
+            }
+        )));
         drop(events);
         assert_eq!(cs.tip_hash(), blocks[39].block_hash());
         drop(cs);
