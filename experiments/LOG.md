@@ -446,3 +446,46 @@ mature coinbases), syncs avila-node from it over real P2P, then diffs
 - Harness bugs found + fixed: cookie file is the full `user:pass`
   (was double-prefixing), `-rpcwait` for the cookie race, params[0]
   of testmempoolaccept must be the rawtxs array.
+
+## Exp9 — mainnet IBD first light (2026-09-25, in progress)
+
+First real mainnet run (`avila-gui --config config/mainnet.toml`,
+`prune_mb=2048`, assumevalid on). Live evidence only; no fixtures.
+
+- DNS seeding + outbound formation: 7–8 established peers within ~40s
+  of a cold start, mixed IPv4/IPv6, v2 transport negotiated.
+- Low-work header presync against real peers: ~940,000 headers
+  buffered and committed in under ~2 minutes once a stable leader
+  held (~8,500 hdr/s sustained, single sync peer).
+- Header tree absorbed the committed chain at ~48k/min while block
+  connect began in parallel (early-era blocks ~20/s; dense-era rate
+  still unmeasured).
+- Pruning now runs in-loop every 60s (was shutdown-only — archival
+  IBD would have needed ~700GB transiently).
+- In-flight bugs found by watching real traffic, fixed in `4d7de93`:
+  - duplicate `getheaders` per peer (Established + leader election)
+    poisoned per-peer presync continuity → leader churn loop;
+  - non-leader presync buffers with suppressed continuations leaked
+    `headers_in_flight` → mass `headers_timed_out` drops;
+  - CPU throttle starved the headers leader's socket → remote peers
+    closed the one connection feeding sync (exempt now);
+  - orphan block announcements during IBD punished as misbehavior —
+    `Acceptance` is now `Option`; unknown-parent defers (Core
+    semantics) instead of disconnecting;
+  - leader election preferred arbitrary peers — now prefers a peer
+    that has already served headers; leadership resumes a peer's
+    presync from its buffered tip rather than re-asking from genesis;
+  - DiversityCollapse grouped IPv6-mapped IPv4 peers into one bucket
+    (`ip[0..2]`) — canonical `addrman::net_group` now + regression
+    test (`v4_mapped_peers_in_distinct_sixteens_do_not_collapse`);
+  - GUI autostart waited for the first frame callback — an occluded
+    Wayland window never got one, so the node silently never started
+    (start moved into `App::new`; SIGTERM now routes through the
+    viewport close so `on_exit` flushes state).
+- Visibility: `SyncProgress.headers_buffered` surfaces presync
+  progress to the banner — previously the tree tip stayed 0 through
+  the whole presync and read as "stuck".
+- Open: full-chain connect time unmeasured; presync buffer is not
+  persisted across restarts (leader loss mid-presync restarts it —
+  cheap at current pace, expensive only if it lands mid-phase);
+  leader is still a single peer, matching Core.
