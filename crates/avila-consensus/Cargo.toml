@@ -23,12 +23,12 @@ thiserror.workspace = true
 k256 = "0.14.0"
 getrandom = "0.3"
 zeroize = "1"
+rustreexo = "0.6.0"
 
 [dev-dependencies]
 # Differential references only. Neither crate is used by the validation path.
 bitcoin.workspace = true
 proptest.workspace = true
-rustreexo = "0.6.0"
 
 [lints]
 workspace = true

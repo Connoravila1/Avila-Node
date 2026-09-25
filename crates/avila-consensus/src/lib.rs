@@ -40,4 +40,5 @@ pub mod sortedrun;
 pub mod store;
 pub mod swiftsync;
 pub mod transaction;
+pub mod utreexo;
 pub mod utxo_snapshot;

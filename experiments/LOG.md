@@ -539,3 +539,24 @@ First real mainnet run (`avila-gui --config config/mainnet.toml`,
     would have attached an index that silently answered "absent" for
     most snapshot coins — consensus-visible corruption once
     background validation spends them.
+
+- Utreexo accumulator backend — first-class path (#3 queued):
+  `crates/avila-consensus/src/utreexo.rs`. `UtxoAccumulator` wraps a
+  rustreexo `Stump` (roots + leaf counter only — ~864 B state at
+  mainnet scale vs the 12 GiB set) persisted to `utreexo.stump`.
+  `connect_block_proven` is the proof-carrying connect path: caller
+  supplies the block's spend set + an accumulator `Proof`; membership
+  verifies the *coin bytes* (leaf = sha256d(outpoint_key ||
+  compact_record) — Avila scheme, not BIP LeafData), completeness is
+  checked input-by-input, then the unmodified `connect_block` runs on
+  a spend-only overlay and the stump applies adds+dels.
+  - Soundness: a forged coin fails the leaf-hash check before any
+    consensus work; a missing bundle entry is `MissingSpend` (bridge
+    starvation is a stall, never a bypass).
+  - Tests: synthetic regtest chain over the same scaffold as
+    connect.rs — grow past maturity, then a two-input spend block
+    connects via proof end-to-end while a conventional `UtxoSet` run
+    cross-checks; tampered-bundle + unbundled-input + reopen-persist
+    coverage.
+  - Not yet: reorg/undo (rustreexo's UpdateData makes it possible),
+    proof serving (MemForest bridge), p2p bundle transport (#6).
