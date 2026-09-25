@@ -1776,6 +1776,20 @@ impl Chainstate {
                         cs.chain.len() - 1
                     );
                 }
+                // Only the tip's own child can connect — a body above a
+                // gap (or a parked side-branch) fed to `accept_block`
+                // pays for `maybe_reorg`: a branch walk back to the
+                // active chain that costs O(gap) per body — O(n²) over
+                // a wedge-accumulated backlog. The header node answers
+                // the parent check without even decoding the body.
+                let parent_ok = cs
+                    .tree
+                    .get(&hash)
+                    .is_some_and(|n| n.header.prev_block_hash == cs.tip_hash());
+                if !parent_ok {
+                    leftover.push((hash, pos));
+                    continue;
+                }
                 let Ok(block) = cs
                     .store
                     .as_ref()
