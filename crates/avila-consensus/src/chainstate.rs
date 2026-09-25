@@ -1623,10 +1623,14 @@ impl Chainstate {
         now: u32,
         cache_bytes: usize,
     ) -> std::io::Result<Self> {
+        eprintln!("open: block store scan");
         let store = BlockStore::open(dir, params.message_start)?;
+        eprintln!("open: store indexed");
         let mut cs = Self::new(params);
         cs.store = Some(store);
+        eprintln!("open: coinsdb");
         cs.enable_coinsdb(dir, cache_bytes)?;
+        eprintln!("open: resume");
         cs.resume(dir, now)
     }
 
@@ -1710,11 +1714,16 @@ impl Chainstate {
         // Headers first, while `invalid` is still empty: a FAILED_CHILD mark
         // cannot turn a stored header's insert into `InvalidParent`. Insert
         // order is by height, so parents always precede children.
-        for header in &state.headers {
+        eprintln!("restore: reinserting {} headers", state.headers.len());
+        for (i, header) in state.headers.iter().enumerate() {
             self.tree
                 .insert(header, now)
                 .map_err(|e| corrupt(&format!("header reinsert: {e}")))?;
+            if i % 50000 == 0 {
+                eprintln!("restore: headers {i}/{}", state.headers.len());
+            }
         }
+        eprintln!("restore: headers done");
         for hash in &state.failed {
             if !self.tree.contains(hash) {
                 return Err(corrupt("failed mark on unindexed header"));
@@ -1730,6 +1739,10 @@ impl Chainstate {
         if !self.tree.restore_tip(state.best_header) {
             return Err(corrupt("best header not a max-work tip"));
         }
+        eprintln!(
+            "restore: tip restored, checking {} chain entries",
+            state.chain.len()
+        );
         let store_dir = self
             .store
             .as_ref()
@@ -1756,6 +1769,7 @@ impl Chainstate {
                 return Err(corrupt("connected block body not stored"));
             }
         }
+        eprintln!("restore: chain verified");
         self.connected = state.tip;
         self.chain = state.chain;
         self.snapshot_base = snapshot_base;
@@ -1786,7 +1800,9 @@ impl Chainstate {
             self.undos = Vec::new();
             // Crash window: the backend may have committed past this
             // snapshot's tip — rewind via the stored undos + bodies.
+            eprintln!("restore: reconciling backend (state tip {})", state.height);
             self.reconcile_backend(state.height)?;
+            eprintln!("restore: backend reconciled");
         } else if let Some(be) = &self.coins_backend {
             // Inline-format state under a backend: stream the coins in
             // bounded chunks, then the undos — one migration commit at

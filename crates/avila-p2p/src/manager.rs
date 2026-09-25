@@ -494,6 +494,12 @@ pub struct PeerManager<S> {
     fetch_index: Vec<(u32, avila_consensus::hash::BlockHash)>,
     /// Header count `fetch_index` was built at.
     fetch_index_headers: usize,
+    /// Connected height at the last `fill_queues` — stall diagnostics
+    /// compare the frontier's movement against wall time.
+    last_frontier: u32,
+    /// When the frontier last advanced — a frontier flat past 60s gets
+    /// a one-line diagnostic naming the blocking hash's fetch state.
+    frontier_moved_at: Instant,
     /// Gossiped peer addresses — discovery lives here.
     addrbook: AddrBook,
     /// The transaction pool — policy layer owned here so `tx` intake,
@@ -658,6 +664,8 @@ impl<S: Read + Write> PeerManager<S> {
             max_in_flight_total: MAX_BLOCKS_IN_TRANSIT_TOTAL,
             fetch_index: Vec::new(),
             fetch_index_headers: usize::MAX,
+            last_frontier: 0,
+            frontier_moved_at: Instant::now(),
             addrbook: AddrBook::new(),
             mempool: avila_mempool::Mempool::new(),
             closed_bytes_sent: 0,
@@ -1752,6 +1760,26 @@ impl<S: Read + Write> PeerManager<S> {
         // peer taking a slice until the aggregate budget binds.
         let frontier = cs.chain().len() as u32;
         let start = self.fetch_index.partition_point(|(h, _)| *h < frontier);
+        if frontier != self.last_frontier {
+            self.last_frontier = frontier;
+            self.frontier_moved_at = Instant::now();
+        } else if self.frontier_moved_at.elapsed() > Duration::from_secs(60)
+            && let Some((_, fh)) = self.fetch_index.get(start)
+        {
+            self.frontier_moved_at = Instant::now(); // once a minute
+            let have = cs.have_body(fh);
+            let held_by: Vec<u64> = self
+                .peers
+                .iter()
+                .filter(|(_, p)| p.sync.reserved_hashes().any(|h| h == fh))
+                .map(|(id, _)| *id)
+                .collect();
+            eprintln!(
+                "fetch-stall: frontier={frontier} next={fh} have_body={have}                  reserved_by={held_by:?} in_flight={} stale={}",
+                reserved.len(),
+                stale
+            );
+        }
         // Resume wedge: bodies persisted by earlier runs satisfy
         // `have_body`, so the fetch loop below never re-requests them —
         // and nothing else ever feeds them to `accept_block`, leaving
@@ -1765,12 +1793,20 @@ impl<S: Read + Write> PeerManager<S> {
             }
             if cs.have_body(h)
                 && let Some(block) = cs.body(h)
-                && matches!(
-                    cs.accept_block(&block, now),
-                    Ok(avila_consensus::chainstate::Acceptance::Connected { .. })
-                )
             {
-                replayed += 1;
+                match cs.accept_block(&block, now) {
+                    Ok(avila_consensus::chainstate::Acceptance::Connected { .. }) => {
+                        replayed += 1;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        // A stored body failing replay is loud signal —
+                        // the freeze diagnosis path. Bounded: the same
+                        // hash re-prints only every ~60s via the stall
+                        // diagnostic cadence of the caller's loop.
+                        eprintln!("replay: {h} rejected: {e}");
+                    }
+                }
             }
         }
         let want_total = self.max_in_flight_total.saturating_sub(reserved.len());
