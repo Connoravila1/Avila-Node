@@ -195,7 +195,28 @@ fn run_bench(be: CoinsBackend, name: &str, dir: &std::path::Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Prints the compact-record length distribution of the synthetic
+/// mix — the input that chooses the wide-slot inline capacity.
+fn size_hist() {
+    use std::collections::BTreeMap;
+    let mut h: BTreeMap<usize, u64> = BTreeMap::new();
+    for i in 0..2_000_000u32 {
+        let (_, c) = mk(i, 900_000);
+        let rec = avila_consensus::coinsdb::encode_coin(&c, CoinFormat::Compact).len() + 4;
+        *h.entry(rec).or_default() += 1;
+    }
+    let mut cum = 0u64;
+    for (sz, c) in &h {
+        cum += c;
+        println!("{sz:>4}B  {c:>8}  cum {:.2}%", 100.0 * cum as f64 / 2_000_000.0);
+    }
+}
+
 fn main() {
+    if std::env::args().any(|a| a == "--sizes") {
+        size_hist();
+        return;
+    }
     println!("coinsdb layout experiment — {COINS_TOTAL} coins, realistic script/amount mix");
     println!("{}", "-".repeat(100));
     run_format(CoinFormat::Legacy, "legacy", None);

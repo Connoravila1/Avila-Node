@@ -133,7 +133,10 @@ pub(crate) fn key_of(op: &OutPoint) -> [u8; 36] {
 /// Coin codec — `Legacy` is the original field order (same as
 /// `store::put_coin`/`get_coin`); `Compact` is Core's `Coin`
 /// serialization (the snapshot dump's wire codec, byte for byte).
-pub(crate) fn encode_coin(c: &Coin, fmt: CoinFormat) -> Vec<u8> {
+/// Encodes `c` under `fmt` — used by the store, the utreexo leaf
+/// scheme, and bench tooling.
+#[doc(hidden)]
+pub fn encode_coin(c: &Coin, fmt: CoinFormat) -> Vec<u8> {
     match fmt {
         CoinFormat::Legacy => {
             let mut v = Vec::new();
