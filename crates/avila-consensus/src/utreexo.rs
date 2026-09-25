@@ -254,7 +254,11 @@ impl ProofBridge {
         let path = dir.join("proofs.dat");
         let mut file = std::fs::OpenOptions::new()
             .read(true)
-            .write(true)
+            // O_APPEND — every record write lands at EOF regardless
+            // of cursor position (the index scan's `read_exact_at`
+            // leaves the cursor wherever it started; a reopen would
+            // otherwise clobber the magic with the next record).
+            .append(true)
             .create(true)
             .truncate(false)
             .open(&path)?;
@@ -996,8 +1000,67 @@ pub fn decode_spend_bundle(buf: &[u8]) -> Option<SpendBundle> {
     // The proof runs to the end of the payload — hand rustreexo the
     // remaining slice directly.
     let consumed = buf.len() - d.remaining();
-    let proof = Proof::deserialize(&buf[consumed..]).ok()?;
+    let rest = &buf[consumed..];
+    // `Proof::deserialize` trusts its leading u64 counts with an
+    // unchecked `Vec::with_capacity` — a garbage count panics in
+    // raw_vec. Pre-bound it: the encoding is
+    // `u64 targets_len | targets | u64 hashes_len | hashes`, where each
+    // hash is a tagged `BitcoinNodeHash` — 1 byte (Empty/Placeholder)
+    // or 33 (Some). Targets also can't exceed the block's spends
+    // (each proof target deletes one leaf). The min-width bounds keep
+    // every `with_capacity` under the payload size; exact consumption
+    // is enforced by the cursor position afterwards.
+    if rest.len() < 16 {
+        return None;
+    }
+    let targets_len = u64::from_le_bytes(rest[..8].try_into().ok()?);
+    // `tlen | t*8 | hlen | hashes` — targets must leave room for the
+    // `hlen` field itself.
+    if targets_len > n || targets_len > (rest.len() as u64 - 16) / 8 {
+        return None;
+    }
+    let hashes_len = u64::from_le_bytes(
+        rest[8 + targets_len as usize * 8..16 + targets_len as usize * 8]
+            .try_into()
+            .ok()?,
+    );
+    // Each hash is ≥1 byte on the wire — this keeps `with_capacity`
+    // under the payload size.
+    if hashes_len > rest.len() as u64 - 16 - targets_len * 8 {
+        return None;
+    }
+    let mut cursor = std::io::Cursor::new(rest);
+    let proof = Proof::deserialize(&mut cursor).ok()?;
+    if cursor.position() != rest.len() as u64 {
+        return None; // trailing garbage is malformed, not consumed
+    }
     Some((spends, proof))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod repro_tests {
+    use super::*;
+
+    #[test]
+    fn decode_the_live_h120_bundle() {
+        // The exact bytes the bridge recorded for the block that spends
+        // the h1 coinbase — `malformed` on the wire consumer.
+        let bundle = hex_decode(
+            "01209be492aa25b117cba458642878ef2655393c48e362316d959a495d40730cf600000000033207510100000000000000000000000000000006000000000000000242c00aa2b21abdbb87dc3370d06eafd2e17881256686a229836712245a616bd3020662c46fe7b7009e60f369c0d299f745e916bee9761133e723d01a8baeb12b340207dd76a2b69109b1ed3d802834db7a7f2ef2e3926478658a24a28ddf85d774b002709d11dde7ec305d6a8463791f12bfd1aa66b061322b47a9582ff8e34f7a3e40028743f6f65da52d55e1831a673e4e8bcb533ef7fbd3e3369019e3008fd3c71eb702b6ae13c0bb8baf624cf5c5be1f6cb9f0282d750a07ef77a8193056015fb5e191",
+        );
+        assert_eq!(bundle.len(), 263);
+        let (spends, proof) = decode_spend_bundle(&bundle).expect("bundle must decode");
+        assert_eq!(spends.len(), 1);
+        assert_eq!(proof.n_targets(), 1);
+    }
+
+    fn hex_decode(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
 }
 
 #[cfg(test)]

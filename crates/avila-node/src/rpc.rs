@@ -14708,6 +14708,7 @@ mod tests {
             peers: 2,
             connected_height: 120,
             header_height: 140,
+            utreexo_height: None,
             headers_buffered: 0,
             in_flight: 3,
             established_total: 4,

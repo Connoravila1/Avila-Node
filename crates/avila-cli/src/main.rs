@@ -535,6 +535,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             }
             let status: avila_node::rpc::SharedStatus =
                 std::sync::Arc::new(std::sync::RwLock::new(SyncProgress {
+                    utreexo_height: None,
                     peers: 0,
                     connected_height: 0,
                     header_height: 0,
@@ -709,8 +710,15 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 if last_print.elapsed() >= Duration::from_secs(5) {
                     last_print = Instant::now();
                     println!(
-                        "  h {} | headers {} | peers {} | pool {}+{}orph",
-                        p.connected_height, p.header_height, p.peers, p.mempool.0, p.mempool.1,
+                        "  h {} | headers {} | peers {} | pool {}+{}orph{}",
+                        p.connected_height,
+                        p.header_height,
+                        p.peers,
+                        p.mempool.0,
+                        p.mempool.1,
+                        p.utreexo_height
+                            .map(|h| format!(" | utx {h}"))
+                            .unwrap_or_default(),
                     );
                 }
             });

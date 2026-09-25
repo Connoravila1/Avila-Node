@@ -588,3 +588,41 @@ First real mainnet run (`avila-gui --config config/mainnet.toml`,
   spent leaves), fetch-side consume wiring, real-connection test.
   Honest status: scaffold only — nothing sends or consumes
   `utxproof` yet.
+
+- **utxproof transport + bridge + shadow consumer — verified on a live
+  pair (queue #6 done).** Regtest two-node test: producer with
+  `--utreexo-bridge` (proving `MemForest` on a dedicated worker —
+  `Rc` internals are `!Send`, so chainstate ships `(block, undo)`
+  records over a bounded channel; a `ProofReader` serves `proofs.dat`
+  via offsets + `pread`), consumer pinned by `--connect` with
+  `--utreexo` (negotiates `sendutxproof`, decodes wire bundles,
+  replays `connect_block_proven` in chain order — no UTXO set).
+  Chain carries a real spend at h120 (spends the matured h1
+  coinbase) so non-empty proofs crossed the wire. Result:
+  consumer reached `h 150 | utx 150` — the shadow stump has the
+  whole chain proven-connected from bundles alone, persisted
+  (`utreexo.stump`), and status line reports the shadow height.
+  Two real bugs found by the live test:
+
+  1. `fetch_index` only rebuilt when ≥2048 new headers arrived —
+     during bulk sync that works, but the tail of a download (or
+     regtest's single 150-header page) never trips it: the index
+     stayed at genesis, zero blocks were ever requested, sync
+     wedged permanently. Now rebuilds whenever the index doesn't
+     reach the known tip. Suspect for the earlier mainnet h112229
+     freeze.
+  2. `BitcoinNodeHash` serializes as a *tagged* enum — 1 byte for
+     Empty/Placeholder, 33 for Some — not a bare 32-byte hash. The
+     defensive pre-decode bound written as `16+8t+32h` rejected
+     every non-empty proof (e.g. `16+8+6·33=222`), so the first
+     real spend's bundle read malformed and shadow replay stalled.
+     Rewritten: min-width bounds (t ≤ spends, t ≤ bytes/8,
+     h ≤ remaining bytes — each hash ≥1B) keep every
+     `with_capacity` under the payload, then a `Cursor` enforces
+     exact consumption — no trailing bytes. Regression test pins
+     the actual on-disk bundle bytes.
+
+  Also fixed along the way: `proofs.dat` opened non-append
+  overwrote the magic+records on restart (now `O_APPEND` + torn-tail
+  truncation on open); `pending_bundles` capped; shadow drive capped
+  per call so proof replay can't monopolize the sync thread.

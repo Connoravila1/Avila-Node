@@ -168,6 +168,9 @@ pub struct SyncProgress {
     pub established_total: u32,
     /// Cumulative disconnects this run.
     pub disconnects: u32,
+    /// Utreexo shadow-accumulator height (`--utreexo`); `None` when the
+    /// consumer isn't enabled.
+    pub utreexo_height: Option<u32>,
     /// The last few connected blocks `(height, hash)` — newest last —
     /// for displays that render the chain itself.
     pub recent: Vec<(u32, avila_consensus::hash::BlockHash)>,
@@ -740,6 +743,7 @@ pub fn run(
             proxy: mgr.proxy(),
             connected_height: connected,
             header_height: cs.tree().tip().height,
+            utreexo_height: cs.utreexo_height(),
             headers_buffered: mgr.presync_height().unwrap_or(0) as u32,
             in_flight: mgr.in_flight(),
             established_total,

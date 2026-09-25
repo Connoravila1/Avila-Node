@@ -2620,6 +2620,12 @@ impl Chainstate {
         self.drive_utreexo();
     }
 
+    /// Shadow-accumulator cursor — the highest block height replayed
+    /// through `connect_block_proven` so far (`--utreexo` off → `None`).
+    pub fn utreexo_height(&self) -> Option<u32> {
+        self.utreexo_acc.as_ref().map(|_| self.acc_height)
+    }
+
     /// Applies pending bundles to the shadow accumulator in connected
     /// order. Runs `connect_block_proven` — a real consensus connect
     /// against only the bundle's coins — so the shadow path is genuine

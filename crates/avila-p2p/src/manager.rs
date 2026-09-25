@@ -1758,7 +1758,16 @@ impl<S: Read + Write> PeerManager<S> {
         // The fetch lookahead only ever needs ~1024 candidates past
         // the frontier, so staleness under 2048 headers starves nothing.
         let stale = header_count.saturating_sub(self.fetch_index_headers);
-        if self.fetch_index.is_empty() || stale >= 2048 {
+        // Rebuild on a 2048-header page OR whenever the index can't
+        // see the known tip — the stale threshold alone wedged sync at
+        // the tail of a download (and on any <2048-header chain): the
+        // last partial page never trips 2048, so the frozen index ends
+        // below the tip and no block is ever requested.
+        let index_short = self
+            .fetch_index
+            .last()
+            .is_none_or(|(h, _)| *h < cs.tree().tip().height);
+        if self.fetch_index.is_empty() || stale >= 2048 || index_short {
             self.fetch_index = cs
                 .tree()
                 .headers_by_height()
