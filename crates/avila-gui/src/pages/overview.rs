@@ -304,6 +304,11 @@ fn note(ui: &mut Ui, s: &Scene, text: &str) {
 
 fn last_block(ui: &mut Ui, s: &Scene, v: &NodeView, w: f32) {
     widgets::label(ui, "Last block");
+    if v.connected == 0 && !v.caught_up() {
+        figure(ui, "—", "");
+        note(ui, s, "No blocks verified yet — headers come first.");
+        return;
+    }
     let pace = s.session.per_min(|x| x.connected);
     match (v.caught_up(), pace, s.session.seen_ago(v.connected)) {
         (false, Some(p), _) if p >= 1.0 => figure(ui, &thousands(p as u64), "blocks a minute"),

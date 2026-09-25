@@ -1183,15 +1183,25 @@ impl<S: Read + Write> PeerManager<S> {
             .collect();
         let outbound: Vec<&&PeerEntry<S>> = established.iter().filter(|p| !p.inbound).collect();
 
-        // TipStale: stale tip + everyone claims more.
+        // TipStale: stale tip + everyone claims more — but only once
+        // our header tree has reached what peers claim. During headers
+        // download the tree tip is mid-history: old by definition, so
+        // staleness then means "still syncing", not "being eclipsed".
         let tip_time = cs.tree().tip().header.time;
         let stale = tip_time < now.saturating_sub(RECENT_HEADER_WINDOW_SECS);
         let our_height = cs.chain().len() as i32 - 1;
+        let best_claim = established
+            .iter()
+            .filter_map(|p| p.session.peer().map(|i| i.start_height))
+            .max()
+            .unwrap_or(0);
+        let headers_current =
+            best_claim <= 0 || cs.tree().tip().height as i32 >= best_claim.saturating_sub(10);
         let all_claim_more = established.len() >= 4
             && established
                 .iter()
                 .all(|p| p.session.peer().map(|i| i.start_height).unwrap_or(0) > our_height);
-        if stale && all_claim_more {
+        if stale && all_claim_more && headers_current {
             out.push(EclipseSignal::TipStale);
         }
 
@@ -4798,9 +4808,11 @@ mod tests {
             let id = mgr.add_outbound_to(session, remote).expect("slot");
             ends.push((peer_end, id));
         }
-        // Attackers complete the handshake, all claiming height 99999.
+        // Attackers complete the handshake, all claiming height 5 —
+        // inside the headers window, so TipStale applies (claims far
+        // above our tree would read as still-syncing instead).
         for (end, _) in &mut ends {
-            testpipe::inject(end, MAGIC, &Message::Version(peer_version(99999)));
+            testpipe::inject(end, MAGIC, &Message::Version(peer_version(5)));
             testpipe::inject(end, MAGIC, &Message::Verack);
         }
         mgr.tick(&mut cs, NOW);
@@ -4818,6 +4830,42 @@ mod tests {
         assert!(
             !signals.contains(&EclipseSignal::AllInbound),
             "outbound attackers are not AllInbound"
+        );
+    }
+
+    /// TipStale must NOT fire while headers still trail what peers
+    /// claim — during sync the tip is old by definition, so staleness
+    /// then means "catching up", not "eclipsed". Claimed heights far
+    /// above our header tree suppress it; claims near our tip don't.
+    #[test]
+    fn tip_stale_quiet_while_headers_lag() {
+        let mut mgr = PeerManager::new(8);
+        let mut cs = regtest();
+        let mut ends = Vec::new();
+        for i in 0..4u8 {
+            let (us_end, peer_end) = testpipe::pair();
+            let session = PeerSession::initiate(
+                us_end,
+                MAGIC,
+                build_version(9, 0, NetAddr::unspecified(), i64::from(NOW)),
+                BUDGET,
+            )
+            .expect("session");
+            let remote =
+                crate::addrman::net_addr_of(format!("203.0.113.{i}:8333").parse().unwrap(), 0);
+            let id = mgr.add_outbound_to(session, remote).expect("slot");
+            ends.push((peer_end, id));
+        }
+        for (end, _) in &mut ends {
+            testpipe::inject(end, MAGIC, &Message::Version(peer_version(99999)));
+            testpipe::inject(end, MAGIC, &Message::Verack);
+        }
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let signals = mgr.eclipse_signals(&cs, NOW);
+        assert!(
+            !signals.contains(&EclipseSignal::TipStale),
+            "a stale tip while headers trail every claim is syncing, not eclipse: {signals:?}"
         );
     }
 

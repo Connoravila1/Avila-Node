@@ -657,6 +657,23 @@ impl eframe::App for App {
         }
     }
 
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if !self.session.running() {
+            return;
+        }
+        // Window-close kills the process — without this the sync
+        // worker dies mid-run and every header learned this session
+        // is lost. Stop + drain until the worker's exit-path flush
+        // reports back, bounded so a wedged worker can't hold the
+        // window open.
+        self.session.stop();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while self.session.running() && std::time::Instant::now() < deadline {
+            self.session.poll();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         // A capture run poses the app, and a skin from the environment is
         // for one run; neither may overwrite real choices.
