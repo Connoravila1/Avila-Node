@@ -438,13 +438,22 @@ impl Session {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let mut last: Option<Instant> = None;
-            let report = avila_node::sync::run(&params, &cfg, |p| {
-                if last.is_none_or(|l| l.elapsed() >= REPORT_EVERY) {
-                    last = Some(Instant::now());
-                    let _ = tx.send(Msg::Progress(Box::new(p.clone())));
-                }
-            });
-            let _ = tx.send(Msg::Done(report.map_err(|e| e.to_string())));
+            // catch_unwind so a sync-worker panic still reports back —
+            // without it the session reads "running" forever with a
+            // dead pipeline underneath.
+            let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                avila_node::sync::run(&params, &cfg, |p| {
+                    if last.is_none_or(|l| l.elapsed() >= REPORT_EVERY) {
+                        last = Some(Instant::now());
+                        let _ = tx.send(Msg::Progress(Box::new(p.clone())));
+                    }
+                })
+            }));
+            let report = match report {
+                Ok(r) => r.map_err(|e| e.to_string()),
+                Err(_) => Err("sync worker panicked".to_string()),
+            };
+            let _ = tx.send(Msg::Done(report));
         });
         self.cancel = Some(cancel);
         self.rx = Some(rx);

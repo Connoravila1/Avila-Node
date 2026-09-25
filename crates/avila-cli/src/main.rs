@@ -525,6 +525,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     peers: 0,
                     connected_height: 0,
                     header_height: 0,
+                    headers_buffered: 0,
                     in_flight: 0,
                     established_total: 0,
                     disconnects: 0,

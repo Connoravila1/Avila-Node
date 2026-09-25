@@ -489,3 +489,27 @@ First real mainnet run (`avila-gui --config config/mainnet.toml`,
   persisted across restarts (leader loss mid-presync restarts it —
   cheap at current pace, expensive only if it lands mid-phase);
   leader is still a single peer, matching Core.
+
+- Stall eviction was the wedge on real mainnet (found via wire
+  telemetry + live probes): `BLOCK_STALLING_TIMEOUT` = 2s dropped any
+  peer whose first `getdata` answer took longer than 2s — under a full
+  16-block request burst real peers regularly need longer — so every
+  connection died ~2s after `Established`, churned the addrbook, and
+  never let headers or blocks flow. Symptom looked like peers muting
+  us (handshake-only rx maps, zero post-verack traffic); probes proved
+  the same code+messages work instantly on a fresh socket.
+- Fix, matching Core's stall recovery: `stalled()` now *releases* the
+  peer's in-flight reservations back to the fetch pool (`release_in_
+  flight`) so answering peers poach the work; disconnect only after 4
+  consecutive poach cycles with no delivery. Any `block` arrival —
+  even a late poached one — resets the counter (`block_delivery_
+  resets_the_stall_counter`, `stalled_peer_is_poached_then_dropped_`
+  `after_repeated_stalls` cover both halves).
+- Live evidence (debug build, mainnet): after the change the node
+  holds 7-8 peers with `in_flight` ~96-128 and connected height
+  advanced 8458→12394 through restart+resume; prior runs churned
+  40+ peers in 2 min with zero post-handshake traffic.
+- Also fixed while in there: `version` nonce was the dial port
+  (8333) for every outbound — now a per-connection random u64 so
+  outbound sessions are distinguishable and our self-connect check
+  works as designed.

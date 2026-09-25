@@ -240,6 +240,15 @@ impl PeerSync {
         self.headers_in_flight.is_some()
     }
 
+    /// How long the outstanding `getheaders` has gone unanswered —
+    /// `None` when nothing is in flight. Leadership rotation uses this:
+    /// a request older than the timeout is a slow sync peer, not a dead
+    /// one (the peer may be serving blocks fine).
+    #[must_use]
+    pub fn headers_wait(&self) -> Option<Duration> {
+        self.headers_in_flight.map(|t| t.elapsed())
+    }
+
     /// `true` once an outstanding `getheaders` has gone unanswered past
     /// [`HEADERS_RESPONSE_TIME`] — the peer is still connected (it may
     /// even be answering pings) but has stopped cooperating on headers.
@@ -258,6 +267,27 @@ impl PeerSync {
     pub(crate) fn force_headers_timeout(&mut self) {
         if let Some(sent_at) = &mut self.headers_in_flight {
             *sent_at = Instant::now() - HEADERS_RESPONSE_TIME - Duration::from_secs(1);
+        }
+    }
+
+    /// Test-only: back-dates the outstanding `getheaders` by `d` —
+    /// for the slow-leader handoff threshold, which sits far under
+    /// the full timeout. A no-op if nothing is outstanding.
+    #[cfg(test)]
+    pub(crate) fn force_headers_wait(&mut self, d: Duration) {
+        if let Some(sent_at) = &mut self.headers_in_flight {
+            *sent_at = Instant::now() - d;
+        }
+    }
+
+    /// Test-only: back-dates every outstanding block request past the
+    /// stall window — the test doesn't wait real seconds for a peer to
+    /// stall.
+    #[cfg(test)]
+    pub(crate) fn force_stalled(&mut self) {
+        let t = Instant::now() - BLOCK_STALLING_TIMEOUT - Duration::from_secs(1);
+        for (_, at) in self.in_flight.iter_mut() {
+            *at = t;
         }
     }
 
@@ -800,6 +830,19 @@ impl PeerSync {
         self.in_flight
             .front()
             .is_some_and(|(_, t)| t.elapsed() > BLOCK_STALLING_TIMEOUT)
+    }
+
+    /// Gives back every outstanding block request so the fetch
+    /// scheduler can assign the hashes to a peer that's actually
+    /// answering — Core's stall recovery reassigns rather than
+    /// instantly disconnecting. A late delivery from this peer still
+    /// counts: `on_block` clears nothing but accepts the body.
+    pub fn release_in_flight(&mut self) -> usize {
+        let n = self.in_flight.len();
+        for (hash, _) in self.in_flight.drain(..) {
+            self.wanted.remove(&hash);
+        }
+        n
     }
 
     /// Removes `hash` from the in-flight queue. Returns whether it was owed.

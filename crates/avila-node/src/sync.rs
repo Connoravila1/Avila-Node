@@ -528,6 +528,7 @@ pub fn run(
         std::collections::VecDeque::new();
 
     let mut last_prune = std::time::Instant::now();
+    let mut hb_at = std::time::Instant::now() - std::time::Duration::from_secs(30);
     while started.elapsed() < cfg.timeout
         && connected.saturating_sub(resumed_height) < cfg.target_height
         && !cancelled()
@@ -698,6 +699,17 @@ pub fn run(
         if eclipse_checked_at.is_none_or(|t| t.elapsed() >= ECLIPSE_CHECK_INTERVAL) {
             eclipse_checked_at = Some(Instant::now());
             eclipse = mgr.eclipse_signals(&cs, unix_now());
+        }
+        if hb_at.elapsed() >= std::time::Duration::from_secs(30) {
+            hb_at = std::time::Instant::now();
+            eprintln!(
+                "sync: peers={} connected={} headers={} buffered={} in_flight={}",
+                mgr.len(),
+                connected,
+                cs.tree().tip().height,
+                mgr.presync_height().unwrap_or(0),
+                mgr.in_flight()
+            );
         }
         let snapshot = SyncProgress {
             peers: mgr.len(),

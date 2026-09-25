@@ -231,6 +231,14 @@ struct PeerEntry<S> {
     ping_last: Option<Duration>,
     /// Smallest round-trip ever seen (`minping`).
     ping_min: Option<Duration>,
+    /// Rotated off headers leadership once for an overdue page —
+    /// re-election prefers peers not so marked while any exist.
+    leader_slow: bool,
+    /// Consecutive stall-release cycles with no block delivery. Core's
+    /// stall recovery reassigns a stalling peer's blocks to others
+    /// instead of dropping it outright — disconnect only after
+    /// repeated theft yields nothing (the peer is dead, not slow).
+    stall_releases: u32,
     /// Node-clock epoch of the last block this peer delivered
     /// (`last_block_time`).
     last_block_time: Option<i64>,
@@ -933,6 +941,8 @@ impl<S: Read + Write> PeerManager<S> {
                 ping_outstanding: None,
                 ping_last: None,
                 ping_min: None,
+                leader_slow: false,
+                stall_releases: 0,
                 last_block_time: None,
                 last_tx_time: None,
                 last_announce: None,
@@ -1110,8 +1120,20 @@ impl<S: Read + Write> PeerManager<S> {
             // leader is allowed to keep paging. Dropping it here clears
             // `headers_leader` below and `fill_queues` hands leadership
             // to another established peer on the next tick.
-            if peer.sync.stalled() || peer.sync.headers_timed_out() {
+            if peer.sync.headers_timed_out() {
                 dead.push((id, DisconnectReason::Stalled));
+            } else if peer.sync.stalled() {
+                // Core's stall recovery: a peer whose block requests
+                // went unanswered isn't instantly dropped — its
+                // reservations are released back to the fetch pool so
+                // answering peers take over, and the peer survives if
+                // it still delivers. Only a peer that stalls release
+                // after release without ever contributing gets dropped.
+                let released = peer.sync.release_in_flight();
+                peer.stall_releases += 1;
+                if released == 0 || peer.stall_releases >= 4 {
+                    dead.push((id, DisconnectReason::Stalled));
+                }
             }
         }
         for (id, reason) in dead {
@@ -1142,7 +1164,7 @@ impl<S: Read + Write> PeerManager<S> {
         if let Some((source, txid, wtxid)) = announce_tx {
             self.send_tx_inv(Some(source), &txid, &wtxid);
         }
-        self.fill_queues(cs);
+        self.fill_queues(cs, now);
         self.recon_pass();
         self.rebroadcast_pass(cs, now);
         self.stem_fluff_pass();
@@ -1612,9 +1634,24 @@ impl<S: Read + Write> PeerManager<S> {
             .and_then(|p| p.sync.presync_height())
     }
 
-    fn fill_queues(&mut self, cs: &Chainstate) {
+    fn fill_queues(&mut self, cs: &mut Chainstate, now: u32) {
         // Leaderless and connected: the first established peer resumes
         // headers paging from our tip (locator-based, so cheap).
+        // Slow-leader handoff: a sync peer whose page request has gone
+        // unanswered for >25s costs minutes over a full presync — peers
+        // vary 100x in getheaders service time. Leadership moves on
+        // without disconnecting: the peer may serve blocks fine, and
+        // its presync buffer survives for a later re-election.
+        let leader_overdue = self
+            .headers_leader
+            .and_then(|leader| self.peers.get(&leader))
+            .is_some_and(|peer| peer.sync.headers_wait() > Some(Duration::from_secs(25)));
+        if leader_overdue
+            && let Some(leader) = self.headers_leader.take()
+            && let Some(peer) = self.peers.get_mut(&leader)
+        {
+            peer.leader_slow = true;
+        }
         if self.headers_leader.is_none()
             && let Some(id) = {
                 // Prefer a peer that's already answered headers — a
@@ -1622,15 +1659,24 @@ impl<S: Read + Write> PeerManager<S> {
                 let proven = self
                     .peers
                     .iter()
-                    .filter(|(_, p)| p.session.established() && p.synced_header_height > 0)
+                    .filter(|(_, p)| {
+                        p.session.established() && p.synced_header_height > 0 && !p.leader_slow
+                    })
                     .max_by_key(|(_, p)| p.synced_header_height)
                     .map(|(id, _)| *id);
-                proven.or_else(|| {
-                    self.peers
-                        .iter()
-                        .find(|(_, p)| p.session.established())
-                        .map(|(id, _)| *id)
-                })
+                proven
+                    .or_else(|| {
+                        self.peers
+                            .iter()
+                            .find(|(_, p)| p.session.established() && !p.leader_slow)
+                            .map(|(id, _)| *id)
+                    })
+                    .or_else(|| {
+                        self.peers
+                            .iter()
+                            .find(|(_, p)| p.session.established())
+                            .map(|(id, _)| *id)
+                    })
             }
             && let Some(peer) = self.peers.get_mut(&id)
         {
@@ -1654,7 +1700,13 @@ impl<S: Read + Write> PeerManager<S> {
         // sorted the entire index for every fill, which was the dominant
         // block-fetch cost once the header set grew large.
         let header_count = cs.tree().len();
-        if header_count != self.fetch_index_headers {
+        // Amortize the rebuild across header growth — during presync
+        // commit the tree gains a ~2000-header page per tick, and
+        // rebuilding a growing Vec every tick is the dominant cost.
+        // The fetch lookahead only ever needs ~1024 candidates past
+        // the frontier, so staleness under 2048 headers starves nothing.
+        let stale = header_count.saturating_sub(self.fetch_index_headers);
+        if self.fetch_index.is_empty() || stale >= 2048 {
             self.fetch_index = cs
                 .tree()
                 .headers_by_height()
@@ -1671,6 +1723,27 @@ impl<S: Read + Write> PeerManager<S> {
         // peer taking a slice until the aggregate budget binds.
         let frontier = cs.chain().len() as u32;
         let start = self.fetch_index.partition_point(|(h, _)| *h < frontier);
+        // Resume wedge: bodies persisted by earlier runs satisfy
+        // `have_body`, so the fetch loop below never re-requests them —
+        // and nothing else ever feeds them to `accept_block`, leaving
+        // the active chain frozen behind stored data. Replay a bounded
+        // batch straight from the store each tick; height order keeps
+        // parents ahead of children within the batch.
+        let mut replayed = 0usize;
+        for (_, h) in self.fetch_index[start..].iter().take(1024) {
+            if replayed >= 256 {
+                break;
+            }
+            if cs.have_body(h)
+                && let Some(block) = cs.body(h)
+                && matches!(
+                    cs.accept_block(&block, now),
+                    Ok(avila_consensus::chainstate::Acceptance::Connected { .. })
+                )
+            {
+                replayed += 1;
+            }
+        }
         let want_total = self.max_in_flight_total.saturating_sub(reserved.len());
         let candidates: Vec<BlockHash> = self.fetch_index[start..]
             .iter()
@@ -1871,6 +1944,9 @@ impl<S: Read + Write> PeerManager<S> {
             }
             SessionEvent::Message(Message::Block(block)) => {
                 peer.last_block_time = Some(i64::from(now));
+                // A delivery — even a late one poached by reassignment —
+                // proves the peer answers; the stall counter resets.
+                peer.stall_releases = 0;
                 match peer.sync.on_block(cs, &block, now) {
                     Ok(outcome) => {
                         peer.last_useful = Instant::now();
@@ -2971,7 +3047,7 @@ impl PeerManager<TcpStream> {
         if self.pending_dials.insert(key.clone(), use_v2).is_some() {
             return; // already in flight
         }
-        let (port, remote) = match &key {
+        let (_port, remote) = match &key {
             DialKey::Addr(addr) => {
                 dialed.push(*addr);
                 (addr.port(), addrman::net_addr_of(*addr, 0))
@@ -2980,7 +3056,14 @@ impl PeerManager<TcpStream> {
             DialKey::Domain(_, port) => (*port, NetAddr::unspecified()),
         };
         let tx = self.dial_tx.clone();
-        let mut version = build_version(port as u64, start_height, remote, (self.clock)());
+        // Per-connection nonce — a fixed value would make every
+        // outbound indistinguishable to peers that fingerprint by
+        // version nonce (and blind our own self-connection check,
+        // which expects distinct nonces per session).
+        let mut nonce_bytes = [0u8; 8];
+        let _ = getrandom::fill(&mut nonce_bytes);
+        let nonce = u64::from_le_bytes(nonce_bytes);
+        let mut version = build_version(nonce, start_height, remote, (self.clock)());
         if use_v2 {
             version.services |= NODE_P2P_V2;
         }
@@ -3874,6 +3957,102 @@ mod tests {
             "the only peer must not be dropped for stalling: {events:?}"
         );
         assert_eq!(mgr.headers_leader, Some(id_a));
+    }
+
+    /// A peer whose block requests go unanswered keeps the connection:
+    /// its reservations are poached by the fetch pool (Core's
+    /// reassign-on-stall) so the work proceeds elsewhere, and only a
+    /// peer that stalls release after release is dropped.
+    #[test]
+    fn stalled_peer_is_poached_then_dropped_after_repeated_stalls() {
+        let (mut mgr, mut peer_a, id_a) = managed_peer();
+        let mut cs = regtest();
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer_a, MAGIC);
+
+        // Give the peer outstanding block requests (fake hashes — the
+        // stall path doesn't care whether the blocks exist).
+        let fake: Vec<BlockHash> = (0..4)
+            .map(|i| BlockHash::from_bytes([i as u8 + 1; 32]))
+            .collect();
+        {
+            let peer = mgr.peers.get_mut(&id_a).unwrap();
+            let _ = peer.sync.want_blocks(&cs, &fake);
+            assert_eq!(peer.sync.in_flight(), 4);
+            peer.sync.force_stalled();
+        }
+        assert!(mgr.peers[&id_a].sync.stalled());
+
+        // First stall: reservations released back to the pool, no drop.
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                NetEvent::Disconnected { peer, .. } if *peer == id_a
+            )),
+            "first stall must poach, not disconnect: {events:?}"
+        );
+        assert_eq!(
+            mgr.peers[&id_a].sync.in_flight(),
+            0,
+            "stall releases the peer's reservations for others"
+        );
+        assert_eq!(mgr.peers[&id_a].stall_releases, 1);
+
+        // Repeat until the eviction threshold: each release with no
+        // intervening delivery counts against the peer.
+        for expected in 2..=4u32 {
+            {
+                let peer = mgr.peers.get_mut(&id_a).unwrap();
+                let _ = peer.sync.want_blocks(&cs, &fake);
+                peer.sync.force_stalled();
+            }
+            let events = mgr.tick(&mut cs, NOW);
+            if expected < 4 {
+                assert!(
+                    !events.iter().any(|e| matches!(
+                        e,
+                        NetEvent::Disconnected { peer, .. } if *peer == id_a
+                    )),
+                    "stall cycle {expected} still only poaches: {events:?}"
+                );
+            } else {
+                assert!(
+                    events.iter().any(|e| matches!(
+                        e,
+                        NetEvent::Disconnected {
+                            peer,
+                            reason: DisconnectReason::Stalled
+                        } if *peer == id_a
+                    )),
+                    "fourth unrelieved stall disconnects: {events:?}"
+                );
+            }
+        }
+    }
+
+    /// A block delivery clears the stall counter — a slow peer that
+    /// still answers is never evicted no matter how often its queues
+    /// get poached.
+    #[test]
+    fn block_delivery_resets_the_stall_counter() {
+        let (mut mgr, mut peer_a, id_a) = managed_peer();
+        let mut cs = regtest();
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer_a, MAGIC);
+        mgr.peers.get_mut(&id_a).unwrap().stall_releases = 3;
+
+        // Any block message resets the counter, even an orphan.
+        let mut orphan = crate::testchain::chain_blocks(&cs, 1)
+            .into_iter()
+            .next()
+            .unwrap();
+        orphan.header.prev_block_hash = BlockHash::from_bytes([9u8; 32]);
+        testpipe::inject(&mut peer_a, MAGIC, &Message::Block(orphan));
+        mgr.tick(&mut cs, NOW);
+        assert_eq!(mgr.peers[&id_a].stall_releases, 0);
     }
 
     #[test]
@@ -4876,6 +5055,46 @@ mod tests {
             !signals.contains(&EclipseSignal::AllInbound),
             "outbound attackers are not AllInbound"
         );
+    }
+
+    /// Slow-leader handoff: a sync peer whose outstanding `getheaders`
+    /// exceeds the handoff window loses leadership (not the connection
+    /// — it may serve blocks fine) to the next established peer, and is
+    /// marked `leader_slow` so election skips it while alternatives
+    /// exist.
+    #[test]
+    fn slow_headers_leader_loses_leadership() {
+        let (mut mgr, mut a, ida) = managed_peer();
+        let mut cs = crate::testchain::regtest();
+        handshake(&mut mgr, &mut a, &mut cs);
+        testpipe::drain(&mut a, MAGIC);
+        let (mut b, idb) = add_peer(&mut mgr);
+        handshake_peer(&mut mgr, &mut b, &mut cs);
+        testpipe::drain(&mut b, MAGIC);
+
+        mgr.tick(&mut cs, NOW);
+        assert_eq!(mgr.headers_leader, Some(ida), "first peer leads");
+
+        // The leader's outstanding getheaders has been waiting past the
+        // handoff window but under the disconnect timeout.
+        mgr.peers
+            .get_mut(&ida)
+            .unwrap()
+            .sync
+            .force_headers_wait(Duration::from_secs(30));
+
+        mgr.tick(&mut cs, NOW);
+        assert_eq!(
+            mgr.headers_leader,
+            Some(idb),
+            "leadership must move to the next established peer"
+        );
+        assert!(
+            mgr.peers.get(&ida).unwrap().leader_slow,
+            "demoted leader carries the slow mark"
+        );
+        // And the connection itself is still alive.
+        assert!(mgr.peers.contains_key(&ida));
     }
 
     /// The regression behind the /16 grouping fix: outbound peers as

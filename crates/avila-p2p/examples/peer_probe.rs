@@ -36,11 +36,6 @@ fn main() {
     let params = network.params();
     let sock: std::net::SocketAddr = addr.parse().expect("bad host:port");
     let stream = TcpStream::connect_timeout(&sock, Duration::from_secs(5)).expect("connect failed");
-    stream
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .expect("timeout");
-    stream.set_nonblocking(true).expect("nonblocking");
-
     let version = build_version(
         0x5eed_5eed_5eed_5eed,
         0,
@@ -54,8 +49,17 @@ fn main() {
         },
         wall_epoch(),
     );
-    let mut session =
-        PeerSession::initiate(stream, params.message_start, version, 8 << 20).expect("initiate");
+    let use_v2 = std::env::args().nth(3).as_deref() == Some("v2");
+    let mut session = if use_v2 {
+        PeerSession::initiate_v2(stream, params.message_start, version, 8 << 20)
+            .expect("initiate_v2")
+    } else {
+        PeerSession::initiate(stream, params.message_start, version, 8 << 20).expect("initiate")
+    };
+    session
+        .stream_mut()
+        .set_nonblocking(true)
+        .expect("nonblocking");
     let mut cs = Chainstate::new(&params);
     let mut sync = PeerSync::new();
     let mut target: i64 = -1; // peer's announced tip height
@@ -169,7 +173,15 @@ fn main() {
             }
         }
         let tip = cs.chain().len().saturating_sub(1) as i64;
-        if target >= 0 && tip >= target {
+        let hold = std::env::args()
+            .nth(4)
+            .map(|s| s.parse::<u64>().unwrap_or(0))
+            .unwrap_or(0);
+        if hold > 0 {
+            if start.elapsed() >= Duration::from_secs(hold) {
+                return;
+            }
+        } else if target >= 0 && tip >= target {
             println!(
                 "synced: h{tip} in {:?} ({} headers indexed, {} blocks)",
                 start.elapsed(),
