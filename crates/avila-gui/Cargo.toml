@@ -9,6 +9,12 @@ authors.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Screenshot/bench harness — dev tooling only; release builds drop
+# the ~730 lines of capture driver + PNG encoder (audit slop).
+default = []
+devtools = []
+
 [dependencies]
 avila-core.workspace = true
 avila-node.workspace = true

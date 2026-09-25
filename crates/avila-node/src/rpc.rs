@@ -10,17 +10,20 @@
 //!   validated state without locking the sync path (the role Core's
 //!   `cs_main` critical section plays for its RPC thread).
 //!
-//! There is no wallet; the mutation methods are `sendrawtransaction`
-//! (pool admission + peer relay), `submitblock`/`submitheader`
-//! (chainstate connect + tip announce), `generatetoaddress`/
-//! `generateblock` (template → grind → connect → announce), and the
-//! `stop` control method (the same cancellation flag a GUI Stop
-//! button or SIGINT handler flips). Every answer is "what this node
-//! has itself observed", never a remote claim.
+//! Mutation methods include `sendrawtransaction` (pool admission +
+//! peer relay), `submitblock`/`submitheader` (chainstate connect +
+//! tip announce), `generatetoaddress`/`generateblock` (template →
+//! grind → connect → announce), the wallet/signer surface
+//! (`createdescriptorseed`, `sendtoaddress`, `walletprocesspsbt`,
+//! `signerexport`/`signerload`/`signerlock`/`signerspawn`,
+//! `importdescriptors`, `listunspent`, …), and `stop`. Every answer
+//! is "what this node has itself observed", never a remote claim.
 //!
-//! Not implemented (by design, this slice): HTTP keep-alive, chunked
-//! encoding, TLS, authentication beyond localhost binding, batch
-//! requests, and the wallet method surface.
+//! Requests authenticate via cookie (`-rpccookiefile`) or `-rpcauth`
+//! credentials before the body is read; JSON-RPC batches are accepted
+//! up to 64 elements. Not implemented (by design): HTTP
+//! keep-alive, chunked encoding, TLS — the listener is loopback by
+//! default and expects an operator-fronted tunnel otherwise.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -110,6 +113,10 @@ impl ChainQuery {
                 reply: self.reply,
                 ..deferred
             }),
+            QueryReply::Spawned(job) => {
+                let reply = self.reply;
+                std::thread::spawn(move || job(reply));
+            }
         }
     }
 }
@@ -122,7 +129,14 @@ pub enum QueryReply {
     /// The query found `pending` heights without bodies — fetch them
     /// and finish when they arrive (or the deadline passes).
     Defer(DeferredQuery),
+    /// Audit CA-F3: the closure returned a slow job — run it on its
+    /// own thread, not the sync loop. The job owns the reply channel;
+    /// `answer` returns immediately.
+    Spawned(Box<SpawnedJob>),
 }
+
+/// The off-sync-thread job a `QueryReply::Spawned` carries.
+pub type SpawnedJob = dyn FnOnce(mpsc::Sender<Result<Value, (i64, String)>>) + Send;
 
 /// A parked rescan — the blocks still missing, the wallet to scan them
 /// into, and where the answer goes.
@@ -402,10 +416,15 @@ impl RpcAuth {
 /// Constant-time-ish comparison for credential values (byte fold, no
 /// early exit on the value bytes themselves).
 fn credentials_match(got: &str, expected: &str) -> bool {
-    let (a, b) = (got.as_bytes(), expected.as_bytes());
-    let mut diff = a.len() ^ b.len();
+    // Audit low: a length-mismatch shortcut lets a remote caller
+    // measure credential length through timing — compare fixed-size
+    // digests instead, so the check is constant-work regardless of
+    // input length. `sha256` then a word-wise constant-time eq.
+    let a = avila_consensus::hash::sha256(got.as_bytes());
+    let b = avila_consensus::hash::sha256(expected.as_bytes());
+    let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
-        diff |= usize::from(x ^ y);
+        diff |= x ^ y;
     }
     diff == 0
 }
@@ -425,7 +444,21 @@ pub fn write_cookie(dir: &std::path::Path) -> std::io::Result<String> {
         .map_err(|e| std::io::Error::other(format!("entropy source: {e}")))?;
     let token = hex::encode(&entropy);
     let path = dir.join(COOKIE_FILE);
-    std::fs::write(&path, format!("__cookie__:{token}"))?;
+    // Audit RPC-2: create with mode 0600 — writing then chmod'ing
+    // leaves the token world-readable between the two calls.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path)?;
+    use std::io::Write;
+    f.write_all(format!("__cookie__:{token}").as_bytes())?;
+    f.sync_all()?;
+    // A pre-existing cookie with loose perms isn't fixed by `mode`
+    // (creation-only) — force them either way.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -734,7 +767,27 @@ fn handle(
         // element's values in place (Core's `jreq` reuse). Elements
         // that parse as V2 notifications produce no reply entry; a
         // batch of only notifications gets 204 (empty batch → `[]`).
+        // Audit RPC-1: the whole batch is parsed and answered in
+        // memory — cap the element count so an authenticated client
+        // can't make one request do unbounded work.
+        const MAX_BATCH: usize = 64;
         let elems = request.as_array().map_or(&[][..], Vec::as_slice);
+        if elems.len() > MAX_BATCH {
+            let reply = reply_obj(
+                Value::Null,
+                Some((
+                    RPC_INVALID_REQUEST,
+                    format!(
+                        "batch size {} exceeds the {MAX_BATCH} element cap",
+                        elems.len()
+                    ),
+                )),
+                &Some(Value::Null),
+                false,
+            );
+            write_json(&mut stream, "200 OK", Value::Array(vec![reply]).to_string());
+            return;
+        }
         let mut id = Some(Value::Null);
         let mut v2 = false;
         let mut replies = Vec::with_capacity(elems.len());
@@ -744,7 +797,18 @@ fn handle(
                 Ok((method, params)) => {
                     let (result, error) = if permitted(&method) {
                         dispatch(
-                            &method, &params, &snap, queries, waiters, scan, wallet, stop,
+                            &method,
+                            &params,
+                            &snap,
+                            queries,
+                            waiters,
+                            scan,
+                            wallet,
+                            stop,
+                            // Audit CA-F4: wallet-derived fields are
+                            // emitted only to wallet-scoped callers —
+                            // probe with a wallet method.
+                            permitted("walletprocesspsbt"),
                         )
                     } else {
                         (
@@ -795,7 +859,15 @@ fn handle(
                 // V2 notification — execute but never reply.
                 if permitted(&method) {
                     let _ = dispatch(
-                        &method, &params, &snap, queries, waiters, scan, wallet, stop,
+                        &method,
+                        &params,
+                        &snap,
+                        queries,
+                        waiters,
+                        scan,
+                        wallet,
+                        stop,
+                        permitted("walletprocesspsbt"),
                     );
                 }
                 let _ = write!(
@@ -807,7 +879,15 @@ fn handle(
             }
             let (result, error) = if permitted(&method) {
                 dispatch(
-                    &method, &params, &snap, queries, waiters, scan, wallet, stop,
+                    &method,
+                    &params,
+                    &snap,
+                    queries,
+                    waiters,
+                    scan,
+                    wallet,
+                    stop,
+                    permitted("walletprocesspsbt"),
                 )
             } else {
                 (
@@ -942,12 +1022,38 @@ fn fund_spend(
     mempool: &avila_mempool::Mempool,
     feerate: i64,
     dest_outputs: Vec<TxOut>,
+    subtract_fee: bool,
 ) -> Result<(Transaction, i64, Option<usize>), (i64, String)> {
     let params = cs.tree().params();
     w.advance(cs);
-    let amount: i64 = dest_outputs.iter().map(|o| o.value).sum();
-    // p2wpkh in ≈68 vB, out ≈31 vB, overhead ≈11 — change counted
-    // up front (Core's conservative estimate).
+    // Audit low: the outputs sum was unchecked — values wrapping i64
+    // turn `amount` negative and the "insufficient funds" gate passes
+    // with the wallet's coins routed to change. Checked math and a
+    // MAX_MONEY bound — Core's `AmountFromValue`/MoneyRange pair.
+    let amount: i64 = dest_outputs
+        .iter()
+        .try_fold(0i64, |acc, o| {
+            if o.value < 0 || o.value > 21_000_000 * 100_000_000 {
+                return None;
+            }
+            acc.checked_add(o.value)
+        })
+        .filter(|a| *a <= 21_000_000 * 100_000_000)
+        .ok_or((
+            RPC_INVALID_PARAMETER,
+            "Transaction amount too large".to_string(),
+        ))?;
+    // Core's subtractfeefromamount: the recipient absorbs the fee —
+    // selection still targets `amount` (the wallet spends exactly
+    // that), the output posts `amount - fee`.
+    let selection_target = amount;
+    // p2wpkh in ≈68 vB; overhead ≈11. Output vsize is 9 + script
+    // length — measured, not assumed (audit low: a flat 31 vB
+    // underpays for taproot destinations by ~8%).
+    let dest_vsize: i64 = dest_outputs
+        .iter()
+        .map(|o| 9 + o.script_pubkey.as_bytes().len() as i64)
+        .sum();
     // Maturity gate (Core's IsImmatureCoinBase): coinbases are
     // spendable only past 100 confirmations — the wallet must not
     // pick what consensus rejects as premature.
@@ -972,19 +1078,33 @@ fn fund_spend(
         .map(|(op, c)| (op, c.value))
         .collect();
     coins.sort_by_key(|c| std::cmp::Reverse(c.1));
-    let mut est_vsize = 11i64 + 31 * (dest_outputs.len() as i64 + 1);
+    // +31 accounts for a p2wpkh change output (Core's conservative
+    // estimate — the actual change script is derived below).
+    let mut est_vsize = 11i64 + dest_vsize + 31;
     for (op, v) in coins {
         chosen.push((op, v));
         est_vsize += 68;
         let fee = (feerate * est_vsize) / 1000;
         let total: i64 = chosen.iter().map(|(_, v)| v).sum();
-        if total >= amount + fee {
+        let need = if subtract_fee {
+            selection_target
+        } else {
+            selection_target.saturating_add(fee)
+        };
+        if total >= need {
             break;
         }
     }
     let total: i64 = chosen.iter().map(|(_, v)| v).sum();
     let fee = (feerate * est_vsize) / 1000;
-    if total < amount + fee {
+    let need = if subtract_fee {
+        selection_target
+    } else {
+        selection_target
+            .checked_add(fee)
+            .ok_or((RPC_WALLET_ERROR, "Insufficient funds".to_string()))?
+    };
+    if total < need {
         return Err((RPC_WALLET_ERROR, "Insufficient funds".into()));
     }
     // Audit SP-F2: the wallet path must honor the same fee ceiling
@@ -994,13 +1114,44 @@ fn fund_spend(
     if fee * 1000 > max_rate_sats * est_vsize {
         return Err((
             RPC_WALLET_ERROR,
-            format!("Fee exceeds maximum configured by wallet transaction (0.10 BTC/kvB)"),
+            "Fee exceeds maximum configured by wallet transaction (0.10 BTC/kvB)".to_string(),
         ));
     }
-    let change_value = total - amount - fee;
+    let mut dest_outputs = dest_outputs;
+    if subtract_fee {
+        // Core's subtractfeefromamount: the recipient absorbs the fee.
+        // The wallet still pays `amount` total — the output posts
+        // `amount - fee`, so change is `total - amount`.
+        let first = dest_outputs.first_mut().ok_or((
+            RPC_INVALID_PARAMETER,
+            "subtractfeefromamount needs an output".to_string(),
+        ))?;
+        let net = first
+            .value
+            .checked_sub(fee)
+            .ok_or((RPC_WALLET_ERROR, "Insufficient funds".to_string()))?;
+        if net < 294 {
+            return Err((
+                RPC_WALLET_ERROR,
+                "The transaction amount is too small to pay the fee".to_string(),
+            ));
+        }
+        first.value = net;
+    }
+    let change_value = if subtract_fee {
+        total - amount
+    } else {
+        total - amount - fee
+    };
     let mut outputs = dest_outputs;
     let mut change_pos = None;
-    if change_value > 546 {
+    // Audit low: 546 was the p2pkh dust threshold — our change is
+    // p2wpkh, whose dust limit is 294 sat (Core's GetDustThreshold
+    // on a 22-byte segwit program). Sending a 300-sat change to fee
+    // burned the difference; creating a 250-sat change never could
+    // be relayed.
+    const P2WPKH_DUST: i64 = 294;
+    if change_value > P2WPKH_DUST {
         let Some(idx) = w
             .descs
             .iter()
@@ -1008,14 +1159,15 @@ fn fund_spend(
         else {
             return Err((RPC_WALLET_ERROR, "no internal descriptor for change".into()));
         };
-        let d = &w.descs[idx];
-        let pos = d.next_index;
-        if pos > d.range.1 {
+        let Some(pos) = w.bump_next_index(idx) else {
             return Err((RPC_WALLET_ERROR, "change range exhausted".into()));
-        }
-        let desc_text = d.desc.clone();
+        };
+        // The clone carries the xprv — wipe it after parsing (audit
+        // low: private descriptor text discarded unwiped).
+        let mut desc_text = w.descs[idx].desc.clone();
         let (parsed, provider, _) = parse_descriptors(&desc_text, params, true)
             .map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
+        zeroize::Zeroize::zeroize(&mut desc_text);
         let Some(scripts) = parsed[0].expand(pos, &provider) else {
             return Err((RPC_WALLET_ERROR, "change derivation failed".into()));
         };
@@ -1025,12 +1177,20 @@ fn fund_spend(
         else {
             return Err((RPC_WALLET_ERROR, "no wpkh change script".into()));
         };
-        outputs.push(TxOut {
-            value: change_value,
-            script_pubkey: Script::new(change_spk.clone()),
-        });
-        w.descs[idx].next_index = pos + 1;
-        change_pos = Some(outputs.len() - 1);
+        // Audit low: change appended last is a position leak once 3+
+        // outputs exist — insert at a random index like Core's
+        // `Insertion` pick, tracking where it landed.
+        let mut pos_b = [0u8; 1];
+        let _ = getrandom::fill(&mut pos_b);
+        let at = (pos_b[0] as usize) % (outputs.len() + 1);
+        outputs.insert(
+            at,
+            TxOut {
+                value: change_value,
+                script_pubkey: Script::new(change_spk.clone()),
+            },
+        );
+        change_pos = Some(at);
     }
     // Fingerprint-matched to Core's wallet: version 2, RBF-signalling
     // sequence, anti-fee-sniping locktime, random output ordering
@@ -1044,19 +1204,30 @@ fn fund_spend(
             witness: Witness::default(),
         })
         .collect();
-    if outputs.len() == 2 {
+    // No change and 2 outputs → still shuffle so "payment first" isn't
+    // a signature; the random-insert above covers the change case.
+    if outputs.len() == 2 && change_pos.is_none() {
         let mut b = [0u8; 1];
         let _ = getrandom::fill(&mut b);
         if b[0] & 1 == 1 {
             outputs.swap(0, 1);
-            change_pos = change_pos.map(|c| if c == 0 { 1 } else { 0 });
         }
+    }
+    // Audit low: locktime was always the tip — Core's wallet sets
+    // nLockTime to the current height ~90% of the time and backdates
+    // by up to 100 blocks otherwise, so "always exact tip" isn't a
+    // wallet fingerprint.
+    let mut lock_time = cs.chain().len().saturating_sub(1) as u32;
+    let mut roll = [0u8; 4];
+    let _ = getrandom::fill(&mut roll);
+    if roll[0] % 10 == 0 {
+        lock_time = lock_time.saturating_sub(1 + (u32::from_be_bytes(roll) >> 8) % 100);
     }
     let tx = Transaction {
         version: 2,
         inputs,
         outputs,
-        lock_time: cs.chain().len().saturating_sub(1) as u32,
+        lock_time,
     };
     Ok((tx, fee, change_pos))
 }
@@ -1770,13 +1941,15 @@ fn process_psbt(
             ));
         };
         for d in arr {
-            let (_, p) = eval_scan_object(d, cs.tree().params(), expand_priv)?;
-            provider.keys.extend(p.keys);
-            provider.xprvs.extend(p.xprvs);
-            provider.pubkeys.extend(p.pubkeys);
-            provider.origins.extend(p.origins);
-            provider.scripts.extend(p.scripts);
-            provider.tr_trees.extend(p.tr_trees);
+            let (_, mut p) = eval_scan_object(d, cs.tree().params(), expand_priv)?;
+            // FlatProvider's Drop (secret-erasing) forbids moving
+            // fields out — take each map instead.
+            provider.keys.extend(std::mem::take(&mut p.keys));
+            provider.xprvs.extend(std::mem::take(&mut p.xprvs));
+            provider.pubkeys.extend(std::mem::take(&mut p.pubkeys));
+            provider.origins.extend(std::mem::take(&mut p.origins));
+            provider.scripts.extend(std::mem::take(&mut p.scripts));
+            provider.tr_trees.extend(std::mem::take(&mut p.tr_trees));
         }
     }
     // `HidingSigningProvider(&provider, hide_secret, hide_origin)`.
@@ -2533,12 +2706,21 @@ fn psbt_json(
     );
     // `fee` only when every input's utxo is known — Core computes it
     // during analysis and emits it when the subtraction is safe.
-    let total_in: Option<i64> = (0..psbt.inputs.len())
-        .map(|i| psbt.input_utxo(i).map(|u| u.value))
-        .sum();
-    if let Some(total_in) = total_in {
-        let total_out: i64 = psbt.tx.outputs.iter().map(|o| o.value).sum();
-        out.insert("fee".into(), json!(value_from_amount(total_in - total_out)));
+    // Audit low: attacker-controlled utxo values can overflow i64 —
+    // a wrapped sum reports a nonsense fee; checked math + omit on
+    // overflow matches "emit only when safe".
+    let total_in: Option<i64> = (0..psbt.inputs.len()).try_fold(0i64, |acc, i| {
+        psbt.input_utxo(i).and_then(|u| acc.checked_add(u.value))
+    });
+    let total_out: Option<i64> = psbt
+        .tx
+        .outputs
+        .iter()
+        .try_fold(0i64, |acc, o| acc.checked_add(o.value));
+    if let (Some(total_in), Some(total_out)) = (total_in, total_out)
+        && let Some(fee) = total_in.checked_sub(total_out)
+    {
+        out.insert("fee".into(), json!(value_from_amount(fee)));
     }
     Value::Object(out)
 }
@@ -4518,6 +4700,106 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         &[("destination", Some("string"), true)],
         BACKUPWALLET_HELP,
     ),
+    (
+        "createdescriptorseed",
+        &[
+            ("entropy", Some("string"), false),
+            ("dice", Some("string"), false),
+            ("mix", Some("bool"), false),
+        ],
+        "createdescriptorseed ( entropy dice mix )\n\nCreate a BIP84 signing descriptor set from entropy — OS CSPRNG by default, caller hex (>=16B), or Coldcard-convention dice rolls; `mix` XOR-folds OS entropy in. The xprv and BIP39 mnemonic are returned once; keys are memory-only until `signerexport` seals them.\n\nArguments:\n1. entropy  (string, optional) Hex entropy bytes\n2. dice     (string, optional) Dice-roll string (>=50 rolls, Coldcard convention)\n3. mix      (boolean, optional, default=true) XOR-fold OS entropy in\n\nResult: { xprv, mnemonic, descriptors, entropy_commitment, warnings }\n",
+    ),
+    (
+        "getnewaddress",
+        &[("label", Some("string"), false)],
+        "getnewaddress ( label )\n\nDerive the next address from the wallet's active external descriptor.\n\nResult: the address string.\n",
+    ),
+    (
+        "sendtoaddress",
+        &[
+            ("address", Some("string"), true),
+            ("amount", None, true),
+            ("comment", Some("string"), false),
+            ("comment_to", Some("string"), false),
+            ("subtractfeefromamount", Some("bool"), false),
+        ],
+        "sendtoaddress \"address\" amount\n\nBuild, sign, and broadcast a wallet spend: coin selection (mempool-spent and immature coinbases excluded), internal change, RBF signalling, anti-fee-sniping locktime, and a 0.10 BTC/kvB fee ceiling.\n",
+    ),
+    (
+        "walletprocesspsbt",
+        &[
+            ("psbt", Some("string"), true),
+            ("sign", Some("bool"), false),
+            ("sighashtype", Some("string"), false),
+        ],
+        "walletprocesspsbt \"psbt\" ( sign sighashtype )\n\nVerify every input's prevout against the node's own UTXO set — a PSBT that misstates a spent amount is rejected outright (the LSB-010 fee-inflation class) — then sign the inputs the loaded signer covers.\n",
+    ),
+    (
+        "walletcreatefundedpsbt",
+        &[
+            ("outputs", Some("array"), true),
+            ("locktime", Some("number"), false),
+        ],
+        "walletcreatefundedpsbt outputs ( locktime )\n\nFund a spend from wallet coins — selection, change, and fee estimation are identical to sendtoaddress; returns the PSBT for external review/signing instead of broadcasting.\n",
+    ),
+    (
+        "signerexport",
+        &[
+            ("passphrase", Some("string"), true),
+            ("overwrite", Some("bool"), false),
+        ],
+        "signerexport \"passphrase\" ( overwrite )\n\nSeal the loaded signer's keys and silent-payment scan keys into the encrypted vault file (argon2id -> ChaCha20Poly1305). Refuses to overwrite an existing vault unless overwrite=true.\n",
+    ),
+    (
+        "signerload",
+        &[("passphrase", Some("string"), true)],
+        "signerload \"passphrase\"\n\nOpen the signer vault and load keys into memory. The KDF runs on the RPC thread — block sync is not stalled.\n",
+    ),
+    (
+        "signerlock",
+        &[],
+        "signerlock\n\nDrop all in-memory signing material (keys are erased). The vault file persists — signerload or signerspawn restores.\n",
+    ),
+    (
+        "signerspawn",
+        &[
+            ("passphrase", Some("string"), true),
+            ("exe", Some("string"), false),
+        ],
+        "signerspawn \"passphrase\" ( exe )\n\nMove signing out of the node process: spawn the `avila-node signer` child holding the vault's keys; signing routes through a stdio pipe afterwards (queue #39).\n",
+    ),
+    (
+        "signerimport",
+        &[("mnemonic", Some("string"), true)],
+        "signerimport \"mnemonic\"\n\nRestore the signer from BIP39 words — the canonical backup emitted by createdescriptorseed.\n",
+    ),
+    (
+        "importdescriptors",
+        &[("requests", Some("array"), true)],
+        IMPORTDESCRIPTORS_HELP,
+    ),
+    (
+        "listunspent",
+        &[
+            ("minconf", Some("number"), false),
+            ("maxconf", Some("number"), false),
+            ("addresses", Some("array"), false),
+            ("include_unsafe", Some("bool"), false),
+            ("query_options", Some("object"), false),
+        ],
+        LISTUNSPENT_HELP,
+    ),
+    (
+        "listreceivedbyaddress",
+        &[
+            ("minconf", Some("number"), false),
+            ("include_empty", Some("bool"), false),
+            ("include_watchonly", Some("bool"), false),
+            ("address_filter", Some("string"), false),
+            ("include_immature_coinbase", Some("bool"), false),
+        ],
+        LISTRECEIVEDBYADDRESS_HELP,
+    ),
     ("getbalances", &[], GETBALANCES_HELP),
     (
         "getwalletinfo",
@@ -5174,10 +5456,47 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
 /// args read it as omitted. Returns `None` when the call passes or
 /// `method`/`params` isn't covered (named object params bypass).
 fn arg_errors(method: &str, params: &Value) -> Option<(i64, String)> {
+    let &(_, specs, help) = METHOD_ARGS.iter().find(|r| r.0 == method)?;
+    if let Value::Object(map) = params {
+        // Audit R4: named params were silently ignored — a caller
+        // sending {"address": "bc1…"} to a positional handler got
+        // defaults, not their argument. Validate like Core: unknown
+        // names are errors, required names must be present, and
+        // per-arg types still apply.
+        for (k, v) in map {
+            let Some((_, ty, _)) = specs.iter().find(|(n, _, _)| *n == k.as_str()) else {
+                return Some((RPC_MISC_ERROR, format!("Unexpected named argument {k}")));
+            };
+            let ok = matches!(
+                (ty, v),
+                (None, _)
+                    | (_, Value::Null)
+                    | (Some("string"), Value::String(_))
+                    | (Some("number"), Value::Number(_))
+                    | (Some("bool"), Value::Bool(_))
+                    | (Some("array"), Value::Array(_))
+                    | (Some("object"), Value::Object(_))
+            );
+            if !ok {
+                return Some((
+                    RPC_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} for field {k} is not of expected type",
+                        json_type_name(v)
+                    ),
+                ));
+            }
+        }
+        for (name, _, required) in specs {
+            if *required && map.get(*name).is_none_or(Value::is_null) {
+                return Some((RPC_MISC_ERROR, help.to_string()));
+            }
+        }
+        return None;
+    }
     let Value::Array(args) = params else {
         return None;
     };
-    let &(_, specs, help) = METHOD_ARGS.iter().find(|r| r.0 == method)?;
     // `IsValidNumArgs` strips only *trailing* optionals — a required
     // arg after an optional one still counts at its position, so
     // `prioritisetransaction`'s `fee_delta` forces a 3-arg minimum.
@@ -5392,6 +5711,22 @@ fn build_raw_tx(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Per-input sighash precedence (audit PS-S3): the PSBT's own
+/// `PSBT_IN_SIGHASH_TYPE` field wins over the RPC `sighashtype`
+/// argument, which itself defaults to ALL — Core's
+/// `SighashFromStr`-then-`input.sighash_type` ordering.
+fn psbt_input_sighash(psbt: &avila_consensus::psbt::Psbt, index: usize, default: i32) -> i32 {
+    psbt.inputs
+        .get(index)
+        .and_then(|inp| inp.get(avila_consensus::psbt::Psbt::IN_SIGHASH_TYPE))
+        .and_then(|raw| {
+            let a: [u8; 4] = raw[..].try_into().ok()?;
+            Some(u32::from_le_bytes(a) as i32)
+        })
+        .unwrap_or(default)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch(
     method: &str,
     params: &Value,
@@ -5401,6 +5736,7 @@ pub(crate) fn dispatch(
     scan: Option<&Arc<TxoutScan>>,
     wallet: Option<&SharedWallet>,
     stop: Option<&Arc<AtomicBool>>,
+    wallet_scope: bool,
 ) -> (Value, Option<(i64, String)>) {
     // `getrpcinfo` reports the in-flight command's runtime — Core's
     // `g_rpc_interfaces` stamps the start at dispatch.
@@ -5503,14 +5839,31 @@ pub(crate) fn dispatch(
             })
         }
         "pruneblockchain" => {
-            // No prune mode exists — Core's exact refusal.
-            (
-                Value::Null,
-                Some((
-                    RPC_MISC_ERROR,
-                    "Cannot prune blocks because node is not in prune mode.".into(),
-                )),
-            )
+            // Audit PRUNE: the refusal is only honest when the node
+            // isn't pruning — under `-prune` the store's byte budget
+            // prunes oldest-first (Core prunes whole blk files too;
+            // the height arg maps onto the budget result).
+            let keep = snap.prune_bytes;
+            let height_arg = param(params, 0, "height").and_then(Value::as_i64);
+            match keep {
+                None => (
+                    Value::Null,
+                    Some((
+                        RPC_MISC_ERROR,
+                        "Cannot prune blocks because node is not in prune mode.".into(),
+                    )),
+                ),
+                Some(keep) => chain_query(method, queries, move |cs, _| {
+                    let deleted = cs
+                        .prune(keep)
+                        .map_err(|e| (RPC_MISC_ERROR, format!("prune failed: {e}")))?;
+                    // Core returns the highest pruned height; the
+                    // store prunes by file, so report the count of
+                    // removed blk files — the honest unit we deleted.
+                    let _ = height_arg;
+                    Ok(json!(deleted))
+                }),
+            }
         }
         "getblockchaininfo" => chain_query(method, queries, |cs, _mgr| {
             let tip = cs.tip_hash();
@@ -5683,24 +6036,34 @@ pub(crate) fn dispatch(
             let path = param(params, 0, "path")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            chain_query(method, queries, move |cs, _| {
+            chain_query_deferred(method, queries, move |cs, _| {
                 let Some(path) = path else {
-                    return Err((
+                    return QueryReply::Now(Err((
                         RPC_INVALID_PARAMETER,
                         "emitswiftsynchints requires a path".to_string(),
-                    ));
+                    )));
                 };
                 let height = (cs.chain().len() - 1) as u32;
-                let hints = cs.emit_hints(height);
-                let bytes = hints.encode();
-                let len = bytes.len();
-                std::fs::write(&path, bytes)
-                    .map_err(|e| (RPC_MISC_ERROR, format!("write hints to {path}: {e}")))?;
-                Ok(json!({
-                    "height": hints.height,
-                    "survivors": hints.survivors.len(),
-                    "aggregate": hex::encode(&hints.aggregate.to_bytes()),
-                    "bytes": len,
+                // Audit CA-F3: emit_hints walks the whole live set —
+                // minutes on a mainnet-scale set is a sync stall. The
+                // clone is bounded (map + Arc'd layers), then the
+                // O(set) iteration + sort + write run on a worker.
+                let utxo = cs.utxo().clone();
+                QueryReply::Spawned(Box::new(move |reply| {
+                    let hints = utxo.emit_hints(height);
+                    let bytes = hints.encode();
+                    let len = bytes.len();
+                    let result = std::fs::write(&path, bytes)
+                        .map_err(|e| (RPC_MISC_ERROR, format!("write hints to {path}: {e}")))
+                        .map(|_| {
+                            json!({
+                                "height": hints.height,
+                                "survivors": hints.survivors.len(),
+                                "aggregate": hex::encode(&hints.aggregate.to_bytes()),
+                                "bytes": len,
+                            })
+                        });
+                    let _ = reply.send(result);
                 }))
             })
         }
@@ -5708,22 +6071,41 @@ pub(crate) fn dispatch(
             let path = param(params, 0, "path")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            chain_query(method, queries, move |cs, _| {
+            chain_query_deferred(method, queries, move |cs, _| {
                 let Some(path) = path else {
-                    return Err((
+                    return QueryReply::Now(Err((
                         RPC_INVALID_PARAMETER,
                         "verifyswiftsynchints requires a path".to_string(),
-                    ));
+                    )));
                 };
-                let bytes = std::fs::read(&path)
-                    .map_err(|e| (RPC_MISC_ERROR, format!("read hints {path}: {e}")))?;
-                let hints = avila_consensus::swiftsync::Hints::decode(&bytes)
-                    .map_err(|e| (RPC_INVALID_PARAMETER, format!("bad hints: {e}")))?;
-                use avila_consensus::swiftsync::HintsVerdict::*;
-                Ok(json!(match cs.verify_hints(&hints) {
-                    Verified => "verified",
-                    AggregateMismatch => "aggregate_mismatch",
-                    SurvivorMismatch => "survivor_mismatch",
+                let bytes = match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return QueryReply::Now(Err((
+                            RPC_MISC_ERROR,
+                            format!("read hints {path}: {e}"),
+                        )));
+                    }
+                };
+                let hints = match avila_consensus::swiftsync::Hints::decode(&bytes) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return QueryReply::Now(Err((
+                            RPC_INVALID_PARAMETER,
+                            format!("bad hints: {e}"),
+                        )));
+                    }
+                };
+                // Audit CA-F3: verify is O(set) — same worker offload.
+                let utxo = cs.utxo().clone();
+                QueryReply::Spawned(Box::new(move |reply| {
+                    use avila_consensus::swiftsync::HintsVerdict::*;
+                    let verdict = match utxo.verify_hints(&hints) {
+                        Verified => "verified",
+                        AggregateMismatch => "aggregate_mismatch",
+                        SurvivorMismatch => "survivor_mismatch",
+                    };
+                    let _ = reply.send(Ok(json!(verdict)));
                 }))
             })
         }
@@ -7334,10 +7716,17 @@ pub(crate) fn dispatch(
             let wallet = wallet.cloned();
             chain_query(method, queries, move |_, mgr| {
                 let pool = mgr.mempool_ref();
-                let w = wallet.as_ref().map(|w| match w.lock() {
-                    Ok(w) => w,
-                    Err(p) => p.into_inner(),
-                });
+                // Audit CA-F4: `mine` reveals wallet ownership — a
+                // method-scoped credential without wallet rights
+                // must not see it. Omit the field entirely for them.
+                let w = if wallet_scope {
+                    wallet.as_ref().map(|w| match w.lock() {
+                        Ok(w) => w,
+                        Err(p) => p.into_inner(),
+                    })
+                } else {
+                    None
+                };
                 Ok(json!(
                     pool.pinning_risk(margin)
                         .into_iter()
@@ -7357,11 +7746,14 @@ pub(crate) fn dispatch(
                                         })
                                 })
                             });
-                            json!({
+                            let mut o = json!({
                                 "txid": txid.to_string(),
                                 "descendants": n,
-                                "mine": mine,
-                            })
+                            });
+                            if wallet_scope {
+                                o["mine"] = json!(mine);
+                            }
+                            o
                         })
                         .collect::<Vec<_>>()
                 ))
@@ -7610,6 +8002,24 @@ pub(crate) fn dispatch(
             if raws.is_empty() {
                 return missing_params("rawtxs");
             }
+            // Audit TMA: `maxfeerate` was silently ignored — parse it
+            // with the same helper sendrawtransaction uses.
+            let maxfeerate_sats = match param(params, 1, "maxfeerate").filter(|v| !v.is_null()) {
+                Some(v) => match amount_from_value(v) {
+                    Ok(a) => a,
+                    Err(e) => return (Value::Null, Some(e)),
+                },
+                None => (DEFAULT_MAX_RAW_TX_FEE_RATE * 100_000_000.0) as i64,
+            };
+            if maxfeerate_sats >= 100_000_000 {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_INVALID_PARAMETER,
+                        "Fee rates larger than or equal to 1BTC/kvB are not accepted".into(),
+                    )),
+                );
+            }
             chain_query(method, queries, move |cs, mgr| {
                 let mut out = Vec::with_capacity(raws.len());
                 for raw in raws {
@@ -7623,7 +8033,14 @@ pub(crate) fn dispatch(
                         }
                     };
                     let pool = mgr.mempool_ref();
-                    let steps = pool.explain_tx(&tx, cs, 0);
+                    // Audit TMA: `0` made time-sensitive checks
+                    // evaluate at epoch — pass the node's real clock
+                    // (median-time and locktime gates depend on it).
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as u32)
+                        .unwrap_or(0);
+                    let steps = pool.explain_tx(&tx, cs, now);
                     let allowed = steps.iter().all(|s| s.passed);
                     let mut verdict = json!({
                         "txid": tx.txid().to_string(),
@@ -7643,8 +8060,17 @@ pub(crate) fn dispatch(
                         let output_sum: i64 = tx.outputs.iter().map(|o| o.value).sum();
                         let fee = input_sum - output_sum;
                         verdict["fees"] = json!({"base": value_from_amount(fee)});
-                        verdict["package-feerrate"] =
-                            json!(fee as f64 / tx.weight().div_ceil(4).max(1) as f64 / 1000.0);
+                        let vsize = tx.weight().div_ceil(4).max(1) as f64;
+                        verdict["package-feerrate"] = json!(fee as f64 / vsize / 1000.0);
+                        // Audit TMA: enforce maxfeerate — a tx over the
+                        // caller's cap is "allowed: false" with the
+                        // same reason Core emits.
+                        if fee as f64 / vsize * 1000.0 > maxfeerate_sats as f64 {
+                            verdict["allowed"] = json!(false);
+                            verdict["reject-reason"] = json!("max-fee-exceeded");
+                            verdict["fees"] = Value::Null;
+                            verdict["package-feerrate"] = Value::Null;
+                        }
                     } else if let Some(failed) = steps.iter().find(|s| !s.passed) {
                         verdict["reject-reason"] = json!(failed.detail);
                     }
@@ -10652,19 +11078,18 @@ pub(crate) fn dispatch(
                             .into(),
                     )));
                 };
-                let d = &w.descs[idx];
-                let pos = d.next_index;
-                if pos > d.range.1 {
+                let Some(pos) = w.bump_next_index(idx) else {
                     return QueryReply::Now(Err((
                         RPC_WALLET_ERROR,
-                        format!("descriptor range exhausted at {}", d.range.1),
+                        "descriptor range exhausted".into(),
                     )));
-                }
-                let desc_text = d.desc.clone();
+                };
+                let mut desc_text = w.descs[idx].desc.clone();
                 let (parsed, provider, _) = match parse_descriptors(&desc_text, params, true) {
                     Ok(v) => v,
                     Err(e) => return QueryReply::Now(Err((RPC_INVALID_ADDRESS_OR_KEY, e))),
                 };
+                zeroize::Zeroize::zeroize(&mut desc_text);
                 let Some(scripts) = parsed[0].expand(pos, &provider) else {
                     return QueryReply::Now(Err((RPC_WALLET_ERROR, "derivation failed".into())));
                 };
@@ -10681,7 +11106,6 @@ pub(crate) fn dispatch(
                         "no addressable script".into(),
                     )));
                 };
-                w.descs[idx].next_index = pos + 1;
                 QueryReply::Now(Ok(json!(addr)))
             })
         }
@@ -10724,7 +11148,7 @@ pub(crate) fn dispatch(
                     Ok(r) => r,
                     Err(e) => return QueryReply::Now(Err((RPC_INVALID_PARAMETER, e))),
                 };
-                let entropy = resolved.seed.clone();
+                let mut entropy = resolved.seed.clone();
                 let provenance = resolved.provenance.clone();
                 // BIP39 over the entropy: the 24 words are the
                 // canonical backup — any BIP39 wallet derives the same
@@ -10739,7 +11163,11 @@ pub(crate) fn dispatch(
                         )));
                     }
                 };
-                let seed = mnemonic.to_seed("");
+                let mut seed = mnemonic.to_seed("");
+                // Audit SEED-3: entropy bytes + the BIP39 seed are key
+                // material — the master derives from them, then they
+                // must not linger in freed heap.
+                zeroize::Zeroize::zeroize(&mut entropy);
                 let Some(master) = avila_consensus::extended_key::ExtKey::from_seed(
                     &seed,
                     params.base58_ext_secret_prefix,
@@ -10756,6 +11184,7 @@ pub(crate) fn dispatch(
                     avila_consensus::params::Network::Mainnet => 0,
                     _ => 1,
                 };
+                zeroize::Zeroize::zeroize(&mut seed);
                 let Some(account) = master
                     .derive(84 | H)
                     .and_then(|k| k.derive(coin | H))
@@ -10855,6 +11284,11 @@ pub(crate) fn dispatch(
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let amount_arg = param(params, 1, "amount").cloned();
+            // Core's position-4 `subtractfeefromamount` (comment and
+            // comment_to at 2/3 are accepted and ignored).
+            let subtract_fee = param(params, 4, "subtractfeefromamount")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let wallet = wallet.cloned();
             chain_query_deferred(method, queries, move |cs, mgr| {
                 let Some(wallet) = wallet else {
@@ -10911,6 +11345,7 @@ pub(crate) fn dispatch(
                         value: amount,
                         script_pubkey: dest,
                     }],
+                    subtract_fee,
                 ) {
                     Ok(v) => v,
                     Err(e) => return QueryReply::Now(Err(e)),
@@ -10975,12 +11410,13 @@ pub(crate) fn dispatch(
                                 "signer dropped".into(),
                             )));
                         };
+                        let sh = psbt_input_sighash(&psbt, i, 1);
                         complete &= avila_consensus::sign::sign_psbt_input(
                             &signer.provider,
                             &mut psbt,
                             i,
                             Some(&txdata),
-                            1,
+                            sh,
                             false,
                             None,
                             true,
@@ -11106,11 +11542,10 @@ pub(crate) fn dispatch(
                 };
                 let feerate = mgr.mempool_ref().estimate_fee(6).unwrap_or(1000);
                 let (mut tx, fee, change_pos) =
-                    match fund_spend(&mut w, cs, mgr.mempool_ref(), feerate, dest_outputs)
-                {
-                    Ok(v) => v,
-                    Err(e) => return QueryReply::Now(Err(e)),
-                };
+                    match fund_spend(&mut w, cs, mgr.mempool_ref(), feerate, dest_outputs, false) {
+                        Ok(v) => v,
+                        Err(e) => return QueryReply::Now(Err(e)),
+                    };
                 if let Some(lt) = locktime_arg.filter(|l| *l >= 0) {
                     tx.lock_time = lt as u32;
                 }
@@ -11257,12 +11692,14 @@ pub(crate) fn dispatch(
                                 "signer dropped".into(),
                             )));
                         };
+                        let sh = psbt_input_sighash(&psbt, i, 1);
                         complete &= avila_consensus::sign::sign_psbt_input(
                             &signer.provider,
                             &mut psbt,
                             i,
                             Some(&txdata),
-                            1,     // SIGHASH_ALL
+                            // PS-S3: the input's own sighash_type wins.
+                            sh,
                             false, // real signatures, not the dummy creator
                             None,
                             false,
@@ -11312,7 +11749,10 @@ pub(crate) fn dispatch(
                         )));
                     }
                 };
-                let seed = mnemonic.to_seed("");
+                let mut seed = mnemonic.to_seed("");
+                // Audit SEED-3: entropy bytes + the BIP39 seed are key
+                // material — the master derives from them, then they
+                // must not linger in freed heap.
                 let Some(master) = avila_consensus::extended_key::ExtKey::from_seed(
                     &seed,
                     params.base58_ext_secret_prefix,
@@ -11327,6 +11767,7 @@ pub(crate) fn dispatch(
                     avila_consensus::params::Network::Mainnet => 0,
                     _ => 1,
                 };
+                zeroize::Zeroize::zeroize(&mut seed);
                 let Some(account) = master
                     .derive(84 | H)
                     .and_then(|k| k.derive(coin | H))
@@ -11418,9 +11859,13 @@ pub(crate) fn dispatch(
             let overwrite = param(params, 1, "overwrite")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let wallet = wallet.cloned();
-            chain_query(method, queries, move |_, _| {
-                let Some(wallet) = wallet else {
+            // Audit V-S8: argon2 is seconds of CPU — run it on THIS
+            // RPC thread. The vault seal needs only the wallet, not
+            // the chainstate, so nothing here belongs on the sync
+            // loop at all.
+            let wallet2 = wallet.cloned();
+            let export = (|| -> Result<Value, (i64, String)> {
+                let Some(wallet) = wallet2 else {
                     return Err((
                         RPC_MISC_ERROR,
                         "watch-only wallet is not available on this node".into(),
@@ -11484,13 +11929,44 @@ pub(crate) fn dispatch(
                     "descs": signer.descs_private.len(),
                     "silents": w.silents.len(),
                 }))
-            })
+            })();
+            match export {
+                Ok(v) => (v, None),
+                Err((code, msg)) => (Value::Null, Some((code, msg))),
+            }
         }
 
         "signerload" => {
             let passphrase = param(params, 0, "passphrase")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            // Audit V-S8: argon2 is seconds of CPU — vault_open runs
+            // on THIS RPC thread; the sync loop only sees the already-
+            // decrypted contents for the wallet import.
+            let mut vault = None;
+            let mut load_err: Option<String> = None;
+            if let Some(wallet) = wallet.as_ref()
+                && let Some(pw) = passphrase.as_ref().filter(|p| !p.is_empty())
+            {
+                match wallet.lock() {
+                    // The "already loaded" check stays in the closure —
+                    // it's atomic with `enable_signing` only there. The
+                    // read/decrypt can skip early when one's loaded.
+                    Ok(w) if w.signer().is_none() => {
+                        let path = w.vault_path();
+                        drop(w);
+                        match std::fs::read(&path) {
+                            Ok(blob) => match crate::watch::vault_open(&blob, pw) {
+                                Ok(v) => vault = Some(v),
+                                Err(e) => load_err = Some(e),
+                            },
+                            Err(e) => load_err = Some(format!("vault read failed: {e}")),
+                        }
+                    }
+                    Ok(_) => {} // already loaded — closure reports it
+                    Err(_) => load_err = Some("wallet lock poisoned".into()),
+                }
+            }
             let wallet = wallet.cloned();
             chain_query(method, queries, move |cs, _| {
                 let Some(wallet) = wallet else {
@@ -11499,12 +11975,12 @@ pub(crate) fn dispatch(
                         "watch-only wallet is not available on this node".into(),
                     ));
                 };
-                let Some(passphrase) = passphrase else {
+                if passphrase.is_none() {
                     return Err((
                         RPC_INVALID_PARAMETER,
                         "signerload requires a passphrase".into(),
                     ));
-                };
+                }
                 let mut w = wallet
                     .lock()
                     .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
@@ -11514,11 +11990,15 @@ pub(crate) fn dispatch(
                         "signer already loaded — signerlock first".into(),
                     ));
                 }
-                let path = w.vault_path();
-                let blob = std::fs::read(&path)
-                    .map_err(|e| (RPC_WALLET_ERROR, format!("vault read failed: {e}")))?;
-                let vault = crate::watch::vault_open(&blob, &passphrase)
-                    .map_err(|e| (RPC_WALLET_ERROR, e))?;
+                let Some(vault) = vault.take() else {
+                    return Err(match load_err.take() {
+                        Some(e) => (RPC_WALLET_ERROR, e),
+                        None => (
+                            RPC_INVALID_PARAMETER,
+                            "signerload requires a passphrase".into(),
+                        ),
+                    });
+                };
                 let params = cs.tree().params();
                 let provider =
                     crate::watch::signer_provider_from_descs(&vault.descs_private, params)
@@ -11538,12 +12018,16 @@ pub(crate) fn dispatch(
                         imported += 1;
                     }
                 }
-                let silents = vault.silents.clone();
+                // VaultContents' Drop (secret-erasing) forbids field
+                // moves — take each field instead; `silents` moves
+                // straight into the wallet with no extra key copies.
+                let mut vault = vault;
+                let silents = std::mem::take(&mut vault.silents);
                 w.enable_signing(crate::watch::SignerState {
                     provider,
-                    descs_private: vault.descs_private,
-                    descs_watch: vault.descs_watch,
-                    provenance: vault.provenance,
+                    descs_private: std::mem::take(&mut vault.descs_private),
+                    descs_watch: std::mem::take(&mut vault.descs_watch),
+                    provenance: std::mem::take(&mut vault.provenance),
                     entropy_commitment: vault.entropy_commitment.clone(),
                 });
                 // V-S1: scan keys ride the vault — restore the watches.
@@ -11795,6 +12279,7 @@ pub(crate) fn dispatch(
                 // query_options — Core's CCoinControl-style filters.
                 let (mut min_amt, mut max_amt) = (0i64, i64::MAX);
                 let (mut max_count, mut min_sum) = (0u64, 0i64);
+                let mut include_immature = false;
                 if let Value::Object(o) = &query_options {
                     for (k, v) in o {
                         let amt = amount_from_value(v).unwrap_or(i64::MAX);
@@ -11803,10 +12288,28 @@ pub(crate) fn dispatch(
                             "maximumAmount" => max_amt = amt,
                             "maximumCount" => max_count = v.as_u64().unwrap_or(0),
                             "minimumSumAmount" => min_sum = amt,
+                            // Audit SP-F6 — Core's
+                            // include_immature_coinbase query option,
+                            // default false.
+                            "include_immature_coinbase" => {
+                                include_immature = v.as_bool().unwrap_or(false);
+                            }
                             _ => {}
                         }
                     }
                 }
+                let tip_h = cs.tree().tip().height;
+                // Audit SP-F6: immature coinbases are not spendable
+                // (consensus rejects them) and by default not listed —
+                // the same IsImmatureCoinBase rule fund_spend uses.
+                let immature = |c: &crate::watch::WatchedCoin| -> bool {
+                    c.coinbase
+                        && cs
+                            .tree()
+                            .get(&c.block)
+                            .map(|n| tip_h.saturating_sub(n.height) + 1 < 100)
+                            .unwrap_or(true)
+                };
                 let mut w = wallet
                     .lock()
                     .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
@@ -11839,6 +12342,7 @@ pub(crate) fn dispatch(
                         || mempool_spends.contains(&(op.txid, op.vout))
                         || coin.value < min_amt
                         || coin.value > max_amt
+                        || (!include_immature && immature(coin))
                     {
                         continue;
                     }
@@ -12093,7 +12597,11 @@ pub(crate) fn dispatch(
                         "hash": last.map(|h| h.to_string()).unwrap_or_default(),
                         "height": w.chain.len() as i64 - 1,
                     },
-                    "private_keys_enabled": false,
+                    // Audit low: was hardcoded false — it tracks the
+                    // signer: a loaded signer means private keys are
+                    // held in memory (the watch wallet itself still
+                    // never holds them on disk).
+                    "private_keys_enabled": w.is_signer(),
                     // Opt-in signer (queue #35) — watch-only default
                     // unchanged; when a signer is installed the wallet
                     // can sign via walletprocesspsbt.
@@ -13260,10 +13768,15 @@ pub(crate) fn dispatch(
             // request for as long as the lookup takes. Resolve here,
             // on this connection's own RPC handler thread, and hand
             // the query only the already-resolved address.
+            // Audit P2P-13: with a proxy configured a hostname is NOT
+            // resolved here — the SOCKS5 proxy resolves it remotely
+            // (`connect_via` + SocksTarget::Domain), so the name never
+            // reaches local DNS.
+            let literal_sock: Option<std::net::SocketAddr> = node.as_str().parse().ok();
             let resolved = (command == "onetry")
-                .then(|| node.as_str().to_socket_addrs().ok())
-                .flatten()
-                .and_then(|mut addrs| addrs.next());
+                .then(|| literal_sock.or_else(|| node.as_str().to_socket_addrs().ok()?.next()))
+                .flatten();
+            let node_host = node.clone();
             chain_query(method, queries, move |cs, mgr| {
                 // Core: requesting v2 on a `-v2transport=0` node is a
                 // parameter error, not a silent downgrade.
@@ -13275,6 +13788,28 @@ pub(crate) fn dispatch(
                 }
                 let use_v2 = want_v2.unwrap_or_else(|| mgr.v2transport());
                 if command == "onetry" {
+                    if let Some(proxy) = mgr.proxy()
+                        && literal_sock.is_none()
+                    {
+                        // Hostname under proxy: the proxy resolves —
+                        // no local DNS lookup (audit P2P-13).
+                        if let Some((host, port_s)) = node_host.as_str().rsplit_once(':')
+                            && let Ok(port) = port_s.parse::<u16>()
+                        {
+                            let target = avila_p2p::proxy::SocksTarget::Domain(
+                                host.trim_matches(&['[', ']'][..]).to_string(),
+                                port,
+                            );
+                            let _ = mgr.connect_via(
+                                &proxy,
+                                &target,
+                                cs.tree().params().message_start,
+                                u64::from(port),
+                                cs.chain().len() as i32 - 1,
+                            );
+                        }
+                        return Ok(Value::Null);
+                    }
                     if let Some(sock) = resolved {
                         let _ = mgr.connect(
                             sock,
@@ -14075,6 +14610,13 @@ pub(crate) fn dispatch(
                      \x20   invalidateblock <hash>, reconsiderblock <hash>,\n\
                      \x20   scanblocks <action> [...],\n\
                      \x20   getdescriptoractivity <hashes> <scanobjects>\n\
+                     \x20 wallet: getwalletinfo, getbalances, getnewaddress [label],\n\
+                     \x20   listunspent [minconf] [maxconf] [addresses] [include_unsafe] [query],\n\
+                     \x20   listreceivedbyaddress, listtransactions, sendtoaddress <addr> <amt>,\n\
+                     \x20   walletcreatefundedpsbt <outputs> [locktime], walletprocesspsbt <psbt>,\n\
+                     \x20   importdescriptors <requests>, createdescriptorseed [entropy] [dice] [mix],\n\
+                     \x20   signerimport <mnemonic>, signerexport <pass> [overwrite],\n\
+                     \x20   signerload <pass>, signerlock, signerspawn <pass> [exe],\n\
                      \x20 mempool: getmempoolinfo, getrawmempool [verbose], getmempoolentry <txid>,\n\
                      \x20   getmempoolancestors|getmempooldescendants <txid> [verbose],\n\
                      \x20   gettxspendingprevout <outputs>,\n\
@@ -14174,6 +14716,7 @@ mod tests {
             profile: Default::default(),
             next_block: None,
             eclipse: Vec::new(),
+            prune_bytes: None,
         }
     }
 
@@ -14183,7 +14726,7 @@ mod tests {
         params: &Value,
         snap: &SyncProgress,
     ) -> (Value, Option<(i64, String)>) {
-        dispatch(method, params, snap, None, None, None, None, None)
+        dispatch(method, params, snap, None, None, None, None, None, true)
     }
 
     #[test]
@@ -14212,6 +14755,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
@@ -14388,12 +14932,23 @@ mod tests {
             None,
             None,
             Some(&flag),
+            false,
         );
         assert!(e.is_none());
         assert_eq!(r, json!("Avila node stopping"));
         assert!(flag.load(Ordering::Relaxed));
         // Without a run loop the call reports honestly instead of lying.
-        let (_, e) = dispatch("stop", &Value::Null, &snap, None, None, None, None, None);
+        let (_, e) = dispatch(
+            "stop",
+            &Value::Null,
+            &snap,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
 
@@ -14444,6 +14999,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r.as_str().unwrap().len(), 64);
@@ -14464,6 +15020,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none());
         let genesis = r.as_str().unwrap().to_string();
@@ -14477,6 +15034,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["height"], 0);
@@ -14496,6 +15054,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none());
         assert_eq!(r.as_str().unwrap().len(), 160);
@@ -14512,6 +15071,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["hash"], genesis);
@@ -14528,6 +15088,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -14539,6 +15100,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
 
@@ -14552,6 +15114,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none());
         let (r, _) = dispatch(
@@ -14563,6 +15126,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(r.is_null());
 
@@ -14576,6 +15140,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
     }
@@ -14596,6 +15161,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         for key in [
@@ -14629,6 +15195,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         for key in [
@@ -14665,6 +15232,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["capabilities"], json!(["proposal"]));
@@ -14699,6 +15267,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["chain"], "regtest");
@@ -14716,6 +15285,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none());
         assert_eq!(
@@ -14733,6 +15303,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["connections_in"], 0);
@@ -14793,6 +15364,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert!(r.is_null(), "{r}");
@@ -14810,6 +15382,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!("inconclusive-not-best-prevblk"));
@@ -14832,6 +15405,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!("bad-txnmrklroot"));
@@ -14846,6 +15420,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -14865,6 +15440,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -14882,6 +15458,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert_eq!(
                 e.unwrap(),
@@ -15021,6 +15598,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap(), (RPC_MISC_ERROR, SENDRAWTRANSACTION_HELP.into()));
         // Negative amounts are AmountFromValue's own "out of range",
@@ -15034,6 +15612,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap(), (RPC_TYPE_ERROR, "Amount out of range".into()));
         // A feerate at/past 1 BTC/kvB is rejected before decoding too,
@@ -15047,6 +15626,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -15067,6 +15647,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         // Same string/negative handling for maxburnamount.
@@ -15079,6 +15660,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         let (_, e) = dispatch(
@@ -15090,6 +15672,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap(), (RPC_TYPE_ERROR, "Amount out of range".into()));
 
@@ -15103,6 +15686,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         let (_, e) = dispatch(
@@ -15114,6 +15698,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let err = e.unwrap();
         assert_eq!(err.0, RPC_DESERIALIZATION_ERROR);
@@ -15132,6 +15717,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let err = e.unwrap();
         assert_eq!(err.0, RPC_VERIFY_REJECTED);
@@ -15147,6 +15733,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
@@ -15170,6 +15757,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             let err = e.unwrap();
             assert_eq!(err.0, RPC_INVALID_PARAMETER);
@@ -15187,6 +15775,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             let err = e.unwrap();
             assert_eq!(err.0, RPC_TYPE_ERROR);
@@ -15204,6 +15793,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let err = e.unwrap();
         assert_eq!(err.0, RPC_DESERIALIZATION_ERROR);
@@ -15226,6 +15816,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap(), (RPC_TYPE_ERROR, "Amount out of range".into()));
         let (_, e) = dispatch(
@@ -15237,6 +15828,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -15260,6 +15852,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let err = e.unwrap();
         assert_eq!(err.0, RPC_VERIFY_ERROR);
@@ -15280,6 +15873,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["package_msg"], json!("transaction failed"));
@@ -15317,6 +15911,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -15335,6 +15930,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -15373,6 +15969,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["psbt_version"], json!(0));
@@ -15400,6 +15997,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
         let (_, e) = dispatch(
@@ -15411,6 +16009,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
@@ -15432,6 +16031,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none());
         assert_eq!(r["subsidy"], json!(5_000_000_000i64));
@@ -15449,6 +16049,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none());
         assert_eq!(r["txs"], json!(1));
@@ -15464,6 +16065,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().1, "Target block height 99 after current tip 0");
         let (_, e) = dispatch(
@@ -15475,6 +16077,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap().1,
@@ -15500,6 +16103,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none());
         assert_eq!(r["height"], json!(0));
@@ -15530,6 +16134,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -15544,6 +16149,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap().1,
@@ -15559,6 +16165,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_MISC_ERROR);
@@ -15587,6 +16194,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         let proof = r.as_str().unwrap().to_string();
@@ -15599,6 +16207,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!([&gtxid]));
@@ -15613,6 +16222,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["proven"]["blockindex"], Value::Null);
@@ -15629,6 +16239,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["blockheight"], json!(0));
@@ -15649,6 +16260,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none());
         assert_eq!(r, json!([]));
@@ -15673,6 +16285,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
         let (_, e) = dispatch(
@@ -15684,6 +16297,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -15701,6 +16315,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -15718,6 +16333,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -15732,6 +16348,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -15750,6 +16367,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -15776,6 +16394,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -15828,6 +16447,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null); // connected — Core's null
@@ -15840,6 +16460,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!("duplicate"));
@@ -15854,6 +16475,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         let (_, e) = dispatch(
@@ -15865,6 +16487,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap(), (RPC_MISC_ERROR, SUBMITBLOCK_HELP.into()));
     }
@@ -15903,6 +16526,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_VERIFY_ERROR);
@@ -15922,6 +16546,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -15935,6 +16560,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
     }
@@ -15958,6 +16584,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         let hashes = r.as_array().unwrap();
@@ -15974,6 +16601,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
 
@@ -15989,6 +16617,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(r.is_null());
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
@@ -16003,6 +16632,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["hash"].as_str().unwrap().len(), 64);
@@ -16017,6 +16647,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_INVALID_ADDRESS_OR_KEY);
@@ -16030,6 +16661,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         // Bad output → -5.
@@ -16042,6 +16674,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
     }
@@ -16065,6 +16698,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         let genesis = r.as_str().unwrap().to_string();
@@ -16080,6 +16714,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(r.is_null());
         assert_eq!(e.unwrap().0, RPC_INTERNAL_ERROR);
@@ -16093,6 +16728,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         let block_hash = r.as_array().unwrap()[0].as_str().unwrap().to_string();
@@ -16107,6 +16743,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         let vin0 = &r["tx"][0]["vin"][0];
@@ -16125,6 +16762,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         let (hex_zero, _) = dispatch(
@@ -16136,6 +16774,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(hex_neg, hex_zero);
     }
@@ -16157,6 +16796,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         let block_hash = r.as_array().unwrap()[0].as_str().unwrap().to_string();
@@ -16169,6 +16809,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         let txid = r["tx"][0].as_str().unwrap().to_string();
@@ -16182,6 +16823,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["txid"], txid);
@@ -16195,6 +16837,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         let (hex_zero, _) = dispatch(
@@ -16206,6 +16849,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(hex_neg, hex_zero);
     }
@@ -16259,21 +16903,25 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
 
         // A minimumSumAmount comfortably under a single coin's value
         // stops the scan after the first qualifying coin instead of
-        // collecting all three.
+        // collecting all three. The coins are coinbases under 100
+        // confs — `include_immature_coinbase` keeps them visible
+        // (audit SP-F6: default filters them).
         let (r, e) = dispatch(
             "listunspent",
-            &json!([0, 9_999_999, [], true, {"minimumSumAmount": "1.0"}]),
+            &json!([0, 9_999_999, [], true, {"minimumSumAmount": "1.0", "include_immature_coinbase": true}]),
             &snap,
             Some(&queries),
             None,
             None,
             Some(&wallet),
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r.as_array().unwrap().len(), 1, "{r}");
@@ -16283,13 +16931,14 @@ mod tests {
         // "Insufficient funds" error.
         let (r, e) = dispatch(
             "listunspent",
-            &json!([0, 9_999_999, [], true, {"minimumSumAmount": "1000000"}]),
+            &json!([0, 9_999_999, [], true, {"minimumSumAmount": "1000000", "include_immature_coinbase": true}]),
             &snap,
             Some(&queries),
             None,
             None,
             Some(&wallet),
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r.as_array().unwrap().len(), 3, "{r}");
@@ -16325,6 +16974,7 @@ mod tests {
                 None,
                 Some(&wallet),
                 None,
+                false,
             )
         };
 
@@ -16406,6 +17056,7 @@ mod tests {
                 None,
                 Some(&wallet2),
                 None,
+                false,
             )
         };
         let (r, e) = call2("signerimport", &json!([mnemonic]));
@@ -16442,6 +17093,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert!(e.is_none(), "{e:?}");
             assert_eq!(r["txid"], json!(cb_txid));
@@ -16461,6 +17113,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         let (_, e) = dispatch(
@@ -16472,6 +17125,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
         let (_, e) = dispatch(
@@ -16483,6 +17137,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_TYPE_ERROR);
@@ -16496,6 +17151,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
         let (_, e) = dispatch(
@@ -16507,6 +17163,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
@@ -16526,6 +17183,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none());
         assert_eq!(r, json!({}));
@@ -16542,6 +17200,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none());
         assert_eq!(r["txindex"]["synced"], json!(true));
@@ -16557,6 +17216,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(r.get("txindex").is_some());
         let (r, _) = dispatch(
@@ -16568,6 +17228,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(r, json!({}));
         // Non-string name → Core's -3; extra args → the -1 help throw.
@@ -16580,6 +17241,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch(
@@ -16591,6 +17253,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
@@ -16614,6 +17277,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(
@@ -16656,6 +17320,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
@@ -16680,6 +17345,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!(0));
@@ -16692,6 +17358,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(r, json!(0));
 
@@ -16715,6 +17382,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
@@ -16736,6 +17404,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["totalbytesrecv"], json!(0));
@@ -16753,6 +17422,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
@@ -16774,6 +17444,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -16786,6 +17457,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
@@ -16801,6 +17473,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
         let (_, e) = dispatch(
@@ -16812,6 +17485,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMS);
         let (_, e) = dispatch(
@@ -16823,6 +17497,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch(
@@ -16834,6 +17509,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
 
@@ -16848,6 +17524,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -16860,6 +17537,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_ALREADY_ADDED);
         let (_, e) = dispatch(
@@ -16871,6 +17549,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (r, e) = dispatch(
@@ -16882,6 +17561,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -16894,6 +17574,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_NOT_ADDED);
         let (_, e) = dispatch(
@@ -16905,6 +17586,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         // `v2transport: true` is accepted now that BIP324 exists —
@@ -16918,6 +17600,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
 
@@ -16934,6 +17617,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -16949,6 +17633,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -16964,6 +17649,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!(false));
@@ -16976,6 +17662,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!(true));
@@ -16988,6 +17675,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch(
@@ -16999,6 +17687,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }
@@ -17021,6 +17710,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!([]));
@@ -17033,6 +17723,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
         let (r, e) = dispatch(
@@ -17044,6 +17735,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -17056,6 +17748,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
@@ -17070,6 +17763,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -17082,6 +17776,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r.as_array().unwrap().len(), 1);
@@ -17105,6 +17800,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_ALREADY_ADDED);
         let (r, e) = dispatch(
@@ -17116,6 +17812,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -17128,6 +17825,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_INVALID_IP_OR_SUBNET);
         let (r, e) = dispatch(
@@ -17139,6 +17837,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!([]));
@@ -17155,6 +17854,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (r, e) = dispatch(
@@ -17166,6 +17866,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -17178,6 +17879,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r[0]["address"], json!("2001:db8::/32"));
@@ -17202,7 +17904,17 @@ mod tests {
                 RPC_MISC_ERROR,
             ),
         ] {
-            let (_, e) = dispatch("setban", &p, &snap, Some(&queries), None, None, None, None);
+            let (_, e) = dispatch(
+                "setban",
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+                None,
+                false,
+            );
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
 
@@ -17216,6 +17928,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -17228,6 +17941,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!([]));
@@ -17262,6 +17976,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert!(e.is_none(), "{p}: {e:?}");
             assert_eq!(r, json!(true), "{p}");
@@ -17282,6 +17997,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
@@ -17318,6 +18034,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r.as_array().unwrap().len(), 2);
@@ -17332,6 +18049,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!(true));
@@ -17349,6 +18067,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!(false), "level 0 must still check bodies");
@@ -17366,6 +18085,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(
@@ -17395,6 +18115,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["headers"], json!(0));
@@ -17416,6 +18137,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert_eq!(e.unwrap().0, code, "params {p}");
         }
@@ -17428,6 +18150,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap().1,
@@ -17443,6 +18166,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none());
         assert_eq!(r, json!([]));
@@ -17456,6 +18180,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none());
         assert_eq!(r, json!([]));
@@ -17468,6 +18193,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_CLIENT_NODE_NOT_ADDED);
     }
@@ -17493,7 +18219,7 @@ mod tests {
             ("importmempool", json!([[]]), RPC_TYPE_ERROR),
             ("importmempool", json!(["x", "x"]), RPC_TYPE_ERROR),
         ] {
-            let (_, e) = dispatch(m, &p, &snap, Some(&queries), None, None, None, None);
+            let (_, e) = dispatch(m, &p, &snap, Some(&queries), None, None, None, None, false);
             assert_eq!(e.unwrap().0, code, "{m} {p}");
         }
 
@@ -17508,6 +18234,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -17519,6 +18246,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap().1,
@@ -17535,6 +18263,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -17554,6 +18283,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -17595,6 +18325,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
 
@@ -17608,6 +18339,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["coins_written"], json!(1));
@@ -17647,7 +18379,7 @@ mod tests {
             ("scanblocks", json!(["start", ["x"], "x"]), RPC_TYPE_ERROR),
             ("scanblocks", json!(["status", "x"]), RPC_TYPE_ERROR),
         ] {
-            let (_, e) = dispatch(m, &p, &snap, Some(&queries), None, None, None, None);
+            let (_, e) = dispatch(m, &p, &snap, Some(&queries), None, None, None, None, false);
             assert_eq!(e.unwrap().0, code, "{m} {p}");
         }
         // Index errors carry the exact Core wording.
@@ -17660,6 +18392,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().1, "Index is not enabled for filtertype basic");
         let (_, e) = dispatch(
@@ -17671,6 +18404,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().1, "Invalid action 'bogus'");
 
@@ -17684,6 +18418,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none() && r.is_null());
         let (r, e) = dispatch(
@@ -17695,6 +18430,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none() && r == json!(false));
     }
@@ -17716,6 +18452,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
         };
 
@@ -17771,6 +18508,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert!(e.is_none());
             r.as_str().unwrap().to_owned()
@@ -17788,6 +18526,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         let mined = r[0].as_str().unwrap().to_owned();
@@ -17832,6 +18571,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         for net in ["ipv4", "ipv6", "onion", "i2p", "cjdns", "all_networks"] {
@@ -17846,6 +18586,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
@@ -17859,6 +18600,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["success"], json!(true));
@@ -17871,6 +18613,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["ipv4"], json!({"new": 0, "tried": 1, "total": 1}));
@@ -17896,6 +18639,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
         let (_, e) = dispatch(
@@ -17907,6 +18651,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch(
@@ -17918,6 +18663,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
@@ -17931,6 +18677,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_INVALID_PARAMETER);
@@ -17947,6 +18694,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -17963,6 +18711,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none());
         let genesis = r.as_str().unwrap().to_string();
@@ -17975,6 +18724,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, Value::Null);
@@ -17998,6 +18748,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert_eq!(e.unwrap().0, RPC_MISC_ERROR, "{method}");
             let (_, e) = dispatch(
@@ -18009,6 +18760,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert_eq!(e.unwrap().0, RPC_TYPE_ERROR, "{method}");
             let (_, e) = dispatch(
@@ -18020,6 +18772,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert_eq!(e.unwrap().0, RPC_MISC_ERROR, "{method}");
 
@@ -18033,6 +18786,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER, "{method}");
 
@@ -18046,6 +18800,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert_eq!(
                 e.unwrap(),
@@ -18065,6 +18820,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none());
         let genesis = r.as_str().unwrap().to_string();
@@ -18078,6 +18834,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert!(e.is_none(), "{method}: {e:?}");
             assert_eq!(r, Value::Null, "{method}");
@@ -18113,6 +18870,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             let (code, msg) = e.unwrap();
             assert_eq!(code, RPC_MISC_ERROR, "{p}");
@@ -18129,6 +18887,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_TYPE_ERROR);
@@ -18147,6 +18906,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -18158,6 +18918,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -18172,6 +18933,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_INVALID_PARAMETER);
@@ -18192,6 +18954,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert!(e.is_none(), "{p}: {e:?}");
             assert_eq!(r, json!(true), "{p}");
@@ -18220,6 +18983,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             let (code, msg) = e.unwrap();
             assert_eq!(code, RPC_MISC_ERROR, "{p}");
@@ -18236,6 +19000,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_TYPE_ERROR);
@@ -18252,6 +19017,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -18263,6 +19029,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -18279,6 +19046,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -18296,6 +19064,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let genesis = r.as_str().unwrap().to_string();
         let (_, e) = dispatch(
@@ -18307,6 +19076,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -18334,6 +19104,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
         };
         let hash = "00".repeat(32);
@@ -18432,6 +19203,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
         };
         let txid = "ab".repeat(32);
@@ -18672,6 +19444,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
         };
         let k1 = "035b29c4f18c17f8f1142ca109c0590a3872f91a32be254a045a31481581f098d6";
@@ -18855,6 +19628,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
         };
         let derive = |p: Value| {
@@ -18867,6 +19641,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
         };
         let k = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
@@ -19019,6 +19794,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
         };
         let k = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
@@ -19088,6 +19864,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(
@@ -19107,6 +19884,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(
@@ -19155,6 +19933,7 @@ mod tests {
                 Some(&scan),
                 None,
                 None,
+                false,
             )
         };
 
@@ -19291,7 +20070,17 @@ mod tests {
         let queries = query_server(Chainstate::new(&Network::Regtest.params()));
         let snap = snap();
         let d = |method: &str, p: Value| {
-            dispatch(method, &p, &snap, Some(&queries), None, None, None, None)
+            dispatch(
+                method,
+                &p,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
         };
         // Secret 0x07…07 — Core 29.4 outputs captured live.
         let wif_c = "cMpMxK92W1DjqDvWV3pMn4xLwAuQJhNF3MFqkEHUQRPQofUJku8R";
@@ -19425,7 +20214,7 @@ mod tests {
     fn getprioritisedtransactions_dispatch_contract() {
         let queries = query_server(Chainstate::new(&Network::Regtest.params()));
         let snap = snap();
-        let d = |m, p: Value| dispatch(m, &p, &snap, Some(&queries), None, None, None, None);
+        let d = |m, p: Value| dispatch(m, &p, &snap, Some(&queries), None, None, None, None, false);
 
         // Any argument is a -1 + help, whatever its type.
         for p in [json!([1]), json!(["x"]), json!([true])] {
@@ -19540,6 +20329,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_MISC_ERROR);
@@ -19555,6 +20345,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_TYPE_ERROR);
@@ -19571,6 +20362,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
 
@@ -19585,6 +20377,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -19601,6 +20394,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             e.unwrap(),
@@ -19619,6 +20413,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert!(e.is_none(), "{p}: {e:?}");
             assert_eq!(r["window_block_count"], json!(0), "{p}");
@@ -19637,6 +20432,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             let (code, msg) = e.unwrap();
             assert_eq!(code, RPC_INVALID_PARAMETER, "{p}");
@@ -19662,6 +20458,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_MISC_ERROR);
@@ -19678,6 +20475,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let (code, msg) = e.unwrap();
         assert_eq!(code, RPC_TYPE_ERROR);
@@ -19695,6 +20493,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let (_, msg) = e.unwrap();
         assert_eq!(msg, "'bogus' is not a valid hash_type");
@@ -19714,6 +20513,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert_eq!(
                 e.unwrap(),
@@ -19740,6 +20540,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             assert!(e.is_none(), "{p}: {e:?}");
             assert_eq!(r["height"], json!(0), "{p}");
@@ -19757,6 +20558,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert!(r.get("hash_serialized_3").is_none());
@@ -19781,6 +20583,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["active_commands"][0]["method"], json!("getrpcinfo"));
@@ -19795,6 +20598,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
 
@@ -19808,6 +20612,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["locked"]["total"], json!(0));
@@ -19820,6 +20625,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -19831,6 +20637,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
 
@@ -19845,6 +20652,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r.as_object().unwrap().len(), 28);
@@ -19858,6 +20666,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(r["net"], json!(true));
         assert_eq!(r["mempool"], json!(true));
@@ -19870,6 +20679,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(r["net"], json!(false));
         assert_eq!(r["mempool"], json!(true));
@@ -19882,6 +20692,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(r["mempool"], json!(false));
         let (_, e) = dispatch(
@@ -19893,6 +20704,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -19904,6 +20716,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         // Reset so other tests see a clean map.
@@ -19916,6 +20729,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
     }
 
@@ -19935,6 +20749,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r, json!({"success": true}));
@@ -19948,6 +20763,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(
@@ -19963,6 +20779,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(r["success"], json!(false));
         // Unparseable → success:false with no error key.
@@ -19975,6 +20792,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(r, json!({"success": false}));
 
@@ -19987,6 +20805,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(e.is_none(), "{e:?}");
         let entries = r.as_array().unwrap();
@@ -20005,6 +20824,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(r.as_array().unwrap().len(), 1);
         let (r, _) = dispatch(
@@ -20016,6 +20836,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(r.as_array().unwrap().len(), 0);
         // Error paths.
@@ -20028,6 +20849,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -20039,6 +20861,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
         let (_, e) = dispatch(
@@ -20050,6 +20873,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_TYPE_ERROR);
         let (_, e) = dispatch(
@@ -20061,6 +20885,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
         let (_, e) = dispatch(
@@ -20072,6 +20897,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(e.unwrap().0, RPC_MISC_ERROR);
     }

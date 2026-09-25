@@ -508,6 +508,12 @@ pub struct PeerManager<S> {
     )>,
     /// Whether locally-submitted txs take the stem path — default on.
     stem_relay: bool,
+    /// Audit P2P-7: the stem hop is per-EPOCH, not per-tx — a fresh
+    /// random relay per transaction lets an observer correlate that
+    /// all stem txs leaving through different hops came from one
+    /// node (us). Dandelion's epoch model: same hop for the whole
+    /// window, rotate on expiry or peer loss.
+    stem_hop: Option<(u64, Instant)>,
     /// SOCKS5 proxy for automatic outbound dials — Core's `-proxy`.
     /// When set, EVERY outbound connection routes through it; there
     /// is no clearnet fallback (fail-closed — queue #13).
@@ -546,14 +552,14 @@ pub struct PeerManager<S> {
     /// blocking the sync loop (Core's `ThreadOpenConnections` runs
     /// dials off the message loop the same way). The session includes
     /// any completed BIP324 handshake.
-    dial_tx: std::sync::mpsc::Sender<(SocketAddr, DialOutcome)>,
-    dial_rx: std::sync::mpsc::Receiver<(SocketAddr, DialOutcome)>,
+    dial_tx: std::sync::mpsc::Sender<(DialKey, DialOutcome)>,
+    dial_rx: std::sync::mpsc::Receiver<(DialKey, DialOutcome)>,
     /// Dials in flight — counted against outbound slots so a dead
     /// network can't queue unbounded workers, and deduplicated so the
     /// same address is never dialed twice at once.
     /// Outbound dials in flight, mapped to whether v2 was requested —
     /// a landed v1 session after a v2 attempt is a forced downgrade.
-    pending_dials: std::collections::HashMap<SocketAddr, bool>,
+    pending_dials: std::collections::HashMap<DialKey, bool>,
     /// Nonces we've sent in our own `version` on outbound connections,
     /// live for as long as that connection is (Core's `CheckIncomingNonce`
     /// scans not-yet-`fSuccessfullyConnected` outbound `CNode`s instead;
@@ -634,6 +640,7 @@ impl<S: Read + Write> PeerManager<S> {
             next_rebroadcast: 0,
             stem_pending: Vec::new(),
             stem_relay: true,
+            stem_hop: None,
             asmap: crate::asmap::AsMap::empty(),
             event_ring: std::collections::VecDeque::with_capacity(1025),
             eclipse_checked_at: Instant::now(),
@@ -1240,10 +1247,25 @@ impl<S: Read + Write> PeerManager<S> {
             })
             .map(|(id, _)| *id)
             .collect();
-        let Some(&hop) = candidates.get((roll as usize) % candidates.len().max(1)) else {
-            // No outbound peer — fluff immediately, better than silence.
-            self.announce_tx(txid, wtxid);
-            return;
+        // Audit P2P-7: per-EPOCH hop — reuse the current stem peer
+        // for the whole window; only re-pick when the epoch expires
+        // or the peer dropped out of the eligible set.
+        const STEM_EPOCH: Duration = Duration::from_secs(600);
+        let hop = match self.stem_hop {
+            Some((id, epoch_start))
+                if epoch_start.elapsed() < STEM_EPOCH && candidates.contains(&id) =>
+            {
+                id
+            }
+            _ => {
+                let Some(&id) = candidates.get((roll as usize) % candidates.len().max(1)) else {
+                    // No outbound peer — fluff immediately, better than silence.
+                    self.announce_tx(txid, wtxid);
+                    return;
+                };
+                self.stem_hop = Some((id, Instant::now()));
+                id
+            }
         };
         if let Some(peer) = self.peers.get_mut(&hop) {
             let (inv_type, hash) = if peer.session.peer().is_some_and(|i| i.wtxid_relay) {
@@ -1300,6 +1322,14 @@ impl<S: Read + Write> PeerManager<S> {
     /// dead proxy means no outbound peers rather than a silent leak.
     pub fn set_proxy(&mut self, proxy: Option<SocketAddr>) {
         self.proxy = proxy;
+    }
+
+    /// The configured SOCKS5 proxy, when any — the `addnode`/`onetry`
+    /// path needs it to keep hostname resolution off local DNS
+    /// (audit P2P-13).
+    #[must_use]
+    pub fn proxy(&self) -> Option<SocketAddr> {
+        self.proxy
     }
 
     /// Fixed-size send cells (queue #17): pads every v2 session's
@@ -2213,7 +2243,18 @@ impl<S: Read + Write> PeerManager<S> {
                 accepted.push(pair);
             }
         }
-        addrbook.add_many(accepted.into_iter(), now_wall);
+        // Audit P2P-6: charge inserts to the relaying peer — a flood
+        // source churns its own quota instead of owning the table.
+        if let Some(remote) = peer.remote {
+            let src = {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&remote.ip, &mut h);
+                std::hash::Hasher::finish(&h)
+            };
+            addrbook.add_many_from(accepted.into_iter(), now_wall, src);
+        } else {
+            addrbook.add_many(accepted.into_iter(), now_wall);
+        }
     }
 
     /// Total in-flight block requests across all peers.
@@ -2661,8 +2702,8 @@ impl PeerManager<TcpStream> {
         // Completed workers first: a ban or a full peer set that
         // landed mid-dial still applies — Core rechecks IsBanned after
         // connect for the same reason.
-        while let Ok((addr, result)) = self.dial_rx.try_recv() {
-            let want_v2 = self.pending_dials.remove(&addr).unwrap_or(false);
+        while let Ok((key, result)) = self.dial_rx.try_recv() {
+            let want_v2 = self.pending_dials.remove(&key).unwrap_or(false);
             let Ok(session) = result else {
                 // Proxy health (privacy matrix): a failed dial under
                 // proxy mode means the private route itself is down —
@@ -2683,18 +2724,28 @@ impl PeerManager<TcpStream> {
             // Forced-downgrade telemetry: v2 was requested but the
             // session landed cleartext v1 — exactly what a transport-
             // stripping MITM produces. Advisory, not a ban.
-            if want_v2 && session.transport_protocol() == "v1" {
+            if want_v2
+                && session.transport_protocol() == "v1"
+                && let DialKey::Addr(addr) = &key
+            {
                 if self.event_ring.len() >= 1024 {
                     self.event_ring.pop_front();
                 }
-                self.event_ring.push_back(NetEvent::V2Downgraded { addr });
+                self.event_ring
+                    .push_back(NetEvent::V2Downgraded { addr: *addr });
             }
-            let remote = addrman::net_addr_of(addr, 0);
+            // A domain dial has no resolved IP to ban-check — the
+            // peer registers with an unspecified remote.
+            let remote = match &key {
+                DialKey::Addr(addr) => addrman::net_addr_of(*addr, 0),
+                DialKey::Domain(..) => NetAddr::unspecified(),
+            };
             // A ban or a full peer set that landed mid-dial still
             // applies — Core rechecks IsBanned after connect.
             let admissible = self.network_active
                 && self.has_slot()
-                && !self.bans.is_banned(&remote.ip, (self.clock)());
+                && (matches!(key, DialKey::Domain(..))
+                    || !self.bans.is_banned(&remote.ip, (self.clock)()));
             if admissible {
                 self.add(session, Some(remote), false);
             }
@@ -2716,15 +2767,36 @@ impl PeerManager<TcpStream> {
             {
                 continue;
             }
+            // Audit P2P-13: under a proxy, a hostname addnode must NOT
+            // resolve through the system DNS — that leaks the peer's
+            // name to the ISP's resolver. The proxy resolves it
+            // instead (SOCKS5 ATYP_DOMAIN); `.onion` only exists
+            // through the proxy path. Without a proxy, literal IPs are
+            // dialed directly and hostnames resolve locally as before.
+            let literal: Option<SocketAddr> = node.as_str().parse().ok();
+            if literal.is_none()
+                && self.proxy.is_some()
+                && let Some((host, port_s)) = node.as_str().rsplit_once(':')
+                && let Ok(port) = port_s.parse::<u16>()
+                && !host.is_empty()
+                && host.len() <= 253
+            {
+                    let key = DialKey::Domain(host.trim_matches(&['[', ']'][..]).to_string(), port);
+                    if self.pending_dials.contains_key(&key) {
+                        continue;
+                    }
+                    self.addnode_dial.insert(node.clone(), Instant::now());
+                    self.queue_dial(key, use_v2, magic, start_height, &mut dialed);
+                    continue;
+            }
             if let Ok(addrs) = node.as_str().to_socket_addrs() {
                 let socks: Vec<SocketAddr> = addrs.collect();
                 // Already talking to this node — Core's AddNode thread
                 // skips connected entries rather than double-dialing.
                 // Don't stamp the backoff either, so a drop redials fast.
-                if socks
-                    .iter()
-                    .any(|s| self.connected_to(*s) || self.pending_dials.contains_key(s))
-                {
+                if socks.iter().any(|s| {
+                    self.connected_to(*s) || self.pending_dials.contains_key(&DialKey::Addr(*s))
+                }) {
                     continue;
                 }
                 self.addnode_dial.insert(node.clone(), Instant::now());
@@ -2740,7 +2812,13 @@ impl PeerManager<TcpStream> {
                     }
                     // addnode's `v2transport` flag overrides the
                     // `-v2transport` default for this peer.
-                    self.queue_dial(sock, use_v2, magic, start_height, &mut dialed);
+                    self.queue_dial(
+                        DialKey::Addr(sock),
+                        use_v2,
+                        magic,
+                        start_height,
+                        &mut dialed,
+                    );
                 }
             }
         }
@@ -2765,9 +2843,7 @@ impl PeerManager<TcpStream> {
                 p.remote.and_then(|r| {
                     if asmap_loaded {
                         let ip = std::net::IpAddr::from(r.ip);
-                        self.asmap
-                            .asn(&ip)
-                            .map(|asn| asn.to_be_bytes().to_vec())
+                        self.asmap.asn(&ip).map(|asn| asn.to_be_bytes().to_vec())
                     } else {
                         Some(addrman::net_group(&r.ip))
                     }
@@ -2803,12 +2879,18 @@ impl PeerManager<TcpStream> {
             // `AlreadyConnectedTo`/`FindNode` check; the book may
             // still carry peers we established sessions with.
             let sock = addrman::socket_addr(&candidate);
-            if self.connected_to(sock) || self.pending_dials.contains_key(&sock) {
+            if self.connected_to(sock) || self.pending_dials.contains_key(&DialKey::Addr(sock)) {
                 continue;
             }
             // Automatic outbounds use the `-v2transport` setting —
             // Core's `use_v2transport` on OpenNetworkConnection.
-            self.queue_dial(sock, self.v2transport, magic, start_height, &mut dialed);
+            self.queue_dial(
+                DialKey::Addr(sock),
+                self.v2transport,
+                magic,
+                start_height,
+                &mut dialed,
+            );
         }
         dialed
     }
@@ -2825,23 +2907,25 @@ impl PeerManager<TcpStream> {
     /// ban recheck, slot check) happens on the tick that drains it.
     fn queue_dial(
         &mut self,
-        addr: SocketAddr,
+        key: DialKey,
         use_v2: bool,
         magic: [u8; 4],
         start_height: i32,
         dialed: &mut Vec<SocketAddr>,
     ) {
-        if self.pending_dials.insert(addr, use_v2).is_some() {
+        if self.pending_dials.insert(key.clone(), use_v2).is_some() {
             return; // already in flight
         }
-        dialed.push(addr);
+        let (port, remote) = match &key {
+            DialKey::Addr(addr) => {
+                dialed.push(*addr);
+                (addr.port(), addrman::net_addr_of(*addr, 0))
+            }
+            // A domain target has no numeric address to gossip yet.
+            DialKey::Domain(_, port) => (*port, NetAddr::unspecified()),
+        };
         let tx = self.dial_tx.clone();
-        let mut version = build_version(
-            addr.port() as u64,
-            start_height,
-            addrman::net_addr_of(addr, 0),
-            (self.clock)(),
-        );
+        let mut version = build_version(port as u64, start_height, remote, (self.clock)());
         if use_v2 {
             version.services |= NODE_P2P_V2;
         }
@@ -2850,11 +2934,29 @@ impl PeerManager<TcpStream> {
         }
         let proxy = self.proxy;
         std::thread::spawn(move || {
-            let outcome = match proxy {
-                Some(p) => dial_via(p, addr, magic, version, use_v2),
-                None => dial(addr, magic, version, use_v2),
+            let outcome = match (&key, proxy) {
+                (DialKey::Addr(addr), Some(p)) => dial_via(
+                    p,
+                    crate::proxy::SocksTarget::Ip(*addr),
+                    magic,
+                    version,
+                    use_v2,
+                ),
+                // Audit P2P-13: a domain target under proxy is
+                // resolved BY the proxy — no local DNS lookup.
+                (DialKey::Domain(host, port), Some(p)) => dial_via(
+                    p,
+                    crate::proxy::SocksTarget::Domain(host.clone(), *port),
+                    magic,
+                    version,
+                    use_v2,
+                ),
+                // A domain target with no proxy would need a local
+                // lookup — the caller resolves eagerly instead.
+                (DialKey::Domain(..), None) => Err(SessionError::HandshakeTimeout),
+                (DialKey::Addr(addr), None) => dial(*addr, magic, version, use_v2),
             };
-            let _ = tx.send((addr, outcome));
+            let _ = tx.send((key, outcome));
         });
     }
 }
@@ -2869,23 +2971,18 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// proxy failure IS the dial's failure (fail-closed, queue #13).
 fn dial_via(
     proxy: SocketAddr,
-    addr: SocketAddr,
+    target: crate::proxy::SocksTarget,
     magic: [u8; 4],
     version: Version,
     want_v2: bool,
 ) -> DialOutcome {
-    let stream =
-        crate::proxy::socks5_connect(&proxy, &crate::proxy::SocksTarget::Ip(addr), DIAL_TIMEOUT)?;
+    let stream = crate::proxy::socks5_connect(&proxy, &target, DIAL_TIMEOUT)?;
     stream.set_nodelay(true)?;
     if want_v2 {
         stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
         match PeerSession::initiate_v2(stream, magic, version.clone(), SEND_BUDGET_PER_PEER) {
             Err(SessionError::V1Fallback) => {
-                let stream = crate::proxy::socks5_connect(
-                    &proxy,
-                    &crate::proxy::SocksTarget::Ip(addr),
-                    DIAL_TIMEOUT,
-                )?;
+                let stream = crate::proxy::socks5_connect(&proxy, &target, DIAL_TIMEOUT)?;
                 stream.set_nodelay(true)?;
                 stream.set_nonblocking(true)?;
                 return PeerSession::initiate(stream, magic, version, SEND_BUDGET_PER_PEER);
@@ -2906,6 +3003,19 @@ fn dial_via(
 /// One dial worker's product — a live `PeerSession` (v1, or v2 with
 /// the BIP324 handshake already done) or the failure.
 type DialOutcome = Result<PeerSession<TcpStream>, SessionError>;
+
+/// What an outbound dial worker is connecting to (audit P2P-13):
+/// either a resolved socket, or a hostname the SOCKS5 proxy resolves
+/// — under `-proxy` a local `to_socket_addrs` call would leak the
+/// hostname to the ISP's DNS, so domain targets ride the proxy's own
+/// resolver (`ATYP_DOMAIN`) instead.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum DialKey {
+    /// A numeric endpoint — `pending_dials`/`connected_to` dedup key.
+    Addr(SocketAddr),
+    /// `host:port` — the proxy resolves it; nothing local is queried.
+    Domain(String, u16),
+}
 
 /// `connect` + optional BIP324 handshake + nonblocking flip — shared
 /// by [`PeerManager::connect`] and the `queue_dial` workers. On

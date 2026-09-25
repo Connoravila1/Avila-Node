@@ -37,7 +37,7 @@ fn hmac_sha512(key: &[u8], data: &[u8]) -> [u8; 64] {
 /// serialized form, 78 bytes:
 /// `version(4) || depth(1) || parent_fp(4) || child_num(4, BE) ||
 /// chain(32) || key(33)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExtKey {
     /// The four version bytes as serialized (e.g. `xpub`/`tpub`/
     /// `xprv`/`tprv`); the network checks happen at decode time.
@@ -54,6 +54,34 @@ pub struct ExtKey {
     /// The serialized key: 33-byte compressed pubkey, or `0x00 ||
     /// secret` for private keys.
     pub key: [u8; 33],
+}
+
+/// Audit SEED-3/V-S3: a dropped ExtKey erases the private half
+/// (`0x00 || secret`) and chain code — freed heap retains key
+/// material until reuse otherwise. `key[0] == 0` marks the private
+/// form; public halves are wiped uniformly (they're not secret, but
+/// the branch-free wipe avoids key-type-dependent timing).
+impl Drop for ExtKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.key);
+        zeroize::Zeroize::zeroize(&mut self.chain_code);
+    }
+}
+
+/// Audit low: `Debug` over the raw struct would print the private
+/// half (`0x00 || secret`) into logs — redact it; the public
+/// metadata still shows for diagnostics.
+impl std::fmt::Debug for ExtKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtKey")
+            .field("version", &self.version)
+            .field("depth", &self.depth)
+            .field("parent_fingerprint", &self.parent_fingerprint)
+            .field("child", &self.child)
+            .field("chain_code", &"[redacted]")
+            .field("key", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Extended-key decode failures.

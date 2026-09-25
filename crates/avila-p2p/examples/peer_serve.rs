@@ -82,13 +82,11 @@ fn pump<S: std::io::Read + std::io::Write>(
             }
             SessionEvent::Message(Message::GetData(reqs)) => {
                 let mut failed = None;
-                PeerSync::serve_getdata(cs, None, &reqs, |reply| {
-                    match session.send(reply) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            failed = Some(e.to_string());
-                            false
-                        }
+                PeerSync::serve_getdata(cs, None, &reqs, |reply| match session.send(reply) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        failed = Some(e.to_string());
+                        false
                     }
                 });
                 if let Some(e) = failed {

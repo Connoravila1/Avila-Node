@@ -1090,7 +1090,16 @@ fn create_schnorr_sig(
                 None => keypair,
             };
             let msg = secp256k1::Message::from_digest(hash);
-            let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+            // Audit PS-S2: BIP340 auxiliary randomness — Core signs
+            // with aux_rand32 so a compromised RNG or a correlated
+            // signing session can't force two different messages to
+            // share a nonce chain. Deterministic nonces alone leak the
+            // key if the same (key, msg) pair is ever signed in
+            // differing execution contexts.
+            let mut aux = [0u8; 32];
+            let _ = getrandom::fill(&mut aux);
+            let sig = secp.sign_schnorr_with_aux_rand(&msg, &keypair, &aux);
+            aux.fill(0);
             let mut out = sig.serialize().to_vec();
             if sighash != 0 {
                 out.push(sighash);
@@ -3149,9 +3158,13 @@ mod tests {
         let scripts = parsed[0]
             .expand_into(0, &signing, &mut expanded, true, &mut cache)
             .unwrap();
-        signing.keys.extend(expanded.keys);
-        signing.pubkeys.extend(expanded.pubkeys);
-        signing.origins.extend(expanded.origins);
+        signing.keys.extend(std::mem::take(&mut expanded.keys));
+        signing
+            .pubkeys
+            .extend(std::mem::take(&mut expanded.pubkeys));
+        signing
+            .origins
+            .extend(std::mem::take(&mut expanded.origins));
         let spk = scripts
             .iter()
             .find(|s| s.len() == 22 && s[0] == 0x00 && s[1] == 0x14)

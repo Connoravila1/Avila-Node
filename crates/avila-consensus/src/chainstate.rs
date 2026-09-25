@@ -267,8 +267,15 @@ pub struct Chainstate {
     /// drained — a strictly-increasing tail of the connected chain.
     /// Bounded by the pipeline depth in `accept_block`; emptied by
     /// [`Self::drain_scripts`] before flushes, snapshots, reorgs.
-    pending_scripts:
-        std::collections::VecDeque<(BlockHash, u32, std::sync::Arc<connect::BlockCheck>)>,
+    /// Audit CA-F2: a deferred check's receipt rides the pending
+    /// entry — it is recorded only when the scripts actually pass,
+    /// never before. A rewound failure leaves no "verified" claim.
+    pending_scripts: std::collections::VecDeque<(
+        BlockHash,
+        u32,
+        std::sync::Arc<connect::BlockCheck>,
+        BlockReceipt,
+    )>,
     /// Per-block verification receipts, oldest → newest (queue #5).
     /// A journal of connect *events*, not a view of the active chain:
     /// a height can appear twice when a reorg replaced it — both
@@ -985,18 +992,21 @@ impl Chainstate {
 
     fn drain_pending_inner(&mut self, depth: usize) -> Result<(), ConnectError> {
         while self.pending_scripts.len() > depth {
-            let Some((hash, height, check)) = self.pending_scripts.pop_front() else {
+            let Some((hash, height, check, receipt)) = self.pending_scripts.pop_front() else {
                 break;
             };
             if let Err(err) = check.wait() {
                 // The failed block and everything pending above it can
                 // never connect — drop their pending entries, mark the
-                // block invalid, rewind to its parent.
-                self.pending_scripts.retain(|(_, h, _)| *h < height);
+                // block invalid, rewind to its parent. Their receipts
+                // die with the entries — nothing claims a block that
+                // failed scripts was verified (audit CA-F2).
+                self.pending_scripts.retain(|(_, h, _, _)| *h < height);
                 self.tree.mark_invalid(hash);
                 self.rewind_connected(height.saturating_sub(1))?;
                 return Err(ConnectError::ScriptVerify(err));
             }
+            self.note_receipt(receipt);
         }
         Ok(())
     }
@@ -2622,17 +2632,24 @@ impl Chainstate {
                     self.chain.push(hash);
                     self.undos.push(undo);
                     self.connected = hash;
-                    self.note_receipt(receipt);
                     self.tree.note_connected(&hash);
                     if let Some(check) = check {
                         // Pipeline window: leave this block's checks
                         // outstanding while the next block's serial
                         // phase overlaps them; only the oldest pending
-                        // block waits here.
+                        // block waits here. Audit CA-F2: the receipt
+                        // rides the pending entry and is recorded when
+                        // the check passes — a deferred block never
+                        // publishes an unearned "verified" receipt.
                         const SPEC_DEPTH: usize = 8;
-                        self.pending_scripts.push_back((hash, height, check));
+                        self.pending_scripts
+                            .push_back((hash, height, check, receipt));
                         self.drain_pending_to(SPEC_DEPTH)
                             .map_err(BlockRejection::Connect)?;
+                    } else {
+                        // No deferred work — the receipt is fully
+                        // earned at connect.
+                        self.note_receipt(receipt);
                     }
                     // This block's own body may have been the missing
                     // link for an already-stored, already-bodied child

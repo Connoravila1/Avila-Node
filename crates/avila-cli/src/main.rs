@@ -224,6 +224,26 @@ enum Command {
 
 /// Recursive copy — every file under `src` lands at the same
 /// relative path under `dst`; a manifest records the run.
+/// Advisory datadir lock — Core's `.lock`: the live node holds it,
+/// so backup/restore/rollback probe it before touching the dir.
+/// Returns the open lock file (the caller keeps it alive) or an
+/// error when another process holds the lock.
+fn probe_datadir_lock(dir: &Path) -> Result<Option<std::fs::File>, String> {
+    let lock_path = dir.join(".lock");
+    let Ok(lock) = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+    else {
+        return Ok(None);
+    };
+    lock.try_lock().map_err(|_| {
+        format!("{} is locked — stop the node first", dir.display())
+    })?;
+    Ok(Some(lock))
+}
+
 fn copy_tree(src: &Path, dst: &Path, files: &mut Vec<String>) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(dst)?;
     for e in std::fs::read_dir(src)? {
@@ -499,6 +519,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     profile: Default::default(),
                     next_block: None,
                     eclipse: Vec::new(),
+                    prune_bytes: None,
                 }));
             let (query_tx, query_rx) = std::sync::mpsc::channel();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -518,18 +539,16 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             let lock_path = data_dir.join(".lock");
             std::fs::create_dir_all(&data_dir)
                 .map_err(|e| format!("datadir {}: {e}", data_dir.display()))?;
-            let lock_file = std::fs::File::options()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&lock_path)
-                .map_err(|e| format!("datadir lock {}: {e}", lock_path.display()))?;
-            lock_file.try_lock().map_err(|_| {
-                format!(
-                    "Cannot obtain a lock on data directory {}. Avila-Node is probably already running.",
-                    data_dir.display()
-                )
-            })?;
+            // Held open for the process's life — the lock is the
+            // point; the binding just keeps it from dropping.
+            let _lock_file = probe_datadir_lock(&data_dir)
+                .map_err(|_| {
+                    format!(
+                        "Cannot obtain a lock on data directory {}. Avila-Node is probably already running.",
+                        data_dir.display()
+                    )
+                })?
+                .ok_or_else(|| format!("datadir lock {}: cannot open", lock_path.display()))?;
             // The waitforblock* registry — RPC handlers park predicates,
             // the sync loop fires them on tick and on shutdown. The
             // scantxoutset slot is pure RPC state (no sync-loop input).
@@ -794,21 +813,14 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             }
             // Refuse to copy a live datadir — the node holds .lock
             // while running; a hot copy could catch mid-write state.
-            let lock_path = src.join(".lock");
-            if let Ok(lock) = std::fs::File::options()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&lock_path)
-            {
-                lock.try_lock().map_err(|_| {
-                    format!(
-                        "{} is locked — stop the node before backing it up",
-                        src.display()
-                    )
-                })?;
-                // Not held — the empty .lock file stays as a marker,
-                // matching Core's datadir layout.
+            // probe_datadir_lock creates the empty .lock marker
+            // (Core's datadir layout) and fails when held.
+            if probe_datadir_lock(&src).is_err() {
+                return Err(format!(
+                    "{} is locked — stop the node before backing it up",
+                    src.display()
+                )
+                .into());
             }
             std::fs::create_dir_all(&dest)?;
             let stamp = std::time::SystemTime::now()
@@ -870,19 +882,12 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     // Refuse a live datadir — the node holds .lock
                     // while running, same as Backup's check; a
                     // rollback out from under it could tear its state.
-                    let lock_path = dir.join(".lock");
-                    if let Ok(lock) = std::fs::File::options()
-                        .write(true)
-                        .create(true)
-                        .truncate(false)
-                        .open(&lock_path)
-                    {
-                        lock.try_lock().map_err(|_| {
-                            format!(
-                                "{} is locked — stop the node before running migrate --rollback",
-                                dir.display()
-                            )
-                        })?;
+                    if probe_datadir_lock(&dir).is_err() {
+                        return Err(format!(
+                            "{} is locked — stop the node before running migrate --rollback",
+                            dir.display()
+                        )
+                        .into());
                     }
                     let non_empty = std::fs::read_dir(&dir)?.next().is_some();
                     if non_empty && !force {

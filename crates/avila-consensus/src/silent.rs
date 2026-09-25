@@ -18,7 +18,7 @@ use crate::transaction::{OutPoint, Transaction};
 /// holds the BIP352 label integers this address scans for (`m = 0`
 /// is the change label — every wallet checks it even when no other
 /// labels are used).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SilentAddress {
     /// `d_scan` — the 32-byte scan private key.
     pub scan_priv: [u8; 32],
@@ -26,6 +26,27 @@ pub struct SilentAddress {
     pub spend_pub: [u8; 33],
     /// BIP352 label integers to detect (always includes 0 = change).
     pub labels: Vec<u32>,
+}
+
+/// Audit low: derived `Debug` would print `scan_priv` — redact it;
+/// the spend pubkey and labels are public and stay visible.
+impl std::fmt::Debug for SilentAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SilentAddress")
+            .field("scan_priv", &"[redacted]")
+            .field("spend_pub", &self.spend_pub)
+            .field("labels", &self.labels)
+            .finish()
+    }
+}
+
+/// Audit V-S3: a dropped silent watch erases its scan key — the key
+/// is secret (it reveals every payment detected to it) and freed heap
+/// retains it until reuse.
+impl Drop for SilentAddress {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.scan_priv);
+    }
 }
 
 /// `label_point = hash_BIP0352/Label(ser256(b_scan) || ser32(m))·G` —

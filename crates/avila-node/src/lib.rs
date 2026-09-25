@@ -64,8 +64,10 @@ impl Node {
         }
     }
 
-    /// Replace this gate only as real implementations pass the roadmap gates.
-    /// It cannot be bypassed by choosing another network or adding a flag.
+    /// The shell-`Node` gate: this struct is config+journal scaffolding
+    /// for the CLI/GUI shell — production startup runs through
+    /// `sync::run`, not here (audit low: the "cannot be bypassed"
+    /// claim was stale; the gate guards this shell only).
     pub fn start(&mut self) -> Result<(), NodeError> {
         self.lifecycle = Lifecycle::StartupBlocked;
         self.events.push(NodeEvent::StartupBlocked)?;

@@ -562,6 +562,10 @@ pub struct Mempool {
     /// Core's `-mempoolexpiry` in seconds — a pooled entry older than
     /// this is swept regardless of fee.
     mempool_expiry_secs: u32,
+    /// Last `expire` sweep timestamp — the scan is O(pool), so it
+    /// runs at most once per minute rather than per admission
+    /// (audit low: an admission flood made it quadratic).
+    last_expire: u32,
     /// Ordered by [`ScoreKey`] (Core's `descendant_score_index`) — the
     /// eviction cursor for the capacity trim. Kept in sync with every
     /// entry's [`Self::effective_score`] on each insertion and removal
@@ -633,6 +637,7 @@ impl Mempool {
             last_rolling_fee_update: 0,
             block_since_rolling_fee_bump: false,
             mempool_expiry_secs: DEFAULT_MEMPOOL_EXPIRY_SECS,
+            last_expire: 0,
             score_index: std::collections::BTreeSet::new(),
             #[cfg(test)]
             descendant_walk_count: std::cell::Cell::new(0),
@@ -1481,9 +1486,14 @@ impl Mempool {
         // 0. Sweep anything that's aged out (Core's `CTxMemPool::Expire`,
         //    normally run from a periodic scheduled task or a reorg;
         //    driven off admission here instead since this crate has no
-        //    scheduler of its own). Cheap relative to admission itself
-        //    and bounded by the entry cap.
-        self.expire(now);
+        //    scheduler of its own). Audit low: throttle the O(pool)
+        //    scan to once a minute — expiry is a minute-resolution
+        //    concept, so per-admission precision bought nothing but
+        //    quadratic admission cost.
+        if now.saturating_sub(self.last_expire) >= 60 {
+            self.last_expire = now;
+            self.expire(now);
+        }
 
         // 1. Context-free consensus (Core's CheckTransaction).
         check_transaction(&tx)?;

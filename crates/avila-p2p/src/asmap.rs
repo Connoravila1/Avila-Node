@@ -30,6 +30,10 @@ pub struct Prefix {
 #[derive(Default, Debug, Clone)]
 pub struct AsMap {
     entries: Vec<Prefix>,
+    /// Audit low: lookups were O(entries) — one hash lookup per
+    /// prefix length instead. Keyed by (plen, masked network bits).
+    /// Built at load/from_entries; `entries` stays for len/is_empty.
+    index: std::collections::HashMap<(u8, u32), u32>,
 }
 
 impl AsMap {
@@ -44,7 +48,15 @@ impl AsMap {
     /// longest prefix wins at lookup time.
     #[must_use]
     pub fn from_entries(entries: Vec<Prefix>) -> Self {
-        Self { entries }
+        let mut index = std::collections::HashMap::with_capacity(entries.len());
+        for p in &entries {
+            let plen = p.plen.min(32);
+            let masked = if plen == 0 { 0 } else { p.net >> (32 - plen) };
+            // `insert` (not or_insert): the old linear scan kept the
+            // LAST duplicate row's ASN — same tie-break.
+            index.insert((plen, masked), p.asn);
+        }
+        Self { entries, index }
     }
 
     /// The ASN for `ip`, longest-prefix match. IPv6 inputs bucket by
@@ -62,14 +74,14 @@ impl AsMap {
                 }
             }
         };
-        self.entries
-            .iter()
-            .filter(|p| {
-                let plen = p.plen.min(32);
-                plen == 0 || (v4 >> (32 - plen)) == (p.net >> (32 - plen))
-            })
-            .max_by_key(|p| p.plen)
-            .map(|p| p.asn)
+        // Longest-prefix first — the index makes each probe O(1).
+        for plen in (0..=32u8).rev() {
+            let masked = if plen == 0 { 0 } else { v4 >> (32 - plen) };
+            if let Some(asn) = self.index.get(&(plen, masked)) {
+                return Some(*asn);
+            }
+        }
+        None
     }
 
     /// Number of prefix rows loaded.
@@ -93,7 +105,25 @@ impl AsMap {
     /// This is the operator-facing bridge until Core's bit-packed
     /// `asmap.dat` (kartograf output) parsing lands; a map converted
     /// to these rows drives identical bucketing.
+    /// Size guard — a real kartograf-style text asmap is a few MB;
+    /// 64 MiB is generous. An unbounded `read_to_string` let a corrupt
+    /// or hostile file stall startup on an allocation (audit low).
+    const MAX_ASMAP_BYTES: u64 = 64 * 1024 * 1024;
+    /// ~1.2M prefixes cover the v4 table several times over.
+    const MAX_ASMAP_ENTRIES: usize = 4_000_000;
+
     pub fn load_file(path: &std::path::Path) -> std::io::Result<(Self, usize)> {
+        let meta = std::fs::metadata(path)?;
+        if meta.len() > Self::MAX_ASMAP_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "asmap file too large ({} bytes > {})",
+                    meta.len(),
+                    Self::MAX_ASMAP_BYTES
+                ),
+            ));
+        }
         let text = std::fs::read_to_string(path)?;
         let mut entries = Vec::new();
         let mut skipped = 0usize;
@@ -122,11 +152,19 @@ impl AsMap {
                 })
             })();
             match row {
-                Some(p) => entries.push(p),
+                Some(p) => {
+                    if entries.len() >= Self::MAX_ASMAP_ENTRIES {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "asmap entry count exceeds bound",
+                        ));
+                    }
+                    entries.push(p);
+                }
                 None => skipped += 1,
             }
         }
-        Ok((Self { entries }, skipped))
+        Ok((Self::from_entries(entries), skipped))
     }
 }
 

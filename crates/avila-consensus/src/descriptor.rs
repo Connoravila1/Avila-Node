@@ -289,6 +289,22 @@ pub struct FlatProvider {
     pub tr_trees: HashMap<[u8; 32], TaprootSpendData>,
 }
 
+/// Audit SEED-3/V-S3: a dropped provider erases its secret material —
+/// secrets left in freed heap survive until reallocation overwrites
+/// them. `SecretKey::non_secure_erase` is a volatile write the
+/// optimizer can't remove.
+impl Drop for FlatProvider {
+    fn drop(&mut self) {
+        for sk in self.keys.values_mut() {
+            sk.non_secure_erase();
+        }
+        for x in self.xprvs.values_mut() {
+            zeroize::Zeroize::zeroize(&mut x.key);
+            zeroize::Zeroize::zeroize(&mut x.chain_code);
+        }
+    }
+}
+
 /// Core's `TaprootSpendData` — what a `tr()` expansion records so the
 /// output script can later be inferred back into `tr(...)` form.
 #[derive(Clone, Debug, Default)]

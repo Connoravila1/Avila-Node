@@ -129,6 +129,11 @@ pub fn resolve_entropy(
         hex::encode(&avila_consensus::hash::sha256(&preimage))
     }
     let mut warnings = Vec::new();
+    // Audit low: two entropy inputs at once is a caller bug — picking
+    // one silently risks seeding from the wrong source. Refuse.
+    if dice.is_some() && entropy_hex.is_some() {
+        return Err("entropy and dice are mutually exclusive — pick one source".into());
+    }
     let (mut seed, source, input_commit) = if let Some(rolls) = dice {
         let rolls = rolls.trim();
         // Hard floor: 50 D6 rolls ≈ 129 bits. Fewer than that is a
@@ -215,19 +220,29 @@ pub fn signer_provider_from_descs(
     let mut signing = avila_consensus::descriptor::FlatProvider::default();
     let mut expanded = avila_consensus::descriptor::FlatProvider::default();
     for d in descs_private {
-        let (parsed, p, _) = avila_consensus::descriptor::parse_descriptors(d, params, true)?;
-        signing.keys.extend(p.keys);
-        signing.xprvs.extend(p.xprvs);
+        let (parsed, mut p, _) = avila_consensus::descriptor::parse_descriptors(d, params, true)?;
+        // FlatProvider's secret-erasing Drop forbids moving fields
+        // out — take the maps.
+        signing.keys.extend(std::mem::take(&mut p.keys));
+        signing.xprvs.extend(std::mem::take(&mut p.xprvs));
         let mut cache = avila_consensus::descriptor::DeriveCache::new();
         for pos in 0..64u32 {
             let _ = parsed[0].expand_into(pos, &signing, &mut expanded, true, &mut cache);
         }
     }
-    signing.keys.extend(expanded.keys);
-    signing.pubkeys.extend(expanded.pubkeys);
-    signing.origins.extend(expanded.origins);
-    signing.scripts.extend(expanded.scripts);
-    signing.tr_trees.extend(expanded.tr_trees);
+    signing.keys.extend(std::mem::take(&mut expanded.keys));
+    signing
+        .pubkeys
+        .extend(std::mem::take(&mut expanded.pubkeys));
+    signing
+        .origins
+        .extend(std::mem::take(&mut expanded.origins));
+    signing
+        .scripts
+        .extend(std::mem::take(&mut expanded.scripts));
+    signing
+        .tr_trees
+        .extend(std::mem::take(&mut expanded.tr_trees));
     Ok(signing)
 }
 
@@ -254,6 +269,19 @@ pub struct VaultContents {
     pub entropy_commitment: String,
     /// BIP352 scan watches: (scan_priv, spend_pub, labels).
     pub silents: Vec<([u8; 32], [u8; 33], Vec<u32>)>,
+}
+
+/// Audit V-S3: parsed vault contents hold xprv text and scan keys —
+/// erase them on drop so freed pages don't retain key material.
+impl Drop for VaultContents {
+    fn drop(&mut self) {
+        for d in &mut self.descs_private {
+            zeroize::Zeroize::zeroize(d);
+        }
+        for (scan, _, _) in &mut self.silents {
+            zeroize::Zeroize::zeroize(scan);
+        }
+    }
 }
 
 /// Seal the signer's secrets under `passphrase` — argon2id KDF →
@@ -327,6 +355,10 @@ pub fn vault_seal(
         )
         .map_err(|_| "encrypt failed".to_string())?;
     out.extend_from_slice(&ct);
+    // Audit V-S3: the KDF key and the plaintext (xprv bodies, scan
+    // keys) must not linger in freed heap after seal.
+    zeroize::Zeroize::zeroize(&mut key);
+    zeroize::Zeroize::zeroize(&mut pt);
     Ok(out)
 }
 
@@ -418,6 +450,7 @@ pub fn vault_open(bytes: &[u8], passphrase: &str) -> Result<VaultContents, Strin
             Ok(out)
         }
     }
+    let mut pt = pt;
     let mut cur = Cursor { buf: &pt, at: 0 };
     let plen = cur.take(1)?[0] as usize;
     let provenance =
@@ -449,6 +482,11 @@ pub fn vault_open(bytes: &[u8], passphrase: &str) -> Result<VaultContents, Strin
             silents.push((scan, spend, labels));
         }
     }
+    // Audit V-S3: key material and the decrypted blob are erased
+    // before the parsed contents leave — the plaintext Vec's heap
+    // pages don't survive as recoverable free-list data.
+    zeroize::Zeroize::zeroize(&mut key);
+    zeroize::Zeroize::zeroize(&mut pt);
     Ok(VaultContents {
         descs_private,
         descs_watch,
@@ -729,7 +767,11 @@ impl WatchWallet {
     /// left a public stub for this spend key (V-S1), its labels carry
     /// over — the vault-restored key picks the watch back up whole.
     pub fn track_silent(&mut self, mut addr: avila_consensus::silent::SilentAddress) {
-        if let Some(i) = self.pending_silents.iter().position(|(b, _)| *b == addr.spend_pub) {
+        if let Some(i) = self
+            .pending_silents
+            .iter()
+            .position(|(b, _)| *b == addr.spend_pub)
+        {
             let (_, labels) = self.pending_silents.remove(i);
             for m in labels {
                 if !addr.labels.contains(&m) {
@@ -761,6 +803,22 @@ impl WatchWallet {
         }
         self.descs.push(desc);
         self.dirty = true;
+    }
+
+    /// Issue the next receive/change index for `descs[i]` and mark the
+    /// wallet dirty — audit SP-F5: a bare `next_index += 1` never
+    /// persisted, so a crash between issue and the next unrelated
+    /// persist re-issued the same address. Returns the issued index,
+    /// or `None` when the descriptor's range is exhausted.
+    pub fn bump_next_index(&mut self, i: usize) -> Option<u32> {
+        let d = self.descs.get_mut(i)?;
+        if d.next_index > d.range.1 {
+            return None;
+        }
+        let issued = d.next_index;
+        d.next_index += 1;
+        self.dirty = true;
+        Some(issued)
     }
 
     /// Installs the opt-in signer — the wallet remains watch-only in
@@ -1053,18 +1111,32 @@ impl WatchWallet {
         }
         let hex_bytes =
             |v: &serde_json::Value| -> Option<Vec<u8>> { hex::decode(v.as_str()?).ok() };
+        // Audit R-load: a damaged or hostile file must never panic or
+        // balloon memory. Every array index is bounds-checked via
+        // `get`, and section counts are capped relative to the file's
+        // own size (each serialized entry costs dozens of bytes, so a
+        // count that big can't be legitimately present).
         let descs = v["descs"].as_array().ok_or(())?;
+        if descs.len() * 16 > text.len() {
+            return Err(());
+        }
         for d in descs {
-            let scripts: HashMap<Vec<u8>, u32> = d["scripts"]
-                .as_array()
-                .ok_or(())?
+            let raw_scripts = d["scripts"].as_array().ok_or(())?;
+            if raw_scripts.len() * 36 > text.len() {
+                return Err(());
+            }
+            let scripts: HashMap<Vec<u8>, u32> = raw_scripts
                 .iter()
                 .filter_map(|pair| {
                     let arr = pair.as_array()?;
-                    Some((hex_bytes(&arr[0])?, arr[1].as_u64()? as u32))
+                    Some((hex_bytes(arr.first()?)?, arr.get(1)?.as_u64()? as u32))
                 })
                 .collect();
             let range = d["range"].as_array().ok_or(())?;
+            let (r0, r1) = (
+                range.first().and_then(|x| x.as_u64()).ok_or(())?,
+                range.get(1).and_then(|x| x.as_u64()).ok_or(())?,
+            );
             let td = TrackedDesc {
                 desc: d["desc"].as_str().ok_or(())?.to_string(),
                 timestamp: d["timestamp"].as_i64().ok_or(())?,
@@ -1072,10 +1144,7 @@ impl WatchWallet {
                 internal: d["internal"].as_bool().unwrap_or(false),
                 label: d["label"].as_str().unwrap_or_default().to_string(),
                 next_index: d["next_index"].as_u64().unwrap_or(0) as u32,
-                range: (
-                    range[0].as_u64().unwrap_or(0) as u32,
-                    range[1].as_u64().unwrap_or(0) as u32,
-                ),
+                range: (r0 as u32, r1 as u32),
                 scripts,
             };
             let idx = self.descs.len();
@@ -1089,7 +1158,11 @@ impl WatchWallet {
         // to `pending_silents` until the vault's scan key reactivates
         // it; a legacy entry still carrying `scan` is honored once —
         // the next persist strips it.
-        for a in v["silents"].as_array().map_or(&[][..], Vec::as_slice) {
+        let silents_arr = v["silents"].as_array().map_or(&[][..], Vec::as_slice);
+        if silents_arr.len() * 66 > text.len() {
+            return Err(());
+        }
+        for a in silents_arr {
             let Some(spend) = hex_bytes(&a["spend"]) else {
                 continue;
             };
@@ -1121,6 +1194,9 @@ impl WatchWallet {
             }
         }
         let coins = v["coins"].as_array().ok_or(())?;
+        if coins.len() * 64 > text.len() {
+            return Err(());
+        }
         for c in coins {
             let txid: Txid = c["txid"].as_str().ok_or(())?.parse().map_err(|_| ())?;
             let vout = c["vout"].as_u64().ok_or(())? as u32;
@@ -1140,16 +1216,24 @@ impl WatchWallet {
                 },
             );
         }
-        for h in v["chain"].as_array().ok_or(())? {
+        let chain_arr = v["chain"].as_array().ok_or(())?;
+        if chain_arr.len() * 64 > text.len() {
+            return Err(());
+        }
+        for h in chain_arr {
             self.chain
                 .push(h.as_str().ok_or(())?.parse().map_err(|_| ())?);
         }
         self.scan_floor = v["scan_floor"].as_u64().unwrap_or(0) as u32;
-        for g in v["gaps"].as_array().unwrap_or(&vec![]) {
+        let gaps_arr: &[serde_json::Value] = v["gaps"].as_array().map_or(&[][..], Vec::as_slice);
+        if gaps_arr.len() * 8 > text.len() {
+            return Err(());
+        }
+        for g in gaps_arr {
             let arr = g.as_array().ok_or(())?;
             self.gaps.push((
-                arr[0].as_u64().ok_or(())? as u32,
-                arr[1].as_u64().ok_or(())? as u32,
+                arr.first().and_then(|x| x.as_u64()).ok_or(())? as u32,
+                arr.get(1).and_then(|x| x.as_u64()).ok_or(())? as u32,
             ));
         }
         Ok(())

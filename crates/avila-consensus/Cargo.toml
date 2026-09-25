@@ -21,6 +21,8 @@ secp256k1.workspace = true
 redb.workspace = true
 thiserror.workspace = true
 k256 = "0.14.0"
+getrandom = "0.3"
+zeroize = "1"
 
 [dev-dependencies]
 # Differential references only. Neither crate is used by the validation path.

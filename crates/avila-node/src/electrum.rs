@@ -311,10 +311,12 @@ fn handle(
         let cancel = cancel.clone();
         let alive = alive.clone();
         thread::spawn(move || {
-            loop {
-                match wake_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            while !cancel.load(Ordering::Relaxed) && alive.load(Ordering::Relaxed) {
+                if matches!(
+                    wake_rx.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Disconnected)
+                ) {
+                    break;
                 }
                 if cancel.load(Ordering::Relaxed) || !alive.load(Ordering::Relaxed) {
                     break;
@@ -1098,6 +1100,8 @@ fn dispatch(
                 None,
                 None,
                 None,
+                // Internal caller — not wallet-scoped (audit CA-F4).
+                false,
             );
             match error {
                 Some((code, msg)) => reply_err(id, code, &msg),
@@ -1118,6 +1122,7 @@ fn dispatch(
                 None,
                 None,
                 None,
+                false,
             );
             match error {
                 Some(_) => reply(id, json!(-1)),
@@ -1350,6 +1355,7 @@ mod tests {
             profile: Default::default(),
             next_block: None,
             eclipse: Vec::new(),
+            prune_bytes: None,
         }));
         let cancel = Arc::new(AtomicBool::new(false));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1462,6 +1468,7 @@ mod tests {
             profile: Default::default(),
             next_block: None,
             eclipse: Vec::new(),
+            prune_bytes: None,
         }));
         let cancel = Arc::new(AtomicBool::new(false));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1604,6 +1611,7 @@ mod tests {
             profile: Default::default(),
             next_block: None,
             eclipse: Vec::new(),
+            prune_bytes: None,
         }))
     }
 

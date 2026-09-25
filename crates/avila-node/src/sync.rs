@@ -117,7 +117,7 @@ impl Default for SyncConfig {
         Self {
             connect: Vec::new(),
             target_height: 100,
-            max_peers: 8,
+            max_peers: avila_p2p::manager::DEFAULT_MAX_PEERS,
             timeout: Duration::from_secs(120),
             proxy: None,
             asmap_path: None,
@@ -170,6 +170,9 @@ pub struct SyncProgress {
     /// What the node has actually verified — connected vs. assumed
     /// coverage per the typed report (`getvalidationreport`).
     pub validation: avila_consensus::chainstate::ValidationReport,
+    /// Configured block-store prune budget — `Some` means the node
+    /// runs in prune mode (`pruneblockchain` is meaningful).
+    pub prune_bytes: Option<u64>,
     /// Work and time along the best header chain (see [`ChainProfile`]).
     pub profile: std::sync::Arc<ChainProfile>,
     /// The block the mempool would produce next; `None` unless
@@ -585,14 +588,11 @@ pub fn run(
         // Periodic chainstate checkpoint — Core's `FlushStateToDisk`
         // cadence. A crash otherwise replays every blk file since the
         // last state.dat; bounding the interval bounds the replay.
-        // Skipped while the SwiftSync transient window is held — a
-        // mid-window flush would write the coins the scheme exists
-        // to skip (crash during the window replays it — the
-        // documented trade-off).
-        if cfg.data_dir.is_some()
-            && !cs.swiftsync_holding()
-            && last_flush + FLUSH_INTERVAL <= connected
-        {
+        // The SwiftSync hold no longer suppresses this: the tag
+        // aggregate tracks the live set across layers, so mid-window
+        // flushes preserve hint correctness (audit CA-F1 — holding
+        // every coin in memory was an unbounded DoS surface).
+        if cfg.data_dir.is_some() && last_flush + FLUSH_INTERVAL <= connected {
             last_flush = connected;
             cs.flush().map_err(SyncError::Store)?;
         }
@@ -707,6 +707,7 @@ pub fn run(
             profile: chain_profile_arc.clone(),
             next_block: next_block.clone(),
             eclipse: eclipse.clone(),
+            prune_bytes: cfg.prune_bytes,
         };
         if let Some(status) = &cfg.status
             && let Ok(mut w) = status.write()

@@ -63,8 +63,21 @@ pub struct AddrBook {
     /// the table is full. `seq` breaks ties the same way it always did
     /// (oldest-inserted first among equal `last_seen`).
     order: BTreeSet<(u32, u64, AddrKey)>,
+    /// Audit P2P-6: which gossip source inserted each entry —
+    /// `None` for operator/seed/file inserts. Lets eviction prefer a
+    /// flooding source's own entries over the table's oldest.
+    source_of: HashMap<AddrKey, u64>,
+    /// source id → its entries keyed by insertion `seq`, oldest first.
+    by_source: HashMap<u64, BTreeSet<(u64, AddrKey)>>,
     next_seq: u64,
     cap: usize,
+}
+
+/// The most entries one gossip source may hold — Core's per-source
+/// bucket scarcity. A flooding peer churns through its own slots
+/// instead of evicting everyone else's entries.
+fn source_quota(cap: usize) -> usize {
+    (cap / 64).max(8)
 }
 
 impl AddrBook {
@@ -81,6 +94,8 @@ impl AddrBook {
             table: HashMap::new(),
             seq: HashMap::new(),
             order: BTreeSet::new(),
+            source_of: HashMap::new(),
+            by_source: HashMap::new(),
             next_seq: 0,
             cap,
         }
@@ -126,7 +141,7 @@ impl AddrBook {
             return false;
         }
         if self.table.len() >= self.cap {
-            self.evict_oldest();
+            self.evict_for_insert(None);
         }
         let seq = self.next_seq;
         self.seq.insert(key, seq);
@@ -145,10 +160,69 @@ impl AddrBook {
         true
     }
 
-    /// Bulk gossip intake (`addr`/`addrv2` messages).
+    /// Gossip intake with a known source — audit P2P-6. `source` is a
+    /// hash of the relaying peer's address; when the source has filled
+    /// its quota the new entry evicts the source's own oldest entry,
+    /// not the table's oldest. Sources can't buy more table by sending
+    /// more traffic.
+    pub fn add_from(&mut self, addr: NetAddr, seen: u32, now: u32, source: u64) -> bool {
+        if network_of(&addr) == Network::Unroutable {
+            return false;
+        }
+        let key = key_of(&addr);
+        if self.table.contains_key(&key) {
+            // Existing entries refresh without consuming source quota
+            // (the update keeps its original owner — moving ownership
+            // would let a flusher launder entries).
+            return self.add(addr, seen, now);
+        }
+        // The quota binds even when the table has room — a source at
+        // its limit churns its own oldest slot rather than growing.
+        if self.table.len() >= self.cap
+            || self
+                .by_source
+                .get(&source)
+                .is_some_and(|o| o.len() >= source_quota(self.cap))
+        {
+            self.evict_for_insert(Some(source));
+        }
+        let seq = self.next_seq;
+        self.seq.insert(key, seq);
+        self.next_seq += 1;
+        let last_seen = seen.min(now);
+        self.order.insert((last_seen, seq, key));
+        self.table.insert(
+            key,
+            AddrInfo {
+                addr,
+                last_seen,
+                tried: false,
+                attempts: 0,
+            },
+        );
+        self.source_of.insert(key, source);
+        self.by_source.entry(source).or_default().insert((seq, key));
+        true
+    }
+
+    /// Bulk gossip intake (`addr`/`addrv2` messages) — sourceless form
+    /// for operator/file inserts.
     pub fn add_many(&mut self, addrs: impl Iterator<Item = (NetAddr, u32)>, now: u32) {
         for (addr, seen) in addrs {
             self.add(addr, seen, now);
+        }
+    }
+
+    /// Bulk gossip intake with a known source — every insert charges
+    /// against that source's quota (audit P2P-6).
+    pub fn add_many_from(
+        &mut self,
+        addrs: impl Iterator<Item = (NetAddr, u32)>,
+        now: u32,
+        source: u64,
+    ) {
+        for (addr, seen) in addrs {
+            self.add_from(addr, seen, now, source);
         }
     }
 
@@ -170,10 +244,7 @@ impl AddrBook {
     /// Drops the entry (e.g. the peer proved unreachable or hostile).
     pub fn forget(&mut self, addr: &NetAddr) {
         let key = key_of(addr);
-        if let Some(e) = self.table.remove(&key) {
-            let seq = self.seq.remove(&key).unwrap_or(0);
-            self.order.remove(&(e.last_seen, seq, key));
-        }
+        self.remove_key(key);
     }
 
     /// Picks the next outbound candidate: fewest attempts first, then
@@ -323,13 +394,40 @@ impl AddrBook {
         Ok(self.table.len())
     }
 
-    /// Oldest-seen entries go first when the cap binds — O(log n) via
-    /// `order`'s first element, rather than scanning the whole table.
-    fn evict_oldest(&mut self) {
+    /// Picks the eviction victim for a new insert: when `source` has
+    /// filled its quota, its own oldest entry goes (audit P2P-6);
+    /// otherwise the table's oldest-seen entry — O(log n) via `order`'s
+    /// first element rather than a full-table scan.
+    fn evict_for_insert(&mut self, source: Option<u64>) {
+        let quota = source_quota(self.cap);
+        if let Some(src) = source
+            && let Some(owned) = self.by_source.get(&src)
+            && owned.len() >= quota
+            && let Some(&(_, key)) = owned.iter().next()
+        {
+            self.remove_key(key);
+            return;
+        }
         if let Some(&victim) = self.order.iter().next() {
-            self.order.remove(&victim);
-            self.table.remove(&victim.2);
-            self.seq.remove(&victim.2);
+            self.remove_key(victim.2);
+        }
+    }
+
+    /// Removes one entry from every index — `order`, `seq`, and the
+    /// audit-P2P-6 source maps.
+    fn remove_key(&mut self, key: AddrKey) {
+        if let Some(e) = self.table.remove(&key) {
+            if let Some(seq) = self.seq.remove(&key) {
+                self.order.remove(&(e.last_seen, seq, key));
+            }
+            if let Some(src) = self.source_of.remove(&key)
+                && let Some(owned) = self.by_source.get_mut(&src)
+            {
+                owned.retain(|(_, k)| *k != key);
+                if owned.is_empty() {
+                    self.by_source.remove(&src);
+                }
+            }
         }
     }
 }
@@ -571,6 +669,40 @@ mod tests {
         let e = &book.table[&key_of(&addr(1, 8333))];
         assert_eq!(e.last_seen, 190);
         assert_eq!(e.attempts, 1); // preserved across re-gossip
+    }
+
+    /// Audit P2P-6: a flooding source churns its own quota — it can
+    /// never evict other sources' entries, even when the table is
+    /// full. Distinct gossip sources get independent slots.
+    #[test]
+    fn source_quota_churns_own_entries() {
+        let mut book = AddrBook::with_cap(16); // quota = 16/64 → min 8
+        // Source 7 plants its quota of fresh entries.
+        for i in 0..8 {
+            assert!(book.add_from(addr(i, 8333), 100 + i as u32, 200, 7));
+        }
+        // Its 9th insert evicts ITS OWN oldest (octet 0), not anyone
+        // else's — the quota binds below the table cap.
+        assert!(book.add_from(addr(100, 8333), 190, 200, 7));
+        assert_eq!(book.len(), 8);
+        assert!(!book.table.contains_key(&key_of(&addr(0, 8333))));
+        assert!(book.table.contains_key(&key_of(&addr(100, 8333))));
+        // A second source fills the table to the cap…
+        for i in 8..16 {
+            assert!(book.add_from(addr(i, 8333), 150, 200, 8));
+        }
+        assert_eq!(book.len(), 16);
+        // …and at the cap, source 7's next insert still costs only
+        // source-7 entries — source 8's are untouched.
+        assert!(book.add_from(addr(101, 8333), 195, 200, 7));
+        assert_eq!(book.len(), 16);
+        assert!(book.table.contains_key(&key_of(&addr(8, 8333))));
+        assert!(book.table.contains_key(&key_of(&addr(101, 8333))));
+        assert!(!book.table.contains_key(&key_of(&addr(1, 8333))));
+        // Source 8 (under quota at the cap) evicts the table's global
+        // oldest — which is a source-7 entry.
+        assert!(book.add_from(addr(102, 8333), 196, 200, 8));
+        assert_eq!(book.len(), 16);
     }
 
     #[test]
