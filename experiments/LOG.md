@@ -626,3 +626,33 @@ First real mainnet run (`avila-gui --config config/mainnet.toml`,
   overwrote the magic+records on restart (now `O_APPEND` + torn-tail
   truncation on open); `pending_bundles` capped; shadow drive capped
   per call so proof replay can't monopolize the sync thread.
+
+- **Stored-body replay no longer OOMs or wedges — and reports itself
+  end-to-end (queue: crash recovery).** A datadir carrying ~13k
+  stored-but-unconnected bodies exposed three compounding pathologies
+  in `resume`: it decoded *every* stored body into a `Vec<Block>` at
+  once (RSS balloon → the kernel OOM-killed the desktop under a
+  30 GB-no-swap box), retried the whole set per leftover pass
+  (quadratic), and ran `best_bodied_descendant` + a `chain_set`
+  HashSet rebuild per connected block (O(n²) at datadir scale).
+  Fixes: positions-not-bodies replay (height-sorted, lazy decode,
+  single linear pass + one leftover retry), DFS capped at 2048
+  visits, O(1) height-indexed fork walk, tick-loop replay gated to
+  tip-children only. Evidence: bounded 4 GiB run replayed 13,290
+  bodies with flat ~800 MB RSS and monotone `restore: replay
+  N/13290 (tip H)` milestones.
+
+- **Startup phases are now real, not inferred.** `SyncProgress`
+  gains `phase: Phase` published from the first line of `run`
+  (Opening / RestoringHeaders / VerifyingChain / ReconcilingBackend
+  / ReplayingBodies / FindingPeers / Syncing) — the GUI can no
+  longer show a frozen `connected` while a 40-minute backlog replay
+  runs underneath, which was exactly the "sync appears wedged" UI
+  lie. Chainstate carries an optional `ProgressEvent` sink
+  (`None` = silent, as before); `with_store_coinsdb_progress`
+  threads it through open/restore/resume. GUI renders a `Starting`
+  lifecycle phase + per-phase banner with determinate counters
+  (headers restored N/M, replay done/total + live tip) — no
+  ambiguity about what a number means. Locked in by
+  `resume_reports_progress_phases` (asserts the event sequence and
+  counts on a synthetic 100-body parked backlog).

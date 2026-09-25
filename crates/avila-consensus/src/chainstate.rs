@@ -4840,6 +4840,70 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The startup progress sink reports each phase with live counts —
+    /// headers reinserted, chain verified, parked bodies replayed — so a
+    /// caller can render real startup progress instead of a stale tip.
+    #[test]
+    fn resume_reports_progress_phases() {
+        let params = params();
+        let dir = store_dir("progress-sink");
+        // `blocks[i]` is height i+1. Header 41 (index 40) is known but
+        // its body never arrives, so bodies at heights 42..=141 (indexes
+        // 41..=140) all park — a 100-deep pending backlog for the replay,
+        // hitting one `is_multiple_of(100)` emit.
+        let blocks = probe_chain(141, &[], &params);
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        for block in &blocks[..=140] {
+            cs.accept_header(&block.header, NOW).unwrap();
+        }
+        for block in &blocks[..=39] {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        for block in &blocks[41..=140] {
+            assert!(matches!(
+                cs.accept_block(block, NOW),
+                Ok(Acceptance::Parked { .. })
+            ));
+        }
+        cs.flush().unwrap();
+        drop(cs);
+
+        let events: std::sync::Arc<std::sync::Mutex<Vec<ProgressEvent>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = std::sync::Arc::clone(&events);
+        let cs = Chainstate::with_store_coinsdb_progress(
+            &dir,
+            &params,
+            NOW,
+            0,
+            Some(Box::new(move |ev| {
+                sink_events.lock().unwrap().push(ev);
+            })),
+        )
+        .unwrap();
+        let events = events.lock().unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ProgressEvent::StoreIndexed { bodies } if *bodies >= 140)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ProgressEvent::RestoreHeaders { total, .. } if *total >= 141)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ProgressEvent::ChainVerify { total, .. } if *total == 41)));
+        // The 100-body backlog hits exactly one milestone; its tip still
+        // shows the connected frontier — the gap at 41 means these bodies
+        // can only ever park, and the replay must say so rather than
+        // pretend the counter moved.
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ProgressEvent::ReplayBodies { done: 100, total: 100, tip: 40 })));
+        drop(events);
+        assert_eq!(cs.tip_hash(), blocks[39].block_hash());
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn snapshot_resume_skips_covered_bodies() {
         let params = params();
