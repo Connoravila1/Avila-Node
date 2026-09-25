@@ -313,6 +313,20 @@ pub enum Message {
     /// `reqbisec` — BIP330: ask the peer to bisect its set when a sketch
     /// exceeds capacity (empty payload like `mempool`).
     ReqBisec,
+    /// `utxproof` — Avila utreexo proof bundle: the spend set + the
+    /// accumulator proof for one block, sent alongside its `block`
+    /// message. A utreexo-mode receiver validates the block against a
+    /// ~1 KiB stump instead of the UTXO set; everyone else ignores it.
+    /// (Intra-Avila transport for queue #6 — no other implementation
+    /// speaks it yet.)
+    UtxoProof {
+        /// The block this bundle belongs to.
+        block_hash: avila_consensus::hash::BlockHash,
+        /// `avila_consensus::utreexo::encode_spend_bundle` output:
+        /// compact-size count, per-input `(outpoint, coin)` records,
+        /// then the rustreexo `Proof` serialization.
+        bundle: Vec<u8>,
+    },
     /// Any other command — Core ignores unknown commands; we preserve the
     /// payload so a session layer can log or drop the peer itself.
     Unknown {
@@ -471,6 +485,7 @@ impl Message {
             Self::Sketch(_) => "sketch",
             Self::ReconcilDiff { .. } => "reconcildiff",
             Self::ReqBisec => "reqbisec",
+            Self::UtxoProof { .. } => "utxproof",
             Self::Unknown { command, .. } => command.as_str(),
         }
     }
@@ -603,6 +618,10 @@ impl Message {
                 for id in short_ids {
                     out.extend_from_slice(&id.to_le_bytes());
                 }
+            }
+            Self::UtxoProof { block_hash, bundle } => {
+                out.extend_from_slice(block_hash.as_bytes());
+                write_var_bytes(&mut out, bundle);
             }
         }
         out
@@ -874,6 +893,18 @@ impl Message {
                 }
             }
             "reqbisec" => Self::ReqBisec,
+            "utxproof" => {
+                let hash_bytes: [u8; 32] = d
+                    .read_bytes(32)
+                    .map_err(|e| payload_err(name, e))?
+                    .try_into()
+                    .map_err(|_| payload_err(name, "hash width"))?;
+                let bundle = d.read_var_bytes().map_err(|e| payload_err(name, e))?;
+                Self::UtxoProof {
+                    block_hash: avila_consensus::hash::BlockHash::from_bytes(hash_bytes),
+                    bundle,
+                }
+            }
             _ => {
                 return Ok(Self::Unknown {
                     command: name.to_string(),
@@ -1180,5 +1211,49 @@ mod tests {
         let mut payload = Message::Verack.encode();
         payload.push(0xee);
         assert!(Message::decode(&cmd("verack"), &payload).is_err());
+    }
+    #[test]
+    fn utxproof_round_trip() {
+        let hash = avila_consensus::hash::BlockHash::from_bytes([0x42; 32]);
+        let msg = Message::UtxoProof {
+            block_hash: hash,
+            bundle: vec![1, 2, 3, 4],
+        };
+        let back = round_trip(&msg);
+        match back {
+            Message::UtxoProof { block_hash, bundle } => {
+                assert_eq!(block_hash, hash);
+                assert_eq!(bundle, vec![1, 2, 3, 4]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn utxproof_rejects_truncated_hash() {
+        assert!(Message::decode(&cmd("utxproof"), &[0u8; 16]).is_err());
+    }
+
+    #[test]
+    fn utxproof_rejects_declared_overlong_bundle() {
+        // A var-bytes prefix advertising more bundle than the payload
+        // holds must fail before the bytes are trusted.
+        let mut payload = Vec::from([0x42; 32]);
+        payload.push(0xfd); // compact-size u16 marker
+        payload.extend_from_slice(&65535u16.to_le_bytes()); // declares 65535
+        payload.extend_from_slice(&[0u8; 8]);
+        assert!(Message::decode(&cmd("utxproof"), &payload).is_err());
+    }
+
+    #[test]
+    fn utxproof_rejects_trailing_garbage() {
+        let hash = avila_consensus::hash::BlockHash::from_bytes([0x42; 32]);
+        let mut payload = Message::UtxoProof {
+            block_hash: hash,
+            bundle: vec![1, 2, 3],
+        }
+        .encode();
+        payload.push(0xee);
+        assert!(Message::decode(&cmd("utxproof"), &payload).is_err());
     }
 }

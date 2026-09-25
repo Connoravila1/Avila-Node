@@ -638,3 +638,120 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Wire/disk encoding of a proof bundle: `compact_size(n_spends)` then
+/// per-input `txid32 | vout u32-le | compact-coin-record` in the
+/// block's input order, then the rustreexo `Proof` serialization to
+/// end. Decoding must consume every byte — a trailing-garbage bundle
+/// is malformed, not truncated.
+///
+/// `encode_coin`/`decode_coin` are `pub(crate)` — this module owns the
+/// bundle format so p2p carries it as opaque bytes.
+pub fn encode_spend_bundle(spends: &[(OutPoint, Coin)], proof: &Proof<BitcoinNodeHash>) -> Vec<u8> {
+    let mut out = Vec::new();
+    crate::encode::write_compact_size(&mut out, spends.len() as u64);
+    for (op, coin) in spends {
+        out.extend_from_slice(op.txid.as_bytes());
+        out.extend_from_slice(&op.vout.to_le_bytes());
+        out.extend_from_slice(&coinsdb::encode_coin(coin, CoinFormat::Compact));
+    }
+    let _ = proof.serialize(&mut out);
+    out
+}
+
+/// A spend bundle cannot exceed a block's possible input count —
+/// 1M is ~10× the densest feasible block; above that the framing
+/// itself is hostile, whatever the contents.
+const MAX_BUNDLE_SPENDS: u64 = 1_000_000;
+
+/// The decoded spend set + accumulator proof for one block.
+pub type SpendBundle = (Vec<(OutPoint, Coin)>, Proof<BitcoinNodeHash>);
+
+/// Decodes a bundle produced by [`encode_spend_bundle`]. Returns
+/// `None` on any malformed or truncated input — callers treat the
+/// message as garbage, never a consensus signal.
+#[must_use]
+pub fn decode_spend_bundle(buf: &[u8]) -> Option<SpendBundle> {
+    let mut d = crate::encode::Decoder::new(buf);
+    let n = d.read_compact_size().ok()?;
+    if n > MAX_BUNDLE_SPENDS {
+        return None;
+    }
+    let mut spends = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let txid_bytes: [u8; 32] = d.read_bytes(32).ok()?.try_into().ok()?;
+        let vout = d.read_u32_le().ok()?;
+        // A compact coin record is self-delimiting: hand the decoder
+        // the remaining tail as a slice it consumes exactly.
+        let rest = &buf[buf.len() - d.remaining()..];
+        let mut rest = rest;
+        let coin = coinsdb::decode_coin_compact(&mut rest)?;
+        let used = d.remaining() - rest.len();
+        let _ = d.read_bytes(used).ok()?;
+        spends.push((
+            OutPoint {
+                txid: crate::hash::Txid::from_bytes(txid_bytes),
+                vout,
+            },
+            coin,
+        ));
+    }
+    // The proof runs to the end of the payload — hand rustreexo the
+    // remaining slice directly.
+    let consumed = buf.len() - d.remaining();
+    let proof = Proof::deserialize(&buf[consumed..]).ok()?;
+    Some((spends, proof))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod bundle_tests {
+    use super::*;
+    use crate::transaction::{Script, TxOut};
+
+    fn coin(v: i64, h: u32) -> Coin {
+        Coin {
+            out: TxOut {
+                value: v,
+                script_pubkey: Script::new(vec![0x51]),
+            },
+            height: h,
+            coinbase: false,
+        }
+    }
+
+    fn op(i: u8) -> OutPoint {
+        OutPoint {
+            txid: crate::hash::Txid::from_bytes([i; 32]),
+            vout: i as u32,
+        }
+    }
+
+    #[test]
+    fn spend_bundle_roundtrips() {
+        let spends = vec![(op(1), coin(50, 100)), (op(2), coin(75, 200))];
+        let proof = Proof::<BitcoinNodeHash>::default();
+        let bytes = encode_spend_bundle(&spends, &proof);
+        let (back_spend, back_proof) = decode_spend_bundle(&bytes).unwrap();
+        assert_eq!(back_spend.len(), 2);
+        assert_eq!(back_spend[0].0, spends[0].0);
+        assert_eq!(back_spend[0].1.out.value, 50);
+        assert_eq!(back_spend[1].1.height, 200);
+        assert_eq!(back_proof.targets, proof.targets);
+    }
+
+    #[test]
+    fn bundle_rejects_truncation_and_garbage() {
+        let spends = vec![(op(9), coin(1, 1))];
+        let bytes = encode_spend_bundle(&spends, &Proof::default());
+        // Every strict prefix must fail to decode.
+        for cut in 0..bytes.len() {
+            assert!(decode_spend_bundle(&bytes[..cut]).is_none(), "cut {cut}");
+        }
+        // A hostile count header fails fast — no gigabyte alloc.
+        let mut bad = Vec::new();
+        crate::encode::write_compact_size(&mut bad, MAX_BUNDLE_SPENDS + 1);
+        bad.extend_from_slice(&bytes[1..]);
+        assert!(decode_spend_bundle(&bad).is_none());
+    }
+}
