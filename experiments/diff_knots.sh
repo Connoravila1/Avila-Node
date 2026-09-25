@@ -32,7 +32,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-bcli() { bitcoin-cli -regtest -datadir="$KROOT" -rpcport=$KRPC "$@"; }
+bcli() { bitcoin-cli -regtest -datadir="$KROOT" -rpcport=$KRPC -rpcwait "$@"; }
 
 echo "== knots: starting regtest daemon (port $KP2P, rpc $KRPC)"
 bitcoind -regtest -datadir="$KROOT" -daemon -server \
@@ -90,7 +90,8 @@ AVILA_PID=$!
 for _ in $(seq 1 600); do
     COOKIE=$(cat "$AROOT/datadir/regtest/.cookie" 2>/dev/null || true)
     if [ -n "$COOKIE" ]; then
-        H=$(curl -s -u "__cookie__:$COOKIE" \
+        # .cookie is the full `user:pass` pair — `-u "$COOKIE"`, no prefix.
+        H=$(curl -s -u "$COOKIE" \
             -d '{"jsonrpc":"1.0","id":"d","method":"getblockcount","params":[]}' \
             http://127.0.0.1:$ARPC/ 2>/dev/null | jq -r .result 2>/dev/null || echo 0)
         [ "$H" = "$KTIP" ] && break
@@ -101,21 +102,24 @@ done
 echo "   avila tip: $H  (synced from knots over $([ -n "$V1" ] && echo v1 || echo v2-negotiated) P2P)"
 
 arpc() {
-    curl -s -u "__cookie__:$COOKIE" \
+    curl -s -u "$COOKIE" \
         -d "{\"jsonrpc\":\"1.0\",\"id\":\"d\",\"method\":\"$1\",\"params\":$2}" \
         http://127.0.0.1:$ARPC/
 }
 
 # --- differential verdicts ----------------------------------------------
 echo "== diff: testmempoolaccept on the corpus"
-verdict() { # engine tx → "allowed" | "reject:<reason>"
+verdict() { # engine tx → "allowed" | "reject:<reason>" — never
+    # nonzero out (set -e): a top-level RPC error IS a rejection.
     if [ "$1" = knots ]; then
         bcli testmempoolaccept "[\"$2\"]" 2>/dev/null |
-            jq -r '.[0] | if .allowed then "allowed" else "reject:" + (."reject-reason" // ."reject-details" // "?") end'
+            jq -r '.[0] // (.error.message) | if (.allowed? == true) then "allowed" elif (.allowed? == false) then "reject:" + (."reject-reason" // ."reject-details" // "?") else "reject:" + tostring end' 2>/dev/null || echo "reject:rpc-error"
     else
-        arpc testmempoolaccept "[\"$2\"]" |
-            jq -r '.result[0] | if .allowed then "allowed" else "reject:" + (."reject-reason" // ."reject-details" // "?") end'
+        # params[0] must be the rawtxs ARRAY — [[hex]], not [hex].
+        arpc testmempoolaccept "[[\"$2\"]]" |
+            jq -r '.result[0] // .error | if (.allowed? == true) then "allowed" elif (.allowed? == false) then "reject:" + (."reject-reason" // ."reject-details" // "?") else "reject:" + tostring end' 2>/dev/null || echo "reject:rpc-error"
     fi
+    return 0
 }
 
 declare -a TXS=("$VALID" "$MUTATED" "$GARBAGE" "$ORPHAN_RAW")

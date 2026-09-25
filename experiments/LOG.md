@@ -423,3 +423,26 @@ medium, plus lows/slop. All findings fixed and verified:
 
 Commits: `fd54db4` (criticals+highs), `a623909` (mediums+lows),
 `1acc2b5` (P2P-13 residual). Workspace release tests green.
+
+## Exp8 — live differential vs Bitcoin Knots 29.3 (real P2P + RPC)
+
+`experiments/diff_knots.sh` spawns a fresh Knots regtest daemon (105
+mature coinbases), syncs avila-node from it over real P2P, then diffs
+`testmempoolaccept` verdicts on a shared corpus.
+
+- INTEROP: synced all 105 blocks over **v2-negotiated BIP324**
+  transport. Earlier stall was environmental (a leftover process
+  holding the connect target), not a wire bug — captured wire bytes
+  were verified correct. `sendrecon` pre-verack "unsupported" log on
+  Knots' side is expected: BIP330 negotiates in the same slot as
+  wtxidrelay; Knots doesn't implement Erlay.
+- DIFFERENTIAL: valid spend allowed by both; mutated (witness byte
+  flip) rejected by both (knots `non-final`, ours
+  `mandatory-script-verify-flag-failed`); garbage hex rejected by
+  both (knots top-level RPC error, ours `TX decode failed`);
+  orphan spend rejected by both (`missing-inputs` ≈
+  `bad-txns-inputs-missingorspent`). **Verdicts aligned 4/4**; reason
+  strings differ in wording only.
+- Harness bugs found + fixed: cookie file is the full `user:pass`
+  (was double-prefixing), `-rpcwait` for the cookie race, params[0]
+  of testmempoolaccept must be the rawtxs array.
