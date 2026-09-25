@@ -507,6 +507,7 @@ dependencies = [
  "clap",
  "eframe",
  "serde",
+ "signal-hook",
 ]
 
 [[package]]

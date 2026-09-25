@@ -23,6 +23,7 @@ avila-p2p.workspace = true
 clap.workspace = true
 eframe.workspace = true
 serde.workspace = true
+signal-hook.workspace = true
 
 [lints]
 workspace = true

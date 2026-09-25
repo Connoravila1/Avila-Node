@@ -79,14 +79,20 @@ fn sync_banner(ui: &mut Ui, s: &Scene, v: &NodeView) {
         .max(1);
     let headers_done = v.headers >= target;
     let (text, frac) = if !headers_done {
-        (
-            format!(
-                "Getting block headers — {} of ~{}",
-                thousands(v.headers.into()),
-                thousands(target.into()),
-            ),
-            f64::from(v.headers) / f64::from(target),
-        )
+        let mut text = format!(
+            "Getting block headers — {} of ~{}",
+            thousands(v.headers.into()),
+            thousands(target.into()),
+        );
+        if let Some(p) = s.session.per_min(|x| x.headers).filter(|p| *p >= 1.0) {
+            let secs = (f64::from(target) - f64::from(v.headers)).max(0.0) / p * 60.0;
+            text.push_str(&format!(
+                " · {} a minute · about {} to go",
+                thousands(p as u64),
+                span(secs as u64),
+            ));
+        }
+        (text, f64::from(v.headers) / f64::from(target))
     } else {
         let mut text = format!(
             "Downloading and verifying blocks — {} of {}",

@@ -112,6 +112,16 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    // SIGINT/SIGTERM ask the window to close — eframe then runs the
+    // app's on_exit, which stops the sync worker and lets its exit
+    // flush write state.dat. A bare kill would otherwise discard
+    // every header learned this session.
+    let close = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        if let Err(e) = signal_hook::flag::register(sig, close.clone()) {
+            eprintln!("warning: signal handler for {sig} not installed: {e}");
+        }
+    }
     let node = Node::new(load_config(args.config.as_deref())?)?;
     let icon = eframe::icon_data::from_png_bytes(brand::LOGO_PNG)?;
     let title = if args.demo {
@@ -130,10 +140,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..Default::default()
     };
     let (demo, theme) = (args.demo, args.theme);
+    let close_flag = close;
     eframe::run_native(
         "Avila Node",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, node, demo, theme)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, node, demo, theme, close_flag)))),
     )?;
     Ok(())
 }

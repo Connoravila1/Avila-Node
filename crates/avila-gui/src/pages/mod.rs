@@ -6,6 +6,7 @@ pub mod chain;
 pub mod overview;
 pub mod peers;
 pub mod settings;
+pub mod tour;
 pub mod welcome;
 
 use crate::session::Session;
@@ -29,6 +30,8 @@ pub enum Action {
     Start,
     Stop,
     Open(crate::rail::Page),
+    /// Re-run the first-open slideshow.
+    ReplayTour,
 }
 
 impl Scene<'_> {

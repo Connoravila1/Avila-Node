@@ -25,6 +25,16 @@ pub fn show(
     appearance(ui, s, prefs);
     ui.add_space(30.0);
     this_node(ui, s, node);
+    ui.add_space(30.0);
+    widgets::section(ui, "Getting oriented", None);
+    if widgets::button(ui, "Replay the intro", Kind::Quiet).clicked() {
+        return Some(Action::ReplayTour);
+    }
+    help(
+        ui,
+        s,
+        "The short slideshow shown on first open — what the node does and what the sync looks like.",
+    );
     None
 }
 

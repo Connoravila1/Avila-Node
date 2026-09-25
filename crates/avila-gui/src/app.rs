@@ -55,6 +55,11 @@ pub struct App {
     decorated: Option<bool>,
     /// Save preferences on exit (not for captures or one-run skins).
     keep_prefs: bool,
+    /// The first-open slideshow — `Some(step)` while it runs.
+    tour: Option<usize>,
+    /// SIGINT/SIGTERM request — closing through eframe runs on_exit,
+    /// which drains the sync worker so state.dat actually writes.
+    close: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl App {
@@ -63,6 +68,7 @@ impl App {
         node: Node,
         demo: bool,
         theme_override: Option<ThemeChoice>,
+        close: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let ctx = &cc.egui_ctx;
         theme::install_fonts(ctx, Skin::Standard);
@@ -119,6 +125,7 @@ impl App {
                 || (prefs.welcomed
                     && (network != avila_core::Network::Regtest
                         || !run.connect.trim().is_empty())));
+        let show_tour = !demo && !prefs.welcomed;
         Self {
             node,
             session,
@@ -137,6 +144,8 @@ impl App {
             swirl: brand::swirl_texture(ctx),
             capture,
             keep_prefs,
+            tour: show_tour.then_some(0),
+            close,
             bench: Bench::from_env(),
             autostart,
             selected_peer: None,
@@ -189,7 +198,7 @@ impl App {
                 network,
                 swirl: self.swirl.as_ref(),
             };
-            action = if !self.prefs.welcomed && !self.session.demo {
+            action = if !self.prefs.welcomed && !self.session.demo && self.tour.is_none() {
                 pages::welcome::show(ui, &scene, &mut self.run)
             } else {
                 match self.page {
@@ -230,6 +239,20 @@ impl App {
                 }
             };
         });
+        // The first-run slideshow rides on top of whatever the page
+        // just drew — the app stays live behind the dim.
+        if let Some(step) = self.tour {
+            match pages::tour::show(ui, &pal, step) {
+                Some(pages::tour::TourAction::Next) => {
+                    self.tour = Some((step + 1).min(pages::tour::slide_count() - 1));
+                }
+                Some(pages::tour::TourAction::Back) => {
+                    self.tour = Some(step.saturating_sub(1));
+                }
+                Some(pages::tour::TourAction::Skip) => self.tour = None,
+                None => {}
+            }
+        }
         action
     }
 
@@ -426,6 +449,11 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // A SIGINT/SIGTERM lands as a window close, so on_exit's
+        // stop-and-drain runs the same as clicking ×.
+        if self.close.load(std::sync::atomic::Ordering::Relaxed) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         if std::mem::take(&mut self.autostart) {
             self.start();
         }
@@ -607,6 +635,7 @@ impl eframe::App for App {
             }
             Some(Action::Stop) => self.session.stop(),
             Some(Action::Open(page)) => self.page = page,
+            Some(Action::ReplayTour) => self.tour = Some(0),
             None => {}
         }
         // Preferences changed anywhere (Settings, the toybox, a shortcut)

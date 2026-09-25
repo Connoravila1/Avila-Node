@@ -190,6 +190,8 @@ impl Phase {
 pub struct Sample {
     pub t: f64,
     pub connected: u32,
+    /// Best header height — the headers phase's own progress counter.
+    pub headers: u32,
     /// The background replay's height (0 without a snapshot).
     pub replayed: u32,
     pub peers: usize,
@@ -556,6 +558,7 @@ impl Session {
             self.history.push_back(Sample {
                 t,
                 connected: view.connected,
+                headers: view.headers,
                 replayed: view.trust.snapshot.as_ref().map_or(0, |s| s.replayed),
                 peers: view.established().count(),
                 mempool: view.mempool_txs,
