@@ -87,6 +87,11 @@ enum Command {
         /// verification choice.
         #[arg(long)]
         assumevalid: Option<String>,
+        /// Prune block files to this many MiB (Core's -prune) —
+        /// overrides the config's prune_mb. Validation is identical;
+        /// only old-block retention changes.
+        #[arg(long)]
+        prune: Option<u64>,
         /// Total peer slots, inbound + outbound (Core's
         /// -maxconnections; default 8).
         #[arg(long)]
@@ -482,6 +487,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             maxmempool,
             v2transport,
             assumevalid,
+            prune,
             maxconnections,
             dbcache,
             listen,
@@ -662,7 +668,10 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 dbcache: dbcache.map(|mb| mb * 1024 * 1024),
                 cancel: Some(cancel),
                 persist: true,
-                prune_bytes: None,
+                // --prune flag wins; else the config's prune_mb.
+                prune_bytes: prune
+                    .or(config.get().prune_mb)
+                    .map(|m| m.saturating_mul(1024 * 1024)),
                 txindex,
                 blockfilterindex,
                 peerblockfilters,

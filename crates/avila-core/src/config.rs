@@ -37,6 +37,9 @@ pub struct NodeConfig {
     pub network: Network,
     pub data_dir: PathBuf,
     pub event_capacity: usize,
+    /// Prune blk files to this many MiB (Core's `-prune` config key).
+    /// `None` keeps every block — archival.
+    pub prune_mb: Option<u64>,
 }
 
 impl Default for NodeConfig {
@@ -46,6 +49,7 @@ impl Default for NodeConfig {
             network: Network::Regtest,
             data_dir: PathBuf::from("data"),
             event_capacity: 256,
+            prune_mb: None,
         }
     }
 }

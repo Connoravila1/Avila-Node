@@ -1,0 +1,7 @@
+# Mainnet node — pruned IBD. Validation is identical to archival;
+# blk files beyond ~2 GiB are deleted (undo stays in coinsdb.redb).
+schema_version = 1
+network = "mainnet"
+data_dir = "../data"
+event_capacity = 256
+prune_mb = 2048

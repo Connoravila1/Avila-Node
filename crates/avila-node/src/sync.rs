@@ -523,6 +523,7 @@ pub fn run(
     let mut rescans: std::collections::VecDeque<crate::rpc::DeferredQuery> =
         std::collections::VecDeque::new();
 
+    let mut last_prune = std::time::Instant::now();
     while started.elapsed() < cfg.timeout
         && connected.saturating_sub(resumed_height) < cfg.target_height
         && !cancelled()
@@ -828,6 +829,19 @@ pub fn run(
         // The scheduler — periodic jobs (peers.dat dumps, …); on
         // regtest `mockscheduler` fast-forwards this same queue.
         mgr.run_due_tasks();
+        // Pruned mode must hold its budget DURING sync, not only at
+        // exit — IBD accumulates blk files at network speed and a
+        // shutdown-only prune needs the full archival disk anyway.
+        // Whole-file deletion at 128 MiB granularity: a minute
+        // cadence keeps the store within keep+one file.
+        if cfg.prune_bytes.is_some() && last_prune.elapsed() >= Duration::from_secs(60) {
+            last_prune = std::time::Instant::now();
+            if let Some(keep) = cfg.prune_bytes
+                && let Err(e) = cs.prune(keep)
+            {
+                eprintln!("prune failed: {e}");
+            }
+        }
         progress(&snapshot);
         if run_progress >= cfg.target_height {
             break;
