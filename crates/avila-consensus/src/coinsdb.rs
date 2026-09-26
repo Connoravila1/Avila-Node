@@ -823,6 +823,27 @@ impl CoinsBackend {
                     undo.insert(*hgt, encode_undo(hash, u, self.format).as_slice())
                         .map_err(|e| std::io::Error::other(format!("coinsdb undo put: {e}")))?;
                 }
+                // A rewind commit that stamps the tip down must drop
+                // the undo rows it consumed — otherwise they describe a
+                // disconnected future and `max_undo_height` keeps
+                // reporting the pre-rewind chain.
+                if let Some(t) = tip {
+                    let mut stale: Vec<u32> = Vec::new();
+                    {
+                        let mut it = undo
+                            .range(t + 1..)
+                            .map_err(|e| std::io::Error::other(format!("coinsdb undo scan: {e}")))?;
+                        while let Some(row) = it.next() {
+                            let row = row
+                                .map_err(|e| std::io::Error::other(format!("coinsdb undo scan: {e}")))?;
+                            stale.push(row.0.value());
+                        }
+                    }
+                    for hgt in stale {
+                        undo.remove(hgt)
+                            .map_err(|e| std::io::Error::other(format!("coinsdb undo del: {e}")))?;
+                    }
+                }
                 let new_len = (self.coins_len() as i64 + delta).max(0) as u64;
                 let mut meta = w
                     .open_table(META)
@@ -884,6 +905,27 @@ impl CoinsBackend {
             for (h, hash, u) in new_undos {
                 undo.insert(*h, encode_undo(hash, u, self.format).as_slice())
                     .map_err(|e| std::io::Error::other(format!("coinsdb undo put: {e}")))?;
+            }
+            // Same consumed-undo cleanup as the hash-engine arm: a
+            // tip-stamping commit must not leave rows describing
+            // heights above the tip it just wrote.
+            if let Some(t) = tip {
+                let mut stale: Vec<u32> = Vec::new();
+                {
+                    let mut it = undo
+                        .range(t + 1..)
+                        .map_err(|e| std::io::Error::other(format!("coinsdb undo scan: {e}")))?;
+                    while let Some(row) = it.next() {
+                        let row = row.map_err(|e| {
+                            std::io::Error::other(format!("coinsdb undo scan: {e}"))
+                        })?;
+                        stale.push(row.0.value());
+                    }
+                }
+                for hgt in stale {
+                    undo.remove(hgt)
+                        .map_err(|e| std::io::Error::other(format!("coinsdb undo del: {e}")))?;
+                }
             }
             let new_len = (self.coins_len() as i64 + delta).max(0) as u64;
             let mut meta = w

@@ -184,13 +184,22 @@ fn sync_banner(ui: &mut Ui, s: &Scene, v: &NodeView) {
             thousands(v.connected.into()),
             thousands(target.into()),
         );
+        // Prefer the pace model's era-aware estimate — it integrates
+        // the fitted cost-vs-size curve over remaining heights and
+        // knows the segwit-era blocks cost more than the empty early
+        // ones. The flat blocks/minute rate stays as the warmup
+        // fallback until ~4 pace windows have accumulated.
+        let eta = v.eta_secs.or_else(|| {
+            s.session
+                .per_min(|x| x.connected)
+                .filter(|p| *p >= 1.0)
+                .map(|p| (f64::from(v.behind()) / p * 60.0) as u64)
+        });
         if let Some(p) = s.session.per_min(|x| x.connected).filter(|p| *p >= 1.0) {
-            let secs = f64::from(v.behind()) / p * 60.0;
-            text.push_str(&format!(
-                " · {} a minute · about {} to go",
-                thousands(p as u64),
-                span(secs as u64),
-            ));
+            text.push_str(&format!(" · {} a minute", thousands(p as u64)));
+        }
+        if let Some(secs) = eta {
+            text.push_str(&format!(" · about {} to go", span(secs)));
         }
         (text, f64::from(v.connected) / f64::from(target))
     };
@@ -312,7 +321,10 @@ fn summary(s: &Scene, v: &NodeView) -> String {
                 "Verifying about {} blocks a minute; {} to go, roughly {}.",
                 thousands(pace as u64),
                 thousands(v.behind().into()),
-                span((f64::from(v.behind()) / pace * 60.0) as u64)
+                span(
+                    v.eta_secs
+                        .unwrap_or((f64::from(v.behind()) / pace * 60.0) as u64)
+                )
             ),
             None => format!(
                 "{} blocks are known by their headers and waiting to be downloaded and verified.",

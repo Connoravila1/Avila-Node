@@ -20,6 +20,204 @@ pub use crate::next_block::NextBlock;
 /// crash to replaying at most that many blk-file entries.
 const FLUSH_INTERVAL: u32 = 2048;
 
+/// Blocks per pace sample — a half-retarget span balances regression
+/// signal against per-sample noise.
+const PACE_WINDOW_BLOCKS: u32 = 1024;
+/// Windows fed to the least-squares fit (the most recent ~20k blocks —
+/// old enough to span an era boundary, young enough to track drift).
+const PACE_FIT_WINDOWS: usize = 20;
+/// Samples retained; anything older drops — the era curve slides.
+const PACE_MAX_WINDOWS: usize = 40;
+/// Encoded-size ceiling for a block: weight cap is 4M units and encoded
+/// bytes can't exceed ~4MB — the principled asymptote the size
+/// extrapolation saturates at instead of growing linearly forever.
+const BLOCK_BYTES_CAP: f64 = 4_000_000.0;
+
+/// One pace sample: the cost of `blocks` connected blocks ending at
+/// `height`, measured as wall time and summed encoded bytes.
+struct PaceWindow {
+    height: u32,
+    wall_ms: u64,
+    blocks: u64,
+    bytes: u64,
+}
+
+/// Era-aware IBD pace model. A flat `blocks/minute` extrapolation is
+/// systematically wrong: validation cost per block scales with block
+/// size (decode, UTXO churn, script work all ride the byte count), and
+/// block size is not flat across history — empty 2010 blocks run
+/// thousands of times cheaper than segwit-era ones. The model regresses
+/// observed per-block wall cost on per-block encoded bytes over recent
+/// windows, extrapolates the byte-size curve forward — saturated at the
+/// protocol weight cap, where real block growth must stop — and
+/// integrates the predicted pace over the remaining heights.
+struct PaceModel {
+    windows: std::collections::VecDeque<PaceWindow>,
+    /// Height of the last recorded sample (windows close every
+    /// `PACE_WINDOW_BLOCKS` above it).
+    last_height: u32,
+    /// Wall clock of the last sample.
+    last_at: std::time::Instant,
+    /// Last fit coefficients — `debug_fit` reports them.
+    last_fit: Option<(f64, f64, f64, f64, usize)>,
+}
+
+impl PaceModel {
+    fn new(from_height: u32) -> Self {
+        Self {
+            windows: std::collections::VecDeque::new(),
+            last_height: from_height,
+            last_at: std::time::Instant::now(),
+            last_fit: None,
+        }
+    }
+
+    /// Records a sample whenever `connected` has advanced a full
+    /// window; sums encoded bytes from the block store so the byte
+    /// axis is real, not estimated.
+    fn sample(&mut self, cs: &Chainstate, connected: u32) {
+        if connected < self.last_height + PACE_WINDOW_BLOCKS {
+            return;
+        }
+        let mut bytes = 0u64;
+        let chain = cs.chain();
+        if let Some(store) = cs.store() {
+            for hash in &chain[(self.last_height as usize + 1)..=(connected as usize)] {
+                if let Some(pos) = store.position(hash) {
+                    bytes += u64::from(pos.len);
+                }
+            }
+        }
+        let now = std::time::Instant::now();
+        self.windows.push_back(PaceWindow {
+            height: connected,
+            wall_ms: now.duration_since(self.last_at).as_millis() as u64,
+            blocks: u64::from(connected - self.last_height),
+            bytes,
+        });
+        self.last_height = connected;
+        self.last_at = now;
+        while self.windows.len() > PACE_MAX_WINDOWS {
+            self.windows.pop_front();
+        }
+    }
+
+    /// Fit coefficients of the last `eta_secs` call, for diagnostics:
+    /// `(pace_intercept_ms, pace_per_byte_ms, byte_slope_per_height,
+    /// byte_cap, windows_used)`.
+    fn debug_fit(&self) -> Option<(f64, f64, f64, f64, usize)> {
+        self.last_fit
+    }
+
+    /// Predicted seconds to connect `from + 1 ..= to`, or `None` while
+    /// the model is still warming up (fewer than four windows — the
+    /// flat-rate fallback stays honest instead).
+    fn eta_secs(&mut self, from: u32, to: u32) -> Option<u64> {
+        if self.windows.len() < 4 || to <= from {
+            return None;
+        }
+        let fit: Vec<&PaceWindow> = self
+            .windows
+            .iter()
+            .rev()
+            .take(PACE_FIT_WINDOWS)
+            .rev()
+            .collect();
+        // Per-window pace and size.
+        let xs: Vec<f64> = fit
+            .iter()
+            .map(|w| w.bytes as f64 / w.blocks.max(1) as f64)
+            .collect();
+        let ys: Vec<f64> = fit
+            .iter()
+            .map(|w| w.wall_ms as f64 / w.blocks.max(1) as f64)
+            .collect();
+        let hs: Vec<f64> = fit.iter().map(|w| f64::from(w.height)).collect();
+        // Outlier guard: a window that crossed a peer stall or a
+        // checkpoint flush is wall-heavy for reasons unrelated to era.
+        // Drop samples whose pace exceeds 4× the median before fitting.
+        let mut sorted = ys.clone();
+        sorted.sort_by(f64::total_cmp);
+        let median = sorted[sorted.len() / 2].max(1.0);
+        let keep: Vec<usize> = (0..ys.len())
+            .filter(|&i| ys[i] <= 4.0 * median || ys.len() < 6)
+            .collect();
+        // pace ≈ F + R·(bytes/blk). `R` is the ratio estimator
+        // Σwall/Σbytes over kept windows — a single stable parameter
+        // that folds decode+validate+download per byte into one
+        // measured rate (robust where least squares over-fits a noisy
+        // 4-window sample into absurd slopes). `F` anchors the line at
+        // the median window — the fixed per-block cost (header, index,
+        // disk) that doesn't scale with size.
+        let (mut sw, mut sb_) = (0.0f64, 0.0f64);
+        for &i in &keep {
+            sw += ys[i] * fit[i].blocks as f64;
+            sb_ += xs[i] * fit[i].blocks as f64;
+        }
+        let r = if sb_ > 0.0 { sw / sb_ } else { 0.0 };
+        let med_x = {
+            let mut m: Vec<f64> = keep.iter().map(|&i| xs[i]).collect();
+            m.sort_by(f64::total_cmp);
+            m[m.len() / 2]
+        };
+        let med_y = sorted[sorted.len() / 2];
+        let f = (med_y - r * med_x).max(0.0);
+        // bytes/blk ≈ e + f·height — least squares on the byte axis.
+        let n = keep.len() as f64;
+        let (sh, sb, shh, shb) = keep.iter().fold((0.0, 0.0, 0.0, 0.0), |acc, &i| {
+            (
+                acc.0 + hs[i],
+                acc.1 + xs[i],
+                acc.2 + hs[i] * hs[i],
+                acc.3 + hs[i] * xs[i],
+            )
+        });
+        let hdenom = n * shh - sh * sh;
+        let (bf, be) = if hdenom.abs() > f64::EPSILON {
+            let f = (n * shb - sh * sb) / hdenom;
+            (f, (sb - f * sh) / n)
+        } else {
+            (0.0, sb / n)
+        };
+        let (a, b) = (f, r);
+        // Bounds for the extrapolation — the regression shapes relative
+        // growth but is ill-conditioned on a few noisy windows, so the
+        // predicted pace is clamped to a band around what has actually
+        // been measured: no slower than 4× the p95 observed window pace
+        // (the segwit-era plateau is a factor-of-few jump, not an
+        // unbounded one), no faster than a quarter of the best observed
+        // (cost doesn't teleport below what the era showed). The byte
+        // mean gets the same treatment: saturation at 4× the biggest
+        // observed window mean — the 4MB weight cap bounds the worst
+        // single block, not the era average.
+        let mut size_sorted = xs.clone();
+        size_sorted.sort_by(f64::total_cmp);
+        let p95_size = size_sorted[size_sorted.len() * 95 / 100];
+        let byte_cap = (p95_size * 4.0).clamp(64_000.0, BLOCK_BYTES_CAP);
+        // Pace bounds come from the kept (outlier-filtered) windows —
+        // a stall window must not widen the cap it would sneak past.
+        let mut kept_paces: Vec<f64> = keep.iter().map(|&i| ys[i]).collect();
+        kept_paces.sort_by(f64::total_cmp);
+        let p95_pace = kept_paces[kept_paces.len() * 95 / 100].max(1.0);
+        let pace_cap = p95_pace * 4.0;
+        let pace_floor = (kept_paces[0] * 0.25).max(0.5);
+        self.last_fit = Some((a, b, bf, byte_cap, keep.len()));
+        // Integrate the predicted pace forward in window-sized strides.
+        let mut remaining_ms = 0.0f64;
+        let mut h = from as u64;
+        let tip = to as u64;
+        let stride = PACE_WINDOW_BLOCKS as u64;
+        while h < tip {
+            let mid = h + stride / 2;
+            let bytes_pred = (be + bf * mid as f64).clamp(0.0, byte_cap);
+            let pace = (a + b * bytes_pred).clamp(pace_floor, pace_cap);
+            remaining_ms += pace * (stride.min(tip - h)) as f64;
+            h += stride;
+        }
+        Some((remaining_ms / 1000.0).ceil() as u64)
+    }
+}
+
 /// How far and how long a sync run should go.
 #[derive(Clone, Debug)]
 pub struct SyncConfig {
@@ -236,6 +434,10 @@ pub struct SyncProgress {
     /// advisory, re-evaluated every 30 seconds; empty when nothing
     /// looks wrong, so a cleared condition clears here too.
     pub eclipse: Vec<EclipseSignal>,
+    /// Estimated seconds to connect the remaining chain to the header
+    /// tip — the era-aware pace model's integration, `None` until the
+    /// model has warmed up (callers fall back to a flat-rate guess).
+    pub eta_secs: Option<u64>,
 }
 
 impl SyncProgress {
@@ -269,6 +471,7 @@ impl SyncProgress {
             next_block: None,
             headers_buffered: 0,
             eclipse: Vec::new(),
+            eta_secs: None,
         }
     }
 }
@@ -510,6 +713,8 @@ pub fn run(
         ));
     }
     let resumed_height = cs.chain().len() as u32 - 1;
+    // Era-aware ETA model — learns cost-vs-bytes as blocks connect.
+    let mut pace = PaceModel::new(resumed_height);
     // `state.dat` checkpoint cadence — blocks between flushes during
     // sync. The value bounds post-crash replay depth, not correctness.
     let mut last_flush = resumed_height;
@@ -745,6 +950,7 @@ pub fn run(
             }
         }
         connected = cs.chain().len() as u32 - 1;
+        pace.sample(&cs, connected);
         // The target counts blocks connected *this run* above whatever
         // the store resumed at — a resumed chain doesn't re-trigger
         // the stop condition at its own height.
@@ -867,8 +1073,29 @@ pub fn run(
                     })
                 })
                 .unwrap_or(0);
+            let eta = pace
+                .eta_secs(connected, cs.tree().tip().height)
+                .map(|s| {
+                    let h = s / 3600;
+                    let m = (s % 3600) / 60;
+                    if h > 0 {
+                        format!("{h}h{m}m")
+                    } else {
+                        format!("{m}m{s}s", s = s % 60)
+                    }
+                })
+                .unwrap_or_else(|| "warming".to_string());
+            let fit = pace
+                .debug_fit()
+                .map(|(a, b, bf, cap, n)| {
+                    format!(
+                        "fit[a={a:.1}ms b={b:.4}ms/KB bf={bf:.2}B/blk cap={}KB n={n}]",
+                        cap as u64 / 1000
+                    )
+                })
+                .unwrap_or_default();
             eprintln!(
-                "sync: peers={} connected={} headers={} buffered={} in_flight={} rss={}MB map={}n/{}MB undos={} | connect_ms/blk total={} read={} apply={} scripts={} drain={} bip30={} other={} accept_cum={} reorg_cum={} (n={})",
+                "sync: peers={} connected={} headers={} buffered={} in_flight={} rss={}MB map={}n/{}MB undos={} eta={} w={} | connect_ms/blk total={} read={} apply={} scripts={} drain={} bip30={} other={} accept_cum={} reorg_cum={} (n={})",
                 mgr.len(),
                 connected,
                 cs.tree().tip().height,
@@ -878,6 +1105,8 @@ pub fn run(
                 map_n,
                 map_b / 1_048_576,
                 undos_n,
+                format_args!("{eta} {fit}"),
+                pace.windows.len(),
                 t.total_ns
                     .checked_div(t.blocks.max(1))
                     .map_or(0, |n| n / 1_000_000),
@@ -921,6 +1150,7 @@ pub fn run(
             next_block: next_block.clone(),
             eclipse: eclipse.clone(),
             prune_bytes: cfg.prune_bytes,
+            eta_secs: pace.eta_secs(connected, cs.tree().tip().height),
         };
         if let Some(status) = &cfg.status
             && let Ok(mut w) = status.write()

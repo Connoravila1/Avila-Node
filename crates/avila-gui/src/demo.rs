@@ -234,6 +234,7 @@ impl Demo {
             next_block: Some(next_block(connected + 1, e, since_block)),
             // A healthy simulated node raises no eclipse indicators.
             eclipse: Vec::new(),
+            eta_secs: None,
         }
     }
 

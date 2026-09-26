@@ -1971,16 +1971,15 @@ impl<S: Read + Write> PeerManager<S> {
                 .peers
                 .values()
                 .any(|p| p.sync.reserved_hashes().any(|h| *h == frontier_hash));
-            if aged || !held {
-                if let Some(peer) = self
+            if (aged || !held)
+                && let Some(peer) = self
                     .peers
                     .values_mut()
                     .filter(|p| p.session.established())
                     .min_by_key(|p| p.sync.in_flight())
-                    && let Some(req) = peer.sync.want_one(frontier_hash)
-                {
-                    let _ = peer.session.send(&req);
-                }
+                && let Some(req) = peer.sync.want_one(frontier_hash)
+            {
+                let _ = peer.session.send(&req);
             }
         }
         // Backlog: announced-but-unrequested blocks drain as slots free —

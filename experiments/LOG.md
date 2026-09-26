@@ -374,6 +374,50 @@ first measurement that would kill or confirm it.
     silent-payments *send* (libsecp sender API), Payjoin sender
     (BIP78/77). Queue only after 35–37 land.
 
+41. **Corpus-parallel script replay.** The load-bearing IBD
+    hypothesis ([physics doc](2026-09-26-ibd-physics.md)): script
+    verification needs only corpus-resolved prevouts, never the UTXO
+    set — so the whole history's sig work is embarrassingly parallel.
+    First measurement: replay the signet corpus, resolve prevouts
+    from the block store (txid→position index), measure sig/s vs
+    worker count. Kill: scaling sub-linear past ~4 workers.
+
+42. **UTXO set as anti-join.** Replace incremental point mutations
+    with one batch operation: partition created/spent records by
+    outpoint-prefix, probe per partition, emit survivors. Sequential
+    I/O only. First measurement: run both paths over the 22.4M-create
+    signet window, compare wall + bytes-written. Kill if <5×.
+
+43. **IFMA/SIMD lane-parallel sig kernel.** ECDSA verify is
+    branch-free → 8 independent sigs in AVX-512+IFMA lanes
+    (5×52-bit limbs), ~6–8×/core on Zen4+/IceLake+. Subprocess worker
+    keeps `unsafe` out. First measurement: kernel bench vs the
+    `ecdsa_advice` harness baseline. Kill <3×/core.
+
+44. **GPU crypto-plane worker.** sig+SHA256d offload via subprocess
+    (same boundary as the advice harness). Published ~4M verifies/s
+    midrange GPU — discount 2×. First measurement: minimal
+    verify-only kernel, bit-exact vs CPU path on the adversarial
+    corpus. Kill <10× aggregate or any unmatched edge case.
+
+45. **Canonical corpus encoding + any-source fetch.** Deterministic
+    re-encoding (positional outpoints, compact sigs, template tags,
+    pubkey dictionary, compact amounts, zstd) — projected ~20–30%.
+    Plus trust-free fetch: torrent/HTTP/LAN source, verified locally,
+    since source honesty is irrelevant under full validation. First
+    measurement: real byte savings on the signet fixture. Kill <15%.
+
+46. **P2P fetch-rate ceiling on mainnet.** Before betting on
+    acquisition alternatives: measure the achievable sustained
+    fetch rate across N real peers vs link speed. Establishes how
+    much of the model is reachable without #45. One bounded run.
+
+47. **Trusted-cluster sharded validation.** Split height ranges
+    across operator-owned machines; each validates its shard,
+    coordinator merges the anti-join (partitions by outpoint-prefix
+    shard cleanly). First measurement: two-machine regtest split.
+    Kill: merge cost eats the parallel gain.
+
 ## Exp6 — scripthash/address index cost model (measured)
 
 `scindex_bench` over `fixtures/signet-blocks-000000-000300.dat` (300

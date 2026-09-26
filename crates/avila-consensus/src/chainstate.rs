@@ -2004,9 +2004,10 @@ impl Chainstate {
             // every later open, which is policy, not store damage.
             if index > 0
                 && !assumed
-                && self.store.as_ref().is_none_or(|s| {
-                    s.position(hash).is_none() && s.pruned_through().is_none()
-                })
+                && self
+                    .store
+                    .as_ref()
+                    .is_none_or(|s| s.position(hash).is_none() && s.pruned_through().is_none())
             {
                 return Err(corrupt("connected block body not stored"));
             }
@@ -3049,10 +3050,24 @@ impl Chainstate {
                     // still runs — a resubmitted side block whose branch now
                     // outworks the tip does reorg.
                     return match self.maybe_reorg(hash, &params) {
-                        Ok(Some(disconnected)) => Ok(Acceptance::Connected {
-                            height,
-                            reorged: disconnected,
-                        }),
+                        Ok(Some(disconnected)) => {
+                            // Same cache-pressure rule as the fresh-body
+                            // arm — replay/backlog drains hit this path for
+                            // every block, and a `maybe_reorg` merge can
+                            // push the dirty map well past the flush bound
+                            // between live accepts.
+                            if self.utxo.needs_flush() {
+                                self.flush_coins().map_err(|_| {
+                                    BlockRejection::Connect(ConnectError::Internal(
+                                        "coinsdb flush failed",
+                                    ))
+                                })?;
+                            }
+                            Ok(Acceptance::Connected {
+                                height,
+                                reorged: disconnected,
+                            })
+                        }
                         Ok(None) => Ok(Acceptance::AlreadyKnown { height }),
                         Err(err) => Err(BlockRejection::Connect(err)),
                     };
@@ -3168,7 +3183,7 @@ impl Chainstate {
                     // boundaries — a full map commits coins + undo tail
                     // + tip atomically (Core's `FlushStateToDisk` under
                     // cache pressure).
-                    if self.utxo.over_budget() {
+                    if self.utxo.needs_flush() {
                         self.flush_coins().map_err(|_| {
                             BlockRejection::Connect(ConnectError::Internal("coinsdb flush failed"))
                         })?;
@@ -3196,10 +3211,21 @@ impl Chainstate {
             // reconsidering the block it was called for).
             let target = self.newly_linked_candidate(hash).unwrap_or(hash);
             match self.maybe_reorg(target, &params) {
-                Ok(Some(disconnected)) => Ok(Acceptance::Connected {
-                    height,
-                    reorged: disconnected,
-                }),
+                Ok(Some(disconnected)) => {
+                    // Cache-pressure rule, same as the tip-child arm —
+                    // a batch merge can leave the dirty map over bound.
+                    if self.utxo.needs_flush() {
+                        self.flush_coins().map_err(|_| {
+                            BlockRejection::Connect(ConnectError::Internal(
+                                "coinsdb flush failed",
+                            ))
+                        })?;
+                    }
+                    Ok(Acceptance::Connected {
+                        height,
+                        reorged: disconnected,
+                    })
+                }
                 Ok(None) => Ok(Acceptance::Parked { height }),
                 Err(err) => Err(BlockRejection::Connect(err)),
             }
@@ -3276,6 +3302,16 @@ impl Chainstate {
         let fork = cursor;
         let fork_height = self.tree.get(&fork).map(|n| n.height).unwrap_or(0);
         branch_hashes.reverse();
+        // Bound the batch: the whole branch's coin delta merges into
+        // the dirty map in one shot, and flushes only happen between
+        // `accept_block` calls — a 2048-deep backlog merge would hold
+        // millions of entries and commit as a multi-minute backend
+        // transaction. Truncating keeps the prefix connectable; the
+        // rest of the branch is re-elected by the next body's arrival.
+        // Reorgs are tiny in practice (this only bounds the IBD
+        // backlog-replay shape), so 256 costs nothing.
+        const BRANCH_BATCH: usize = 256;
+        branch_hashes.truncate(BRANCH_BATCH);
 
         // `assumeutxo` floors the chain: a branch forking below the
         // snapshot base can never activate — there is no state or undo
@@ -3367,6 +3403,7 @@ impl Chainstate {
                 }
             }
         }
+        let new_tip = branch_hashes.last().copied().unwrap_or(hash);
         self.chain.extend(branch_hashes);
         for receipt in new_receipts {
             self.note_receipt(receipt);
@@ -3405,7 +3442,7 @@ impl Chainstate {
             }
         }
         self.undos.extend(new_undos.into_iter().skip(split));
-        self.connected = hash;
+        self.connected = new_tip;
         self.drive_utreexo();
         crate::connect::seg_tick(5, &mut t_seg);
         Ok(Some(disconnected))

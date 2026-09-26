@@ -269,6 +269,23 @@ impl UtxoSet {
         self.backend.is_some() && !self.swift_hold && self.map_bytes > self.budget
     }
 
+    /// Live entries in the write-back map — the flush trigger's second
+    /// axis. `map_bytes` alone lets small coins pile up into millions
+    /// of entries before the byte budget trips, and a multi-million
+    /// entry backend commit is a multi-minute stall under writeback
+    /// pressure. ~130B/entry means ~100–130MB dirty at this bound.
+    pub const DIRTY_FLUSH_ENTRIES: usize = 1_000_000;
+
+    /// `true` when either flush bound trips — byte budget or entry
+    /// count — at the next block boundary.
+    #[must_use]
+    pub fn needs_flush(&self) -> bool {
+        self.over_budget()
+            || (self.backend.is_some()
+                && !self.swift_hold
+                && self.map.len() >= Self::DIRTY_FLUSH_ENTRIES)
+    }
+
     /// Turns on SwiftSync tag tracking and holds the transient
     /// window open (no flushes until [`Self::release_swiftsync_hold`]).
     /// The aggregate starts at `Σ coin_tag(current set)` — free at

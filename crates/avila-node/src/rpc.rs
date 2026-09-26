@@ -14723,6 +14723,7 @@ mod tests {
             next_block: None,
             eclipse: Vec::new(),
             prune_bytes: None,
+            eta_secs: None,
             proxy: None,
         }
     }

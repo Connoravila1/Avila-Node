@@ -14,6 +14,24 @@ mechanism observation, not a win.
 - **Architectural comparator for SwiftSync-style claims: Floresta.**
   Its utreexo path is the closest public analogue; where a Floresta
   number exists, cite it, not a Core default.
+- **Architectural comparator for IBD-throughput claims: libbitcoin v4
+  and btcd.** Both are independent (non-Core-lineage) consensus
+  implementations — the same category Avila sits in — so IBD/sync
+  claims should be measured against all three where feasible:
+  - *libbitcoin v4* (C++, AGPL): parallel headers/blocks/validate/
+    confirm pipeline over an append-only mmap store. Published
+    developer numbers (not yet independently reproduced — treat as
+    mechanism evidence until run locally): IBD to ~900k blocks in
+    <1 h on a $350 mini-PC at 2.3 Gbps in milestone (assumevalid-
+    equivalent) mode; ~4.5–8.5 h for full validation on the same
+    class of hardware, without SHA-NI. This is the demonstrated
+    ceiling for pipeline-architecture claims.
+  - *btcd v0.26* (Go): clean-room implementation; its v0.26 release
+    claims IBD ~45 h → ~6 h vs earlier versions. Useful as the
+    "naive sequential architecture" lower bound among independent
+    implementations.
+  When a comparative run is performed, record it with the same
+  fixture/machine rules as the Core baseline below.
 - **Fixture: real chain data, never synthetic.** The signet blk files
   (~5.6 GB, ~324k blocks) are the canonical replay fixture. Synthetic
   fixtures are for unit tests only — they cannot support a claim.

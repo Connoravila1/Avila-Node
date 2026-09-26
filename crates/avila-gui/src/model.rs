@@ -36,6 +36,9 @@ pub struct NodeView {
     pub next_block: Option<NextBlockView>,
     /// Eclipse indicators the node currently raises.
     pub eclipse: Vec<Eclipse>,
+    /// Era-aware ETA to the header tip in seconds — the pace model's
+    /// integration over remaining heights; `None` until it warms up.
+    pub eta_secs: Option<u64>,
 }
 
 /// An eclipse indicator — the node's advisory signs that an attacker
@@ -194,6 +197,7 @@ impl From<&SyncProgress> for NodeView {
                     EclipseSignal::AllInbound => Eclipse::AllInbound,
                 })
                 .collect(),
+            eta_secs: p.eta_secs,
             curve: ChainCurve::new(
                 p.profile
                     .samples
