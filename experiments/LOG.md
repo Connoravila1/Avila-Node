@@ -6,6 +6,8 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 
 | # | Date | Experiment | Hypothesis | Verdict | Key numbers | Doc |
 |---|------|-----------|------------|---------|-------------|-----|
+| 73 | 09-26 | SHRD replacement in field u128_rshift | Gracemont SHRD cost (~12+ cyc) makes >>52 extraction a real verify fraction | **bounded win, smaller than modeled** | Microbench: 4×SHRD 19.3ns vs 3-op seq 2.5ns (~7.5×). Real verify A/B: 404→102 SHRDs (16→2 in fe_mul/sqr), 2048-trace verdicts identical; compressed+verify −4.2% med / −7.8% min, preparsed −2.8%. In-context marginal SHRD cost ~1–2c, not 12–19c. | [shrd-replacement](2026-09-26-ibd-shrd-replacement.md) |
+| 72 | 09-26 | IBD workload census (structural) | Era-resolved structural counts can replace assumed corpus parameters | **measured sampled windows; segwit era gap** | Windows over real corpora: pre-segwit 229–408k + taproot 956.5k + genesis fixture. Per-block: 303–1,147 tx / 731–3,971 sig-items pre-segwit; 4,765 tx / 7,667 sig-items at 956k (schnorr ~8%). Legacy sighash = dominant hash plane: 9–11 GB SHA input per 134 MB blk file (~35–75× amplification). Structural sig estimate matches executed trace within ~4%. | [workload-census](2026-09-26-ibd-workload-census.md) |
 | 71 | 09-26 | IBD arithmetic census and hardware limits | Instruction accounting can replace unsupported universal IBD-floor estimates | **measured narrow scope; full-IBD floor unestablished** | 512 canonical mainnet ECDSA attempts: all verdicts matched, 985 field multiplies + 973 squares + one scalar inversion/attempt, no variable field inversion; compressed parse adds 14 multiplies + 255 squares. Shared-host timing ~100–135 microseconds/attempt; native compiler gain inconclusive. Static field kernels retain costly SHRD candidates. Further experiments assigned to SWE-2 | [hardware-floor](2026-09-26-ibd-hardware-floor.md) |
 | 1 | 09-14 | RPC compat matrix vs Core 29.4 | RPC surface can be made byte-compatible | **adopted** | 75 calls exact-match | [rpc-compat-matrix](2026-09-14-rpc-compat-matrix.md) |
 | 2 | ~09-20 | Header acceptance baseline | Header-chain parity is provable offline | **adopted** | `check_headers_core.py` 0 mismatches | [header-acceptance](2026-09-header-acceptance-baseline.md) |
@@ -814,3 +816,34 @@ First real mainnet run (`avila-gui --config config/mainnet.toml`,
   ahead-of-state repair on every restart (~10min wasted per boot).
   Tip-stamping commits now delete undo keys above the tip in the same
   transaction.
+
+## 2026-09-26b — Speculative connect completion boundary (audit Work Order A)
+
+**Finding:** `docs/IBD_EXECUTION_AUDIT_2026-09-26.md` was right —
+`enable_speculative_connect` (shipped with run23) had no completion
+boundary: `Acceptance::Connected` returned while ≤8 script checks were
+still in flight, so `mempool.on_block_connected`, `TipAdvanced`/relay
+announce, RPC heights, and `validation_report` all treated unverified
+blocks as authoritative; a short tail could sit undrained forever.
+
+**Fix (8a8ea5a, d19eac9):** a `checked_feed`/`checked_height`
+completion boundary in chainstate — blocks become observable to
+mempool/relay/RPC only when their checks pass; drains push `(height,
+hash)` to the feed; non-speculative connects push at accept.
+Short-tail drains run on a 50ms idle tick. Deferred failures set
+`spec_failed` (peer attribution) and rewind the bad suffix; pending
+entries drop on reorg/invalidate; flushes drain before committing.
+RPC generate/submitblock and the sv2 template path drain before
+answering. All authoritative reads (`getblockchaininfo`,
+`getchainstates`, `getchaintips`, `getbestblockhash`, GUI tape,
+SyncProgress) report the checked frontier.
+
+**Verification:** new live tests over `testpipe` real sessions —
+`speculative_short_tail_failure_is_never_published` (bad script in a
+≤8-deep tail: nothing announced or fed, drain rewinds to the prefix,
+sender attribution resolves) and `speculative_valid_tail_publishes_on
+_drain` — plus 3 chainstate boundary tests. 553+9+19 consensus, 170
+p2p, 108 node tests green; clippy clean.
+
+**Live:** run24 resumed at 407,176; replay + sync healthy with the
+bounded pipeline (RSS ~2.3GB, flush bounds holding).
