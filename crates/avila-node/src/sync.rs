@@ -388,6 +388,9 @@ fn audit_sample(cs: &Chainstate, n: usize, seed: u64) -> usize {
         rng ^= rng << 17;
         let h = (rng % u64::from(tip)) as u32;
         if let Some(hash) = cs.chain().get(h as usize).copied()
+            // A pruned body is absent by policy, not by rot — only
+            // real audit failures (decode/merkle/witness) count.
+            && cs.body_stored(&hash)
             && cs.audit_block(&hash).is_err()
         {
             bad += 1;

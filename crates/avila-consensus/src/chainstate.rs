@@ -1746,10 +1746,11 @@ impl Chainstate {
         let mut pending = match store::read_state(dir, cs.tree.params().message_start) {
             Ok(Some(state)) => match cs.restore(state, now) {
                 Ok(pending) => pending,
-                Err(_) => {
+                Err(err) => {
                     // Restore failed — rebuild a clean in-memory
                     // chainstate; the backend keeps its data (a fresh
                     // UtxoSet over it replays from blk files anyway).
+                    eprintln!("restore: state.dat rejected ({err}) — rebuilding from blk files");
                     let store = cs.store.take();
                     let backend = cs.coins_backend.take();
                     cs = Self::new(cs.tree.params());
@@ -1997,12 +1998,15 @@ impl Chainstate {
             // base were never connected — both legitimately absent
             // from the store.
             let assumed = snapshot_base.is_some_and(|b| index <= b as usize);
+            // A connected block with no stored body is corruption ONLY
+            // when pruning has never run — `position` is rebuilt from
+            // surviving blk files, so pruned bodies read as absent on
+            // every later open, which is policy, not store damage.
             if index > 0
                 && !assumed
-                && self
-                    .store
-                    .as_ref()
-                    .is_none_or(|s| s.position(hash).is_none())
+                && self.store.as_ref().is_none_or(|s| {
+                    s.position(hash).is_none() && s.pruned_through().is_none()
+                })
             {
                 return Err(corrupt("connected block body not stored"));
             }
@@ -2127,6 +2131,24 @@ impl Chainstate {
             return self.tree.params().genesis_block();
         }
         None
+    }
+
+    /// `true` when the body is actually on disk/in memory right now —
+    /// `false` for never-stored OR pruned positions. The self-audit
+    /// distinguishes "pruned by policy" from "should exist but doesn't":
+    /// sampling the full connected range otherwise counts deliberate
+    /// deletions as storage corruption.
+    #[must_use]
+    pub fn body_stored(&self, hash: &BlockHash) -> bool {
+        if self.blocks.contains_key(hash) {
+            return true;
+        }
+        if let Some(store) = self.store.as_ref()
+            && let Some(pos) = store.position(hash)
+        {
+            return !store.is_pruned(pos);
+        }
+        *hash == self.tree.params().genesis_header.hash()
     }
 
     /// Self-audit (queue #15): re-verify one stored block's internal

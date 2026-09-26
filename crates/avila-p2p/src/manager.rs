@@ -500,6 +500,12 @@ pub struct PeerManager<S> {
     /// When the frontier last advanced — a frontier flat past 60s gets
     /// a one-line diagnostic naming the blocking hash's fetch state.
     frontier_moved_at: Instant,
+    /// Round-robin cursor for `fill_queues` peer order — HashMap
+    /// iteration order is stable, so the frontier block otherwise lands
+    /// on the same peer every tick and a silent withholder re-pins it
+    /// after each 16s release (live wedge at height 140,378: one peer
+    /// monopolized the frontier reservation for minutes).
+    fill_rot: usize,
     /// Gossiped peer addresses — discovery lives here.
     addrbook: AddrBook,
     /// The transaction pool — policy layer owned here so `tx` intake,
@@ -670,6 +676,7 @@ impl<S: Read + Write> PeerManager<S> {
             fetch_index_headers: usize::MAX,
             last_frontier: 0,
             frontier_moved_at: Instant::now(),
+            fill_rot: 0,
             addrbook: AddrBook::new(),
             mempool: avila_mempool::Mempool::new(),
             closed_bytes_sent: 0,
@@ -1054,6 +1061,19 @@ impl<S: Read + Write> PeerManager<S> {
             avila_consensus::hash::Wtxid,
         )> = None;
         for (&id, peer) in peers.iter_mut() {
+            // Fold the window into the decayed per-second rate BEFORE
+            // the throttle check can `continue` — previously the fold
+            // sat below it, so a peer that tripped the threshold never
+            // decayed: the busiest block-serving peer (exactly the one
+            // holding the most reservations) became permanently
+            // quarantined, and its in-flight entries pinned the
+            // frontier forever (live wedge at height 134,384: age 246s
+            // at queue position 0, `stalled()` never reached).
+            if peer.cpu_window_start.elapsed() >= Duration::from_secs(1) {
+                peer.cpu_rate_ns = peer.cpu_rate_ns / 2 + peer.cpu_window_ns;
+                peer.cpu_window_ns = 0;
+                peer.cpu_window_start = Instant::now();
+            }
             // CPU throttle (PEER_BUDGETS): a peer burning >50% of
             // total dispatch CPU at >200ms/s loses this tick's poll —
             // socket backpressure slows it while others proceed. No
@@ -1110,15 +1130,6 @@ impl<S: Read + Write> PeerManager<S> {
                     }
                 }
                 Err(e) => dead.push((id, DisconnectReason::Session(e.to_string()))),
-            }
-            // Fold the window into the decayed per-second rate; a
-            // peer dominating dispatch CPU is skipped for a poll —
-            // socket backpressure throttles it, no disconnect (the
-            // sync leader legitimately dominates during IBD).
-            if peer.cpu_window_start.elapsed() >= Duration::from_secs(1) {
-                peer.cpu_rate_ns = peer.cpu_rate_ns / 2 + peer.cpu_window_ns;
-                peer.cpu_window_ns = 0;
-                peer.cpu_window_start = Instant::now();
             }
             // Periodic liveness ping.
             if peer.session.established() && peer.last_ping.elapsed() > PING_INTERVAL {
@@ -1810,8 +1821,25 @@ impl<S: Read + Write> PeerManager<S> {
                 .filter(|(_, p)| p.sync.reserved_hashes().any(|h| h == fh))
                 .map(|(id, _)| *id)
                 .collect();
+            let held_svcs: Vec<u64> = held_by
+                .iter()
+                .filter_map(|id| self.peers.get(id))
+                .filter_map(|p| p.session.peer().map(|i| i.services))
+                .collect();
+            let held_detail: Vec<String> = held_by
+                .iter()
+                .filter_map(|id| self.peers.get(id))
+                .map(|p| {
+                    format!(
+                        "pos={:?} age={:?} recv={}",
+                        p.sync.in_flight_position(fh),
+                        p.sync.in_flight_age(fh).map(|d| d.as_secs()),
+                        p.sync.blocks_received()
+                    )
+                })
+                .collect();
             eprintln!(
-                "fetch-stall: frontier={frontier} next={fh} have_body={have}                  reserved_by={held_by:?} in_flight={} stale={}",
+                "fetch-stall: frontier={frontier} next={fh} have_body={have}                  reserved_by={held_by:?} svcs={held_svcs:?} detail={held_detail:?} in_flight={} stale={}",
                 reserved.len(),
                 stale
             );
@@ -1859,17 +1887,30 @@ impl<S: Read + Write> PeerManager<S> {
             }
         }
         let want_total = self.max_in_flight_total.saturating_sub(reserved.len());
-        let candidates: Vec<BlockHash> = self.fetch_index[start..]
+        let candidates: Vec<(u32, BlockHash)> = self.fetch_index[start..]
             .iter()
-            .map(|(_, h)| *h)
-            .filter(|h| !cs.have_body(h) && !reserved.contains(h))
+            .copied()
+            .filter(|(_, h)| !cs.have_body(h) && !reserved.contains(h))
             .take(want_total)
             .collect();
+        // Rotate the iteration start each fill: stable map order gave the
+        // same peer first pick every tick, so a released straggler kept
+        // landing back on the peer withholding it. Rotation walks the
+        // reservation to a different peer on the next tick.
+        let n_peers = self.peers.len();
+        let mut order: Vec<u64> = self.peers.keys().copied().collect();
+        if n_peers > 0 {
+            order.rotate_left(self.fill_rot % n_peers);
+            self.fill_rot = self.fill_rot.wrapping_add(1);
+        }
         let mut next = 0usize;
-        for peer in self.peers.values_mut() {
+        for id in order {
             if next >= candidates.len() {
                 break;
             }
+            let Some(peer) = self.peers.get_mut(&id) else {
+                continue;
+            };
             if !peer.session.established()
                 || peer.sync.stalled()
                 || peer.sync.in_flight() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER
@@ -1880,12 +1921,67 @@ impl<S: Read + Write> PeerManager<S> {
             let take = crate::sync::MAX_BLOCKS_IN_TRANSIT_PER_PEER
                 .saturating_sub(peer.sync.in_flight())
                 .min(candidates.len() - next);
-            let unfetched = &candidates[next..next + take];
-            if let Some(req) = peer.sync.want_blocks_excluding(cs, unfetched, &reserved) {
+            // A NODE_NETWORK_LIMITED peer only retains ~288 blocks below
+            // its announced tip — a getdata for older heights is silently
+            // dropped, and the reservation pins whatever it re-wins until
+            // the next release cycle. Offer it only heights it can serve.
+            let (services, peer_tip) = peer
+                .session
+                .peer()
+                .map(|p| (p.services, p.start_height))
+                .unwrap_or((0, 0));
+            let limited_only = services & crate::message::NODE_NETWORK == 0
+                && services & crate::message::NODE_NETWORK_LIMITED != 0;
+            let unfetched: Vec<BlockHash> = if limited_only {
+                let floor = (peer_tip.max(0) as u32).saturating_sub(288);
+                candidates
+                    .iter()
+                    .copied()
+                    .filter(|(h, _)| *h >= floor)
+                    .map(|(_, h)| h)
+                    .take(take)
+                    .collect()
+            } else {
+                candidates[next..next + take]
+                    .iter()
+                    .map(|(_, h)| *h)
+                    .collect()
+            };
+            if let Some(req) = peer.sync.want_blocks_excluding(cs, &unfetched, &reserved) {
                 let _ = peer.session.send(&req);
             }
-            next += take;
+            if !limited_only {
+                next += take;
+            }
             reserved.extend(peer.sync.reserved_hashes().copied());
+        }
+        // Critical-path escalation: when the frontier block's reservation
+        // ages past ~half the release window, duplicate-request it on the
+        // least-loaded peer instead of waiting out another withhold cycle.
+        // `want_one` skips peers already holding it, so the fan-out bounds
+        // at one copy per peer, and only while the frontier hash sits stale.
+        if let Some(&(_, frontier_hash)) = self.fetch_index.get(start) {
+            let aged = self
+                .peers
+                .values()
+                .filter_map(|p| p.sync.in_flight_age(&frontier_hash))
+                .max()
+                .is_some_and(|a| a > crate::sync::BLOCK_STALLING_TIMEOUT * 4);
+            let held = self
+                .peers
+                .values()
+                .any(|p| p.sync.reserved_hashes().any(|h| *h == frontier_hash));
+            if aged || !held {
+                if let Some(peer) = self
+                    .peers
+                    .values_mut()
+                    .filter(|p| p.session.established())
+                    .min_by_key(|p| p.sync.in_flight())
+                    && let Some(req) = peer.sync.want_one(frontier_hash)
+                {
+                    let _ = peer.session.send(&req);
+                }
+            }
         }
         // Backlog: announced-but-unrequested blocks drain as slots free —
         // without this, inv bursts beyond the window are forgotten.

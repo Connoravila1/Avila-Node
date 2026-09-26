@@ -314,6 +314,23 @@ impl PeerSync {
         self.blocks_received
     }
 
+    /// `hash`'s position in the in-flight queue (0 = front) — the stall
+    /// diagnostic distinguishes "peer never asked" from "asked but
+    /// buried 100-deep behind unordered reservations".
+    #[must_use]
+    pub fn in_flight_position(&self, hash: &BlockHash) -> Option<usize> {
+        self.in_flight.iter().position(|(h, _)| h == hash)
+    }
+
+    /// Age of the in-flight entry for `hash`, when present.
+    #[must_use]
+    pub fn in_flight_age(&self, hash: &BlockHash) -> Option<std::time::Duration> {
+        self.in_flight
+            .iter()
+            .find(|(h, _)| h == hash)
+            .map(|(_, t)| t.elapsed())
+    }
+
     /// The `getheaders` that (re)starts or continues the headers phase —
     /// a locator over the best-*header* tip, matching Core's
     /// `FindNextBlocksToDownload`/`SendMessages` flow.
@@ -777,6 +794,26 @@ impl PeerSync {
         } else {
             Some(Message::GetData(want))
         }
+    }
+
+    /// Requests one specific hash bypassing the reservation set —
+    /// the critical-path block gets a dedicated duplicate fetch on the
+    /// least-loaded peer every tick, so a deep FIFO queue or a silent
+    /// withholder can no longer starve the frontier (one redundant
+    /// ~KiB download is cheaper than a stalled IBD).
+    pub fn want_one(&mut self, hash: BlockHash) -> Option<Message> {
+        if self.in_flight.len() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER {
+            return None;
+        }
+        if self.in_flight.iter().any(|(h, _)| *h == hash) {
+            return None; // already in this peer's queue — no point re-asking
+        }
+        self.wanted.insert(hash);
+        self.in_flight.push_back((hash, Instant::now()));
+        Some(Message::GetData(vec![InvVector {
+            inv_type: InvType::WitnessBlock,
+            hash,
+        }]))
     }
 
     /// Feeds an arrived block into the chainstate, clearing its in-flight

@@ -136,6 +136,14 @@ impl BlockStore {
                 .open(file_path(dir, tail_no))?
         };
 
+        // Reopen infers the prune watermark from the lowest surviving
+        // file: blk files delete oldest-first only, so a directory that
+        // starts at blk00NN has had N-1 files pruned in a previous
+        // session. Without this `is_pruned`/`position` can't distinguish
+        // "body deleted by policy" from "store lost data" — restore's
+        // connected-block check was treating a pruned chain as corrupt
+        // and discarding the whole checkpointed state on restart.
+        let pruned_through = files.first().and_then(|(no, _)| no.checked_sub(1));
         Ok(Self {
             dir: dir.to_path_buf(),
             magic,
@@ -144,7 +152,7 @@ impl BlockStore {
             tail_len,
             tail,
             max_file_size,
-            pruned_through: None,
+            pruned_through,
         })
     }
 
