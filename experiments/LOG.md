@@ -787,3 +787,29 @@ First real mainnet run (`avila-gui --config config/mainnet.toml`,
   proliferation. The dirty-map budget (`over_budget`) fires correctly
   once connect flushes see it; the 736MB-map overshoot was a
   poisoned-state symptom, not a cache bug.
+
+- **Pace model ETA:** flat `blocks/min` extrapolation lies during IBD —
+  era cost varies ~30× (empty-2010 vs dense-segwit blocks). Implemented
+  a windowed model: every 1024 connected blocks records
+  (end height, wall ms, block count, Σ encoded bytes via
+  `store.position().len`); pace = F + R·bytes/blk where R = ratio
+  estimator Σwall/Σbytes over outlier-filtered recent windows (stable
+  where least-squares over-fits n=4 noise into 397h) and F anchors at
+  the median window; bytes/blk regressed on height, clamped to
+  [median, p95×4 ≤ 4MB]; predicted pace clamped to [p95×4 cap,
+  floor]. Integrates per-window to the header tip. First live read at
+  h~373k: ~35h — vs flat extrapolation's misleading ~4h.
+- **Replay bypassed the flush check:** `accept_block`'s
+  `AlreadyKnown`+`have_body` arm and the unlinked-descendant arm
+  returned `maybe_reorg` results directly — no `over_budget` check.
+  Replay/backlog drains rode those arms exclusively, letting the dirty
+  map reach 5.2M entries/688MB and stall commits for minutes (D-state
+  worker under cgroup writeback throttle). `needs_flush` (bytes OR
+  1M-entry bound) now runs after every `maybe_reorg` merge; branches
+  truncate at 256 blocks per batch.
+- **Stale undos survived rewinds:** `commit_inner` only inserted undo
+  rows; a backend rewind left rows above the new tip, so
+  `max_undo_height` reported the pre-rewind chain and re-triggered the
+  ahead-of-state repair on every restart (~10min wasted per boot).
+  Tip-stamping commits now delete undo keys above the tip in the same
+  transaction.

@@ -317,6 +317,12 @@ pub struct Chainstate {
     /// Read handle on `proofs.dat` — serves peer `utxproof` requests
     /// without touching the worker.
     proof_reader: Option<crate::utreexo::ProofReader>,
+    /// Tip of the most recently persisted `state.dat` — the height
+    /// below which a crash-recovery rewind can never need blk-file
+    /// bodies. Pruning must not delete the file holding this height:
+    /// bodies between it and the backend tip are exactly what
+    /// `reconcile_backend` disconnects through.
+    state_tip_persisted: u32,
     /// Utreexo shadow consumer (`--utreexo`): a `UtxoAccumulator`
     /// replaying the connected chain through `connect_block_proven`
     /// against peer-served bundles — the no-UTXO validation shape,
@@ -990,6 +996,7 @@ impl Chainstate {
             utreexo_acc: None,
             pending_bundles: HashMap::new(),
             acc_height: 0,
+            state_tip_persisted: 0,
         }
     }
 
@@ -2015,6 +2022,7 @@ impl Chainstate {
         eprintln!("restore: chain verified");
         self.connected = state.tip;
         self.chain = state.chain;
+        self.state_tip_persisted = state.height;
         self.snapshot_base = snapshot_base;
         self.snapshot_verified = state.snapshot_verified;
         // A resumed snapshot that never finished its background
@@ -2337,23 +2345,45 @@ impl Chainstate {
         // committed undo records. The reverse order would leave the
         // backend *behind* — unrecoverable without a full replay.
         self.flush_coins()?;
-        store::write_state(&dir, magic, &self.snapshot())
+        store::write_state(&dir, magic, &self.snapshot())?;
+        self.state_tip_persisted = self.chain.len() as u32 - 1;
+        Ok(())
     }
 
     /// Deletes the oldest `blk*.dat` files while their total exceeds
-    /// `keep` bytes — Core's `-prune` analog. A reorg reaching a pruned
-    /// body fails loudly at disconnect rather than silently skipping
-    /// (Core halts with a fatal error past the prune depth); a
-    /// resubmitted pruned block re-validates and re-stores.
+    /// `keep` bytes — Core's `-prune` analog, with a floor at the last
+    /// persisted state tip: bodies between `state_tip_persisted` and
+    /// the backend tip are what a crash-recovery rewind disconnects
+    /// through, so the file holding that height and everything newer
+    /// must survive. A reorg reaching a pruned body fails loudly at
+    /// disconnect rather than silently skipping (Core halts with a
+    /// fatal error past the prune depth); a resubmitted pruned block
+    /// re-validates and re-stores.
     ///
     /// # Errors
     ///
     /// `io::Error` on listing/removal failure. No-op without a store.
     pub fn prune(&mut self, keep_bytes: u64) -> std::io::Result<u32> {
-        match &mut self.store {
-            Some(store) => store.prune_to_bytes(keep_bytes),
-            None => Ok(0),
-        }
+        let Some(store) = &mut self.store else {
+            return Ok(0);
+        };
+        // File floor: bodies above `state_tip_persisted` may still be
+        // needed to unwind a crash-ahead backend — and a straggler can
+        // sit in an old file (out-of-order download), so the floor is
+        // the earliest file holding ANY such body, not the file the tip
+        // itself happens to live in. One index scan per prune tick.
+        let floor = store
+            .positions()
+            .into_iter()
+            .filter(|(hash, _)| {
+                self.tree
+                    .get(hash)
+                    .is_some_and(|n| n.height > self.state_tip_persisted)
+            })
+            .map(|(_, pos)| pos.file)
+            .min()
+            .unwrap_or(u32::MAX);
+        store.prune_to_bytes(keep_bytes, floor)
     }
 
     /// The block index (Core's `mapBlockIndex` + best-tip bookkeeping).

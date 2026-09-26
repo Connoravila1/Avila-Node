@@ -261,7 +261,10 @@ impl BlockStore {
     ///
     /// `io::Error` on listing or removal failure — a partial prune may
     /// leave some files deleted.
-    pub fn prune_to_bytes(&mut self, keep: u64) -> io::Result<u32> {
+    /// `floor` bounds deletions: files at or above it are kept even when
+    /// `total` exceeds `keep` — the caller uses it to protect bodies the
+    /// crash-recovery rewind still needs.
+    pub fn prune_to_bytes(&mut self, keep: u64, floor: u32) -> io::Result<u32> {
         self.tail.flush()?;
         let mut files: Vec<(u32, u64)> = fs::read_dir(&self.dir)?
             .filter_map(|entry| {
@@ -279,7 +282,7 @@ impl BlockStore {
         let mut total: u64 = files.iter().map(|(_, size)| size).sum();
         let mut deleted = 0;
         for (file, size) in files {
-            if file >= self.tail_no || total <= keep {
+            if file >= self.tail_no || file >= floor || total <= keep {
                 break;
             }
             fs::remove_file(file_path(&self.dir, file))?;
@@ -903,7 +906,7 @@ mod tests {
         let first_pos = store.position(&blocks[0].block_hash()).unwrap();
         let last_pos = store.position(&blocks[8].block_hash()).unwrap();
         let keep = fs::metadata(file_path(&dir, last_pos.file)).unwrap().len();
-        let deleted = store.prune_to_bytes(keep).unwrap();
+        let deleted = store.prune_to_bytes(keep, u32::MAX).unwrap();
         assert!(deleted >= 1, "oldest files pruned");
         // Pruned positions still resolve but reads report NotFound.
         assert!(store.is_pruned(first_pos));

@@ -209,7 +209,12 @@ impl PaceModel {
         let stride = PACE_WINDOW_BLOCKS as u64;
         while h < tip {
             let mid = h + stride / 2;
-            let bytes_pred = (be + bf * mid as f64).clamp(0.0, byte_cap);
+            // Floor: the size regression can go negative on a thin
+            // window (early 2015 blocks shrank after the 2014 spike),
+            // but blocks never empty out — the long-run size trend is
+            // growth. Hold the prediction at the recent median at
+            // least, so a declining window can't predict a free future.
+            let bytes_pred = (be + bf * mid as f64).clamp(med_x, byte_cap);
             let pace = (a + b * bytes_pred).clamp(pace_floor, pace_cap);
             remaining_ms += pace * (stride.min(tip - h)) as f64;
             h += stride;
