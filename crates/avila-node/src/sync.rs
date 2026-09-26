@@ -109,10 +109,14 @@ impl PaceModel {
         self.last_fit
     }
 
-    /// Predicted seconds to connect `from + 1 ..= to`, or `None` while
-    /// the model is still warming up (fewer than four windows — the
-    /// flat-rate fallback stays honest instead).
-    fn eta_secs(&mut self, from: u32, to: u32) -> Option<u64> {
+    /// Predicted seconds to connect `from + 1 ..= to` as
+    /// `(lo, central, hi)` — a calibrated interval, not fake point
+    /// precision. `lo` holds blocks at the measured median size (the
+    /// era never densifies), `central` follows the size regression
+    /// (era-bound), `hi` prices every remaining block at the dense-era
+    /// ceiling. `None` while warming (<4 windows) — the flat-rate
+    /// fallback stays honest instead.
+    fn eta_secs(&mut self, from: u32, to: u32) -> Option<(u64, u64, u64)> {
         if self.windows.len() < 4 || to <= from {
             return None;
         }
@@ -142,25 +146,24 @@ impl PaceModel {
         let keep: Vec<usize> = (0..ys.len())
             .filter(|&i| ys[i] <= 4.0 * median || ys.len() < 6)
             .collect();
-        // pace ≈ F + R·(bytes/blk). `R` is the ratio estimator
-        // Σwall/Σbytes over kept windows — a single stable parameter
-        // that folds decode+validate+download per byte into one
-        // measured rate (robust where least squares over-fits a noisy
-        // 4-window sample into absurd slopes). `F` anchors the line at
-        // the median window — the fixed per-block cost (header, index,
-        // disk) that doesn't scale with size.
-        let (mut sw, mut sb_) = (0.0f64, 0.0f64);
-        for &i in &keep {
-            sw += ys[i] * fit[i].blocks as f64;
-            sb_ += xs[i] * fit[i].blocks as f64;
-        }
-        let r = if sb_ > 0.0 { sw / sb_ } else { 0.0 };
+        // pace ≈ F + R·(bytes/blk). `R` is the *median* per-window
+        // ms-per-byte — Σwall/Σbytes lets one wall-heavy window bend
+        // the whole slope; the per-window median is insensitive to a
+        // stall window that survived the outlier cut. `F` anchors the
+        // line at the median window — the fixed per-block cost
+        // (header, index, disk) that doesn't scale with size.
         let med_x = {
             let mut m: Vec<f64> = keep.iter().map(|&i| xs[i]).collect();
             m.sort_by(f64::total_cmp);
             m[m.len() / 2]
         };
         let med_y = sorted[sorted.len() / 2];
+        let r = {
+            let mut ratios: Vec<f64> =
+                keep.iter().map(|&i| ys[i] / xs[i].max(1.0)).collect();
+            ratios.sort_by(f64::total_cmp);
+            ratios[ratios.len() / 2]
+        };
         let f = (med_y - r * med_x).max(0.0);
         // bytes/blk ≈ e + f·height — least squares on the byte axis.
         let n = keep.len() as f64;
@@ -187,19 +190,25 @@ impl PaceModel {
         // (the segwit-era plateau is a factor-of-few jump, not an
         // unbounded one), no faster than a quarter of the best observed
         // (cost doesn't teleport below what the era showed). The byte
-        // mean gets the same treatment: saturation at 4× the biggest
-        // observed window mean — the 4MB weight cap bounds the worst
-        // single block, not the era average.
+        // mean gets the same treatment: saturation well past the
+        // biggest observed era mean (era-bound below), not at the
+        // protocol's per-block edge.
         let mut size_sorted = xs.clone();
         size_sorted.sort_by(f64::total_cmp);
         let p95_size = size_sorted[size_sorted.len() * 95 / 100];
-        let byte_cap = (p95_size * 4.0).clamp(64_000.0, BLOCK_BYTES_CAP);
+        // Era-bound, not protocol-bound: the far tail can't be denser
+        // than ~1.5× the worst measured window — the 4MB cap is a
+        // per-block edge, never a sustained mean, and letting the
+        // prediction float to it was the 9-day/4-day inflation.
+        let byte_cap = (p95_size * 1.5).clamp(med_x, BLOCK_BYTES_CAP);
         // Pace bounds come from the kept (outlier-filtered) windows —
         // a stall window must not widen the cap it would sneak past.
+        // ×2.5 covers a genuinely denser era without double-counting
+        // the byte-size inflation already in `bytes_pred`.
         let mut kept_paces: Vec<f64> = keep.iter().map(|&i| ys[i]).collect();
         kept_paces.sort_by(f64::total_cmp);
         let p95_pace = kept_paces[kept_paces.len() * 95 / 100].max(1.0);
-        let pace_cap = p95_pace * 4.0;
+        let pace_cap = p95_pace * 2.5;
         let pace_floor = (kept_paces[0] * 0.25).max(0.5);
         self.last_fit = Some((a, b, bf, byte_cap, keep.len()));
         // The size slope only holds over the evidence — extrapolating a
@@ -214,9 +223,14 @@ impl PaceModel {
             .fold((f64::MAX, f64::MIN), |(lo, hi), h| (lo.min(h), hi.max(h)));
         let freeze_h = h_hi + (h_hi - h_lo).max(20_000.0);
         let mut remaining_ms = 0.0f64;
+        let mut lo_ms = 0.0f64;
+        let mut hi_ms = 0.0f64;
         let mut h = from as u64;
         let tip = to as u64;
         let stride = PACE_WINDOW_BLOCKS as u64;
+        let pace_at = |bytes: f64| (a + b * bytes).clamp(pace_floor, pace_cap);
+        let lo_pace = pace_at(med_x);
+        let hi_pace = pace_at(byte_cap);
         while h < tip {
             let mid = (h + stride / 2).min(freeze_h as u64);
             // Floor: the size regression can go negative on a thin
@@ -225,11 +239,17 @@ impl PaceModel {
             // growth. Hold the prediction at the recent median at
             // least, so a declining window can't predict a free future.
             let bytes_pred = (be + bf * mid as f64).clamp(med_x, byte_cap);
-            let pace = (a + b * bytes_pred).clamp(pace_floor, pace_cap);
-            remaining_ms += pace * (stride.min(tip - h)) as f64;
+            let len = stride.min(tip - h) as f64;
+            remaining_ms += pace_at(bytes_pred) * len;
+            lo_ms += lo_pace * len;
+            hi_ms += hi_pace * len;
             h += stride;
         }
-        Some((remaining_ms / 1000.0).ceil() as u64)
+        Some((
+            (lo_ms / 1000.0).ceil() as u64,
+            (remaining_ms / 1000.0).ceil() as u64,
+            (hi_ms / 1000.0).ceil() as u64,
+        ))
     }
 }
 
@@ -450,9 +470,16 @@ pub struct SyncProgress {
     /// looks wrong, so a cleared condition clears here too.
     pub eclipse: Vec<EclipseSignal>,
     /// Estimated seconds to connect the remaining chain to the header
-    /// tip — the era-aware pace model's integration, `None` until the
-    /// model has warmed up (callers fall back to a flat-rate guess).
+    /// tip — the era-aware pace model's central integration, `None`
+    /// until the model has warmed up (callers fall back to a flat-rate
+    /// guess).
     pub eta_secs: Option<u64>,
+    /// The model's optimistic bound — every remaining block at the
+    /// measured median era's cost. `Some` exactly when `eta_secs` is.
+    pub eta_lo_secs: Option<u64>,
+    /// The model's pessimistic bound — every remaining block priced at
+    /// the dense-era ceiling.
+    pub eta_hi_secs: Option<u64>,
 }
 
 impl SyncProgress {
@@ -487,6 +514,8 @@ impl SyncProgress {
             headers_buffered: 0,
             eclipse: Vec::new(),
             eta_secs: None,
+            eta_lo_secs: None,
+            eta_hi_secs: None,
         }
     }
 }
@@ -1121,14 +1150,17 @@ pub fn run(
                 .unwrap_or(0);
             let eta = pace
                 .eta_secs(connected, cs.tree().tip().height)
-                .map(|s| {
-                    let h = s / 3600;
-                    let m = (s % 3600) / 60;
-                    if h > 0 {
-                        format!("{h}h{m}m")
-                    } else {
-                        format!("{m}m{s}s", s = s % 60)
-                    }
+                .map(|(lo, mid, hi)| {
+                    let f = |s: u64| {
+                        let h = s / 3600;
+                        let m = (s % 3600) / 60;
+                        if h > 0 {
+                            format!("{h}h{m}m")
+                        } else {
+                            format!("{m}m{s}s", s = s % 60)
+                        }
+                    };
+                    format!("{}[{lo}..{hi}]", f(mid), lo = f(lo), hi = f(hi))
                 })
                 .unwrap_or_else(|| "warming".to_string());
             let fit = pace
@@ -1187,6 +1219,7 @@ pub fn run(
             hb_prev_t = t;
             hb_prev_connected = connected;
         }
+        let etas = pace.eta_secs(connected, cs.tree().tip().height);
         let snapshot = SyncProgress {
             phase: if mgr.is_empty() {
                 Phase::FindingPeers
@@ -1215,7 +1248,9 @@ pub fn run(
             next_block: next_block.clone(),
             eclipse: eclipse.clone(),
             prune_bytes: cfg.prune_bytes,
-            eta_secs: pace.eta_secs(connected, cs.tree().tip().height),
+            eta_secs: etas.map(|(_, mid, _)| mid),
+            eta_lo_secs: etas.map(|(lo, _, _)| lo),
+            eta_hi_secs: etas.map(|(_, _, hi)| hi),
         };
         if let Some(status) = &cfg.status
             && let Ok(mut w) = status.write()

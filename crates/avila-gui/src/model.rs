@@ -37,8 +37,15 @@ pub struct NodeView {
     /// Eclipse indicators the node currently raises.
     pub eclipse: Vec<Eclipse>,
     /// Era-aware ETA to the header tip in seconds — the pace model's
-    /// integration over remaining heights; `None` until it warms up.
+    /// central integration over remaining heights; `None` until it
+    /// warms up.
     pub eta_secs: Option<u64>,
+    /// Optimistic bound: every remaining block at the measured median
+    /// era's cost. `Some` exactly when `eta_secs` is.
+    pub eta_lo_secs: Option<u64>,
+    /// Pessimistic bound: every remaining block at the dense-era
+    /// ceiling.
+    pub eta_hi_secs: Option<u64>,
 }
 
 /// An eclipse indicator — the node's advisory signs that an attacker
@@ -198,6 +205,8 @@ impl From<&SyncProgress> for NodeView {
                 })
                 .collect(),
             eta_secs: p.eta_secs,
+            eta_lo_secs: p.eta_lo_secs,
+            eta_hi_secs: p.eta_hi_secs,
             curve: ChainCurve::new(
                 p.profile
                     .samples

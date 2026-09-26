@@ -1360,6 +1360,8 @@ mod tests {
             eclipse: Vec::new(),
             prune_bytes: None,
             eta_secs: None,
+            eta_lo_secs: None,
+            eta_hi_secs: None,
             proxy: None,
         }));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1478,6 +1480,8 @@ mod tests {
             eclipse: Vec::new(),
             prune_bytes: None,
             eta_secs: None,
+            eta_lo_secs: None,
+            eta_hi_secs: None,
             proxy: None,
         }));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1626,6 +1630,8 @@ mod tests {
             eclipse: Vec::new(),
             prune_bytes: None,
             eta_secs: None,
+            eta_lo_secs: None,
+            eta_hi_secs: None,
             proxy: None,
         }))
     }

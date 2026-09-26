@@ -235,6 +235,8 @@ impl Demo {
             // A healthy simulated node raises no eclipse indicators.
             eclipse: Vec::new(),
             eta_secs: None,
+            eta_lo_secs: None,
+            eta_hi_secs: None,
         }
     }
 

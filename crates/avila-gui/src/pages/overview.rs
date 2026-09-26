@@ -200,6 +200,14 @@ fn sync_banner(ui: &mut Ui, s: &Scene, v: &NodeView) {
         }
         if let Some(secs) = eta {
             text.push_str(&format!(" · about {} to go", span(secs)));
+            // The model's honest band — a single ETA over 550k
+            // heterogeneous blocks is fake precision; the range is
+            // what the data actually supports.
+            if let (Some(lo), Some(hi)) = (v.eta_lo_secs, v.eta_hi_secs)
+                && hi > lo + 600
+            {
+                text.push_str(&format!(" ({}–{})", span(lo), span(hi)));
+            }
         }
         (text, f64::from(v.connected) / f64::from(target))
     };
