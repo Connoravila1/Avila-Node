@@ -396,11 +396,20 @@ fn handle_with_timeout(
                     let now = crate::time::time() as u32;
                     match cs.accept_block(&block, now) {
                         Ok(avila_consensus::chainstate::Acceptance::Connected {
-                            height,
                             reorged,
                             ..
                         }) => {
-                            mgr.mempool().on_block_connected(&block, height);
+                            // Wait for deferred script checks before the
+                            // block becomes authoritative — same
+                            // boundary as submitblock/generate.
+                            if let Err(e) = cs.drain_scripts() {
+                                return Ok(serde_json::json!(format!("{e}")));
+                            }
+                            for (h, hash) in cs.take_checked() {
+                                if let Some(body) = cs.body(&hash) {
+                                    mgr.mempool().on_block_connected(&body, h);
+                                }
+                            }
                             if reorged {
                                 let gone = cs.take_disconnected();
                                 mgr.mempool().refill_from_disconnected(

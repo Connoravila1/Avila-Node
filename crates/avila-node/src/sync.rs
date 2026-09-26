@@ -982,10 +982,11 @@ pub fn run(
         // next arrival or a periodic flush. A drain failure rewinds
         // the failed suffix; the mempool feed then publishes only
         // fully-checked blocks.
-        if cs.pending_scripts_len() > 0 && cs.pending_idle() > Duration::from_millis(50) {
-            if let Err(e) = cs.drain_scripts() {
-                eprintln!("sync: deferred script check failed: {e}");
-            }
+        if cs.pending_scripts_len() > 0
+            && cs.pending_idle() > Duration::from_millis(50)
+            && let Err(e) = cs.drain_scripts()
+        {
+            eprintln!("sync: deferred script check failed: {e}");
         }
         for (h, hash) in cs.take_checked() {
             if let Some(body) = cs.body(&hash) {
@@ -1068,13 +1069,16 @@ pub fn run(
                 .collect();
             mgr.request_blocks(&want);
         }
-        // The last connected blocks, for the tape display.
+        // The last *checked* blocks, for the tape display — the
+        // speculative tail stays invisible to every consumer-facing
+        // surface (tape, getbestblockhash, progress numbers).
         let chain = cs.chain();
+        let end = (cs.checked_height() as usize + 1).min(chain.len());
         let recent: Vec<(u32, avila_consensus::hash::BlockHash)> = chain
+            [end.saturating_sub(12)..end]
             .iter()
             .enumerate()
-            .skip(chain.len().saturating_sub(12))
-            .map(|(i, h)| (i as u32, *h))
+            .map(|(i, h)| (end.saturating_sub(12) as u32 + i as u32, *h))
             .collect();
         // ChainProfile::refresh is a no-op once the tip hash matches, so
         // this is cheap on every tick that didn't just connect a block;

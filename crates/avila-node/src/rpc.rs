@@ -5881,8 +5881,14 @@ pub(crate) fn dispatch(
             }
         }
         "getblockchaininfo" => chain_query(method, queries, |cs, _mgr| {
-            let tip = cs.tip_hash();
-            let connected = cs.chain().len().saturating_sub(1) as u32;
+            // The checked frontier — `cs.tip_hash()` would name a
+            // speculative block whose scripts are still in flight.
+            let connected = cs.checked_height();
+            let tip = cs
+                .chain()
+                .get(connected as usize)
+                .copied()
+                .unwrap_or_else(|| cs.tip_hash());
             let best_header = cs.tree().tip();
             let Some(node) = cs.tree().get(&tip) else {
                 return Err((RPC_MISC_ERROR, "tip not indexed".into()));
@@ -5936,8 +5942,12 @@ pub(crate) fn dispatch(
             // then the snapshot chainstate (`validated: false` plus
             // `snapshot_blockhash`). After verification merges them the
             // single entry reports `validated: true`.
-            let tip = cs.tip_hash();
-            let connected = cs.chain().len().saturating_sub(1) as u32;
+            let connected = cs.checked_height();
+            let tip = cs
+                .chain()
+                .get(connected as usize)
+                .copied()
+                .unwrap_or_else(|| cs.tip_hash());
             let best_header = cs.tree().tip();
             let chainstate_entry = |height: u32, hash: BlockHash| -> Option<Value> {
                 let node = cs.tree().get(&hash)?;
@@ -7928,7 +7938,12 @@ pub(crate) fn dispatch(
                             branchlen = node.height - h;
                         }
                     }
-                    let status = if *hash == cs.tip_hash() {
+                    let status = if *hash
+                        == cs.chain()
+                            .get(cs.checked_height() as usize)
+                            .copied()
+                            .unwrap_or_else(|| cs.tip_hash())
+                    {
                         "active"
                     } else if cs.tree().is_failed(hash) {
                         "invalid"

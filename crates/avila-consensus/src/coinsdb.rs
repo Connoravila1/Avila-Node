@@ -830,10 +830,10 @@ impl CoinsBackend {
                 if let Some(t) = tip {
                     let mut stale: Vec<u32> = Vec::new();
                     {
-                        let mut it = undo
+                        let it = undo
                             .range(t + 1..)
                             .map_err(|e| std::io::Error::other(format!("coinsdb undo scan: {e}")))?;
-                        while let Some(row) = it.next() {
+                        for row in it {
                             let row = row
                                 .map_err(|e| std::io::Error::other(format!("coinsdb undo scan: {e}")))?;
                             stale.push(row.0.value());
@@ -912,10 +912,10 @@ impl CoinsBackend {
             if let Some(t) = tip {
                 let mut stale: Vec<u32> = Vec::new();
                 {
-                    let mut it = undo
+                    let it = undo
                         .range(t + 1..)
                         .map_err(|e| std::io::Error::other(format!("coinsdb undo scan: {e}")))?;
-                    while let Some(row) = it.next() {
+                    for row in it {
                         let row = row.map_err(|e| {
                             std::io::Error::other(format!("coinsdb undo scan: {e}"))
                         })?;
