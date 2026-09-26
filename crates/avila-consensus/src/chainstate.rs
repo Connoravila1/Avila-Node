@@ -1763,6 +1763,55 @@ impl Chainstate {
             },
             _ => cs.stored_positions(&HashSet::new()),
         };
+        // Torn/absent state.dat skips `restore` — and with it the
+        // backend reconcile. The backend may sit thousands of heights
+        // ahead of the rebuilt genesis tip (crash during connect
+        // commits coins before state.dat catches up). Replaying bodies
+        // against that mismatched view once poisoned a real mainnet
+        // datadir: a spent-input lookup failed, `mark_invalid` cascaded
+        // to ~24k descendants, and the marks persisted. Rewind to the
+        // rebuilt tip first — batched, so a huge gap costs a handful of
+        // commits instead of one transaction per height.
+        if cs.coins_backend.is_some() {
+            let tip = cs.chain.len() as u32 - 1;
+            // Meta tip may lie low after a torn flush — the undo table
+            // cannot (entries commit atomically with the coins they
+            // reverse), so `max_undo_height` is the ahead-of-state probe.
+            let ahead = cs
+                .coins_backend
+                .as_ref()
+                .map(|be| be.tip_height().max(be.max_undo_height()) > tip)
+                .unwrap_or(false);
+            if ahead {
+                eprintln!("restore: rewinding ahead-of-state backend to tip {tip}");
+                match cs.reconcile_backend(tip) {
+                    Ok(()) => eprintln!("restore: backend rewound"),
+                    Err(err) => {
+                        // Rewind can't cross pruned/missing bodies or a
+                        // gap in the undo table — and attaching the
+                        // mismatched backend anyway is how one run
+                        // poisoned 24k valid blocks. The coinsdb is
+                        // fully derived state (blk files are the truth),
+                        // so the honest recovery is rebuild-from-empty.
+                        eprintln!("restore: backend rewind failed ({err}) — rebuilding coinsdb");
+                        cs.coins_backend = None;
+                        cs.utxo = UtxoSet::new();
+                        for name in [
+                            "coinsdb.redb",
+                            "coinsdb.shadow.redb",
+                            "coins.idx",
+                            "coins.dat",
+                        ] {
+                            let _ = std::fs::remove_file(dir.join(name));
+                        }
+                        let fresh = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open(dir)?);
+                        cs.utxo.attach_shared(fresh.clone());
+                        cs.coins_backend = Some(fresh);
+                        eprintln!("restore: coinsdb rebuilt empty; bodies replay over it");
+                    }
+                }
+            }
+        }
         // Bodies stored out of order are orphans until their parent lands.
         // Height order puts every parent ahead of its children — one linear
         // pass connects everything the store recorded, replacing the old
@@ -2307,6 +2356,15 @@ impl Chainstate {
         self.connected
     }
 
+    /// `(dirty-map entries, dirty-map bytes, in-memory undo tail len)`
+    /// — the three things that can balloon during bulk connect, for the
+    /// sync heartbeat's memory accounting. Cheap field reads only.
+    #[must_use]
+    pub fn mem_stats(&self) -> (usize, usize, usize) {
+        let (n, bytes) = self.utxo.map_stats();
+        (n, bytes, self.undos.len())
+    }
+
     /// The active chain's block hashes, genesis at index 0 — so
     /// `chain().len() - 1` is the tip height.
     #[must_use]
@@ -2480,7 +2538,13 @@ impl Chainstate {
         let Some(be) = self.coins_backend.clone() else {
             return Ok(());
         };
-        let db_tip = be.tip_height();
+        // The real applied height is `max(meta tip, last undo key)`:
+        // both land in the same commit, but a torn write-state flush can
+        // leave meta tip at 0 (or behind) while the undo table still
+        // records the coins that were applied. A zero `tip` with a
+        // populated undo table must still rewind — it cannot be the
+        // genesis state.
+        let db_tip = be.tip_height().max(be.max_undo_height());
         if db_tip < state_tip {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2489,6 +2553,14 @@ impl Chainstate {
                 ),
             ));
         }
+        // Rewind in bounded-size commits: the OOM-kill window leaves the
+        // backend tens of thousands of heights ahead of `state.dat`, and
+        // the original loop paid a full redb transaction per height
+        // (~30min for a 34k gap). The per-height undos compose into one
+        // delta — apply them to a scratch set and flush every 2048
+        // heights (also crash-safe: each commit's tip survives a kill).
+        let mut scratch = UtxoSet::new();
+        scratch.attach_shared(be.clone());
         for h in (state_tip + 1..=db_tip).rev() {
             let Some((hash, undo)) = be.undo_entry(h) else {
                 return Err(std::io::Error::new(
@@ -2502,15 +2574,17 @@ impl Chainstate {
                     format!("coinsdb rewind: no body for {hash} at {h}"),
                 ));
             };
-            let mut scratch = UtxoSet::new();
-            scratch.attach_shared(be.clone());
             connect::disconnect_block(&block, &mut scratch, &undo).map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("coinsdb rewind: undo inconsistent at {h}"),
                 )
             })?;
-            scratch.flush_to_backend(&[], h - 1)?;
+            // Periodic commit bounds scratch memory AND makes mid-rewind
+            // progress durable — a crash re-enters with less to redo.
+            if (h - 1) % 2048 == 0 || h - 1 == state_tip {
+                scratch.flush_to_backend(&[], h - 1)?;
+            }
         }
         Ok(())
     }

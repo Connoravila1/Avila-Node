@@ -853,13 +853,28 @@ pub fn run(
             hb_at = std::time::Instant::now();
             let t = avila_consensus::connect::connect_timing();
             let ms = |ns: u64| ns / 1_000_000;
+            let (map_n, map_b, undos_n) = cs.mem_stats();
+            let rss_kb = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines().find(|l| l.starts_with("VmRSS")).and_then(|l| {
+                        l.split_whitespace()
+                            .nth(1)
+                            .and_then(|v| v.parse::<u64>().ok())
+                    })
+                })
+                .unwrap_or(0);
             eprintln!(
-                "sync: peers={} connected={} headers={} buffered={} in_flight={} | connect_ms/blk total={} read={} apply={} scripts={} drain={} bip30={} other={} accept_cum={} reorg_cum={} (n={})",
+                "sync: peers={} connected={} headers={} buffered={} in_flight={} rss={}MB map={}n/{}MB undos={} | connect_ms/blk total={} read={} apply={} scripts={} drain={} bip30={} other={} accept_cum={} reorg_cum={} (n={})",
                 mgr.len(),
                 connected,
                 cs.tree().tip().height,
                 mgr.presync_height().unwrap_or(0),
                 mgr.in_flight(),
+                rss_kb / 1024,
+                map_n,
+                map_b / 1_048_576,
+                undos_n,
                 t.total_ns
                     .checked_div(t.blocks.max(1))
                     .map_or(0, |n| n / 1_000_000),

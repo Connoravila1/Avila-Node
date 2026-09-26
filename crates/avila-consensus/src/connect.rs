@@ -385,6 +385,13 @@ impl UtxoSet {
         self.len() == 0
     }
 
+    /// `(entry count, accounted bytes)` of the write-back dirty map —
+    /// diagnostics for the `-dbcache` watermark, never on a hot path.
+    #[must_use]
+    pub fn map_stats(&self) -> (usize, usize) {
+        (self.map.len(), self.map_bytes)
+    }
+
     /// The coin at `outpoint` — layered lookup: dirty map, then the
     /// simulation base, then the disk backend. Backend reads are not
     /// cached in `map` (the cache is write-back only); `redb`'s mmap

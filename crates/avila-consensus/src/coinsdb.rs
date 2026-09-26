@@ -704,6 +704,21 @@ impl CoinsBackend {
         decode_undo(g.value(), self.format)
     }
 
+    /// Highest height holding an undo record — the authoritative
+    /// "backend has state through here" probe. Unlike `tip_height()`
+    /// (a meta key a torn write can zero), undo entries are written in
+    /// the same commit as the coins they reverse, so they cannot
+    /// under-report the applied height.
+    #[must_use]
+    pub fn max_undo_height(&self) -> u32 {
+        self.db
+            .begin_read()
+            .ok()
+            .and_then(|r| r.open_table(UNDO).ok())
+            .and_then(|t| t.last().ok().flatten().map(|(k, _)| k.value()))
+            .unwrap_or(0)
+    }
+
     /// Atomically commits a cache delta: `dirty` entries (`Some` =
     /// put/overwrite, `None` = delete), `new_undos` the per-height undo
     /// records landing this commit, `tip` the connected height this
