@@ -146,25 +146,21 @@ impl PaceModel {
         let keep: Vec<usize> = (0..ys.len())
             .filter(|&i| ys[i] <= 4.0 * median || ys.len() < 6)
             .collect();
-        // pace ≈ F + R·(bytes/blk). `R` is the *median* per-window
-        // ms-per-byte — Σwall/Σbytes lets one wall-heavy window bend
-        // the whole slope; the per-window median is insensitive to a
-        // stall window that survived the outlier cut. `F` anchors the
-        // line at the median window — the fixed per-block cost
-        // (header, index, disk) that doesn't scale with size.
+        // Predicted pace = median observed pace scaled by the
+        // predicted/observed size ratio. A linear `F + R·bytes` split
+        // on 4-7 noisy windows produced unstable fits (both OLS and
+        // ratio estimators): flush commits, fetch stalls, and fixed
+        // per-block costs all land in the same wall sample, and any
+        // two-parameter decomposition of that noise swings wildly.
+        // The median is the one quantity that survives; the size
+        // ratio carries the era-dependence (denser future blocks
+        // cost proportionally more).
         let med_x = {
             let mut m: Vec<f64> = keep.iter().map(|&i| xs[i]).collect();
             m.sort_by(f64::total_cmp);
             m[m.len() / 2]
         };
         let med_y = sorted[sorted.len() / 2];
-        let r = {
-            let mut ratios: Vec<f64> =
-                keep.iter().map(|&i| ys[i] / xs[i].max(1.0)).collect();
-            ratios.sort_by(f64::total_cmp);
-            ratios[ratios.len() / 2]
-        };
-        let f = (med_y - r * med_x).max(0.0);
         // bytes/blk ≈ e + f·height — least squares on the byte axis.
         let n = keep.len() as f64;
         let (sh, sb, shh, shb) = keep.iter().fold((0.0, 0.0, 0.0, 0.0), |acc, &i| {
@@ -182,7 +178,6 @@ impl PaceModel {
         } else {
             (0.0, sb / n)
         };
-        let (a, b) = (f, r);
         // Bounds for the extrapolation — the regression shapes relative
         // growth but is ill-conditioned on a few noisy windows, so the
         // predicted pace is clamped to a band around what has actually
@@ -210,7 +205,16 @@ impl PaceModel {
         let p95_pace = kept_paces[kept_paces.len() * 95 / 100].max(1.0);
         let pace_cap = p95_pace * 2.5;
         let pace_floor = (kept_paces[0] * 0.25).max(0.5);
-        self.last_fit = Some((a, b, bf, byte_cap, keep.len()));
+        // Debug tuple repurposed for the size-scaled model:
+        // (median pace ms, size ratio at the cap, byte slope, byte
+        // cap, windows used).
+        self.last_fit = Some((
+            med_y,
+            byte_cap / med_x.max(1.0),
+            bf,
+            byte_cap,
+            keep.len(),
+        ));
         // The size slope only holds over the evidence — extrapolating a
         // local growth rate to the tip saturates every future block at
         // the cap (a 560k-height projection turned a +8B/blk mid-2016
@@ -228,7 +232,9 @@ impl PaceModel {
         let mut h = from as u64;
         let tip = to as u64;
         let stride = PACE_WINDOW_BLOCKS as u64;
-        let pace_at = |bytes: f64| (a + b * bytes).clamp(pace_floor, pace_cap);
+        let pace_at = |bytes: f64| {
+            (med_y * bytes / med_x.max(1.0)).clamp(pace_floor, pace_cap)
+        };
         let lo_pace = pace_at(med_x);
         let hi_pace = pace_at(byte_cap);
         while h < tip {
@@ -1165,9 +1171,9 @@ pub fn run(
                 .unwrap_or_else(|| "warming".to_string());
             let fit = pace
                 .debug_fit()
-                .map(|(a, b, bf, cap, n)| {
+                .map(|(med, ratio_cap, bf, cap, n)| {
                     format!(
-                        "fit[a={a:.1}ms b={b:.4}ms/KB bf={bf:.2}B/blk cap={}KB n={n}]",
+                        "fit[med={med:.0}ms rcap={ratio_cap:.2} bf={bf:.2}B/blk cap={}KB n={n}]",
                         cap as u64 / 1000
                     )
                 })
