@@ -6,8 +6,11 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 
 | # | Date | Experiment | Hypothesis | Verdict | Key numbers | Doc |
 |---|------|-----------|------------|---------|-------------|-----|
-| 73 | 09-26 | SHRD replacement in field u128_rshift | Gracemont SHRD cost (~12+ cyc) makes >>52 extraction a real verify fraction | **bounded win, smaller than modeled** | Microbench: 4×SHRD 19.3ns vs 3-op seq 2.5ns (~7.5×). Real verify A/B: 404→102 SHRDs (16→2 in fe_mul/sqr), 2048-trace verdicts identical; compressed+verify −4.2% med / −7.8% min, preparsed −2.8%. In-context marginal SHRD cost ~1–2c, not 12–19c. | [shrd-replacement](2026-09-26-ibd-shrd-replacement.md) |
-| 72 | 09-26 | IBD workload census (structural) | Era-resolved structural counts can replace assumed corpus parameters | **measured sampled windows; segwit era gap** | Windows over real corpora: pre-segwit 229–408k + taproot 956.5k + genesis fixture. Per-block: 303–1,147 tx / 731–3,971 sig-items pre-segwit; 4,765 tx / 7,667 sig-items at 956k (schnorr ~8%). Legacy sighash = dominant hash plane: 9–11 GB SHA input per 134 MB blk file (~35–75× amplification). Structural sig estimate matches executed trace within ~4%. | [workload-census](2026-09-26-ibd-workload-census.md) |
+| 76 | 09-26 | Resolver repair + executed calibration (#41/#72 gates) | File-identity, coinbase sources, per-item preimage model, executed counters | **repairs verified; counters reconcile** | V2 corpus: 599,840 resolved (89.29%), 0 txid mismatches, 0 immature; executed 517,819 (77.08%), 82,021 resolved-in-excluded. Executed counters: 526,534 ECDSA sighash+verify attempts (1.017/input), schnorr 0; sighash 1.4% of check-stage time. Same-window calibration: structural×share ≈ executed within ~0.5%. Deterministic regressions added. | [corpus-replay](2026-09-26-ibd-corpus-replay.md) |
+| 75 | 09-26 | Exact-state anti-join (#42) bounded | UTXO state derivable as batch set-join over sequential ledgers | **ledger volumes only; exact-state gate open** | Span h~337–342k: 7.24M created/6.66M spent set keys (614 MB ledger writes). 77.2% created∩spent set overlap (not an exact-state proof); 16% of spends have source absent from selected records; 22.8% key-set survivor tail. Multiplicity/order/maturity/BIP30 not implemented; survivors lack full output data. | [state-join](2026-09-26-ibd-state-join.md) |
+| 74 | 09-26 | Corpus-parallel script replay (#41) | Prevouts from raw corpus + parallel check_input_scripts scales sig-plane without UTXO store | **holds on resolved subset; 0 failures** | Window h340787–342234 (449 blk). Executed 515,779/671,771 inputs = **76.8%** (89.1% was per-input resolution incl. excluded-tx inputs). 10.8k→49.3k inputs/s at 1→8 workers (shared host). Zero failures authenticate scriptPubKey only — legacy sighash does not commit amounts. File-identity defect found+fixed in v2 re-run (#76). | [corpus-replay](2026-09-26-ibd-corpus-replay.md) |
+| 73 | 09-26 | SHRD replacement in field u128_rshift | Gracemont SHRD cost makes >>52 extraction a real verify fraction | **small keepable win** | 404→102 SHRDs (8→1 per fe_mul/sqr kernel), 2048-trace verdicts identical. Recomputed medians: compressed+verify −5.37%, preparsed −3.22% (2/6 paired runs regress slightly). batch_y33 advice path 40.265µs/sig on 4,096 synthetic records (batch param 8192 not a real 8192 batch; producer ~91.4µs/record not included). | [shrd-replacement](2026-09-26-ibd-shrd-replacement.md) |
+| 72 | 09-26 | IBD workload census (structural) | Era-resolved structural counts can replace assumed corpus parameters | **structural counts valid; hash figures were coarse estimates (regenerated in #76)** | Windows over real corpora: pre-segwit 229–408k + taproot 956.5k + genesis fixture. Per-block: 303–1,147 tx / 731–3,971 sig-items pre-segwit; 4,765 tx / 7,667 sig-items at 956k (schnorr ~8%). DER-attempt estimate calibrated ≈exact vs executed (#76). Legacy sighash dominates hash plane — v1 amplification figure (~35–75×) retired; corrected ~3.75× lower (still dominant). | [workload-census](2026-09-26-ibd-workload-census.md) |
 | 71 | 09-26 | IBD arithmetic census and hardware limits | Instruction accounting can replace unsupported universal IBD-floor estimates | **measured narrow scope; full-IBD floor unestablished** | 512 canonical mainnet ECDSA attempts: all verdicts matched, 985 field multiplies + 973 squares + one scalar inversion/attempt, no variable field inversion; compressed parse adds 14 multiplies + 255 squares. Shared-host timing ~100–135 microseconds/attempt; native compiler gain inconclusive. Static field kernels retain costly SHRD candidates. Further experiments assigned to SWE-2 | [hardware-floor](2026-09-26-ibd-hardware-floor.md) |
 | 1 | 09-14 | RPC compat matrix vs Core 29.4 | RPC surface can be made byte-compatible | **adopted** | 75 calls exact-match | [rpc-compat-matrix](2026-09-14-rpc-compat-matrix.md) |
 | 2 | ~09-20 | Header acceptance baseline | Header-chain parity is provable offline | **adopted** | `check_headers_core.py` 0 mismatches | [header-acceptance](2026-09-header-acceptance-baseline.md) |
@@ -847,3 +850,27 @@ p2p, 108 node tests green; clippy clean.
 
 **Live:** run24 resumed at 407,176; replay + sync healthy with the
 bounded pipeline (RSS ~2.3GB, flush bounds holding).
+
+## 2026-09-26c — ETA: calibrated interval, era-bound caps (47d82c3)
+
+**Finding:** the point ETA quoted "4 days" (110h) at h~417k — an
+inflation, not a stall. Two clamps double-counted the same
+densification: `byte_cap = p95_size*4` let the far-tail prediction
+float to the 4MB protocol edge (a per-block edge, never a sustained
+mean — real segwit-era means plateau ~1.3-1.6MB), and `pace_cap =
+p95_pace*4` let the priced pace quadruple on top. The ratio estimator
+`Σwall/Σbytes` also let one wall-heavy window bend the cost slope.
+
+**Fix:** `R` is now the median per-window ms/byte; `byte_cap` is
+era-bound (`1.5×` the worst measured window mean); `pace_cap` is
+`2.5× p95`. More importantly, `eta_secs` now returns
+`(lo, central, hi)`: lo holds every remaining block at the measured
+median-era cost, central follows the size regression frozen at the
+evidence horizon, hi prices every block at the dense-era ceiling.
+`SyncProgress`/`NodeView` carry the interval; heartbeat prints
+`mid[lo..hi]`; the GUI banner shows the range.
+
+A single ETA over ~550k heterogeneous blocks is fake precision — the
+calibrated band is what the measurements actually support. Verified:
+108/108 node tests; the running node continues on the corrected
+build (windows warming).
