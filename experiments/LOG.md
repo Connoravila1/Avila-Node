@@ -678,3 +678,68 @@ First real mainnet run (`avila-gui --config config/mainnet.toml`,
   <500 steps for 5 full-depth descents over a 20k chain; the
   `ancestor_steps` diagnostic counter and `sim_checks` timing
   bucket remain for live verification.
+
+- **IBD crash-recovery cascade fixed: torn state.dat can no longer
+  poison the chain (queue: real mainnet IBD).** An OOM kill mid-flush
+  left `state.dat` truncated while `coinsdb.redb` held ~214k heights of
+  committed UTXOs. On restart, `resume()`'s restore-failure arm rebuilt
+  the chainstate at genesis but reattached the ahead backend without
+  rewinding — replaying block 1 against a 214k-height coin set failed a
+  spend check, `mark_invalid` cascaded to ~24k descendants, and a
+  shutdown checkpoint persisted the bogus marks. Layered fixes:
+  `resume` logs the restore error instead of silently discarding it;
+  the rewind target is the rebuilt tip, not a stale reference;
+  `reconcile_backend` rewinds in bounded 2048-height commits so a
+  34k-height gap costs 17 transactions instead of 34k (the old
+  per-height loop took ~30min — observed live); `tip_height` can be
+  clobbered to 0 by a torn meta write so the ahead-probe uses
+  `tip_height().max(max_undo_height())` (undo records commit atomically
+  with the coins they reverse — can't lie low); rewind failure on
+  missing bodies wipes+rebuilds coinsdb from blk files rather than
+  attaching mismatched state.
+
+- **Restart-under-pruning fixed: `restore` treated pruned bodies as
+  corruption → every restart discarded the checkpointed chain.** The
+  chain-verify required `store.position(hash)` for every connected
+  entry — but the position index is rebuilt from surviving blk files,
+  so pruned bodies read as absent → `corrupt("connected block body
+  not stored")` → silent rebuild → the ahead-backend check then
+  computed tip=0 and tried to rewind a healthy ~214k backend to
+  genesis, failing on pruned bodies and wiping coinsdb. Net effect:
+  restart under `-prune` reset the node to genesis (observed live —
+  a 175,002-block checkpoint at restart became "tip 0" replay).
+  Fixes: `open` infers `pruned_through` from the lowest surviving
+  blk file; chain-verify accepts absent bodies when pruning is
+  active; restore error printed before fallback.
+
+- **The real wedge: peer CPU budget `continue` skipped the rate-decay
+  fold → dominant download peer permanently quarantined.** Three
+  separate live wedges (147,629 / 140,378 / 134,384 / 214,850) shared
+  one signature: the next-needed hash `reserved_by` one peer with
+  `have_body=false` while in-flight churned below it. Diagnostics
+  (`pos`, `age`, `recv` per reservation) showed the hash pinned at
+  queue position 0, aging 246s+, on a peer with blocks_received frozen
+  at 3,775 — the fastest server had tripped the 200ms/s throttle, and
+  the fold that halves `cpu_rate_ns` sat BELOW the `continue` that
+  skips throttled peers, so its rate never decayed: once dominant,
+  permanently dead to us. Its getdata response for the frontier block
+  arrived and sat unread on an unpolled socket. Hoisting the fold
+  above the throttle check restores temporary-backoff semantics.
+  Supporting hardening: peer order rotates each `fill_queues` tick
+  (stable HashMap order had been landing the frontier block on the
+  same peer every release cycle); `NODE_NETWORK_LIMITED`-only peers
+  are never offered heights below their ~288-block retention floor
+  (a pruned peer silently drops the getdata and re-pins the hash);
+  the aged frontier hash gets a duplicate reservation on the
+  least-loaded peer each tick (`want_one`); fetch-stall diagnostics
+  now print services/pos/age/recv; the self-audit skips pruned bodies
+  (`body_stored` distinguishes policy-absent from store-lost).
+
+- **Memory under real IBD bounded via cgroup knowledge:** RSS
+  plateaus ~6.6GB during bulk connect (allocator steady state); the
+  earlier 5.7GB→OOM deaths were cgroup page-cache writeback charged
+  to `MemoryMax`, not heap — `MemoryHigh` below `MemoryMax` throttles
+  writeback instead of killing. `MALLOC_ARENA_MAX=2` bounds arena
+  proliferation. The dirty-map budget (`over_budget`) fires correctly
+  once connect flushes see it; the 736MB-map overshoot was a
+  poisoned-state symptom, not a cache bug.
