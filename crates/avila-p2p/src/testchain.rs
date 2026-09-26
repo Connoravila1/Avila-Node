@@ -35,6 +35,12 @@ pub fn coinbase_tx(height: u32) -> Transaction {
 }
 
 pub fn block_on(prev: &BlockHeader, height: u32, params: &Params) -> Block {
+    block_on_txs(prev, vec![coinbase_tx(height)], params)
+}
+
+/// `block_on` carrying an explicit transaction list — for chains that
+/// need spends (or deliberately failing ones) beyond the coinbase.
+pub fn block_on_txs(prev: &BlockHeader, txs: Vec<Transaction>, params: &Params) -> Block {
     let mut block = Block {
         header: BlockHeader {
             version: 4,
@@ -44,7 +50,7 @@ pub fn block_on(prev: &BlockHeader, height: u32, params: &Params) -> Block {
             bits: CompactTarget(REGTEST_BITS),
             nonce: 0,
         },
-        transactions: vec![coinbase_tx(height)],
+        transactions: txs,
     };
     let (root, _) = block.merkle_root();
     block.header.merkle_root = root;
@@ -52,6 +58,49 @@ pub fn block_on(prev: &BlockHeader, height: u32, params: &Params) -> Block {
         block.header.nonce += 1;
     }
     block
+}
+
+/// A chain whose `bad_height` block spends an always-false `OP_0`
+/// output created in block 1 — every check passes except that one
+/// input's script evaluation, so the block fails *only* at script
+/// verify (the deferred-check path). `tip_height` must be ≥ bad+1 for
+/// the failure to land inside the speculative window.
+pub fn probe_chain(params: &Params, tip_height: u32, bad_height: u32) -> Vec<Block> {
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut prev = params.genesis_header;
+    for height in 1..=tip_height {
+        let mut coinbase = coinbase_tx(height);
+        if height == 1 {
+            coinbase.outputs.push(TxOut {
+                value: 0,
+                script_pubkey: Script::new(vec![script::OP_0]),
+            });
+        }
+        let mut txs = vec![coinbase];
+        if height == bad_height {
+            txs.push(Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: blocks[0].transactions[0].txid(),
+                        vout: 1,
+                    },
+                    script_sig: Script::new(vec![]),
+                    sequence: SEQUENCE_FINAL,
+                    witness: Witness::default(),
+                }],
+                outputs: vec![TxOut {
+                    value: 0,
+                    script_pubkey: Script::new(vec![script::OP_1]),
+                }],
+                lock_time: 0,
+            });
+        }
+        let block = block_on_txs(&prev, txs, params);
+        prev = block.header;
+        blocks.push(block);
+    }
+    blocks
 }
 
 pub fn regtest() -> Chainstate {

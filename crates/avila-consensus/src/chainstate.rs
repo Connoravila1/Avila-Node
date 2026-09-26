@@ -299,6 +299,24 @@ pub struct Chainstate {
         std::sync::Arc<connect::BlockCheck>,
         BlockReceipt,
     )>,
+    /// Wall-clock of the most recent speculative push — the sync loop
+    /// uses it to drain a short tail once arrivals pause, so a pending
+    /// block never waits for a *next* block to become authoritative.
+    pending_last_push: std::time::Instant,
+    /// Heights whose script checks have *fully* completed, in connect
+    /// order — the completion boundary between "applied to the dirty
+    /// map" and "safe to feed to mempool/relay/RPC as verified". Every
+    /// connected block lands here exactly once: non-speculative
+    /// connects push at accept time, speculative ones push when their
+    /// check drains. Callers drain via [`Self::take_checked`]; the
+    /// queue is capped, and an overflow is reported rather than
+    /// silently dropping feeds.
+    checked_feed: std::collections::VecDeque<(u32, BlockHash)>,
+    /// Hash of the block whose deferred script check most recently
+    /// failed — consumed by the peer layer, which otherwise would
+    /// blame whichever peer happened to deliver the block that
+    /// *surfaced* the failure rather than the one that sent it.
+    spec_failed: Option<BlockHash>,
     /// Per-block verification receipts, oldest → newest (queue #5).
     /// A journal of connect *events*, not a view of the active chain:
     /// a height can appear twice when a reorg replaced it — both
@@ -997,6 +1015,9 @@ impl Chainstate {
             pending_bundles: HashMap::new(),
             acc_height: 0,
             state_tip_persisted: 0,
+            pending_last_push: std::time::Instant::now(),
+            checked_feed: std::collections::VecDeque::new(),
+            spec_failed: None,
         }
     }
 
@@ -1060,6 +1081,59 @@ impl Chainstate {
         self.drain_pending_to(0)
     }
 
+    /// `connected` minus the pending script tail — the highest height
+    /// every caller may treat as fully verified. `chain().len() - 1`
+    /// counts blocks whose scripts are still in flight; this one
+    /// doesn't.
+    #[must_use]
+    pub fn checked_height(&self) -> u32 {
+        (self.chain.len() - 1 - self.pending_scripts.len()) as u32
+    }
+
+    /// Blocks with outstanding script checks — nonzero means the tip
+    /// observed through `chain()` is ahead of the verified frontier.
+    #[must_use]
+    pub fn pending_scripts_len(&self) -> usize {
+        self.pending_scripts.len()
+    }
+
+    /// How long the pending tail has gone without a new connect —
+    /// the sync loop drains to zero once this exceeds a small grace
+    /// window so a quiet tip still becomes authoritative promptly.
+    #[must_use]
+    pub fn pending_idle(&self) -> std::time::Duration {
+        self.pending_last_push.elapsed()
+    }
+
+    /// Height+hash pairs whose script checks have fully passed, in
+    /// connect order — mempool feed, tip announcements, and any other
+    /// "verified" effect drain this. Bodies resolve via
+    /// [`Self::body`]; a pruned entry (possible only for feeds older
+    /// than the prune floor) is skipped by the caller.
+    #[must_use]
+    pub fn take_checked(&mut self) -> Vec<(u32, BlockHash)> {
+        self.checked_feed.drain(..).collect()
+    }
+
+    /// The hash whose deferred script check failed — consumed once by
+    /// the peer layer for misbehavior attribution. `None` after read.
+    pub fn take_spec_failed(&mut self) -> Option<BlockHash> {
+        self.spec_failed.take()
+    }
+
+    /// One entry per fully-checked connect; bounded — an undrained
+    /// feed past the cap drops oldest-first with a warning (a node
+    /// consumer drains every accept, so the cap binds only when no
+    /// mempool/RPC layer exists — benches — where feeds are moot).
+    fn push_checked(&mut self, height: u32, hash: BlockHash) {
+        const CHECKED_CAP: usize = 8192;
+        if self.checked_feed.len() >= CHECKED_CAP {
+            eprintln!("checked feed overflow ({CHECKED_CAP}) — mempool feed skipped for oldest blocks");
+            self.checked_feed.pop_front();
+        }
+        self.checked_feed.push_back((height, hash));
+    }
+
     /// Waits until at most `depth` speculatively-applied blocks remain
     /// unverified — the pipeline's steady-state boundary inside
     /// `accept_block`.
@@ -1081,11 +1155,15 @@ impl Chainstate {
                 // block invalid, rewind to its parent. Their receipts
                 // die with the entries — nothing claims a block that
                 // failed scripts was verified (audit CA-F2).
+                self.spec_failed = Some(hash);
                 self.pending_scripts.retain(|(_, h, _, _)| *h < height);
                 self.tree.mark_invalid(hash);
                 self.rewind_connected(height.saturating_sub(1))?;
                 return Err(ConnectError::ScriptVerify(err));
             }
+            // The check passed — the block may now be observed as
+            // verified by mempool/relay/RPC consumers of the feed.
+            self.push_checked(height, hash);
             self.note_receipt(receipt);
         }
         Ok(())
@@ -3185,6 +3263,7 @@ impl Chainstate {
                         // the check passes — a deferred block never
                         // publishes an unearned "verified" receipt.
                         const SPEC_DEPTH: usize = 8;
+                        self.pending_last_push = std::time::Instant::now();
                         self.pending_scripts
                             .push_back((hash, height, check, receipt));
                         self.drain_pending_to(SPEC_DEPTH)
@@ -3193,6 +3272,7 @@ impl Chainstate {
                         // No deferred work — the receipt is fully
                         // earned at connect.
                         self.note_receipt(receipt);
+                        self.push_checked(height, hash);
                     }
                     self.drive_utreexo();
                     // This block's own body may have been the missing
@@ -3403,6 +3483,11 @@ impl Chainstate {
         for h in (fork_height + 1..=old_tip_height).rev() {
             self.disconnected.push(self.chain[h as usize]);
         }
+        // Speculative checks for disconnected blocks are moot —
+        // drop their pending entries so a late pass can't publish a
+        // checked-feed entry for a block that left the chain.
+        self.pending_scripts
+            .retain(|(_, h, _, _)| *h <= fork_height);
         self.chain.truncate(fork_height as usize + 1);
         // `undos` is the tail above `undo_base` — the backend holds the
         // rest. A fork below the watermark leaves flushed undo records
@@ -3437,6 +3522,13 @@ impl Chainstate {
         self.chain.extend(branch_hashes);
         for receipt in new_receipts {
             self.note_receipt(receipt);
+        }
+        // Branch blocks ran their checks inline (`simulate_branch`
+        // uses no script pool) — they are fully verified at commit,
+        // so they feed straight into the checked queue.
+        let new_seg: Vec<BlockHash> = self.chain[fork_height as usize + 1..].to_vec();
+        for (i, bh) in new_seg.iter().enumerate() {
+            self.push_checked(fork_height + 1 + i as u32, *bh);
         }
         // Undos for heights at/below the backend watermark can't sit in
         // the tail — they're committed now, atomically with the coin
@@ -3737,6 +3829,11 @@ impl Chainstate {
     /// indexes; the coin delta and new tip then commit in one transaction via
     /// `flush_coins`.
     fn rewind_connected(&mut self, target: u32) -> Result<(), ConnectError> {
+        // A pending block being disconnected leaves the queue — its
+        // check result is moot (the block unwinds regardless) and
+        // draining it later would publish a checked-feed entry for a
+        // disconnected block.
+        self.pending_scripts.retain(|(_, h, _, _)| *h <= target);
         while self.chain.len() as u32 - 1 > target {
             let height = self.chain.len() as u32 - 1;
             let block_hash = self.chain[height as usize];
@@ -3940,7 +4037,9 @@ impl Chainstate {
     /// this node actually verify?".
     #[must_use]
     pub fn validation_report(&self) -> ValidationReport {
-        let connected_height = self.chain().len().saturating_sub(1) as u32;
+        // The *checked* tip — a speculative tail whose scripts are
+        // still in flight must not count as verified coverage.
+        let connected_height = self.checked_height();
         let header_height = self.tree().tip().height;
         let snapshot = self.snapshot_base.map(|base| {
             let au = self
@@ -4932,6 +5031,104 @@ mod tests {
         // Tip is back at the last good block and the bad one is marked.
         assert_eq!(cs.chain().len() as u32, 110); // genesis + 109
         assert!(cs.tree().is_failed(&blocks[109].block_hash()));
+    }
+
+    /// Completion boundary (audit CA): a short speculative tail —
+    /// fewer pending than the drain depth — must never appear in the
+    /// checked feed, the checked height, or the validation report
+    /// until its scripts actually pass. Effects consumers (mempool,
+    /// relay, RPCs) all key off the checked frontier.
+    #[test]
+    fn speculative_short_tail_not_authoritative_until_drained() {
+        let params = params();
+        let blocks = spend_chain(140, &params);
+        let mut cs = Chainstate::new(&params);
+        cs.enable_speculative_connect();
+        // Deliver a burst then STOP — the tail stays pending (nothing
+        // pushes past the depth bound, no flush happens).
+        for b in &blocks[..115] {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        let applied = cs.chain().len() as u32 - 1;
+        assert_eq!(applied, 115);
+        assert!(cs.pending_scripts_len() > 0);
+        // The checked frontier is strictly below the applied tip.
+        assert_eq!(
+            cs.checked_height() + cs.pending_scripts_len() as u32,
+            applied
+        );
+        // Every fed entry is at-or-below the checked frontier — nothing
+        // unverified leaks to mempool/RPC observers.
+        let fed = cs.take_checked();
+        assert!(fed.iter().all(|(h, _)| *h <= cs.checked_height()));
+        assert!(fed.iter().any(|(h, _)| *h == cs.checked_height()));
+        // The report counts only the verified span.
+        assert_eq!(cs.validation_report().connected_height, cs.checked_height());
+        // A quiet tail still completes: the drain that the sync loop's
+        // idle path calls makes the rest authoritative.
+        cs.drain_scripts().unwrap();
+        assert_eq!(cs.checked_height(), applied);
+        assert_eq!(cs.pending_scripts_len(), 0);
+    }
+
+    /// The failing variant: a bad script buried in a short tail —
+    /// nothing downstream (feed, checked height, report) may observe
+    /// the unverified blocks before or after the drain unwinds them.
+    #[test]
+    fn speculative_short_tail_failure_never_observed() {
+        let params = params();
+        // Bad spend at 110; deliver only up to 113 — a <8-deep tail.
+        let blocks = probe_chain(113, &[(110, 1)], &params);
+        let mut cs = Chainstate::new(&params);
+        cs.enable_speculative_connect();
+        for b in &blocks[..113] {
+            let _ = cs.accept_block(b, NOW);
+        }
+        // Pending tail holds the failure — the checked frontier stops
+        // short of it.
+        assert!(cs.checked_height() < 110);
+        let fed_heights: Vec<u32> =
+            cs.take_checked().iter().map(|(h, _)| *h).collect();
+        assert!(fed_heights.iter().all(|h| *h < 110));
+        // The quiet-tail drain surfaces the failure and unwinds the
+        // suffix — afterwards, observers still see only ≤109.
+        assert!(cs.drain_scripts().is_err());
+        assert_eq!(cs.chain().len() as u32, 110); // genesis + 109
+        assert_eq!(cs.checked_height(), 109);
+        assert_eq!(cs.validation_report().connected_height, 109);
+        let fed_after: Vec<u32> = cs.take_checked().iter().map(|(h, _)| *h).collect();
+        assert!(fed_after.iter().all(|h| *h < 110));
+        // Misbehavior attribution: the failed hash is named for the
+        // peer layer.
+        assert_eq!(cs.take_spec_failed(), Some(blocks[109].block_hash()));
+        assert!(cs.take_spec_failed().is_none());
+    }
+
+    /// Deferred failure above already-checked blocks: blocks below the
+    /// bad one keep their checked status; only the bad suffix rewinds,
+    /// and the disconnect feed re-admits those blocks' transactions.
+    #[test]
+    fn speculative_failure_preserves_checked_prefix() {
+        let params = params();
+        let blocks = probe_chain(125, &[(120, 1)], &params);
+        let mut cs = Chainstate::new(&params);
+        cs.enable_speculative_connect();
+        for b in &blocks[..118] {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        // Steady state: ~8 pending at the tail, ~110 checked.
+        let checked_before = cs.checked_height();
+        assert!(checked_before >= 110 && checked_before < 118);
+        // The rest of the burst — the failure lands pending.
+        for b in &blocks[118..124] {
+            let _ = cs.accept_block(b, NOW);
+        }
+        cs.drain_scripts().ok();
+        // Everything below 120 survives verified; the bad block marked.
+        assert_eq!(cs.chain().len() as u32, 120); // genesis + 119
+        assert_eq!(cs.checked_height(), 119);
+        assert!(cs.tree().is_failed(&blocks[119].block_hash()));
+        assert!(cs.take_disconnected().contains(&blocks[119].block_hash()));
     }
 
     #[test]

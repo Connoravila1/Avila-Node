@@ -506,6 +506,14 @@ pub struct PeerManager<S> {
     /// after each 16s release (live wedge at height 140,378: one peer
     /// monopolized the frontier reservation for minutes).
     fill_rot: usize,
+    /// Bounded `(hash → delivering peer)` journal — a deferred script
+    /// failure surfaces at the *next* accept, not the guilty block's;
+    /// misbehavior attribution reads this instead of blaming whoever
+    /// delivered the triggering block.
+    recent_deliveries: std::collections::VecDeque<(
+        avila_consensus::hash::BlockHash,
+        u64,
+    )>,
     /// Gossiped peer addresses — discovery lives here.
     addrbook: AddrBook,
     /// The transaction pool — policy layer owned here so `tx` intake,
@@ -677,6 +685,7 @@ impl<S: Read + Write> PeerManager<S> {
             last_frontier: 0,
             frontier_moved_at: Instant::now(),
             fill_rot: 0,
+            recent_deliveries: std::collections::VecDeque::new(),
             addrbook: AddrBook::new(),
             mempool: avila_mempool::Mempool::new(),
             closed_bytes_sent: 0,
@@ -1120,6 +1129,7 @@ impl<S: Read + Write> PeerManager<S> {
                             serve_filters,
                             outbound_nonces,
                             &stem_exclude,
+                            &mut self.recent_deliveries,
                         );
                         // Per-peer CPU accounting (PEER_BUDGETS):
                         // time inside dispatch lands on this peer's
@@ -1657,9 +1667,11 @@ impl<S: Read + Write> PeerManager<S> {
     /// fan-out). `exclude` spares the peer that delivered the block;
     /// `None` for locally submitted/mined blocks.
     fn send_tip_announce(&mut self, cs: &Chainstate, exclude: Option<u64>) {
-        // The connected tip — not `tree().tip()`, which is the best
-        // *header* and may sit above the connected chain.
-        let tip_hash = cs.chain().last().copied();
+        // The *checked* tip — not `tree().tip()` (best header) and not
+        // `chain().last()` (which may be a speculative block whose
+        // script checks are still in flight). We never relay a block
+        // as verified before its checks actually passed.
+        let tip_hash = cs.chain().get(cs.checked_height() as usize).copied();
         let tip_header = tip_hash.and_then(|h| cs.tree().get(&h)).map(|n| n.header);
         for (&id, peer) in &mut self.peers {
             if Some(id) == exclude || !peer.session.established() {
@@ -2042,6 +2054,10 @@ impl<S: Read + Write> PeerManager<S> {
         serve_filters: bool,
         outbound_nonces: &std::collections::HashSet<u64>,
         stem_exclude: &std::collections::HashSet<avila_consensus::hash::Txid>,
+        recent_deliveries: &mut std::collections::VecDeque<(
+            avila_consensus::hash::BlockHash,
+            u64,
+        )>,
     ) {
         match event {
             SessionEvent::Established => {
@@ -2157,22 +2173,36 @@ impl<S: Read + Write> PeerManager<S> {
                 // A delivery — even a late one poached by reassignment —
                 // proves the peer answers; the stall counter resets.
                 peer.stall_releases = 0;
+                // Journal who delivered this hash — a deferred script
+                // failure surfaces blocks later and must not blame the
+                // peer that merely triggered the drain.
+                recent_deliveries.push_back((block.block_hash(), id));
+                if recent_deliveries.len() > 2048 {
+                    recent_deliveries.pop_front();
+                }
                 match peer.sync.on_block(cs, &block, now) {
                     Ok(outcome) => {
                         peer.last_useful = Instant::now();
-                        let connected_height =
-                            if let Some(avila_consensus::chainstate::Acceptance::Connected {
-                                height,
-                                ..
-                            }) = outcome.acceptance
-                            {
-                                peer.synced_block_height = i64::from(height);
-                                Some(height)
-                            } else {
-                                None
-                            };
-                        if let Some(h) = connected_height {
-                            mempool.on_block_connected(&block, h);
+                        if let Some(avila_consensus::chainstate::Acceptance::Connected {
+                            height,
+                            ..
+                        }) = outcome.acceptance
+                        {
+                            peer.synced_block_height = i64::from(height);
+                        }
+                        // Verified effects only: a speculative connect
+                        // returns `Connected` with script checks still
+                        // in flight — the mempool feed, tip event, and
+                        // relay announcement wait for `take_checked`,
+                        // which yields a block only after its checks
+                        // actually passed.
+                        let checked = cs.take_checked();
+                        let mut checked_tip = None;
+                        for (h, hash) in &checked {
+                            if let Some(body) = cs.body(hash) {
+                                mempool.on_block_connected(&body, *h);
+                            }
+                            checked_tip = Some(*h);
                         }
                         if let Some(avila_consensus::chainstate::Acceptance::Connected {
                             reorged,
@@ -2188,14 +2218,46 @@ impl<S: Read + Write> PeerManager<S> {
                                 let gone = cs.take_disconnected();
                                 mempool.refill_from_disconnected(&gone, cs, now, true, usize::MAX);
                             }
-                            events.push(NetEvent::TipAdvanced(cs.chain().len() as u32 - 1));
-                            // Relay the new tip to everyone except the peer
-                            // that delivered it — they already know.
-                            *announce_tip = Some(id);
+                            // The tip event and relay announcement fire
+                            // only when the *checked* frontier moved —
+                            // a purely speculative connect publishes
+                            // nothing.
+                            if let Some(h) = checked_tip {
+                                events.push(NetEvent::TipAdvanced(h));
+                                *announce_tip = Some(id);
+                            }
                         }
                         // The tick fill pass re-feeds this peer's queue.
                     }
-                    Err(e) => dead.push((id, DisconnectReason::Misbehavior(e.to_string()))),
+                    Err(e) => {
+                        // A deferred script failure names the guilty
+                        // block — blame its recorded sender, not the
+                        // peer whose delivery happened to surface it.
+                        // When the sender is unknown (journal rotated
+                        // out), punish nobody: the block is marked
+                        // invalid either way.
+                        match cs.take_spec_failed() {
+                            Some(bad) => {
+                                // Deferred failure: blame the bad
+                                // block's recorded sender; if the
+                                // journal rotated it out, punish the
+                                // innocent triggerer not at all — the
+                                // block stays marked invalid either way.
+                                if let Some((_, who)) = recent_deliveries
+                                    .iter()
+                                    .find(|(h, _)| *h == bad)
+                                {
+                                    eprintln!(
+                                        "block {bad} failed deferred script checks — blaming its sender"
+                                    );
+                                    dead.push((*who, DisconnectReason::Misbehavior(
+                                        e.to_string(),
+                                    )));
+                                }
+                            }
+                            None => dead.push((id, DisconnectReason::Misbehavior(e.to_string()))),
+                        }
+                    }
                 }
             }
             SessionEvent::Message(Message::SendHeaders) => {
@@ -3629,7 +3691,7 @@ mod tests {
     use crate::message::{
         AddrEntry, GetHeaders, InvType, InvVector, NODE_NETWORK, PROTOCOL_VERSION, Version,
     };
-    use crate::testchain::{chain_blocks, regtest};
+    use crate::testchain::{self, chain_blocks, regtest};
     use crate::testpipe::{self, End};
     use avila_consensus::hash::BlockHash;
 
@@ -4580,6 +4642,105 @@ mod tests {
             )),
             "C should get an inv announcement: {sent_c:?}"
         );
+    }
+
+    /// Audit reproducer — a block whose script check fails, delivered
+    /// over a real session as the LAST block of a batch shorter than
+    /// the speculative window, with no further deliveries: it must
+    /// never reach an authoritative observer (no TipAdvanced event
+    /// past the checked frontier, no announcement to other peers,
+    /// mempool untouched). The applied tip may advance — verification
+    /// is what's gated, not UTXO application.
+    #[test]
+    fn speculative_short_tail_failure_is_never_published() {
+        let (mut mgr, mut peer, _id_a) = managed_peer();
+        let mut cs = regtest();
+        cs.enable_speculative_connect();
+        let params = *cs.tree().params();
+        // Heights 1..=110 — block 105 spends an always-false script
+        // (mature by then); delivery stops at 110 so blocks 103..110
+        // are still inside the pending window when the burst ends.
+        let blocks = testchain::probe_chain(&params, 110, 105);
+        for b in &blocks {
+            cs.accept_header(&b.header, NOW).unwrap();
+        }
+        let (mut peer_b, _id_b) = add_peer(&mut mgr);
+        handshake(&mut mgr, &mut peer, &mut cs);
+        handshake_peer(&mut mgr, &mut peer_b, &mut cs);
+        testpipe::drain(&mut peer, MAGIC);
+        testpipe::drain(&mut peer_b, MAGIC);
+
+        let mut events = Vec::new();
+        for b in &blocks {
+            testpipe::inject(&mut peer, MAGIC, &Message::Block(b.clone()));
+            events.extend(mgr.tick(&mut cs, NOW));
+        }
+        // The applied tip ran ahead of the checked frontier — pending
+        // holds the tail (bad block inside it, undrained) — yet
+        // nothing authoritative may show it.
+        assert_eq!(cs.chain().len() as u32, 111);
+        let checked = cs.checked_height();
+        assert!(checked < 105, "checked frontier must lag the tail");
+        assert!(cs.pending_scripts_len() > 0);
+        for ev in &events {
+            if let NetEvent::TipAdvanced(h) = ev {
+                assert!(
+                    *h <= checked,
+                    "TipAdvanced({h}) published an unverified height"
+                );
+            }
+        }
+        // A second peer was told about nothing past the checked tip.
+        let heard = testpipe::drain(&mut peer_b, MAGIC);
+        for h in checked..110 {
+            let hash = blocks[h as usize].block_hash();
+            assert!(
+                !heard.iter().any(|m| matches!(m,
+                    Message::Inv(vs) if vs.iter().any(|v| v.hash == hash))
+                    || matches!(m, Message::Headers(hs) if hs.iter().any(|hh| hh.hash() == hash))),
+                "unverified block {h} announced to peers: {heard:?}"
+            );
+        }
+        // The quiet-tail drain (what the sync loop runs once arrivals
+        // pause) surfaces the failure: rewind to 104, bad block marked,
+        // checked frontier still clean.
+        assert!(cs.drain_scripts().is_err());
+        assert_eq!(cs.chain().len() as u32, 105); // genesis + 104
+        assert_eq!(cs.checked_height(), 104);
+        assert!(cs.tree().is_failed(&blocks[104].block_hash()));
+        // Attribution: the failure names the bad block's hash.
+        assert_eq!(cs.take_spec_failed(), Some(blocks[104].block_hash()));
+    }
+
+    /// The all-valid short tail: pending blocks publish normally once
+    /// their checks complete — the boundary delays effects, it never
+    /// drops them.
+    #[test]
+    fn speculative_valid_tail_publishes_on_drain() {
+        let (mut mgr, mut peer, _id_a) = managed_peer();
+        let mut cs = regtest();
+        cs.enable_speculative_connect();
+        let blocks = testchain::chain_blocks(&cs, 6);
+        for b in &blocks {
+            cs.accept_header(&b.header, NOW).unwrap();
+        }
+        handshake(&mut mgr, &mut peer, &mut cs);
+        testpipe::drain(&mut peer, MAGIC);
+        let mut events = Vec::new();
+        for b in &blocks {
+            testpipe::inject(&mut peer, MAGIC, &Message::Block(b.clone()));
+            events.extend(mgr.tick(&mut cs, NOW));
+        }
+        assert_eq!(cs.chain().len() as u32, 7);
+        // A 6-block batch never exceeds the window — all 6 pending,
+        // checked frontier at genesis.
+        assert_eq!(cs.checked_height(), 0);
+        assert!(events.iter().all(|e| !matches!(e, NetEvent::TipAdvanced(_))));
+        // Quiet-tail drain completes them all.
+        cs.drain_scripts().unwrap();
+        assert_eq!(cs.checked_height(), 6);
+        let fed: Vec<u32> = cs.take_checked().iter().map(|(h, _)| *h).collect();
+        assert_eq!(fed, (1..=6).collect::<Vec<u32>>());
     }
 
     fn add_inbound_peer(mgr: &mut PeerManager<End>) -> Option<(End, u64)> {

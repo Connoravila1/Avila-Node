@@ -6,6 +6,7 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 
 | # | Date | Experiment | Hypothesis | Verdict | Key numbers | Doc |
 |---|------|-----------|------------|---------|-------------|-----|
+| 71 | 09-26 | IBD arithmetic census and hardware limits | Instruction accounting can replace unsupported universal IBD-floor estimates | **measured narrow scope; full-IBD floor unestablished** | 512 canonical mainnet ECDSA attempts: all verdicts matched, 985 field multiplies + 973 squares + one scalar inversion/attempt, no variable field inversion; compressed parse adds 14 multiplies + 255 squares. Shared-host timing ~100–135 microseconds/attempt; native compiler gain inconclusive. Static field kernels retain costly SHRD candidates. Further experiments assigned to SWE-2 | [hardware-floor](2026-09-26-ibd-hardware-floor.md) |
 | 1 | 09-14 | RPC compat matrix vs Core 29.4 | RPC surface can be made byte-compatible | **adopted** | 75 calls exact-match | [rpc-compat-matrix](2026-09-14-rpc-compat-matrix.md) |
 | 2 | ~09-20 | Header acceptance baseline | Header-chain parity is provable offline | **adopted** | `check_headers_core.py` 0 mismatches | [header-acceptance](2026-09-header-acceptance-baseline.md) |
 | 3 | 09-22 | coinsdb snapshot ingest | redb can absorb AssumeUTXO-scale writes | **adopted w/ caveat** | 20M sorted OK; random ingest collapses ~40M | [snapshot-ingest](2026-09-22-coinsdb-snapshot-ingest.md) |

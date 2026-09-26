@@ -1308,6 +1308,7 @@ struct AppliedTx {
 /// (input fetches + value math — the UTXO read cost), spend+output
 /// application (map writes), the parallel script-check drain, and
 /// the BIP30 pre-scan.
+#[derive(Clone, Copy, Default)]
 pub struct ConnectTiming {
     pub blocks: u64,
     pub total_ns: u64,

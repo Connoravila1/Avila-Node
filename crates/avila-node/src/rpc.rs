@@ -4616,9 +4616,24 @@ fn mine_and_connect(
     }
     match cs.accept_block(&block, now) {
         Ok(avila_consensus::chainstate::Acceptance::Connected {
-            height, reorged, ..
+            height: _,
+            reorged,
+            ..
         }) => {
-            mgr.mempool().on_block_connected(&block, height);
+            // `generate`/`submitblock` report success only for a fully
+            // verified block — drain the speculative tail before any
+            // effect or answer leaves the node.
+            if let Err(e) = cs.drain_scripts() {
+                return Err((
+                    RPC_VERIFY_ERROR,
+                    format!("Block validation failed: {e}"),
+                ));
+            }
+            for (h, hash) in cs.take_checked() {
+                if let Some(body) = cs.body(&hash) {
+                    mgr.mempool().on_block_connected(&body, h);
+                }
+            }
             if reorged {
                 let gone = cs.take_disconnected();
                 mgr.mempool()
@@ -10044,14 +10059,23 @@ pub(crate) fn dispatch(
                 // errors are only for decode/parameter failures.
                 match cs.accept_block(&block, now) {
                     Ok(avila_consensus::chainstate::Acceptance::Connected {
-                        height,
+                        height: _,
                         reorged,
                         ..
                     }) => {
                         // Purge confirmed txs, then relay the new tip
                         // (Core's NewPoWValidBlock fan-out — no source
-                        // peer for a local submission).
-                        mgr.mempool().on_block_connected(&block, height);
+                        // peer for a local submission). Scripts must
+                        // have fully verified before success is
+                        // reported — drain the speculative tail.
+                        if let Err(e) = cs.drain_scripts() {
+                            return Ok(json!(format!("rejected: {e}")));
+                        }
+                        for (h, hash) in cs.take_checked() {
+                            if let Some(body) = cs.body(&hash) {
+                                mgr.mempool().on_block_connected(&body, h);
+                            }
+                        }
                         if reorged {
                             // The rolled-back branch's txs are
                             // unconfirmed again — refill fork-first.

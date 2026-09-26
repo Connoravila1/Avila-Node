@@ -202,13 +202,23 @@ impl PaceModel {
         let pace_cap = p95_pace * 4.0;
         let pace_floor = (kept_paces[0] * 0.25).max(0.5);
         self.last_fit = Some((a, b, bf, byte_cap, keep.len()));
-        // Integrate the predicted pace forward in window-sized strides.
+        // The size slope only holds over the evidence — extrapolating a
+        // local growth rate to the tip saturates every future block at
+        // the cap (a 560k-height projection turned a +8B/blk mid-2016
+        // slope into 4MB blocks forever and a 9-day ETA). The honest
+        // bound: apply the trend at most twice the observed span, then
+        // freeze — sizes stop growing at the edge of what we've seen.
+        let (h_lo, h_hi) = keep
+            .iter()
+            .map(|&i| hs[i])
+            .fold((f64::MAX, f64::MIN), |(lo, hi), h| (lo.min(h), hi.max(h)));
+        let freeze_h = h_hi + (h_hi - h_lo).max(20_000.0);
         let mut remaining_ms = 0.0f64;
         let mut h = from as u64;
         let tip = to as u64;
         let stride = PACE_WINDOW_BLOCKS as u64;
         while h < tip {
-            let mid = h + stride / 2;
+            let mid = (h + stride / 2).min(freeze_h as u64);
             // Floor: the size regression can go negative on a thin
             // window (early 2015 blocks shrank after the 2014 spike),
             // but blocks never empty out — the long-run size trend is
@@ -705,6 +715,11 @@ pub fn run(
         cs.enable_scripthashindex(cfg.data_dir.as_deref())
             .map_err(SyncError::Store)?;
     }
+    // Script checks overlap the next block's serial phase — Core's
+    // `CCheckQueue` behavior. On sighash-dense eras (2016+) this is
+    // worth ~2-4× on the connect critical path; receipts still only
+    // publish after the check actually passes.
+    cs.enable_speculative_connect();
     if let Some(dir) = &cfg.data_dir {
         if cfg.utreexo_bridge {
             cs.enable_proof_bridge(dir).map_err(SyncError::Store)?;
@@ -891,6 +906,13 @@ pub fn run(
 
     let mut last_prune = std::time::Instant::now();
     let mut hb_at = std::time::Instant::now() - std::time::Duration::from_secs(30);
+    // Interval timing: `connect_timing` is cumulative since process
+    // start — the heartbeat diffs it so each line reports the actual
+    // cost of the blocks connected in *this* interval, not a lifetime
+    // average (audit work-order: cumulative buckets misattribute era
+    // cost once the pipeline shape changes).
+    let mut hb_prev_t = avila_consensus::connect::connect_timing();
+    let mut hb_prev_connected = resumed_height;
     while started.elapsed() < cfg.timeout
         && connected.saturating_sub(resumed_height) < cfg.target_height
         && !cancelled()
@@ -952,6 +974,22 @@ pub fn run(
                     );
                 }
                 _ => {}
+            }
+        }
+        // Completion boundary for the speculative tail: pending script
+        // checks never linger past a quiet 50ms — a short burst's last
+        // blocks must become authoritative without waiting for the
+        // next arrival or a periodic flush. A drain failure rewinds
+        // the failed suffix; the mempool feed then publishes only
+        // fully-checked blocks.
+        if cs.pending_scripts_len() > 0 && cs.pending_idle() > Duration::from_millis(50) {
+            if let Err(e) = cs.drain_scripts() {
+                eprintln!("sync: deferred script check failed: {e}");
+            }
+        }
+        for (h, hash) in cs.take_checked() {
+            if let Some(body) = cs.body(&hash) {
+                mgr.mempool().on_block_connected(&body, h);
             }
         }
         connected = cs.chain().len() as u32 - 1;
@@ -1066,7 +1104,6 @@ pub fn run(
         if hb_at.elapsed() >= std::time::Duration::from_secs(30) {
             hb_at = std::time::Instant::now();
             let t = avila_consensus::connect::connect_timing();
-            let ms = |ns: u64| ns / 1_000_000;
             let (map_n, map_b, undos_n) = cs.mem_stats();
             let rss_kb = std::fs::read_to_string("/proc/self/status")
                 .ok()
@@ -1099,8 +1136,21 @@ pub fn run(
                     )
                 })
                 .unwrap_or_default();
+            // Interval deltas — per-block cost of THIS window, not a
+            // cumulative average that flattens era changes.
+            let d_blocks = connected.saturating_sub(hb_prev_connected);
+            let d = |cur: u64, prev: u64| {
+                let ns = cur.saturating_sub(prev);
+                if d_blocks == 0 {
+                    0
+                } else {
+                    ns / 1_000_000 / d_blocks as u64
+                }
+            };
+            let d_ms = |cur: u64, prev: u64| cur.saturating_sub(prev) / 1_000_000;
+            let pending_n = cs.pending_scripts_len();
             eprintln!(
-                "sync: peers={} connected={} headers={} buffered={} in_flight={} rss={}MB map={}n/{}MB undos={} eta={} w={} | connect_ms/blk total={} read={} apply={} scripts={} drain={} bip30={} other={} accept_cum={} reorg_cum={} (n={})",
+                "sync: peers={} connected={} headers={} buffered={} in_flight={} rss={}MB map={}n/{}MB undos={} pend={} eta={} w={} | ms/blk[{} blk] total={} read={} apply={} scripts={} drain={} bip30={} other={} | accept={}ms reorg={}ms",
                 mgr.len(),
                 connected,
                 cs.tree().tip().height,
@@ -1110,22 +1160,28 @@ pub fn run(
                 map_n,
                 map_b / 1_048_576,
                 undos_n,
+                pending_n,
                 format_args!("{eta} {fit}"),
                 pace.windows.len(),
-                t.total_ns
-                    .checked_div(t.blocks.max(1))
-                    .map_or(0, |n| n / 1_000_000),
-                ms(t.read_ns),
-                ms(t.apply_ns),
-                ms(t.script_ns),
-                ms(t.drain_ns),
-                ms(t.bip30_ns),
-                ms(t.total_ns
-                    .saturating_sub(t.read_ns + t.apply_ns + t.script_ns + t.bip30_ns)),
-                ms(t.accept_ns),
-                ms(t.reorg_ns),
-                t.blocks,
+                d_blocks,
+                d(t.total_ns, hb_prev_t.total_ns),
+                d(t.read_ns, hb_prev_t.read_ns),
+                d(t.apply_ns, hb_prev_t.apply_ns),
+                d(t.script_ns, hb_prev_t.script_ns),
+                d(t.drain_ns, hb_prev_t.drain_ns),
+                d(t.bip30_ns, hb_prev_t.bip30_ns),
+                d(t.total_ns.saturating_sub(
+                    t.read_ns + t.apply_ns + t.script_ns + t.bip30_ns),
+                    hb_prev_t.total_ns.saturating_sub(
+                        hb_prev_t.read_ns
+                            + hb_prev_t.apply_ns
+                            + hb_prev_t.script_ns
+                            + hb_prev_t.bip30_ns)),
+                d_ms(t.accept_ns, hb_prev_t.accept_ns),
+                d_ms(t.reorg_ns, hb_prev_t.reorg_ns),
             );
+            hb_prev_t = t;
+            hb_prev_connected = connected;
         }
         let snapshot = SyncProgress {
             phase: if mgr.is_empty() {
@@ -1135,7 +1191,7 @@ pub fn run(
             },
             peers: mgr.len(),
             proxy: mgr.proxy(),
-            connected_height: connected,
+            connected_height: cs.checked_height(),
             header_height: cs.tree().tip().height,
             utreexo_height: cs.utreexo_height(),
             headers_buffered: mgr.presync_height().unwrap_or(0) as u32,
