@@ -1,0 +1,395 @@
+{
+  "review": "Gate 4 real-window result at ce5558b",
+  "recorded_utc": "2026-09-27T18:25:37.008326+00:00",
+  "head": "ce5558bd9bbfeebe14b6cea0193078224a0b0943",
+  "worktree_status_before_document_edits": "",
+  "method": "Source and small saved-artifact review; small-file hashing; 51 bytes read from each donor header; metadata-only checks of large files; read-only GitHub Actions query. No experiments, builds, tests, examples, large scans/hashes/comparisons, RPCs, service/process operations or file cleanup.",
+  "ci": {
+    "databaseId": 36339371116,
+    "headSha": "ce5558bd9bbfeebe14b6cea0193078224a0b0943",
+    "conclusion": "success",
+    "status": "completed",
+    "url": "https://github.com/Connoravila1/Avila-Node/actions/runs/36339371116",
+    "verification": "GitHub API read during this review."
+  },
+  "files": {
+    "AGENTS.md": {
+      "bytes": 1336,
+      "sha256": "056bfee0f4ed06b54f91977caea8dd4908e82b09da23c473e8ad20a22b58d1b6"
+    },
+    "tools/guard_run.sh": {
+      "bytes": 2664,
+      "sha256": "a028568483fec9034c20899861fa61eb7aa350274ac799be60af21f64acab73e"
+    },
+    "Cargo.toml": {
+      "bytes": 2688,
+      "sha256": "34d3607a80c803bbc6ec60c5e7103666c99743202383f63ba2b070ad09d201b9"
+    },
+    ".github/workflows/ci.yml": {
+      "bytes": 2462,
+      "sha256": "f4ce30e163045164f144a8770fc319cba36666b65cd365273bf589b63a1ffbe9"
+    },
+    "crates/avila-consensus/examples/window_join.rs": {
+      "bytes": 54571,
+      "sha256": "891c293c54bc41cd5cfe79688819936859c7da2c626b4d46fcfa53bd815fdd22"
+    },
+    "crates/avila-consensus/examples/shared/join_engine.rs": {
+      "bytes": 15442,
+      "sha256": "04ffa91f0d9d693acb4c61a78ae658881a2c948f94dde8805ac24aa78bb883b7"
+    },
+    "crates/avila-consensus/examples/snap_to_canonical.rs": {
+      "bytes": 2788,
+      "sha256": "23460653b3392911869a3513620050f16a251825ad5f600e93c6048972bc658b"
+    },
+    "crates/avila-consensus/examples/export_headers.rs": {
+      "bytes": 2127,
+      "sha256": "520d27b07a410bce31b7123187f4c650c9ef441eb081ee8d66c9cd316e6671f9"
+    },
+    "crates/avila-consensus/examples/state_join.rs": {
+      "bytes": 69936,
+      "sha256": "73a225bb6c0c63590eaa0ceda6853521b33c8d9ec69fb03932e51cf60cf90610"
+    },
+    "crates/avila-consensus/src/check.rs": {
+      "bytes": 41783,
+      "sha256": "5ecf61def1518ff40989eb35a2c2b311b9de2c94f27b9cd7d994bdf35ab48eca"
+    },
+    "crates/avila-consensus/src/chain.rs": {
+      "bytes": 66009,
+      "sha256": "a7aa0ebf29220822da5e04b5d16e1b6436be5b8bef3f80737c63aca8f8bd333a"
+    },
+    "crates/avila-consensus/src/connect.rs": {
+      "bytes": 122518,
+      "sha256": "1de9a03e85ba0dd5ee7051acb46c5f7c747bc46fae9cec767a2cfb1389cd119e"
+    },
+    "crates/avila-consensus/build.rs": {
+      "bytes": 1603,
+      "sha256": "7c62068c878af23987066186f3a42f4b7d8af1ca9579a9ba14d57a30b1d9d91a"
+    },
+    "tools/ibd_corpus_window.py": {
+      "bytes": 14871,
+      "sha256": "2ed112b485f508822738c44673a2dd6ccf48652c43d95fc50a186242e05c89c0"
+    },
+    "tools/test_window_join_exec.py": {
+      "bytes": 19736,
+      "sha256": "0321a6daff678e4aaa53885f5762ac0d34d664e8b86ac85ffe35ef34c08281c5"
+    },
+    "experiments/results/gate4/corpus-454k/run-manifest.json": {
+      "bytes": 1298,
+      "sha256": "e1465388df395131740f59dd517a189b49ea8f1bbb3b5c2ba331abf9d00301bf"
+    },
+    "experiments/results/gate4/corpus-454k/run.stderr": {
+      "bytes": 2474,
+      "sha256": "244c87eea1da4d50792bc51a914fba19fe18760e511137618d49c8b006db5bea"
+    },
+    "experiments/results/gate4/corpus-454k/run.t0": {
+      "bytes": 11,
+      "sha256": "9f9cc2e067f3a1612cda140e7c4bba68256f0725d0656559a5578e035a16acab"
+    },
+    "experiments/results/gate4/corpus-454k/manifest.json": {
+      "bytes": 6671,
+      "sha256": "70bd1d55a0b34f63ae4daf96bb2a547a18e33664204bed49f1659b32a5403f27"
+    },
+    "experiments/results/gate4/corpus-454k/window-manifest.jsonl": {
+      "bytes": 61037,
+      "sha256": "d9148e2e98808e8aae3be9b32c5f63b27246d7144f55f6751607a237cf7cba4b"
+    },
+    "experiments/results/gate4/corpus-454k/headers.jsonl": {
+      "bytes": 237016,
+      "sha256": "a37e9cbe43acefc1b0b9c4ea7fbdce6015bd73633f54ffb117fc290fea2af443"
+    },
+    "experiments/results/gate4/corpus-454k/build.log": {
+      "bytes": 106,
+      "sha256": "6b1ca2615205eb54f7af918f3917fdfb65b2973fbac8e84168c8eec5e3b43d0b"
+    }
+  },
+  "run_manifest": {
+    "type": "run_manifest",
+    "build_rev": "c80d9916d9873ea84e5104a54b750a94bd1b7645+dirty",
+    "checkout_rev": "c80d9916d9873ea84e5104a54b750a94bd1b7645",
+    "binary_sha256": "53fc5ea6d8b83ba1c45928e7b6e9c8b26a257366e5cfd5c6f79e5d83bce5e2c2",
+    "corpus_sha256": "55216ff423ae36af6bd826fde5da649b9c448816a0ed7ef7ba51cb3c3d8ac05d",
+    "boundary_sha256": "582aa9592e8784bc5f84214a2f1f07728fdc1a6ecd60a7c1c4e673ce6453f805",
+    "headers_sha256": "57c73d99a1f2e06df1e5aefa27271bbf8dafea69957e293c3bbae6c7ebdabafa",
+    "export_sha256": "865d32cfaea57e15352ece551685dd71d9b96ea39f8118cc0ca0152b44cd3168",
+    "argv": [
+      "experiments/results/gate4/corpus-454k/corpus.bin",
+      "--params",
+      "mainnet",
+      "--segment",
+      "454001:454301",
+      "--boundary",
+      "experiments/results/gate4/donor-454000.utxo",
+      "--boundary-base-height",
+      "454000",
+      "--boundary-base-hash",
+      "0000000000000000024e8bd568de4d4624d340370e62223b04a11e460262817d",
+      "--boundary-txoutset-hash",
+      "00617975f4a08fd15201ca9417b0fc2b274a03298c8e2d3a79e47fdba51f581c",
+      "--headers",
+      "experiments/results/gate4/headers-full.hchain",
+      "--workers",
+      "8",
+      "--manifest",
+      "experiments/results/gate4/corpus-454k/window-manifest.jsonl",
+      "--export",
+      "experiments/results/gate4/corpus-454k/window-454k.canonical",
+      "--run-manifest",
+      "experiments/results/gate4/corpus-454k/run-manifest.json"
+    ],
+    "exit_code": 0,
+    "known_invalid": false,
+    "exported": true
+  },
+  "saved_run_stderr": "Running as unit: run-p1737875-i1749323.scope; invocation ID: 3245adecccf242f8b2d0fbad2896bf95\n{\"type\":\"export\",\"path\":\"experiments/results/gate4/corpus-454k/window-454k.canonical\",\"bytes\":3594371786,\"sha256\":\"865d32cfaea57e15352ece551685dd71d9b96ea39f8118cc0ca0152b44cd3168\",\"chainstate_complete\":false,\"projection\":\"valid_prefix\"}\n{\"type\":\"window_join\",\"window\":[454001,454201],\"corpus_bytes\":1276970754,\"blocks_present\":301,\"heights_span\":201,\"heights_missing\":0,\"duplicate_heights\":0,\"longest_contiguous_run\":201,\"header_hash_verified\":301,\"linkage_checked\":300,\"linkage_broken\":0,\"mtp_computable\":290,\"context_free_failed\":0,\"txs\":615804,\"inputs_noncb\":1303682,\"srcs_resolved\":1193423,\"srcs_unresolved\":110259,\"gap_height_sourced\":0,\"spend_records\":1303682,\"creation_records\":1438746,\"boundary_coins\":45616695,\"boundary_conflicts\":0,\"join_dup_creations\":0,\"join_dup_spends\":0,\"join_missing_spends\":0,\"fully_resolved_txs\":615503,\"excluded_txs\":0,\"resolved_spec_unjoined\":0,\"unresolved_spec_inputs\":0,\"blocks_fully_covered\":301,\"exec_inputs\":1303682,\"queued_tasks\":615503,\"completed_tasks\":615503,\"verified_inputs\":1303682,\"inputs_in_failed_txs\":0,\"script_failure_txs\":0,\"immature_violations\":0,\"value_violations\":0,\"nonfinal_violations\":0,\"time_locks_unevaluated\":0,\"sigop_violations\":0,\"bip68_evaluated\":615503,\"bip68_violations\":0,\"bip68_unevaluated\":0,\"cb_bound_checks\":301,\"cb_bound_violations\":0,\"headers_loaded\":968779,\"headers_inserted\":968778,\"headers_unknown_parent\":0,\"headers_failed\":0,\"window_headers_in_tree\":301,\"survivor_records\":45751759,\"applied_events\":2742428,\"first_bad_height\":null,\"first_bad\":null,\"known_invalid\":false,\"resolved_inputs_complete\":true,\"script_jobs_complete\":true,\"starting_state_complete\":true,\"boundary_loaded_coins\":45616695,\"boundary_base_height\":454000,\"boundary_base_hash\":\"0000000000000000024e8bd568de4d4624d340370e62223b04a11e460262817d\",\"boundary_txoutset_hash\":\"00617975f4a08fd15201ca9417b0fc2b274a03298c8e2d3a79e47fdba51f581c\",\"boundary_dup_outpoints\":0,\"first_missing_height\":null,\"header_context_checked\":true,\"header_context_full\":true,\"window_complete\":true,\"context_free_checks_complete\":true,\"coverage_complete\":true,\"chainstate_complete\":false,\"exported\":true,\"stages\":{\"parse_s\":5.173,\"emit_s\":1.344,\"join_s\":28.590,\"predicate_s\":0.935,\"script_s\":38.519,\"materialize_s\":4.404,\"export_s\":17.025},\"rss_hwm_bytes\":10083909632,\"workers\":8}\nguard_run: exit=0 cap=10240MiB peak=10239MiB unit=run-p1737875-i1749323.scope\n",
+  "saved_window_result": {
+    "type": "window_join",
+    "window": [
+      454001,
+      454201
+    ],
+    "corpus_bytes": 1276970754,
+    "blocks_present": 301,
+    "heights_span": 201,
+    "heights_missing": 0,
+    "duplicate_heights": 0,
+    "longest_contiguous_run": 201,
+    "header_hash_verified": 301,
+    "linkage_checked": 300,
+    "linkage_broken": 0,
+    "mtp_computable": 290,
+    "context_free_failed": 0,
+    "txs": 615804,
+    "inputs_noncb": 1303682,
+    "srcs_resolved": 1193423,
+    "srcs_unresolved": 110259,
+    "gap_height_sourced": 0,
+    "spend_records": 1303682,
+    "creation_records": 1438746,
+    "boundary_coins": 45616695,
+    "boundary_conflicts": 0,
+    "join_dup_creations": 0,
+    "join_dup_spends": 0,
+    "join_missing_spends": 0,
+    "fully_resolved_txs": 615503,
+    "excluded_txs": 0,
+    "resolved_spec_unjoined": 0,
+    "unresolved_spec_inputs": 0,
+    "blocks_fully_covered": 301,
+    "exec_inputs": 1303682,
+    "queued_tasks": 615503,
+    "completed_tasks": 615503,
+    "verified_inputs": 1303682,
+    "inputs_in_failed_txs": 0,
+    "script_failure_txs": 0,
+    "immature_violations": 0,
+    "value_violations": 0,
+    "nonfinal_violations": 0,
+    "time_locks_unevaluated": 0,
+    "sigop_violations": 0,
+    "bip68_evaluated": 615503,
+    "bip68_violations": 0,
+    "bip68_unevaluated": 0,
+    "cb_bound_checks": 301,
+    "cb_bound_violations": 0,
+    "headers_loaded": 968779,
+    "headers_inserted": 968778,
+    "headers_unknown_parent": 0,
+    "headers_failed": 0,
+    "window_headers_in_tree": 301,
+    "survivor_records": 45751759,
+    "applied_events": 2742428,
+    "first_bad_height": null,
+    "first_bad": null,
+    "known_invalid": false,
+    "resolved_inputs_complete": true,
+    "script_jobs_complete": true,
+    "starting_state_complete": true,
+    "boundary_loaded_coins": 45616695,
+    "boundary_base_height": 454000,
+    "boundary_base_hash": "0000000000000000024e8bd568de4d4624d340370e62223b04a11e460262817d",
+    "boundary_txoutset_hash": "00617975f4a08fd15201ca9417b0fc2b274a03298c8e2d3a79e47fdba51f581c",
+    "boundary_dup_outpoints": 0,
+    "first_missing_height": null,
+    "header_context_checked": true,
+    "header_context_full": true,
+    "window_complete": true,
+    "context_free_checks_complete": true,
+    "coverage_complete": true,
+    "chainstate_complete": false,
+    "exported": true,
+    "stages": {
+      "parse_s": 5.173,
+      "emit_s": 1.344,
+      "join_s": 28.59,
+      "predicate_s": 0.935,
+      "script_s": 38.519,
+      "materialize_s": 4.404,
+      "export_s": 17.025
+    },
+    "rss_hwm_bytes": 10083909632,
+    "workers": 8
+  },
+  "saved_export_result": {
+    "type": "export",
+    "path": "experiments/results/gate4/corpus-454k/window-454k.canonical",
+    "bytes": 3594371786,
+    "sha256": "865d32cfaea57e15352ece551685dd71d9b96ea39f8118cc0ca0152b44cd3168",
+    "chainstate_complete": false,
+    "projection": "valid_prefix"
+  },
+  "donor_header_checks": {
+    "donor-454000.utxo": {
+      "read_bytes": 51,
+      "raw_header_hex": "7574786fff0200f9beb4d97d816202461ea1043b22620e3740d324464dde68d58b4e020000000000000000370eb80200000000",
+      "version": 2,
+      "network": "f9beb4d9",
+      "base_hash": "0000000000000000024e8bd568de4d4624d340370e62223b04a11e460262817d",
+      "coins_count": 45616695,
+      "file_bytes": 1896098516
+    },
+    "donor-454301.utxo": {
+      "read_bytes": 51,
+      "raw_header_hex": "7574786fff0200f9beb4d9aab95cea82d106bc5b98468a9fc430f528a6e8a3e89c63010000000000000000cf1dba0200000000",
+      "version": 2,
+      "network": "f9beb4d9",
+      "base_hash": "000000000000000001639ce8a3e8a628f530c49f8a46985bbc06d182ea5cb9aa",
+      "coins_count": 45751759,
+      "file_bytes": 1903277940
+    }
+  },
+  "large_file_metadata_only": {
+    "experiments/results/gate4/corpus-454k/donor-454301.canonical": {
+      "bytes": 3594371786,
+      "contents_read_by_auditor": false
+    },
+    "experiments/results/gate4/corpus-454k/window-454k.canonical": {
+      "bytes": 3594371786,
+      "contents_read_by_auditor": false
+    },
+    "experiments/results/gate4/corpus-454k/corpus.bin": {
+      "bytes": 1276970754,
+      "contents_read_by_auditor": false
+    },
+    "experiments/results/gate4/headers-full.hchain": {
+      "bytes": 92096997,
+      "contents_read_by_auditor": false
+    }
+  },
+  "manifest_reconciliation": {
+    "records": 301,
+    "unique_heights": 301,
+    "min_height": 454001,
+    "max_height": 454301,
+    "first_height": 454001,
+    "last_height": 454201,
+    "missing": [],
+    "out_of_order_adjacent_pairs": 6,
+    "broken_adjacent_links": [],
+    "boundary_hash_matches_first_parent": true,
+    "end_donor_hash_matches_selected_tip": true,
+    "end_donor_count_matches_survivors": true,
+    "reported_span": 201,
+    "reported_window": [
+      454001,
+      454201
+    ],
+    "interpretation": "Saved rows prove a contiguous linked 301-height selection, but saved summary reports 201-height span and the last file-order height. Current ce5558b computes min/max, so source/result versions must be kept distinct."
+  },
+  "timing_and_memory": {
+    "stage_sum_s": 95.99,
+    "wall_s_reported_by_researcher": 112,
+    "wall_duration_field_in_saved_run": false,
+    "difference_vs_reported_wall_s": 16.01,
+    "verified_script_inputs_per_s": 33845.16732002389,
+    "not_signature_attempts_per_s": true,
+    "process_rss_hwm_bytes": 10083909632,
+    "process_rss_hwm_mib": 9616.765625,
+    "guard_sampled_cgroup_peak_mib": 10239,
+    "guard_memorymax_mib": 10240,
+    "guard_sampling": "Maximum of memory.current sampled once per second; memory.peak read only as fallback when sampled peak is zero.",
+    "scope": "Single local supplied-boundary window, not first-launch IBD or a physical floor. Preparation durations (~10 min donor, ~5 min corpus) are user-reported, not timed fields here."
+  },
+  "findings": [
+    {
+      "id": "P1-contextual-block",
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "line": 507,
+      "description": "Calls check_block but never contextual_check_block. Header insertion and BIP68 do not check BIP34 coinbase height, coinbase finality or witness/weight rules. window_complete can therefore be true with required block checks absent.",
+      "source_counterexample": "Add a nonempty witness to a pre-SegWit coinbase. txid/merkle/header/created coins remain unchanged, coinbase is not script-checked, but production contextual_check_block rejects UnexpectedWitness. Not executed by Codex."
+    },
+    {
+      "id": "P1-header-failure-and-binding",
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "line": 454,
+      "description": "HeaderTree failures only warn and do not enter known_invalid/export/exit decision; missing header context may still exit 0 in strict mode. Window header presence is checked, but tree-derived height is not compared to corpus height; CHAIN section is read and discarded. blocks are not sorted even though predicate loop breaks by height. Require selected-path failure accounting, actual height/ancestry/endpoint binding, and complete-mode enforcement."
+    },
+    {
+      "id": "P1-comparison-receipt",
+      "path": "experiments/results/gate4/corpus-454k/run-manifest.json",
+      "description": "Run receipt binds join output but not end-donor file, its validation provenance, converter build/command/output or comparator result. End donor header and canonical file sizes reconcile; claimed full byte equality was not independently rehashed/read by Codex and no separate comparison receipt was found in the reviewed Gate 4 artifacts. Preserve/recover those receipts with the corrected run."
+    },
+    {
+      "id": "P2-resource-and-capacity",
+      "path": "crates/avila-consensus/examples/shared/join_engine.rs",
+      "line": 83,
+      "description": "Flat representation removes map cloning, but reserve is capped at 2^26 records and 2^31 script bytes; larger data can reallocate. window_join still constructs the complete canonical output Vec, unlike the streaming converter. Current sampled usage is near the cap. No claim of eliminating future memory pressure or whole-history capacity follows."
+    }
+  ],
+  "remaining_scope": [
+    "Existing donor pins are supplied in this recorded run. window_complete itself does not require pins; checked-runner enforcement still required.",
+    "chainstate_complete is false in the saved output, despite window_complete true.",
+    "New HeaderTree/FlatBoundary path lacks recorded executable rejection/differential coverage against the prior fixture battery; CI success does not run the Python runner.",
+    "Gate 4 also includes representative workload/resource scaling and a practical laptop range, not just this window."
+  ],
+  "source_excerpts": [
+    {
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "first_line": 424,
+      "last_line": 472,
+      "text": "        let mut t = HeaderTree::new(params);\n        for i in 0..count {\n            let raw = need(12 + i * 80, 80);\n            let hdr = BlockHeader::decode(raw).unwrap_or_else(|e| {\n                eprintln!(\"fatal: headers manifest record {i} undecodable: {e}\");\n                std::process::exit(2);\n            });\n            match t.insert(&hdr, now) {\n                Ok(InsertStatus::AlreadyKnown { .. }) => {}\n                Ok(_) => headers_inserted += 1,\n                Err(avila_consensus::chain::ChainError::UnknownParent(_)) => {\n                    headers_unknown_parent += 1;\n                }\n                Err(e) => {\n                    headers_failed += 1;\n                    if headers_failed <= 3 {\n                        eprintln!(\"header {} insert failed: {e}\", hdr.hash());\n                    }\n                }\n            }\n        }\n        let tail = 12 + count * 80;\n        if need(tail, 5) != b\"CHAIN\".as_slice() {\n            eprintln!(\"fatal: headers manifest missing CHAIN section\");\n            std::process::exit(2);\n        }\n        let cc = u32::from_le_bytes(need(tail + 5, 4).try_into().unwrap()) as usize;\n        for i in 0..cc {\n            let _ = need(tail + 9 + i * 32, 32);\n        }\n        if headers_failed > 0 || headers_unknown_parent > 0 {\n            eprintln!(\n                \"warning: {headers_failed} indexed headers fail production checks; \\\n{headers_unknown_parent} have unknown parents\"\n            );\n        }\n        headers_loaded = count;\n        // Real parent MTP for every window block whose parent is indexed,\n        // plus a presence check: a window header the index doesn't know\n        // is unverifiable beyond its self-consistent hash.\n        for b in &blocks {\n            if let Some(m) = t.median_time_past(&b.header.prev_block_hash) {\n                block_mtp.insert(b.height, m);\n            }\n            if t.get(&b.hash).is_some() {\n                window_headers_in_tree += 1;\n            }\n        }\n        tree = Some(t);"
+    },
+    {
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "first_line": 502,
+      "last_line": 518,
+      "text": "    for b in &blocks {\n        let block = Block {\n            header: b.header,\n            transactions: b.txs.iter().map(|t| t.tx.clone()).collect(),\n        };\n        if let Err(e) = check_block(&block, &params) {\n            ctx_free_failed += 1;\n            mark_bad(\n                b.height,\n                format!(\"check_block: {e:?}\"),\n                &mut first_bad_h,\n                &mut first_bad_msg,\n            );\n        }\n        for (j, tr) in b.txs.iter().enumerate() {\n            n_txs += 1;\n            let txid = tr.tx.txid();"
+    },
+    {
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "first_line": 1039,
+      "last_line": 1128,
+      "text": "    // ---- ONE invalidity decision drives exit + export ------------------\n    // With a complete supplied state, `Missing` is not a coverage gap:\n    // a spend whose outpoint is absent from a COMPLETE boundary never\n    // existed (or was spent before the window) — known invalidity.\n    let missing_is_invalid = boundary_supplied;\n    let known_invalid = first_bad_h != u32::MAX\n        || !report.violations.is_empty()\n        || report.dup_spends > 0\n        || boundary_conflicts > 0\n        || failed_tasks > 0\n        || ctx_free_failed > 0\n        || linkage_broken > 0\n        || (missing_is_invalid && report.missing_spends > 0);\n\n    // ---- stage E: materialize valid-prefix survivor set ----------------\n    let t = std::time::Instant::now();\n    let boundary_coins_report = boundary.b_len();\n    // Flat-boundary live set: boundary records carry an alive bitmap;\n    // in-window creations live in `extra` and shadow boundary records\n    // (a re-created boundary op kills the boundary bit, then the new\n    // coin lives in `extra` — identical to HashMap insert-overwrite).\n    let mut boundary = boundary;\n    let mut extra: HashMap<OutPoint, Coin> = HashMap::new();\n    let mut order: Vec<(Occ, bool, usize)> = Vec::new();\n    for (k, c) in created.iter().enumerate() {\n        order.push((c.pos, true, k));\n    }\n    for (k, s) in spends.iter().enumerate() {\n        order.push((s.pos, false, k));\n    }\n    order.sort_by_key(|a| a.0);\n    let mut applied_events = 0usize;\n    for (pos, is_creation, k) in order {\n        if pos.h >= first_bad_h {\n            break;\n        }\n        if is_creation {\n            let op = &created[k].op;\n            if let Some(i) = boundary.find(op.txid.as_bytes(), op.vout) {\n                boundary.kill(i);\n            }\n            extra.insert(*op, created[k].coin.clone());\n        } else {\n            let op = &spends[k].op;\n            if extra.remove(op).is_none()\n                && let Some(i) = boundary.find(op.txid.as_bytes(), op.vout)\n            {\n                boundary.kill(i);\n            }\n        }\n        applied_events += 1;\n    }\n    let mat_s = t.elapsed().as_secs_f64();\n\n    // ---- component completion (explicit, not one overloaded flag) ------\n    // `resolved_inputs_complete` is driven by the JOIN (a spend resolved\n    // from an authenticated local creation record needs no spec hint).\n    let resolved_inputs_complete = report.missing_spends == 0;\n    let script_jobs_complete = completed_tasks == queued_tasks && failed_tasks == 0;\n    // Corpus boundary = spend-mentioned pre-window coins only; unspent\n    // pre-window outputs are absent by construction → never \"complete\"\n    // without an explicitly supplied full starting state.\n    let starting_state_complete = boundary_supplied;\n    let header_context_checked = linkage_broken == 0 && linkage_checked > 0;\n    // `header_context_full` — every window header was present in a\n    // HeaderTree built from the node's own index, meaning each passed\n    // production AcceptBlockHeader/ContextualCheckBlockHeader (PoW,\n    // required_bits, MTP time floor, version floors) at manifest insert.\n    // Without --headers the context is linkage+MTP-only and this is false.\n    let header_context_full = tree.is_some()\n        && headers_failed == 0\n        && headers_unknown_parent == 0\n        && window_headers_in_tree == blocks.len();\n    let context_free_checks_complete = ctx_free_failed == 0;\n    let coverage_complete = missing_heights == 0 && dup_heights == 0;\n    // `window_complete` — every component check that production requires\n    // for this era actually ran and passed on every block: complete\n    // authenticated starting state (all three pins enforced by the caller's\n    // flags), every spend resolved, every script job executed, full header\n    // context, zero unevaluated locks, and every block's coinbase bound\n    // checked (fully-covered blocks only can certify fees).\n    let window_complete = !known_invalid\n        && resolved_inputs_complete\n        && script_jobs_complete\n        && starting_state_complete\n        && header_context_full\n        && coverage_complete\n        && time_locks_unevaluated == 0\n        && bip68_unevaluated == 0\n        && blocks_fully_covered == blocks.len();"
+    },
+    {
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "first_line": 1299,
+      "last_line": 1328,
+      "text": "    // ---- exit: ONE contract -------------------------------------------\n    // Known invalidity → 1 in BOTH modes (diagnostic permits coverage\n    // gaps, never acceptance of detected invalidity). Incomplete\n    // coverage under strict → 1. Diagnostic incomplete-but-clean → 0.\n    // Computed ONCE so the manifest records the same exit the process\n    // takes.\n    let exit_code = if known_invalid {\n        eprintln!(\"invalid: {first_bad_msg} @ {first_bad_h}\");\n        1\n    } else if !(resolved_inputs_complete && script_jobs_complete) && !diagnostic {\n        eprintln!(\n            \"incomplete: missing_spends={} failed_tasks={failed_tasks}\",\n            report.missing_spends\n        );\n        1\n    } else {\n        0\n    };\n\n    // ---- run manifest: source + binary + inputs + outputs, one record --\n    // Lets an auditor prove WHICH binary produced WHICH output from\n    // WHICH inputs. `build_rev` is embedded at COMPILE time by build.rs\n    // (an older binary can never report a newer checkout); `checkout_rev`\n    // is the checkout's runtime HEAD, labeled separately. Streams all\n    // file hashes — no whole-file Vec reads at snapshot sizes.\n    if let Some(rm) = &run_manifest_path {\n        let self_sha = file_sha256(\"/proc/self/exe\");\n        let boundary_sha = boundary_path.as_ref().and_then(|p| file_sha256(p));\n        let headers_sha = headers_path.as_ref().and_then(|p| file_sha256(p));\n        let export_sha = if exported {"
+    },
+    {
+      "path": "crates/avila-consensus/src/check.rs",
+      "first_line": 417,
+      "last_line": 475,
+      "text": "pub fn contextual_check_block(\n    block: &Block,\n    ctx: &BlockContext<'_>,\n) -> Result<(), ContextualBlockError> {\n    // BIP113: with CSV active the nLockTime cutoff is the parent's median-time-past;\n    // before that it was the block's own timestamp. A deployment height `h` governs\n    // the block *at* height `h` (Core's `DeploymentActiveAfter` tests\n    // `pindexPrev->nHeight >= h - 1`).\n    let locktime_cutoff = if ctx.height >= ctx.params.csv_height {\n        ctx.parent_median_time_past\n            .ok_or(ContextualBlockError::MissingMedianTimePast)?\n    } else {\n        block.header.time\n    };\n    for tx in &block.transactions {\n        if !is_final_tx(tx, ctx.height, locktime_cutoff) {\n            return Err(ContextualBlockError::TxNonFinal);\n        }\n    }\n\n    // BIP34: the coinbase scriptSig must begin with the serialized block height.\n    if ctx.height >= ctx.params.bip34_height {\n        let expect = script::push_int(i64::from(ctx.height));\n        let script_sig = block\n            .transactions\n            .first()\n            .and_then(|coinbase| coinbase.inputs.first())\n            .map_or(&[][..], |input| input.script_sig.as_bytes());\n        if script_sig.len() < expect.len() || !script_sig.starts_with(&expect) {\n            return Err(ContextualBlockError::BadCbHeight);\n        }\n    }\n\n    // BIP141: when segwit is active, a present witness commitment must be correct;\n    // an absent commitment (or segwit being inactive) forbids witness data.\n    if ctx.height >= ctx.params.segwit_height\n        && let Some(commitpos) = block.witness_commitment_output()\n    {\n        // `witness_commitment_output` only matches coinbase outputs ≥38 bytes, so the\n        // [6..38] slice below is always in range.\n        let expected = block\n            .expected_witness_commitment()\n            .ok_or(ContextualBlockError::BadWitnessNonceSize)?;\n        let output_script = block.transactions[0].outputs[commitpos]\n            .script_pubkey\n            .as_bytes();\n        if output_script[6..38] != expected[..] {\n            return Err(ContextualBlockError::BadWitnessMerkleMatch);\n        }\n    } else if block.transactions.iter().any(Transaction::has_witness) {\n        return Err(ContextualBlockError::UnexpectedWitness);\n    }\n\n    // Weight is checked last, after witness-commitment verification — the coinbase\n    // witness is uncommitted until then and could otherwise inflate weight while the\n    // block hash stayed constant (Core's comment in ContextualCheckBlock).\n    if block.weight() > MAX_BLOCK_WEIGHT {\n        return Err(ContextualBlockError::BadBlkWeight);\n    }"
+    },
+    {
+      "path": "crates/avila-consensus/examples/shared/join_engine.rs",
+      "first_line": 71,
+      "last_line": 99,
+      "text": "}\n\n/// Streaming builder for [`FlatBoundary`] — the `for_each_coin`\n/// callback feeds `push` directly, so the compact record vec is the only\n/// intermediate structure (no per-coin `Coin`/map overhead).\npub struct FlatBuilder {\n    recs: Vec<BRec>,\n    spk_blob: Vec<u8>,\n}\n\nimpl FlatBuilder {\n    /// `expected` pre-sizes the table — pass the snapshot's declared coin\n    /// count so the ~3 GB record vec never doubles mid-fill.\n    pub fn new(expected: usize) -> Self {\n        Self {\n            recs: Vec::with_capacity(expected.min(1 << 26)),\n            spk_blob: Vec::with_capacity(expected.saturating_mul(28).min(1 << 31)),\n        }\n    }\n\n    /// Append one raw coin record (`code` is `height << 1 | coinbase`,\n    /// the snapshot's native encoding — bounded far below u32).\n    pub fn push(&mut self, txid: [u8; 32], vout: u32, value: i64, code: u64, spk: &[u8]) {\n        let off = self.spk_blob.len() as u64;\n        self.spk_blob.extend_from_slice(spk);\n        self.recs.push(BRec {\n            txid,\n            vout,\n            value,"
+    },
+    {
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "first_line": 166,
+      "last_line": 195,
+      "text": "/// Canonical export for the flat live set: boundary alive records are\n/// already in `(txid, vout)` order; `extra` (in-window creations) is\n/// sorted then merged — byte-identical output to `canonical_bytes` over\n/// the equivalent `HashMap` live set.\nfn canonical_bytes_flat(boundary: &FlatBoundary, extra: &HashMap<OutPoint, Coin>) -> Vec<u8> {\n    let mut ex: Vec<(&OutPoint, &Coin)> = extra.iter().collect();\n    ex.sort_unstable_by_key(|(op, _)| (op.txid, op.vout));\n    let mut ex_i = 0usize;\n    let mut out = Vec::with_capacity(boundary.txids_len() * 48);\n    for i in boundary.alive_indices() {\n        let (txid, vout, c) = boundary.record(i);\n        // Emit every `extra` record sorting strictly before this one.\n        while ex_i < ex.len() && (*ex[ex_i].0.txid.as_bytes(), ex[ex_i].0.vout) < (txid, vout) {\n            let (op, coin) = ex[ex_i];\n            put_coin_rec(&mut out, op.txid.as_bytes(), op.vout, coin);\n            ex_i += 1;\n        }\n        put_coin_rec(&mut out, &txid, vout, &c);\n    }\n    while ex_i < ex.len() {\n        let (op, coin) = ex[ex_i];\n        put_coin_rec(&mut out, op.txid.as_bytes(), op.vout, coin);\n        ex_i += 1;\n    }\n    out\n}\n\nfn money_range(v: i64) -> bool {\n    (0..=MAX_MONEY).contains(&v)\n}"
+    },
+    {
+      "path": "tools/guard_run.sh",
+      "first_line": 34,
+      "last_line": 72,
+      "text": "avail=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)\nneed=$((MAX_MIB + RESERVE_MIB))\nif [ \"$avail\" -lt \"$need\" ]; then\n    echo \"guard_run: REFUSING — MemAvailable=${avail}MiB < required=${need}MiB\" \\\n         \"(cap=${MAX_MIB}MiB + reserve=${RESERVE_MIB}MiB)\" >&2\n    exit 3\nfi\n\n# systemd-run in background so we can sample the scope cgroup while it lives.\ntmp=$(mktemp)\nsystemd-run --user --scope \\\n    -p \"MemoryMax=${MAX_MIB}M\" -p \"MemorySwapMax=0\" -p \"OOMPolicy=kill\" \\\n    -- \"$@\" >\"$tmp\" 2>&1 &\nrunner=$!\n\n# Wait for the unit name, then poll memory.current → peak.\nunit=\"\"\npeak=0\nslice=\"/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice\"\nwhile kill -0 \"$runner\" 2>/dev/null; do\n    if [ -z \"$unit\" ]; then\n        unit=$(grep -o 'run-[a-zA-Z0-9_-]*\\.scope' \"$tmp\" 2>/dev/null | head -1)\n    fi\n    if [ -n \"$unit\" ] && [ -f \"$slice/$unit/memory.current\" ]; then\n        cur=$(cat \"$slice/$unit/memory.current\" 2>/dev/null || echo 0)\n        [ \"$cur\" -gt \"$peak\" ] && peak=$cur\n    fi\n    sleep 1\ndone\nwait \"$runner\"; rc=$?\n\ncat \"$tmp\" >&2\nrm -f \"$tmp\"\n# Fallback peak: memory.peak may still exist for a moment after exit.\nif [ \"$peak\" -eq 0 ] && [ -n \"$unit\" ] && [ -f \"$slice/$unit/memory.peak\" ]; then\n    peak=$(cat \"$slice/$unit/memory.peak\" 2>/dev/null || echo 0)\nfi\necho \"guard_run: exit=$rc cap=${MAX_MIB}MiB peak=$((peak/1048576))MiB unit=${unit:-n/a}\" >&2\nexit \"$rc\""
+    }
+  ],
+  "disposition": "Meaningful real-state and bounded-memory progress; acquired boundaries remove prior data blocker. Do not accept Gate 4 complete/full validation yet. Finish existing context/acceptance contract and preserve complete comparison receipt, then measure capacity without block-count extrapolation. Earlier accepted repairs remain closed."
+}

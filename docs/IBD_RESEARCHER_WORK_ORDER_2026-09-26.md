@@ -47,6 +47,36 @@ the genuine donor and finish production context checks. The checked runner
 must supply all three donor pins for the complete real-state comparison.
 Whole-IBD capacity claims still require that comparison and scaling measurements.
 
+The subsequent real-window result at `ce5558b` is reviewed in
+[the 454k-window audit](IBD_SWE2_REVIEW_78_REAL_2026-09-27.md). The genuine
+boundaries remove the data blocker and the flat representation is meaningful
+progress. Full-validation closure still needs the production contextual block
+check, selected-chain context enforced in acceptance, and complete comparison
+receipts. Finish those on the same window, then measure resource/workload
+scaling; do not extrapolate the reported 112 seconds by block count or mark
+the entire Gate 4 complete from this result.
+
+The `2d77ad7` repair is reviewed in
+[the real-window follow-up](IBD_SWE2_REVIEW_78_REAL_FOLLOWUP_2026-09-27.md).
+The production contextual-block call and streamed export are accepted, and
+the saved manifest covers all 301 requested heights. Before scaling, enforce
+the requested interval endpoints and full selected-CHAIN coverage, and make
+the small flat-state oracle compare complete records. Preserve the existing
+real-window result; fold complete receipts and an outer duration into the
+next planned dedicated-laptop measurement. The saved 83.718-second marker is
+through export/reporting, before final receipt hashing, and is not a
+whole-IBD forecast.
+
+The `d8f32b3` closure update at the top of that follow-up accepts all three
+remaining controls. Codex independently confirmed 114 passing checks in the
+new CI executable step and reconciled the tracked comparison receipt. Proceed
+to the dedicated-laptop baseline and representative workload scaling; the
+next substantive deliverable is the conditional full-IBD capacity range and
+its remaining gap to the one-hour objective. The guard's endpoint load/memory
+readings do not supply process CPU time or sustained clocks: capture those
+with existing monitoring tools during the run. No further correctness repair
+round is assigned by this closure review.
+
 Read [the hardware analysis](../experiments/2026-09-26-ibd-hardware-floor.md)
 before using the earlier physics proposal. Its local-corpus targets and
 desktop/GPU examples are not first-launch laptop results.
@@ -103,6 +133,20 @@ shared-host timing changes as wins. Log each experiment, including null results,
 in experiments/LOG.md. Run cargo test --release -p <affected-crate> for relevant
 Rust implementation changes. Protocol changes eventually need real-connection
 tests; an offline replay does not establish their behavior.
+
+The user's 2026-09-27 clarification makes a dedicated reference laptop the
+primary acceptance condition: other user applications and competing workloads
+will be closed for the benchmark. See the
+[product objective](IBD_PRODUCT_OBJECTIVE.md). After the existing correctness
+repairs, use the already requested same-window measurement to establish that
+baseline. Record process CPU time and wall time by stage where feasible,
+system competing CPU load, sustained clocks/thermal conditions, and memory/I/O
+pressure and cgroup limits. Eight configured workers do not establish eight
+fully available cores. Keep shared-use results labeled; do not apply an assumed
+speedup to them. Compare the same corrected binary and workload under matched
+cache and power conditions if quantifying the contention penalty. Retain the
+resource guard and one-heavy-job rule; this clarification does not authorize
+stopping the user's applications or services now.
 
 **First deliverable: count the problem and define the completion boundary**
 

@@ -1,0 +1,170 @@
+{
+  "review": "Closure of real-window completion findings at d8f32b3",
+  "recorded_utc": "2026-09-27T19:49:26.259386+00:00",
+  "head": "d8f32b3eb8a0e80dce3f5f9d52de35e11092871f",
+  "method": "Source and small-artifact review plus read-only GitHub Actions run/job/log queries. No local tests, builds, experiments, node operations, large file reads/hashes/comparisons or process/service actions. Large-file equality is a saved SWE-2 receipt, not an independently repeated comparison.",
+  "files": {
+    "AGENTS.md": {
+      "bytes": 1336,
+      "sha256": "056bfee0f4ed06b54f91977caea8dd4908e82b09da23c473e8ad20a22b58d1b6"
+    },
+    ".github/workflows/ci.yml": {
+      "bytes": 2749,
+      "sha256": "2a82dd91c1428232be657bc98ac32ecec1584a4bde90b03ad079ba022001c111"
+    },
+    "tools/guard_run.sh": {
+      "bytes": 3122,
+      "sha256": "8ddaca6506c82e0aa7d18b046a142a76f3fb27a38a15a3b5243c1c7dd8f243aa"
+    },
+    "tools/test_window_join_exec.py": {
+      "bytes": 36536,
+      "sha256": "b2bf946988084424efd7b8a3b60de8a7622346d28d2545ef2760df49ff1187f8"
+    },
+    "crates/avila-consensus/examples/window_join.rs": {
+      "bytes": 65152,
+      "sha256": "2471aa735372afc2c2ce5fe7ff189268b4450dce6d19a12759489f61da9adaea"
+    },
+    "experiments/results/gate4/corpus-454k/comparison-receipt.json": {
+      "bytes": 1411,
+      "sha256": "46f9f5ab59e4670ea68e85bed594e2e543e779c56939d422fff36b12e63b72dd"
+    },
+    "experiments/results/gate4/corpus-454k/exec-regressions.txt": {
+      "bytes": 5140,
+      "sha256": "8415d5c0ec390c2d698ecf52575ee9877bd886d29039d6d62ed5813c550b37fd"
+    },
+    "experiments/results/gate4/corpus-454k/run-manifest.json": {
+      "bytes": 1319,
+      "sha256": "85d9467364c9cd02a5c3da7ce13ff7c4e2cd77d94719e0d4e300e4a909c4acf3"
+    },
+    "experiments/results/gate4/corpus-454k/run.stderr": {
+      "bytes": 2769,
+      "sha256": "74eef43188de67817af13d39ccbbf3cd68ebd115afb5705713dc69100dfc9ec0"
+    }
+  },
+  "ci": {
+    "run_id": 36344244794,
+    "head_sha": "d8f32b3eb8a0e80dce3f5f9d52de35e11092871f",
+    "url": "https://github.com/Connoravila1/Avila-Node/actions/runs/36344244794",
+    "conclusion": "success",
+    "job_id": 108690132458,
+    "step": "window_join executable regressions",
+    "step_conclusion": "success",
+    "step_log_pass_lines": 114,
+    "step_log_fail_lines": 0,
+    "step_binary_sha256": "cd8a007f3c7547f9da86ecbde7731ce062ce0021ff19da911032cfc5719194f0",
+    "step_manifest_build_rev": "d8f32b3eb8a0e80dce3f5f9d52de35e11092871f",
+    "step_completion": "all window_join executable regressions pass",
+    "verification": "Read-only gh run view job metadata and filtered executable step log during this audit."
+  },
+  "local_executable_receipt": {
+    "text": "binary_sha256: 79d35e1215a69188e335efc91f905c492b7d51a4f9cf5e1fc36ba57f57c1af2c\nbuild_rev: 2d77ad7944cc4f1fe337bde4d8e9cf55bd031a85\n---\nPASS ok exit 0 rc=0\nPASS ok verified=1 \nPASS ok exported-not-chainstate \nPASS dup-boundary [strict] exit 1 rc=1\nPASS dup-boundary [strict] not exported \nPASS dup-boundary [strict] known_invalid \nPASS dup-boundary [strict] dup counted \nPASS dup-boundary [diag] exit 1 rc=1\nPASS dup-boundary [diag] not exported \nPASS dup-boundary [diag] known_invalid \nPASS dup-boundary [diag] dup counted \nPASS boundary-conflict [strict] exit 1 rc=1\nPASS boundary-conflict [strict] not exported \nPASS boundary-conflict [strict] known_invalid \nPASS boundary-conflict [strict] conflict counted \nPASS boundary-conflict [diag] exit 1 rc=1\nPASS boundary-conflict [diag] not exported \nPASS boundary-conflict [diag] known_invalid \nPASS boundary-conflict [diag] conflict counted \nPASS immature [strict] exit 1 rc=1\nPASS immature [strict] not exported \nPASS immature [strict] known_invalid \nPASS immature [strict] immature counted \nPASS immature [diag] exit 1 rc=1\nPASS immature [diag] not exported \nPASS immature [diag] known_invalid \nPASS immature [diag] immature counted \nPASS overspend [strict] exit 1 rc=1\nPASS overspend [strict] not exported \nPASS overspend [strict] known_invalid \nPASS overspend [strict] value violation \nPASS overspend [diag] exit 1 rc=1\nPASS overspend [diag] not exported \nPASS overspend [diag] known_invalid \nPASS overspend [diag] value violation \nPASS neg-output [strict] exit 1 rc=1\nPASS neg-output [strict] not exported \nPASS neg-output [strict] known_invalid \nPASS neg-output [strict] context-free catch \nPASS neg-output [diag] exit 1 rc=1\nPASS neg-output [diag] not exported \nPASS neg-output [diag] known_invalid \nPASS neg-output [diag] context-free catch \nPASS nonfinal [strict] exit 1 rc=1\nPASS nonfinal [strict] not exported \nPASS nonfinal [strict] known_invalid \nPASS nonfinal [strict] nonfinal counted \nPASS nonfinal [diag] exit 1 rc=1\nPASS nonfinal [diag] not exported \nPASS nonfinal [diag] known_invalid \nPASS nonfinal [diag] nonfinal counted \nPASS excess-cb [strict] exit 1 rc=1\nPASS excess-cb [strict] not exported \nPASS excess-cb [strict] known_invalid \nPASS excess-cb [strict] cb bound violation \nPASS excess-cb [diag] exit 1 rc=1\nPASS excess-cb [diag] not exported \nPASS excess-cb [diag] known_invalid \nPASS excess-cb [diag] cb bound violation \nPASS badsig-prefix [strict] exit 1 rc=1\nPASS badsig-prefix [strict] not exported \nPASS badsig-prefix [strict] known_invalid \nPASS badsig-prefix [strict] fails at 141, prefix before it \nPASS badsig-prefix [diag] exit 1 rc=1\nPASS badsig-prefix [diag] not exported \nPASS badsig-prefix [diag] known_invalid \nPASS badsig-prefix [diag] fails at 141, prefix before it \nPASS workers0 exit 2 rc=2\nPASS unresolved strict exit 1 rc=1\nPASS unresolved diagnostic exit 0 rc=0\nPASS diagnostic incomplete-labeled \nPASS boundary resolves spec-less spend rc=0 missing=0\nPASS boundary/spec mismatch \u2192 invalid rc=1\nPASS absent-from-boundary \u2192 invalid rc=1\nPASS wrong-network boundary \u2192 exit 2 rc=2 err=fatal: boundary network [f9, be, b4, d9] \u2260 params [fa, bf, b5, da]\n\nPASS non-adjacent base \u2192 exit 2 rc=2\nPASS dup-outpoint boundary \u2192 exit 2 rc=2\nPASS all donor pins correct \u2192 exit 0 rc=0\nPASS wrong base-hash pin \u2192 exit 2 rc=2\nPASS short base-hash pin \u2192 exit 2 not panic rc=2\nPASS non-hex base-hash pin \u2192 exit 2 not panic rc=2\nPASS wrong donor-height pin \u2192 exit 2 rc=2\nPASS wrong txoutset pin \u2192 exit 2 rc=2\nPASS fully-qualified window \u2192 exit 0 + all flags rc=0\nPASS require-complete w/o headers \u2192 exit 1 rc=1\nPASS missing requested endpoint \u2192 require-complete exit 1 rc=1\nPASS missing requested endpoint \u2192 strict exit 1 rc=1\nPASS missing requested endpoint \u2192 diag clean-but-incomplete rc=0\nPASS short CHAIN strict exit 1 rc=1\nPASS short CHAIN diag: gap not invalidity rc=0 miss=1\nPASS short CHAIN require-complete exit 1 rc=1\nPASS cb-height [strict] exit 1 rc=1\nPASS cb-height [strict] ctx flag contextual_check_block: BadCbHeight\nPASS cb-height [diag] exit 1 rc=1\nPASS cb-height [diag] ctx flag contextual_check_block: BadCbHeight\nPASS unexpected-witness [strict] exit 1 rc=1\nPASS unexpected-witness [strict] flag contextual_check_block: UnexpectedWitness\nPASS unexpected-witness [diag] exit 1 rc=1\nPASS unexpected-witness [diag] flag contextual_check_block: UnexpectedWitness\nPASS ctx-hdr-fail [strict] exit 1 rc=1\nPASS ctx-hdr-fail [strict] flag \nPASS ctx-hdr-fail [diag] exit 1 rc=1\nPASS ctx-hdr-fail [diag] flag \nPASS height-mismatch [strict] exit 1 rc=1\nPASS height-mismatch [strict] flag \nPASS height-mismatch [diag] exit 1 rc=1\nPASS height-mismatch [diag] flag \nPASS missing-header strict exit 1 rc=1\nPASS missing-header diag: clean but not complete rc=0\nPASS missing-header require-complete exit 1 rc=1\nPASS out-of-order corpus still complete rc=0\nPASS flat-oracle complete + survivors rc=0 surv=4\nPASS flat-oracle records byte-exact (incl. absent s1:vout0) match\nPASS run manifest: build_rev + argv array + hashes rc=0 rev=2d77ad7944cc4f1fe337bde4d8e9cf55bd031a85+dirty\n\nall window_join executable regressions pass\n",
+    "pass_lines": 114,
+    "fail_lines": 0,
+    "identity_scope": "Local precommit dirty build is distinct from the clean CI build above."
+  },
+  "comparison_receipt": {
+    "type": "state_comparison_receipt",
+    "donor": {
+      "path": "experiments/results/gate4/donor-454301.utxo",
+      "sha256": "f2caeeeb43bc974c47edea34e0f24830e048bd6f5ed37d05ee0e92e0944c1f73",
+      "height": 454301,
+      "coins": 45751759,
+      "produced_by": "avila-node dumptxoutset (rollback @454301)"
+    },
+    "converter": {
+      "binary": "target/release/examples/snap_to_canonical",
+      "binary_sha256": "6e3a7ae0ce90f04721f447292ee6c7fc0b1e80e590d9ddf3114aef8021d9ef85",
+      "argv": [
+        "target/release/examples/snap_to_canonical",
+        "experiments/results/gate4/donor-454301.utxo",
+        "experiments/results/gate4/corpus-454k/donor-454301.canonical"
+      ],
+      "output": "experiments/results/gate4/corpus-454k/donor-454301.canonical",
+      "output_sha256": "865d32cfaea57e15352ece551685dd71d9b96ea39f8118cc0ca0152b44cd3168",
+      "output_bytes": 3594371786,
+      "output_coins": 45751759,
+      "note": "canonicalizes each dumptxoutset coin to the join record format, sorted by (txid,vout)"
+    },
+    "join": {
+      "export": "experiments/results/gate4/corpus-454k/window-454k.canonical",
+      "export_sha256": "865d32cfaea57e15352ece551685dd71d9b96ea39f8118cc0ca0152b44cd3168",
+      "export_bytes": 3594371786,
+      "argv": "see run-manifest.json"
+    },
+    "comparison": {
+      "method": "cmp -s byte compare + independent sha256",
+      "cmp_exit": 0,
+      "byte_identical": true,
+      "both_sha256_match": true
+    }
+  },
+  "comparison_reconciliation": {
+    "output_digest": true,
+    "output_bytes": true,
+    "output_coins": true,
+    "cmp_receipt_success": true
+  },
+  "existing_real_run_manifest": {
+    "type": "run_manifest",
+    "build_rev": "ce5558bd9bbfeebe14b6cea0193078224a0b0943+dirty",
+    "checkout_rev": "ce5558bd9bbfeebe14b6cea0193078224a0b0943",
+    "binary_sha256": "8908c766202b4954d6735718b21ce92ab72def748cbf172897924e2ebed38f06",
+    "corpus_sha256": "55216ff423ae36af6bd826fde5da649b9c448816a0ed7ef7ba51cb3c3d8ac05d",
+    "boundary_sha256": "582aa9592e8784bc5f84214a2f1f07728fdc1a6ecd60a7c1c4e673ce6453f805",
+    "headers_sha256": "57c73d99a1f2e06df1e5aefa27271bbf8dafea69957e293c3bbae6c7ebdabafa",
+    "export_sha256": "865d32cfaea57e15352ece551685dd71d9b96ea39f8118cc0ca0152b44cd3168",
+    "argv": [
+      "experiments/results/gate4/corpus-454k/corpus.bin",
+      "--params",
+      "mainnet",
+      "--segment",
+      "454001:454301",
+      "--boundary",
+      "experiments/results/gate4/donor-454000.utxo",
+      "--boundary-base-height",
+      "454000",
+      "--boundary-base-hash",
+      "0000000000000000024e8bd568de4d4624d340370e62223b04a11e460262817d",
+      "--boundary-txoutset-hash",
+      "00617975f4a08fd15201ca9417b0fc2b274a03298c8e2d3a79e47fdba51f581c",
+      "--headers",
+      "experiments/results/gate4/headers-full.hchain",
+      "--workers",
+      "8",
+      "--manifest",
+      "experiments/results/gate4/corpus-454k/window-manifest.jsonl",
+      "--export",
+      "experiments/results/gate4/corpus-454k/window-454k.canonical",
+      "--run-manifest",
+      "experiments/results/gate4/corpus-454k/run-manifest.json",
+      "--require-complete"
+    ],
+    "exit_code": 0,
+    "known_invalid": false,
+    "exported": true
+  },
+  "closed_findings": [
+    "requested interval endpoint completeness",
+    "missing selected CHAIN entries prevent completion",
+    "flat-state oracle compares all canonical record fields"
+  ],
+  "measurement_scope": {
+    "existing_real_run_is_new_capacity_run": false,
+    "existing_manifest_has_wall_s_total": false,
+    "new_wall_s_total_source_scope": "Sampled after receipt hashes and argv collection, before manifest serialization/write. Guard outer wall measures command/wrapper lifecycle at whole-second resolution.",
+    "guard_records": [
+      "start/end load averages",
+      "start/end MemAvailable",
+      "outer wall seconds",
+      "sampled cgroup memory peak",
+      "cap and exit status"
+    ],
+    "not_recorded_by_guard": [
+      "process user/system CPU time",
+      "CPU utilization during run",
+      "sustained clock frequency",
+      "thermal telemetry"
+    ],
+    "next_action": "Dedicated-laptop measurement and era/workload scaling with existing monitoring tools; no additional correctness repair gate from this review."
+  }
+}

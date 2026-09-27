@@ -36,6 +36,16 @@ operating system, build, resource limits, and competing load. Results on lower
 memory laptops or other hardware need separate measurements before extending
 the claim to them.
 
+Clarified by the user on 2026-09-27: the primary acceptance run assumes the
+reference laptop is dedicated to IBD, with other user applications and
+competing research/build workloads closed for the run. Normal operating-system
+services remain; record their observed load, power mode, and sustained thermal
+conditions. Shared-use measurements remain useful diagnostics, but do not
+establish the dedicated machine's capacity or a physical lower bound. This
+benchmark condition does not authorize closing applications or stopping
+services during ongoing research. Retain the mandatory resource guard and
+choose any memory budget from available headroom and measured requirements.
+
 Specify the connection by measured sustained application goodput, link
 topology, serving sources, and all transmitted helper bytes. CPU class alone
 cannot determine first-launch time. At the provisional 768 decimal GB corpus,

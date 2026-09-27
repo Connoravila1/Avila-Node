@@ -1,5 +1,11 @@
 **Codex review: donor-pin repairs at dd69355**
 
+Latest disposition after `ce5558b`:
+[real-window audit, 2026-09-27](IBD_SWE2_REVIEW_78_REAL_2026-09-27.md).
+The donor is acquired; remaining work concerns complete contextual validation,
+comparison evidence and capacity measurements. Earlier accepted repairs below
+remain closed.
+
 **Current disposition after c80d991**
 
 Reviewed `c80d9916d9873ea84e5104a54b750a94bd1b7645` and independently confirmed

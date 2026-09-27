@@ -1,0 +1,305 @@
+{
+  "review": "Gate 4 real-window repair at 2d77ad7",
+  "recorded_utc": "2026-09-27T19:13:06.696488+00:00",
+  "head": "2d77ad7944cc4f1fe337bde4d8e9cf55bd031a85",
+  "worktree_status_before_document_edits": " M docs/IBD_PRODUCT_OBJECTIVE.md\n M docs/IBD_RESEARCHER_WORK_ORDER_2026-09-26.md\n M docs/IBD_SWE2_REVIEW_78_DONOR_2026-09-26.md\n?? docs/IBD_SWE2_REVIEW_78_REAL_2026-09-27.md\n?? docs/evidence/2026-09-27-ibd-gate4-real-review.json\n",
+  "method": "Read-only source and small saved-artifact review, small-file hashes and arithmetic, read-only GitHub Actions query. No workloads, builds, tests, examples, corpus/header/snapshot/export scans, large-file reads/hashes/comparisons, RPCs or process/service operations. Source-derived counterexamples were not executed.",
+  "ci": {
+    "databaseId": 36342750628,
+    "headSha": "2d77ad7944cc4f1fe337bde4d8e9cf55bd031a85",
+    "conclusion": "success",
+    "status": "completed",
+    "url": "https://github.com/Connoravila1/Avila-Node/actions/runs/36342750628",
+    "verification": "Read-only gh run list during this audit."
+  },
+  "files": {
+    "AGENTS.md": {
+      "bytes": 1336,
+      "sha256": "056bfee0f4ed06b54f91977caea8dd4908e82b09da23c473e8ad20a22b58d1b6",
+      "tracked": true
+    },
+    ".github/workflows/ci.yml": {
+      "bytes": 2462,
+      "sha256": "f4ce30e163045164f144a8770fc319cba36666b65cd365273bf589b63a1ffbe9",
+      "tracked": true
+    },
+    "tools/guard_run.sh": {
+      "bytes": 2664,
+      "sha256": "a028568483fec9034c20899861fa61eb7aa350274ac799be60af21f64acab73e",
+      "tracked": true
+    },
+    "crates/avila-consensus/examples/window_join.rs": {
+      "bytes": 64036,
+      "sha256": "6250e62781d74b14c4f81f0ba643c017c5c18d92ff49509f7ec920c6b887015e",
+      "tracked": true
+    },
+    "crates/avila-consensus/examples/shared/join_engine.rs": {
+      "bytes": 15442,
+      "sha256": "04ffa91f0d9d693acb4c61a78ae658881a2c948f94dde8805ac24aa78bb883b7",
+      "tracked": true
+    },
+    "crates/avila-consensus/examples/snap_to_canonical.rs": {
+      "bytes": 2788,
+      "sha256": "23460653b3392911869a3513620050f16a251825ad5f600e93c6048972bc658b",
+      "tracked": true
+    },
+    "crates/avila-consensus/src/chain.rs": {
+      "bytes": 66009,
+      "sha256": "a7aa0ebf29220822da5e04b5d16e1b6436be5b8bef3f80737c63aca8f8bd333a",
+      "tracked": true
+    },
+    "crates/avila-consensus/src/check.rs": {
+      "bytes": 41783,
+      "sha256": "5ecf61def1518ff40989eb35a2c2b311b9de2c94f27b9cd7d994bdf35ab48eca",
+      "tracked": true
+    },
+    "tools/test_window_join_exec.py": {
+      "bytes": 32894,
+      "sha256": "2549ee7693e443368c70459a7bc7c224912c2b4de272b20830a0845a6dc8b239",
+      "tracked": true
+    },
+    "experiments/results/gate4/corpus-454k/run.stderr": {
+      "bytes": 2769,
+      "sha256": "74eef43188de67817af13d39ccbbf3cd68ebd115afb5705713dc69100dfc9ec0",
+      "tracked": true
+    },
+    "experiments/results/gate4/corpus-454k/run-manifest.json": {
+      "bytes": 1319,
+      "sha256": "85d9467364c9cd02a5c3da7ce13ff7c4e2cd77d94719e0d4e300e4a909c4acf3",
+      "tracked": true
+    },
+    "experiments/results/gate4/corpus-454k/window-manifest.jsonl": {
+      "bytes": 61037,
+      "sha256": "f2ba61019d972274e8a69fe291513dde2d7cd5d1914db0aaa6e84a85ce26ca32",
+      "tracked": true
+    },
+    "experiments/results/gate4/corpus-454k/comparator.log": {
+      "bytes": 292,
+      "sha256": "5fe2fcd4eebfd4ee4b08efa833d434b3a39eb136dedb2918f322d43e9a91947d",
+      "tracked": false
+    },
+    "experiments/results/gate4/corpus-454k/run.log": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tracked": false
+    },
+    "experiments/results/gate4/exec-regression-2026-09-26b.log": {
+      "bytes": 3528,
+      "sha256": "b7006831d02bb0ea3e61ef630b33b9a10269f2f8a07c1ff52f36a9d1169c47e2",
+      "tracked": false
+    }
+  },
+  "saved_run_objects": [
+    {
+      "type": "export",
+      "path": "experiments/results/gate4/corpus-454k/window-454k.canonical",
+      "bytes": 3594371786,
+      "sha256": "865d32cfaea57e15352ece551685dd71d9b96ea39f8118cc0ca0152b44cd3168",
+      "chainstate_complete": true,
+      "projection": "valid_prefix"
+    },
+    {
+      "type": "window_join",
+      "window": [
+        454001,
+        454301
+      ],
+      "corpus_bytes": 1276970754,
+      "blocks_present": 301,
+      "heights_span": 301,
+      "heights_missing": 0,
+      "duplicate_heights": 0,
+      "longest_contiguous_run": 301,
+      "header_hash_verified": 301,
+      "linkage_checked": 300,
+      "linkage_broken": 0,
+      "mtp_computable": 290,
+      "context_free_failed": 0,
+      "txs": 615804,
+      "inputs_noncb": 1303682,
+      "srcs_resolved": 1193423,
+      "srcs_unresolved": 110259,
+      "gap_height_sourced": 0,
+      "spend_records": 1303682,
+      "creation_records": 1438746,
+      "boundary_coins": 45616695,
+      "boundary_conflicts": 0,
+      "join_dup_creations": 0,
+      "join_dup_spends": 0,
+      "join_missing_spends": 0,
+      "fully_resolved_txs": 615503,
+      "excluded_txs": 0,
+      "resolved_spec_unjoined": 0,
+      "unresolved_spec_inputs": 0,
+      "blocks_fully_covered": 301,
+      "exec_inputs": 1303682,
+      "queued_tasks": 615503,
+      "completed_tasks": 615503,
+      "verified_inputs": 1303682,
+      "inputs_in_failed_txs": 0,
+      "script_failure_txs": 0,
+      "immature_violations": 0,
+      "value_violations": 0,
+      "nonfinal_violations": 0,
+      "time_locks_unevaluated": 0,
+      "sigop_violations": 0,
+      "bip68_evaluated": 615503,
+      "bip68_violations": 0,
+      "bip68_unevaluated": 0,
+      "cb_bound_checks": 301,
+      "cb_bound_violations": 0,
+      "headers_loaded": 968779,
+      "headers_inserted": 968778,
+      "headers_unknown_parent": 0,
+      "headers_failed": 0,
+      "window_headers_in_tree": 301,
+      "headers_height_mismatch": 0,
+      "headers_chain_mismatch": 0,
+      "headers_failed_selected": 0,
+      "headers_missing_selected": 0,
+      "ctx_block_evaluated": 301,
+      "ctx_block_failed": 0,
+      "ctx_block_unevaluated": 0,
+      "survivor_records": 45751759,
+      "applied_events": 2742428,
+      "first_bad_height": null,
+      "first_bad": null,
+      "known_invalid": false,
+      "resolved_inputs_complete": true,
+      "script_jobs_complete": true,
+      "starting_state_complete": true,
+      "boundary_loaded_coins": 45616695,
+      "boundary_base_height": 454000,
+      "boundary_base_hash": "0000000000000000024e8bd568de4d4624d340370e62223b04a11e460262817d",
+      "boundary_txoutset_hash": "00617975f4a08fd15201ca9417b0fc2b274a03298c8e2d3a79e47fdba51f581c",
+      "boundary_dup_outpoints": 0,
+      "first_missing_height": null,
+      "header_context_checked": true,
+      "header_context_full": true,
+      "contextual_blocks_complete": true,
+      "all_donor_pins": true,
+      "window_complete": true,
+      "context_free_checks_complete": true,
+      "coverage_complete": true,
+      "chainstate_complete": true,
+      "exported": true,
+      "stages": {
+        "parse_s": 4.075,
+        "emit_s": 1.276,
+        "headers_s": 3.429,
+        "boundary_load_s": 11.333,
+        "join_s": 23.504,
+        "predicate_s": 0.813,
+        "script_s": 31.768,
+        "materialize_s": 4.057,
+        "export_s": 14.736
+      },
+      "wall_s": 83.718,
+      "rss_hwm_bytes": 7057620992,
+      "workers": 8
+    }
+  ],
+  "saved_guard_output": "guard_run: exit=0 cap=8192MiB peak=8191MiB unit=run-p1800553-i1804195.scope",
+  "saved_run_manifest": {
+    "type": "run_manifest",
+    "build_rev": "ce5558bd9bbfeebe14b6cea0193078224a0b0943+dirty",
+    "checkout_rev": "ce5558bd9bbfeebe14b6cea0193078224a0b0943",
+    "binary_sha256": "8908c766202b4954d6735718b21ce92ab72def748cbf172897924e2ebed38f06",
+    "corpus_sha256": "55216ff423ae36af6bd826fde5da649b9c448816a0ed7ef7ba51cb3c3d8ac05d",
+    "boundary_sha256": "582aa9592e8784bc5f84214a2f1f07728fdc1a6ecd60a7c1c4e673ce6453f805",
+    "headers_sha256": "57c73d99a1f2e06df1e5aefa27271bbf8dafea69957e293c3bbae6c7ebdabafa",
+    "export_sha256": "865d32cfaea57e15352ece551685dd71d9b96ea39f8118cc0ca0152b44cd3168",
+    "argv": [
+      "experiments/results/gate4/corpus-454k/corpus.bin",
+      "--params",
+      "mainnet",
+      "--segment",
+      "454001:454301",
+      "--boundary",
+      "experiments/results/gate4/donor-454000.utxo",
+      "--boundary-base-height",
+      "454000",
+      "--boundary-base-hash",
+      "0000000000000000024e8bd568de4d4624d340370e62223b04a11e460262817d",
+      "--boundary-txoutset-hash",
+      "00617975f4a08fd15201ca9417b0fc2b274a03298c8e2d3a79e47fdba51f581c",
+      "--headers",
+      "experiments/results/gate4/headers-full.hchain",
+      "--workers",
+      "8",
+      "--manifest",
+      "experiments/results/gate4/corpus-454k/window-manifest.jsonl",
+      "--export",
+      "experiments/results/gate4/corpus-454k/window-454k.canonical",
+      "--run-manifest",
+      "experiments/results/gate4/corpus-454k/run-manifest.json",
+      "--require-complete"
+    ],
+    "exit_code": 0,
+    "known_invalid": false,
+    "exported": true
+  },
+  "saved_comparator_receipt": "Running as unit: run-p1803180-i1817591.scope; invocation ID: 777e4604ccba42e9899b57348b9b5809\ncoins=45751759 declared=45751759 bytes=3594371786 sha256=865d32cfaea57e15352ece551685dd71d9b96ea39f8118cc0ca0152b44cd3168\nguard_run: exit=0 cap=6144MiB peak=6143MiB unit=run-p1803180-i1817591.scope\n",
+  "manifest_reconciliation": {
+    "rows": 301,
+    "unique_heights": 301,
+    "min": 454001,
+    "max": 454301,
+    "requested_interval": [
+      454001,
+      454301
+    ],
+    "missing_requested_heights": [],
+    "ordered": true,
+    "adjacent_links_ok": 300,
+    "first_parent": "0000000000000000024e8bd568de4d4624d340370e62223b04a11e460262817d",
+    "terminal_hash": "000000000000000001639ce8a3e8a628f530c49f8a46985bbc06d182ea5cb9aa"
+  },
+  "calculations": {
+    "nonnested_stage_sum_s": 83.658,
+    "wall_marker_s": 83.718,
+    "join_remainder_s": 12.171000000000001,
+    "rss_MiB": 6730.671875,
+    "rss_GiB": 6.5729217529296875,
+    "verified_inputs_per_script_second": 41037.5849911861
+  },
+  "archived_regression_log": {
+    "path": "experiments/results/gate4/exec-regression-2026-09-26b.log",
+    "pass_lines": 84,
+    "scope": "Pre-change 84-check log. No current 96-check output located in reviewed gate4 result files; CI does not invoke the Python executable suite."
+  },
+  "source_excerpts": {
+    "segment_observed_extent": "343:     if let Some((lo, hi)) = segment {\n344:         blocks.retain(|b| (lo..=hi).contains(&b.height));\n345:     }\n346:     // Processing must follow the verified chain order \u2014 blk-file order is\n347:     // not height order and later stages `break` on the first bad height.\n348:     blocks.sort_by_key(|b| b.height);\n349:     assert!(!blocks.is_empty());\n350:     let parse_s = t.elapsed().as_secs_f64();\n351:     // min/max \u2014 corpus order is blk-file order, not height order.\n352:     let window_lo = blocks.iter().map(|b| b.height).min().unwrap();\n353:     let window_hi = blocks.iter().map(|b| b.height).max().unwrap();\n354:     let header_hash_verified = blocks.len(); // assert in parse enforced each\n355: \n356:     // ---- coverage + header linkage manifest --------------------------\n357:     let mut heights_seen: HashMap<u32, usize> = HashMap::new();\n358:     for b in &blocks {\n359:         *heights_seen.entry(b.height).or_insert(0) += 1;\n360:     }\n361:     let dup_heights = heights_seen.values().filter(|&&n| n > 1).count();\n362:     let mut missing_heights = 0usize;\n363:     let mut longest_run = 0usize;\n364:     let mut run = 0usize;\n365:     for h in window_lo..=window_hi {\n366:         if heights_seen.contains_key(&h) {\n367:             run += 1;\n368:             longest_run = longest_run.max(run);\n369:         } else {\n370:             missing_heights += 1;\n371:             run = 0;\n372:         }\n373:     }",
+    "optional_chain_entry_check": "537:         // Real parent MTP for every window block whose parent is indexed,\n538:         // plus the selected-chain binding: the header node must exist AND\n539:         // sit at the corpus-labeled height AND (when the chain list covers\n540:         // it) be the best-chain hash at that height.\n541:         for b in &blocks {\n542:             if let Some(m) = t.median_time_past(&b.header.prev_block_hash) {\n543:                 block_mtp.insert(b.height, m);\n544:             }\n545:             match t.get(&b.hash) {\n546:                 Some(node) => {\n547:                     window_headers_in_tree += 1;\n548:                     if node.height != b.height {\n549:                         headers_height_mismatch += 1;\n550:                         header_bad.push((\n551:                             b.height,\n552:                             format!(\n553:                                 \"corpus height {} \u2260 chain height {} for {}\",\n554:                                 b.height, node.height, b.hash\n555:                             ),\n556:                         ));\n557:                     }\n558:                 }\n559:                 None => {\n560:                     if failed_hashes.contains(&b.hash) {\n561:                         headers_failed_selected += 1;\n562:                         header_bad.push((\n563:                             b.height,\n564:                             format!(\"window header {} failed production insert\", b.hash),\n565:                         ));\n566:                     } else if unknown_hashes.contains(&b.hash) {\n567:                         headers_missing_selected += 1; // ancestry absent \u2014 context gap\n568:                     } else {\n569:                         headers_missing_selected += 1; // not indexed at all \u2014 context gap\n570:                     }\n571:                 }\n572:             }\n573:             if let Some(h) = chain_hashes.get(b.height as usize)\n574:                 && *h != *b.hash.as_bytes()\n575:             {\n576:                 headers_chain_mismatch += 1;\n577:                 header_bad.push((\n578:                     b.height,\n579:                     format!(\"CHAIN[{}] \u2260 corpus hash {}\", b.height, b.hash),\n580:                 ));\n581:             }",
+    "complete_and_publish": "1276:     // ---- component completion (explicit, not one overloaded flag) ------\n1277:     // `resolved_inputs_complete` is driven by the JOIN (a spend resolved\n1278:     // from an authenticated local creation record needs no spec hint).\n1279:     let resolved_inputs_complete = report.missing_spends == 0;\n1280:     let script_jobs_complete = completed_tasks == queued_tasks && failed_tasks == 0;\n1281:     // Corpus boundary = spend-mentioned pre-window coins only; unspent\n1282:     // pre-window outputs are absent by construction \u2192 never \"complete\"\n1283:     // without an explicitly supplied full starting state.\n1284:     let starting_state_complete = boundary_supplied;\n1285:     let header_context_checked = linkage_broken == 0 && linkage_checked > 0;\n1286:     // `header_context_full` \u2014 every window header was verified in a\n1287:     // HeaderTree built from the node's own index (production\n1288:     // AcceptBlockHeader/ContextualCheckBlockHeader: PoW, required_bits,\n1289:     // MTP floor, version floors) AND sits at the corpus-labeled height on\n1290:     // the selected best chain. A failed or missing window header, a\n1291:     // height disagreement, or a CHAIN-entry disagreement all disqualify.\n1292:     let header_context_full = tree.is_some()\n1293:         && window_headers_in_tree == blocks.len()\n1294:         && headers_height_mismatch == 0\n1295:         && headers_chain_mismatch == 0\n1296:         && headers_failed_selected == 0\n1297:         && headers_missing_selected == 0;\n1298:     // `contextual_blocks_complete` \u2014 production `contextual_check_block`\n1299:     // evaluated on every block (BIP34 cb-height, witness rules, weight,\n1300:     // full-tx finality incl. coinbase). Without a header tree there is no\n1301:     // parent MTP \u2192 the check is unevaluated, not skipped-as-passed.\n1302:     let contextual_blocks_complete =\n1303:         tree.is_some() && ctx_block_evaluated == blocks.len() && ctx_block_unevaluated == 0;\n1304:     // All three donor pins supplied \u2014 a \"complete\" run must be anchored.\n1305:     let all_pins = boundary_base_height_pin.is_some()\n1306:         && boundary_base_hash.is_some()\n1307:         && boundary_txoutset_pin.is_some();\n1308:     let context_free_checks_complete = ctx_free_failed == 0;\n1309:     let coverage_complete = missing_heights == 0 && dup_heights == 0;\n1310:     // `window_complete` \u2014 every component check that production requires\n1311:     // for this era actually ran and passed on every block: complete\n1312:     // authenticated starting state with ALL THREE pins, every spend\n1313:     // resolved, every script job executed, full header context AND\n1314:     // selected-chain binding, per-block contextual checks evaluated,\n1315:     // zero unevaluated locks, and every block's coinbase bound checked\n1316:     // (fully-covered blocks only can certify fees).\n1317:     let window_complete = !known_invalid\n1318:         && resolved_inputs_complete\n1319:         && script_jobs_complete\n1320:         && starting_state_complete\n1321:         && all_pins\n1322:         && header_context_full\n1323:         && contextual_blocks_complete\n1324:         && coverage_complete\n1325:         && time_locks_unevaluated == 0\n1326:         && bip68_unevaluated == 0\n1327:         && blocks_fully_covered == blocks.len();\n1328: \n1329:     // ---- stage F: export \u2014 only when a state may legitimately exist ----\n1330:     // Never exported on known invalidity (either mode). In strict mode a\n1331:     // state artifact additionally requires full input coverage.\n1332:     let t = std::time::Instant::now();\n1333:     let mut exported = false;\n1334:     let may_publish =\n1335:         !known_invalid && (diagnostic || (resolved_inputs_complete && script_jobs_complete));\n1336:     if may_publish {",
+    "wall_marker": "1494:         parse_s,\n1495:         emit_s,\n1496:         headers_s,\n1497:         boundary_load_s,\n1498:         join_s,\n1499:         pred_s,\n1500:         script_s,\n1501:         mat_s,\n1502:         export_s,\n1503:         wall_t.elapsed().as_secs_f64(),\n1504:         rss,\n1505:         workers,",
+    "post_wall_receipt_work": "1542:     // ---- run manifest: source + binary + inputs + outputs, one record --\n1543:     // Lets an auditor prove WHICH binary produced WHICH output from\n1544:     // WHICH inputs. `build_rev` is embedded at COMPILE time by build.rs\n1545:     // (an older binary can never report a newer checkout); `checkout_rev`\n1546:     // is the checkout's runtime HEAD, labeled separately. Streams all\n1547:     // file hashes \u2014 no whole-file Vec reads at snapshot sizes.\n1548:     if let Some(rm) = &run_manifest_path {\n1549:         let self_sha = file_sha256(\"/proc/self/exe\");\n1550:         let boundary_sha = boundary_path.as_ref().and_then(|p| file_sha256(p));\n1551:         let headers_sha = headers_path.as_ref().and_then(|p| file_sha256(p));\n1552:         let export_sha = if exported {\n1553:             file_sha256(&export_path)\n1554:         } else {\n1555:             None\n1556:         };",
+    "flat_oracle_count_only": "698:     p, hp = make_orcl()\n699:     rc, out, _ = run(p, '--boundary', bp3f, '--headers', hp,\n700:                      '--boundary-base-hash', GEN_DISP,\n701:                      '--boundary-base-height', '0',\n702:                      '--boundary-txoutset-hash', commit_of(donor3),\n703:                      '--require-complete')\n704:     d = last_json(out)\n705:     # survivors: 2 boundary - 1 spent + cb(1) + s1-out1 + s2-out0 = 4\n706:     check('flat-oracle complete + survivors', rc == 0\n707:           and d['window_complete'] and d['survivor_records'] == 4\n708:           and d['exported'], f'rc={rc} surv={d.get(\"survivor_records\")}')"
+  },
+  "findings": [
+    {
+      "id": "completion-requested-extent",
+      "priority": "P1",
+      "status": "source-derived, not executed",
+      "counterexample": "Existing fully qualified h1..2 fixture with --segment 1:3 and --require-complete: observed extent stays 1..2, missing_heights remains zero; completion can succeed without requested h3."
+    },
+    {
+      "id": "selected-chain-coverage",
+      "priority": "P1 for claimed complete selected-chain contract",
+      "status": "source-derived, not executed",
+      "counterexample": "Keep valid h1/h2 headers but shorten CHAIN to genesis only with a genesis boundary. Boundary entry exists; selected entries None bypass comparison; header_context_full can remain true."
+    },
+    {
+      "id": "flat-export-oracle",
+      "priority": "P2",
+      "status": "source verified",
+      "detail": "New oracle only asserts four survivors and export/completion flags; never reads or compares canonical coin bytes."
+    },
+    {
+      "id": "timing-receipts",
+      "priority": "P2",
+      "status": "source and artifact verified",
+      "detail": "83.718 s marker precedes binary/boundary/header/export hashes and manifest write. RSS 7057620992 bytes is 6730.671875 MiB. Comparator receipt has matching count/size/hash but no input or binary identity/argv/cmp result; it is ignored and untracked. Build is ce5558b+dirty without exact dirty-source receipt."
+    }
+  ]
+}
