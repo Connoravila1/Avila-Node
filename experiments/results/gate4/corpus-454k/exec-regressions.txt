@@ -1,0 +1,120 @@
+binary_sha256: 79d35e1215a69188e335efc91f905c492b7d51a4f9cf5e1fc36ba57f57c1af2c
+build_rev: 2d77ad7944cc4f1fe337bde4d8e9cf55bd031a85
+---
+PASS ok exit 0 rc=0
+PASS ok verified=1 
+PASS ok exported-not-chainstate 
+PASS dup-boundary [strict] exit 1 rc=1
+PASS dup-boundary [strict] not exported 
+PASS dup-boundary [strict] known_invalid 
+PASS dup-boundary [strict] dup counted 
+PASS dup-boundary [diag] exit 1 rc=1
+PASS dup-boundary [diag] not exported 
+PASS dup-boundary [diag] known_invalid 
+PASS dup-boundary [diag] dup counted 
+PASS boundary-conflict [strict] exit 1 rc=1
+PASS boundary-conflict [strict] not exported 
+PASS boundary-conflict [strict] known_invalid 
+PASS boundary-conflict [strict] conflict counted 
+PASS boundary-conflict [diag] exit 1 rc=1
+PASS boundary-conflict [diag] not exported 
+PASS boundary-conflict [diag] known_invalid 
+PASS boundary-conflict [diag] conflict counted 
+PASS immature [strict] exit 1 rc=1
+PASS immature [strict] not exported 
+PASS immature [strict] known_invalid 
+PASS immature [strict] immature counted 
+PASS immature [diag] exit 1 rc=1
+PASS immature [diag] not exported 
+PASS immature [diag] known_invalid 
+PASS immature [diag] immature counted 
+PASS overspend [strict] exit 1 rc=1
+PASS overspend [strict] not exported 
+PASS overspend [strict] known_invalid 
+PASS overspend [strict] value violation 
+PASS overspend [diag] exit 1 rc=1
+PASS overspend [diag] not exported 
+PASS overspend [diag] known_invalid 
+PASS overspend [diag] value violation 
+PASS neg-output [strict] exit 1 rc=1
+PASS neg-output [strict] not exported 
+PASS neg-output [strict] known_invalid 
+PASS neg-output [strict] context-free catch 
+PASS neg-output [diag] exit 1 rc=1
+PASS neg-output [diag] not exported 
+PASS neg-output [diag] known_invalid 
+PASS neg-output [diag] context-free catch 
+PASS nonfinal [strict] exit 1 rc=1
+PASS nonfinal [strict] not exported 
+PASS nonfinal [strict] known_invalid 
+PASS nonfinal [strict] nonfinal counted 
+PASS nonfinal [diag] exit 1 rc=1
+PASS nonfinal [diag] not exported 
+PASS nonfinal [diag] known_invalid 
+PASS nonfinal [diag] nonfinal counted 
+PASS excess-cb [strict] exit 1 rc=1
+PASS excess-cb [strict] not exported 
+PASS excess-cb [strict] known_invalid 
+PASS excess-cb [strict] cb bound violation 
+PASS excess-cb [diag] exit 1 rc=1
+PASS excess-cb [diag] not exported 
+PASS excess-cb [diag] known_invalid 
+PASS excess-cb [diag] cb bound violation 
+PASS badsig-prefix [strict] exit 1 rc=1
+PASS badsig-prefix [strict] not exported 
+PASS badsig-prefix [strict] known_invalid 
+PASS badsig-prefix [strict] fails at 141, prefix before it 
+PASS badsig-prefix [diag] exit 1 rc=1
+PASS badsig-prefix [diag] not exported 
+PASS badsig-prefix [diag] known_invalid 
+PASS badsig-prefix [diag] fails at 141, prefix before it 
+PASS workers0 exit 2 rc=2
+PASS unresolved strict exit 1 rc=1
+PASS unresolved diagnostic exit 0 rc=0
+PASS diagnostic incomplete-labeled 
+PASS boundary resolves spec-less spend rc=0 missing=0
+PASS boundary/spec mismatch → invalid rc=1
+PASS absent-from-boundary → invalid rc=1
+PASS wrong-network boundary → exit 2 rc=2 err=fatal: boundary network [f9, be, b4, d9] ≠ params [fa, bf, b5, da]
+
+PASS non-adjacent base → exit 2 rc=2
+PASS dup-outpoint boundary → exit 2 rc=2
+PASS all donor pins correct → exit 0 rc=0
+PASS wrong base-hash pin → exit 2 rc=2
+PASS short base-hash pin → exit 2 not panic rc=2
+PASS non-hex base-hash pin → exit 2 not panic rc=2
+PASS wrong donor-height pin → exit 2 rc=2
+PASS wrong txoutset pin → exit 2 rc=2
+PASS fully-qualified window → exit 0 + all flags rc=0
+PASS require-complete w/o headers → exit 1 rc=1
+PASS missing requested endpoint → require-complete exit 1 rc=1
+PASS missing requested endpoint → strict exit 1 rc=1
+PASS missing requested endpoint → diag clean-but-incomplete rc=0
+PASS short CHAIN strict exit 1 rc=1
+PASS short CHAIN diag: gap not invalidity rc=0 miss=1
+PASS short CHAIN require-complete exit 1 rc=1
+PASS cb-height [strict] exit 1 rc=1
+PASS cb-height [strict] ctx flag contextual_check_block: BadCbHeight
+PASS cb-height [diag] exit 1 rc=1
+PASS cb-height [diag] ctx flag contextual_check_block: BadCbHeight
+PASS unexpected-witness [strict] exit 1 rc=1
+PASS unexpected-witness [strict] flag contextual_check_block: UnexpectedWitness
+PASS unexpected-witness [diag] exit 1 rc=1
+PASS unexpected-witness [diag] flag contextual_check_block: UnexpectedWitness
+PASS ctx-hdr-fail [strict] exit 1 rc=1
+PASS ctx-hdr-fail [strict] flag 
+PASS ctx-hdr-fail [diag] exit 1 rc=1
+PASS ctx-hdr-fail [diag] flag 
+PASS height-mismatch [strict] exit 1 rc=1
+PASS height-mismatch [strict] flag 
+PASS height-mismatch [diag] exit 1 rc=1
+PASS height-mismatch [diag] flag 
+PASS missing-header strict exit 1 rc=1
+PASS missing-header diag: clean but not complete rc=0
+PASS missing-header require-complete exit 1 rc=1
+PASS out-of-order corpus still complete rc=0
+PASS flat-oracle complete + survivors rc=0 surv=4
+PASS flat-oracle records byte-exact (incl. absent s1:vout0) match
+PASS run manifest: build_rev + argv array + hashes rc=0 rev=2d77ad7944cc4f1fe337bde4d8e9cf55bd031a85+dirty
+
+all window_join executable regressions pass

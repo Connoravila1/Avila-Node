@@ -956,3 +956,42 @@ UnexpectedWitness reject; PoW-pass/ctx-fail header on the selected chain
 → no complete acceptance; out-of-order corpus → still complete; flat
 oracle (untouched boundary coin + same-block create/spend) → survivors
 exact.
+
+## 2026-09-27c — completion-contract controls (real-followup audit)
+
+Three audit findings closed:
+
+- **Requested endpoints**: `--require-complete` previously qualified a
+  shorter observed interval (gaps counted only between found blocks).
+  `coverage_endpoints` now requires `min==seg_lo && max==seg_hi`; missing
+  requested blocks = incompleteness (strict exit 1, diagnostic emits a
+  clean-but-incomplete projection). Regression: `--segment 1:3` over a
+  2-block corpus fails on all modes' completion claims.
+- **CHAIN coverage**: `chain_hashes.get(h)==None` silently skipped the
+  selected-chain comparison. Now counted (`headers_chain_missing`) and
+  gates `window_complete` — a CHAIN list shortened to genesis leaves the
+  base binding satisfied but is correctly incomplete.
+- **State oracle**: the flat-boundary fixture now parses the exported
+  canonical and compares complete records (txid/vout/value/script/
+  height/coinbase) — not merely the survivor count — and asserts the
+  same-block-spent output is absent.
+
+Receipt fixes: `run-manifest.json` gains `wall_s_total` measured after
+all input/output hashing (the JSON `wall_s` still excludes it — labeled
+as such); `guard_run.sh` receipts now record host loadavg + MemAvailable
+at start/end plus an outer wall second count; `comparison-receipt.json`
+in the corpus dir records the real `cmp -s` result (exit 0, byte-
+identical), donor/converter/export sha256s and argv. The CI workflow now
+runs `tools/test_window_join_exec.py` on the release binary and prints
+its sha256 — the 114-check runner output is preserved at
+`corpus-454k/exec-regressions.txt`.
+
+Metric corrections from the audit: recorded `rss_hwm_bytes` is
+7,057,620,992 B = **6,731 MiB** (the earlier "7,057 MiB" figure was a
+units error); the cgroup sampled peak is a separate 8,191 MiB against an
+8,192 MiB cap. Script throughput ≈ 1,303,682/31.77 ≈ **41,041 verified
+inputs/s** — verified inputs, not signature attempts, and not a
+dedicated-capacity figure (competing load unrecorded on that run).
+
+Suite: **114 executable checks** — the followup audit's six controls
+(endpoint gap ×3 modes, short-CHAIN ×3 modes) plus the byte-exact oracle.

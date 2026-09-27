@@ -50,6 +50,11 @@ jobs:
         run: |
           cargo run --locked -p avila-cli -- --config config/default.toml check-config
           cargo run --locked -p avila-cli -- inspect --json
+      - name: window_join executable regressions
+        run: |
+          cargo build --release --locked -p avila-consensus --example window_join
+          sha256sum target/release/examples/window_join
+          python3 tools/test_window_join_exec.py target/release/examples/window_join
 
   reproducible:
     name: Reproducible release build

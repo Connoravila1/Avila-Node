@@ -527,6 +527,53 @@ with tempfile.TemporaryDirectory() as td:
     rc, out, _ = run(p, '--require-complete')
     check('require-complete w/o headers → exit 1', rc == 1, f'rc={rc}')
 
+    # requested endpoint absent: corpus has blocks 1..2 but segment asks
+    # for 1..3 — zero interior holes must NOT qualify as complete.
+    rc, out, _ = run(p, '--boundary', bp_full, '--headers', hp,
+                     '--boundary-base-hash', GEN_DISP,
+                     '--boundary-base-height', '0',
+                     '--boundary-txoutset-hash', commit_full,
+                     '--segment', '1:3', '--require-complete')
+    d = last_json(out)
+    check('missing requested endpoint → require-complete exit 1',
+          rc == 1 and not d['window_complete']
+          and not d['coverage_endpoints'], f'rc={rc}')
+    rc, out, _ = run(p, '--headers', hp, '--segment', '1:3')
+    check('missing requested endpoint → strict exit 1', rc == 1,
+          f'rc={rc}')
+    rc, out, _ = run(p, '--headers', hp, '--segment', '1:3', '--diagnostic')
+    d = last_json(out)
+    check('missing requested endpoint → diag clean-but-incomplete',
+          rc == 0 and not d['known_invalid'] and not d['window_complete'],
+          f'rc={rc}')
+
+    # CHAIN truncated to the genesis entry: base binding still holds but
+    # every selected-block comparison is missing → context gap.
+    hp_short = W('chain-short.hchain')
+    open(hp_short, 'wb').write(
+        b'HCHAIN01' + struct.pack('<I', 0)          # no header records needed
+        + b'CHAIN' + struct.pack('<I', 1) + GENESIS  # chain stops at height 0
+    )
+    # headers_empty manifest leaves selected headers missing too; make a
+    # manifest that HAS the headers but a SHORT chain list.
+    c0 = HChain()
+    c0.block(1, [(cb_h(1), [b'\x00'])])
+    p1 = W('short1'); open(p1, 'wb').write(bytes(c0.buf))
+    hp1 = W('short1.hchain')
+    open(hp1, 'wb').write(
+        b'HCHAIN01' + struct.pack('<I', 1) + c0.hdrs[0]
+        + b'CHAIN' + struct.pack('<I', 1) + c0.hashes[0])  # chain ends @0
+    rc, out, _ = run(p1, '--headers', hp1)
+    check('short CHAIN strict exit 1', rc == 1, f'rc={rc}')
+    rc, out, _ = run(p1, '--headers', hp1, '--diagnostic')
+    d = last_json(out)
+    check('short CHAIN diag: gap not invalidity',
+          rc == 0 and d['headers_chain_missing'] == 1
+          and not d['known_invalid'] and not d['window_complete'],
+          f'rc={rc} miss={d.get("headers_chain_missing")}')
+    rc, out, _ = run(p1, '--headers', hp1, '--require-complete')
+    check('short CHAIN require-complete exit 1', rc == 1, f'rc={rc}')
+
     # -- BIP34: coinbase pushes the wrong height → BadCbHeight ----------
     def make_badcb():
         c = HChain()
@@ -706,6 +753,28 @@ with tempfile.TemporaryDirectory() as td:
     check('flat-oracle complete + survivors', rc == 0
           and d['window_complete'] and d['survivor_records'] == 4
           and d['exported'], f'rc={rc} surv={d.get("survivor_records")}')
+    # P2 oracle: compare EVERY exported record field, not just the count.
+    # Canonical record: txid32 + vout4 + value8 + spklen4 + spk + h4 + cb1
+    raw = open(p + '.canonical', 'rb').read()
+    recs, o = [], 0
+    while o < len(raw):
+        txi = raw[o:o + 32]; vo, = struct.unpack_from('<I', raw, o + 32)
+        vv, = struct.unpack_from('<q', raw, o + 36)
+        sl, = struct.unpack_from('<I', raw, o + 44)
+        spk = raw[o + 48:o + 48 + sl]; o += 48 + sl
+        hh, = struct.unpack_from('<I', raw, o); cb = raw[o + 4]; o += 5
+        recs.append((txi, vo, vv, spk, hh, cb))
+    s1r = tx([(BOP, 0, b'', 0xffffffff)], [(4000, OP_TRUE), (5000, OP_TRUE)])
+    s2r = tx([(sha256d(s1r), 0, b'', 0xffffffff)], [(3500, OP_TRUE)])
+    expected = sorted([
+        (b'\xee' * 32, 7, 5000, P2PKH, 0, 0),            # untouched donor
+        (sha256d(cb_h(1)), 0, 50_00000000, b'\x51', 1, 1),  # coinbase out
+        (sha256d(s1r), 1, 5000, OP_TRUE, 1, 0),           # s1 surviving out
+        (sha256d(s2r), 0, 3500, OP_TRUE, 1, 0),           # s2 surviving out
+    ])
+    check('flat-oracle records byte-exact (incl. absent s1:vout0)',
+          recs == expected,
+          f'{len(recs)} recs' if recs != expected else 'match')
 
     # manifest ties build + binary + inputs + outputs on the success path
     rm = W('final') + '.runmanifest'

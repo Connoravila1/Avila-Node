@@ -1,0 +1,36 @@
+{
+  "type": "state_comparison_receipt",
+  "donor": {
+    "path": "experiments/results/gate4/donor-454301.utxo",
+    "sha256": "f2caeeeb43bc974c47edea34e0f24830e048bd6f5ed37d05ee0e92e0944c1f73",
+    "height": 454301,
+    "coins": 45751759,
+    "produced_by": "avila-node dumptxoutset (rollback @454301)"
+  },
+  "converter": {
+    "binary": "target/release/examples/snap_to_canonical",
+    "binary_sha256": "6e3a7ae0ce90f04721f447292ee6c7fc0b1e80e590d9ddf3114aef8021d9ef85",
+    "argv": [
+      "target/release/examples/snap_to_canonical",
+      "experiments/results/gate4/donor-454301.utxo",
+      "experiments/results/gate4/corpus-454k/donor-454301.canonical"
+    ],
+    "output": "experiments/results/gate4/corpus-454k/donor-454301.canonical",
+    "output_sha256": "865d32cfaea57e15352ece551685dd71d9b96ea39f8118cc0ca0152b44cd3168",
+    "output_bytes": 3594371786,
+    "output_coins": 45751759,
+    "note": "canonicalizes each dumptxoutset coin to the join record format, sorted by (txid,vout)"
+  },
+  "join": {
+    "export": "experiments/results/gate4/corpus-454k/window-454k.canonical",
+    "export_sha256": "865d32cfaea57e15352ece551685dd71d9b96ea39f8118cc0ca0152b44cd3168",
+    "export_bytes": 3594371786,
+    "argv": "see run-manifest.json"
+  },
+  "comparison": {
+    "method": "cmp -s byte compare + independent sha256",
+    "cmp_exit": 0,
+    "byte_identical": true,
+    "both_sha256_match": true
+  }
+}

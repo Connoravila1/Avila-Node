@@ -467,6 +467,7 @@ fn main() {
     let mut headers_unknown_parent = 0usize;
     let mut headers_failed = 0usize;
     let mut window_headers_in_tree = 0usize;
+    let mut headers_chain_missing = 0usize;
     let mut headers_s = 0f64;
     if let Some(hp) = &headers_path {
         let th = std::time::Instant::now();
@@ -570,14 +571,18 @@ fn main() {
                     }
                 }
             }
-            if let Some(h) = chain_hashes.get(b.height as usize)
-                && *h != *b.hash.as_bytes()
-            {
-                headers_chain_mismatch += 1;
-                header_bad.push((
-                    b.height,
-                    format!("CHAIN[{}] ≠ corpus hash {}", b.height, b.hash),
-                ));
+            match chain_hashes.get(b.height as usize) {
+                Some(h) if *h != *b.hash.as_bytes() => {
+                    headers_chain_mismatch += 1;
+                    header_bad.push((
+                        b.height,
+                        format!("CHAIN[{}] ≠ corpus hash {}", b.height, b.hash),
+                    ));
+                }
+                // No chain entry at this height: the selected-chain
+                // comparison cannot run → missing context, not invalid.
+                None => headers_chain_missing += 1,
+                _ => {}
             }
         }
         chain = Some(chain_hashes);
@@ -1306,7 +1311,14 @@ fn main() {
         && boundary_base_hash.is_some()
         && boundary_txoutset_pin.is_some();
     let context_free_checks_complete = ctx_free_failed == 0;
-    let coverage_complete = missing_heights == 0 && dup_heights == 0;
+    // Coverage must span the REQUESTED interval, endpoints included — a
+    // window missing a requested boundary block is incomplete, not a
+    // smaller valid window.
+    let coverage_endpoints = match segment {
+        Some((lo, hi)) => window_lo == lo && window_hi == hi,
+        None => true,
+    };
+    let coverage_complete = missing_heights == 0 && dup_heights == 0 && coverage_endpoints;
     // `window_complete` — every component check that production requires
     // for this era actually ran and passed on every block: complete
     // authenticated starting state with ALL THREE pins, every spend
@@ -1322,6 +1334,7 @@ fn main() {
         && header_context_full
         && contextual_blocks_complete
         && coverage_complete
+        && headers_chain_missing == 0
         && time_locks_unevaluated == 0
         && bip68_unevaluated == 0
         && blocks_fully_covered == blocks.len();
@@ -1378,6 +1391,7 @@ fn main() {
 \"headers_failed\":{},\"window_headers_in_tree\":{},\
 \"headers_height_mismatch\":{},\"headers_chain_mismatch\":{},\
 \"headers_failed_selected\":{},\"headers_missing_selected\":{},\
+\"headers_chain_missing\":{},\
 \"ctx_block_evaluated\":{},\"ctx_block_failed\":{},\"ctx_block_unevaluated\":{},\
 \"survivor_records\":{},\"applied_events\":{},\
 \"first_bad_height\":{},\"first_bad\":{},\
@@ -1390,7 +1404,7 @@ fn main() {
 \"header_context_checked\":{},\"header_context_full\":{},\
 \"contextual_blocks_complete\":{},\"all_donor_pins\":{},\
 \"window_complete\":{},\
-\"context_free_checks_complete\":{},\"coverage_complete\":{},\
+\"context_free_checks_complete\":{},\"coverage_endpoints\":{},\"coverage_complete\":{},\
 \"chainstate_complete\":{},\
 \"exported\":{},\
 \"stages\":{{\"parse_s\":{:.3},\"emit_s\":{:.3},\"headers_s\":{:.3},\
@@ -1452,6 +1466,7 @@ fn main() {
         headers_chain_mismatch,
         headers_failed_selected,
         headers_missing_selected,
+        headers_chain_missing,
         ctx_block_evaluated,
         ctx_block_failed,
         ctx_block_unevaluated,
@@ -1488,6 +1503,7 @@ fn main() {
         all_pins,
         window_complete,
         context_free_checks_complete,
+        coverage_endpoints,
         coverage_complete,
         window_complete && exported,
         exported,
@@ -1517,11 +1533,19 @@ fn main() {
         eprintln!("invalid: {first_bad_msg} @ {first_bad_h}");
         1
     } else if !diagnostic
-        && (!(resolved_inputs_complete && script_jobs_complete) || headers_missing_selected > 0)
+        && (!(resolved_inputs_complete && script_jobs_complete)
+            || headers_missing_selected > 0
+            || headers_chain_missing > 0
+            || !coverage_endpoints)
     {
         eprintln!(
-            "incomplete: missing_spends={} failed_tasks={} headers_missing_selected={}",
-            report.missing_spends, failed_tasks, headers_missing_selected
+            "incomplete: missing_spends={} failed_tasks={} headers_missing_selected={} \
+headers_chain_missing={} coverage_endpoints={}",
+            report.missing_spends,
+            failed_tasks,
+            headers_missing_selected,
+            headers_chain_missing,
+            coverage_endpoints
         );
         1
     } else if require_complete && !window_complete {
@@ -1571,12 +1595,14 @@ bip68_uneval={} time_locks_uneval={})",
             .map(|a| jstr(&a))
             .collect::<Vec<_>>()
             .join(",");
+        let wall_s_total = wall_t.elapsed().as_secs_f64();
         let manifest = format!(
             "{{\"type\":\"run_manifest\",\
 \"build_rev\":{},\"checkout_rev\":{},\
 \"binary_sha256\":{},\"corpus_sha256\":{},\
 \"boundary_sha256\":{},\"headers_sha256\":{},\"export_sha256\":{},\
-\"argv\":[{}],\"exit_code\":{},\"known_invalid\":{},\"exported\":{}}}",
+\"argv\":[{}],\"exit_code\":{},\"known_invalid\":{},\"exported\":{},\
+\"wall_s_total\":{:.3}}}",
             jstr(option_env!("AVILA_GIT_REV").unwrap_or("unknown")),
             jstr(&checkout_rev),
             self_sha.map(|s| jstr(&s)).unwrap_or("null".into()),
@@ -1588,6 +1614,7 @@ bip68_uneval={} time_locks_uneval={})",
             exit_code,
             known_invalid,
             exported,
+            wall_s_total,
         );
         std::fs::write(rm, manifest + "\n").expect("run manifest writable");
     }

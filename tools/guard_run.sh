@@ -38,6 +38,10 @@ if [ "$avail" -lt "$need" ]; then
          "(cap=${MAX_MIB}MiB + reserve=${RESERVE_MIB}MiB)" >&2
     exit 3
 fi
+# Host context at start: competing load is part of the measurement.
+load0=$(cut -d' ' -f1-3 /proc/loadavg)
+avail0=$avail
+t0=$(date +%s)
 
 # systemd-run in background so we can sample the scope cgroup while it lives.
 tmp=$(mktemp)
@@ -68,5 +72,12 @@ rm -f "$tmp"
 if [ "$peak" -eq 0 ] && [ -n "$unit" ] && [ -f "$slice/$unit/memory.peak" ]; then
     peak=$(cat "$slice/$unit/memory.peak" 2>/dev/null || echo 0)
 fi
-echo "guard_run: exit=$rc cap=${MAX_MIB}MiB peak=$((peak/1048576))MiB unit=${unit:-n/a}" >&2
+# Host context at end + outer wall (includes receipt work the process
+# reports before exiting).
+load1=$(cut -d' ' -f1-3 /proc/loadavg)
+avail1=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+wall=$(( $(date +%s) - t0 ))
+echo "guard_run: exit=$rc cap=${MAX_MIB}MiB peak=$((peak/1048576))MiB" \
+     "wall_s=${wall} load=${load0}→${load1} memavail=${avail0}→${avail1}MiB" \
+     "unit=${unit:-n/a}" >&2
 exit "$rc"
