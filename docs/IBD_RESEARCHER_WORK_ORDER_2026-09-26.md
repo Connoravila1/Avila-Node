@@ -34,14 +34,16 @@ The subsequent
 [shared-join repair review](IBD_SWE2_REVIEW_78_FOLLOWUP_2026-09-26.md) accepts
 the common resolver and boundary double-spend repair. The
 [validation-contract closure and boundary review](IBD_SWE2_REVIEW_78_BOUNDARY_2026-09-26.md)
-closes the earlier exit/export and negative-output findings. The latest
+closes the earlier exit/export and negative-output findings. The
 [pushed-boundary review](IBD_SWE2_REVIEW_78_PUSH_2026-09-26.md) confirms green CI
 and the new component guards, but finds a panic in the donor-hash pin parser
-and incomplete build provenance. Acquire the genuine full starting-state
-export while repairing those and completing the already required donor
-height/content binding and header/context checks. Then run the complete
-real-state comparison. Whole-IBD capacity claims still require that comparison
-and the scaling measurements.
+and incomplete build provenance. The latest
+[donor-pin repair review](IBD_SWE2_REVIEW_78_DONOR_2026-09-26.md) closes the
+pin-parser finding and accepts the supplied height/content pins against the
+84-check saved regression. Refresh build identity and fix the early h=0
+subtraction while acquiring the genuine donor and finishing production context
+checks. Supply all donor pins for the complete real-state comparison.
+Whole-IBD capacity claims still require that comparison and scaling measurements.
 
 Read [the hardware analysis](../experiments/2026-09-26-ibd-hardware-floor.md)
 before using the earlier physics proposal. Its local-corpus targets and

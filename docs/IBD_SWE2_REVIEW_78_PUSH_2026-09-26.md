@@ -1,5 +1,11 @@
 **Codex review: pushed Gate 4 boundary integration**
 
+Updated after `dd69355`: the
+[donor-pin repair review](IBD_SWE2_REVIEW_78_DONOR_2026-09-26.md) closes the
+hash-option panic and accepts the supplied donor-pin implementation. It leaves
+two focused P2 repairs alongside the existing acquisition/context assignment.
+This document preserves the findings against the earlier commits.
+
 Reviewed `695f73cb7c8da6fe5d8c2b4a55821402142a2eb3` and
 `cd3cb4519034cb1ac8f0396f88b9478f0d2a07d3`. This updates the
 [boundary handoff](IBD_SWE2_REVIEW_78_BOUNDARY_2026-09-26.md).

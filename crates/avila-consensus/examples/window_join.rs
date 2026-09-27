@@ -293,11 +293,14 @@ fn main() {
     let mut linkage_broken = 0usize;
     let mut first_link_break_h = 0u32;
     for b in &blocks {
-        if present_heights.contains(&(b.height - 1)) {
+        let Some(parent_h) = b.height.checked_sub(1) else {
+            continue; // h=0 has no parent height
+        };
+        if present_heights.contains(&parent_h) {
             linkage_checked += 1;
             let parent_ok = by_hash
                 .get(&b.header.prev_block_hash)
-                .is_some_and(|p| p.height == b.height - 1);
+                .is_some_and(|p| p.height == parent_h);
             if !parent_ok {
                 linkage_broken += 1;
                 if first_link_break_h == 0 {
@@ -329,7 +332,10 @@ fn main() {
     let mut mtp_computable = 0usize;
     let mut block_mtp: HashMap<u32, u32> = HashMap::new();
     for b in &blocks {
-        if let Some(m) = mtp_of(b.height - 1) {
+        let Some(parent_h) = b.height.checked_sub(1) else {
+            continue; // h=0: no in-window parent
+        };
+        if let Some(m) = mtp_of(parent_h) {
             block_mtp.insert(b.height, m);
             mtp_computable += 1;
         }

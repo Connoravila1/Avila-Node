@@ -1,0 +1,202 @@
+{
+  "review": "Gate 4 donor-pin repair review",
+  "recorded_utc": "2026-09-27T02:32:05.977892+00:00",
+  "reviewed_head": "dd69355bfb1889102fc9f0aa67330a0c1deed20e",
+  "worktree_status_before_document_edits": "",
+  "method": "Source review, saved logs and Cargo cache metadata, hashes, and primary documentation. No experiments, builds, tests, corpus scans, RPCs or node operations.",
+  "files": {
+    "Cargo.toml": {
+      "bytes": 2688,
+      "sha256": "34d3607a80c803bbc6ec60c5e7103666c99743202383f63ba2b070ad09d201b9"
+    },
+    "crates/avila-consensus/build.rs": {
+      "bytes": 996,
+      "sha256": "93b34b0ac46ab47dcc541c372543c81c2c8d68887157156e947a3cefa8c8e8ff"
+    },
+    "crates/avila-consensus/examples/window_join.rs": {
+      "bytes": 45179,
+      "sha256": "77f6ae22a8db622674b08cc48fff234b448a7981003a2ea1927b152b706ff992"
+    },
+    "crates/avila-consensus/examples/shared/join_engine.rs": {
+      "bytes": 8498,
+      "sha256": "8efebe2c05963b8df5bcca4f55102e7c37b3b4d7d1176fcc4f1136cd8b3aea92"
+    },
+    "crates/avila-consensus/src/snapverify.rs": {
+      "bytes": 87732,
+      "sha256": "3a905ecf49ba33957e5270e5a8d3efd53369c3e0179b61886bbc6af234c33c3b"
+    },
+    "crates/avila-consensus/src/coinstats.rs": {
+      "bytes": 10088,
+      "sha256": "cbfbd402a4d86e67daa04037bc80e4827c81734f0907e8883b0fa19d765d63e8"
+    },
+    "tools/test_window_join_exec.py": {
+      "bytes": 19736,
+      "sha256": "0321a6daff678e4aaa53885f5762ac0d34d664e8b86ac85ffe35ef34c08281c5"
+    },
+    "experiments/results/gate4/exec-regression-2026-09-26b.log": {
+      "bytes": 3528,
+      "sha256": "b7006831d02bb0ea3e61ef630b33b9a10269f2f8a07c1ff52f36a9d1169c47e2"
+    },
+    "experiments/results/gate4/cargo-test-release-2026-09-26c.log": {
+      "bytes": 37332,
+      "sha256": "bbdfb5bfbaa151072d641a09b2f363ce05671ef814b7f8739ba8423f7a4a22cb"
+    },
+    "experiments/2026-09-26-ibd-window-join.md": {
+      "bytes": 8694,
+      "sha256": "e12b0860b038a07478a90bbc4190d8ae1d5dbe3f1b431855b4a886ad9fa5627f"
+    },
+    ".github/workflows/ci.yml": {
+      "bytes": 2462,
+      "sha256": "f4ce30e163045164f144a8770fc319cba36666b65cd365273bf589b63a1ffbe9"
+    },
+    "target/release/.fingerprint/avila-consensus-0aadad7882854e7e/run-build-script-build-script-build.json": {
+      "bytes": 285,
+      "sha256": "fad0d77a50897c2c6a834167acb2f694e1a808864d02d1913ea1137bca232165"
+    },
+    "target/release/build/avila-consensus-0aadad7882854e7e/output": {
+      "bytes": 118,
+      "sha256": "9558b8bb3002b52a3bd9bec3acf6b2ac817358bd4f7d2bb95c35c8f14dd469b3"
+    }
+  },
+  "saved_executable_regression": {
+    "path": "experiments/results/gate4/exec-regression-2026-09-26b.log",
+    "pass_lines": 84,
+    "fail_lines": 0,
+    "text": "PASS ok exit 0 rc=0\nPASS ok verified=1 \nPASS ok exported-not-chainstate \nPASS dup-boundary [strict] exit 1 rc=1\nPASS dup-boundary [strict] not exported \nPASS dup-boundary [strict] known_invalid \nPASS dup-boundary [strict] dup counted \nPASS dup-boundary [diag] exit 1 rc=1\nPASS dup-boundary [diag] not exported \nPASS dup-boundary [diag] known_invalid \nPASS dup-boundary [diag] dup counted \nPASS boundary-conflict [strict] exit 1 rc=1\nPASS boundary-conflict [strict] not exported \nPASS boundary-conflict [strict] known_invalid \nPASS boundary-conflict [strict] conflict counted \nPASS boundary-conflict [diag] exit 1 rc=1\nPASS boundary-conflict [diag] not exported \nPASS boundary-conflict [diag] known_invalid \nPASS boundary-conflict [diag] conflict counted \nPASS immature [strict] exit 1 rc=1\nPASS immature [strict] not exported \nPASS immature [strict] known_invalid \nPASS immature [strict] immature counted \nPASS immature [diag] exit 1 rc=1\nPASS immature [diag] not exported \nPASS immature [diag] known_invalid \nPASS immature [diag] immature counted \nPASS overspend [strict] exit 1 rc=1\nPASS overspend [strict] not exported \nPASS overspend [strict] known_invalid \nPASS overspend [strict] value violation \nPASS overspend [diag] exit 1 rc=1\nPASS overspend [diag] not exported \nPASS overspend [diag] known_invalid \nPASS overspend [diag] value violation \nPASS neg-output [strict] exit 1 rc=1\nPASS neg-output [strict] not exported \nPASS neg-output [strict] known_invalid \nPASS neg-output [strict] context-free catch \nPASS neg-output [diag] exit 1 rc=1\nPASS neg-output [diag] not exported \nPASS neg-output [diag] known_invalid \nPASS neg-output [diag] context-free catch \nPASS nonfinal [strict] exit 1 rc=1\nPASS nonfinal [strict] not exported \nPASS nonfinal [strict] known_invalid \nPASS nonfinal [strict] nonfinal counted \nPASS nonfinal [diag] exit 1 rc=1\nPASS nonfinal [diag] not exported \nPASS nonfinal [diag] known_invalid \nPASS nonfinal [diag] nonfinal counted \nPASS excess-cb [strict] exit 1 rc=1\nPASS excess-cb [strict] not exported \nPASS excess-cb [strict] known_invalid \nPASS excess-cb [strict] cb bound violation \nPASS excess-cb [diag] exit 1 rc=1\nPASS excess-cb [diag] not exported \nPASS excess-cb [diag] known_invalid \nPASS excess-cb [diag] cb bound violation \nPASS badsig-prefix [strict] exit 1 rc=1\nPASS badsig-prefix [strict] not exported \nPASS badsig-prefix [strict] known_invalid \nPASS badsig-prefix [strict] fails at 141, prefix before it \nPASS badsig-prefix [diag] exit 1 rc=1\nPASS badsig-prefix [diag] not exported \nPASS badsig-prefix [diag] known_invalid \nPASS badsig-prefix [diag] fails at 141, prefix before it \nPASS workers0 exit 2 rc=2\nPASS unresolved strict exit 1 rc=1\nPASS unresolved diagnostic exit 0 rc=0\nPASS diagnostic incomplete-labeled \nPASS boundary resolves spec-less spend rc=0 missing=0\nPASS boundary/spec mismatch → invalid rc=1\nPASS absent-from-boundary → invalid rc=1\nPASS wrong-network boundary → exit 2 rc=2 err=fatal: boundary network [f9, be, b4, d9] ≠ params [fa, bf, b5, da]\n\nPASS non-adjacent base → exit 2 rc=2\nPASS dup-outpoint boundary → exit 2 rc=2\nPASS all donor pins correct → exit 0 rc=0\nPASS wrong base-hash pin → exit 2 rc=2\nPASS short base-hash pin → exit 2 not panic rc=2\nPASS non-hex base-hash pin → exit 2 not panic rc=2\nPASS wrong donor-height pin → exit 2 rc=2\nPASS wrong txoutset pin → exit 2 rc=2\nPASS run manifest: build_rev + argv array + hashes rc=0 rev=cd3cb4519034cb1ac8f0396f88b9478f0d2a07d3+dirty\n\nall window_join executable regressions pass\n"
+  },
+  "release_test_evidence": {
+    "path": "experiments/results/gate4/cargo-test-release-2026-09-26c.log",
+    "unchanged_from_previous_review": true,
+    "summaries": [
+      "test result: ok. 551 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 4.34s",
+      "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ],
+    "qualification": "The new 579-pass run is reported by SWE-2. The available c.log is unchanged from the previous review, so it is not fresh evidence for this commit."
+  },
+  "build_cache": {
+    "fingerprint": {
+      "rustc": 1625334936438085654,
+      "features": "",
+      "declared_features": "",
+      "target": 0,
+      "profile": 0,
+      "path": 0,
+      "deps": [
+        [
+          275666249127234097,
+          "build_script_build",
+          false,
+          1457332849852968882
+        ]
+      ],
+      "local": [
+        {
+          "RerunIfEnvChanged": {
+            "var": "AVILA_GIT_REV",
+            "val": null
+          }
+        }
+      ],
+      "rustflags": [],
+      "config": 0,
+      "compile_kind": 0
+    },
+    "outputs": {
+      "target/release/build/avila-consensus-0aadad7882854e7e/output": "cargo:rustc-env=AVILA_GIT_REV=cd3cb4519034cb1ac8f0396f88b9478f0d2a07d3+dirty\ncargo:rerun-if-env-changed=AVILA_GIT_REV\n"
+    },
+    "interpretation": "Only RerunIfEnvChanged(AVILA_GIT_REV, null) is recorded. No Git/source path change dependencies. This supports the stale-build-metadata finding without executing any rebuild."
+  },
+  "accepted": [
+    "Checked donor hash decode, exact 32-byte size, one reverse, recorded valid/wrong/short/non-hex controls.",
+    "Optional donor height and coin-set commitment checks are implemented and exercised on the one-coin fixture.",
+    "Loaded commitment hashes each decoded TxOutSer once, after complete group parsing; matches repository verifier/coinstats representation by source review.",
+    "Manifest argv array, control-character escaping, streamed file hashing and terminal validation exit-code recording.",
+    "first_missing position is recorded by shared join and used for full-boundary first_bad."
+  ],
+  "remaining_findings": [
+    {
+      "id": "P2-build-refresh",
+      "path": "crates/avila-consensus/build.rs",
+      "line": 23,
+      "source_derived": true,
+      "description": "Build script only watches AVILA_GIT_REV from the Cargo invocation. Git/source changes with unchanged script and environment may rebuild the example while reusing the old emitted value. +dirty also does not uniquely identify dirty source. A controlled clean-build receipt can qualify the next run without waiting for a general metadata solution."
+    },
+    {
+      "id": "P2-height-zero",
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "line": 296,
+      "source_derived": true,
+      "description": "Unchecked b.height - 1 occurs at lines 296/300/332 before checked_sub at line 474. Cargo.toml enables release overflow checks. An h=0 record therefore panics before the intended setup exit 2. No height-zero control is in the 84-check script."
+    }
+  ],
+  "scope_qualifications": [
+    "All donor pins remain optional. The complete-window run must supply height, base hash and commitment from an independently pinned donor manifest.",
+    "Source commitment test is one coin, which is spent; not a real donor interoperability run or an executed never-spent-tamper/refill control.",
+    "Run manifest covers terminal validation exit 0/1, not earlier setup errors/panics or failed export. The test only inspects a success manifest and deletes it with its temporary directory.",
+    "Existing production contextual/ancestry/BIP68 integration remains open. header_context_checked still denotes only adjacent linkage; chainstate_complete remains false.",
+    "Complete-state and capacity measurements have not been added in this commit."
+  ],
+  "primary_sources": [
+    {
+      "url": "https://doc.rust-lang.org/cargo/reference/build-scripts.html#change-detection",
+      "checked": "Official Cargo documentation: emitted rerun-if directives determine when a build script is rerun. Environment watching is for inputs to Cargo, not a Git revision recomputed magically on source changes."
+    },
+    {
+      "url": "https://raw.githubusercontent.com/bitcoin/bitcoin/v29.0/src/kernel/coinstats.cpp",
+      "checked": "Pinned Core v29.0 TxOutSer emits outpoint, uint32 height/coinbase code, and coin.out. ApplyHash iterates ordered outputs; HashWriter is finalized via GetHash. Confirms representation, not a live donor equality test."
+    }
+  ],
+  "source_excerpts": [
+    {
+      "path": "crates/avila-consensus/build.rs",
+      "first_line": 1,
+      "last_line": 24,
+      "text": "// Embeds the build's source identity so run manifests can attribute a\n// binary to the revision it was compiled from — a runtime `git\n// rev-parse` would report whatever the checkout happens to point at.\nfn main() {\n    let rev = std::process::Command::new(\"git\")\n        .args([\"-C\", env!(\"CARGO_MANIFEST_DIR\"), \"rev-parse\", \"HEAD\"])\n        .output()\n        .ok()\n        .filter(|o| o.status.success())\n        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())\n        .unwrap_or_else(|| \"unknown\".into());\n    let dirty = std::process::Command::new(\"git\")\n        .args([\"-C\", env!(\"CARGO_MANIFEST_DIR\"), \"status\", \"--porcelain\"])\n        .output()\n        .ok()\n        .filter(|o| o.status.success())\n        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())\n        .unwrap_or(false);\n    println!(\n        \"cargo:rustc-env=AVILA_GIT_REV={rev}{}\",\n        if dirty { \"+dirty\" } else { \"\" }\n    );\n    println!(\"cargo:rerun-if-env-changed=AVILA_GIT_REV\");\n}"
+    },
+    {
+      "path": "Cargo.toml",
+      "first_line": 74,
+      "last_line": 78,
+      "text": "[profile.release]\noverflow-checks = true\nlto = \"thin\"\ncodegen-units = 1\ndebug = 1"
+    },
+    {
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "first_line": 290,
+      "last_line": 336,
+      "text": "    let by_height: HashMap<u32, &BlockRec> = blocks.iter().map(|b| (b.height, b)).collect();\n    // linkage: each block whose (height-1) is present must name it as parent\n    let mut linkage_checked = 0usize;\n    let mut linkage_broken = 0usize;\n    let mut first_link_break_h = 0u32;\n    for b in &blocks {\n        if present_heights.contains(&(b.height - 1)) {\n            linkage_checked += 1;\n            let parent_ok = by_hash\n                .get(&b.header.prev_block_hash)\n                .is_some_and(|p| p.height == b.height - 1);\n            if !parent_ok {\n                linkage_broken += 1;\n                if first_link_break_h == 0 {\n                    first_link_break_h = b.height;\n                }\n            }\n        }\n    }\n    // MTP where ≥11 consecutive ancestors exist in-corpus\n    // MTP of block at height h's parent chain: median of its 11 latest\n    // ancestor times — only computable when all 11 are in the corpus.\n    let mtp_of = |h: u32| -> Option<u32> {\n        let mut times = Vec::with_capacity(11);\n        let mut cur = *by_height.get(&h)?;\n        loop {\n            times.push(cur.header.time);\n            if times.len() == 11 {\n                break;\n            }\n            let prev = by_hash.get(&cur.header.prev_block_hash)?;\n            if prev.height + 1 != cur.height {\n                return None;\n            }\n            cur = prev;\n        }\n        times.sort_unstable();\n        Some(times[5])\n    };\n    let mut mtp_computable = 0usize;\n    let mut block_mtp: HashMap<u32, u32> = HashMap::new();\n    for b in &blocks {\n        if let Some(m) = mtp_of(b.height - 1) {\n            block_mtp.insert(b.height, m);\n            mtp_computable += 1;\n        }\n    }"
+    },
+    {
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "first_line": 469,
+      "last_line": 578,
+      "text": "    if let Some(bp) = &boundary_path {\n        // A supplied boundary is meaningful only as the state at the\n        // window's parent block: the corpus's first block must name it\n        // (the audit's comparison window starts \"immediately after\" the\n        // exported boundary).\n        let base_height = blocks[0].height.checked_sub(1).unwrap_or_else(|| {\n            eprintln!(\"fatal: window starts at height 0 — no parent boundary can precede it\");\n            std::process::exit(2);\n        });\n        boundary_base_height = Some(base_height);\n        if let Some(pin) = &boundary_base_height_pin {\n            let pinned: u32 = pin.parse().expect(\"--boundary-base-height u32\");\n            if pinned != base_height {\n                eprintln!(\n                    \"fatal: donor height {pinned} ≠ window parent height {base_height} — boundary is not adjacent\"\n                );\n                std::process::exit(2);\n            }\n        }\n        let mut m: HashMap<OutPoint, Coin> = HashMap::new();\n        let mut dups = 0usize;\n        let loaded = for_each_coin(\n            std::path::Path::new(bp),\n            Some(base_height), // creation heights may not exceed the base\n            |txid_b, vout, code, value, spk| {\n                let txid = avila_consensus::hash::Txid::from_bytes(txid_b);\n                if m.insert(\n                    OutPoint { txid, vout },\n                    Coin {\n                        out: TxOut {\n                            value,\n                            script_pubkey: Script::new(spk.to_vec()),\n                        },\n                        height: (code >> 1) as u32,\n                        coinbase: code & 1 != 0,\n                    },\n                )\n                .is_some()\n                {\n                    dups += 1; // a dump cannot name one outpoint twice\n                }\n                Ok(())\n            },\n        )\n        .unwrap_or_else(|e| {\n            eprintln!(\"fatal: --boundary load failed: {e}\");\n            std::process::exit(2);\n        });\n        let snap_hdr = loaded.header;\n        boundary_dup_outpoints = dups;\n        if boundary_dup_outpoints > 0 {\n            eprintln!(\"fatal: boundary contains {boundary_dup_outpoints} duplicate outpoints\");\n            std::process::exit(2);\n        }\n        boundary_load_coins = m.len();\n        if snap_hdr.network != params.message_start {\n            eprintln!(\n                \"fatal: boundary network {:02x?} ≠ params {:02x?}\",\n                snap_hdr.network, params.message_start\n            );\n            std::process::exit(2);\n        }\n        if let Some(pin) = &boundary_base_hash {\n            // dumptxoutset reports display-order; file stores LE bytes\n            let want = avila_consensus::hex::decode(pin)\n                .ok()\n                .filter(|v| v.len() == 32)\n                .map(|mut v| {\n                    v.reverse();\n                    v\n                })\n                .unwrap_or_else(|| {\n                    eprintln!(\"fatal: --boundary-base-hash is not 64-char hex\");\n                    std::process::exit(2);\n                });\n            if snap_hdr.base_blockhash != want[..] {\n                eprintln!(\"fatal: --boundary base hash ≠ --boundary-base-hash pin\");\n                std::process::exit(2);\n            }\n        }\n        if snap_hdr.base_blockhash[..] != blocks[0].header.prev_block_hash.as_bytes()[..] {\n            eprintln!(\n                \"fatal: boundary base ≠ corpus window parent — window not adjacent to the exported state\"\n            );\n            std::process::exit(2);\n        }\n        // coin-set commitment: hash_serialized_3 over the loaded coins\n        // must match the donor's published txoutset_hash (display order).\n        let disp_commit: Vec<u8> = loaded.txoutset_hash.iter().rev().cloned().collect();\n        boundary_txoutset_hash_json = jstr(&avila_consensus::hex::encode(&disp_commit));\n        if let Some(pin) = &boundary_txoutset_pin {\n            let want = avila_consensus::hex::decode(pin)\n                .ok()\n                .filter(|v| v.len() == 32)\n                .map(|mut v| {\n                    v.reverse(); // display hex → internal order\n                    v\n                })\n                .unwrap_or_else(|| {\n                    eprintln!(\"fatal: --boundary-txoutset-hash is not 64-char hex\");\n                    std::process::exit(2);\n                });\n            if *want != loaded.txoutset_hash {\n                eprintln!(\"fatal: loaded coin-set commitment ≠ --boundary-txoutset-hash pin\");\n                std::process::exit(2);\n            }\n        }\n        let disp: Vec<u8> = snap_hdr.base_blockhash.iter().rev().cloned().collect();\n        boundary_base_hash_json = jstr(&avila_consensus::hex::encode(&disp));\n        boundary_loaded = Some(m);"
+    },
+    {
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "first_line": 618,
+      "last_line": 628,
+      "text": "    // Under a complete supplied state a `Missing` spend is a spend of a\n    // coin that never existed — known invalidity, not a coverage gap.\n    // `first_missing` gives the earliest such position (the diagnostics\n    // the audit asked for); it folds into the same first-bad boundary.\n    if boundary_loaded.is_some()\n        && let Some(mpos) = report.first_missing\n        && mpos.h < first_bad_h\n    {\n        first_bad_h = mpos.h;\n        first_bad_msg = format!(\"spend of absent coin @ {mpos:?} (complete boundary)\");\n    }"
+    },
+    {
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "first_line": 1095,
+      "last_line": 1165,
+      "text": "    // ---- exit: ONE contract -------------------------------------------\n    // Known invalidity → 1 in BOTH modes (diagnostic permits coverage\n    // gaps, never acceptance of detected invalidity). Incomplete\n    // coverage under strict → 1. Diagnostic incomplete-but-clean → 0.\n    // Computed ONCE so the manifest records the same exit the process\n    // takes.\n    let exit_code = if known_invalid {\n        eprintln!(\"invalid: {first_bad_msg} @ {first_bad_h}\");\n        1\n    } else if !(resolved_inputs_complete && script_jobs_complete) && !diagnostic {\n        eprintln!(\n            \"incomplete: missing_spends={} failed_tasks={failed_tasks}\",\n            report.missing_spends\n        );\n        1\n    } else {\n        0\n    };\n\n    // ---- run manifest: source + binary + inputs + outputs, one record --\n    // Lets an auditor prove WHICH binary produced WHICH output from\n    // WHICH inputs. `build_rev` is embedded at COMPILE time by build.rs\n    // (an older binary can never report a newer checkout); `checkout_rev`\n    // is the checkout's runtime HEAD, labeled separately. Streams all\n    // file hashes — no whole-file Vec reads at snapshot sizes.\n    if let Some(rm) = &run_manifest_path {\n        let self_sha = file_sha256(\"/proc/self/exe\");\n        let boundary_sha = boundary_path.as_ref().and_then(|p| file_sha256(p));\n        let export_sha = if exported {\n            file_sha256(&export_path)\n        } else {\n            None\n        };\n        let checkout_rev = std::process::Command::new(\"git\")\n            .args([\n                \"-C\",\n                concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../..\"),\n                \"rev-parse\",\n                \"HEAD\",\n            ])\n            .output()\n            .ok()\n            .filter(|o| o.status.success())\n            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())\n            .unwrap_or_else(|| \"unknown\".into());\n        let argv_json = std::env::args()\n            .skip(1)\n            .map(|a| jstr(&a))\n            .collect::<Vec<_>>()\n            .join(\",\");\n        let manifest = format!(\n            \"{{\\\"type\\\":\\\"run_manifest\\\",\\\n\\\"build_rev\\\":{},\\\"checkout_rev\\\":{},\\\n\\\"binary_sha256\\\":{},\\\"corpus_sha256\\\":{},\\\n\\\"boundary_sha256\\\":{},\\\"export_sha256\\\":{},\\\n\\\"argv\\\":[{}],\\\"exit_code\\\":{},\\\"known_invalid\\\":{},\\\"exported\\\":{}}}\",\n            jstr(option_env!(\"AVILA_GIT_REV\").unwrap_or(\"unknown\")),\n            jstr(&checkout_rev),\n            self_sha.map(|s| jstr(&s)).unwrap_or(\"null\".into()),\n            jstr(&corpus_sha256),\n            boundary_sha.map(|s| jstr(&s)).unwrap_or(\"null\".into()),\n            export_sha.map(|s| jstr(&s)).unwrap_or(\"null\".into()),\n            argv_json,\n            exit_code,\n            known_invalid,\n            exported,\n        );\n        std::fs::write(rm, manifest + \"\\n\").expect(\"run manifest writable\");\n    }\n    std::process::exit(exit_code);\n}"
+    },
+    {
+      "path": "crates/avila-consensus/src/snapverify.rs",
+      "first_line": 469,
+      "last_line": 544,
+      "text": "    loop {\n        let mut p = 0usize;\n        loop {\n            match group::<true>(&buf[p..fill], height_bound, &mut ser) {\n                Ok(g) => {\n                    let mut q = 0usize;\n                    for _ in 0..g.n {\n                        let coin_start = q; // whole ser record → commitment\n                        // ser record: txid32 ‖ vout4 ‖ code4 ‖ value8\n                        // ‖ compactsize len ‖ script — bounds-checked.\n                        let rec = ser\n                            .get(q..q + 48)\n                            .ok_or_else(|| invalid(\"ser record bounds\"))?;\n                        let mut txid = [0u8; 32];\n                        txid.copy_from_slice(&rec[..32]);\n                        q += 32;\n                        let vout = u32::from_le_bytes(\n                            rec[32..36].try_into().map_err(|_| invalid(\"ser vout\"))?,\n                        );\n                        q += 4;\n                        let code = u64::from(u32::from_le_bytes(\n                            rec[36..40].try_into().map_err(|_| invalid(\"ser code\"))?,\n                        ));\n                        q += 4;\n                        let value = i64::from_le_bytes(\n                            rec[40..48].try_into().map_err(|_| invalid(\"ser value\"))?,\n                        );\n                        q += 8;\n                        let slen =\n                            compact(&ser, &mut q).map_err(|_| invalid(\"ser script length\"))?;\n                        let slen =\n                            usize::try_from(slen).map_err(|_| invalid(\"ser script length\"))?;\n                        let spk = ser\n                            .get(q..q + slen)\n                            .ok_or_else(|| invalid(\"ser script bounds\"))?;\n                        f(txid, vout, code, value, spk)?;\n                        q += slen;\n                        // hash the exact TxOutSer bytes the verifier's\n                        // commitment covers\n                        sha.update(&ser[coin_start..q]);\n                        streamed += 1;\n                    }\n                    ser.clear();\n                    p += g.len;\n                }\n                Err(PErr::Short) => break,\n                Err(PErr::Bad(m)) => return Err(invalid(m)),\n            }\n        }\n        buf.drain(..p);\n        fill -= p;\n        if eof {\n            if fill != 0 {\n                return Err(invalid(\"trailing unparsed bytes\"));\n            }\n            break;\n        }\n        buf.resize(fill + READ_BLOCK, 0);\n        let n = file.read(&mut buf[fill..])?;\n        buf.truncate(fill + n);\n        fill += n;\n        if n == 0 {\n            eof = true;\n        }\n    }\n    if streamed != want {\n        return Err(invalid(\"coin count disagrees with header\"));\n    }\n    Ok(LoadedCoins {\n        header: Header {\n            network,\n            base_blockhash,\n            coins_count: want,\n        },\n        txoutset_hash: finish_hash(sha),\n    })"
+    },
+    {
+      "path": "tools/test_window_join_exec.py",
+      "first_line": 371,
+      "last_line": 430,
+      "text": "    # --- donor pins: base-hash / base-height / coin-set commitment ------\n    # A NON-palindromic base hash exercises real byte-order handling.\n    custom_base = bytes(range(32))          # internal (file) order\n    custom_base_disp = custom_base[::-1].hex()  # display hex\n    c = Chain()\n    c.prev = custom_base\n    s = tx([(b'\\xcc' * 32, 0, b'', 0xffffffff)], [(val - 1000, OP_TRUE)])\n    c.block(140, [(cb_tx(1), [b'\\x00']), (s, [b'\\x00'])])  # spec-less spend\n    p = os.path.join(td, 'pin.corpus')\n    open(p, 'wb').write(bytes(c.buf))\n    donor = {b'\\xcc' * 32: [(0, 100, val, OP_TRUE)]}\n    bpf = os.path.join(td, 'pin.utxo')\n    open(bpf, 'wb').write(snapshot(donor, base=custom_base))\n    # coin-set commitment, computed the same way the verifier does:\n    # sha256d over every coin's TxOutSer (txid‖vout‖code‖value‖len‖spk)\n    ser = b''\n    for txi, coins in donor.items():\n        for (vout, code, v, spk) in coins:\n            ser += txi + struct.pack('<I', vout) + struct.pack('<I', code)\n            ser += struct.pack('<q', v) + compact_size(len(spk)) + spk\n    commit_disp = sha256d(ser)[::-1].hex()\n\n    rc, out, _ = run(p, '--boundary', bpf,\n                     '--boundary-base-hash', custom_base_disp,\n                     '--boundary-base-height', '139',\n                     '--boundary-txoutset-hash', commit_disp)\n    d = last_json(out)\n    check('all donor pins correct → exit 0',\n          rc == 0 and d['join_missing_spends'] == 0\n          and d['boundary_txoutset_hash'] == commit_disp, f'rc={rc}')\n\n    rc, _, _ = run(p, '--boundary', bpf,\n                   '--boundary-base-hash', 'aa' * 32)\n    check('wrong base-hash pin → exit 2', rc == 2, f'rc={rc}')\n    rc, _, _ = run(p, '--boundary', bpf, '--boundary-base-hash', 'abc')\n    check('short base-hash pin → exit 2 not panic', rc == 2, f'rc={rc}')\n    rc, _, _ = run(p, '--boundary', bpf,\n                   '--boundary-base-hash', 'zz' * 32)\n    check('non-hex base-hash pin → exit 2 not panic', rc == 2, f'rc={rc}')\n    rc, _, _ = run(p, '--boundary', bpf, '--boundary-base-height', '138')\n    check('wrong donor-height pin → exit 2', rc == 2, f'rc={rc}')\n    rc, _, _ = run(p, '--boundary', bpf,\n                   '--boundary-txoutset-hash', 'aa' * 32)\n    check('wrong txoutset pin → exit 2', rc == 2, f'rc={rc}')\n\n    # manifest ties build + binary + inputs + outputs on the success path\n    rm = p + '.runmanifest'\n    rc, out, _ = run(p, '--boundary', bpf, '--run-manifest', rm)\n    m = json.loads(open(rm).read())\n    check('run manifest: build_rev + argv array + hashes',\n          rc == 0 and m['build_rev'] and isinstance(m['argv'], list)\n          and m['exit_code'] == 0 and m['boundary_sha256']\n          and m['corpus_sha256'] and m['export_sha256'],\n          f'rc={rc} rev={m.get(\"build_rev\")}')\n\nprint()\nif fails:\n    print(\"FAILED:\", fails)\n    sys.exit(1)\nprint(\"all window_join executable regressions pass\")"
+    }
+  ],
+  "disposition": "Close P1 hash-parser failure and accept supplied-pin implementation. Retain two P2 follow-ups and existing real donor/context/integrated comparison assignment; do not restart accepted earlier gates."
+}
