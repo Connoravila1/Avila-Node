@@ -1,0 +1,211 @@
+{
+  "span_files": [
+    {
+      "file": "data/mainnet/blk01200.dat",
+      "sha256": "561ab81e7959972f998cb8a2f47b66c3bb3b8d96a9c790b16f246cc92276bb21",
+      "records": 136
+    },
+    {
+      "file": "data/mainnet/blk01201.dat",
+      "sha256": "ec485f787e33acef31045061a13480a6e832611540d008fece99a581f3552443",
+      "records": 152
+    },
+    {
+      "file": "data/mainnet/blk01202.dat",
+      "sha256": "f3ba68e4ad1445eca05b59697da7f21c124b33f2e0706313ccd722f89fdc1fa1",
+      "records": 151
+    },
+    {
+      "file": "data/mainnet/blk01203.dat",
+      "sha256": "e978a3a5df9a2340984b3949768c29b184cf10ebe6c6381443ff6e1c5b629bee",
+      "records": 152
+    },
+    {
+      "file": "data/mainnet/blk01204.dat",
+      "sha256": "883f90a4eb4037d43003a0022ace6eb0f49a7760245acaf8df2ce3c7c8760e70",
+      "records": 148
+    },
+    {
+      "file": "data/mainnet/blk01205.dat",
+      "sha256": "7db64b2b195274ca04a92913a6c45aae127ed11214591973947a758adf74f14d",
+      "records": 141
+    },
+    {
+      "file": "data/mainnet/blk01206.dat",
+      "sha256": "a8f87817d9d16415afd72902d31ca1402a892283881d78b1a7a2018d4371db3e",
+      "records": 139
+    },
+    {
+      "file": "data/mainnet/blk01207.dat",
+      "sha256": "d5defb2df7cc1c0544614a641b98bd6b364feb73b2435ee6e470cb0980f9cbcc",
+      "records": 140
+    },
+    {
+      "file": "data/mainnet/blk01208.dat",
+      "sha256": "e3014fd508784d98bb4cd8291d8ece2e9854953b086b614eace920dccccd26c0",
+      "records": 145
+    },
+    {
+      "file": "data/mainnet/blk01209.dat",
+      "sha256": "aac2305ef3aa16aa15c898d99c6120c9700f4ffa75ca20678017dbc4d9e64bb7",
+      "records": 139
+    },
+    {
+      "file": "data/mainnet/blk01210.dat",
+      "sha256": "3f3fe82e61333e5c97d3c8af82b90a76403568e7cf5e457f4677959bc8d7bae9",
+      "records": 142
+    },
+    {
+      "file": "data/mainnet/blk01211.dat",
+      "sha256": "66541ef8e05249983c03705531f39fe209eca2c1e779b9a6700a62c98195f9cc",
+      "records": 139
+    },
+    {
+      "file": "data/mainnet/blk01212.dat",
+      "sha256": "bba94d3844b92e96a74cb90ccbc858549d500b98f1e5b9984d90edb7bf7c7d99",
+      "records": 137
+    },
+    {
+      "file": "data/mainnet/blk01213.dat",
+      "sha256": "d320740a459cd3dc1d3a90ac23e62b15e53ce3600566f956b5475563f4473aa7",
+      "records": 138
+    },
+    {
+      "file": "data/mainnet/blk01214.dat",
+      "sha256": "26bcddd18c081e3f9efb22874950703cf41b732d458dd60940312d1d202d7e74",
+      "records": 142
+    },
+    {
+      "file": "data/mainnet/blk01215.dat",
+      "sha256": "1a5628b8b9ae58993c92eab9414e25da0ce8d426ca70dac5355a17eaf7b86d9c",
+      "records": 141
+    },
+    {
+      "file": "data/mainnet/blk01216.dat",
+      "sha256": "19016617555a75dad36e54a2aa94100fbb5891c2d334ff99f012d7335efbfc79",
+      "records": 139
+    },
+    {
+      "file": "data/mainnet/blk01217.dat",
+      "sha256": "a1c5b75869310aa49dea8a5a45054fba0967e72e89d8a13535048b66f9d35f3f",
+      "records": 137
+    },
+    {
+      "file": "data/mainnet/blk01218.dat",
+      "sha256": "8237bb8b2ad228214ad8b6ba4f4da4b550d447513a419bd0555c398473c89992",
+      "records": 143
+    },
+    {
+      "file": "data/mainnet/blk01219.dat",
+      "sha256": "678632284bf364dcef55d7cf483b0fd7a61cb42d8352f48705d1208f4fdf55a3",
+      "records": 150
+    },
+    {
+      "file": "data/mainnet/blk01220.dat",
+      "sha256": "c0f533088794324d3fb05ebb4e223b05b3d9a7a8af3de80534564ecf7a1c85a1",
+      "records": 158
+    },
+    {
+      "file": "data/mainnet/blk01221.dat",
+      "sha256": "b3909c62ac10231027233668e7186124c8af776fead8643f52e4f448c71f6cbc",
+      "records": 140
+    },
+    {
+      "file": "data/mainnet/blk01222.dat",
+      "sha256": "932127c1ab04909b030ef402c72176090440ddba82e08e17d8d9f73eb09ca71b",
+      "records": 138
+    },
+    {
+      "file": "data/mainnet/blk01223.dat",
+      "sha256": "9a04d4ffde00413a5b152ad0404b93320cb2568ec51f6aeb99d51700dca33e83",
+      "records": 138
+    },
+    {
+      "file": "data/mainnet/blk01224.dat",
+      "sha256": "d796e8e2cde8fdb034a29c66f2597f3b76e30f99435bcd4664e0647378f1cf68",
+      "records": 138
+    },
+    {
+      "file": "data/mainnet/blk01225.dat",
+      "sha256": "abb7b3a2f38ad637d05607b98309aee1659a591e9e79652ea58ba8489d1111ed",
+      "records": 141
+    },
+    {
+      "file": "data/mainnet/blk01226.dat",
+      "sha256": "4dbfa5c81d3500615fa0f1e6ae71070cc2adb3b18ffac98c4b65b4f98aa376e7",
+      "records": 142
+    },
+    {
+      "file": "data/mainnet/blk01227.dat",
+      "sha256": "b9fa99428025a4463695e0237631fb659ff0a422bbd23c6ab382cb9b7f0d0191",
+      "records": 139
+    },
+    {
+      "file": "data/mainnet/blk01228.dat",
+      "sha256": "6f7dc7296ea2b729dc99e5b276fef799e5c10ede6a6a74e4036c3f7d2a3fce69",
+      "records": 142
+    },
+    {
+      "file": "data/mainnet/blk01229.dat",
+      "sha256": "10300da4f82e050a4ce563e0cfebdf0c2ead4e57f6fc30a3d56c1ca651fd0e1d",
+      "records": 137
+    },
+    {
+      "file": "data/mainnet/blk01230.dat",
+      "sha256": "c0a070069fcc7e7a3c746fdfbb7b08db84cf1bb1e5710ba3739dfc8edf064b8a",
+      "records": 139
+    },
+    {
+      "file": "data/mainnet/blk01231.dat",
+      "sha256": "d520edac77c237a5fadedf4322a304f593c192b1f90be13b748326bb92fd5ecd",
+      "records": 139
+    },
+    {
+      "file": "data/mainnet/blk01232.dat",
+      "sha256": "3fb9790f242107c543fb2644c8c7b2071e325f9a3c127df98b4f846f0a0db44d",
+      "records": 137
+    },
+    {
+      "file": "data/mainnet/blk01233.dat",
+      "sha256": "5bab19e73fca6d3f9d4ba9e98e5fc4bb97b0ee4ec943246399055ea06772a8c5",
+      "records": 144
+    },
+    {
+      "file": "data/mainnet/blk01234.dat",
+      "sha256": "30aff8d19e0ec89c35bfb70df5b44991fa33a483d976898c5dc35c6760f74b74",
+      "records": 141
+    }
+  ],
+  "window_files": [
+    "data/mainnet/blk01227.dat",
+    "data/mainnet/blk01228.dat",
+    "data/mainnet/blk01229.dat",
+    "data/mainnet/blk01230.dat",
+    "data/mainnet/blk01231.dat",
+    "data/mainnet/blk01232.dat",
+    "data/mainnet/blk01233.dat",
+    "data/mainnet/blk01234.dat"
+  ],
+  "labels": {
+    "provenance": "local blk-store scan (corpus-resolved prevouts)",
+    "occurrence_model": "latest (height,txidx) < (spend_height,spend_idx)",
+    "ordering": "blocks sorted by BIP34 height; file order not trusted"
+  },
+  "window": {
+    "height_min": 453549,
+    "height_max": 968774,
+    "stats": {
+      "blocks": 1118,
+      "txs": 2178806,
+      "inputs": 4892371,
+      "resolved": 4439118,
+      "unresolved_no_occurrence": 453253,
+      "unresolved_future_only": 0,
+      "unresolved_bad_vout": 0,
+      "coinbase_inputs": 1118,
+      "duplicate_txid_occurrences": 0
+    },
+    "corpus_sha256": "55216ff423ae36af6bd826fde5da649b9c448816a0ed7ef7ba51cb3c3d8ac05d",
+    "corpus_bytes": 1276970754
+  }
+}

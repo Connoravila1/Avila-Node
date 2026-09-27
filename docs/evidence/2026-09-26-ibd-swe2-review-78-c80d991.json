@@ -1,0 +1,106 @@
+{
+  "review": "c80d991 follow-up disposition",
+  "recorded_utc": "2026-09-27T02:53:35.395357+00:00",
+  "head": "c80d9916d9873ea84e5104a54b750a94bd1b7645",
+  "worktree_status_before_document_edits": "",
+  "method": "Read-only source, saved artifacts and Cargo cache review; read-only GitHub Actions query; no builds, examples, tests, benchmarks, corpus scans, RPCs or node operations.",
+  "files": {
+    "crates/avila-consensus/build.rs": {
+      "bytes": 1603,
+      "sha256": "7c62068c878af23987066186f3a42f4b7d8af1ca9579a9ba14d57a30b1d9d91a"
+    },
+    "crates/avila-consensus/examples/window_join.rs": {
+      "bytes": 45407,
+      "sha256": "87e454c5b5ade0d6c7b234973a0d6eeedc9f23a7bec59bed70e28c20b837c41f"
+    },
+    "tools/test_window_join_exec.py": {
+      "bytes": 19736,
+      "sha256": "0321a6daff678e4aaa53885f5762ac0d34d664e8b86ac85ffe35ef34c08281c5"
+    },
+    "Cargo.toml": {
+      "bytes": 2688,
+      "sha256": "34d3607a80c803bbc6ec60c5e7103666c99743202383f63ba2b070ad09d201b9"
+    },
+    ".github/workflows/ci.yml": {
+      "bytes": 2462,
+      "sha256": "f4ce30e163045164f144a8770fc319cba36666b65cd365273bf589b63a1ffbe9"
+    },
+    "experiments/results/gate4/exec-regression-2026-09-26b.log": {
+      "bytes": 3528,
+      "sha256": "b7006831d02bb0ea3e61ef630b33b9a10269f2f8a07c1ff52f36a9d1169c47e2"
+    },
+    "target/release/build/avila-consensus-0aadad7882854e7e/output": {
+      "bytes": 290,
+      "sha256": "d0c61d2fd967e87e8bcec4ce87182232bfb55c1b6cfaf9f249d408bf8d4a40a9"
+    },
+    "target/release/.fingerprint/avila-consensus-0aadad7882854e7e/run-build-script-build-script-build.json": {
+      "bytes": 371,
+      "sha256": "3d4c239b29ce175a998ac093a5d29e119b0b9d3f5496e1ef6ef96059193dfda1"
+    }
+  },
+  "ci": {
+    "databaseId": 36289439451,
+    "headSha": "c80d9916d9873ea84e5104a54b750a94bd1b7645",
+    "status": "completed",
+    "conclusion": "success",
+    "url": "https://github.com/Connoravila1/Avila-Node/actions/runs/36289439451",
+    "verification": "Read from gh run list during this review. The workflow does not invoke the Python executable-regression runner."
+  },
+  "build_script": "// Embeds the build's source identity so run manifests can attribute a\n// binary to the revision it was compiled from — a runtime `git\n// rev-parse` would report whatever the checkout happens to point at.\n// `rerun-if-changed` on .git/HEAD + the ref it names forces a rebuild\n// when the commit moves, so an incremental rebuild cannot keep a stale\n// identity.\nfn main() {\n    let root = concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../..\");\n    let head_path = format!(\"{root}/.git/HEAD\");\n    println!(\"cargo:rerun-if-changed={head_path}\");\n    if let Ok(head) = std::fs::read_to_string(&head_path) {\n        // HEAD → \"ref: refs/heads/<branch>\" — also watch the branch tip\n        // file, or a commit that doesn't move HEAD goes unnoticed.\n        if let Some(r) = head.trim().strip_prefix(\"ref: \") {\n            println!(\"cargo:rerun-if-changed={root}/.git/{r}\");\n        }\n    }\n    let rev = std::process::Command::new(\"git\")\n        .args([\"-C\", env!(\"CARGO_MANIFEST_DIR\"), \"rev-parse\", \"HEAD\"])\n        .output()\n        .ok()\n        .filter(|o| o.status.success())\n        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())\n        .unwrap_or_else(|| \"unknown\".into());\n    let dirty = std::process::Command::new(\"git\")\n        .args([\"-C\", env!(\"CARGO_MANIFEST_DIR\"), \"status\", \"--porcelain\"])\n        .output()\n        .ok()\n        .filter(|o| o.status.success())\n        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())\n        .unwrap_or(false);\n    println!(\n        \"cargo:rustc-env=AVILA_GIT_REV={rev}{}\",\n        if dirty { \"+dirty\" } else { \"\" }\n    );\n}\n",
+  "cargo_build_output": "cargo:rerun-if-changed=/home/connoravila/Documents/Avila-Node/crates/avila-consensus/../../.git/HEAD\ncargo:rerun-if-changed=/home/connoravila/Documents/Avila-Node/crates/avila-consensus/../../.git/refs/heads/main\ncargo:rustc-env=AVILA_GIT_REV=dd69355bfb1889102fc9f0aa67330a0c1deed20e+dirty\n",
+  "cargo_fingerprint": {
+    "rustc": 1625334936438085654,
+    "features": "",
+    "declared_features": "",
+    "target": 0,
+    "profile": 0,
+    "path": 0,
+    "deps": [
+      [
+        275666249127234097,
+        "build_script_build",
+        false,
+        1457332849852968882
+      ]
+    ],
+    "local": [
+      {
+        "RerunIfChanged": {
+          "output": "release/build/avila-consensus-0aadad7882854e7e/output",
+          "paths": [
+            "../../.git/HEAD",
+            "../../.git/refs/heads/main"
+          ]
+        }
+      }
+    ],
+    "rustflags": [],
+    "config": 0,
+    "compile_kind": 0
+  },
+  "height_guard_source": {
+    "path": "crates/avila-consensus/examples/window_join.rs",
+    "first_line": 290,
+    "last_line": 345,
+    "text": "    let by_height: HashMap<u32, &BlockRec> = blocks.iter().map(|b| (b.height, b)).collect();\n    // linkage: each block whose (height-1) is present must name it as parent\n    let mut linkage_checked = 0usize;\n    let mut linkage_broken = 0usize;\n    let mut first_link_break_h = 0u32;\n    for b in &blocks {\n        let Some(parent_h) = b.height.checked_sub(1) else {\n            continue; // h=0 has no parent height\n        };\n        if present_heights.contains(&parent_h) {\n            linkage_checked += 1;\n            let parent_ok = by_hash\n                .get(&b.header.prev_block_hash)\n                .is_some_and(|p| p.height == parent_h);\n            if !parent_ok {\n                linkage_broken += 1;\n                if first_link_break_h == 0 {\n                    first_link_break_h = b.height;\n                }\n            }\n        }\n    }\n    // MTP where ≥11 consecutive ancestors exist in-corpus\n    // MTP of block at height h's parent chain: median of its 11 latest\n    // ancestor times — only computable when all 11 are in the corpus.\n    let mtp_of = |h: u32| -> Option<u32> {\n        let mut times = Vec::with_capacity(11);\n        let mut cur = *by_height.get(&h)?;\n        loop {\n            times.push(cur.header.time);\n            if times.len() == 11 {\n                break;\n            }\n            let prev = by_hash.get(&cur.header.prev_block_hash)?;\n            if prev.height + 1 != cur.height {\n                return None;\n            }\n            cur = prev;\n        }\n        times.sort_unstable();\n        Some(times[5])\n    };\n    let mut mtp_computable = 0usize;\n    let mut block_mtp: HashMap<u32, u32> = HashMap::new();\n    for b in &blocks {\n        let Some(parent_h) = b.height.checked_sub(1) else {\n            continue; // h=0: no in-window parent\n        };\n        if let Some(m) = mtp_of(parent_h) {\n            block_mtp.insert(b.height, m);\n            mtp_computable += 1;\n        }\n    }\n    if let Some(mp) = &manifest_path {\n        let mut lines = String::new();\n        for b in &blocks {"
+  },
+  "saved_regression": {
+    "path": "experiments/results/gate4/exec-regression-2026-09-26b.log",
+    "passes": 84,
+    "failures": 0,
+    "unchanged_from_previous_review": true,
+    "current_script_unchanged": true,
+    "qualification": "The reported 84/84 rerun is not independently archived as new evidence here. The existing log still reports cd3cb45+dirty, and the source has no h=0 or incremental-build test. No additional broad rerun requested solely for this distinction."
+  },
+  "accepted": [
+    "Both earlier unchecked height subtractions now use checked_sub; the existing boundary guard rejects a parent-before-genesis setup. Close the source defect.",
+    "Cargo records watches for .git/HEAD and refs/heads/main. Accept tracking of committed tip changes in this normal checkout."
+  ],
+  "qualifications": [
+    "Newly printed dd69355+dirty is expected after build.rs itself changes; it alone is not an isolated test of the HEAD/ref watches.",
+    "Uncommitted source edits do not necessarily change HEAD/ref files. A +dirty suffix is not a unique source identity. This remains covered by the already accepted clean-build/external receipt or source digest requirement.",
+    "Hardcoded .git directory paths are not a demonstrated general solution for linked worktrees or packed-ref layouts. No general provenance overhaul required before acquisition.",
+    "Retain requested focused h=0 and metadata controls with the next relevant verification; code acceptance is based on inspection, not a new executed regression."
+  ],
+  "next": "Acquire and pin genuine donor; checked runner supplies all three donor pins and complete build/input/output receipt; finish production contextual checks and real complete-state comparison. Gate 4 and capacity measurements remain open. No new speed claim."
+}

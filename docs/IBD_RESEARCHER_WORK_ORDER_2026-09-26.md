@@ -40,9 +40,11 @@ and the new component guards, but finds a panic in the donor-hash pin parser
 and incomplete build provenance. The latest
 [donor-pin repair review](IBD_SWE2_REVIEW_78_DONOR_2026-09-26.md) closes the
 pin-parser finding and accepts the supplied height/content pins against the
-84-check saved regression. Refresh build identity and fix the early h=0
-subtraction while acquiring the genuine donor and finishing production context
-checks. Supply all donor pins for the complete real-state comparison.
+84-check saved regression. Its c80d991 update closes the early h=0 source
+defect and accepts committed-tip build tracking in the ordinary checkout.
+Use the agreed clean-build/source-and-binary receipt for measurements; acquire
+the genuine donor and finish production context checks. The checked runner
+must supply all three donor pins for the complete real-state comparison.
 Whole-IBD capacity claims still require that comparison and scaling measurements.
 
 Read [the hardware analysis](../experiments/2026-09-26-ibd-hardware-floor.md)

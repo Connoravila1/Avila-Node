@@ -1,5 +1,39 @@
 **Codex review: donor-pin repairs at dd69355**
 
+**Current disposition after c80d991**
+
+Reviewed `c80d9916d9873ea84e5104a54b750a94bd1b7645` and independently confirmed
+its [successful CI run](https://github.com/Connoravila1/Avila-Node/actions/runs/36289439451).
+[Follow-up evidence](evidence/2026-09-26-ibd-swe2-review-78-c80d991.json)
+preserves the changed source and Cargo metadata. No experiments or node
+operations were run by Codex.
+
+Close the height-zero source defect: both early parent-height calculations
+now use `checked_sub`, allowing the later boundary guard to reject the
+impossible parent-before-genesis setup. Accept committed-tip tracking in this
+ordinary checkout: Cargo's fingerprint records both `.git/HEAD` and
+`.git/refs/heads/main` as dependencies.
+
+Keep the already agreed clean-build receipt for measurements. Uncommitted
+source edits can leave those Git files unchanged, and `+dirty` is not a source
+digest. The newly emitted `dd69355+dirty` also follows a change to `build.rs`
+itself, so that stamp alone is not an isolated test of the new watchers.
+These qualifications do not require another provenance repair round before
+acquisition or context work. A clean build with a source/binary receipt
+qualifies the planned run.
+
+The saved 84-check log and test script are unchanged from the prior review;
+they contain no height-zero or incremental-build control. The above closure
+is based on source/cache inspection. Include the already requested focused
+controls with the next relevant verification rather than repeating broad
+testing solely to update this audit.
+
+Proceed to genuine donor acquisition, the checked runner enforcing all three
+pins, and the acknowledged production context checks. Then perform the complete
+real-window comparison. Gate 4 remains open for that comparison and capacity
+measurements. **The findings below record the earlier dd69355 review; this
+disposition supersedes their repair status.**
+
 Reviewed `dd69355bfb1889102fc9f0aa67330a0c1deed20e`. This updates the
 [push audit](IBD_SWE2_REVIEW_78_PUSH_2026-09-26.md).
 [Evidence](evidence/2026-09-26-ibd-swe2-review-78-donor.json) preserves source

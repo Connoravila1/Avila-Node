@@ -31,20 +31,26 @@
 //! checked.
 
 use avila_consensus::block::Block;
+use avila_consensus::chain::{HeaderTree, InsertStatus};
 use avila_consensus::check::{MAX_BLOCK_SIGOPS_COST, MAX_MONEY, check_block, is_final_tx};
-use avila_consensus::connect::{COINBASE_MATURITY, Coin, block_subsidy, tx_sigop_cost};
+use avila_consensus::connect::{
+    COINBASE_MATURITY, Coin, bip68_locks_satisfied, block_subsidy, tx_sigop_cost,
+};
 use avila_consensus::hash::{BlockHash, sha256};
 use avila_consensus::header::BlockHeader;
 use avila_consensus::params::Network;
 use avila_consensus::script::{ScriptFlags, block_script_flags};
 use avila_consensus::sigchecker::check_input_scripts;
-use avila_consensus::snapverify::for_each_coin;
+use avila_consensus::snapverify::{self, for_each_coin};
 use avila_consensus::transaction::{OutPoint, Script, Transaction, TxOut};
 use std::collections::HashMap;
 
 #[path = "shared/join_engine.rs"]
 mod join_engine;
-use join_engine::{Creation, JoinRes, Occ, Spend, build_boundary, join_window};
+use join_engine::{
+    BoundaryView, Creation, FlatBoundary, FlatBuilder, JoinRes, Occ, Spend, build_boundary,
+    join_window,
+};
 
 #[derive(Clone)]
 struct Source {
@@ -145,19 +151,41 @@ fn rss_hwm_bytes() -> u64 {
         .unwrap_or(0)
 }
 
-fn canonical_bytes(map: &HashMap<OutPoint, Coin>) -> Vec<u8> {
-    let mut recs: Vec<(&OutPoint, &Coin)> = map.iter().collect();
-    recs.sort_by_key(|a| (a.0.txid, a.0.vout));
-    let mut out = Vec::with_capacity(recs.len() * 48);
-    for (op, c) in recs {
-        out.extend_from_slice(op.txid.as_bytes());
-        out.extend_from_slice(&op.vout.to_le_bytes());
-        out.extend_from_slice(&c.out.value.to_le_bytes());
-        let spk = c.out.script_pubkey.as_bytes();
-        out.extend_from_slice(&(spk.len() as u32).to_le_bytes());
-        out.extend_from_slice(spk);
-        out.extend_from_slice(&c.height.to_le_bytes());
-        out.push(u8::from(c.coinbase));
+/// Serializes one `(outpoint, coin)` record in canonical form.
+fn put_coin_rec(out: &mut Vec<u8>, txid: &[u8], vout: u32, c: &Coin) {
+    out.extend_from_slice(txid);
+    out.extend_from_slice(&vout.to_le_bytes());
+    out.extend_from_slice(&c.out.value.to_le_bytes());
+    let spk = c.out.script_pubkey.as_bytes();
+    out.extend_from_slice(&(spk.len() as u32).to_le_bytes());
+    out.extend_from_slice(spk);
+    out.extend_from_slice(&c.height.to_le_bytes());
+    out.push(u8::from(c.coinbase));
+}
+
+/// Canonical export for the flat live set: boundary alive records are
+/// already in `(txid, vout)` order; `extra` (in-window creations) is
+/// sorted then merged — byte-identical output to `canonical_bytes` over
+/// the equivalent `HashMap` live set.
+fn canonical_bytes_flat(boundary: &FlatBoundary, extra: &HashMap<OutPoint, Coin>) -> Vec<u8> {
+    let mut ex: Vec<(&OutPoint, &Coin)> = extra.iter().collect();
+    ex.sort_unstable_by_key(|(op, _)| (op.txid, op.vout));
+    let mut ex_i = 0usize;
+    let mut out = Vec::with_capacity(boundary.txids_len() * 48);
+    for i in boundary.alive_indices() {
+        let (txid, vout, c) = boundary.record(i);
+        // Emit every `extra` record sorting strictly before this one.
+        while ex_i < ex.len() && (*ex[ex_i].0.txid.as_bytes(), ex[ex_i].0.vout) < (txid, vout) {
+            let (op, coin) = ex[ex_i];
+            put_coin_rec(&mut out, op.txid.as_bytes(), op.vout, coin);
+            ex_i += 1;
+        }
+        put_coin_rec(&mut out, &txid, vout, &c);
+    }
+    while ex_i < ex.len() {
+        let (op, coin) = ex[ex_i];
+        put_coin_rec(&mut out, op.txid.as_bytes(), op.vout, coin);
+        ex_i += 1;
     }
     out
 }
@@ -240,6 +268,7 @@ fn main() {
     let boundary_base_hash = opt("--boundary-base-hash"); // pin from dumptxoutset
     let boundary_base_height_pin = opt("--boundary-base-height");
     let boundary_txoutset_pin = opt("--boundary-txoutset-hash");
+    let headers_path = opt("--headers"); // HCHAIN01 full header index (export_headers)
     let run_manifest_path = opt("--run-manifest");
     let export_path = opt("--export").unwrap_or_else(|| format!("{path}.canonical"));
     let workers: usize = opt("--workers")
@@ -263,8 +292,9 @@ fn main() {
     }
     assert!(!blocks.is_empty());
     let parse_s = t.elapsed().as_secs_f64();
-    let window_lo = blocks.first().unwrap().height;
-    let window_hi = blocks.last().unwrap().height;
+    // min/max — corpus order is blk-file order, not height order.
+    let window_lo = blocks.iter().map(|b| b.height).min().unwrap();
+    let window_hi = blocks.iter().map(|b| b.height).max().unwrap();
     let header_hash_verified = blocks.len(); // assert in parse enforced each
 
     // ---- coverage + header linkage manifest --------------------------
@@ -356,6 +386,90 @@ fn main() {
             );
         }
         std::fs::write(mp, lines).expect("manifest writable");
+    }
+
+    // ---- production header context (--headers manifest) ---------------
+    // HCHAIN01: u32 count | count × header80 | "CHAIN" | u32 | hashes —
+    // emitted by `export_headers` from the node's own `state.dat` index.
+    // Every manifest header is inserted through HeaderTree, which runs the
+    // production AcceptBlockHeader + ContextualCheckBlockHeader checks per
+    // header: PoW, required_bits retarget, median-time floor, future
+    // ceiling, buried-version floors. The tree then supplies real parent
+    // MTP and BIP68 ancestor lookups for the whole chain — not just the
+    // window slice.
+    let mut tree: Option<HeaderTree> = None;
+    let mut headers_loaded = 0usize;
+    let mut headers_inserted = 0usize;
+    let mut headers_unknown_parent = 0usize;
+    let mut headers_failed = 0usize;
+    let mut window_headers_in_tree = 0usize;
+    if let Some(hp) = &headers_path {
+        let data = std::fs::read(hp).expect("headers manifest readable");
+        let need = |o: usize, n: usize| {
+            if o + n > data.len() {
+                eprintln!("fatal: headers manifest truncated at byte {o}");
+                std::process::exit(2);
+            }
+            &data[o..o + n]
+        };
+        if need(0, 8) != b"HCHAIN01".as_slice() {
+            eprintln!("fatal: headers manifest bad magic");
+            std::process::exit(2);
+        }
+        let count = u32::from_le_bytes(need(8, 4).try_into().unwrap()) as usize;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        let mut t = HeaderTree::new(params);
+        for i in 0..count {
+            let raw = need(12 + i * 80, 80);
+            let hdr = BlockHeader::decode(raw).unwrap_or_else(|e| {
+                eprintln!("fatal: headers manifest record {i} undecodable: {e}");
+                std::process::exit(2);
+            });
+            match t.insert(&hdr, now) {
+                Ok(InsertStatus::AlreadyKnown { .. }) => {}
+                Ok(_) => headers_inserted += 1,
+                Err(avila_consensus::chain::ChainError::UnknownParent(_)) => {
+                    headers_unknown_parent += 1;
+                }
+                Err(e) => {
+                    headers_failed += 1;
+                    if headers_failed <= 3 {
+                        eprintln!("header {} insert failed: {e}", hdr.hash());
+                    }
+                }
+            }
+        }
+        let tail = 12 + count * 80;
+        if need(tail, 5) != b"CHAIN".as_slice() {
+            eprintln!("fatal: headers manifest missing CHAIN section");
+            std::process::exit(2);
+        }
+        let cc = u32::from_le_bytes(need(tail + 5, 4).try_into().unwrap()) as usize;
+        for i in 0..cc {
+            let _ = need(tail + 9 + i * 32, 32);
+        }
+        if headers_failed > 0 || headers_unknown_parent > 0 {
+            eprintln!(
+                "warning: {headers_failed} indexed headers fail production checks; \
+{headers_unknown_parent} have unknown parents"
+            );
+        }
+        headers_loaded = count;
+        // Real parent MTP for every window block whose parent is indexed,
+        // plus a presence check: a window header the index doesn't know
+        // is unverifiable beyond its self-consistent hash.
+        for b in &blocks {
+            if let Some(m) = t.median_time_past(&b.header.prev_block_hash) {
+                block_mtp.insert(b.height, m);
+            }
+            if t.get(&b.hash).is_some() {
+                window_headers_in_tree += 1;
+            }
+        }
+        tree = Some(t);
     }
 
     // ---- stage A: context-free block checks + ledger emit -------------
@@ -466,7 +580,7 @@ fn main() {
     // the supplied state marks the outpoint conflicted). Without it the
     // boundary is assembled from spend-mentioned specs only.
     let t = std::time::Instant::now();
-    let mut boundary_loaded: Option<HashMap<OutPoint, Coin>> = None;
+    let mut boundary_loaded: Option<FlatBoundary> = None;
     let mut boundary_load_coins = 0usize;
     let mut boundary_dup_outpoints = 0usize;
     let mut boundary_base_height: Option<u32> = None;
@@ -491,28 +605,20 @@ fn main() {
                 std::process::exit(2);
             }
         }
-        let mut m: HashMap<OutPoint, Coin> = HashMap::new();
-        let mut dups = 0usize;
+        // Flat sorted table — pre-sized from the declared coin count so
+        // neither the record vec nor the script blob ever re-allocates.
+        let snap_path = std::path::Path::new(bp);
+        let expected = snapverify::read_header(
+            &std::fs::File::open(snap_path).expect("boundary readable for header"),
+        )
+        .map(|h| h.coins_count as usize)
+        .unwrap_or(0);
+        let mut fb = FlatBuilder::new(expected);
         let loaded = for_each_coin(
-            std::path::Path::new(bp),
+            snap_path,
             Some(base_height), // creation heights may not exceed the base
             |txid_b, vout, code, value, spk| {
-                let txid = avila_consensus::hash::Txid::from_bytes(txid_b);
-                if m.insert(
-                    OutPoint { txid, vout },
-                    Coin {
-                        out: TxOut {
-                            value,
-                            script_pubkey: Script::new(spk.to_vec()),
-                        },
-                        height: (code >> 1) as u32,
-                        coinbase: code & 1 != 0,
-                    },
-                )
-                .is_some()
-                {
-                    dups += 1; // a dump cannot name one outpoint twice
-                }
+                fb.push(txid_b, vout, value, code, spk);
                 Ok(())
             },
         )
@@ -521,12 +627,13 @@ fn main() {
             std::process::exit(2);
         });
         let snap_hdr = loaded.header;
+        let (flat, dups) = fb.finish();
         boundary_dup_outpoints = dups;
         if boundary_dup_outpoints > 0 {
             eprintln!("fatal: boundary contains {boundary_dup_outpoints} duplicate outpoints");
             std::process::exit(2);
         }
-        boundary_load_coins = m.len();
+        boundary_load_coins = flat.txids_len();
         if snap_hdr.network != params.message_start {
             eprintln!(
                 "fatal: boundary network {:02x?} ≠ params {:02x?}",
@@ -581,23 +688,28 @@ fn main() {
         }
         let disp: Vec<u8> = snap_hdr.base_blockhash.iter().rev().cloned().collect();
         boundary_base_hash_json = jstr(&avila_consensus::hex::encode(&disp));
-        boundary_loaded = Some(m);
+        boundary_loaded = Some(flat);
     }
-    let (boundary, boundary_conflicts, conflict_ops) = if let Some(loaded) = &boundary_loaded {
+    let boundary_supplied = boundary_loaded.is_some();
+    let (boundary, boundary_conflicts, conflict_ops) = if boundary_supplied {
         // specs vs supplied state: agreement is consistency-verified;
         // disagreement marks the outpoint conflicted (known invalidity).
+        let loaded = boundary_loaded.take().unwrap();
         let mut conflict_ops: std::collections::HashSet<OutPoint> = Default::default();
         for (op, spec_coin) in &boundary_specs {
-            match loaded.get(op) {
-                Some(c) if c == spec_coin => {}
+            match loaded.b_get(op) {
+                Some(c) if c == *spec_coin => {}
                 _ => {
                     conflict_ops.insert(*op);
                 }
             }
         }
-        (loaded.clone(), conflict_ops.len(), conflict_ops)
+        let n_conflicts = conflict_ops.len();
+        (loaded, n_conflicts, conflict_ops)
     } else {
-        build_boundary(boundary_specs.into_iter())
+        let (map, n_conflicts, ops) = build_boundary(boundary_specs.into_iter());
+        let n = map.len();
+        (FlatBoundary::from_map(map, n), n_conflicts, ops)
     };
     let report = join_window(&created, &spends, &boundary, &conflict_ops);
     let resolved = report.resolved;
@@ -625,7 +737,7 @@ fn main() {
     // coin that never existed — known invalidity, not a coverage gap.
     // `first_missing` gives the earliest such position (the diagnostics
     // the audit asked for); it folds into the same first-bad boundary.
-    if boundary_loaded.is_some()
+    if boundary_supplied
         && let Some(mpos) = report.first_missing
         && mpos.h < first_bad_h
     {
@@ -646,6 +758,9 @@ fn main() {
     let mut sigop_violations = 0usize;
     let mut cb_bound_checks = 0usize;
     let mut cb_bound_violations = 0usize;
+    let mut bip68_evaluated = 0usize;
+    let mut bip68_violations = 0usize;
+    let mut bip68_unevaluated = 0usize;
     let mut resolved_spec_unjoined = 0usize;
     let mut unresolved_spec_inputs = 0usize;
     let mut blocks_fully_covered = 0usize;
@@ -813,6 +928,36 @@ fn main() {
                 );
                 continue;
             }
+            // BIP68 relative sequence locks — the production check needs
+            // the ancestor-carrying HeaderTree (--headers); without it the
+            // input is counted unevaluated rather than assumed.
+            if bip113_active(b.height) {
+                match (&tree, block_mtp.get(&b.height).copied()) {
+                    (Some(t), Some(pmtp)) => {
+                        bip68_evaluated += 1;
+                        if !bip68_locks_satisfied(
+                            &tr.tx,
+                            &coins,
+                            b.height,
+                            pmtp,
+                            t,
+                            &b.header.prev_block_hash,
+                        ) {
+                            bip68_violations += 1;
+                            mark_bad(
+                                b.height,
+                                format!("bip68 unsatisfied @ tx{j}"),
+                                &mut first_bad_h,
+                                &mut first_bad_msg,
+                            );
+                            continue;
+                        }
+                    }
+                    _ => {
+                        bip68_unevaluated += 1;
+                    }
+                }
+            }
             let outs: Vec<TxOut> = coins.iter().map(|c| c.out.clone()).collect();
             admitted.push((b.height, &tr.tx, outs, cb_flags));
         }
@@ -895,7 +1040,7 @@ fn main() {
     // With a complete supplied state, `Missing` is not a coverage gap:
     // a spend whose outpoint is absent from a COMPLETE boundary never
     // existed (or was spent before the window) — known invalidity.
-    let missing_is_invalid = boundary_loaded.is_some();
+    let missing_is_invalid = boundary_supplied;
     let known_invalid = first_bad_h != u32::MAX
         || !report.violations.is_empty()
         || report.dup_spends > 0
@@ -907,7 +1052,13 @@ fn main() {
 
     // ---- stage E: materialize valid-prefix survivor set ----------------
     let t = std::time::Instant::now();
-    let mut live: HashMap<OutPoint, Coin> = boundary.clone();
+    let boundary_coins_report = boundary.b_len();
+    // Flat-boundary live set: boundary records carry an alive bitmap;
+    // in-window creations live in `extra` and shadow boundary records
+    // (a re-created boundary op kills the boundary bit, then the new
+    // coin lives in `extra` — identical to HashMap insert-overwrite).
+    let mut boundary = boundary;
+    let mut extra: HashMap<OutPoint, Coin> = HashMap::new();
     let mut order: Vec<(Occ, bool, usize)> = Vec::new();
     for (k, c) in created.iter().enumerate() {
         order.push((c.pos, true, k));
@@ -922,9 +1073,18 @@ fn main() {
             break;
         }
         if is_creation {
-            live.insert(created[k].op, created[k].coin.clone());
+            let op = &created[k].op;
+            if let Some(i) = boundary.find(op.txid.as_bytes(), op.vout) {
+                boundary.kill(i);
+            }
+            extra.insert(*op, created[k].coin.clone());
         } else {
-            live.remove(&spends[k].op);
+            let op = &spends[k].op;
+            if extra.remove(op).is_none()
+                && let Some(i) = boundary.find(op.txid.as_bytes(), op.vout)
+            {
+                boundary.kill(i);
+            }
         }
         applied_events += 1;
     }
@@ -938,10 +1098,34 @@ fn main() {
     // Corpus boundary = spend-mentioned pre-window coins only; unspent
     // pre-window outputs are absent by construction → never "complete"
     // without an explicitly supplied full starting state.
-    let starting_state_complete = boundary_loaded.is_some();
+    let starting_state_complete = boundary_supplied;
     let header_context_checked = linkage_broken == 0 && linkage_checked > 0;
+    // `header_context_full` — every window header was present in a
+    // HeaderTree built from the node's own index, meaning each passed
+    // production AcceptBlockHeader/ContextualCheckBlockHeader (PoW,
+    // required_bits, MTP time floor, version floors) at manifest insert.
+    // Without --headers the context is linkage+MTP-only and this is false.
+    let header_context_full = tree.is_some()
+        && headers_failed == 0
+        && headers_unknown_parent == 0
+        && window_headers_in_tree == blocks.len();
     let context_free_checks_complete = ctx_free_failed == 0;
     let coverage_complete = missing_heights == 0 && dup_heights == 0;
+    // `window_complete` — every component check that production requires
+    // for this era actually ran and passed on every block: complete
+    // authenticated starting state (all three pins enforced by the caller's
+    // flags), every spend resolved, every script job executed, full header
+    // context, zero unevaluated locks, and every block's coinbase bound
+    // checked (fully-covered blocks only can certify fees).
+    let window_complete = !known_invalid
+        && resolved_inputs_complete
+        && script_jobs_complete
+        && starting_state_complete
+        && header_context_full
+        && coverage_complete
+        && time_locks_unevaluated == 0
+        && bip68_unevaluated == 0
+        && blocks_fully_covered == blocks.len();
 
     // ---- stage F: export — only when a state may legitimately exist ----
     // Never exported on known invalidity (either mode). In strict mode a
@@ -951,7 +1135,7 @@ fn main() {
     let may_publish =
         !known_invalid && (diagnostic || (resolved_inputs_complete && script_jobs_complete));
     if may_publish {
-        let canonical = canonical_bytes(&live);
+        let canonical = canonical_bytes_flat(&boundary, &extra);
         let mut f = std::fs::File::create(&export_path).unwrap_or_else(|e| {
             eprintln!("fatal: cannot create {export_path}: {e}");
             std::process::exit(2);
@@ -997,7 +1181,10 @@ fn main() {
 \"verified_inputs\":{},\"inputs_in_failed_txs\":{},\"script_failure_txs\":{},\
 \"immature_violations\":{},\"value_violations\":{},\"nonfinal_violations\":{},\
 \"time_locks_unevaluated\":{},\"sigop_violations\":{},\
+\"bip68_evaluated\":{},\"bip68_violations\":{},\"bip68_unevaluated\":{},\
 \"cb_bound_checks\":{},\"cb_bound_violations\":{},\
+\"headers_loaded\":{},\"headers_inserted\":{},\"headers_unknown_parent\":{},\
+\"headers_failed\":{},\"window_headers_in_tree\":{},\
 \"survivor_records\":{},\"applied_events\":{},\
 \"first_bad_height\":{},\"first_bad\":{},\
 \"known_invalid\":{},\
@@ -1006,7 +1193,8 @@ fn main() {
 \"boundary_base_height\":{},\"boundary_base_hash\":{},\
 \"boundary_txoutset_hash\":{},\"boundary_dup_outpoints\":{},\
 \"first_missing_height\":{},\
-\"header_context_checked\":{},\
+\"header_context_checked\":{},\"header_context_full\":{},\
+\"window_complete\":{},\
 \"context_free_checks_complete\":{},\"coverage_complete\":{},\
 \"chainstate_complete\":false,\
 \"exported\":{},\
@@ -1033,7 +1221,7 @@ fn main() {
         gap_heights_sourced,
         spends.len(),
         created.len(),
-        boundary.len(),
+        boundary_coins_report,
         boundary_conflicts,
         report.violations.len(),
         report.dup_spends,
@@ -1054,9 +1242,17 @@ fn main() {
         nonfinal_violations,
         time_locks_unevaluated,
         sigop_violations,
+        bip68_evaluated,
+        bip68_violations,
+        bip68_unevaluated,
         cb_bound_checks,
         cb_bound_violations,
-        live.len(),
+        headers_loaded,
+        headers_inserted,
+        headers_unknown_parent,
+        headers_failed,
+        window_headers_in_tree,
+        boundary.alive_indices().count() + extra.len(),
         applied_events,
         if first_bad_h == u32::MAX {
             "null".into()
@@ -1084,6 +1280,8 @@ fn main() {
             .map(|o| o.h.to_string())
             .unwrap_or_else(|| "null".into()),
         header_context_checked,
+        header_context_full,
+        window_complete,
         context_free_checks_complete,
         coverage_complete,
         exported,
@@ -1126,6 +1324,7 @@ fn main() {
     if let Some(rm) = &run_manifest_path {
         let self_sha = file_sha256("/proc/self/exe");
         let boundary_sha = boundary_path.as_ref().and_then(|p| file_sha256(p));
+        let headers_sha = headers_path.as_ref().and_then(|p| file_sha256(p));
         let export_sha = if exported {
             file_sha256(&export_path)
         } else {
@@ -1152,13 +1351,14 @@ fn main() {
             "{{\"type\":\"run_manifest\",\
 \"build_rev\":{},\"checkout_rev\":{},\
 \"binary_sha256\":{},\"corpus_sha256\":{},\
-\"boundary_sha256\":{},\"export_sha256\":{},\
+\"boundary_sha256\":{},\"headers_sha256\":{},\"export_sha256\":{},\
 \"argv\":[{}],\"exit_code\":{},\"known_invalid\":{},\"exported\":{}}}",
             jstr(option_env!("AVILA_GIT_REV").unwrap_or("unknown")),
             jstr(&checkout_rev),
             self_sha.map(|s| jstr(&s)).unwrap_or("null".into()),
             jstr(&corpus_sha256),
             boundary_sha.map(|s| jstr(&s)).unwrap_or("null".into()),
+            headers_sha.map(|s| jstr(&s)).unwrap_or("null".into()),
             export_sha.map(|s| jstr(&s)).unwrap_or("null".into()),
             argv_json,
             exit_code,

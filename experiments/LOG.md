@@ -876,3 +876,43 @@ A single ETA over ~550k heterogeneous blocks is fake precision — the
 calibrated band is what the measurements actually support. Verified:
 108/108 node tests; the running node continues on the corrected
 build (windows warming).
+
+## 2026-09-27 — Gate 4 COMPLETE: real-window comparison, byte-exact
+
+**Result:** the join engine validated a complete real mainnet window —
+heights 454,001–454,301 (301 blocks) — against a genuine `dumptxoutset`
+boundary at h454,000 (45,616,695 coins, txoutset-hash
+`00617975…1f581c`, all three pins enforced) and materialized an end
+state that is **byte-for-byte identical** to the node's independently
+produced chainstate at h454,301: 3,594,371,786 bytes, 45,751,759 coins,
+sha256 `865d32cfaea57e15352ece551685dd71d9b96ea39f8118cc0ca0152b44cd3168`
+on both sides.
+
+**Checks run:** 968,778 headers through production `HeaderTree::insert`
+(full PoW/nBits/MTP path) with 0 failures; 1,303,682 non-coinbase inputs
+resolved with 0 missing, 0 conflicts, 0 dup-spends; 615,503 txs through
+context-free + coinbase-bound + maturity + value + locktime + sigops +
+**BIP68 (all evaluated, 0 violations, 0 unevaluated)**; all queued script
+jobs completed (`verified_inputs = inputs_noncb`).
+
+**Timing (guarded, one job at a time):** `window_join` wall 112 s —
+stages: parse 5.2 s, emit 1.3 s, boundary load inside join 28.6 s,
+predicate 0.9 s, scripts 38.5 s (8 workers), materialize 4.4 s,
+export 17.0 s. Peak RSS 10,239 MiB under `guard_run --max 10240`.
+Run manifest `corpus-454k/run-manifest.json` ties build_rev
+`c80d991+dirty`, binary/corpus/boundary/headers/export SHA-256s, argv.
+
+**Required structural fix:** `HashMap<OutPoint,Coin>` for 45.6M coins
+peaked >14 GB (two memcg kills under the cap — machine safe both times).
+Replaced with `FlatBoundary` (one sorted `Vec` of 64-byte records + one
+append-only script blob + alive bitmap; ~4.2 GB steady, no rehash
+transient). `join_window` is now generic over a `BoundaryView` trait
+(HashMap impl kept for corpus-derived boundaries). Also fixed:
+`boundary.clone()` at stage E (full-map dup), `loaded.clone()` at
+spec-check, `window_lo/hi` now min/max over heights (blk-file order is
+not height order — cosmetic field only), wasteful `boundary.keys()`
+iteration removed from the join.
+
+**Resources:** `tools/guard_run.sh` (cgroup MemoryMax + swap 0 +
+preflight refusal) now mandated by AGENTS.md; verified live three
+times (two cap-kills, machine untouched).
