@@ -1,0 +1,204 @@
+{
+  "review": "Gate 4 pushed boundary integration: 695f73c + cd3cb45",
+  "recorded_utc": "2026-09-27T01:54:26.740626+00:00",
+  "reviewed_head": "cd3cb4519034cb1ac8f0396f88b9478f0d2a07d3",
+  "worktree_status_before_review_document_edits": "",
+  "method": "Read-only source and saved artifact review, file hashing, and read-only GitHub Actions metadata query. Findings are source-derived unless marked as saved results.",
+  "not_run": [
+    "builds",
+    "tests",
+    "examples",
+    "benchmarks",
+    "corpus scans",
+    "node RPCs",
+    "live-node operations"
+  ],
+  "ci": {
+    "query": "gh run list --limit 10 --json databaseId,headSha,name,status,conclusion,url",
+    "verification": "Both listed success records returned by GitHub API during this review; initial sandbox attempts could not connect, read-only escalated retry succeeded.",
+    "runs": [
+      {
+        "headSha": "cd3cb4519034cb1ac8f0396f88b9478f0d2a07d3",
+        "databaseId": 36285985938,
+        "status": "completed",
+        "conclusion": "success",
+        "name": "CI",
+        "url": "https://github.com/Connoravila1/Avila-Node/actions/runs/36285985938"
+      },
+      {
+        "headSha": "695f73cb7c8da6fe5d8c2b4a55821402142a2eb3",
+        "databaseId": 36285627391,
+        "status": "completed",
+        "conclusion": "success",
+        "name": "CI",
+        "url": "https://github.com/Connoravila1/Avila-Node/actions/runs/36285627391"
+      }
+    ],
+    "workflow_scope": "Workspace fmt, clippy --all-targets, cargo test --workspace, docs, CLI smoke; independent avila-cli release builds compare avila-node binaries. No invocation of tools/test_window_join_exec.py or run-manifest behavioral controls."
+  },
+  "files": {
+    "crates/avila-consensus/examples/window_join.rs": {
+      "bytes": 41351,
+      "sha256": "44b373ff52d31dda3abae7dc871d5d0cbb8b7840f25d122874c4cc7583014cc3"
+    },
+    "crates/avila-consensus/examples/shared/join_engine.rs": {
+      "bytes": 8051,
+      "sha256": "15f51427e4451d414b63c4e67f9cf6c0201d8ea9054c480c60878bfd2e0b5998"
+    },
+    "crates/avila-consensus/examples/state_join.rs": {
+      "bytes": 69936,
+      "sha256": "73a225bb6c0c63590eaa0ceda6853521b33c8d9ec69fb03932e51cf60cf90610"
+    },
+    "crates/avila-consensus/src/snapverify.rs": {
+      "bytes": 86882,
+      "sha256": "cb7e37adcc3a5877233ac4a5c31b58150a1b4bb553974b049d8b3ad89cf81a5d"
+    },
+    "crates/avila-consensus/src/hex.rs": {
+      "bytes": 5900,
+      "sha256": "5e4d926fabcea0d422f75719ad34a562a560a0f97032c4738e55cbcdf38bf799"
+    },
+    "tools/test_window_join_exec.py": {
+      "bytes": 16910,
+      "sha256": "312971a0e2a7c9435c0a3eaea71b97c6c4da1add62542f671fb7c5410e1051a9"
+    },
+    ".github/workflows/ci.yml": {
+      "bytes": 2462,
+      "sha256": "f4ce30e163045164f144a8770fc319cba36666b65cd365273bf589b63a1ffbe9"
+    },
+    "experiments/2026-09-26-ibd-window-join.md": {
+      "bytes": 7650,
+      "sha256": "9f449cfde9c1ba632504a4eaa5c39de696bc3cb86883b573bd8403889b389526"
+    },
+    "experiments/results/gate4/exec-regression-2026-09-26.log": {
+      "bytes": 2948,
+      "sha256": "7b9fd6d1a60d0a1f4a514484c18bddc20185fe1569e206eade502242df5f592a"
+    },
+    "experiments/results/gate4/cargo-test-release-2026-09-26c.log": {
+      "bytes": 37332,
+      "sha256": "bbdfb5bfbaa151072d641a09b2f363ce05671ef814b7f8739ba8423f7a4a22cb"
+    },
+    "experiments/results/gate4/source-rev.txt": {
+      "bytes": 106,
+      "sha256": "649a81e4b0a052ae345a82bd6b54ac691418e77a6d509bd5023bb052188e3136"
+    },
+    "experiments/results/gate4/segment-v3.jsonl": {
+      "bytes": 1765,
+      "sha256": "1c8fde1c9e5ffd05b238807cbc925bbc80690ab04399d0d0f16f23f0abce2a86"
+    },
+    "experiments/results/gate4/window-v3.jsonl": {
+      "bytes": 1751,
+      "sha256": "d04019f1a7b99e031785e115e15ee53847ac072969fa0e7261ba496165efc494"
+    }
+  },
+  "saved_regression": {
+    "path": "experiments/results/gate4/exec-regression-2026-09-26.log",
+    "pass_lines": 74,
+    "fail_lines": 0,
+    "text": "PASS ok exit 0 rc=0\nPASS ok verified=1 \nPASS ok exported-not-chainstate \nPASS dup-boundary [strict] exit 1 rc=1\nPASS dup-boundary [strict] not exported \nPASS dup-boundary [strict] known_invalid \nPASS dup-boundary [strict] dup counted \nPASS dup-boundary [diag] exit 1 rc=1\nPASS dup-boundary [diag] not exported \nPASS dup-boundary [diag] known_invalid \nPASS dup-boundary [diag] dup counted \nPASS boundary-conflict [strict] exit 1 rc=1\nPASS boundary-conflict [strict] not exported \nPASS boundary-conflict [strict] known_invalid \nPASS boundary-conflict [strict] conflict counted \nPASS boundary-conflict [diag] exit 1 rc=1\nPASS boundary-conflict [diag] not exported \nPASS boundary-conflict [diag] known_invalid \nPASS boundary-conflict [diag] conflict counted \nPASS immature [strict] exit 1 rc=1\nPASS immature [strict] not exported \nPASS immature [strict] known_invalid \nPASS immature [strict] immature counted \nPASS immature [diag] exit 1 rc=1\nPASS immature [diag] not exported \nPASS immature [diag] known_invalid \nPASS immature [diag] immature counted \nPASS overspend [strict] exit 1 rc=1\nPASS overspend [strict] not exported \nPASS overspend [strict] known_invalid \nPASS overspend [strict] value violation \nPASS overspend [diag] exit 1 rc=1\nPASS overspend [diag] not exported \nPASS overspend [diag] known_invalid \nPASS overspend [diag] value violation \nPASS neg-output [strict] exit 1 rc=1\nPASS neg-output [strict] not exported \nPASS neg-output [strict] known_invalid \nPASS neg-output [strict] context-free catch \nPASS neg-output [diag] exit 1 rc=1\nPASS neg-output [diag] not exported \nPASS neg-output [diag] known_invalid \nPASS neg-output [diag] context-free catch \nPASS nonfinal [strict] exit 1 rc=1\nPASS nonfinal [strict] not exported \nPASS nonfinal [strict] known_invalid \nPASS nonfinal [strict] nonfinal counted \nPASS nonfinal [diag] exit 1 rc=1\nPASS nonfinal [diag] not exported \nPASS nonfinal [diag] known_invalid \nPASS nonfinal [diag] nonfinal counted \nPASS excess-cb [strict] exit 1 rc=1\nPASS excess-cb [strict] not exported \nPASS excess-cb [strict] known_invalid \nPASS excess-cb [strict] cb bound violation \nPASS excess-cb [diag] exit 1 rc=1\nPASS excess-cb [diag] not exported \nPASS excess-cb [diag] known_invalid \nPASS excess-cb [diag] cb bound violation \nPASS badsig-prefix [strict] exit 1 rc=1\nPASS badsig-prefix [strict] not exported \nPASS badsig-prefix [strict] known_invalid \nPASS badsig-prefix [strict] fails at 141, prefix before it \nPASS badsig-prefix [diag] exit 1 rc=1\nPASS badsig-prefix [diag] not exported \nPASS badsig-prefix [diag] known_invalid \nPASS badsig-prefix [diag] fails at 141, prefix before it \nPASS workers0 exit 2 rc=2\nPASS unresolved strict exit 1 rc=1\nPASS unresolved diagnostic exit 0 rc=0\nPASS diagnostic incomplete-labeled \nPASS boundary resolves spec-less spend rc=0 missing=0\nPASS boundary/spec mismatch → invalid rc=1\nPASS absent-from-boundary → invalid rc=1\n\nall window_join executable regressions pass\n",
+    "reported_new_count": 77,
+    "qualification": "The 77-check run is user-reported. The available saved log contains the earlier 74 checks; current source adds three boundary rejection assertions. No new run manifest or 77-check log was found in the gate4 artifact directory."
+  },
+  "gate4_artifact_filenames": [
+    "cargo-test-release-2026-09-26b.log",
+    "cargo-test-release-2026-09-26c.log",
+    "dup.json",
+    "exec-regression-2026-09-26.log",
+    "segment-341808-342108.canonical",
+    "segment-341808-342108.canonical.prerepair",
+    "segment-341808-342108.jsonl",
+    "segment-manifest.jsonl",
+    "segment-v3.canonical",
+    "segment-v3.jsonl",
+    "segment-v3.stderr",
+    "source-rev.txt",
+    "window-341k-PREREPAIR-unshared-join.jsonl",
+    "window-341k-diagnostic.canonical",
+    "window-341k-diagnostic.jsonl",
+    "window-341k-diagnostic.stderr",
+    "window-manifest.jsonl",
+    "window-v3.canonical",
+    "window-v3.jsonl"
+  ],
+  "closed_by_source_review": [
+    "snapshot network compared to selected network",
+    "snapshot base hash compared to first corpus header parent",
+    "duplicate outpoint rejection",
+    "creation height bounded by supplied corpus first height minus one",
+    "loader returns parsed Header and checks decoded coin count",
+    "earlier invalidity/export and negative-output repairs remain closed"
+  ],
+  "findings": [
+    {
+      "id": "P1-pin-parser",
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "line": 489,
+      "claim": "Valid --boundary-base-hash input cannot complete parsing.",
+      "reason": "Slices are pin[60 - i*2 .. 62 - i*2] for i in 0..32. First slice skips the last byte; i=31 makes the lower endpoint negative mathematically, which underflows usize or becomes an invalid slice. Source-derived, not executed."
+    },
+    {
+      "id": "P1-donor-binding",
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "line": 443,
+      "claim": "Parent equality does not validate donor height or coin-set contents.",
+      "reason": "Height is inferred from unverified corpus metadata with wrapping_sub(1); no expected donor height, donor coin commitment, or expected raw snapshot digest is checked. Manifest only computes a raw snapshot hash after work. Still a supplied research fixture, not trust-free validation."
+    },
+    {
+      "id": "P2-run-provenance",
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "line": 1043,
+      "claim": "git_rev names runtime checkout HEAD rather than build source.",
+      "reason": "CARGO_MANIFEST_DIR anchors the path, but git rev-parse runs at process runtime. Failure exits precede manifest generation; args are lossy space-joined; jstr omits control-character escaping. Snapshot/export hashes reread entire files after reported stages/RSS. No source build receipt or observed manifest artifact supplied."
+    }
+  ],
+  "existing_remaining_scope": [
+    "Required header/contextual and BIP68 checks for selected era not performed by real-window driver.",
+    "header_context_checked still means some matching adjacent links; projection remains valid_prefix despite partial coverage.",
+    "Full-boundary Missing does not set earliest failing position; loaded live conflict can resolve Coin though outer guard correctly refuses export.",
+    "Large boundary held in cloned in-memory maps; no full-state memory scaling evidence yet."
+  ],
+  "source_excerpts": [
+    {
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "first_line": 438,
+      "last_line": 505,
+      "text": "    if let Some(bp) = &boundary_path {\n        // A supplied boundary is meaningful only as the state at the\n        // window's parent block: the corpus's first block must name it\n        // (the audit's comparison window starts \"immediately after\" the\n        // exported boundary).\n        let base_height = blocks[0].height.wrapping_sub(1);\n        boundary_base_height = Some(base_height);\n        let mut m: HashMap<OutPoint, Coin> = HashMap::new();\n        let mut dups = 0usize;\n        let snap_hdr = for_each_coin(\n            std::path::Path::new(bp),\n            Some(base_height), // creation heights may not exceed the base\n            |txid_b, vout, code, value, spk| {\n                let txid = avila_consensus::hash::Txid::from_bytes(txid_b);\n                if m.insert(\n                    OutPoint { txid, vout },\n                    Coin {\n                        out: TxOut {\n                            value,\n                            script_pubkey: Script::new(spk.to_vec()),\n                        },\n                        height: (code >> 1) as u32,\n                        coinbase: code & 1 != 0,\n                    },\n                )\n                .is_some()\n                {\n                    dups += 1; // a dump cannot name one outpoint twice\n                }\n                Ok(())\n            },\n        )\n        .unwrap_or_else(|e| {\n            eprintln!(\"fatal: --boundary load failed: {e}\");\n            std::process::exit(2);\n        });\n        boundary_dup_outpoints = dups;\n        if boundary_dup_outpoints > 0 {\n            eprintln!(\"fatal: boundary contains {boundary_dup_outpoints} duplicate outpoints\");\n            std::process::exit(2);\n        }\n        boundary_load_coins = m.len();\n        if snap_hdr.network != params.message_start {\n            eprintln!(\n                \"fatal: boundary network {:02x?} ≠ params {:02x?}\",\n                snap_hdr.network, params.message_start\n            );\n            std::process::exit(2);\n        }\n        if let Some(pin) = &boundary_base_hash {\n            // dumptxoutset reports display-order; file stores LE bytes\n            let want: Vec<u8> = (0..32)\n                .map(|i| u8::from_str_radix(&pin[60 - i * 2..62 - i * 2], 16))\n                .collect::<Result<_, _>>()\n                .expect(\"--boundary-base-hash hex\");\n            if snap_hdr.base_blockhash != want[..] {\n                eprintln!(\"fatal: --boundary base hash ≠ --boundary-base-hash pin\");\n                std::process::exit(2);\n            }\n        }\n        if snap_hdr.base_blockhash[..] != blocks[0].header.prev_block_hash.as_bytes()[..] {\n            eprintln!(\n                \"fatal: boundary base ≠ corpus window parent — window not adjacent to the exported state\"\n            );\n            std::process::exit(2);\n        }\n        let disp: Vec<u8> = snap_hdr.base_blockhash.iter().rev().cloned().collect();\n        boundary_base_hash_json = jstr(&avila_consensus::hex::encode(&disp));"
+    },
+    {
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "first_line": 805,
+      "last_line": 864,
+      "text": "    // ---- ONE invalidity decision drives exit + export ------------------\n    // With a complete supplied state, `Missing` is not a coverage gap:\n    // a spend whose outpoint is absent from a COMPLETE boundary never\n    // existed (or was spent before the window) — known invalidity.\n    let missing_is_invalid = boundary_loaded.is_some();\n    let known_invalid = first_bad_h != u32::MAX\n        || !report.violations.is_empty()\n        || report.dup_spends > 0\n        || boundary_conflicts > 0\n        || failed_tasks > 0\n        || ctx_free_failed > 0\n        || linkage_broken > 0\n        || (missing_is_invalid && report.missing_spends > 0);\n\n    // ---- stage E: materialize valid-prefix survivor set ----------------\n    let t = std::time::Instant::now();\n    let mut live: HashMap<OutPoint, Coin> = boundary.clone();\n    let mut order: Vec<(Occ, bool, usize)> = Vec::new();\n    for (k, c) in created.iter().enumerate() {\n        order.push((c.pos, true, k));\n    }\n    for (k, s) in spends.iter().enumerate() {\n        order.push((s.pos, false, k));\n    }\n    order.sort_by_key(|a| a.0);\n    let mut applied_events = 0usize;\n    for (pos, is_creation, k) in order {\n        if pos.h >= first_bad_h {\n            break;\n        }\n        if is_creation {\n            live.insert(created[k].op, created[k].coin.clone());\n        } else {\n            live.remove(&spends[k].op);\n        }\n        applied_events += 1;\n    }\n    let mat_s = t.elapsed().as_secs_f64();\n\n    // ---- component completion (explicit, not one overloaded flag) ------\n    // `resolved_inputs_complete` is driven by the JOIN (a spend resolved\n    // from an authenticated local creation record needs no spec hint).\n    let resolved_inputs_complete = report.missing_spends == 0;\n    let script_jobs_complete = completed_tasks == queued_tasks && failed_tasks == 0;\n    // Corpus boundary = spend-mentioned pre-window coins only; unspent\n    // pre-window outputs are absent by construction → never \"complete\"\n    // without an explicitly supplied full starting state.\n    let starting_state_complete = boundary_loaded.is_some();\n    let header_context_checked = linkage_broken == 0 && linkage_checked > 0;\n    let context_free_checks_complete = ctx_free_failed == 0;\n    let coverage_complete = missing_heights == 0 && dup_heights == 0;\n\n    // ---- stage F: export — only when a state may legitimately exist ----\n    // Never exported on known invalidity (either mode). In strict mode a\n    // state artifact additionally requires full input coverage.\n    let t = std::time::Instant::now();\n    let mut exported = false;\n    let may_publish =\n        !known_invalid && (diagnostic || (resolved_inputs_complete && script_jobs_complete));\n    if may_publish {"
+    },
+    {
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "first_line": 1006,
+      "last_line": 1070,
+      "text": "    // ---- exit: ONE contract -------------------------------------------\n    // Known invalidity → 1 in BOTH modes (diagnostic permits coverage\n    // gaps, never acceptance of detected invalidity). Incomplete\n    // coverage under strict → 1. Diagnostic incomplete-but-clean → 0.\n    if known_invalid {\n        eprintln!(\"invalid: {first_bad_msg} @ {first_bad_h}\");\n        std::process::exit(1);\n    }\n    if !(resolved_inputs_complete && script_jobs_complete) && !diagnostic {\n        eprintln!(\n            \"incomplete: missing_spends={} failed_tasks={failed_tasks}\",\n            report.missing_spends\n        );\n        std::process::exit(1);\n    }\n\n    // ---- run manifest: source + binary + inputs + outputs, one record --\n    // Lets an auditor prove WHICH binary produced WHICH output from\n    // WHICH inputs — the audit found the archived binary hash had\n    // drifted from the executable, so the identity goes into the file.\n    if let Some(rm) = &run_manifest_path {\n        let self_sha = std::fs::read(\"/proc/self/exe\")\n            .map(|b| sha256(&b))\n            .map(|h| avila_consensus::hex::encode(&h))\n            .ok();\n        let corpus_sha = corpus_sha256;\n        let boundary_sha = boundary_path\n            .as_ref()\n            .and_then(|p| std::fs::read(p).ok())\n            .map(|b| avila_consensus::hex::encode(&sha256(&b)));\n        let export_sha = if exported {\n            std::fs::read(&export_path)\n                .ok()\n                .map(|b| avila_consensus::hex::encode(&sha256(&b)))\n        } else {\n            None\n        };\n        let git_rev = std::process::Command::new(\"git\")\n            .args([\n                \"-C\",\n                concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../..\"),\n                \"rev-parse\",\n                \"HEAD\",\n            ])\n            .output()\n            .ok()\n            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())\n            .unwrap_or_else(|| \"unknown\".into());\n        let manifest = format!(\n            \"{{\\\"type\\\":\\\"run_manifest\\\",\\\"git_rev\\\":{},\\\n\\\"binary_sha256\\\":{},\\\"corpus_sha256\\\":{},\\\n\\\"boundary_sha256\\\":{},\\\"export_sha256\\\":{},\\\n\\\"args\\\":{},\\\"known_invalid\\\":{},\\\"exported\\\":{}}}\",\n            jstr(&git_rev),\n            self_sha.map(|s| jstr(&s)).unwrap_or(\"null\".into()),\n            jstr(&corpus_sha),\n            boundary_sha.map(|s| jstr(&s)).unwrap_or(\"null\".into()),\n            export_sha.map(|s| jstr(&s)).unwrap_or(\"null\".into()),\n            jstr(&std::env::args().skip(1).collect::<Vec<_>>().join(\" \")),\n            known_invalid,\n            exported,\n        );\n        std::fs::write(rm, manifest + \"\\n\").expect(\"run manifest writable\");\n    }\n}"
+    },
+    {
+      "path": "crates/avila-consensus/examples/window_join.rs",
+      "first_line": 169,
+      "last_line": 171,
+      "text": "fn jstr(s: &str) -> String {\n    format!(\"\\\"{}\\\"\", s.replace('\\\\', \"\\\\\\\\\").replace('\"', \"\\\\\\\"\"))\n}"
+    },
+    {
+      "path": "tools/test_window_join_exec.py",
+      "first_line": 315,
+      "last_line": 375,
+      "text": "    # --- --boundary: supplied state resolves a spec-less spend ----------\n    # the unresolved corpus's missing spec is (BOP'bb',0) — supply it\n    p = make_unres()\n    bp = os.path.join(td, 'state.utxo')\n    open(bp, 'wb').write(snapshot({b'\\xbb' * 32: [(0, 100, val, OP_TRUE)]}))\n    rc, out, _ = run(p, '--boundary', bp)\n    d = last_json(out)\n    check('boundary resolves spec-less spend',\n          rc == 0 and d['starting_state_complete']\n          and d['verified_inputs'] == 1 and d['join_missing_spends'] == 0,\n          f'rc={rc} missing={d[\"join_missing_spends\"]}')\n\n    # spec says value=val but boundary holds a DIFFERENT coin → conflict\n    p = make_ok()\n    bp2 = os.path.join(td, 'bad.utxo')\n    open(bp2, 'wb').write(snapshot({BOP: [(0, 100, val - 5, OP_TRUE)]}))\n    rc, out, _ = run(p, '--boundary', bp2)\n    d = last_json(out)\n    check('boundary/spec mismatch → invalid',\n          rc == 1 and d['boundary_conflicts'] >= 1, f'rc={rc}')\n\n    # boundary supplied but spend's outpoint absent entirely → the coin\n    # does not exist → invalid (Missing is no longer a coverage gap)\n    p = make_unres()\n    bp3 = os.path.join(td, 'empty.utxo')\n    open(bp3, 'wb').write(snapshot({b'\\xdd' * 32: [(0, 100, val, OP_TRUE)]}))\n    rc, out, _ = run(p, '--boundary', bp3)\n    d = last_json(out)\n    check('absent-from-boundary → invalid',\n          rc == 1 and d['join_missing_spends'] == 1, f'rc={rc}')\n\n    # --- boundary INTEGRITY checks (exit 2, malformed input) --------------\n    # wrong network magic (mainnet f9beb4d9 vs the run's regtest)\n    p = make_unres()\n    bpn = os.path.join(td, 'net.utxo')\n    snap = snapshot({b'\\xbb' * 32: [(0, 100, val, OP_TRUE)]})\n    snap = snap[:7] + b'\\xf9\\xbe\\xb4\\xd9' + snap[11:]\n    open(bpn, 'wb').write(snap)\n    rc, out, err = run(p, '--boundary', bpn)\n    check('wrong-network boundary → exit 2', rc == 2, f'rc={rc} err={err[-80:]}')\n\n    # base hash not naming the window's parent → not adjacent → exit 2\n    bpb = os.path.join(td, 'far.utxo')\n    open(bpb, 'wb').write(snapshot({b'\\xbb' * 32: [(0, 100, val, OP_TRUE)]},\n                                  base=b'\\x77' * 32))\n    rc, out, err = run(p, '--boundary', bpb)\n    check('non-adjacent base → exit 2', rc == 2, f'rc={rc}')\n\n    # duplicate outpoint in the dump → malformed → exit 2\n    bpd = os.path.join(td, 'dup.utxo')\n    open(bpd, 'wb').write(\n        snapshot({b'\\xbb' * 32: [(0, 100, val, OP_TRUE),\n                                 (0, 100, val, OP_TRUE)]}))\n    rc, out, err = run(p, '--boundary', bpd)\n    check('dup-outpoint boundary → exit 2', rc == 2, f'rc={rc}')\n\nprint()\nif fails:\n    print(\"FAILED:\", fails)\n    sys.exit(1)\nprint(\"all window_join executable regressions pass\")"
+    },
+    {
+      "path": "crates/avila-consensus/src/snapverify.rs",
+      "first_line": 408,
+      "last_line": 460,
+      "text": "/// Streams every coin of a `dumptxoutset`-format snapshot (Core\n/// `utxo\\xff`, version 2). `f` receives `(txid, vout, code, value,\n/// script_pubkey)` per coin — `code = height * 2 + coinbase` — using the\n/// exact `coin`/`group` decode path the verifier uses. The streamed\n/// count must equal the header's declared count, else `Err`.\n///\n/// `base_height`, when `Some`, bounds each coin's creation height the\n/// same way the verifier does (`code >> 1 <= base_height`); `None`\n/// leaves the bound open. Returns the parsed snapshot [`Header`] —\n/// caller verifies `network` and `base_blockhash` against the intended\n/// chain and boundary.\n///\n/// This is a loader, not a verifier: it reconstructs coins for a\n/// boundary state. `verify_stream` remains the integrity check.\n///\n/// # Errors\n/// I/O on read; `InvalidData` on malformed records or a coin count that\n/// disagrees with the header. `f`'s errors propagate.\npub fn for_each_coin(\n    path: &Path,\n    base_height: Option<u32>,\n    mut f: impl FnMut([u8; 32], u32, u64, i64, &[u8]) -> io::Result<()>,\n) -> io::Result<Header> {\n    use std::io::Read;\n    let mut file = File::open(path)?;\n    let mut hdr = [0u8; HEADER_LEN as usize];\n    file.read_exact(&mut hdr)?;\n    if &hdr[..5] != b\"utxo\\xff\" {\n        return Err(invalid(\"bad snapshot magic\"));\n    }\n    if u16::from_le_bytes([hdr[5], hdr[6]]) != 2 {\n        return Err(invalid(\"unsupported snapshot version\"));\n    }\n    let mut network = [0u8; 4];\n    network.copy_from_slice(&hdr[7..11]);\n    let mut base_blockhash = [0u8; 32];\n    base_blockhash.copy_from_slice(&hdr[11..43]);\n    let want = u64::from_le_bytes(\n        hdr[43..51]\n            .try_into()\n            .map_err(|_| invalid(\"truncated snapshot header\"))?,\n    );\n    let height_bound = base_height.unwrap_or(u32::MAX);\n\n    let mut buf: Vec<u8> = Vec::new();\n    let mut fill = 0usize;\n    let mut eof = false;\n    let mut streamed = 0u64;\n    let mut ser: Vec<u8> = Vec::new();\n    loop {\n        let mut p = 0usize;\n        loop {\n            match group::<true>(&buf[p..fill], height_bound, &mut ser) {"
+    },
+    {
+      "path": "crates/avila-consensus/src/snapverify.rs",
+      "first_line": 498,
+      "last_line": 526,
+      "text": "                Err(PErr::Short) => break,\n                Err(PErr::Bad(m)) => return Err(invalid(m)),\n            }\n        }\n        buf.drain(..p);\n        fill -= p;\n        if eof {\n            if fill != 0 {\n                return Err(invalid(\"trailing unparsed bytes\"));\n            }\n            break;\n        }\n        buf.resize(fill + READ_BLOCK, 0);\n        let n = file.read(&mut buf[fill..])?;\n        buf.truncate(fill + n);\n        fill += n;\n        if n == 0 {\n            eof = true;\n        }\n    }\n    if streamed != want {\n        return Err(invalid(\"coin count disagrees with header\"));\n    }\n    Ok(Header {\n        network,\n        base_blockhash,\n        coins_count: want,\n    })\n}"
+    }
+  ],
+  "disposition": "Accept implemented component guards and verified green CI. Fix donor hash-pin parser, finish existing donor qualification and build/run provenance alongside acquisition, then perform complete real-window comparison. Gate 4 remains open; no new speed measurement or full-IBD range follows from this push."
+}

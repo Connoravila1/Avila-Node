@@ -411,11 +411,22 @@ pub fn read_header(f: &File) -> io::Result<Header> {
 /// exact `coin`/`group` decode path the verifier uses. The streamed
 /// count must equal the header's declared count, else `Err`.
 ///
+/// A `for_each_coin` result: the file header plus the computed
+/// `hash_serialized_3` coin-set commitment — the same digest
+/// `verify_stream` reports — so a caller can compare the loaded set to
+/// the donor's published `txoutset_hash`.
+pub struct LoadedCoins {
+    pub header: Header,
+    /// SHA256d over every coin's `TxOutSer`, in file order.
+    pub txoutset_hash: [u8; 32],
+}
+
 /// `base_height`, when `Some`, bounds each coin's creation height the
 /// same way the verifier does (`code >> 1 <= base_height`); `None`
-/// leaves the bound open. Returns the parsed snapshot [`Header`] —
-/// caller verifies `network` and `base_blockhash` against the intended
-/// chain and boundary.
+/// leaves the bound open. Returns the parsed snapshot [`Header`] and the
+/// coin-set commitment — caller verifies `network`, `base_blockhash`,
+/// the commitment and the donor's height against the intended chain and
+/// boundary.
 ///
 /// This is a loader, not a verifier: it reconstructs coins for a
 /// boundary state. `verify_stream` remains the integrity check.
@@ -427,7 +438,7 @@ pub fn for_each_coin(
     path: &Path,
     base_height: Option<u32>,
     mut f: impl FnMut([u8; 32], u32, u64, i64, &[u8]) -> io::Result<()>,
-) -> io::Result<Header> {
+) -> io::Result<LoadedCoins> {
     use std::io::Read;
     let mut file = File::open(path)?;
     let mut hdr = [0u8; HEADER_LEN as usize];
@@ -448,6 +459,7 @@ pub fn for_each_coin(
             .map_err(|_| invalid("truncated snapshot header"))?,
     );
     let height_bound = base_height.unwrap_or(u32::MAX);
+    let mut sha = ShaState::default();
 
     let mut buf: Vec<u8> = Vec::new();
     let mut fill = 0usize;
@@ -461,6 +473,7 @@ pub fn for_each_coin(
                 Ok(g) => {
                     let mut q = 0usize;
                     for _ in 0..g.n {
+                        let coin_start = q; // whole ser record → commitment
                         // ser record: txid32 ‖ vout4 ‖ code4 ‖ value8
                         // ‖ compactsize len ‖ script — bounds-checked.
                         let rec = ser
@@ -490,6 +503,9 @@ pub fn for_each_coin(
                             .ok_or_else(|| invalid("ser script bounds"))?;
                         f(txid, vout, code, value, spk)?;
                         q += slen;
+                        // hash the exact TxOutSer bytes the verifier's
+                        // commitment covers
+                        sha.update(&ser[coin_start..q]);
                         streamed += 1;
                     }
                     ser.clear();
@@ -518,10 +534,13 @@ pub fn for_each_coin(
     if streamed != want {
         return Err(invalid("coin count disagrees with header"));
     }
-    Ok(Header {
-        network,
-        base_blockhash,
-        coins_count: want,
+    Ok(LoadedCoins {
+        header: Header {
+            network,
+            base_blockhash,
+            coins_count: want,
+        },
+        txoutset_hash: finish_hash(sha),
     })
 }
 

@@ -167,7 +167,35 @@ fn money_range(v: i64) -> bool {
 }
 
 fn jstr(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Streaming single-SHA256 of a file — identical to `sha256sum`, no
+/// whole-file allocation (boundaries run to multiple GB).
+fn file_sha256(p: &str) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(p).ok()?;
+    let mut st = avila_consensus::snapverify::ShaState::default();
+    let mut chunk = vec![0u8; 8 << 20];
+    loop {
+        let n = f.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        st.update(&chunk[..n]);
+    }
+    Some(avila_consensus::hex::encode(&st.finalize()))
 }
 
 fn hexid(h: &BlockHash) -> String {
@@ -210,6 +238,8 @@ fn main() {
     let manifest_path = opt("--manifest");
     let boundary_path = opt("--boundary"); // dumptxoutset-format starting state
     let boundary_base_hash = opt("--boundary-base-hash"); // pin from dumptxoutset
+    let boundary_base_height_pin = opt("--boundary-base-height");
+    let boundary_txoutset_pin = opt("--boundary-txoutset-hash");
     let run_manifest_path = opt("--run-manifest");
     let export_path = opt("--export").unwrap_or_else(|| format!("{path}.canonical"));
     let workers: usize = opt("--workers")
@@ -435,16 +465,29 @@ fn main() {
     let mut boundary_dup_outpoints = 0usize;
     let mut boundary_base_height: Option<u32> = None;
     let mut boundary_base_hash_json = "null".to_string();
+    let mut boundary_txoutset_hash_json = "null".to_string();
     if let Some(bp) = &boundary_path {
         // A supplied boundary is meaningful only as the state at the
         // window's parent block: the corpus's first block must name it
         // (the audit's comparison window starts "immediately after" the
         // exported boundary).
-        let base_height = blocks[0].height.wrapping_sub(1);
+        let base_height = blocks[0].height.checked_sub(1).unwrap_or_else(|| {
+            eprintln!("fatal: window starts at height 0 — no parent boundary can precede it");
+            std::process::exit(2);
+        });
         boundary_base_height = Some(base_height);
+        if let Some(pin) = &boundary_base_height_pin {
+            let pinned: u32 = pin.parse().expect("--boundary-base-height u32");
+            if pinned != base_height {
+                eprintln!(
+                    "fatal: donor height {pinned} ≠ window parent height {base_height} — boundary is not adjacent"
+                );
+                std::process::exit(2);
+            }
+        }
         let mut m: HashMap<OutPoint, Coin> = HashMap::new();
         let mut dups = 0usize;
-        let snap_hdr = for_each_coin(
+        let loaded = for_each_coin(
             std::path::Path::new(bp),
             Some(base_height), // creation heights may not exceed the base
             |txid_b, vout, code, value, spk| {
@@ -471,6 +514,7 @@ fn main() {
             eprintln!("fatal: --boundary load failed: {e}");
             std::process::exit(2);
         });
+        let snap_hdr = loaded.header;
         boundary_dup_outpoints = dups;
         if boundary_dup_outpoints > 0 {
             eprintln!("fatal: boundary contains {boundary_dup_outpoints} duplicate outpoints");
@@ -486,10 +530,17 @@ fn main() {
         }
         if let Some(pin) = &boundary_base_hash {
             // dumptxoutset reports display-order; file stores LE bytes
-            let want: Vec<u8> = (0..32)
-                .map(|i| u8::from_str_radix(&pin[60 - i * 2..62 - i * 2], 16))
-                .collect::<Result<_, _>>()
-                .expect("--boundary-base-hash hex");
+            let want = avila_consensus::hex::decode(pin)
+                .ok()
+                .filter(|v| v.len() == 32)
+                .map(|mut v| {
+                    v.reverse();
+                    v
+                })
+                .unwrap_or_else(|| {
+                    eprintln!("fatal: --boundary-base-hash is not 64-char hex");
+                    std::process::exit(2);
+                });
             if snap_hdr.base_blockhash != want[..] {
                 eprintln!("fatal: --boundary base hash ≠ --boundary-base-hash pin");
                 std::process::exit(2);
@@ -500,6 +551,27 @@ fn main() {
                 "fatal: boundary base ≠ corpus window parent — window not adjacent to the exported state"
             );
             std::process::exit(2);
+        }
+        // coin-set commitment: hash_serialized_3 over the loaded coins
+        // must match the donor's published txoutset_hash (display order).
+        let disp_commit: Vec<u8> = loaded.txoutset_hash.iter().rev().cloned().collect();
+        boundary_txoutset_hash_json = jstr(&avila_consensus::hex::encode(&disp_commit));
+        if let Some(pin) = &boundary_txoutset_pin {
+            let want = avila_consensus::hex::decode(pin)
+                .ok()
+                .filter(|v| v.len() == 32)
+                .map(|mut v| {
+                    v.reverse(); // display hex → internal order
+                    v
+                })
+                .unwrap_or_else(|| {
+                    eprintln!("fatal: --boundary-txoutset-hash is not 64-char hex");
+                    std::process::exit(2);
+                });
+            if *want != loaded.txoutset_hash {
+                eprintln!("fatal: loaded coin-set commitment ≠ --boundary-txoutset-hash pin");
+                std::process::exit(2);
+            }
         }
         let disp: Vec<u8> = snap_hdr.base_blockhash.iter().rev().cloned().collect();
         boundary_base_hash_json = jstr(&avila_consensus::hex::encode(&disp));
@@ -542,6 +614,17 @@ fn main() {
             }
             _ => {}
         }
+    }
+    // Under a complete supplied state a `Missing` spend is a spend of a
+    // coin that never existed — known invalidity, not a coverage gap.
+    // `first_missing` gives the earliest such position (the diagnostics
+    // the audit asked for); it folds into the same first-bad boundary.
+    if boundary_loaded.is_some()
+        && let Some(mpos) = report.first_missing
+        && mpos.h < first_bad_h
+    {
+        first_bad_h = mpos.h;
+        first_bad_msg = format!("spend of absent coin @ {mpos:?} (complete boundary)");
     }
 
     // ---- stage C: predicates over resolved coins -----------------------
@@ -915,7 +998,8 @@ fn main() {
 \"resolved_inputs_complete\":{},\"script_jobs_complete\":{},\
 \"starting_state_complete\":{},\"boundary_loaded_coins\":{},\
 \"boundary_base_height\":{},\"boundary_base_hash\":{},\
-\"boundary_dup_outpoints\":{},\
+\"boundary_txoutset_hash\":{},\"boundary_dup_outpoints\":{},\
+\"first_missing_height\":{},\
 \"header_context_checked\":{},\
 \"context_free_checks_complete\":{},\"coverage_complete\":{},\
 \"chainstate_complete\":false,\
@@ -987,7 +1071,12 @@ fn main() {
             .map(|h| h.to_string())
             .unwrap_or_else(|| "null".into()),
         boundary_base_hash_json,
+        boundary_txoutset_hash_json,
         boundary_dup_outpoints,
+        report
+            .first_missing
+            .map(|o| o.h.to_string())
+            .unwrap_or_else(|| "null".into()),
         header_context_checked,
         context_free_checks_complete,
         coverage_complete,
@@ -1007,40 +1096,36 @@ fn main() {
     // Known invalidity → 1 in BOTH modes (diagnostic permits coverage
     // gaps, never acceptance of detected invalidity). Incomplete
     // coverage under strict → 1. Diagnostic incomplete-but-clean → 0.
-    if known_invalid {
+    // Computed ONCE so the manifest records the same exit the process
+    // takes.
+    let exit_code = if known_invalid {
         eprintln!("invalid: {first_bad_msg} @ {first_bad_h}");
-        std::process::exit(1);
-    }
-    if !(resolved_inputs_complete && script_jobs_complete) && !diagnostic {
+        1
+    } else if !(resolved_inputs_complete && script_jobs_complete) && !diagnostic {
         eprintln!(
             "incomplete: missing_spends={} failed_tasks={failed_tasks}",
             report.missing_spends
         );
-        std::process::exit(1);
-    }
+        1
+    } else {
+        0
+    };
 
     // ---- run manifest: source + binary + inputs + outputs, one record --
     // Lets an auditor prove WHICH binary produced WHICH output from
-    // WHICH inputs — the audit found the archived binary hash had
-    // drifted from the executable, so the identity goes into the file.
+    // WHICH inputs. `build_rev` is embedded at COMPILE time by build.rs
+    // (an older binary can never report a newer checkout); `checkout_rev`
+    // is the checkout's runtime HEAD, labeled separately. Streams all
+    // file hashes — no whole-file Vec reads at snapshot sizes.
     if let Some(rm) = &run_manifest_path {
-        let self_sha = std::fs::read("/proc/self/exe")
-            .map(|b| sha256(&b))
-            .map(|h| avila_consensus::hex::encode(&h))
-            .ok();
-        let corpus_sha = corpus_sha256;
-        let boundary_sha = boundary_path
-            .as_ref()
-            .and_then(|p| std::fs::read(p).ok())
-            .map(|b| avila_consensus::hex::encode(&sha256(&b)));
+        let self_sha = file_sha256("/proc/self/exe");
+        let boundary_sha = boundary_path.as_ref().and_then(|p| file_sha256(p));
         let export_sha = if exported {
-            std::fs::read(&export_path)
-                .ok()
-                .map(|b| avila_consensus::hex::encode(&sha256(&b)))
+            file_sha256(&export_path)
         } else {
             None
         };
-        let git_rev = std::process::Command::new("git")
+        let checkout_rev = std::process::Command::new("git")
             .args([
                 "-C",
                 concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
@@ -1049,22 +1134,32 @@ fn main() {
             ])
             .output()
             .ok()
+            .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|| "unknown".into());
+        let argv_json = std::env::args()
+            .skip(1)
+            .map(|a| jstr(&a))
+            .collect::<Vec<_>>()
+            .join(",");
         let manifest = format!(
-            "{{\"type\":\"run_manifest\",\"git_rev\":{},\
+            "{{\"type\":\"run_manifest\",\
+\"build_rev\":{},\"checkout_rev\":{},\
 \"binary_sha256\":{},\"corpus_sha256\":{},\
 \"boundary_sha256\":{},\"export_sha256\":{},\
-\"args\":{},\"known_invalid\":{},\"exported\":{}}}",
-            jstr(&git_rev),
+\"argv\":[{}],\"exit_code\":{},\"known_invalid\":{},\"exported\":{}}}",
+            jstr(option_env!("AVILA_GIT_REV").unwrap_or("unknown")),
+            jstr(&checkout_rev),
             self_sha.map(|s| jstr(&s)).unwrap_or("null".into()),
-            jstr(&corpus_sha),
+            jstr(&corpus_sha256),
             boundary_sha.map(|s| jstr(&s)).unwrap_or("null".into()),
             export_sha.map(|s| jstr(&s)).unwrap_or("null".into()),
-            jstr(&std::env::args().skip(1).collect::<Vec<_>>().join(" ")),
+            argv_json,
+            exit_code,
             known_invalid,
             exported,
         );
         std::fs::write(rm, manifest + "\n").expect("run manifest writable");
     }
+    std::process::exit(exit_code);
 }

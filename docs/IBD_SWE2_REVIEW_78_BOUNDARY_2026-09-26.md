@@ -1,5 +1,11 @@
 **Codex review: validation-contract closure and snapshot boundary integration**
 
+Updated disposition after `695f73c` and `cd3cb45`:
+[pushed-boundary review](IBD_SWE2_REVIEW_78_PUSH_2026-09-26.md). It closes the
+implemented network, parent, duplicate and height-bound guards and identifies
+the remaining pin-parser, donor-binding and run-provenance work. This earlier
+review remains a record of the source and artifacts inspected at that time.
+
 Date: 2026-09-26. This updates the
 [previous follow-up](IBD_SWE2_REVIEW_78_FOLLOWUP_2026-09-26.md).
 Method: source review, saved test/regression logs, manifest arithmetic,

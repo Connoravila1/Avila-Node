@@ -78,6 +78,10 @@ pub struct JoinReport {
     /// spends with unknown provenance (missing; coverage class, not
     /// necessarily invalidity)
     pub missing_spends: usize,
+    /// earliest spend position resolving `Missing` (first missing-spend
+    /// height for diagnostics; under a complete supplied boundary this
+    /// is the earliest known-invalid position)
+    pub first_missing: Option<Occ>,
 }
 
 /// The shared merge-join. `boundary` is the supplied starting state;
@@ -107,6 +111,7 @@ pub fn join_window(
     keys.extend(boundary.keys().copied());
     let mut dup_spends = 0usize;
     let mut missing_spends = 0usize;
+    let mut first_missing: Option<Occ> = None;
     for op in keys {
         let mut events: Vec<(Occ, bool, usize)> = Vec::new();
         for &k in created_by_op.get(&op).map(Vec::as_slice).unwrap_or(&[]) {
@@ -137,6 +142,9 @@ pub fn join_window(
                     } else {
                         resolved.insert(pos, JoinRes::Missing);
                         missing_spends += 1;
+                        if first_missing.is_none_or(|f| pos < f) {
+                            first_missing = Some(pos);
+                        }
                     }
                 } else {
                     // Latest in-window creation before pos, else the
@@ -165,6 +173,7 @@ pub fn join_window(
         boundary_conflicts: 0, // set by the boundary builder
         dup_spends,
         missing_spends,
+        first_missing,
     }
 }
 

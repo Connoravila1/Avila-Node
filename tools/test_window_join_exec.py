@@ -368,6 +368,61 @@ with tempfile.TemporaryDirectory() as td:
     rc, out, err = run(p, '--boundary', bpd)
     check('dup-outpoint boundary → exit 2', rc == 2, f'rc={rc}')
 
+    # --- donor pins: base-hash / base-height / coin-set commitment ------
+    # A NON-palindromic base hash exercises real byte-order handling.
+    custom_base = bytes(range(32))          # internal (file) order
+    custom_base_disp = custom_base[::-1].hex()  # display hex
+    c = Chain()
+    c.prev = custom_base
+    s = tx([(b'\xcc' * 32, 0, b'', 0xffffffff)], [(val - 1000, OP_TRUE)])
+    c.block(140, [(cb_tx(1), [b'\x00']), (s, [b'\x00'])])  # spec-less spend
+    p = os.path.join(td, 'pin.corpus')
+    open(p, 'wb').write(bytes(c.buf))
+    donor = {b'\xcc' * 32: [(0, 100, val, OP_TRUE)]}
+    bpf = os.path.join(td, 'pin.utxo')
+    open(bpf, 'wb').write(snapshot(donor, base=custom_base))
+    # coin-set commitment, computed the same way the verifier does:
+    # sha256d over every coin's TxOutSer (txid‖vout‖code‖value‖len‖spk)
+    ser = b''
+    for txi, coins in donor.items():
+        for (vout, code, v, spk) in coins:
+            ser += txi + struct.pack('<I', vout) + struct.pack('<I', code)
+            ser += struct.pack('<q', v) + compact_size(len(spk)) + spk
+    commit_disp = sha256d(ser)[::-1].hex()
+
+    rc, out, _ = run(p, '--boundary', bpf,
+                     '--boundary-base-hash', custom_base_disp,
+                     '--boundary-base-height', '139',
+                     '--boundary-txoutset-hash', commit_disp)
+    d = last_json(out)
+    check('all donor pins correct → exit 0',
+          rc == 0 and d['join_missing_spends'] == 0
+          and d['boundary_txoutset_hash'] == commit_disp, f'rc={rc}')
+
+    rc, _, _ = run(p, '--boundary', bpf,
+                   '--boundary-base-hash', 'aa' * 32)
+    check('wrong base-hash pin → exit 2', rc == 2, f'rc={rc}')
+    rc, _, _ = run(p, '--boundary', bpf, '--boundary-base-hash', 'abc')
+    check('short base-hash pin → exit 2 not panic', rc == 2, f'rc={rc}')
+    rc, _, _ = run(p, '--boundary', bpf,
+                   '--boundary-base-hash', 'zz' * 32)
+    check('non-hex base-hash pin → exit 2 not panic', rc == 2, f'rc={rc}')
+    rc, _, _ = run(p, '--boundary', bpf, '--boundary-base-height', '138')
+    check('wrong donor-height pin → exit 2', rc == 2, f'rc={rc}')
+    rc, _, _ = run(p, '--boundary', bpf,
+                   '--boundary-txoutset-hash', 'aa' * 32)
+    check('wrong txoutset pin → exit 2', rc == 2, f'rc={rc}')
+
+    # manifest ties build + binary + inputs + outputs on the success path
+    rm = p + '.runmanifest'
+    rc, out, _ = run(p, '--boundary', bpf, '--run-manifest', rm)
+    m = json.loads(open(rm).read())
+    check('run manifest: build_rev + argv array + hashes',
+          rc == 0 and m['build_rev'] and isinstance(m['argv'], list)
+          and m['exit_code'] == 0 and m['boundary_sha256']
+          and m['corpus_sha256'] and m['export_sha256'],
+          f'rc={rc} rev={m.get("build_rev")}')
+
 print()
 if fails:
     print("FAILED:", fails)

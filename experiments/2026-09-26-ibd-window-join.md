@@ -136,16 +136,36 @@ whole-history forecast. Retarget correctness, BIP34 height commitment,
 pre-window MTP ancestry, and assume-valid boundary remain unverifiable
 from a bare window — listed in the result as component flags.
 
-## 7. Data-boundary path (per audit)
+## 7. Data-boundary path (per audit) — donor qualification complete
 
 `--boundary` accepts Core/Avila `dumptxoutset` (`utxo\xff` v2) via
-`snapverify::for_each_coin` — added as a public streaming loader reusing
-the exact `coin`/`group` decode path; loads every coin, checks the
-header count. The live-path owner's next action: schedule a consistent
-`dumptxoutset … latest` (returns `base_height`/`base_hash`/
-`txoutset_hash`), pin the returned boundary, choose the comparison
-window immediately after it, then run the same blocks through the join
-(with `--boundary`) and through `connect_block` — byte-compare exports.
+`snapverify::for_each_coin`, which reuses the verifier's `coin`/`group`
+decode and now returns `{ header, txoutset_hash }` — the same
+`hash_serialized_3` commitment `verify_stream` computes (SHA256d over
+every coin's TxOutSer, hashed incrementally while loading).
+
+Driver-side donor binding (all mismatch → exit 2):
+
+- `--boundary-base-hash HEX` — display-order pin vs file header.
+- `--boundary-base-height N` — donor H pin vs the corpus window's
+  parent (window must start at H+1); h=0 corpus rejected.
+- `--boundary-txoutset-hash HEX` — loaded coin-set commitment vs the
+  donor's published hash — a never-spent tampered coin can no longer
+  hide: the commitment covers every coin, not just spend-mentioned ones.
+- network magic vs `params.message_start`; duplicate outpoints;
+  creation-height bound `code>>1 ≤ base_height`; corpus-window parent
+  hash == donor base hash (adjacency).
+
+Regression now exercises pins: correct triple → exit 0; wrong/short/
+non-hex base hash, wrong height, wrong commitment → exit 2 — **84
+checks total** (`exec-regression-2026-09-26b.log`).
+
+`--run-manifest` ties the run together: `build_rev` is embedded at
+compile time by `build.rs` (a stale binary cannot report a newer
+checkout — the push-audit hole); `checkout_rev` records runtime HEAD
+separately; binary/corpus/boundary/export SHA-256s are *streamed*
+(`ShaState`, no whole-file reads); `argv` is a proper JSON array; the
+manifest writes on the recorded exit path with `exit_code`.
 
 Artifacts: `experiments/results/gate4/` — v3 window + segment JSONLs and
 canonical exports, per-block manifests, regression log, two fresh

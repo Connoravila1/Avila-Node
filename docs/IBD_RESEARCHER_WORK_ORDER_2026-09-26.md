@@ -32,13 +32,16 @@ Gate 4 part 1 is reviewed in
 [the experiment 78 audit and repair assignment](IBD_SWE2_REVIEW_78_2026-09-26.md).
 The subsequent
 [shared-join repair review](IBD_SWE2_REVIEW_78_FOLLOWUP_2026-09-26.md) accepts
-the common resolver and boundary double-spend repair. The latest
+the common resolver and boundary double-spend repair. The
 [validation-contract closure and boundary review](IBD_SWE2_REVIEW_78_BOUNDARY_2026-09-26.md)
-closes the earlier exit/export and negative-output findings. Acquire the
-genuine full starting-state export while qualifying its network, base,
-content and coin integrity against the selected window, then run the complete
-real-state comparison with required header/context checks. Whole-IBD capacity
-claims still require that comparison and the scaling measurements.
+closes the earlier exit/export and negative-output findings. The latest
+[pushed-boundary review](IBD_SWE2_REVIEW_78_PUSH_2026-09-26.md) confirms green CI
+and the new component guards, but finds a panic in the donor-hash pin parser
+and incomplete build provenance. Acquire the genuine full starting-state
+export while repairing those and completing the already required donor
+height/content binding and header/context checks. Then run the complete
+real-state comparison. Whole-IBD capacity claims still require that comparison
+and the scaling measurements.
 
 Read [the hardware analysis](../experiments/2026-09-26-ibd-hardware-floor.md)
 before using the earlier physics proposal. Its local-corpus targets and
