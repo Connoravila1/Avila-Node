@@ -1,3 +1,5 @@
 *.utxo
 *.hints
 *.hchain
+*/corpus.bin
+*.canonical

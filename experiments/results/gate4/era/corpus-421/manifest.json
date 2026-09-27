@@ -1,0 +1,52 @@
+{
+  "span_files": [
+    {
+      "file": "data/mainnet/blk01026.dat",
+      "sha256": "fa1ee3d835e9294e78aefc1e2d5c0adaad012f85041aadc50834ac2341d5cceb",
+      "records": 171
+    },
+    {
+      "file": "data/mainnet/blk01027.dat",
+      "sha256": "2b57eaa7552be42fbce4f34ad8e439d1ae534de53d25c4033f1681af5fa6d2c7",
+      "records": 155
+    },
+    {
+      "file": "data/mainnet/blk01028.dat",
+      "sha256": "5fe01356c7b069d4441f4403e91929bc8df10e00351df0c0d70c1ad6aa3d8713",
+      "records": 151
+    },
+    {
+      "file": "data/mainnet/blk01029.dat",
+      "sha256": "a50cc6d7b6e16f0826f5df7394d5181490da6dccbe134f4f3360ab60f34f810b",
+      "records": 146
+    }
+  ],
+  "window_files": [
+    "data/mainnet/blk01026.dat",
+    "data/mainnet/blk01027.dat",
+    "data/mainnet/blk01028.dat",
+    "data/mainnet/blk01029.dat"
+  ],
+  "labels": {
+    "provenance": "local blk-store scan (corpus-resolved prevouts)",
+    "occurrence_model": "latest (height,txidx) < (spend_height,spend_idx)",
+    "ordering": "blocks sorted by BIP34 height; file order not trusted"
+  },
+  "window": {
+    "height_min": 420732,
+    "height_max": 422540,
+    "stats": {
+      "blocks": 623,
+      "txs": 1032100,
+      "inputs": 2399736,
+      "resolved": 1464091,
+      "unresolved_no_occurrence": 935645,
+      "unresolved_future_only": 0,
+      "unresolved_bad_vout": 0,
+      "coinbase_inputs": 623,
+      "duplicate_txid_occurrences": 0
+    },
+    "corpus_sha256": "84f710739d25e7e6bc5527d6b5dbb7861c6db8863ff90039c579d71ea273be5e",
+    "corpus_bytes": 606462197
+  }
+}

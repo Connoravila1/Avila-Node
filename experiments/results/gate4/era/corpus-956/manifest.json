@@ -1,0 +1,76 @@
+{
+  "span_files": [
+    {
+      "file": "/home/connoravila/.bitcoin/blocks/blk05625.dat",
+      "sha256": "e7b182ddc187d4886d877dc69ca32c2e32a8377b4746fe6160be1b436f58c03e",
+      "records": 83
+    },
+    {
+      "file": "/home/connoravila/.bitcoin/blocks/blk05626.dat",
+      "sha256": "10137d88ebf00635f8a14399a41f78baf7e5ff6c4e3d53673aac901127188277",
+      "records": 81
+    },
+    {
+      "file": "/home/connoravila/.bitcoin/blocks/blk05627.dat",
+      "sha256": "4a63f703dfcddea43a7dbb35d9f3e418c846b7e37d3dbb375a2ec7b5cfab8b9f",
+      "records": 81
+    },
+    {
+      "file": "/home/connoravila/.bitcoin/blocks/blk05628.dat",
+      "sha256": "491af5e12195c1d0fbd03076ff3365804a8754660699a0bde53680618b4068d5",
+      "records": 84
+    },
+    {
+      "file": "/home/connoravila/.bitcoin/blocks/blk05629.dat",
+      "sha256": "9f692f3aa97c298ef432fe32523f3f15e691112cdbba1c1b13574b35cf5228bc",
+      "records": 82
+    },
+    {
+      "file": "/home/connoravila/.bitcoin/blocks/blk05630.dat",
+      "sha256": "b44c086abb2e14b493b006f267974b217ca6f2dadfe4604a60cec52f9c0eae48",
+      "records": 83
+    },
+    {
+      "file": "/home/connoravila/.bitcoin/blocks/blk05631.dat",
+      "sha256": "e9b34b33c8879a7a6b96e3ba501144b16d8058556dd08328d969dec5592556be",
+      "records": 86
+    },
+    {
+      "file": "/home/connoravila/.bitcoin/blocks/blk05632.dat",
+      "sha256": "427bae4c2cd5e1ff16adb6d45b8798f32ef70c1c84262c7b9c54aac9bdaf8e3e",
+      "records": 82
+    }
+  ],
+  "window_files": [
+    "/home/connoravila/.bitcoin/blocks/blk05625.dat",
+    "/home/connoravila/.bitcoin/blocks/blk05626.dat",
+    "/home/connoravila/.bitcoin/blocks/blk05627.dat",
+    "/home/connoravila/.bitcoin/blocks/blk05628.dat",
+    "/home/connoravila/.bitcoin/blocks/blk05629.dat",
+    "/home/connoravila/.bitcoin/blocks/blk05630.dat",
+    "/home/connoravila/.bitcoin/blocks/blk05631.dat",
+    "/home/connoravila/.bitcoin/blocks/blk05632.dat"
+  ],
+  "labels": {
+    "provenance": "local blk-store scan (corpus-resolved prevouts)",
+    "occurrence_model": "latest (height,txidx) < (spend_height,spend_idx)",
+    "ordering": "blocks sorted by BIP34 height; file order not trusted"
+  },
+  "window": {
+    "height_min": 955931,
+    "height_max": 956718,
+    "stats": {
+      "blocks": 662,
+      "txs": 2932455,
+      "inputs": 5123793,
+      "resolved": 4136128,
+      "unresolved_no_occurrence": 987665,
+      "unresolved_future_only": 0,
+      "unresolved_bad_vout": 0,
+      "coinbase_inputs": 662,
+      "duplicate_txid_occurrences": 0
+    },
+    "corpus_sha256": "ed0bbee2e72ebf7c9635f5154b9e0b55236654d031ea3495d068c1b1e1c85395",
+    "corpus_bytes": 1259251055
+  }
+}

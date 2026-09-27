@@ -995,3 +995,21 @@ dedicated-capacity figure (competing load unrecorded on that run).
 
 Suite: **114 executable checks** — the followup audit's six controls
 (endpoint gap ×3 modes, short-CHAIN ×3 modes) plus the byte-exact oracle.
+
+## 2026-09-27d — capacity measurements (dedicated window + era scaling)
+
+- Dedicated 454k rerun on clean `9986ea5` build: identical export
+  `865d32cf…`, all flags true, outer wall 98 s (internal 83.1 + ~15 s
+  receipt hashing — `wall_s_total` now records it), process RSS
+  6,729 MiB, cgroup peak 10,239 MiB.
+- Six era slices (232k–956k; taproot era from the Core pruned tail,
+  xor-decoded): verified-inputs/s 81k→39.5k with density 770→7,738
+  inputs/blk. Zero invalidity anywhere. Full table + full-IBD model in
+  `docs/IBD_CAPACITY_MEASUREMENTS_2026-09-27.md` → script verification
+  ≈24 h dominates; ~28–30 h pipeline total; one-hour objective needs
+  ~25–30× (batch crypto × more cores × overlap) and ≥140 MB/s
+  acquisition.
+- Fixed: `window_join` panicked on an empty `--segment` selection → now
+  clean exit 2 with a regression control.
+- Segwit-era block bodies absent from both datadirs — flagged as the
+  model's unmeasured segment.

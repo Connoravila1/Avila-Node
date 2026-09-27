@@ -1,0 +1,58 @@
+{
+  "span_files": [
+    {
+      "file": "data/mainnet/blk00519.dat",
+      "sha256": "c730a1ca77afef4003b59cda8cda3dc85a6db702ca10cac6f78b1a4c65754a10",
+      "records": 833
+    },
+    {
+      "file": "data/mainnet/blk00520.dat",
+      "sha256": "1ca53c82148f4c225455e7b18624237d15120048a2ef209458d8cb5cf45c1b13",
+      "records": 873
+    },
+    {
+      "file": "data/mainnet/blk00521.dat",
+      "sha256": "c1db7e534118183ce7d7e30714ab067c1656d94eeb8be9cb21f3d5d993b02d28",
+      "records": 756
+    },
+    {
+      "file": "data/mainnet/blk00522.dat",
+      "sha256": "572fe9461c98927946ffeb9901f91f0ef779b11fecddbbfbdc028d22825c701b",
+      "records": 809
+    },
+    {
+      "file": "data/mainnet/blk00523.dat",
+      "sha256": "548c2e0af1307c0a5224403ae14086c0f988cbc594ba2a9f74f0eab5f1a34d07",
+      "records": 722
+    }
+  ],
+  "window_files": [
+    "data/mainnet/blk00519.dat",
+    "data/mainnet/blk00520.dat",
+    "data/mainnet/blk00521.dat",
+    "data/mainnet/blk00522.dat",
+    "data/mainnet/blk00523.dat"
+  ],
+  "labels": {
+    "provenance": "local blk-store scan (corpus-resolved prevouts)",
+    "occurrence_model": "latest (height,txidx) < (spend_height,spend_idx)",
+    "ordering": "blocks sorted by BIP34 height; file order not trusted"
+  },
+  "window": {
+    "height_min": 231969,
+    "height_max": 236076,
+    "stats": {
+      "blocks": 3993,
+      "txs": 1366474,
+      "inputs": 3074093,
+      "resolved": 2716304,
+      "unresolved_no_occurrence": 357789,
+      "unresolved_future_only": 0,
+      "unresolved_bad_vout": 0,
+      "coinbase_inputs": 3993,
+      "duplicate_txid_occurrences": 0
+    },
+    "corpus_sha256": "515b902f08358425fae37942179c4993d06c61611b25b6a77df5ffc8cfd6fb6f",
+    "corpus_bytes": 799818489
+  }
+}

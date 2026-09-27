@@ -1,0 +1,40 @@
+{
+  "span_files": [
+    {
+      "file": "data/mainnet/blk00810.dat",
+      "sha256": "b9915f186ec370e92d3ab550ea87148cd8895e2450fcc46d2aad6d14210748f3",
+      "records": 225
+    },
+    {
+      "file": "data/mainnet/blk00811.dat",
+      "sha256": "079030940906193ce99ff7885fbfbda3e75e386341027fdb149e39cda4ff047c",
+      "records": 250
+    }
+  ],
+  "window_files": [
+    "data/mainnet/blk00810.dat",
+    "data/mainnet/blk00811.dat"
+  ],
+  "labels": {
+    "provenance": "local blk-store scan (corpus-resolved prevouts)",
+    "occurrence_model": "latest (height,txidx) < (spend_height,spend_idx)",
+    "ordering": "blocks sorted by BIP34 height; file order not trusted"
+  },
+  "window": {
+    "height_min": 380498,
+    "height_max": 381362,
+    "stats": {
+      "blocks": 475,
+      "txs": 504532,
+      "inputs": 1362984,
+      "resolved": 817883,
+      "unresolved_no_occurrence": 545101,
+      "unresolved_future_only": 0,
+      "unresolved_bad_vout": 0,
+      "coinbase_inputs": 475,
+      "duplicate_txid_occurrences": 0
+    },
+    "corpus_sha256": "3feae91d97fb16acf089fd0bf4ef7e704f7fc1945810d1c7d6286fa5a4faf2b9",
+    "corpus_bytes": 307408229
+  }
+}

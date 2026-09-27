@@ -776,6 +776,10 @@ with tempfile.TemporaryDirectory() as td:
           recs == expected,
           f'{len(recs)} recs' if recs != expected else 'match')
 
+    # a segment matching no blocks is malformed selection, not a panic
+    rc, _, _ = run(p, '--segment', '9000:9005')
+    check('empty segment → exit 2 not panic', rc == 2, f'rc={rc}')
+
     # manifest ties build + binary + inputs + outputs on the success path
     rm = W('final') + '.runmanifest'
     rc, out, _ = run(os.path.join(td, 'pin.corpus'),

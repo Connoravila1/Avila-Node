@@ -346,7 +346,10 @@ fn main() {
     // Processing must follow the verified chain order — blk-file order is
     // not height order and later stages `break` on the first bad height.
     blocks.sort_by_key(|b| b.height);
-    assert!(!blocks.is_empty());
+    if blocks.is_empty() {
+        eprintln!("fatal: no blocks selected (empty corpus or segment outside its coverage)");
+        std::process::exit(2);
+    }
     let parse_s = t.elapsed().as_secs_f64();
     // min/max — corpus order is blk-file order, not height order.
     let window_lo = blocks.iter().map(|b| b.height).min().unwrap();

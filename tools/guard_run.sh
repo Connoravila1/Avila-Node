@@ -74,8 +74,9 @@ while kill -0 "$runner" 2>/dev/null; do
             cur=$(cat "$slice/$unit/memory.current" 2>/dev/null || echo 0)
             [ "$cur" -gt "$peak" ] && peak=$cur
         fi
-        if [ -z "$cpu_usec0" ] && [ -f "$slice/$unit/cpu.stat" ]; then
-            cpu_usec0=$(awk '/usage_usec/{print $2}' "$slice/$unit/cpu.stat")
+        if [ -f "$slice/$unit/cpu.stat" ]; then
+            u=$(awk '/usage_usec/{print $2}' "$slice/$unit/cpu.stat" 2>/dev/null)
+            [ -n "$u" ] && { [ -z "$cpu_usec0" ] && cpu_usec0=$u; cpu_last=$u; }
         fi
     fi
     m=$(cpus_mhz)
@@ -87,9 +88,7 @@ while kill -0 "$runner" 2>/dev/null; do
     sleep 1
 done
 wait "$runner"; rc=$?
-cpu_usec1=""
-[ -n "$unit" ] && [ -f "$slice/$unit/cpu.stat" ] && \
-    cpu_usec1=$(awk '/usage_usec/{print $2}' "$slice/$unit/cpu.stat" 2>/dev/null)
+cpu_usec1="${cpu_last:-}"
 
 cat "$tmp" >&2
 rm -f "$tmp"
