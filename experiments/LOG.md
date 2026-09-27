@@ -916,3 +916,43 @@ iteration removed from the join.
 **Resources:** `tools/guard_run.sh` (cgroup MemoryMax + swap 0 +
 preflight refusal) now mandated by AGENTS.md; verified live three
 times (two cap-kills, machine untouched).
+
+## 2026-09-27b — real-window CORRECTION run: full contextual coverage
+
+Per the real-window audit, the first comparison was missing
+`contextual_check_block` and did not bind header-context failures to the
+selected chain. Fixed and re-run under the guard:
+
+- `contextual_check_block` (BIP34 cb-height, witness-commitment /
+  unexpected-witness, block weight, full finality incl. coinbase) now
+  runs per block with the real parent MTP from the production HeaderTree:
+  `ctx_block_evaluated=301/301`, zero failed, zero unevaluated.
+- Header context is bound to the selected chain: `node.height == corpus
+  label`, `CHAIN[h] == corpus hash`, `CHAIN[454000] == donor base hash`,
+  and a window header that failed production insert is invalid —
+  `headers_{height,chain}_mismatch / failed_selected / missing_selected`
+  all zero; unrelated bad index entries no longer taint the run.
+- Blocks process in verified chain order (`sort_by_key(height)`);
+  corpus/BLK file order had 6 backward transitions.
+- `--require-complete` is the checked complete-run entry point: exit 0
+  only iff `window_complete` (all pins + header context + ctx blocks +
+  coverage + zero unresolved). `chainstate_complete` is now real.
+- Export is streamed (merge-iterate alive bitmap + overlay, inline
+  sha256) — the 3.6 GB output Vec is gone; run peak dropped ~2 GiB.
+
+**Corrected receipt** (`corpus-454k/run.log`, `run-manifest.json`):
+exit 0 under `guard_run --max 8192`; wall **83.7 s** — parse 4.1, emit
+1.3, headers 3.4, boundary-load 11.3 (inside join 23.5), predicate 0.8,
+scripts 31.8 (8w), materialize 4.1, export 14.7 — stages account for the
+wall. Process RSS HWM 7,057 MiB; cgroup sampled peak 8,191 MiB vs
+8,192 MiB cap. Export identical sha `865d32cf…44cd3168` (3,594,371,786 B)
+== `snap_to_canonical` of donor-454301 (`corpus-454k/comparator.log`,
+guarded, exit 0): **byte-exact end state confirmed with complete checks.**
+
+Regression suite now 96 checks incl. genesis-rooted manifest fixtures:
+wrong cb height → BadCbHeight reject; witness data sans commitment →
+UnexpectedWitness reject; PoW-pass/ctx-fail header on the selected chain
+→ reject; corpus label ≠ chain height → reject; missing selected header
+→ no complete acceptance; out-of-order corpus → still complete; flat
+oracle (untouched boundary coin + same-block create/spend) → survivors
+exact.

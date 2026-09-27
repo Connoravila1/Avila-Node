@@ -413,9 +413,304 @@ with tempfile.TemporaryDirectory() as td:
                    '--boundary-txoutset-hash', 'aa' * 32)
     check('wrong txoutset pin → exit 2', rc == 2, f'rc={rc}')
 
+    # --- selected-chain context controls (--headers + --require-complete)
+    # A genesis-rooted chain so tree-derived heights are real. regtest
+    # genesis hash (display order reversed → internal bytes).
+    GENESIS = bytes.fromhex(
+        '0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206')[::-1]
+
+    def push_int(n):  # mirror script::push_int — OP_N for 1..16
+        if n == 0:
+            return b'\x00'
+        if 1 <= n <= 16:
+            return bytes([0x50 + n])
+        b = bytearray()
+        while n:
+            b.append(n & 0xff)
+            n >>= 8
+        if b[-1] & 0x80:
+            b.append(0)
+        return bytes([len(b)]) + bytes(b)
+
+    def tx_w(inputs, outputs, witness_stacks, lock=0):
+        # returns (full serialization, txid = sha256d of the stripped form)
+        stripped = tx(inputs, outputs, lock)
+        b = struct.pack('<I', 1) + b'\x00\x01' + stripped[4:-4]
+        for stack in witness_stacks:
+            b += bytes([len(stack)])
+            for item in stack:
+                b += bytes([len(item)]) + item
+        return b + struct.pack('<I', lock), sha256d(stripped)
+
+    class HChain(Chain):
+        """Chain rooted at regtest genesis; records header bytes +
+        best-chain hashes for an HCHAIN01 manifest."""
+        def __init__(self):
+            super().__init__()
+            self.prev = GENESIS
+            self.hdrs = []
+            self.hashes = [GENESIS]
+
+        def block(self, h, txs_with_specs, time_off=None, label=None,
+                  txids=None):
+            raws = [r for r, _ in txs_with_specs]
+            mr = merkle(txids if txids is not None
+                        else [sha256d(r) for r in raws])
+            hdr = mkheader(self.prev, mr,
+                           self.t if time_off is None else time_off)
+            self.t += 600
+            self.prev = sha256d(hdr)
+            self.hdrs.append(hdr)
+            self.hashes.append(self.prev)
+            self.buf += struct.pack('<I', label if label is not None else h) \
+                + self.prev + hdr
+            self.buf += struct.pack('<I', len(txs_with_specs))
+            for raw, specs in txs_with_specs:
+                self.buf += (struct.pack('<I', len(raw)) + raw
+                             + struct.pack('<I', len(specs)))
+                for s in specs:
+                    self.buf += s if s else b'\x00'
+            return self
+
+        def manifest(self):
+            return (b'HCHAIN01' + struct.pack('<I', len(self.hdrs))
+                    + b''.join(self.hdrs) + b'CHAIN'
+                    + struct.pack('<I', len(self.hashes))
+                    + b''.join(self.hashes))
+
+    def cb_h(h, value=50_00000000):
+        return tx([(b'\x00' * 32, 0xffffffff,
+                    push_int(h) + b'\xaa', 0xffffffff)],
+                  [(value, b'\x51')])
+
+    def commit_of(coins_by_txid):
+        ser = b''
+        for txi, coins in coins_by_txid.items():
+            for (vout, code, v, spk) in coins:
+                ser += (txi + struct.pack('<I', vout) + struct.pack('<I', code)
+                        + struct.pack('<q', v) + compact_size(len(spk)) + spk)
+        return sha256d(ser)[::-1].hex()
+
+    GEN_DISP = GENESIS[::-1].hex()
+
+    # -- complete window: headers + boundary + all three pins + require --
+    donor2 = {BOP: [(0, 0, val, OP_TRUE)], BOP.replace(b'\xaa', b'\xbb'):
+                  [(0, 0, val, OP_TRUE)]}
+    bp_full = os.path.join(td, 'full.utxo')
+    open(bp_full, 'wb').write(snapshot(donor2, base=GENESIS))
+    commit_full = commit_of(donor2)
+
+    def make_full():
+        c = HChain()
+        s1 = tx([(BOP, 0, b'', 0xffffffff)], [(val - 1000, OP_TRUE)])
+        c.block(1, [(cb_h(1), [b'\x00']), (s1, [b'\x00'])])
+        s2 = tx([(BOP.replace(b'\xaa', b'\xbb'), 0, b'', 0xffffffff)],
+                [(val - 2000, OP_TRUE)])
+        c.block(2, [(cb_h(2), [b'\x00']), (s2, [b'\x00'])])
+        p = W('full'); open(p, 'wb').write(bytes(c.buf))
+        hp = W('full.hchain'); open(hp, 'wb').write(c.manifest())
+        return p, hp
+
+    p, hp = make_full()
+    rc, out, _ = run(p, '--boundary', bp_full, '--headers', hp,
+                     '--boundary-base-hash', GEN_DISP,
+                     '--boundary-base-height', '0',
+                     '--boundary-txoutset-hash', commit_full,
+                     '--require-complete')
+    d = last_json(out)
+    check('fully-qualified window → exit 0 + all flags',
+          rc == 0 and d['window_complete'] and d['chainstate_complete']
+          and d['contextual_blocks_complete'] and d['ctx_block_evaluated'] == 2
+          and d['header_context_full'], f'rc={rc}')
+
+    # require-complete without context must NOT pass
+    rc, out, _ = run(p, '--require-complete')
+    check('require-complete w/o headers → exit 1', rc == 1, f'rc={rc}')
+
+    # -- BIP34: coinbase pushes the wrong height → BadCbHeight ----------
+    def make_badcb():
+        c = HChain()
+        s1 = tx([(BOP, 0, b'', 0xffffffff)], [(val - 1000, OP_TRUE)])
+        c.block(1, [(cb_h(1), [b'\x00']), (s1, [b'\x00'])])
+        c.block(2, [(cb_h(99), [b'\x00'])])  # wrong height in coinbase
+        p = W('badcb'); open(p, 'wb').write(bytes(c.buf))
+        hp = W('badcb.hchain'); open(hp, 'wb').write(c.manifest())
+        return p, hp
+    for diag in ([], ['--diagnostic']):
+        p, hp = make_badcb()
+        rc, out, _ = run(p, '--headers', hp, *diag)
+        mode = 'diag' if diag else 'strict'
+        check(f'cb-height [{mode}] exit 1', rc == 1, f'rc={rc}')
+        if rc == 1:
+            d = last_json(out)
+            check(f'cb-height [{mode}] ctx flag', d['ctx_block_failed'] == 1
+                  and d['first_bad_height'] == 2
+                  and 'BadCbHeight' in d['first_bad'],
+                  d.get('first_bad'))
+
+    # -- pre-commitment witness data → UnexpectedWitness ----------------
+    def make_wit():
+        c = HChain()
+        c.block(1, [(cb_h(1), [b'\x00'])])
+        # segwit-serialized tx with a witness stack, no commitment in cb —
+        # spends BOP alone (supplied via spec so the join resolves it)
+        wtx, wtxid = tx_w([(BOP, 0, b'', 0xffffffff)], [(val - 1500, OP_TRUE)],
+                          [[b'\x02\x03']])
+        c.block(2, [(cb_h(2), [b'\x00']),
+                    (wtx, [spec(val, OP_TRUE, 0, 0)])],
+                txids=[sha256d(cb_h(2)), wtxid])
+        p = W('wit'); open(p, 'wb').write(bytes(c.buf))
+        hp = W('wit.hchain'); open(hp, 'wb').write(c.manifest())
+        return p, hp
+    for diag in ([], ['--diagnostic']):
+        p, hp = make_wit()
+        rc, out, _ = run(p, '--headers', hp, *diag)
+        mode = 'diag' if diag else 'strict'
+        check(f'unexpected-witness [{mode}] exit 1', rc == 1, f'rc={rc}')
+        if rc == 1:
+            d = last_json(out)
+            check(f'unexpected-witness [{mode}] flag',
+                  'UnexpectedWitness' in (d['first_bad'] or ''),
+                  d.get('first_bad'))
+
+    # -- header passes PoW but fails contextual header rules ------------
+    def make_badhdr():
+        c = HChain()
+        s1 = tx([(BOP, 0, b'', 0xffffffff)], [(val - 1000, OP_TRUE)])
+        c.block(1, [(cb_h(1), [b'\x00']), (s1, [b'\x00'])])
+        # block 2's header time BEFORE parent MTP → insert fails
+        # contextual, even though PoW is ground fine.
+        raws2 = [cb_h(2)]
+        mr2 = merkle([sha256d(r) for r in raws2])
+        bad_hdr = mkheader(c.prev, mr2, time_=1)
+        c.prev = sha256d(bad_hdr)
+        c.hdrs.append(bad_hdr); c.hashes.append(c.prev)
+        c.buf += struct.pack('<I', 2) + c.prev + bad_hdr
+        c.buf += struct.pack('<I', 1)
+        c.buf += struct.pack('<I', len(raws2[0])) + raws2[0] \
+            + struct.pack('<I', 1) + b'\x00'
+        p = W('badhdr'); open(p, 'wb').write(bytes(c.buf))
+        hp = W('badhdr.hchain'); open(hp, 'wb').write(c.manifest())
+        return p, hp
+    for diag in ([], ['--diagnostic']):
+        p, hp = make_badhdr()
+        rc, out, _ = run(p, '--headers', hp, *diag)
+        mode = 'diag' if diag else 'strict'
+        check(f'ctx-hdr-fail [{mode}] exit 1', rc == 1, f'rc={rc}')
+        if rc == 1:
+            d = last_json(out)
+            check(f'ctx-hdr-fail [{mode}] flag',
+                  d['headers_failed_selected'] == 1
+                  and d['first_bad_height'] == 2)
+
+    # -- corpus label ≠ derived chain height → invalid ------------------
+    def make_badh():
+        c = HChain()
+        s1 = tx([(BOP, 0, b'', 0xffffffff)], [(val - 1000, OP_TRUE)])
+        c.block(1, [(cb_h(1), [b'\x00']), (s1, [b'\x00'])])
+        c.block(999, [(cb_h(999), [b'\x00'])], label=999)  # label vs real h=2
+        p = W('badh'); open(p, 'wb').write(bytes(c.buf))
+        hp = W('badh.hchain'); open(hp, 'wb').write(c.manifest())
+        return p, hp
+    for diag in ([], ['--diagnostic']):
+        p, hp = make_badh()
+        rc, out, _ = run(p, '--headers', hp, *diag)
+        mode = 'diag' if diag else 'strict'
+        check(f'height-mismatch [{mode}] exit 1', rc == 1, f'rc={rc}')
+        if rc == 1:
+            d = last_json(out)
+            check(f'height-mismatch [{mode}] flag',
+                  d['headers_height_mismatch'] == 1
+                  and d['first_bad_height'] == 999)
+
+    # -- missing selected header → context gap, not invalidity ----------
+    def make_gap():
+        c = HChain()
+        s1 = tx([(BOP, 0, b'', 0xffffffff)], [(val - 1000, OP_TRUE)])
+        c.block(1, [(cb_h(1), [b'\x00']), (s1, [b'\x00'])])
+        c.block(2, [(cb_h(2), [b'\x00'])])
+        p = W('gap'); open(p, 'wb').write(bytes(c.buf))
+        # manifest omits block 2's header: chain still binds h1.
+        hp = W('gap.hchain')
+        open(hp, 'wb').write(
+            b'HCHAIN01' + struct.pack('<I', 1) + c.hdrs[0]
+            + b'CHAIN' + struct.pack('<I', 3) + b''.join(c.hashes[:3]))
+        return p, hp
+    p, hp = make_gap()
+    rc, out, _ = run(p, '--headers', hp)
+    check('missing-header strict exit 1', rc == 1, f'rc={rc}')
+    rc, out, _ = run(p, '--headers', hp, '--diagnostic')
+    d = last_json(out)
+    check('missing-header diag: clean but not complete',
+          rc == 0 and not d['window_complete']
+          and d['headers_missing_selected'] == 1
+          and not d['known_invalid'], f'rc={rc}')
+    rc, out, _ = run(p, '--headers', hp, '--require-complete')
+    check('missing-header require-complete exit 1', rc == 1, f'rc={rc}')
+
+    # -- out-of-order corpus: blk-file order ≠ chain order --------------
+    p, hp = make_full()
+    raw = open(p, 'rb').read()
+    # split corpus records: magic + per-block records. Reorder h2 before h1.
+    blk_recs = []
+    o = 8
+    while o < len(raw):
+        h, = struct.unpack_from('<I', raw, o)
+        hsh = raw[o + 4:o + 36]
+        hdr = raw[o + 36:o + 116]
+        ntx, = struct.unpack_from('<I', raw, o + 116)
+        o2 = o + 120
+        for _ in range(ntx):
+            tl, = struct.unpack_from('<I', raw, o2); o2 += 4 + tl
+            nspec, = struct.unpack_from('<I', raw, o2); o2 += 4
+            for _ in range(nspec):
+                sl = raw[o2]; o2 += 1 + sl
+        blk_recs.append(raw[o:o2])
+        o = o2
+    p2 = W('reord')
+    open(p2, 'wb').write(raw[:8] + b''.join(reversed(blk_recs)))
+    rc, out, _ = run(p2, '--boundary', bp_full, '--headers', hp,
+                     '--boundary-base-hash', GEN_DISP,
+                     '--boundary-base-height', '0',
+                     '--boundary-txoutset-hash', commit_full,
+                     '--require-complete')
+    d = last_json(out)
+    check('out-of-order corpus still complete',
+          rc == 0 and d['window_complete'] and d['chainstate_complete'],
+          f'rc={rc}')
+
+    # -- flat boundary oracle: untouched coin + same-block create/spend -
+    donor3 = {BOP: [(0, 0, val, OP_TRUE)], b'\xee' * 32: [(7, 0, 5000, P2PKH)]}
+    bp3f = os.path.join(td, 'orcl.utxo')
+    open(bp3f, 'wb').write(snapshot(donor3, base=GENESIS))
+    def make_orcl():
+        c = HChain()
+        # spend BOP, create two outputs; spend the first in-block.
+        s1 = tx([(BOP, 0, b'', 0xffffffff)],
+                [(4000, OP_TRUE), (5000, OP_TRUE)])
+        # s1's txid = sha256d(raw) — spend its output 0 in the SAME block
+        txid1 = sha256d(s1)
+        s2 = tx([(txid1, 0, b'', 0xffffffff)], [(3500, OP_TRUE)])
+        c.block(1, [(cb_h(1), [b'\x00']), (s1, [b'\x00']), (s2, [b'\x00'])])
+        p = W('orcl'); open(p, 'wb').write(bytes(c.buf))
+        hp = W('orcl.hchain'); open(hp, 'wb').write(c.manifest())
+        return p, hp
+    p, hp = make_orcl()
+    rc, out, _ = run(p, '--boundary', bp3f, '--headers', hp,
+                     '--boundary-base-hash', GEN_DISP,
+                     '--boundary-base-height', '0',
+                     '--boundary-txoutset-hash', commit_of(donor3),
+                     '--require-complete')
+    d = last_json(out)
+    # survivors: 2 boundary - 1 spent + cb(1) + s1-out1 + s2-out0 = 4
+    check('flat-oracle complete + survivors', rc == 0
+          and d['window_complete'] and d['survivor_records'] == 4
+          and d['exported'], f'rc={rc} surv={d.get("survivor_records")}')
+
     # manifest ties build + binary + inputs + outputs on the success path
-    rm = p + '.runmanifest'
-    rc, out, _ = run(p, '--boundary', bpf, '--run-manifest', rm)
+    rm = W('final') + '.runmanifest'
+    rc, out, _ = run(os.path.join(td, 'pin.corpus'),
+                     '--boundary', bpf, '--run-manifest', rm)
     m = json.loads(open(rm).read())
     check('run manifest: build_rev + argv array + hashes',
           rc == 0 and m['build_rev'] and isinstance(m['argv'], list)
