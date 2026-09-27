@@ -1041,7 +1041,12 @@ fn main() {
             None
         };
         let git_rev = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
+            .args([
+                "-C",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
+                "rev-parse",
+                "HEAD",
+            ])
             .output()
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
