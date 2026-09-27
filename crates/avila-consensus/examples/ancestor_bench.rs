@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Measures `get_ancestor` descent cost — the skip list should make a
 //! tip→deep-ancestor probe O(log n) (~tens of hops), not O(n).
 use avila_consensus::chainstate::Chainstate;

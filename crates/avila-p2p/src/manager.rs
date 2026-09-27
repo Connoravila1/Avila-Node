@@ -510,10 +510,7 @@ pub struct PeerManager<S> {
     /// failure surfaces at the *next* accept, not the guilty block's;
     /// misbehavior attribution reads this instead of blaming whoever
     /// delivered the triggering block.
-    recent_deliveries: std::collections::VecDeque<(
-        avila_consensus::hash::BlockHash,
-        u64,
-    )>,
+    recent_deliveries: std::collections::VecDeque<(avila_consensus::hash::BlockHash, u64)>,
     /// Gossiped peer addresses — discovery lives here.
     addrbook: AddrBook,
     /// The transaction pool — policy layer owned here so `tx` intake,
@@ -2054,10 +2051,7 @@ impl<S: Read + Write> PeerManager<S> {
         serve_filters: bool,
         outbound_nonces: &std::collections::HashSet<u64>,
         stem_exclude: &std::collections::HashSet<avila_consensus::hash::Txid>,
-        recent_deliveries: &mut std::collections::VecDeque<(
-            avila_consensus::hash::BlockHash,
-            u64,
-        )>,
+        recent_deliveries: &mut std::collections::VecDeque<(avila_consensus::hash::BlockHash, u64)>,
     ) {
         match event {
             SessionEvent::Established => {
@@ -2243,16 +2237,13 @@ impl<S: Read + Write> PeerManager<S> {
                                 // journal rotated it out, punish the
                                 // innocent triggerer not at all — the
                                 // block stays marked invalid either way.
-                                if let Some((_, who)) = recent_deliveries
-                                    .iter()
-                                    .find(|(h, _)| *h == bad)
+                                if let Some((_, who)) =
+                                    recent_deliveries.iter().find(|(h, _)| *h == bad)
                                 {
                                     eprintln!(
                                         "block {bad} failed deferred script checks — blaming its sender"
                                     );
-                                    dead.push((*who, DisconnectReason::Misbehavior(
-                                        e.to_string(),
-                                    )));
+                                    dead.push((*who, DisconnectReason::Misbehavior(e.to_string())));
                                 }
                             }
                             None => dead.push((id, DisconnectReason::Misbehavior(e.to_string()))),
@@ -4735,7 +4726,11 @@ mod tests {
         // A 6-block batch never exceeds the window — all 6 pending,
         // checked frontier at genesis.
         assert_eq!(cs.checked_height(), 0);
-        assert!(events.iter().all(|e| !matches!(e, NetEvent::TipAdvanced(_))));
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, NetEvent::TipAdvanced(_)))
+        );
         // Quiet-tail drain completes them all.
         cs.drain_scripts().unwrap();
         assert_eq!(cs.checked_height(), 6);

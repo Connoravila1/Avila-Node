@@ -4616,18 +4616,13 @@ fn mine_and_connect(
     }
     match cs.accept_block(&block, now) {
         Ok(avila_consensus::chainstate::Acceptance::Connected {
-            height: _,
-            reorged,
-            ..
+            height: _, reorged, ..
         }) => {
             // `generate`/`submitblock` report success only for a fully
             // verified block — drain the speculative tail before any
             // effect or answer leaves the node.
             if let Err(e) = cs.drain_scripts() {
-                return Err((
-                    RPC_VERIFY_ERROR,
-                    format!("Block validation failed: {e}"),
-                ));
+                return Err((RPC_VERIFY_ERROR, format!("Block validation failed: {e}")));
             }
             for (h, hash) in cs.take_checked() {
                 if let Some(body) = cs.body(&hash) {
@@ -7939,7 +7934,8 @@ pub(crate) fn dispatch(
                         }
                     }
                     let status = if *hash
-                        == cs.chain()
+                        == cs
+                            .chain()
                             .get(cs.checked_height() as usize)
                             .copied()
                             .unwrap_or_else(|| cs.tip_hash())

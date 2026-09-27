@@ -1,0 +1,15 @@
+{
+ "selection_digest_match": true,
+ "selection_digest_python": "2276ffea366df4f181a9379f46fc2fb470239129b4b3a252bd6f49ca7748abb5",
+ "selection_digest_rust": "2276ffea366df4f181a9379f46fc2fb470239129b4b3a252bd6f49ca7748abb5",
+ "executed_txs_python": 223295,
+ "executed_txs_rust": 223295,
+ "executed_inputs_python": 517819,
+ "executed_inputs_rust": 517819,
+ "structural_ecdsa_der_attempts": 524092,
+ "structural_witness_der_attempts": 0,
+ "structural_schnorr_sized_items": 0,
+ "executed_ecdsa_verify_attempts": 526534,
+ "executed_schnorr_verify_attempts": 0,
+ "ecdsa_ratio": 0.9954
+}

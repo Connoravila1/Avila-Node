@@ -1,3 +1,6 @@
+// Benchmark/probe harness — panics on setup failure are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 fn main() {
     let dir = std::path::Path::new("/home/connoravila/Documents/Avila-Node/data/mainnet");
     let be = avila_consensus::coinsdb::CoinsBackend::open(dir).unwrap();

@@ -1,0 +1,4 @@
+{"type":"prep","corpus_bytes":161838980,"blocks":449,"parse_s":0.245,"task_build_s":0.213,"rss_hwm_bytes":459206656}
+{"type":"counters","total_txs":247193,"total_inputs_noncb":671771,"inputs_resolved":599840,"inputs_missing_source":71931,"excluded_unresolved_txs":23449,"resolved_inputs_in_excluded_txs":82021,"excluded_immature_txs":0,"immature_source_inputs":0,"inputs_excluded_by_immaturity":0,"resolved_inputs_in_immature_txs":0,"executed_txs":223295,"executed_inputs":517819,"executed_set_digest":"2276ffea366df4f181a9379f46fc2fb470239129b4b3a252bd6f49ca7748abb5"}
+{"type":"run","workers":1,"wall_s":59.508,"executed_txs":223295,"executed_inputs_ok":517819,"failed_txs":0,"failed_inputs_ub":0,"ecdsa_sighash_calls":526534,"ecdsa_verify_attempts":526534,"schnorr_verify_attempts":0,"ecdsa_backend_calls":526528,"schnorr_backend_calls":0,"sighash_ms":767.7,"verify_ms":57764.8,"inputs_per_s":8702,"us_per_input":114.92}
+{"type":"final","rss_hwm_bytes":460808192}

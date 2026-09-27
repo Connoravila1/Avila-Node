@@ -1128,7 +1128,9 @@ impl Chainstate {
     fn push_checked(&mut self, height: u32, hash: BlockHash) {
         const CHECKED_CAP: usize = 8192;
         if self.checked_feed.len() >= CHECKED_CAP {
-            eprintln!("checked feed overflow ({CHECKED_CAP}) — mempool feed skipped for oldest blocks");
+            eprintln!(
+                "checked feed overflow ({CHECKED_CAP}) — mempool feed skipped for oldest blocks"
+            );
             self.checked_feed.pop_front();
         }
         self.checked_feed.push_back((height, hash));
@@ -3326,9 +3328,7 @@ impl Chainstate {
                     // a batch merge can leave the dirty map over bound.
                     if self.utxo.needs_flush() {
                         self.flush_coins().map_err(|_| {
-                            BlockRejection::Connect(ConnectError::Internal(
-                                "coinsdb flush failed",
-                            ))
+                            BlockRejection::Connect(ConnectError::Internal("coinsdb flush failed"))
                         })?;
                     }
                     Ok(Acceptance::Connected {
@@ -5087,8 +5087,7 @@ mod tests {
         // Pending tail holds the failure — the checked frontier stops
         // short of it.
         assert!(cs.checked_height() < 110);
-        let fed_heights: Vec<u32> =
-            cs.take_checked().iter().map(|(h, _)| *h).collect();
+        let fed_heights: Vec<u32> = cs.take_checked().iter().map(|(h, _)| *h).collect();
         assert!(fed_heights.iter().all(|h| *h < 110));
         // The quiet-tail drain surfaces the failure and unwinds the
         // suffix — afterwards, observers still see only ≤109.
@@ -5118,7 +5117,7 @@ mod tests {
         }
         // Steady state: ~8 pending at the tail, ~110 checked.
         let checked_before = cs.checked_height();
-        assert!(checked_before >= 110 && checked_before < 118);
+        assert!((110..118).contains(&checked_before));
         // The rest of the burst — the failure lands pending.
         for b in &blocks[118..124] {
             let _ = cs.accept_block(b, NOW);

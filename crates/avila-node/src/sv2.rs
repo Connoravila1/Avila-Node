@@ -396,8 +396,7 @@ fn handle_with_timeout(
                     let now = crate::time::time() as u32;
                     match cs.accept_block(&block, now) {
                         Ok(avila_consensus::chainstate::Acceptance::Connected {
-                            reorged,
-                            ..
+                            reorged, ..
                         }) => {
                             // Wait for deferred script checks before the
                             // block becomes authoritative — same

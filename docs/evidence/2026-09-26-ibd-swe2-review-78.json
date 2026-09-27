@@ -1,0 +1,444 @@
+{
+  "captured_at_utc": "2026-09-26T23:51:04.284265+00:00",
+  "method": "Read-only source inspection, saved small-artifact parsing, independent canonical export byte comparison and decoding, arithmetic on saved metrics. No test/example/build/benchmark/corpus scan or live-node operation executed by Codex. Defect counterexamples are source traces, not new program executions.",
+  "source_identities": {
+    "crates/avila-consensus/examples/state_join.rs": {
+      "sha256": "54406e6be8e50bc816a73ffe55d837c4e6467040576855dc9ce67bdfa7b71200",
+      "bytes": 69146
+    },
+    "crates/avila-consensus/examples/window_join.rs": {
+      "sha256": "da8fd32b4095ee9af0b8eb364b90034f949a7f2f9f9d05dd381df36f5981e986",
+      "bytes": 21446
+    },
+    "crates/avila-consensus/src/connect.rs": {
+      "sha256": "1de9a03e85ba0dd5ee7051acb46c5f7c747bc46fae9cec767a2cfb1389cd119e",
+      "bytes": 122518
+    },
+    "crates/avila-consensus/src/check.rs": {
+      "sha256": "5ecf61def1518ff40989eb35a2c2b311b9de2c94f27b9cd7d994bdf35ab48eca",
+      "bytes": 41783
+    },
+    "crates/avila-consensus/src/params.rs": {
+      "sha256": "b0871146024983436f4842e0950b192e36f77a4aad6a14fa0c7158bfccab3693",
+      "bytes": 52110
+    },
+    "tools/ibd_corpus_window.py": {
+      "sha256": "1e75efa7e0292b63876395d8952bb90b42ee0f5a27ee65832e68dfce28df422e",
+      "bytes": 14238
+    },
+    "experiments/2026-09-26-ibd-window-join.md": {
+      "sha256": "798fa5938900129b8c07cbf0c634811e561f3594b00ad66ab1c29c991976de5d",
+      "bytes": 6037
+    },
+    "experiments/LOG.md": {
+      "sha256": "5d51bb29b81a861fa01e2d09948e0e14e804343b53cb334167b7b0604f588be9",
+      "bytes": 85660
+    }
+  },
+  "artifacts": {
+    "experiments/results/gate3/state-join-2026-09-26.jsonl": {
+      "sha256": "42a26741d6d9b30c6c3ee861b41e3bc32a35f885b4836dfe071266d189dd05dd",
+      "bytes": 30138,
+      "raw_text": "{\"scenario\":\"valid_window\",\"blocks\":108,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"711689c70194dc9bc1bc930d4bd40528df19336b21c5ee6726f1c50d11847954\",\"expected\":\"accept\",\"expect_tip\":108,\"inc_tip\":108,\"inc_tip_hash\":\"711689c70194dc9bc1bc930d4bd40528df19336b21c5ee6726f1c50d11847954\",\"inc_reject\":null,\"batch_tip\":108,\"batch_tip_hash\":\"711689c70194dc9bc1bc930d4bd40528df19336b21c5ee6726f1c50d11847954\",\"batch_reject\":null,\"state_bytes\":5778,\"records\":107,\"inc_digest\":\"2e8cbd2d56326b44e9cbe524f46d933a99748293f7e2a062dad93a6237ffaa3d\",\"batch_digest\":\"2e8cbd2d56326b44e9cbe524f46d933a99748293f7e2a062dad93a6237ffaa3d\",\"inc_ms\":3.24,\"batch_ms\":1.74,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"valid_window\",\"engine\":\"join\",\"tip\":108,\"tip_hash\":\"711689c70194dc9bc1bc930d4bd40528df19336b21c5ee6726f1c50d11847954\",\"reject\":null,\"digest\":\"2e8cbd2d56326b44e9cbe524f46d933a99748293f7e2a062dad93a6237ffaa3d\",\"ms\":1.70}\n{\"scenario\":\"immature_coinbase\",\"blocks\":104,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"576d7749761303050404f95cd85af120ba7212c6325d446d2037c6938bb361eb\",\"expected\":\"reject@104\",\"expect_tip\":103,\"inc_tip\":103,\"inc_tip_hash\":\"5b4409666a81b3d6d1cf3ec3f794e6d62e7b1b9f6ca2851b3bf9f41f6f09fbcc\",\"inc_reject\":\"h104:tried to spend coinbase at depth 99\",\"batch_tip\":103,\"batch_tip_hash\":\"5b4409666a81b3d6d1cf3ec3f794e6d62e7b1b9f6ca2851b3bf9f41f6f09fbcc\",\"batch_reject\":\"h104:immature coinbase tx1 depth 99\",\"state_bytes\":5562,\"records\":103,\"inc_digest\":\"da734da61024c1a94dd0966ef4f87dfaf32c091f7c7a6d84d671b51515a25aa8\",\"batch_digest\":\"da734da61024c1a94dd0966ef4f87dfaf32c091f7c7a6d84d671b51515a25aa8\",\"inc_ms\":2.28,\"batch_ms\":1.63,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"immature_coinbase\",\"engine\":\"join\",\"tip\":103,\"tip_hash\":\"5b4409666a81b3d6d1cf3ec3f794e6d62e7b1b9f6ca2851b3bf9f41f6f09fbcc\",\"reject\":\"h104:immature coinbase tx1 depth 99\",\"digest\":\"da734da61024c1a94dd0966ef4f87dfaf32c091f7c7a6d84d671b51515a25aa8\",\"ms\":1.66}\n{\"scenario\":\"double_spend_cross_block\",\"blocks\":106,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"088cfce7001a289ed0bf10d94e32431642629dc039f7feb4c8a1d10240b1cdfb\",\"expected\":\"reject@106\",\"expect_tip\":105,\"inc_tip\":105,\"inc_tip_hash\":\"56a2b450c08a5d1ccae1aa712195a42081b17223cce0abb75c1a7580d2e60b36\",\"inc_reject\":\"h106:inputs missing or already spent\",\"batch_tip\":105,\"batch_tip_hash\":\"56a2b450c08a5d1ccae1aa712195a42081b17223cce0abb75c1a7580d2e60b36\",\"batch_reject\":\"h106:missing/unavailable input tx1 in0\",\"state_bytes\":5670,\"records\":105,\"inc_digest\":\"f356d03f358b3b9fdad2c2f231c0dd648f63e251fee9f415b6fe92562cece753\",\"batch_digest\":\"f356d03f358b3b9fdad2c2f231c0dd648f63e251fee9f415b6fe92562cece753\",\"inc_ms\":2.47,\"batch_ms\":1.64,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"double_spend_cross_block\",\"engine\":\"join\",\"tip\":105,\"tip_hash\":\"56a2b450c08a5d1ccae1aa712195a42081b17223cce0abb75c1a7580d2e60b36\",\"reject\":\"h106:double spend tx1 in0\",\"digest\":\"f356d03f358b3b9fdad2c2f231c0dd648f63e251fee9f415b6fe92562cece753\",\"ms\":1.63}\n{\"scenario\":\"double_spend_same_block\",\"blocks\":105,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"5198d68a2ed22e4f1ca0dcb13cb328c7e507ea23d9cd367f64f0c27e4814ae93\",\"expected\":\"reject@105\",\"expect_tip\":104,\"inc_tip\":104,\"inc_tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"inc_reject\":\"h105:inputs missing or already spent\",\"batch_tip\":104,\"batch_tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"batch_reject\":\"h105:double spend pos Occ { h: 105, tx: 2, idx: 0 }\",\"state_bytes\":5616,\"records\":104,\"inc_digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"batch_digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"inc_ms\":2.43,\"batch_ms\":1.61,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"double_spend_same_block\",\"engine\":\"join\",\"tip\":104,\"tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"reject\":\"h105:double spend tx2 in0\",\"digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"ms\":1.60}\n{\"scenario\":\"future_output\",\"blocks\":106,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"5cf9a01602fb0dc8cef23e228919b040bf5d848668cc1ebe234acc62302cc137\",\"expected\":\"reject@105\",\"expect_tip\":104,\"inc_tip\":104,\"inc_tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"inc_reject\":\"h105:inputs missing or already spent\",\"batch_tip\":104,\"batch_tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"batch_reject\":\"h105:missing/unavailable input tx1 in0\",\"state_bytes\":5616,\"records\":104,\"inc_digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"batch_digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"inc_ms\":2.32,\"batch_ms\":1.61,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"future_output\",\"engine\":\"join\",\"tip\":104,\"tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"reject\":\"h105:missing input tx1 in0\",\"digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"ms\":1.64}\n{\"scenario\":\"same_block_order_bad\",\"blocks\":105,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"236183c4aed137936000c74daebd1dc99e8b914602f0d45ed892a9ffdbe9b73e\",\"expected\":\"reject@105\",\"expect_tip\":104,\"inc_tip\":104,\"inc_tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"inc_reject\":\"h105:inputs missing or already spent\",\"batch_tip\":104,\"batch_tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"batch_reject\":\"h105:missing/unavailable input tx1 in0\",\"state_bytes\":5616,\"records\":104,\"inc_digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"batch_digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"inc_ms\":2.22,\"batch_ms\":1.54,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"same_block_order_bad\",\"engine\":\"join\",\"tip\":104,\"tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"reject\":\"h105:missing input tx1 in0\",\"digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"ms\":1.57}\n{\"scenario\":\"wrong_amount\",\"blocks\":105,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"1371485ab84f535983e75e94dc8445056a937b302ad95366467da08541634a71\",\"expected\":\"reject@105\",\"expect_tip\":104,\"inc_tip\":104,\"inc_tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"inc_reject\":\"h105:value in < value out\",\"batch_tip\":104,\"batch_tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"batch_reject\":\"h105:outputs exceed inputs tx1\",\"state_bytes\":5616,\"records\":104,\"inc_digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"batch_digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"inc_ms\":2.28,\"batch_ms\":1.55,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"wrong_amount\",\"engine\":\"join\",\"tip\":104,\"tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"reject\":\"h105:outputs exceed inputs tx1\",\"digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"ms\":1.56}\n{\"scenario\":\"excess_reward\",\"blocks\":105,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"7d96551ee5730451afd352028e3fd484883367562ac4a7c1fb4ec71ca3e2c864\",\"expected\":\"reject@105\",\"expect_tip\":104,\"inc_tip\":104,\"inc_tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"inc_reject\":\"h105:coinbase pays too much (actual=5000000001 vs limit=5000000000)\",\"batch_tip\":104,\"batch_tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"batch_reject\":\"h105:coinbase overpays 5000000001>5000000000\",\"state_bytes\":5616,\"records\":104,\"inc_digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"batch_digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"inc_ms\":2.26,\"batch_ms\":1.63,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"excess_reward\",\"engine\":\"join\",\"tip\":104,\"tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"reject\":\"h105:coinbase overpays 5000000001>5000000000\",\"digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"ms\":1.56}\n{\"scenario\":\"unspendable_spend\",\"blocks\":106,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"7cd2301567257259feb016cd3adba7dad349f07ad8bffe049b10e266c7ec0cb8\",\"expected\":\"reject@106\",\"expect_tip\":105,\"inc_tip\":105,\"inc_tip_hash\":\"19006e32e8230eb79fd9fe2bd0d064114fd3788775645c7e7e918073be33e3b5\",\"inc_reject\":\"h106:inputs missing or already spent\",\"batch_tip\":105,\"batch_tip_hash\":\"19006e32e8230eb79fd9fe2bd0d064114fd3788775645c7e7e918073be33e3b5\",\"batch_reject\":\"h106:missing/unavailable input tx1 in0\",\"state_bytes\":5616,\"records\":104,\"inc_digest\":\"2850592177ec647f1ed9b3e9477bf39680a0c513bfe625b2140dbabc55278593\",\"batch_digest\":\"2850592177ec647f1ed9b3e9477bf39680a0c513bfe625b2140dbabc55278593\",\"inc_ms\":2.44,\"batch_ms\":1.56,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"unspendable_spend\",\"engine\":\"join\",\"tip\":105,\"tip_hash\":\"19006e32e8230eb79fd9fe2bd0d064114fd3788775645c7e7e918073be33e3b5\",\"reject\":\"h106:missing input tx1 in0\",\"digest\":\"2850592177ec647f1ed9b3e9477bf39680a0c513bfe625b2140dbabc55278593\",\"ms\":1.48}\n{\"scenario\":\"locktime_early\",\"blocks\":105,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"1e98ce5b957e956c2ee7e2386d70636388675bbec3340195cba4e80e99a4ad88\",\"expected\":\"reject@105\",\"expect_tip\":104,\"inc_tip\":104,\"inc_tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"inc_reject\":\"h105:contextual: non-final transaction\",\"batch_tip\":104,\"batch_tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"batch_reject\":\"h105:contextual: non-final transaction\",\"state_bytes\":5616,\"records\":104,\"inc_digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"batch_digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"inc_ms\":2.19,\"batch_ms\":1.51,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"locktime_early\",\"engine\":\"join\",\"tip\":104,\"tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"reject\":\"h105:contextual: non-final transaction\",\"digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"ms\":1.56}\n{\"scenario\":\"locktime_satisfied\",\"blocks\":106,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"35d3730b6b267d5d8436baccc3d02b761c99f623e1a0e7dcd061fecc6eb02ed4\",\"expected\":\"accept\",\"expect_tip\":106,\"inc_tip\":106,\"inc_tip_hash\":\"35d3730b6b267d5d8436baccc3d02b761c99f623e1a0e7dcd061fecc6eb02ed4\",\"inc_reject\":null,\"batch_tip\":106,\"batch_tip_hash\":\"35d3730b6b267d5d8436baccc3d02b761c99f623e1a0e7dcd061fecc6eb02ed4\",\"batch_reject\":null,\"state_bytes\":5724,\"records\":106,\"inc_digest\":\"b9749bf8c58b59a77d33dc059711df0ec1938803c89a58219e459e214f3db357\",\"batch_digest\":\"b9749bf8c58b59a77d33dc059711df0ec1938803c89a58219e459e214f3db357\",\"inc_ms\":2.26,\"batch_ms\":1.51,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"locktime_satisfied\",\"engine\":\"join\",\"tip\":106,\"tip_hash\":\"35d3730b6b267d5d8436baccc3d02b761c99f623e1a0e7dcd061fecc6eb02ed4\",\"reject\":null,\"digest\":\"b9749bf8c58b59a77d33dc059711df0ec1938803c89a58219e459e214f3db357\",\"ms\":1.49}\n{\"scenario\":\"locktime_bypass_final\",\"blocks\":106,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"0c19c721aedce98cae09d86174dea80b01231bed29884c4ca40e50e1e2995dec\",\"expected\":\"accept\",\"expect_tip\":106,\"inc_tip\":106,\"inc_tip_hash\":\"0c19c721aedce98cae09d86174dea80b01231bed29884c4ca40e50e1e2995dec\",\"inc_reject\":null,\"batch_tip\":106,\"batch_tip_hash\":\"0c19c721aedce98cae09d86174dea80b01231bed29884c4ca40e50e1e2995dec\",\"batch_reject\":null,\"state_bytes\":5724,\"records\":106,\"inc_digest\":\"260f3fa6e3505408690c4abf350e8a414d154d11c0f0e59ad7ce84aa278731a7\",\"batch_digest\":\"260f3fa6e3505408690c4abf350e8a414d154d11c0f0e59ad7ce84aa278731a7\",\"inc_ms\":2.24,\"batch_ms\":1.55,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"locktime_bypass_final\",\"engine\":\"join\",\"tip\":106,\"tip_hash\":\"0c19c721aedce98cae09d86174dea80b01231bed29884c4ca40e50e1e2995dec\",\"reject\":null,\"digest\":\"260f3fa6e3505408690c4abf350e8a414d154d11c0f0e59ad7ce84aa278731a7\",\"ms\":1.49}\n{\"scenario\":\"locktime_mtp_early\",\"blocks\":106,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"3ad64c30f0ae44f12277c9e3352649127c85686d628216b5210e04d7c7f8142e\",\"expected\":\"reject@106\",\"expect_tip\":105,\"inc_tip\":105,\"inc_tip_hash\":\"13b7a761176304d1910b2685898bcaeb1da29a94eb56433dd0ff471b93afde42\",\"inc_reject\":\"h106:contextual: non-final transaction\",\"batch_tip\":105,\"batch_tip_hash\":\"13b7a761176304d1910b2685898bcaeb1da29a94eb56433dd0ff471b93afde42\",\"batch_reject\":\"h106:contextual: non-final transaction\",\"state_bytes\":5670,\"records\":105,\"inc_digest\":\"a1c98653297963d4747515ad161740e58767f4a8304b65d5718cdf8f7fac0f0e\",\"batch_digest\":\"a1c98653297963d4747515ad161740e58767f4a8304b65d5718cdf8f7fac0f0e\",\"inc_ms\":2.11,\"batch_ms\":1.48,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"locktime_mtp_early\",\"engine\":\"join\",\"tip\":105,\"tip_hash\":\"13b7a761176304d1910b2685898bcaeb1da29a94eb56433dd0ff471b93afde42\",\"reject\":\"h106:contextual: non-final transaction\",\"digest\":\"a1c98653297963d4747515ad161740e58767f4a8304b65d5718cdf8f7fac0f0e\",\"ms\":1.53}\n{\"scenario\":\"locktime_mtp_ok\",\"blocks\":106,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"5176b04edf4213cfcbe941a3315cd5abc3b5070968d774b5d94f9642050d69e2\",\"expected\":\"accept\",\"expect_tip\":106,\"inc_tip\":106,\"inc_tip_hash\":\"5176b04edf4213cfcbe941a3315cd5abc3b5070968d774b5d94f9642050d69e2\",\"inc_reject\":null,\"batch_tip\":106,\"batch_tip_hash\":\"5176b04edf4213cfcbe941a3315cd5abc3b5070968d774b5d94f9642050d69e2\",\"batch_reject\":null,\"state_bytes\":5724,\"records\":106,\"inc_digest\":\"6fdc62a419a1a57c01437aa7f58e428f3341441055118c6ef6d1077e092513dc\",\"batch_digest\":\"6fdc62a419a1a57c01437aa7f58e428f3341441055118c6ef6d1077e092513dc\",\"inc_ms\":2.32,\"batch_ms\":1.58,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"locktime_mtp_ok\",\"engine\":\"join\",\"tip\":106,\"tip_hash\":\"5176b04edf4213cfcbe941a3315cd5abc3b5070968d774b5d94f9642050d69e2\",\"reject\":null,\"digest\":\"6fdc62a419a1a57c01437aa7f58e428f3341441055118c6ef6d1077e092513dc\",\"ms\":1.54}\n{\"scenario\":\"seq_lock_early\",\"blocks\":107,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"264097b9dd0361f5f609550cf2f53a8a072090a55978a7bcbc8b20b3caa7e9c2\",\"expected\":\"reject@107\",\"expect_tip\":106,\"inc_tip\":106,\"inc_tip_hash\":\"1355a12e4fdb13d0fd02802a802a0d44084ad5ece0070f0bb38541377abd367f\",\"inc_reject\":\"h107:contains a non-BIP68-final transaction\",\"batch_tip\":106,\"batch_tip_hash\":\"1355a12e4fdb13d0fd02802a802a0d44084ad5ece0070f0bb38541377abd367f\",\"batch_reject\":\"h107:BIP68 lock tx1\",\"state_bytes\":5724,\"records\":106,\"inc_digest\":\"a657e65df5b41d16e0c6cbbb8452504fa62e436f8e31dc98b79bf9772f887a75\",\"batch_digest\":\"a657e65df5b41d16e0c6cbbb8452504fa62e436f8e31dc98b79bf9772f887a75\",\"inc_ms\":2.32,\"batch_ms\":1.59,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"seq_lock_early\",\"engine\":\"join\",\"tip\":106,\"tip_hash\":\"1355a12e4fdb13d0fd02802a802a0d44084ad5ece0070f0bb38541377abd367f\",\"reject\":\"h107:BIP68 lock tx1\",\"digest\":\"a657e65df5b41d16e0c6cbbb8452504fa62e436f8e31dc98b79bf9772f887a75\",\"ms\":1.60}\n{\"scenario\":\"seq_lock_satisfied\",\"blocks\":108,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"5e4b26bf1f7268a7473b46364ae02df53f4f2c6179391586d899167844d984cf\",\"expected\":\"accept\",\"expect_tip\":108,\"inc_tip\":108,\"inc_tip_hash\":\"5e4b26bf1f7268a7473b46364ae02df53f4f2c6179391586d899167844d984cf\",\"inc_reject\":null,\"batch_tip\":108,\"batch_tip_hash\":\"5e4b26bf1f7268a7473b46364ae02df53f4f2c6179391586d899167844d984cf\",\"batch_reject\":null,\"state_bytes\":5832,\"records\":108,\"inc_digest\":\"23ba38a4cec7e98b7db0960aa09bcdc23b0713ec7a14634054c7ae69ab1d9c27\",\"batch_digest\":\"23ba38a4cec7e98b7db0960aa09bcdc23b0713ec7a14634054c7ae69ab1d9c27\",\"inc_ms\":2.60,\"batch_ms\":1.68,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"seq_lock_satisfied\",\"engine\":\"join\",\"tip\":108,\"tip_hash\":\"5e4b26bf1f7268a7473b46364ae02df53f4f2c6179391586d899167844d984cf\",\"reject\":null,\"digest\":\"23ba38a4cec7e98b7db0960aa09bcdc23b0713ec7a14634054c7ae69ab1d9c27\",\"ms\":1.56}\n{\"scenario\":\"seq_timelock_ok\",\"blocks\":107,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"33c71c6fd98f5f85d54ac6167a5c1dc99326be8cd027e2b461ce787b344a5d07\",\"expected\":\"accept\",\"expect_tip\":107,\"inc_tip\":107,\"inc_tip_hash\":\"33c71c6fd98f5f85d54ac6167a5c1dc99326be8cd027e2b461ce787b344a5d07\",\"inc_reject\":null,\"batch_tip\":107,\"batch_tip_hash\":\"33c71c6fd98f5f85d54ac6167a5c1dc99326be8cd027e2b461ce787b344a5d07\",\"batch_reject\":null,\"state_bytes\":5778,\"records\":107,\"inc_digest\":\"dbf40e977e5c20cf7864c2de6d14f6fb14375dbdf12b9fff0141ec2094358157\",\"batch_digest\":\"dbf40e977e5c20cf7864c2de6d14f6fb14375dbdf12b9fff0141ec2094358157\",\"inc_ms\":2.27,\"batch_ms\":1.51,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"seq_timelock_ok\",\"engine\":\"join\",\"tip\":107,\"tip_hash\":\"33c71c6fd98f5f85d54ac6167a5c1dc99326be8cd027e2b461ce787b344a5d07\",\"reject\":null,\"digest\":\"dbf40e977e5c20cf7864c2de6d14f6fb14375dbdf12b9fff0141ec2094358157\",\"ms\":1.48}\n{\"scenario\":\"seq_timelock_early\",\"blocks\":107,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"51e64c2c438624f4c82ed9df18dbf6cfdf900d6f94cc4e50d5873d8c3ffbb273\",\"expected\":\"reject@107\",\"expect_tip\":106,\"inc_tip\":106,\"inc_tip_hash\":\"7708fa40a810adda7835f769083001c91d2bee0c6eead0c25a82b3de0983d540\",\"inc_reject\":\"h107:contains a non-BIP68-final transaction\",\"batch_tip\":106,\"batch_tip_hash\":\"7708fa40a810adda7835f769083001c91d2bee0c6eead0c25a82b3de0983d540\",\"batch_reject\":\"h107:BIP68 lock tx1\",\"state_bytes\":5724,\"records\":106,\"inc_digest\":\"a657e65df5b41d16e0c6cbbb8452504fa62e436f8e31dc98b79bf9772f887a75\",\"batch_digest\":\"a657e65df5b41d16e0c6cbbb8452504fa62e436f8e31dc98b79bf9772f887a75\",\"inc_ms\":2.42,\"batch_ms\":1.66,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"seq_timelock_early\",\"engine\":\"join\",\"tip\":106,\"tip_hash\":\"7708fa40a810adda7835f769083001c91d2bee0c6eead0c25a82b3de0983d540\",\"reject\":\"h107:BIP68 lock tx1\",\"digest\":\"a657e65df5b41d16e0c6cbbb8452504fa62e436f8e31dc98b79bf9772f887a75\",\"ms\":1.59}\n{\"scenario\":\"fee_claim_exact\",\"blocks\":106,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"66bd6d0a20b87ab09f3fc23c02a88fe675f39846c538104aeef1d22c2ac05c95\",\"expected\":\"accept\",\"expect_tip\":106,\"inc_tip\":106,\"inc_tip_hash\":\"66bd6d0a20b87ab09f3fc23c02a88fe675f39846c538104aeef1d22c2ac05c95\",\"inc_reject\":null,\"batch_tip\":106,\"batch_tip_hash\":\"66bd6d0a20b87ab09f3fc23c02a88fe675f39846c538104aeef1d22c2ac05c95\",\"batch_reject\":null,\"state_bytes\":5724,\"records\":106,\"inc_digest\":\"708473c96e06f04355799c3d5f751b5ca42cf1e652daf4f20c45ce396be0c20f\",\"batch_digest\":\"708473c96e06f04355799c3d5f751b5ca42cf1e652daf4f20c45ce396be0c20f\",\"inc_ms\":2.24,\"batch_ms\":1.71,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"fee_claim_exact\",\"engine\":\"join\",\"tip\":106,\"tip_hash\":\"66bd6d0a20b87ab09f3fc23c02a88fe675f39846c538104aeef1d22c2ac05c95\",\"reject\":null,\"digest\":\"708473c96e06f04355799c3d5f751b5ca42cf1e652daf4f20c45ce396be0c20f\",\"ms\":1.47}\n{\"scenario\":\"fee_claim_plus1\",\"blocks\":106,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"6bc15e9bfc3eb6d701f13d66d6110bf44109b18d4febbd8cd9bc529c667938a8\",\"expected\":\"reject@106\",\"expect_tip\":105,\"inc_tip\":105,\"inc_tip_hash\":\"13b7a761176304d1910b2685898bcaeb1da29a94eb56433dd0ff471b93afde42\",\"inc_reject\":\"h106:coinbase pays too much (actual=5000007001 vs limit=5000007000)\",\"batch_tip\":105,\"batch_tip_hash\":\"13b7a761176304d1910b2685898bcaeb1da29a94eb56433dd0ff471b93afde42\",\"batch_reject\":\"h106:coinbase overpays 5000007001>5000007000\",\"state_bytes\":5670,\"records\":105,\"inc_digest\":\"a1c98653297963d4747515ad161740e58767f4a8304b65d5718cdf8f7fac0f0e\",\"batch_digest\":\"a1c98653297963d4747515ad161740e58767f4a8304b65d5718cdf8f7fac0f0e\",\"inc_ms\":2.11,\"batch_ms\":1.52,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"fee_claim_plus1\",\"engine\":\"join\",\"tip\":105,\"tip_hash\":\"13b7a761176304d1910b2685898bcaeb1da29a94eb56433dd0ff471b93afde42\",\"reject\":\"h106:coinbase overpays 5000007001>5000007000\",\"digest\":\"a1c98653297963d4747515ad161740e58767f4a8304b65d5718cdf8f7fac0f0e\",\"ms\":1.51}\n{\"scenario\":\"missing_input\",\"blocks\":105,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"0094c7692e2301f7d50bf2048309cad50caaf8484479fafd3a3d798a53ddcf03\",\"expected\":\"reject@105\",\"expect_tip\":104,\"inc_tip\":104,\"inc_tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"inc_reject\":\"h105:inputs missing or already spent\",\"batch_tip\":104,\"batch_tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"batch_reject\":\"h105:missing/unavailable input tx1 in0\",\"state_bytes\":5616,\"records\":104,\"inc_digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"batch_digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"inc_ms\":2.13,\"batch_ms\":1.60,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"missing_input\",\"engine\":\"join\",\"tip\":104,\"tip_hash\":\"287fa1df305850d1cc5abdec0c925339f4af3116a6d8907882c688194ace7edb\",\"reject\":\"h105:missing input tx1 in0\",\"digest\":\"3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e\",\"ms\":1.57}\n{\"scenario\":\"bip30_dup_coinbase_synthetic\",\"blocks\":106,\"first_block_parent\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"last_block_hash\":\"1242dbd17ee5356933c81905d507e7bd0e40199f857dc27a3700824206ad73cc\",\"expected\":\"reject@106\",\"expect_tip\":105,\"inc_tip\":105,\"inc_tip_hash\":\"78aa02507c3e8aac47676ac68c6289b32627f27755ca3b933a24c0e81b69ade0\",\"inc_reject\":\"h106:tried to overwrite unspent output OutPoint { txid: Txid(546bb3a09381a44bdb663a56c08e7f8ac580127c01a5691c2646124271cdbeee), vout: 0 }\",\"batch_tip\":105,\"batch_tip_hash\":\"78aa02507c3e8aac47676ac68c6289b32627f27755ca3b933a24c0e81b69ade0\",\"batch_reject\":\"h106:BIP30 duplicate creation tx0 out0\",\"state_bytes\":5670,\"records\":105,\"inc_digest\":\"2085612f08d2edd412dbfe12eb73bd42808842fe028b3b2ba7f4bacec3d4adaf\",\"batch_digest\":\"2085612f08d2edd412dbfe12eb73bd42808842fe028b3b2ba7f4bacec3d4adaf\",\"inc_ms\":2.12,\"batch_ms\":1.52,\"state_equal\":true,\"boundary_digests_equal\":true,\"tip_hash_equal\":true,\"tip_correct\":true,\"rejection_preserves_state\":true,\"expectations_met\":true,\"first_diff_byte\":null,\"first_diff_record\":null,\"inc_rec\":null,\"batch_rec\":null,\"inc_records_n\":null,\"batch_records_n\":null,\"ok\":true}\n{\"scenario\":\"bip30_dup_coinbase_synthetic\",\"engine\":\"join\",\"tip\":105,\"tip_hash\":\"78aa02507c3e8aac47676ac68c6289b32627f27755ca3b933a24c0e81b69ade0\",\"reject\":\"h106:join: BIP30 duplicate creation @ Occ { h: 106, tx: 0, idx: 0 }\",\"digest\":\"2085612f08d2edd412dbfe12eb73bd42808842fe028b3b2ba7f4bacec3d4adaf\",\"ms\":1.49}\n{\"scenario\":\"supplied_state_h105\",\"suffix_blocks\":3,\"fixture_bytes\":5670,\"fixture_records\":105,\"fixture_sha256\":\"a1c98653297963d4747515ad161740e58767f4a8304b65d5718cdf8f7fac0f0e\",\"inc_tip\":108,\"inc_tip_hash\":\"711689c70194dc9bc1bc930d4bd40528df19336b21c5ee6726f1c50d11847954\",\"batch_tip\":108,\"batch_tip_hash\":\"711689c70194dc9bc1bc930d4bd40528df19336b21c5ee6726f1c50d11847954\",\"whole_tip_hash\":\"711689c70194dc9bc1bc930d4bd40528df19336b21c5ee6726f1c50d11847954\",\"inc_digest\":\"2e8cbd2d56326b44e9cbe524f46d933a99748293f7e2a062dad93a6237ffaa3d\",\"batch_digest\":\"2e8cbd2d56326b44e9cbe524f46d933a99748293f7e2a062dad93a6237ffaa3d\",\"whole_digest\":\"2e8cbd2d56326b44e9cbe524f46d933a99748293f7e2a062dad93a6237ffaa3d\",\"state_equal\":true,\"tip_equal\":true,\"ok\":true}\n{\"scenario\":\"supplied_state_timelock\",\"suffix_blocks\":3,\"inc_tip\":108,\"inc_reject\":null,\"batch_tip\":108,\"batch_reject\":null,\"inc_digest\":\"9b5dca37765e527cc0aa06d766d515f4d1f18ee6069f5eea8a762f37a9a82704\",\"batch_digest\":\"9b5dca37765e527cc0aa06d766d515f4d1f18ee6069f5eea8a762f37a9a82704\",\"whole_digest\":\"9b5dca37765e527cc0aa06d766d515f4d1f18ee6069f5eea8a762f37a9a82704\",\"state_equal\":true,\"tip_equal\":true,\"accepted\":true,\"ok\":true}\n{\"type\":\"summary\",\"genesis_hash\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\",\"all_ok\":true}\n"
+    },
+    "experiments/results/gate4-window-join-341k.jsonl": {
+      "sha256": "6978049a14c9fada53a82401b42c897f65aae2b24ce566a5d7df3953ba166e30",
+      "bytes": 890,
+      "raw_text": "{\"type\":\"window_join\",\"window\":[340787,342234],\"corpus_bytes\":161838980,\"blocks\":449,\"txs\":247193,\"inputs_noncb\":671771,\"srcs_resolved\":599840,\"srcs_unresolved\":71931,\"spend_records\":671771,\"creation_records\":704753,\"join_violations\":0,\"fully_resolved_txs\":180242,\"excluded_txs\":66502,\"exec_inputs\":375741,\"verified_inputs\":375741,\"script_failures\":0,\"immature_violations\":0,\"value_violations\":0,\"nonfinal_violations\":0,\"time_form_locks_unevaluated\":0,\"sigop_violations\":0,\"resolved_spec_unjoined\":45351,\"unresolved_spec_inputs\":21151,\"cb_bound_checks\":5,\"cb_bound_violations\":0,\"survivor_records\":252735,\"canonical_bytes\":19848854,\"canonical_digest\":\"bdc203ebffc2d5b1f35b00c97a7b7742bc68201077e79e09eebe9b1e37899182\",\"stages\":{\"parse_s\":0.290,\"emit_s\":0.191,\"join_s\":1.663,\"predicate_s\":0.192,\"script_s\":5.198,\"materialize_s\":0.360,\"export_s\":0.118},\"rss_hwm_bytes\":903168000,\"workers\":8}\n"
+    },
+    "experiments/results/window-join-341k.jsonl": {
+      "sha256": "6007a395fa58177d0a8c95ba27749b531002dce97c0080e50e03e5a2b367e1aa",
+      "bytes": 238,
+      "raw_text": "\nthread 'main' (915278) panicked at crates/avila-consensus/examples/window_join.rs:81:46:\nrange end index 2525549611 out of range for slice of length 161838980\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+    }
+  },
+  "fixture_checks": {
+    "ordinary_scenarios": 22,
+    "supplied_state_scenarios": 2,
+    "total_scenarios": 24,
+    "jsonl_rows": 47,
+    "join_diagnostic_rows": 22,
+    "canonical_files_checked": 66,
+    "triples": [
+      {
+        "scenario": "valid_window",
+        "paths": [
+          "experiments/results/gate3/valid_window-inc.canonical",
+          "experiments/results/gate3/valid_window-batch.canonical",
+          "experiments/results/gate3/valid_window-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "2e8cbd2d56326b44e9cbe524f46d933a99748293f7e2a062dad93a6237ffaa3d",
+        "bytes_each": 5778,
+        "records_each": 107,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "immature_coinbase",
+        "paths": [
+          "experiments/results/gate3/immature_coinbase-inc.canonical",
+          "experiments/results/gate3/immature_coinbase-batch.canonical",
+          "experiments/results/gate3/immature_coinbase-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "da734da61024c1a94dd0966ef4f87dfaf32c091f7c7a6d84d671b51515a25aa8",
+        "bytes_each": 5562,
+        "records_each": 103,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "double_spend_cross_block",
+        "paths": [
+          "experiments/results/gate3/double_spend_cross_block-inc.canonical",
+          "experiments/results/gate3/double_spend_cross_block-batch.canonical",
+          "experiments/results/gate3/double_spend_cross_block-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "f356d03f358b3b9fdad2c2f231c0dd648f63e251fee9f415b6fe92562cece753",
+        "bytes_each": 5670,
+        "records_each": 105,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "double_spend_same_block",
+        "paths": [
+          "experiments/results/gate3/double_spend_same_block-inc.canonical",
+          "experiments/results/gate3/double_spend_same_block-batch.canonical",
+          "experiments/results/gate3/double_spend_same_block-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e",
+        "bytes_each": 5616,
+        "records_each": 104,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "future_output",
+        "paths": [
+          "experiments/results/gate3/future_output-inc.canonical",
+          "experiments/results/gate3/future_output-batch.canonical",
+          "experiments/results/gate3/future_output-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e",
+        "bytes_each": 5616,
+        "records_each": 104,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "same_block_order_bad",
+        "paths": [
+          "experiments/results/gate3/same_block_order_bad-inc.canonical",
+          "experiments/results/gate3/same_block_order_bad-batch.canonical",
+          "experiments/results/gate3/same_block_order_bad-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e",
+        "bytes_each": 5616,
+        "records_each": 104,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "wrong_amount",
+        "paths": [
+          "experiments/results/gate3/wrong_amount-inc.canonical",
+          "experiments/results/gate3/wrong_amount-batch.canonical",
+          "experiments/results/gate3/wrong_amount-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e",
+        "bytes_each": 5616,
+        "records_each": 104,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "excess_reward",
+        "paths": [
+          "experiments/results/gate3/excess_reward-inc.canonical",
+          "experiments/results/gate3/excess_reward-batch.canonical",
+          "experiments/results/gate3/excess_reward-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e",
+        "bytes_each": 5616,
+        "records_each": 104,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "unspendable_spend",
+        "paths": [
+          "experiments/results/gate3/unspendable_spend-inc.canonical",
+          "experiments/results/gate3/unspendable_spend-batch.canonical",
+          "experiments/results/gate3/unspendable_spend-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "2850592177ec647f1ed9b3e9477bf39680a0c513bfe625b2140dbabc55278593",
+        "bytes_each": 5616,
+        "records_each": 104,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "locktime_early",
+        "paths": [
+          "experiments/results/gate3/locktime_early-inc.canonical",
+          "experiments/results/gate3/locktime_early-batch.canonical",
+          "experiments/results/gate3/locktime_early-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e",
+        "bytes_each": 5616,
+        "records_each": 104,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "locktime_satisfied",
+        "paths": [
+          "experiments/results/gate3/locktime_satisfied-inc.canonical",
+          "experiments/results/gate3/locktime_satisfied-batch.canonical",
+          "experiments/results/gate3/locktime_satisfied-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "b9749bf8c58b59a77d33dc059711df0ec1938803c89a58219e459e214f3db357",
+        "bytes_each": 5724,
+        "records_each": 106,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "locktime_bypass_final",
+        "paths": [
+          "experiments/results/gate3/locktime_bypass_final-inc.canonical",
+          "experiments/results/gate3/locktime_bypass_final-batch.canonical",
+          "experiments/results/gate3/locktime_bypass_final-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "260f3fa6e3505408690c4abf350e8a414d154d11c0f0e59ad7ce84aa278731a7",
+        "bytes_each": 5724,
+        "records_each": 106,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "locktime_mtp_early",
+        "paths": [
+          "experiments/results/gate3/locktime_mtp_early-inc.canonical",
+          "experiments/results/gate3/locktime_mtp_early-batch.canonical",
+          "experiments/results/gate3/locktime_mtp_early-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "a1c98653297963d4747515ad161740e58767f4a8304b65d5718cdf8f7fac0f0e",
+        "bytes_each": 5670,
+        "records_each": 105,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "locktime_mtp_ok",
+        "paths": [
+          "experiments/results/gate3/locktime_mtp_ok-inc.canonical",
+          "experiments/results/gate3/locktime_mtp_ok-batch.canonical",
+          "experiments/results/gate3/locktime_mtp_ok-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "6fdc62a419a1a57c01437aa7f58e428f3341441055118c6ef6d1077e092513dc",
+        "bytes_each": 5724,
+        "records_each": 106,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "seq_lock_early",
+        "paths": [
+          "experiments/results/gate3/seq_lock_early-inc.canonical",
+          "experiments/results/gate3/seq_lock_early-batch.canonical",
+          "experiments/results/gate3/seq_lock_early-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "a657e65df5b41d16e0c6cbbb8452504fa62e436f8e31dc98b79bf9772f887a75",
+        "bytes_each": 5724,
+        "records_each": 106,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "seq_lock_satisfied",
+        "paths": [
+          "experiments/results/gate3/seq_lock_satisfied-inc.canonical",
+          "experiments/results/gate3/seq_lock_satisfied-batch.canonical",
+          "experiments/results/gate3/seq_lock_satisfied-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "23ba38a4cec7e98b7db0960aa09bcdc23b0713ec7a14634054c7ae69ab1d9c27",
+        "bytes_each": 5832,
+        "records_each": 108,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "seq_timelock_ok",
+        "paths": [
+          "experiments/results/gate3/seq_timelock_ok-inc.canonical",
+          "experiments/results/gate3/seq_timelock_ok-batch.canonical",
+          "experiments/results/gate3/seq_timelock_ok-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "dbf40e977e5c20cf7864c2de6d14f6fb14375dbdf12b9fff0141ec2094358157",
+        "bytes_each": 5778,
+        "records_each": 107,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "seq_timelock_early",
+        "paths": [
+          "experiments/results/gate3/seq_timelock_early-inc.canonical",
+          "experiments/results/gate3/seq_timelock_early-batch.canonical",
+          "experiments/results/gate3/seq_timelock_early-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "a657e65df5b41d16e0c6cbbb8452504fa62e436f8e31dc98b79bf9772f887a75",
+        "bytes_each": 5724,
+        "records_each": 106,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "fee_claim_exact",
+        "paths": [
+          "experiments/results/gate3/fee_claim_exact-inc.canonical",
+          "experiments/results/gate3/fee_claim_exact-batch.canonical",
+          "experiments/results/gate3/fee_claim_exact-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "708473c96e06f04355799c3d5f751b5ca42cf1e652daf4f20c45ce396be0c20f",
+        "bytes_each": 5724,
+        "records_each": 106,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "fee_claim_plus1",
+        "paths": [
+          "experiments/results/gate3/fee_claim_plus1-inc.canonical",
+          "experiments/results/gate3/fee_claim_plus1-batch.canonical",
+          "experiments/results/gate3/fee_claim_plus1-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "a1c98653297963d4747515ad161740e58767f4a8304b65d5718cdf8f7fac0f0e",
+        "bytes_each": 5670,
+        "records_each": 105,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "missing_input",
+        "paths": [
+          "experiments/results/gate3/missing_input-inc.canonical",
+          "experiments/results/gate3/missing_input-batch.canonical",
+          "experiments/results/gate3/missing_input-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "3eb771e24de835bec364e42bd53920a8056213ca5a0438a43cd162dc17ffc92e",
+        "bytes_each": 5616,
+        "records_each": 104,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      },
+      {
+        "scenario": "bip30_dup_coinbase_synthetic",
+        "paths": [
+          "experiments/results/gate3/bip30_dup_coinbase_synthetic-inc.canonical",
+          "experiments/results/gate3/bip30_dup_coinbase_synthetic-batch.canonical",
+          "experiments/results/gate3/bip30_dup_coinbase_synthetic-join.canonical"
+        ],
+        "byte_equal": true,
+        "sha256": "2085612f08d2edd412dbfe12eb73bd42808842fe028b3b2ba7f4bacec3d4adaf",
+        "bytes_each": 5670,
+        "records_each": 105,
+        "outpoints_unique": true,
+        "matches_reported_digests_sizes_counts_tips": true
+      }
+    ],
+    "supplied_comparison_scope": "Terminal equality asserted in source and reported via aggregate booleans; no per-boundary continuation equality assertion or separately saved join export for these cases."
+  },
+  "saved_window_arithmetic": {
+    "required_heights_in_closed_interval": 1448,
+    "blocks_reported": 449,
+    "minimum_absent_heights_assuming_all_reported_blocks_within_interval": 999,
+    "stage_sum_s": 8.012,
+    "script_share_of_stage_sum": 0.6487768347478782,
+    "join_share_of_stage_sum": 0.20756365451822265,
+    "join_share_of_non_script_stage_sum": 0.5909737029140014,
+    "verified_inputs_per_script_stage_second": 72285.68680261639,
+    "verified_share_of_non_coinbase_inputs": 0.5593289975304084,
+    "cb_checks_share_of_reported_blocks": 0.011135857461024499,
+    "excluded_transactions_equal_first_unmatched_reason_counts": true,
+    "timing_scope": "One saved shared-host partial-sample run; not a capacity or full-validation estimate."
+  },
+  "report_table_arithmetic": {
+    "stages_s": {
+      "parse_s": 0.307,
+      "emit_s": 0.211,
+      "join_s": 1.905,
+      "predicate_s": 0.221,
+      "script_s": 7.142,
+      "materialize_s": 0.479,
+      "export_s": 0.009
+    },
+    "sum_s": 10.274000000000001,
+    "join_share_of_non_script_time": 0.6082375478927202,
+    "script_share_of_stage_sum": 0.6951528129258322,
+    "matches_saved_window_stages": false
+  },
+  "test_artifact": {
+    "path": "experiments/results/gate3/cargo-test-release-2026-09-26.log",
+    "sha256": "8e623b939ec402a337189ff24f2d82adf21345abd2d61ab18a7a74e4c66c36c0",
+    "same_hash_as_previous_review": true,
+    "result_lines": [
+      "test result: ok. 551 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 2.70s",
+      "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ],
+    "qualification": "A fresh rerun was reported by SWE-2; this archived log is unchanged from the prior review, so it does not independently substantiate the new run."
+  },
+  "source_findings": [
+    {
+      "id": "P1-measured-join-drift",
+      "detail": "window_join.rs implements its own join; it does not call state_join.rs::run_join. Boundary Some(Coin) is consulted again on every spend while alive=false, permitting repeated resolution of a spent boundary coin. Known in-window repeated spends become Unresolved and excluded rather than a multiplicity violation."
+    },
+    {
+      "id": "P1-failures-and-worker-count",
+      "detail": "window_join.rs has no nonzero exit on validation counters or script_failures. Zero workers are accepted, while verified_inputs is computed from admitted tasks rather than completed successful checks. It materializes every emitted event regardless of invalidity or exclusion."
+    },
+    {
+      "id": "P1-chain-and-provenance",
+      "detail": "449 blocks cannot be a contiguous 1448-height span. The builder uses BIP34 heights and latest-earlier occurrences, without selected-header-chain membership. Missing creation-ledger entries do not establish orphan/unspendable causes. Metadata and unspent-boundary status are not authenticated by a source txid recheck."
+    },
+    {
+      "id": "P1-rule-parity",
+      "detail": "Fixture run_join omits scripts and UTXO-dependent sigop checks. window_join uses saturating fee aggregation without money_range aggregate check, incomplete coinbase sigops, and no contextual block validation or BIP68 evaluation. Height 340787..342234 is below local mainnet CSV/BIP113 activation at 419328."
+    },
+    {
+      "id": "P2-cost-and-evidence",
+      "detail": "Saved stages differ from report; corpus index build and external-memory work absent; std::fs::write is not a durable sync checkpoint; full-history block-count extrapolation and comparing inputs/sec with attempts/sec are unsupported."
+    }
+  ],
+  "limitations": [
+    "Canonical triple comparisons confirm equality of saved outputs, not complete Bitcoin consensus correctness.",
+    "No real corpus was scanned and no cause assigned to individual missing sources. The 999-height figure is interval arithmetic, not a decoded height-list census.",
+    "Window canonical digest is reported by the saved JSON; the 19.8 MB partial export was not independently inspected.",
+    "Only the existing archived test log was reviewed; no fresh build/test was executed by Codex.",
+    "The actual external-memory implementation and complete real-mainnet state comparison remain absent."
+  ]
+}

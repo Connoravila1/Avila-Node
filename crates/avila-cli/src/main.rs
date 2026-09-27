@@ -559,6 +559,8 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     eclipse: Vec::new(),
                     prune_bytes: None,
                     eta_secs: None,
+                    eta_lo_secs: None,
+                    eta_hi_secs: None,
                     proxy: None,
                 }));
             let (query_tx, query_rx) = std::sync::mpsc::channel();

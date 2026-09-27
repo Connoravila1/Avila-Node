@@ -1,0 +1,151 @@
+{
+  "kind": "read_only_source_and_host_configuration_audit_with_analytical_model",
+  "captured_utc": "2026-09-26T14:11:38.390180+00:00",
+  "git_head": "8a8ea5a4e85d337eb937bb48e3147ed7def717bb",
+  "scope": "No benchmarks, traffic generation, packet capture, socket reconfiguration, or live-node mutation. No ISP speed, Wi-Fi PHY rate, packet loss, or sustained capacity measured.",
+  "source_files": {
+    "crates/avila-p2p/src/manager.rs": {
+      "sha256": "f505aba4181ece2140689f518e2816ce803a6843f060cc27f39fdcc5d91cc4ab",
+      "bytes": 255475
+    },
+    "crates/avila-p2p/src/sync.rs": {
+      "sha256": "b861fd92d673223f406c0a4be6c72f44391b9a4d5f146a4905f60ca15aa37ecb",
+      "bytes": 78819
+    },
+    "crates/avila-p2p/src/session.rs": {
+      "sha256": "302f47853e0fc8bec158c03e73fbf421c791d7240b6f6478903c5f9999c8b0e9",
+      "bytes": 46703
+    },
+    "crates/avila-p2p/src/codec.rs": {
+      "sha256": "fb3f7893d6535e93b7a13d30a7edc7b39d3c4998d7a31cfc42a5d5efd93ce0db",
+      "bytes": 12481
+    },
+    "crates/avila-p2p/src/bip324.rs": {
+      "sha256": "c01905486c5da8a92267b59759b9b80942389660737b89782c37b4f75e02d176",
+      "bytes": 38918
+    },
+    "crates/avila-p2p/src/message.rs": {
+      "sha256": "bef70f17017fe3a4b405f42baa098b61e3570af11597306d91742cf5242e0dbb",
+      "bytes": 48361
+    },
+    "crates/avila-node/src/sync.rs": {
+      "sha256": "c2d6191e05069774b7e63769b094c76e4d9703e05f84914b83c7726ecb8f031f",
+      "bytes": 61933
+    },
+    "crates/avila-node/src/rpc.rs": {
+      "sha256": "bbe65130dca6830f553ecec249cfe1155f2f983cc913e6aadf911f9ed12e5511",
+      "bytes": 1027902
+    }
+  },
+  "host_network_configuration": {
+    "net/ipv4/tcp_rmem": "4096\t131072\t33554432",
+    "net/ipv4/tcp_wmem": "4096\t16384\t4194304",
+    "net/ipv4/tcp_moderate_rcvbuf": "1",
+    "net/ipv4/tcp_window_scaling": "1",
+    "net/ipv4/tcp_congestion_control": "cubic",
+    "net/core/rmem_max": "4194304",
+    "net/core/wmem_max": "4194304"
+  },
+  "interfaces": [
+    {
+      "name": "wlp0s20f3",
+      "wireless": true,
+      "operstate": "up",
+      "mtu": "1500",
+      "tx_queue_len": "1000",
+      "speed": null,
+      "duplex": null,
+      "driver": "iwlwifi"
+    }
+  ],
+  "analytical_model_not_measurement": {
+    "corpus_bytes_assumption_unverified": 768000000000,
+    "decimal_units": true,
+    "target_seconds": 3600,
+    "required_raw_payload_bits_per_second": 1706666666.6666667,
+    "download_table": [
+      {
+        "application_goodput_bits_per_second": 100000000,
+        "raw_download_minutes": 1024.0,
+        "max_total_application_bytes_in_one_hour": 45000000000.0,
+        "minimum_savings_fraction_if_no_helper_bytes": 0.94140625
+      },
+      {
+        "application_goodput_bits_per_second": 300000000,
+        "raw_download_minutes": 341.3333333333333,
+        "max_total_application_bytes_in_one_hour": 135000000000.0,
+        "minimum_savings_fraction_if_no_helper_bytes": 0.82421875
+      },
+      {
+        "application_goodput_bits_per_second": 500000000,
+        "raw_download_minutes": 204.8,
+        "max_total_application_bytes_in_one_hour": 225000000000.0,
+        "minimum_savings_fraction_if_no_helper_bytes": 0.70703125
+      },
+      {
+        "application_goodput_bits_per_second": 940000000,
+        "raw_download_minutes": 108.93617021276596,
+        "max_total_application_bytes_in_one_hour": 423000000000.0,
+        "minimum_savings_fraction_if_no_helper_bytes": 0.44921875
+      },
+      {
+        "application_goodput_bits_per_second": 1000000000,
+        "raw_download_minutes": 102.4,
+        "max_total_application_bytes_in_one_hour": 450000000000.0,
+        "minimum_savings_fraction_if_no_helper_bytes": 0.4140625
+      },
+      {
+        "application_goodput_bits_per_second": 2500000000,
+        "raw_download_minutes": 40.96,
+        "max_total_application_bytes_in_one_hour": 1125000000000.0,
+        "minimum_savings_fraction_if_no_helper_bytes": 0
+      }
+    ],
+    "bdp_examples": [
+      {
+        "bits_per_second": 1000000000,
+        "rtt_ms": 50,
+        "bytes": 6250000.0
+      },
+      {
+        "bits_per_second": 1000000000,
+        "rtt_ms": 100,
+        "bytes": 12500000.0
+      },
+      {
+        "bits_per_second": 2500000000,
+        "rtt_ms": 100,
+        "bytes": 31250000.0
+      }
+    ],
+    "ethernet_mtu1500_ipv4_no_options": {
+      "tcp_payload_bytes": 1460,
+      "occupied_byte_times": 1538,
+      "payload_fraction": 0.9492847854356307,
+      "raw_download_minutes_at_1gbe": 107.87068493150686
+    },
+    "ethernet_mtu1500_ipv4_12byte_tcp_options": {
+      "tcp_payload_bytes": 1448,
+      "occupied_byte_times": 1538,
+      "payload_fraction": 0.94148244473342,
+      "raw_download_minutes_at_1gbe": 108.76464088397789
+    },
+    "read_8192_minimum_successful_calls_for_raw_corpus": 93750000.0,
+    "read_8192_minimum_successful_calls_per_second_at_hour_target": 26041.666666666668,
+    "one_extra_full_uncached_copy_read_plus_write_bytes": 1536000000000,
+    "illustrative_dispatch_clock_hz": 3000000000,
+    "single_core_cycles_per_raw_byte_at_hour_target_if_3ghz": 14.0625,
+    "serialization_examples_ms": {
+      "2MB_at_100Mbps": 160.0,
+      "18KB_at_100Mbps": 1.4400000000000002,
+      "4MB_at_10Mbps": 3200.0,
+      "8MB_queue_at_20Mbps": 3200.0
+    },
+    "hypothetical_outpoint_savings_bytes": {
+      "inputs_assumed": 1300000000,
+      "original_bytes": 36,
+      "hypothetical_mean_locator_bytes": 5,
+      "savings_bytes": 40300000000
+    }
+  }
+}

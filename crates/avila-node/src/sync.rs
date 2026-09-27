@@ -208,13 +208,7 @@ impl PaceModel {
         // Debug tuple repurposed for the size-scaled model:
         // (median pace ms, size ratio at the cap, byte slope, byte
         // cap, windows used).
-        self.last_fit = Some((
-            med_y,
-            byte_cap / med_x.max(1.0),
-            bf,
-            byte_cap,
-            keep.len(),
-        ));
+        self.last_fit = Some((med_y, byte_cap / med_x.max(1.0), bf, byte_cap, keep.len()));
         // The size slope only holds over the evidence — extrapolating a
         // local growth rate to the tip saturates every future block at
         // the cap (a 560k-height projection turned a +8B/blk mid-2016
@@ -232,9 +226,7 @@ impl PaceModel {
         let mut h = from as u64;
         let tip = to as u64;
         let stride = PACE_WINDOW_BLOCKS as u64;
-        let pace_at = |bytes: f64| {
-            (med_y * bytes / med_x.max(1.0)).clamp(pace_floor, pace_cap)
-        };
+        let pace_at = |bytes: f64| (med_y * bytes / med_x.max(1.0)).clamp(pace_floor, pace_cap);
         let lo_pace = pace_at(med_x);
         let hi_pace = pace_at(byte_cap);
         while h < tip {
@@ -1212,13 +1204,16 @@ pub fn run(
                 d(t.script_ns, hb_prev_t.script_ns),
                 d(t.drain_ns, hb_prev_t.drain_ns),
                 d(t.bip30_ns, hb_prev_t.bip30_ns),
-                d(t.total_ns.saturating_sub(
-                    t.read_ns + t.apply_ns + t.script_ns + t.bip30_ns),
+                d(
+                    t.total_ns
+                        .saturating_sub(t.read_ns + t.apply_ns + t.script_ns + t.bip30_ns),
                     hb_prev_t.total_ns.saturating_sub(
                         hb_prev_t.read_ns
                             + hb_prev_t.apply_ns
                             + hb_prev_t.script_ns
-                            + hb_prev_t.bip30_ns)),
+                            + hb_prev_t.bip30_ns
+                    )
+                ),
                 d_ms(t.accept_ns, hb_prev_t.accept_ns),
                 d_ms(t.reorg_ns, hb_prev_t.reorg_ns),
             );

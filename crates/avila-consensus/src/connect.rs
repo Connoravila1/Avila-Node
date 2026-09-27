@@ -1258,7 +1258,11 @@ pub fn bip68_locks_satisfied(
 /// `CountWitnessSigOps`. `spent` must be this tx's consumed coins in input
 /// order — pass an empty slice for the coinbase (it returns after the legacy
 /// term).
-fn tx_sigop_cost(tx: &Transaction, spent: &[Coin], flags: ScriptFlags) -> u64 {
+/// Per-transaction sigop cost (legacy + P2SH-redeem + witness under `flags`),
+/// weighted by `WITNESS_SCALE_FACTOR` — the unit summed per block against
+/// `MAX_BLOCK_SIGOPS_COST`. Exposed for the Gate-4 window-join experiment's
+/// UTXO-dependent sigop accounting (needs the resolved spent coins).
+pub fn tx_sigop_cost(tx: &Transaction, spent: &[Coin], flags: ScriptFlags) -> u64 {
     let mut sigops = tx
         .inputs
         .iter()

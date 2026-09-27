@@ -1,0 +1,1645 @@
+{
+  "scope": "Bounded offline arithmetic/instruction probe on shared host, not full IBD; full-history counts below are explicitly assumed, not measured.",
+  "runs": {
+    "run-2": {
+      "scope": "512 by default evenly spaced canonical ECDSA attempts from an existing trace; operation census plus bounded single-core timings; not full IBD or a physical lower-bound proof",
+      "started_utc": "2026-09-26T13:25:21Z",
+      "source_sha256": "4ed82f5c9506ca9a816506fac724c6f1266007e1c4001e35a4e6f42cf9aab711",
+      "runner_sha256": "8741d9fa2b8edd6ecc7aad12d20b42530cd8992fc095687b8338da0727b3a196",
+      "harness_sha256": "818a876583ec40145df6054ab9a5691f9ea334983c0f07506e7729d30667abab",
+      "trace": "/home/connoravila/Documents/Avila-Node/target/ecdsa-replay/final-1/mainnet.trace",
+      "trace_sha256": "63a253a37560e39aa2e4775dcf64936944e444bb37ed2ddb59bd4641bd5e53cc",
+      "trace_bytes": 23891660,
+      "sampling": "record floor(i * total_records / count), i=0..count-1",
+      "count": 512,
+      "cpu_affinity": 7,
+      "nice_increment": 19,
+      "cpuinfo": "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 190\nmodel name\t: Intel(R) Core(TM) i3-N305\nstepping\t: 0\nmicrocode\t: 0x21\ncpu MHz\t\t: 2599.962\ncache size\t: 6144 KB\nphysical id\t: 0\nsiblings\t: 8\ncore id\t\t: 0\ncpu cores\t: 8\napicid\t\t: 0\ninitial apicid\t: 0\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 32\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l2 cdp_l2 ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdt_a rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs rfds bhi spectre_v2_user vmscape\nbogomips\t: 3609.60\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 39 bits physical, 48 bits virtual\npower management:",
+      "platform": "Linux-7.0.0-34-generic-x86_64-with-glibc2.43",
+      "loadavg_before": [
+        6.47021484375,
+        4.916015625,
+        3.70458984375
+      ],
+      "compiler": "cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+      "dependency": {
+        "name": "secp256k1-sys",
+        "version": "0.10.1",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "d4387882333d3aa8cb20530a17c69a3752e97837832f34f6dccc760e715001d9",
+        "dependencies": [
+          "cc"
+        ]
+      },
+      "instrumented_points": [
+        [
+          "field_5x52_impl.h",
+          "fe_impl_mul"
+        ],
+        [
+          "field_5x52_impl.h",
+          "fe_impl_sqr"
+        ],
+        [
+          "field_5x52_impl.h",
+          "fe_impl_inv_var"
+        ],
+        [
+          "field_impl.h",
+          "fe_sqrt"
+        ],
+        [
+          "scalar_4x64_impl.h",
+          "scalar_inverse_var"
+        ],
+        [
+          "group_impl.h",
+          "gej_double_var"
+        ],
+        [
+          "group_impl.h",
+          "gej_add_ge_var"
+        ],
+        [
+          "group_impl.h",
+          "gej_add_zinv_var"
+        ],
+        [
+          "scalar_4x64_impl.h",
+          "scalar_mul"
+        ]
+      ],
+      "commands": [
+        {
+          "label": "build-count",
+          "argv": [
+            "cc",
+            "-std=c99",
+            "-O3",
+            "-msha",
+            "-include",
+            "stdio.h",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused-function",
+            "-Wno-unused-parameter",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-DECMULT_WINDOW_SIZE=15",
+            "-DECMULT_GEN_PREC_BITS=4",
+            "-DCOST_INSTRUMENTED",
+            "-I/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-2/secp-instrumented",
+            "-I/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-2/secp-instrumented/src",
+            "-I/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-2/secp-instrumented/include",
+            "/home/connoravila/Documents/Avila-Node/experiments/code/ibd_cost_probe.c",
+            "/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-2/secp-instrumented/src/precomputed_ecmult.c",
+            "/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-2/secp-instrumented/src/precomputed_ecmult_gen.c",
+            "-o",
+            "/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-2/count"
+          ],
+          "elapsed": 10.03173043300194,
+          "returncode": 0
+        },
+        {
+          "label": "count",
+          "argv": [
+            "/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-2/count",
+            "/home/connoravila/Documents/Avila-Node/target/ecdsa-replay/final-1/mainnet.trace",
+            "512"
+          ],
+          "elapsed": 0.2053070010006195,
+          "returncode": 0
+        },
+        {
+          "label": "build-timing",
+          "argv": [
+            "cc",
+            "-std=c99",
+            "-O3",
+            "-msha",
+            "-include",
+            "stdio.h",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused-function",
+            "-Wno-unused-parameter",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-DECMULT_WINDOW_SIZE=15",
+            "-DECMULT_GEN_PREC_BITS=4",
+            "-I/home/connoravila/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1",
+            "-I/home/connoravila/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src",
+            "-I/home/connoravila/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/include",
+            "/home/connoravila/Documents/Avila-Node/experiments/code/ibd_cost_probe.c",
+            "/home/connoravila/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src/precomputed_ecmult.c",
+            "/home/connoravila/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src/precomputed_ecmult_gen.c",
+            "-o",
+            "/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-2/timing"
+          ],
+          "elapsed": 8.725326034997124,
+          "returncode": 0
+        },
+        {
+          "label": "timing",
+          "argv": [
+            "/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-2/timing",
+            "/home/connoravila/Documents/Avila-Node/target/ecdsa-replay/final-1/mainnet.trace",
+            "512"
+          ],
+          "elapsed": 0.6663584090056247,
+          "returncode": 0
+        }
+      ],
+      "results": {
+        "count": [
+          {
+            "mode": "compressed_parse_and_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 504170,
+              "field_square": 497973,
+              "field_inverse_var": 0,
+              "field_sqrt": 512,
+              "scalar_inverse_var": 512,
+              "point_double_calls": 65734,
+              "point_mixed_add_calls": 25732,
+              "point_zinv_add_calls": 8690,
+              "scalar_mul": 2560
+            }
+          },
+          {
+            "mode": "preparsed_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 497002,
+              "field_square": 367413,
+              "field_inverse_var": 0,
+              "field_sqrt": 0,
+              "scalar_inverse_var": 512,
+              "point_double_calls": 65734,
+              "point_mixed_add_calls": 25732,
+              "point_zinv_add_calls": 8690,
+              "scalar_mul": 2560
+            }
+          }
+        ],
+        "timing": [
+          {
+            "mode": "compressed_parse_and_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 0,
+              "field_square": 0,
+              "field_inverse_var": 0,
+              "field_sqrt": 0,
+              "scalar_inverse_var": 0,
+              "point_double_calls": 0,
+              "point_mixed_add_calls": 0,
+              "point_zinv_add_calls": 0,
+              "scalar_mul": 0
+            }
+          },
+          {
+            "mode": "preparsed_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 0,
+              "field_square": 0,
+              "field_inverse_var": 0,
+              "field_sqrt": 0,
+              "scalar_inverse_var": 0,
+              "point_double_calls": 0,
+              "point_mixed_add_calls": 0,
+              "point_zinv_add_calls": 0,
+              "scalar_mul": 0
+            }
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 0,
+            "operations": 512,
+            "cpu_seconds": 0.067321331,
+            "wall_seconds": 0.068380515
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 0,
+            "operations": 512,
+            "cpu_seconds": 0.060222971,
+            "wall_seconds": 0.062401561
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 0,
+            "operations": 3200000,
+            "cpu_seconds": 0.004309924,
+            "wall_seconds": 0.005407211
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 0,
+            "operations": 6400000,
+            "cpu_seconds": 0.004292061,
+            "wall_seconds": 0.004680361
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 0,
+            "operations": 12800000,
+            "cpu_seconds": 0.005590903,
+            "wall_seconds": 0.005607314
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 1,
+            "operations": 512,
+            "cpu_seconds": 0.066353809,
+            "wall_seconds": 0.068251282
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 1,
+            "operations": 512,
+            "cpu_seconds": 0.059718359,
+            "wall_seconds": 0.061696311
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 1,
+            "operations": 3200000,
+            "cpu_seconds": 0.0041037,
+            "wall_seconds": 0.004101945
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 1,
+            "operations": 6400000,
+            "cpu_seconds": 0.004158332,
+            "wall_seconds": 0.00440046
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 1,
+            "operations": 12800000,
+            "cpu_seconds": 0.005410348,
+            "wall_seconds": 0.005408189
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 2,
+            "operations": 512,
+            "cpu_seconds": 0.069457408,
+            "wall_seconds": 0.073028712
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 2,
+            "operations": 512,
+            "cpu_seconds": 0.060777441,
+            "wall_seconds": 0.061758967
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 2,
+            "operations": 3200000,
+            "cpu_seconds": 0.004375738,
+            "wall_seconds": 0.004822338
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 2,
+            "operations": 6400000,
+            "cpu_seconds": 0.004428691,
+            "wall_seconds": 0.005885272
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 2,
+            "operations": 12800000,
+            "cpu_seconds": 0.005910609,
+            "wall_seconds": 0.006280711
+          }
+        ]
+      },
+      "vendor_c_h_sha256": "3a284fb04618353879dc2e37b52889f55a0ec07bd96843c87cf2fa2c43bcf50d",
+      "count_binary_sha256": "b1ab002e65890794724654cdda1230d3333f8b28063bcc80fe9d75d70350b08c",
+      "timing_binary_sha256": "dbf80b885ab308a3e5e6781f258a34949a4f888ea114c50a735a3725bf7b5529",
+      "loadavg_after": [
+        6.89794921875,
+        5.1162109375,
+        3.79736328125
+      ]
+    },
+    "run-3-native": {
+      "scope": "512 by default evenly spaced canonical ECDSA attempts from an existing trace; operation census plus bounded single-core timings; not full IBD or a physical lower-bound proof",
+      "started_utc": "2026-09-26T13:27:15Z",
+      "source_sha256": "4ed82f5c9506ca9a816506fac724c6f1266007e1c4001e35a4e6f42cf9aab711",
+      "runner_sha256": "4d281c4f1a17c38de011466b371141ce1c3f84157c28d11a01268e6cb024ef19",
+      "harness_sha256": "818a876583ec40145df6054ab9a5691f9ea334983c0f07506e7729d30667abab",
+      "trace": "/home/connoravila/Documents/Avila-Node/target/ecdsa-replay/final-1/mainnet.trace",
+      "trace_sha256": "63a253a37560e39aa2e4775dcf64936944e444bb37ed2ddb59bd4641bd5e53cc",
+      "trace_bytes": 23891660,
+      "sampling": "record floor(i * total_records / count), i=0..count-1",
+      "count": 512,
+      "native": true,
+      "cpu_affinity": 7,
+      "nice_increment": 19,
+      "cpuinfo": "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 190\nmodel name\t: Intel(R) Core(TM) i3-N305\nstepping\t: 0\nmicrocode\t: 0x21\ncpu MHz\t\t: 2887.970\ncache size\t: 6144 KB\nphysical id\t: 0\nsiblings\t: 8\ncore id\t\t: 0\ncpu cores\t: 8\napicid\t\t: 0\ninitial apicid\t: 0\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 32\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l2 cdp_l2 ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdt_a rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs rfds bhi spectre_v2_user vmscape\nbogomips\t: 3609.60\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 39 bits physical, 48 bits virtual\npower management:",
+      "platform": "Linux-7.0.0-34-generic-x86_64-with-glibc2.43",
+      "loadavg_before": [
+        6.65576171875,
+        5.68603515625,
+        4.14306640625
+      ],
+      "compiler": "cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+      "dependency": {
+        "name": "secp256k1-sys",
+        "version": "0.10.1",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "d4387882333d3aa8cb20530a17c69a3752e97837832f34f6dccc760e715001d9",
+        "dependencies": [
+          "cc"
+        ]
+      },
+      "instrumented_points": [
+        [
+          "field_5x52_impl.h",
+          "fe_impl_mul"
+        ],
+        [
+          "field_5x52_impl.h",
+          "fe_impl_sqr"
+        ],
+        [
+          "field_5x52_impl.h",
+          "fe_impl_inv_var"
+        ],
+        [
+          "field_impl.h",
+          "fe_sqrt"
+        ],
+        [
+          "scalar_4x64_impl.h",
+          "scalar_inverse_var"
+        ],
+        [
+          "group_impl.h",
+          "gej_double_var"
+        ],
+        [
+          "group_impl.h",
+          "gej_add_ge_var"
+        ],
+        [
+          "group_impl.h",
+          "gej_add_zinv_var"
+        ],
+        [
+          "scalar_4x64_impl.h",
+          "scalar_mul"
+        ]
+      ],
+      "commands": [
+        {
+          "label": "build-count",
+          "argv": [
+            "cc",
+            "-std=c99",
+            "-O3",
+            "-msha",
+            "-include",
+            "stdio.h",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused-function",
+            "-Wno-unused-parameter",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-DECMULT_WINDOW_SIZE=15",
+            "-DECMULT_GEN_PREC_BITS=4",
+            "-march=native",
+            "-DCOST_INSTRUMENTED",
+            "-I/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-3-native/secp-instrumented",
+            "-I/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-3-native/secp-instrumented/src",
+            "-I/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-3-native/secp-instrumented/include",
+            "/home/connoravila/Documents/Avila-Node/experiments/code/ibd_cost_probe.c",
+            "/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-3-native/secp-instrumented/src/precomputed_ecmult.c",
+            "/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-3-native/secp-instrumented/src/precomputed_ecmult_gen.c",
+            "-o",
+            "/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-3-native/count"
+          ],
+          "elapsed": 8.012199919001432,
+          "returncode": 0
+        },
+        {
+          "label": "count",
+          "argv": [
+            "/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-3-native/count",
+            "/home/connoravila/Documents/Avila-Node/target/ecdsa-replay/final-1/mainnet.trace",
+            "512"
+          ],
+          "elapsed": 0.17856110299908323,
+          "returncode": 0
+        },
+        {
+          "label": "build-timing",
+          "argv": [
+            "cc",
+            "-std=c99",
+            "-O3",
+            "-msha",
+            "-include",
+            "stdio.h",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused-function",
+            "-Wno-unused-parameter",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-DECMULT_WINDOW_SIZE=15",
+            "-DECMULT_GEN_PREC_BITS=4",
+            "-march=native",
+            "-I/home/connoravila/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1",
+            "-I/home/connoravila/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src",
+            "-I/home/connoravila/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/include",
+            "/home/connoravila/Documents/Avila-Node/experiments/code/ibd_cost_probe.c",
+            "/home/connoravila/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src/precomputed_ecmult.c",
+            "/home/connoravila/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src/precomputed_ecmult_gen.c",
+            "-o",
+            "/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-3-native/timing"
+          ],
+          "elapsed": 7.336958795996907,
+          "returncode": 0
+        },
+        {
+          "label": "timing",
+          "argv": [
+            "/home/connoravila/Documents/Avila-Node/target/ibd-hardware-floor/run-3-native/timing",
+            "/home/connoravila/Documents/Avila-Node/target/ecdsa-replay/final-1/mainnet.trace",
+            "512"
+          ],
+          "elapsed": 0.5145061840012204,
+          "returncode": 0
+        }
+      ],
+      "results": {
+        "count": [
+          {
+            "mode": "compressed_parse_and_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 504170,
+              "field_square": 497973,
+              "field_inverse_var": 0,
+              "field_sqrt": 512,
+              "scalar_inverse_var": 512,
+              "point_double_calls": 65734,
+              "point_mixed_add_calls": 25732,
+              "point_zinv_add_calls": 8690,
+              "scalar_mul": 2560
+            }
+          },
+          {
+            "mode": "preparsed_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 497002,
+              "field_square": 367413,
+              "field_inverse_var": 0,
+              "field_sqrt": 0,
+              "scalar_inverse_var": 512,
+              "point_double_calls": 65734,
+              "point_mixed_add_calls": 25732,
+              "point_zinv_add_calls": 8690,
+              "scalar_mul": 2560
+            }
+          }
+        ],
+        "timing": [
+          {
+            "mode": "compressed_parse_and_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 0,
+              "field_square": 0,
+              "field_inverse_var": 0,
+              "field_sqrt": 0,
+              "scalar_inverse_var": 0,
+              "point_double_calls": 0,
+              "point_mixed_add_calls": 0,
+              "point_zinv_add_calls": 0,
+              "scalar_mul": 0
+            }
+          },
+          {
+            "mode": "preparsed_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 0,
+              "field_square": 0,
+              "field_inverse_var": 0,
+              "field_sqrt": 0,
+              "scalar_inverse_var": 0,
+              "point_double_calls": 0,
+              "point_mixed_add_calls": 0,
+              "point_zinv_add_calls": 0,
+              "scalar_mul": 0
+            }
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 0,
+            "operations": 512,
+            "cpu_seconds": 0.053944059,
+            "wall_seconds": 0.054109693
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 0,
+            "operations": 512,
+            "cpu_seconds": 0.049186674,
+            "wall_seconds": 0.049773435
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 0,
+            "operations": 3200000,
+            "cpu_seconds": 0.003362464,
+            "wall_seconds": 0.003360864
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 0,
+            "operations": 6400000,
+            "cpu_seconds": 0.003478777,
+            "wall_seconds": 0.003536697
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 0,
+            "operations": 12800000,
+            "cpu_seconds": 0.004574955,
+            "wall_seconds": 0.004618361
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 1,
+            "operations": 512,
+            "cpu_seconds": 0.053259012,
+            "wall_seconds": 0.053757281
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 1,
+            "operations": 512,
+            "cpu_seconds": 0.046022184,
+            "wall_seconds": 0.046091769
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 1,
+            "operations": 3200000,
+            "cpu_seconds": 0.003377916,
+            "wall_seconds": 0.004285948
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 1,
+            "operations": 6400000,
+            "cpu_seconds": 0.003464634,
+            "wall_seconds": 0.003462749
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 1,
+            "operations": 12800000,
+            "cpu_seconds": 0.004689147,
+            "wall_seconds": 0.004701387
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 2,
+            "operations": 512,
+            "cpu_seconds": 0.05407928,
+            "wall_seconds": 0.054313168
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 2,
+            "operations": 512,
+            "cpu_seconds": 0.047116208,
+            "wall_seconds": 0.047267624
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 2,
+            "operations": 3200000,
+            "cpu_seconds": 0.003350301,
+            "wall_seconds": 0.003371509
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 2,
+            "operations": 6400000,
+            "cpu_seconds": 0.003344163,
+            "wall_seconds": 0.003342902
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 2,
+            "operations": 12800000,
+            "cpu_seconds": 0.004594295,
+            "wall_seconds": 0.004605528
+          }
+        ]
+      },
+      "vendor_c_h_sha256": "3a284fb04618353879dc2e37b52889f55a0ec07bd96843c87cf2fa2c43bcf50d",
+      "count_binary_sha256": "7e98e4f6d3707d84c8e8acc76ff0cffc037097cc0230558110f2d650b14a0694",
+      "timing_binary_sha256": "99a92ba5771c9f0eff4e34f8f946cb0608081c4d0924ed53737684ac13a957a9",
+      "loadavg_after": [
+        6.5849609375,
+        5.7177734375,
+        4.17919921875
+      ]
+    }
+  },
+  "paired": {
+    "scope": "bounded sequential A B B A on shared host; no fixed frequency; CPU 7 nice +19",
+    "runs": [
+      {
+        "variant": "run-2",
+        "elapsed": 0.4972400379992905,
+        "results": [
+          {
+            "mode": "compressed_parse_and_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 0,
+              "field_square": 0,
+              "field_inverse_var": 0,
+              "field_sqrt": 0,
+              "scalar_inverse_var": 0,
+              "point_double_calls": 0,
+              "point_mixed_add_calls": 0,
+              "point_zinv_add_calls": 0,
+              "scalar_mul": 0
+            }
+          },
+          {
+            "mode": "preparsed_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 0,
+              "field_square": 0,
+              "field_inverse_var": 0,
+              "field_sqrt": 0,
+              "scalar_inverse_var": 0,
+              "point_double_calls": 0,
+              "point_mixed_add_calls": 0,
+              "point_zinv_add_calls": 0,
+              "scalar_mul": 0
+            }
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 0,
+            "operations": 512,
+            "cpu_seconds": 0.053500271,
+            "wall_seconds": 0.053529557
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 0,
+            "operations": 512,
+            "cpu_seconds": 0.046647557,
+            "wall_seconds": 0.046781471
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 0,
+            "operations": 3200000,
+            "cpu_seconds": 0.003250283,
+            "wall_seconds": 0.003248535
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 0,
+            "operations": 6400000,
+            "cpu_seconds": 0.00326338,
+            "wall_seconds": 0.003261563
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 0,
+            "operations": 12800000,
+            "cpu_seconds": 0.004410917,
+            "wall_seconds": 0.004424701
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 1,
+            "operations": 512,
+            "cpu_seconds": 0.053585333,
+            "wall_seconds": 0.053692215
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 1,
+            "operations": 512,
+            "cpu_seconds": 0.045959688,
+            "wall_seconds": 0.046036535
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 1,
+            "operations": 3200000,
+            "cpu_seconds": 0.003238787,
+            "wall_seconds": 0.003236759
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 1,
+            "operations": 6400000,
+            "cpu_seconds": 0.003211881,
+            "wall_seconds": 0.003217866
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 1,
+            "operations": 12800000,
+            "cpu_seconds": 0.004277846,
+            "wall_seconds": 0.004276512
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 2,
+            "operations": 512,
+            "cpu_seconds": 0.053330166,
+            "wall_seconds": 0.053431285
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 2,
+            "operations": 512,
+            "cpu_seconds": 0.04661086,
+            "wall_seconds": 0.046691494
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 2,
+            "operations": 3200000,
+            "cpu_seconds": 0.003263442,
+            "wall_seconds": 0.003269816
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 2,
+            "operations": 6400000,
+            "cpu_seconds": 0.003241123,
+            "wall_seconds": 0.003239253
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 2,
+            "operations": 12800000,
+            "cpu_seconds": 0.004387929,
+            "wall_seconds": 0.004449226
+          }
+        ]
+      },
+      {
+        "variant": "run-3-native",
+        "elapsed": 0.5075215609977022,
+        "results": [
+          {
+            "mode": "compressed_parse_and_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 0,
+              "field_square": 0,
+              "field_inverse_var": 0,
+              "field_sqrt": 0,
+              "scalar_inverse_var": 0,
+              "point_double_calls": 0,
+              "point_mixed_add_calls": 0,
+              "point_zinv_add_calls": 0,
+              "scalar_mul": 0
+            }
+          },
+          {
+            "mode": "preparsed_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 0,
+              "field_square": 0,
+              "field_inverse_var": 0,
+              "field_sqrt": 0,
+              "scalar_inverse_var": 0,
+              "point_double_calls": 0,
+              "point_mixed_add_calls": 0,
+              "point_zinv_add_calls": 0,
+              "scalar_mul": 0
+            }
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 0,
+            "operations": 512,
+            "cpu_seconds": 0.052263212,
+            "wall_seconds": 0.053594101
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 0,
+            "operations": 512,
+            "cpu_seconds": 0.051543879,
+            "wall_seconds": 0.051585921
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 0,
+            "operations": 3200000,
+            "cpu_seconds": 0.003399275,
+            "wall_seconds": 0.003412559
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 0,
+            "operations": 6400000,
+            "cpu_seconds": 0.003527582,
+            "wall_seconds": 0.003539604
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 0,
+            "operations": 12800000,
+            "cpu_seconds": 0.0047312,
+            "wall_seconds": 0.004729638
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 1,
+            "operations": 512,
+            "cpu_seconds": 0.053589275,
+            "wall_seconds": 0.053604749
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 1,
+            "operations": 512,
+            "cpu_seconds": 0.046975239,
+            "wall_seconds": 0.047732276
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 1,
+            "operations": 3200000,
+            "cpu_seconds": 0.003346408,
+            "wall_seconds": 0.003434158
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 1,
+            "operations": 6400000,
+            "cpu_seconds": 0.003259954,
+            "wall_seconds": 0.003257887
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 1,
+            "operations": 12800000,
+            "cpu_seconds": 0.00433779,
+            "wall_seconds": 0.004336097
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 2,
+            "operations": 512,
+            "cpu_seconds": 0.055707702,
+            "wall_seconds": 0.056970048
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 2,
+            "operations": 512,
+            "cpu_seconds": 0.047640049,
+            "wall_seconds": 0.047720658
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 2,
+            "operations": 3200000,
+            "cpu_seconds": 0.003583526,
+            "wall_seconds": 0.003587809
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 2,
+            "operations": 6400000,
+            "cpu_seconds": 0.003571476,
+            "wall_seconds": 0.003580722
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 2,
+            "operations": 12800000,
+            "cpu_seconds": 0.004694799,
+            "wall_seconds": 0.004700485
+          }
+        ]
+      },
+      {
+        "variant": "run-3-native",
+        "elapsed": 0.49042787100188434,
+        "results": [
+          {
+            "mode": "compressed_parse_and_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 0,
+              "field_square": 0,
+              "field_inverse_var": 0,
+              "field_sqrt": 0,
+              "scalar_inverse_var": 0,
+              "point_double_calls": 0,
+              "point_mixed_add_calls": 0,
+              "point_zinv_add_calls": 0,
+              "scalar_mul": 0
+            }
+          },
+          {
+            "mode": "preparsed_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 0,
+              "field_square": 0,
+              "field_inverse_var": 0,
+              "field_sqrt": 0,
+              "scalar_inverse_var": 0,
+              "point_double_calls": 0,
+              "point_mixed_add_calls": 0,
+              "point_zinv_add_calls": 0,
+              "scalar_mul": 0
+            }
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 0,
+            "operations": 512,
+            "cpu_seconds": 0.051664031,
+            "wall_seconds": 0.051728
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 0,
+            "operations": 512,
+            "cpu_seconds": 0.04472817,
+            "wall_seconds": 0.044795689
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 0,
+            "operations": 3200000,
+            "cpu_seconds": 0.003183278,
+            "wall_seconds": 0.003181751
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 0,
+            "operations": 6400000,
+            "cpu_seconds": 0.003166153,
+            "wall_seconds": 0.003164911
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 0,
+            "operations": 12800000,
+            "cpu_seconds": 0.004184997,
+            "wall_seconds": 0.00418394
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 1,
+            "operations": 512,
+            "cpu_seconds": 0.051179233,
+            "wall_seconds": 0.051222089
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 1,
+            "operations": 512,
+            "cpu_seconds": 0.044716056,
+            "wall_seconds": 0.044798518
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 1,
+            "operations": 3200000,
+            "cpu_seconds": 0.003227573,
+            "wall_seconds": 0.003226315
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 1,
+            "operations": 6400000,
+            "cpu_seconds": 0.003253107,
+            "wall_seconds": 0.004392535
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 1,
+            "operations": 12800000,
+            "cpu_seconds": 0.004307432,
+            "wall_seconds": 0.00432166
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 2,
+            "operations": 512,
+            "cpu_seconds": 0.051891701,
+            "wall_seconds": 0.051945243
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 2,
+            "operations": 512,
+            "cpu_seconds": 0.044737806,
+            "wall_seconds": 0.044965348
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 2,
+            "operations": 3200000,
+            "cpu_seconds": 0.003245343,
+            "wall_seconds": 0.003243556
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 2,
+            "operations": 6400000,
+            "cpu_seconds": 0.003274231,
+            "wall_seconds": 0.003279018
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 2,
+            "operations": 12800000,
+            "cpu_seconds": 0.004414534,
+            "wall_seconds": 0.004510786
+          }
+        ]
+      },
+      {
+        "variant": "run-2",
+        "elapsed": 0.5460435109998798,
+        "results": [
+          {
+            "mode": "compressed_parse_and_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 0,
+              "field_square": 0,
+              "field_inverse_var": 0,
+              "field_sqrt": 0,
+              "scalar_inverse_var": 0,
+              "point_double_calls": 0,
+              "point_mixed_add_calls": 0,
+              "point_zinv_add_calls": 0,
+              "scalar_mul": 0
+            }
+          },
+          {
+            "mode": "preparsed_verify",
+            "records": 512,
+            "passed": 489,
+            "operations": {
+              "field_mul": 0,
+              "field_square": 0,
+              "field_inverse_var": 0,
+              "field_sqrt": 0,
+              "scalar_inverse_var": 0,
+              "point_double_calls": 0,
+              "point_mixed_add_calls": 0,
+              "point_zinv_add_calls": 0,
+              "scalar_mul": 0
+            }
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 0,
+            "operations": 512,
+            "cpu_seconds": 0.055360856,
+            "wall_seconds": 0.056054558
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 0,
+            "operations": 512,
+            "cpu_seconds": 0.048822015,
+            "wall_seconds": 0.050001742
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 0,
+            "operations": 3200000,
+            "cpu_seconds": 0.003507167,
+            "wall_seconds": 0.003768659
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 0,
+            "operations": 6400000,
+            "cpu_seconds": 0.003563778,
+            "wall_seconds": 0.003635052
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 0,
+            "operations": 12800000,
+            "cpu_seconds": 0.004659916,
+            "wall_seconds": 0.004665685
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 1,
+            "operations": 512,
+            "cpu_seconds": 0.05776488,
+            "wall_seconds": 0.060807375
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 1,
+            "operations": 512,
+            "cpu_seconds": 0.052553455,
+            "wall_seconds": 0.058445222
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 1,
+            "operations": 3200000,
+            "cpu_seconds": 0.003646162,
+            "wall_seconds": 0.00374134
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 1,
+            "operations": 6400000,
+            "cpu_seconds": 0.003731048,
+            "wall_seconds": 0.004073867
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 1,
+            "operations": 12800000,
+            "cpu_seconds": 0.004805228,
+            "wall_seconds": 0.004803167
+          },
+          {
+            "timing": "compressed_parse_and_verify",
+            "repeat": 2,
+            "operations": 512,
+            "cpu_seconds": 0.060173452,
+            "wall_seconds": 0.061056102
+          },
+          {
+            "timing": "preparsed_verify",
+            "repeat": 2,
+            "operations": 512,
+            "cpu_seconds": 0.052083108,
+            "wall_seconds": 0.054878897
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 1,
+            "repeat": 2,
+            "operations": 3200000,
+            "cpu_seconds": 0.003653559,
+            "wall_seconds": 0.003753038
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 2,
+            "repeat": 2,
+            "operations": 6400000,
+            "cpu_seconds": 0.003659113,
+            "wall_seconds": 0.00367392
+          },
+          {
+            "timing": "sha256rnds2_only",
+            "chains": 4,
+            "repeat": 2,
+            "operations": 12800000,
+            "cpu_seconds": 0.004850996,
+            "wall_seconds": 0.005235026
+          }
+        ]
+      }
+    ]
+  },
+  "trace_census": {
+    "bytes": 23891660,
+    "records": 183782,
+    "true": 177645,
+    "false": 6137,
+    "distinct_tuples": 183782,
+    "distinct_keys": 97304,
+    "first_block": {
+      "height": 956105,
+      "block_hash": "00000000000000000000aef57217a37344c891fa60577800c297b193ac2e6d73",
+      "block_offset": 46911826,
+      "undo_offset": 8084314,
+      "block_bytes": 1507850,
+      "undo_bytes": 231920,
+      "block_sha256": "46a4a906c50436b8b3b3e2c4f9673f076b2d0fcba3b6253a45f3814c7419f990",
+      "undo_sha256": "3daa6a4be5f610a1d277df5e73ed223ff8ca8ad667cbed01c43e63c62392687e",
+      "undo_checksum": "418d530db919563a6cfb87d421f50eab47a3cfcff8614d1618a4f667f210d103"
+    },
+    "last_block": {
+      "height": 956128,
+      "block_hash": "000000000000000000016dbd108cf1e1175b4541ac841f119ec78105d95d7bf1",
+      "block_offset": 99118622,
+      "undo_offset": 13573453,
+      "block_bytes": 1599211,
+      "undo_bytes": 229780,
+      "block_sha256": "3f47b585499e5b971341af0401b23a860acaa225cd4c9fd7e49b453ab38d26f0",
+      "undo_sha256": "66209ca1ca670b0c2796436173512c7062d4500b943d013f3c227a219aea74f9",
+      "undo_checksum": "cc8b6898c815a4fa693121ff9ec47440c972a84b815e2e4a3a71cece32d5af7f"
+    }
+  },
+  "disassembly": {
+    "run-2": {
+      "rustsecp256k1_v0_10_0_fe_mul_inner": {
+        "instruction_counts": {
+          "push": 6,
+          "mov": 108,
+          "xor": 9,
+          "movabs": 7,
+          "sub": 1,
+          "mul": 31,
+          "add": 31,
+          "adc": 29,
+          "shrd": 8,
+          "shr": 8,
+          "shl": 1,
+          "and": 9,
+          "or": 1,
+          "pop": 6,
+          "ret": 1
+        },
+        "assembly_sha256": "4def7f71c976a58cfe5420bbdbf833169ae53bacaa4892b6c055d4de4728174a"
+      },
+      "rustsecp256k1_v0_10_0_fe_mul_inner.constprop.0": {
+        "instruction_counts": {
+          "movabs": 12,
+          "push": 6,
+          "xor": 5,
+          "mov": 97,
+          "sub": 1,
+          "mul": 31,
+          "add": 31,
+          "adc": 29,
+          "shrd": 8,
+          "shr": 8,
+          "and": 9,
+          "shl": 1,
+          "or": 1,
+          "pop": 6,
+          "ret": 1
+        },
+        "assembly_sha256": "4d258e710220377c087316fa9ed4eee281e17d2e4d8e24ba3f7b711cbeca3a03"
+      },
+      "rustsecp256k1_v0_10_0_fe_sqr_inner": {
+        "instruction_counts": {
+          "push": 6,
+          "xor": 1,
+          "mov": 72,
+          "mul": 21,
+          "lea": 4,
+          "movabs": 7,
+          "add": 21,
+          "adc": 19,
+          "shrd": 8,
+          "shr": 8,
+          "shl": 1,
+          "and": 9,
+          "or": 1,
+          "pop": 6,
+          "ret": 1
+        },
+        "assembly_sha256": "1260ddf4611718fa11a07c90695b9e78a3629d58b6f565f4091bb52ddd2d6138"
+      },
+      "sha_rounds.constprop.0": {
+        "instruction_counts": {
+          "mov": 16,
+          "cmp": 2,
+          "jbe": 1,
+          "je": 1,
+          "pcmpeqd": 5,
+          "movdqa": 34,
+          "movd": 16,
+          "psrld": 9,
+          "pshufd": 16,
+          "nop": 2,
+          "sha256rnds2": 224,
+          "sub": 3,
+          "jne": 3,
+          "movq": 2,
+          "pxor": 8,
+          "ret": 1,
+          "jmp": 2,
+          "cs": 1
+        },
+        "assembly_sha256": "2f359952b54ee37c7720fd7cae87ac0f99076c5a139bf96ba47b7cc2d7190a94"
+      }
+    },
+    "run-3-native": {
+      "rustsecp256k1_v0_10_0_fe_mul_inner": {
+        "instruction_counts": {
+          "push": 6,
+          "mov": 82,
+          "xor": 9,
+          "sub": 1,
+          "mulx": 31,
+          "movabs": 7,
+          "add": 31,
+          "adc": 29,
+          "shrd": 8,
+          "shr": 8,
+          "shl": 1,
+          "and": 9,
+          "or": 1,
+          "pop": 6,
+          "ret": 1
+        },
+        "assembly_sha256": "d94e0e89042e448491f195e9e6c2268f8a6c3f93aab8c5ff02624dc96f5dac1a"
+      },
+      "rustsecp256k1_v0_10_0_fe_mul_inner.constprop.0": {
+        "instruction_counts": {
+          "push": 6,
+          "xor": 5,
+          "movabs": 12,
+          "sub": 1,
+          "mov": 91,
+          "mulx": 30,
+          "add": 31,
+          "adc": 29,
+          "mul": 1,
+          "shrd": 8,
+          "shr": 8,
+          "shl": 1,
+          "and": 9,
+          "or": 1,
+          "pop": 6,
+          "ret": 1
+        },
+        "assembly_sha256": "ecc0e46ad5a5bf188df1b1ed6f5977071ef8fd8da833d367fffb5a8b92e70ab6"
+      },
+      "rustsecp256k1_v0_10_0_fe_sqr_inner": {
+        "instruction_counts": {
+          "push": 6,
+          "xor": 1,
+          "movabs": 10,
+          "mov": 48,
+          "lea": 5,
+          "mulx": 21,
+          "add": 20,
+          "adc": 19,
+          "shrd": 8,
+          "shr": 8,
+          "shl": 1,
+          "and": 9,
+          "or": 1,
+          "pop": 6,
+          "ret": 1
+        },
+        "assembly_sha256": "122ac4135dabfd726cc7b270ece59abd37a52eb73d473b115a6ddf90b51a0d97"
+      },
+      "sha_rounds.constprop.0": {
+        "instruction_counts": {
+          "cmp": 2,
+          "mov": 16,
+          "jbe": 1,
+          "je": 1,
+          "vmovd": 16,
+          "vpcmpeqd": 5,
+          "vpsrld": 9,
+          "vpbroadcastd": 16,
+          "nop": 2,
+          "vmovdqa": 21,
+          "sha256rnds2": 224,
+          "sub": 3,
+          "jne": 3,
+          "vpxor": 8,
+          "vmovq": 2,
+          "ret": 1,
+          "jmp": 2,
+          "cs": 1
+        },
+        "assembly_sha256": "eb95e082ffd2b5677ece0c9f4bcfcc8781cb10f61cf909465bd2f051d10dbb3a"
+      }
+    }
+  },
+  "model": {
+    "assumptions": {
+      "corpus_bytes": 768000000000.0,
+      "ecdsa_attempts": 1500000000.0,
+      "state_events": 2700000000.0,
+      "created_outputs": 1500000000.0,
+      "normalized_sha_compression_bytes": 3000000000000.0,
+      "cores": 8
+    },
+    "deadlines": [
+      {
+        "minutes": 60,
+        "source_GB_per_second": 0.21333333333333335,
+        "payload_Gbit_per_second": 1.7066666666666668,
+        "ECDSA_attempts_per_second": 416666.6666666667,
+        "per_core_us_per_attempt_on_8_cores": 19.2,
+        "state_events_per_second": 750000.0,
+        "normalized_SHA_GB_per_second": 0.8333333333333334
+      },
+      {
+        "minutes": 30,
+        "source_GB_per_second": 0.4266666666666667,
+        "payload_Gbit_per_second": 3.4133333333333336,
+        "ECDSA_attempts_per_second": 833333.3333333334,
+        "per_core_us_per_attempt_on_8_cores": 9.6,
+        "state_events_per_second": 1500000.0,
+        "normalized_SHA_GB_per_second": 1.6666666666666667
+      },
+      {
+        "minutes": 20,
+        "source_GB_per_second": 0.64,
+        "payload_Gbit_per_second": 5.12,
+        "ECDSA_attempts_per_second": 1250000.0,
+        "per_core_us_per_attempt_on_8_cores": 6.3999999999999995,
+        "state_events_per_second": 2250000.0,
+        "normalized_SHA_GB_per_second": 2.5
+      },
+      {
+        "minutes": 10,
+        "source_GB_per_second": 1.28,
+        "payload_Gbit_per_second": 10.24,
+        "ECDSA_attempts_per_second": 2500000.0,
+        "per_core_us_per_attempt_on_8_cores": 3.1999999999999997,
+        "state_events_per_second": 4500000.0,
+        "normalized_SHA_GB_per_second": 5.0
+      },
+      {
+        "minutes": 5,
+        "source_GB_per_second": 2.56,
+        "payload_Gbit_per_second": 20.48,
+        "ECDSA_attempts_per_second": 5000000.0,
+        "per_core_us_per_attempt_on_8_cores": 1.5999999999999999,
+        "state_events_per_second": 9000000.0,
+        "normalized_SHA_GB_per_second": 10.0
+      },
+      {
+        "minutes": 1,
+        "source_GB_per_second": 12.8,
+        "payload_Gbit_per_second": 102.4,
+        "ECDSA_attempts_per_second": 25000000.0,
+        "per_core_us_per_attempt_on_8_cores": 0.32,
+        "state_events_per_second": 45000000.0,
+        "normalized_SHA_GB_per_second": 50.0
+      }
+    ],
+    "network_seconds": {
+      "100": 61440.0,
+      "300": 20480.0,
+      "1000": 6144.0,
+      "2500": 2457.6,
+      "10000": 614.4
+    },
+    "cpu_only_signature_seconds": {
+      "5": 937.5,
+      "10": 1875.0,
+      "20": 3750.0,
+      "50": 9375.0,
+      "100": 18750.0,
+      "135": 25312.5
+    },
+    "operation_means": {
+      "compressed_parse_and_verify": {
+        "field_mul": 984.70703125,
+        "field_square": 972.603515625,
+        "field_inverse_var": 0.0,
+        "field_sqrt": 1.0,
+        "scalar_inverse_var": 1.0,
+        "point_double_calls": 128.38671875,
+        "point_mixed_add_calls": 50.2578125,
+        "point_zinv_add_calls": 16.97265625,
+        "scalar_mul": 5.0
+      },
+      "preparsed_verify": {
+        "field_mul": 970.70703125,
+        "field_square": 717.603515625,
+        "field_inverse_var": 0.0,
+        "field_sqrt": 0.0,
+        "scalar_inverse_var": 1.0,
+        "point_double_calls": 128.38671875,
+        "point_mixed_add_calls": 50.2578125,
+        "point_zinv_add_calls": 16.97265625,
+        "scalar_mul": 5.0
+      }
+    },
+    "conditional_instruction_demand": {
+      "field_inner_mul_or_mulx_per_attempt": 50950.591796875,
+      "field_inner_shrd_per_attempt": 15658.484375,
+      "note": "Static generic inner-body counts times operation census; specialized/inlined paths and model-specific instruction capacity must be confirmed before treating this as a bound."
+    },
+    "nvme_coding_only_GB_per_second": 3.9384615384615387,
+    "assumed_cold_raw_corpus_nvme_link_minimum_seconds": 195.0
+  },
+  "hardware": {
+    "model": "Intel Core i3-N305",
+    "logical_cpus": 8,
+    "MemTotal_kB": 32175188,
+    "nvme_model": "Samsung SSD 990 EVO Plus 1TB",
+    "cache_line_bytes": 64,
+    "L1D_bytes_per_core": 32768,
+    "L2_bytes_per_four_core_cluster": 2097152,
+    "L3_bytes": 6291456,
+    "cpu_features_observed": [
+      "sha_ni",
+      "avx2",
+      "bmi2",
+      "adx"
+    ],
+    "cpu_features_absent": [
+      "avx512f",
+      "avx512ifma"
+    ],
+    "scope": "sysfs/proc/lsblk inspection, including negotiated NVMe link; installed DRAM speed, sustained memory/storage bandwidth, thermal power limits and GPU throughput not measured",
+    "nvme_current_link_speed": "8.0 GT/s PCIe",
+    "nvme_current_link_width": 4,
+    "nvme_device": "0000:01:00.0",
+    "display_device": "0000:00:02.0, vendor 0x8086"
+  }
+}

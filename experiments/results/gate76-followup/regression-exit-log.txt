@@ -1,0 +1,5 @@
+{"blocks": 1, "txs": 2, "inputs": 6, "resolved": 5, "heights": 200, "to": 200}
+resolver regressions: PASS {'blocks': 1, 'txs': 2, 'inputs': 6, 'resolved': 5, 'unresolved_no_occurrence': 1, 'unresolved_future_only': 0, 'unresolved_bad_vout': 0, 'coinbase_inputs': 1, 'duplicate_txid_occurrences': 1, 'immature_coinbase_refs': 1}
+{"blocks": 1, "txs": 3, "inputs": 4, "resolved": 3, "heights": 200, "to": 200}
+replay rejection regression: PASS {'rc': 1, 'excluded_immature_txs': 2}
+worker-count regression: PASS

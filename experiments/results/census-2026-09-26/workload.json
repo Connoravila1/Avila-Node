@@ -1,0 +1,965 @@
+{
+  "scope": "mainnet IBD workload census; structural parse only",
+  "eras": {
+    "genesis_sparse": {
+      "span": [
+        0,
+        227930
+      ],
+      "blocks": 227931
+    },
+    "pre_segwit": {
+      "span": [
+        227931,
+        481823
+      ],
+      "blocks": 253893
+    },
+    "segwit_era": {
+      "span": [
+        481824,
+        709631
+      ],
+      "blocks": 227808
+    },
+    "taproot_era": {
+      "span": [
+        709632,
+        970000
+      ],
+      "blocks": 260369
+    }
+  },
+  "coverage": {
+    "pre_segwit": [
+      276342,
+      968679
+    ],
+    "taproot_era": [
+      956468,
+      956718
+    ],
+    "genesis_sparse": [
+      0,
+      0
+    ]
+  },
+  "gaps": [
+    "segwit_era"
+  ],
+  "era_stats": {
+    "pre_segwit": {
+      "windows": [
+        "blk00570.json",
+        "blk00690.json",
+        "blk00765.json",
+        "blk00925.json"
+      ],
+      "height_range": [
+        276342,
+        968679
+      ],
+      "blocks_measured": 1728,
+      "totals": {
+        "blocks": 1728,
+        "txs": 920155,
+        "inputs": 2729171,
+        "inputs_coinbase": 1728,
+        "outputs": 2561356,
+        "coinbase_txs": 1728,
+        "witness_items": 23034,
+        "witness_der_items": 10680,
+        "witness_schnorr_sized": 1544,
+        "scriptsig_push_items": 5602869,
+        "scriptsig_der_items": 2800718,
+        "bytes_header": 138240,
+        "bytes_tx_count_field": 3866,
+        "bytes_tx_overhead": 7373282,
+        "bytes_outpoint": 98312364,
+        "bytes_scriptsig": 326659532,
+        "bytes_sequence": 10923596,
+        "bytes_output_value": 20490848,
+        "bytes_scriptpubkey": 63925634,
+        "bytes_witness": 1262848,
+        "sha_comps_txid": 9797033,
+        "sha_comps_wtxid": 9818045,
+        "sha_comps_merkle_interior": 2755281,
+        "sha_comps_header": 5184,
+        "sha_input_bytes_txid": 534922331,
+        "sha_input_bytes_wtxid": 536197221,
+        "sighash_legacy_preimage_bytes_est": 25663858142,
+        "sighash_legacy_comps_est": 405338229,
+        "sighash_witness_comps_est": 58840,
+        "sighash_legacy_inputs": 2717403,
+        "sighash_witness_inputs": 11768,
+        "outcls_p2pk_compressed": 118,
+        "input_shape_sig_plus_pubkey": 2632608,
+        "outcls_p2pkh": 2412624,
+        "outcls_p2ms_bare": 2709,
+        "outcls_p2sh": 120027,
+        "input_shape_multi_push": 84257,
+        "input_shape_ops_only_or_mixed": 42,
+        "input_shape_single_push": 1276,
+        "outcls_p2pk_uncompressed": 139,
+        "outcls_op_return": 8007,
+        "outcls_other": 5403,
+        "outcls_p2wsh": 374,
+        "input_shape_empty": 10988,
+        "outcls_p2wpkh": 10602,
+        "outcls_p2tr": 1353
+      },
+      "per_block": {
+        "blocks": 1.0,
+        "txs": 532.4971064814815,
+        "inputs": 1579.3813657407406,
+        "inputs_coinbase": 1.0,
+        "outputs": 1482.2662037037037,
+        "coinbase_txs": 1.0,
+        "witness_items": 13.32986111111111,
+        "witness_der_items": 6.180555555555555,
+        "witness_schnorr_sized": 0.8935185185185185,
+        "scriptsig_push_items": 3242.4010416666665,
+        "scriptsig_der_items": 1620.7858796296296,
+        "bytes_header": 80.0,
+        "bytes_tx_count_field": 2.2372685185185186,
+        "bytes_tx_overhead": 4266.945601851852,
+        "bytes_outpoint": 56893.729166666664,
+        "bytes_scriptsig": 189039.0810185185,
+        "bytes_sequence": 6321.525462962963,
+        "bytes_output_value": 11858.12962962963,
+        "bytes_scriptpubkey": 36994.00115740741,
+        "bytes_witness": 730.8148148148148,
+        "sha_comps_txid": 5669.579282407408,
+        "sha_comps_wtxid": 5681.73900462963,
+        "sha_comps_merkle_interior": 1594.4913194444443,
+        "sha_comps_header": 3.0,
+        "sha_input_bytes_txid": 309561.53414351854,
+        "sha_input_bytes_wtxid": 310299.3177083333,
+        "sighash_legacy_preimage_bytes_est": 14851769.758101853,
+        "sighash_legacy_comps_est": 234570.734375,
+        "sighash_witness_comps_est": 34.050925925925924,
+        "sighash_legacy_inputs": 1572.5711805555557,
+        "sighash_witness_inputs": 6.810185185185185,
+        "outcls_p2pk_compressed": 0.06828703703703703,
+        "input_shape_sig_plus_pubkey": 1523.5,
+        "outcls_p2pkh": 1396.1944444444443,
+        "outcls_p2ms_bare": 1.5677083333333333,
+        "outcls_p2sh": 69.46006944444444,
+        "input_shape_multi_push": 48.75983796296296,
+        "input_shape_ops_only_or_mixed": 0.024305555555555556,
+        "input_shape_single_push": 0.7384259259259259,
+        "outcls_p2pk_uncompressed": 0.08043981481481481,
+        "outcls_op_return": 4.633680555555555,
+        "outcls_other": 3.126736111111111,
+        "outcls_p2wsh": 0.21643518518518517,
+        "input_shape_empty": 6.358796296296297,
+        "outcls_p2wpkh": 6.135416666666667,
+        "outcls_p2tr": 0.7829861111111112
+      }
+    },
+    "taproot_era": {
+      "windows": [
+        "core05630.json",
+        "core05631.json",
+        "core05632.json"
+      ],
+      "height_range": [
+        956468,
+        956718
+      ],
+      "blocks_measured": 251,
+      "totals": {
+        "blocks": 251,
+        "txs": 1196022,
+        "inputs": 1918867,
+        "inputs_coinbase": 251,
+        "outputs": 2719531,
+        "coinbase_txs": 251,
+        "witness_items": 3478420,
+        "witness_der_items": 1636650,
+        "witness_schnorr_sized": 152021,
+        "scriptsig_push_items": 354852,
+        "scriptsig_der_items": 135616,
+        "bytes_header": 20080,
+        "bytes_tx_count_field": 753,
+        "bytes_tx_overhead": 11813564,
+        "bytes_outpoint": 69088248,
+        "bytes_scriptsig": 16697311,
+        "bytes_sequence": 7676472,
+        "bytes_output_value": 21756248,
+        "bytes_scriptpubkey": 61543708,
+        "bytes_witness": 200078138,
+        "sha_comps_txid": 4701057,
+        "sha_comps_wtxid": 8158486,
+        "sha_comps_merkle_interior": 3587313,
+        "sha_comps_header": 753,
+        "sha_input_bytes_txid": 198596635,
+        "sha_input_bytes_wtxid": 400920161,
+        "sighash_legacy_preimage_bytes_est": 3012549202,
+        "sighash_legacy_comps_est": 47354623,
+        "sighash_witness_comps_est": 8704185,
+        "sighash_legacy_inputs": 178030,
+        "sighash_witness_inputs": 1740837,
+        "outcls_p2pkh": 129437,
+        "outcls_op_return": 766902,
+        "input_shape_empty": 1702272,
+        "outcls_p2wpkh": 1503641,
+        "outcls_p2tr": 145818,
+        "outcls_p2sh": 82689,
+        "input_shape_sig_plus_pubkey": 130077,
+        "outcls_p2wsh": 44960,
+        "input_shape_single_push": 83877,
+        "input_shape_multi_push": 2641,
+        "outcls_other": 45462,
+        "outcls_p2ms_bare": 622
+      },
+      "per_block": {
+        "blocks": 1.0,
+        "txs": 4765.027888446215,
+        "inputs": 7644.888446215139,
+        "inputs_coinbase": 1.0,
+        "outputs": 10834.78486055777,
+        "coinbase_txs": 1.0,
+        "witness_items": 13858.247011952191,
+        "witness_der_items": 6520.517928286853,
+        "witness_schnorr_sized": 605.6613545816733,
+        "scriptsig_push_items": 1413.7529880478087,
+        "scriptsig_der_items": 540.3027888446215,
+        "bytes_header": 80.0,
+        "bytes_tx_count_field": 3.0,
+        "bytes_tx_overhead": 47065.99203187251,
+        "bytes_outpoint": 275251.984063745,
+        "bytes_scriptsig": 66523.15139442231,
+        "bytes_sequence": 30583.553784860556,
+        "bytes_output_value": 86678.27888446215,
+        "bytes_scriptpubkey": 245194.05577689243,
+        "bytes_witness": 797124.0557768925,
+        "sha_comps_txid": 18729.31075697211,
+        "sha_comps_wtxid": 32503.928286852588,
+        "sha_comps_merkle_interior": 14292.083665338645,
+        "sha_comps_header": 3.0,
+        "sha_input_bytes_txid": 791221.6533864542,
+        "sha_input_bytes_wtxid": 1597291.4780876494,
+        "sighash_legacy_preimage_bytes_est": 12002188.055776892,
+        "sighash_legacy_comps_est": 188663.83665338645,
+        "sighash_witness_comps_est": 34678.02788844622,
+        "sighash_legacy_inputs": 709.2828685258964,
+        "sighash_witness_inputs": 6935.605577689243,
+        "outcls_p2pkh": 515.6852589641434,
+        "outcls_op_return": 3055.386454183267,
+        "input_shape_empty": 6781.960159362549,
+        "outcls_p2wpkh": 5990.601593625498,
+        "outcls_p2tr": 580.9482071713147,
+        "outcls_p2sh": 329.43824701195217,
+        "input_shape_sig_plus_pubkey": 518.2350597609561,
+        "outcls_p2wsh": 179.12350597609563,
+        "input_shape_single_push": 334.17131474103587,
+        "input_shape_multi_push": 10.52191235059761,
+        "outcls_other": 181.12350597609563,
+        "outcls_p2ms_bare": 2.4780876494023905
+      }
+    },
+    "genesis_sparse": {
+      "windows": [
+        "fixture-genesis.json"
+      ],
+      "height_range": [
+        0,
+        0
+      ],
+      "blocks_measured": 501,
+      "totals": {
+        "blocks": 501,
+        "txs": 509,
+        "inputs": 10,
+        "inputs_coinbase": 501,
+        "outputs": 514,
+        "coinbase_txs": 501,
+        "witness_items": 0,
+        "witness_der_items": 0,
+        "witness_schnorr_sized": 0,
+        "scriptsig_push_items": 10,
+        "scriptsig_der_items": 10,
+        "bytes_header": 40080,
+        "bytes_tx_count_field": 501,
+        "bytes_tx_overhead": 4072,
+        "bytes_outpoint": 18396,
+        "bytes_scriptsig": 4584,
+        "bytes_sequence": 2044,
+        "bytes_output_value": 4112,
+        "bytes_scriptpubkey": 34438,
+        "bytes_witness": 0,
+        "sha_comps_txid": 2053,
+        "sha_comps_wtxid": 2053,
+        "sha_comps_merkle_interior": 24,
+        "sha_comps_header": 1503,
+        "sha_input_bytes_txid": 69689,
+        "sha_input_bytes_wtxid": 69689,
+        "sighash_legacy_preimage_bytes_est": 3058,
+        "sighash_legacy_comps_est": 64,
+        "sighash_witness_comps_est": 0,
+        "sighash_legacy_inputs": 10,
+        "sighash_witness_inputs": 0,
+        "outcls_p2pk_uncompressed": 514,
+        "input_shape_single_push": 10
+      },
+      "per_block": {
+        "blocks": 1.0,
+        "txs": 1.0159680638722555,
+        "inputs": 0.01996007984031936,
+        "inputs_coinbase": 1.0,
+        "outputs": 1.0259481037924152,
+        "coinbase_txs": 1.0,
+        "witness_items": 0.0,
+        "witness_der_items": 0.0,
+        "witness_schnorr_sized": 0.0,
+        "scriptsig_push_items": 0.01996007984031936,
+        "scriptsig_der_items": 0.01996007984031936,
+        "bytes_header": 80.0,
+        "bytes_tx_count_field": 1.0,
+        "bytes_tx_overhead": 8.127744510978044,
+        "bytes_outpoint": 36.7185628742515,
+        "bytes_scriptsig": 9.149700598802395,
+        "bytes_sequence": 4.079840319361278,
+        "bytes_output_value": 8.207584830339322,
+        "bytes_scriptpubkey": 68.73852295409182,
+        "bytes_witness": 0.0,
+        "sha_comps_txid": 4.097804391217565,
+        "sha_comps_wtxid": 4.097804391217565,
+        "sha_comps_merkle_interior": 0.04790419161676647,
+        "sha_comps_header": 3.0,
+        "sha_input_bytes_txid": 139.0998003992016,
+        "sha_input_bytes_wtxid": 139.0998003992016,
+        "sighash_legacy_preimage_bytes_est": 6.103792415169661,
+        "sighash_legacy_comps_est": 0.1277445109780439,
+        "sighash_witness_comps_est": 0.0,
+        "sighash_legacy_inputs": 0.01996007984031936,
+        "sighash_witness_inputs": 0.0,
+        "outcls_p2pk_uncompressed": 1.0259481037924152,
+        "input_shape_single_push": 0.01996007984031936
+      }
+    }
+  },
+  "full_history_estimate": {
+    "genesis_sparse": {
+      "blocks": {
+        "basis": "sample_extrapolation",
+        "value": 227931.0,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "txs": {
+        "basis": "sample_extrapolation",
+        "value": 231570.61676646705,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "inputs": {
+        "basis": "sample_extrapolation",
+        "value": 4549.520958083833,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "inputs_coinbase": {
+        "basis": "sample_extrapolation",
+        "value": 227931.0,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "outputs": {
+        "basis": "sample_extrapolation",
+        "value": 233845.37724550898,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "coinbase_txs": {
+        "basis": "sample_extrapolation",
+        "value": 227931.0,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "witness_items": {
+        "basis": "sample_extrapolation",
+        "value": 0.0,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "witness_der_items": {
+        "basis": "sample_extrapolation",
+        "value": 0.0,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "witness_schnorr_sized": {
+        "basis": "sample_extrapolation",
+        "value": 0.0,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "scriptsig_push_items": {
+        "basis": "sample_extrapolation",
+        "value": 4549.520958083833,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "scriptsig_der_items": {
+        "basis": "sample_extrapolation",
+        "value": 4549.520958083833,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "bytes_header": {
+        "basis": "sample_extrapolation",
+        "value": 18234480.0,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "bytes_tx_count_field": {
+        "basis": "sample_extrapolation",
+        "value": 227931.0,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "bytes_tx_overhead": {
+        "basis": "sample_extrapolation",
+        "value": 1852564.9341317364,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "bytes_outpoint": {
+        "basis": "sample_extrapolation",
+        "value": 8369298.754491018,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "bytes_scriptsig": {
+        "basis": "sample_extrapolation",
+        "value": 2085500.4071856288,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "bytes_sequence": {
+        "basis": "sample_extrapolation",
+        "value": 929922.0838323354,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "bytes_output_value": {
+        "basis": "sample_extrapolation",
+        "value": 1870763.0179640718,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "bytes_scriptpubkey": {
+        "basis": "sample_extrapolation",
+        "value": 15667640.275449103,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "bytes_witness": {
+        "basis": "sample_extrapolation",
+        "value": 0.0,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "sha_comps_txid": {
+        "basis": "sample_extrapolation",
+        "value": 934016.6526946108,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "sha_comps_wtxid": {
+        "basis": "sample_extrapolation",
+        "value": 934016.6526946108,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "sha_comps_merkle_interior": {
+        "basis": "sample_extrapolation",
+        "value": 10918.850299401198,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "sha_comps_header": {
+        "basis": "sample_extrapolation",
+        "value": 683793.0,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "sha_input_bytes_txid": {
+        "basis": "sample_extrapolation",
+        "value": 31705156.60479042,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "sha_input_bytes_wtxid": {
+        "basis": "sample_extrapolation",
+        "value": 31705156.60479042,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "sighash_legacy_preimage_bytes_est": {
+        "basis": "sample_extrapolation",
+        "value": 1391243.508982036,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "sighash_legacy_comps_est": {
+        "basis": "sample_extrapolation",
+        "value": 29116.934131736525,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "sighash_witness_comps_est": {
+        "basis": "sample_extrapolation",
+        "value": 0.0,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "sighash_legacy_inputs": {
+        "basis": "sample_extrapolation",
+        "value": 4549.520958083833,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "sighash_witness_inputs": {
+        "basis": "sample_extrapolation",
+        "value": 0.0,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "outcls_p2pk_uncompressed": {
+        "basis": "sample_extrapolation",
+        "value": 233845.37724550898,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "input_shape_single_push": {
+        "basis": "sample_extrapolation",
+        "value": 4549.520958083833,
+        "note": "genesis_sparse density measured over [0, 0]"
+      }
+    },
+    "pre_segwit": {
+      "blocks": {
+        "basis": "sample_extrapolation",
+        "value": 253893.0,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "txs": {
+        "basis": "sample_extrapolation",
+        "value": 135197287.8559028,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "inputs": {
+        "basis": "sample_extrapolation",
+        "value": 400993873.09201384,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "inputs_coinbase": {
+        "basis": "sample_extrapolation",
+        "value": 253893.0,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "outputs": {
+        "basis": "sample_extrapolation",
+        "value": 376337013.2569444,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "coinbase_txs": {
+        "basis": "sample_extrapolation",
+        "value": 253893.0,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "witness_items": {
+        "basis": "sample_extrapolation",
+        "value": 3384358.427083333,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "witness_der_items": {
+        "basis": "sample_extrapolation",
+        "value": 1569199.7916666665,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "witness_schnorr_sized": {
+        "basis": "sample_extrapolation",
+        "value": 226858.09722222222,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "scriptsig_push_items": {
+        "basis": "sample_extrapolation",
+        "value": 823222927.671875,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "scriptsig_der_items": {
+        "basis": "sample_extrapolation",
+        "value": 411506189.3368055,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "bytes_header": {
+        "basis": "sample_extrapolation",
+        "value": 20311440.0,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "bytes_tx_count_field": {
+        "basis": "sample_extrapolation",
+        "value": 568026.8159722222,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "bytes_tx_overhead": {
+        "basis": "sample_extrapolation",
+        "value": 1083347619.6909723,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "bytes_outpoint": {
+        "basis": "sample_extrapolation",
+        "value": 14444919579.3125,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "bytes_scriptsig": {
+        "basis": "sample_extrapolation",
+        "value": 47995699397.03472,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "bytes_sequence": {
+        "basis": "sample_extrapolation",
+        "value": 1604991064.3680553,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "bytes_output_value": {
+        "basis": "sample_extrapolation",
+        "value": 3010696106.0555553,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "bytes_scriptpubkey": {
+        "basis": "sample_extrapolation",
+        "value": 9392517935.85764,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "bytes_witness": {
+        "basis": "sample_extrapolation",
+        "value": 185548765.77777776,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "sha_comps_txid": {
+        "basis": "sample_extrapolation",
+        "value": 1439466492.748264,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "sha_comps_wtxid": {
+        "basis": "sample_extrapolation",
+        "value": 1442553761.1024306,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "sha_comps_merkle_interior": {
+        "basis": "sample_extrapolation",
+        "value": 404830184.5677083,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "sha_comps_header": {
+        "basis": "sample_extrapolation",
+        "value": 761679.0,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "sha_input_bytes_txid": {
+        "basis": "sample_extrapolation",
+        "value": 78595506588.30035,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "sha_input_bytes_wtxid": {
+        "basis": "sample_extrapolation",
+        "value": 78782824670.92188,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "sighash_legacy_preimage_bytes_est": {
+        "basis": "sample_extrapolation",
+        "value": 3770760379193.754,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "sighash_legacy_comps_est": {
+        "basis": "sample_extrapolation",
+        "value": 59555867462.671875,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "sighash_witness_comps_est": {
+        "basis": "sample_extrapolation",
+        "value": 8645291.73611111,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "sighash_legacy_inputs": {
+        "basis": "sample_extrapolation",
+        "value": 399264814.7447917,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "sighash_witness_inputs": {
+        "basis": "sample_extrapolation",
+        "value": 1729058.3472222222,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "outcls_p2pk_compressed": {
+        "basis": "sample_extrapolation",
+        "value": 17337.600694444445,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "input_shape_sig_plus_pubkey": {
+        "basis": "sample_extrapolation",
+        "value": 386805985.5,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "outcls_p2pkh": {
+        "basis": "sample_extrapolation",
+        "value": 354483996.0833333,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "outcls_p2ms_bare": {
+        "basis": "sample_extrapolation",
+        "value": 398030.171875,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "outcls_p2sh": {
+        "basis": "sample_extrapolation",
+        "value": 17635425.411458332,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "input_shape_multi_push": {
+        "basis": "sample_extrapolation",
+        "value": 12379781.539930556,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "input_shape_ops_only_or_mixed": {
+        "basis": "sample_extrapolation",
+        "value": 6171.010416666667,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "input_shape_single_push": {
+        "basis": "sample_extrapolation",
+        "value": 187481.17361111112,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "outcls_p2pk_uncompressed": {
+        "basis": "sample_extrapolation",
+        "value": 20423.105902777777,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "outcls_op_return": {
+        "basis": "sample_extrapolation",
+        "value": 1176459.0572916665,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "outcls_other": {
+        "basis": "sample_extrapolation",
+        "value": 793856.4114583334,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "outcls_p2wsh": {
+        "basis": "sample_extrapolation",
+        "value": 54951.37847222222,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "input_shape_empty": {
+        "basis": "sample_extrapolation",
+        "value": 1614453.8680555557,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "outcls_p2wpkh": {
+        "basis": "sample_extrapolation",
+        "value": 1557739.34375,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "outcls_p2tr": {
+        "basis": "sample_extrapolation",
+        "value": 198794.69270833334,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      }
+    },
+    "segwit_era": {
+      "_basis": "unmeasured_assumption",
+      "_note": "no local corpus coverage for segwit_era; carry bounded ranges only"
+    },
+    "taproot_era": {
+      "blocks": {
+        "basis": "sample_extrapolation",
+        "value": 260369.0,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "txs": {
+        "basis": "sample_extrapolation",
+        "value": 1240665546.2868526,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "inputs": {
+        "basis": "sample_extrapolation",
+        "value": 1990491959.8525896,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "inputs_coinbase": {
+        "basis": "sample_extrapolation",
+        "value": 260369.0,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "outputs": {
+        "basis": "sample_extrapolation",
+        "value": 2821042099.358566,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "coinbase_txs": {
+        "basis": "sample_extrapolation",
+        "value": 260369.0,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "witness_items": {
+        "basis": "sample_extrapolation",
+        "value": 3608257916.25498,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "witness_der_items": {
+        "basis": "sample_extrapolation",
+        "value": 1697740732.4701197,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "witness_schnorr_sized": {
+        "basis": "sample_extrapolation",
+        "value": 157695441.2310757,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "scriptsig_push_items": {
+        "basis": "sample_extrapolation",
+        "value": 368097451.7450199,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "scriptsig_der_items": {
+        "basis": "sample_extrapolation",
+        "value": 140678096.82868525,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "bytes_header": {
+        "basis": "sample_extrapolation",
+        "value": 20829520.0,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "bytes_tx_count_field": {
+        "basis": "sample_extrapolation",
+        "value": 781107.0,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "bytes_tx_overhead": {
+        "basis": "sample_extrapolation",
+        "value": 12254525279.346615,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "bytes_outpoint": {
+        "basis": "sample_extrapolation",
+        "value": 71667083838.69322,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "bytes_scriptsig": {
+        "basis": "sample_extrapolation",
+        "value": 17320566405.41434,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "bytes_sequence": {
+        "basis": "sample_extrapolation",
+        "value": 7963009315.410358,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "bytes_output_value": {
+        "basis": "sample_extrapolation",
+        "value": 22568336794.868526,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "bytes_scriptpubkey": {
+        "basis": "sample_extrapolation",
+        "value": 63840931108.57371,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "bytes_witness": {
+        "basis": "sample_extrapolation",
+        "value": 207546393278.5737,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "sha_comps_txid": {
+        "basis": "sample_extrapolation",
+        "value": 4876531912.482072,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "sha_comps_wtxid": {
+        "basis": "sample_extrapolation",
+        "value": 8463015304.119521,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "sha_comps_merkle_interior": {
+        "basis": "sample_extrapolation",
+        "value": 3721215531.8605576,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "sha_comps_header": {
+        "basis": "sample_extrapolation",
+        "value": 781107.0,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "sha_input_bytes_txid": {
+        "basis": "sample_extrapolation",
+        "value": 206009590670.5777,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "sha_input_bytes_wtxid": {
+        "basis": "sample_extrapolation",
+        "value": 415885184858.2032,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "sighash_legacy_preimage_bytes_est": {
+        "basis": "sample_extrapolation",
+        "value": 3124997701894.5737,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "sighash_legacy_comps_est": {
+        "basis": "sample_extrapolation",
+        "value": 49122214485.605576,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "sighash_witness_comps_est": {
+        "basis": "sample_extrapolation",
+        "value": 9029083443.286854,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "sighash_legacy_inputs": {
+        "basis": "sample_extrapolation",
+        "value": 184675271.19521913,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "sighash_witness_inputs": {
+        "basis": "sample_extrapolation",
+        "value": 1805816688.6573703,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "outcls_p2pkh": {
+        "basis": "sample_extrapolation",
+        "value": 134268455.19123504,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "outcls_op_return": {
+        "basis": "sample_extrapolation",
+        "value": 795527915.689243,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "input_shape_empty": {
+        "basis": "sample_extrapolation",
+        "value": 1765812184.7330675,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "outcls_p2wpkh": {
+        "basis": "sample_extrapolation",
+        "value": 1559766946.3306773,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "outcls_p2tr": {
+        "basis": "sample_extrapolation",
+        "value": 151260903.75298804,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "outcls_p2sh": {
+        "basis": "sample_extrapolation",
+        "value": 85775506.93625498,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "input_shape_sig_plus_pubkey": {
+        "basis": "sample_extrapolation",
+        "value": 134932344.27490038,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "outcls_p2wsh": {
+        "basis": "sample_extrapolation",
+        "value": 46638208.12749004,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "input_shape_single_push": {
+        "basis": "sample_extrapolation",
+        "value": 87007851.04780877,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "input_shape_multi_push": {
+        "basis": "sample_extrapolation",
+        "value": 2739579.796812749,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "outcls_other": {
+        "basis": "sample_extrapolation",
+        "value": 47158946.12749004,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "outcls_p2ms_bare": {
+        "basis": "sample_extrapolation",
+        "value": 645217.203187251,
+        "note": "taproot_era density measured over [956468, 956718]"
+      }
+    }
+  }
+}

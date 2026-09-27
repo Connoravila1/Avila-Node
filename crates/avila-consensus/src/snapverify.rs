@@ -405,6 +405,126 @@ pub fn read_header(f: &File) -> io::Result<Header> {
     })
 }
 
+/// Streams every coin of a `dumptxoutset`-format snapshot (Core
+/// `utxo\xff`, version 2). `f` receives `(txid, vout, code, value,
+/// script_pubkey)` per coin — `code = height * 2 + coinbase` — using the
+/// exact `coin`/`group` decode path the verifier uses. The streamed
+/// count must equal the header's declared count, else `Err`.
+///
+/// `base_height`, when `Some`, bounds each coin's creation height the
+/// same way the verifier does (`code >> 1 <= base_height`); `None`
+/// leaves the bound open. Returns the parsed snapshot [`Header`] —
+/// caller verifies `network` and `base_blockhash` against the intended
+/// chain and boundary.
+///
+/// This is a loader, not a verifier: it reconstructs coins for a
+/// boundary state. `verify_stream` remains the integrity check.
+///
+/// # Errors
+/// I/O on read; `InvalidData` on malformed records or a coin count that
+/// disagrees with the header. `f`'s errors propagate.
+pub fn for_each_coin(
+    path: &Path,
+    base_height: Option<u32>,
+    mut f: impl FnMut([u8; 32], u32, u64, i64, &[u8]) -> io::Result<()>,
+) -> io::Result<Header> {
+    use std::io::Read;
+    let mut file = File::open(path)?;
+    let mut hdr = [0u8; HEADER_LEN as usize];
+    file.read_exact(&mut hdr)?;
+    if &hdr[..5] != b"utxo\xff" {
+        return Err(invalid("bad snapshot magic"));
+    }
+    if u16::from_le_bytes([hdr[5], hdr[6]]) != 2 {
+        return Err(invalid("unsupported snapshot version"));
+    }
+    let mut network = [0u8; 4];
+    network.copy_from_slice(&hdr[7..11]);
+    let mut base_blockhash = [0u8; 32];
+    base_blockhash.copy_from_slice(&hdr[11..43]);
+    let want = u64::from_le_bytes(
+        hdr[43..51]
+            .try_into()
+            .map_err(|_| invalid("truncated snapshot header"))?,
+    );
+    let height_bound = base_height.unwrap_or(u32::MAX);
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut fill = 0usize;
+    let mut eof = false;
+    let mut streamed = 0u64;
+    let mut ser: Vec<u8> = Vec::new();
+    loop {
+        let mut p = 0usize;
+        loop {
+            match group::<true>(&buf[p..fill], height_bound, &mut ser) {
+                Ok(g) => {
+                    let mut q = 0usize;
+                    for _ in 0..g.n {
+                        // ser record: txid32 ‖ vout4 ‖ code4 ‖ value8
+                        // ‖ compactsize len ‖ script — bounds-checked.
+                        let rec = ser
+                            .get(q..q + 48)
+                            .ok_or_else(|| invalid("ser record bounds"))?;
+                        let mut txid = [0u8; 32];
+                        txid.copy_from_slice(&rec[..32]);
+                        q += 32;
+                        let vout = u32::from_le_bytes(
+                            rec[32..36].try_into().map_err(|_| invalid("ser vout"))?,
+                        );
+                        q += 4;
+                        let code = u64::from(u32::from_le_bytes(
+                            rec[36..40].try_into().map_err(|_| invalid("ser code"))?,
+                        ));
+                        q += 4;
+                        let value = i64::from_le_bytes(
+                            rec[40..48].try_into().map_err(|_| invalid("ser value"))?,
+                        );
+                        q += 8;
+                        let slen =
+                            compact(&ser, &mut q).map_err(|_| invalid("ser script length"))?;
+                        let slen =
+                            usize::try_from(slen).map_err(|_| invalid("ser script length"))?;
+                        let spk = ser
+                            .get(q..q + slen)
+                            .ok_or_else(|| invalid("ser script bounds"))?;
+                        f(txid, vout, code, value, spk)?;
+                        q += slen;
+                        streamed += 1;
+                    }
+                    ser.clear();
+                    p += g.len;
+                }
+                Err(PErr::Short) => break,
+                Err(PErr::Bad(m)) => return Err(invalid(m)),
+            }
+        }
+        buf.drain(..p);
+        fill -= p;
+        if eof {
+            if fill != 0 {
+                return Err(invalid("trailing unparsed bytes"));
+            }
+            break;
+        }
+        buf.resize(fill + READ_BLOCK, 0);
+        let n = file.read(&mut buf[fill..])?;
+        buf.truncate(fill + n);
+        fill += n;
+        if n == 0 {
+            eof = true;
+        }
+    }
+    if streamed != want {
+        return Err(invalid("coin count disagrees with header"));
+    }
+    Ok(Header {
+        network,
+        base_blockhash,
+        coins_count: want,
+    })
+}
+
 // ---------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------

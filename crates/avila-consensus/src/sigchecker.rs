@@ -553,6 +553,7 @@ impl<'a> TransactionSignatureChecker<'a> {
         let Ok(msg) = secp256k1::Message::from_digest_slice(sighash) else {
             return false;
         };
+        ECDSA_VERIFY_BACKEND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         secp().verify_ecdsa(&msg, &sig, &pk).is_ok()
     }
 
@@ -567,6 +568,7 @@ impl<'a> TransactionSignatureChecker<'a> {
         let Ok(msg) = secp256k1::Message::from_digest_slice(sighash) else {
             return false;
         };
+        SCHNORR_VERIFY_BACKEND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         secp().verify_schnorr(&sig, &msg, &pk).is_ok()
     }
 }
@@ -590,6 +592,18 @@ impl SignatureChecker for TransactionSignatureChecker<'_> {
         if sig.is_empty() {
             return false;
         }
+        // Attempt classification for the calibration counters: strict
+        // DER shape (same predicate as the structural census) vs
+        // non-DER items that still reach the helper.
+        let der_shaped = sig.len() >= 8
+            && sig.len() <= 73
+            && sig[0] == 0x30
+            && (sig[1] as usize == sig.len() - 2 || sig[1] as usize == sig.len() - 3);
+        if der_shaped {
+            ECDSA_VERIFY_CALLS_DER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            ECDSA_VERIFY_CALLS_NONDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let hash_type = i32::from(sig[sig.len() - 1]);
         let sig = &sig[..sig.len() - 1];
 
@@ -612,8 +626,10 @@ impl SignatureChecker for TransactionSignatureChecker<'_> {
             _t.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+        ECDSA_SIGHASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _t = std::time::Instant::now();
         let r = Self::verify_ecdsa_signature(sig, pubkey, &sighash);
+        ECDSA_VERIFY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         VERIFY_NS.fetch_add(
             _t.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -655,7 +671,9 @@ impl SignatureChecker for TransactionSignatureChecker<'_> {
         else {
             return Err(ScriptError::SchnorrSigHashType);
         };
-        if !Self::verify_schnorr_signature(sig, pubkey, &sighash) {
+        let ok = Self::verify_schnorr_signature(sig, pubkey, &sighash);
+        SCHNORR_VERIFY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !ok {
             return Err(ScriptError::SchnorrSig);
         }
         Ok(())
@@ -791,6 +809,28 @@ mod tests;
 pub static SIGHASH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Cumulative ns in the libsecp verify call itself.
 pub static VERIFY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Executed ECDSA sighash computations reaching the hash (post early-returns).
+pub static ECDSA_SIGHASH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// ECDSA signature-check attempts reaching the verify helper (the helper
+/// can early-return on key/sig parse without invoking the curve verifier).
+pub static ECDSA_VERIFY_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// ECDSA attempts actually entering `secp().verify_ecdsa`.
+pub static ECDSA_VERIFY_BACKEND_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// ECDSA verify-helper attempts carrying a strictly DER-shaped sig item
+/// (chain encoding incl. sighash byte; same predicate as the structural
+/// census — enables matched-set attempt-vs-shape calibration).
+pub static ECDSA_VERIFY_CALLS_DER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// ECDSA verify-helper attempts on non-DER-shaped sig items.
+pub static ECDSA_VERIFY_CALLS_NONDER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Schnorr signature-check attempts reaching the verify helper.
+pub static SCHNORR_VERIFY_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Schnorr attempts actually entering `secp().verify_schnorr`.
+pub static SCHNORR_VERIFY_BACKEND_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Verified-tx cache — mempool→block script-check dedup

@@ -55,7 +55,7 @@ pub struct HeaderNode {
     /// `getchaintxstats` decides `txcount` is "known".
     pub n_chain_tx: u64,
     /// Core's `pskip` — a pointer part-way down the ancestry, chosen by
-    /// [`get_skip_height`] so ancestor queries descend in O(log n) jumps
+    /// `get_skip_height` so ancestor queries descend in O(log n) jumps
     /// instead of O(n) `pprev` steps. Built at insert from the parent's
     /// already-linked skip pointer; `None` near genesis where the skip
     /// height is nonpositive.

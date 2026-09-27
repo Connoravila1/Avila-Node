@@ -1,0 +1,503 @@
+{
+  "kind": "read_only_source_and_existing_artifact_audit_no_new_experiments",
+  "captured_utc": "2026-09-26T16:41:26.190698+00:00",
+  "git_head": "571b6f69a1ef9abc06f708031b9321fd5f62330e",
+  "scope": "Read code, regression definitions, and saved results; recompute arithmetic. Did not run tests, benchmarks, corpus scans, or live-node operations.",
+  "sources": {
+    "tools/ibd_corpus_window.py": {
+      "sha256": "bacf173d199afc16366b25b6beeb8e74ee473cf3b9cb098ce094181c7342bf7c",
+      "bytes": 13698
+    },
+    "tools/test_ibd_corpus_window.py": {
+      "sha256": "c7e182bdfabddd8a31c6a9cd30bde688aa9ec2a38818f3d7cd758868f783bd21",
+      "bytes": 6149
+    },
+    "tools/ibd_census.py": {
+      "sha256": "6eded28270df562b6ec560477bda70204b2dbff0ac398cab2a796117ce1bde5b",
+      "bytes": 21492
+    },
+    "tools/ibd_shrd_bench.py": {
+      "sha256": "bf27a9b3818a8011c80b7a601738f527f80bf11e532dde7c4bd6e9b50740075f",
+      "bytes": 8191
+    },
+    "tools/ibd_workload.py": {
+      "sha256": "f117cea8d123c1091fd2f0da155f659e088606e05119049af6f7d0574a50b5dd",
+      "bytes": 4240
+    },
+    "crates/avila-consensus/examples/corpus_replay.rs": {
+      "sha256": "b48147b331824333a3cbfbb0f512d15043f3c861697e633e5e8d94ca99d693cd",
+      "bytes": 11607
+    },
+    "crates/avila-consensus/src/sigchecker.rs": {
+      "sha256": "e49ed6f962fb590f2e90c84676ecec83e0b238413afe9731dbaf8cd16f3ecd88",
+      "bytes": 33847
+    },
+    "crates/avila-consensus/src/block.rs": {
+      "sha256": "9f970eb4a107eed09d8506c5e83813b1a5a6bb47591537ec755af79291dfa47f",
+      "bytes": 30714
+    },
+    "experiments/LOG.md": {
+      "sha256": "b9d26d600fc37e642f9181bd8b9fb36c2457a0491035c432f333f6a664c3775f",
+      "bytes": 83398
+    },
+    "experiments/2026-09-26-ibd-corpus-replay.md": {
+      "sha256": "39f1662bb92cc1234d367867b2111ba5f2b728be01fa7ec6ee1c91564cb12abe",
+      "bytes": 7171
+    },
+    "experiments/2026-09-26-ibd-workload-census.md": {
+      "sha256": "a0955cf49fb2be90edbaf6d66b33f0faf4a2ff9e494fbb63c40622f50e1b9d81",
+      "bytes": 12293
+    },
+    "target/ibd-corpus/341k-v2/manifest.json": {
+      "sha256": "3b5582c5baa8aed5077bb50a1e24950d4b79c7e3537831131f10ddc71ab17b3f",
+      "bytes": 2408
+    },
+    "target/ibd-corpus/341k-v2/replay.jsonl": {
+      "sha256": "3a73ac0195f18a1369c0cc51ee8b23b43a22704eb17792a42dd061978cc434a8",
+      "bytes": 1083
+    },
+    "target/ibd-corpus/341k-v2/replay-v2.jsonl": {
+      "sha256": "a89a378b1e5b45ecbb11b69d6d74832bcaf5fcb4b31c151044b8e5dff8feeb8a",
+      "bytes": 1009
+    },
+    "experiments/results/census-2026-09-26/blk00690.json": {
+      "sha256": "233cdd7e84bd549e62411adfffc95483e580a7a9e3acf810993905d9d4753341",
+      "bytes": 2649
+    },
+    "experiments/results/census-2026-09-26/blk00765.json": {
+      "sha256": "f6a0c9859a11bc014ff6e43f3ceeea514fecf249a0d4a4c9e3065b825e6b7edf",
+      "bytes": 2610
+    },
+    "/tmp/census-fixed": {
+      "sha256": "1d4e4cb8c4e7236aaa6d3e11701f8b459d9c6bb0fbdd11bc0a233334ad7903e3",
+      "bytes": 2732
+    },
+    "/tmp/census-690": {
+      "sha256": "d134707befc23f5c6de843abf6a2edf5a0cade07067773207773fdd39334d9f3",
+      "bytes": 3043
+    }
+  },
+  "instrumented_replay_rows": [
+    {
+      "type": "prep",
+      "corpus_bytes": 161838980,
+      "blocks": 449,
+      "parse_s": 0.812,
+      "task_build_s": 0.215,
+      "rss_hwm_bytes": 451313664
+    },
+    {
+      "type": "counters",
+      "total_txs": 247193,
+      "total_inputs_noncb": 671771,
+      "inputs_resolved": 599840,
+      "inputs_missing_source": 71931,
+      "excluded_unresolved_txs": 23449,
+      "resolved_inputs_in_excluded_txs": 82021,
+      "excluded_immature_txs": 0,
+      "immature_source_inputs": 0,
+      "executed_txs": 223295,
+      "executed_inputs": 517819
+    },
+    {
+      "type": "run",
+      "workers": 1,
+      "wall_s": 59.465,
+      "executed_txs": 223295,
+      "executed_inputs_ok": 517819,
+      "failed_txs": 0,
+      "failed_inputs_ub": 0,
+      "ecdsa_sighash_calls": 526534,
+      "ecdsa_verify_attempts": 526534,
+      "schnorr_verify_attempts": 0,
+      "sighash_ms": 819.6,
+      "verify_ms": 57512.8,
+      "inputs_per_s": 8708,
+      "us_per_input": 114.84
+    },
+    {
+      "type": "run",
+      "workers": 8,
+      "wall_s": 14.545,
+      "executed_txs": 223295,
+      "executed_inputs_ok": 517819,
+      "failed_txs": 0,
+      "failed_inputs_ub": 0,
+      "ecdsa_sighash_calls": 526534,
+      "ecdsa_verify_attempts": 526534,
+      "schnorr_verify_attempts": 0,
+      "sighash_ms": 1409.2,
+      "verify_ms": 113050.3,
+      "inputs_per_s": 35601,
+      "us_per_input": 28.09
+    }
+  ],
+  "corpus_manifest": {
+    "span_files": [
+      {
+        "file": "data/mainnet/blk00681.dat",
+        "sha256": "a4cb087c2b9d4555f45e1938bb4261bae221ec56af691871c8bf70e7fe77cb07",
+        "records": 313
+      },
+      {
+        "file": "data/mainnet/blk00682.dat",
+        "sha256": "2a8ea048254b14ad677accb19cad878a3b8d4dd438fa88704fd51f3190023d60",
+        "records": 327
+      },
+      {
+        "file": "data/mainnet/blk00683.dat",
+        "sha256": "505626af4974cb6664fe43e8d770279234f00c5d33ca36b67e7add5017c0969d",
+        "records": 369
+      },
+      {
+        "file": "data/mainnet/blk00684.dat",
+        "sha256": "6f75e9fb1a7bc4d6799f4133df42584f81b4660f8a7c1dfedca1641898921e46",
+        "records": 318
+      },
+      {
+        "file": "data/mainnet/blk00685.dat",
+        "sha256": "48e69676e96d5c2481552b426d21be3c7320a3ef41339273ffae8ab483d47b1b",
+        "records": 367
+      },
+      {
+        "file": "data/mainnet/blk00686.dat",
+        "sha256": "5ab1c6f40e374adcea89e607580c7dd17787794e646d371947ac7365aabad5f1",
+        "records": 313
+      },
+      {
+        "file": "data/mainnet/blk00687.dat",
+        "sha256": "c2b9ec40e990fa082881bba0d0a3c88bcae576f82a9ec92bb6a7e41bd9132fa4",
+        "records": 353
+      },
+      {
+        "file": "data/mainnet/blk00688.dat",
+        "sha256": "26fffa4a18d21c98f9205e575b373325eddd44e65cddc174ce856bbf5ef7dd82",
+        "records": 434
+      },
+      {
+        "file": "data/mainnet/blk00689.dat",
+        "sha256": "a0f1103837e788a16dff2643d1b07b7c3047ac7bb18d15fc0833d82dc76936ae",
+        "records": 417
+      },
+      {
+        "file": "data/mainnet/blk00690.dat",
+        "sha256": "98609e62dfe68458a6168e02ef6f9ade3adf8dd51dca20aefa89484701d814ae",
+        "records": 449
+      }
+    ],
+    "window_files": [
+      "data/mainnet/blk00690.dat"
+    ],
+    "labels": {
+      "provenance": "local blk-store scan (corpus-resolved prevouts)",
+      "occurrence_model": "latest (height,txidx) < (spend_height,spend_idx)",
+      "ordering": "blocks sorted by BIP34 height; file order not trusted"
+    },
+    "window": {
+      "height_min": 340787,
+      "height_max": 342234,
+      "stats": {
+        "blocks": 449,
+        "txs": 247193,
+        "inputs": 671771,
+        "resolved": 599840,
+        "unresolved_no_occurrence": 71931,
+        "unresolved_future_only": 0,
+        "unresolved_bad_vout": 0,
+        "coinbase_inputs": 449,
+        "duplicate_txid_occurrences": 0
+      },
+      "corpus_sha256": "0b63fc76385dfd361f6a0d8001e52be472938e8dc1d429820a9739ec6ae6c8fa",
+      "corpus_bytes": 161838980
+    }
+  },
+  "derived_arithmetic": {
+    "denominator_reconciles_for_observed_zero_immaturity_sample": true,
+    "resolved_reconciles_for_observed_sample": true,
+    "executed_share": 0.7708266656345689,
+    "resolution_share": 0.8929233325046779,
+    "helper_attempts_per_successful_input": 1.0168302051489033,
+    "worker_1_sighash_elapsed_fraction_of_wall": 0.0137828975027327,
+    "worker_1_verify_helper_elapsed_fraction_of_wall": 0.9671706045573026,
+    "worker_8_sum_sighash_verify_elapsed_seconds": 114.4595,
+    "worker_8_wall_seconds": 14.545,
+    "observed_worker_8_speedup_over_1": 4.088346510828464,
+    "whole_window_structural_der_items": 680168,
+    "whole_window_structural_times_executed_input_share_not_matched_subset": 524291.6315113335,
+    "scaled_vs_observed_attempt_relative_difference": -0.004258734457160407,
+    "sample_assumptions": "Scalable structural count is included only to reconstruct the reported arithmetic; it is not a matched-subset calibration."
+  },
+  "saved_census_v2_outputs": {
+    "/tmp/census-fixed": {
+      "files": [
+        {
+          "file": "data/mainnet/blk00765.dat",
+          "size": 133971922,
+          "sha256": "e5372f232e5cbbcdd7cd7395b4c706ce0f317a6a993608d32d00dace0d23ec3e",
+          "records_decoded": 189
+        }
+      ],
+      "totals": {
+        "blocks": 189,
+        "txs": 164023,
+        "inputs": 737076,
+        "inputs_coinbase": 189,
+        "outputs": 454593,
+        "coinbase_txs": 189,
+        "witness_items": 0,
+        "witness_der_items": 0,
+        "witness_schnorr_sized": 0,
+        "scriptsig_push_items": 1502060,
+        "scriptsig_der_items": 750412,
+        "bytes_header": 15120,
+        "bytes_tx_count_field": 519,
+        "bytes_tx_overhead": 1312184,
+        "bytes_outpoint": 26541540,
+        "bytes_scriptsig": 86745383,
+        "bytes_sequence": 2949060,
+        "bytes_output_value": 3636744,
+        "bytes_scriptpubkey": 11238082,
+        "bytes_witness": 0,
+        "sha_comps_txid": 2350874,
+        "sha_comps_wtxid": 0,
+        "sha_comps_merkle_interior": 494019,
+        "sha_comps_header": 567,
+        "sha_input_bytes_txid": 133954771,
+        "sha_input_bytes_wtxid": 0,
+        "sighash_legacy_preimage_bytes_est": 2391044385,
+        "sighash_legacy_comps_est": 38658394,
+        "sighash_witness_comps_est": 0,
+        "sighash_legacy_inputs": 737076,
+        "sighash_witness_inputs": 0,
+        "block_hash_first": "00000000000000000646e3a441fdb71f3119f2363d53697000a2a70a4c3271bb",
+        "block_hash_last": "00000000000000000f48fb7d18cc4d63ac8e9d3f556b70adb3e4cc18f5a18a63",
+        "txs_no_wtxid": 164023,
+        "outcls_p2pkh": 422217,
+        "input_shape_sig_plus_pubkey": 722483,
+        "sighash_legacy_attempts_der": 750412,
+        "outcls_p2sh": 25526,
+        "input_shape_multi_push": 14583,
+        "outcls_op_return": 902,
+        "outcls_p2ms_bare": 768,
+        "merkle_verified": 189,
+        "input_shape_single_push": 6,
+        "sighash_legacy_nosig_inputs": 1,
+        "outcls_other": 5179,
+        "input_shape_ops_only_or_mixed": 4,
+        "outcls_p2pk_uncompressed": 1
+      },
+      "tx_size_hist_256b_buckets": [
+        62011,
+        60453,
+        14425,
+        6330,
+        1771,
+        866,
+        840,
+        598,
+        395,
+        328,
+        523,
+        504,
+        583,
+        6096,
+        2853,
+        2335,
+        335,
+        154,
+        75,
+        945,
+        37,
+        180,
+        55,
+        101,
+        44,
+        36,
+        46,
+        43,
+        57,
+        35,
+        22,
+        17,
+        21,
+        21,
+        9,
+        17,
+        12,
+        11,
+        97,
+        7,
+        16,
+        6,
+        61,
+        11,
+        20,
+        12,
+        7,
+        6,
+        6,
+        10,
+        8,
+        11,
+        10,
+        4,
+        1,
+        5,
+        7,
+        3,
+        5,
+        2,
+        6,
+        4,
+        5,
+        509
+      ],
+      "height_min": 364669,
+      "height_max": 365709,
+      "height_median": 365587,
+      "height_p05": 365467,
+      "height_p95": 365692,
+      "labels": {
+        "count_kind": "structural_parse",
+        "sighash": "structural estimate: legacy preimage ~= stripped tx size per input; dynamic attempt counts require executed replay"
+      }
+    },
+    "/tmp/census-690": {
+      "files": [
+        {
+          "file": "data/mainnet/blk00690.dat",
+          "size": 134031567,
+          "sha256": "98609e62dfe68458a6168e02ef6f9ade3adf8dd51dca20aefa89484701d814ae",
+          "records_decoded": 449
+        }
+      ],
+      "totals": {
+        "blocks": 449,
+        "txs": 247193,
+        "inputs": 671771,
+        "inputs_coinbase": 449,
+        "outputs": 705205,
+        "coinbase_txs": 449,
+        "witness_items": 0,
+        "witness_der_items": 0,
+        "witness_schnorr_sized": 0,
+        "scriptsig_push_items": 1359897,
+        "scriptsig_der_items": 680168,
+        "bytes_header": 35920,
+        "bytes_tx_count_field": 1055,
+        "bytes_tx_overhead": 1977544,
+        "bytes_outpoint": 24199920,
+        "bytes_scriptsig": 79849924,
+        "bytes_sequence": 2688880,
+        "bytes_output_value": 5641640,
+        "bytes_scriptpubkey": 17754679,
+        "bytes_witness": 0,
+        "sha_comps_txid": 2475470,
+        "sha_comps_wtxid": 0,
+        "sha_comps_merkle_interior": 745686,
+        "sha_comps_header": 1347,
+        "sha_input_bytes_txid": 133991000,
+        "sha_input_bytes_wtxid": 0,
+        "sighash_legacy_preimage_bytes_est": 927658084,
+        "sighash_legacy_comps_est": 15647390,
+        "sighash_witness_comps_est": 0,
+        "sighash_legacy_inputs": 671771,
+        "sighash_witness_inputs": 0,
+        "block_hash_first": "000000000000000003b77974684d16cb0601c89fb2bbc8a8513946e2842f0eed",
+        "block_hash_last": "00000000000000001a0562e55499dc069a9bd9e75c0270f303971610aaa3aace",
+        "txs_no_wtxid": 247193,
+        "outcls_p2pkh": 693395,
+        "input_shape_sig_plus_pubkey": 663781,
+        "sighash_legacy_attempts_der": 680168,
+        "outcls_p2sh": 9616,
+        "outcls_op_return": 452,
+        "input_shape_multi_push": 7959,
+        "outcls_p2ms_bare": 1728,
+        "merkle_verified": 449,
+        "input_shape_ops_only_or_mixed": 29,
+        "outcls_other": 9,
+        "outcls_p2pk_uncompressed": 4,
+        "input_shape_single_push": 2,
+        "outcls_p2pk_compressed": 1
+      },
+      "tx_size_hist_256b_buckets": [
+        94567,
+        104462,
+        22954,
+        9673,
+        2864,
+        1714,
+        1294,
+        920,
+        705,
+        476,
+        678,
+        565,
+        940,
+        940,
+        1116,
+        521,
+        686,
+        273,
+        262,
+        223,
+        89,
+        68,
+        71,
+        81,
+        55,
+        42,
+        53,
+        37,
+        32,
+        35,
+        37,
+        42,
+        19,
+        26,
+        21,
+        17,
+        16,
+        18,
+        32,
+        18,
+        16,
+        21,
+        23,
+        15,
+        11,
+        20,
+        14,
+        8,
+        11,
+        16,
+        10,
+        10,
+        8,
+        11,
+        13,
+        4,
+        7,
+        17,
+        5,
+        4,
+        3,
+        8,
+        5,
+        291
+      ],
+      "height_min": 340787,
+      "height_max": 342234,
+      "height_median": 341989,
+      "height_p05": 341745,
+      "height_p95": 342197,
+      "labels": {
+        "count_kind": "structural_parse",
+        "sighash": "structural estimate v2: per-DER-item preimage lengths with blanked scripts + SIGHASH_SINGLE/NONE/ANYONECANPAY cases; scriptCode approximated from input shape (prevouts unresolved). Dynamic attempt counts require executed replay.",
+        "scriptcode": "estimated: p2pkh=25B, multisig=last push, else 25",
+        "merkle": "executed: real tree computed and verified vs header",
+        "wtxid": "counted only for witness-serialized txs"
+      }
+    }
+  }
+}

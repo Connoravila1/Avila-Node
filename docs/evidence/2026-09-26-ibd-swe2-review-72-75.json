@@ -1,0 +1,761 @@
+{
+  "kind": "audit_of_existing_sources_and_saved_measurements_no_new_benchmarks",
+  "captured_utc": "2026-09-26T14:49:04.810291+00:00",
+  "git_head": "78032ce6a6135cf85d36dfdd5a66225227237bf2",
+  "scope": "Read source/log/JSON artifacts, inspect already-built binaries with objdump, recompute summary arithmetic. No validator, benchmark, full corpus parser, or live-node control executed.",
+  "source_hashes": {
+    "tools/ibd_census.py": {
+      "sha256": "60b414d94d92e4b1c7088cf946d07bd0a58dcdfc87446728cb017f1f75cf7bff",
+      "bytes": 14479
+    },
+    "tools/ibd_workload.py": {
+      "sha256": "f117cea8d123c1091fd2f0da155f659e088606e05119049af6f7d0574a50b5dd",
+      "bytes": 4240
+    },
+    "tools/ibd_corpus_window.py": {
+      "sha256": "04e7d0e6cb8e246fe0be77a816dc357de3abc1c2dcf08d434e5a08cd89501a3b",
+      "bytes": 12331
+    },
+    "tools/ibd_state_ledger.py": {
+      "sha256": "b645f49f093d99a6d2fb2486d1bdb11b8bedef8c9319e5b826f2f7c01c7d4466",
+      "bytes": 5228
+    },
+    "tools/ibd_shrd_bench.py": {
+      "sha256": "f2584a93c22ee06437bc6d7cdf41c64ed7d72c208bcc1400c2aeeb954707270e",
+      "bytes": 7812
+    },
+    "crates/avila-consensus/examples/corpus_replay.rs": {
+      "sha256": "762dc20945bacb0c10e885504fa57a6d1f24d141a43c0ff4f671ad39fedefabd",
+      "bytes": 5917
+    },
+    "crates/avila-consensus/src/sigchecker.rs": {
+      "sha256": "b7ac1e275ac6da275a29352bde76903f4a855c86d590a63ae1228e8d361a0bf7",
+      "bytes": 33097
+    },
+    "experiments/2026-09-26-ibd-workload-census.md": {
+      "sha256": "be3d6082df5a929293bafa6afb7cb4c34c6877d8c9d5095cabbfdc569472b5cf",
+      "bytes": 9462
+    },
+    "experiments/2026-09-26-ibd-shrd-replacement.md": {
+      "sha256": "b0d73a4a7135107670f115ed58e20e603a63ecbf770cfbd5126c8516ed09f021",
+      "bytes": 4981
+    },
+    "experiments/2026-09-26-ibd-corpus-replay.md": {
+      "sha256": "6e2f83d48185bc399256383a650598b2c9d5eb1f99dfc3e644dcda3ca43bd127",
+      "bytes": 4742
+    },
+    "experiments/2026-09-26-ibd-state-join.md": {
+      "sha256": "622590f0ae4c6419d52fea52643e384feb008b7a0c049db5f3952fe78bc23132",
+      "bytes": 2551
+    },
+    "experiments/results/census-2026-09-26/workload.json": {
+      "sha256": "707bef87d4ab0cadc109127f7e175e65b2450efff1d86c33cbee5129a24dc427",
+      "bytes": 33718
+    },
+    "target/ibd-corpus/341k/manifest.json": {
+      "sha256": "4641eb8cc40c5281e70681b0fa03a3d503f890090060baab493c236ef8a7276f",
+      "bytes": 2408
+    },
+    "target/ibd-corpus-341k.log": {
+      "sha256": "b9e923e652ca3fa016ab050a01e4ed143cad01625d6a0daf805cc3ffaabf2adb",
+      "bytes": 102
+    },
+    "target/ibd-ledger-341k.log": {
+      "sha256": "8c233ce53a3618bd282b09abf2e272ee9c7ccbc0686eb85987773dbb71a38564",
+      "bytes": 484
+    },
+    "target/ibd-ledger/341k/join.json": {
+      "sha256": "46a6a35b2910c1414e988294ffc90f56a76237b7fd5fbebe556c88a677462467",
+      "bytes": 182
+    },
+    "target/ibd-shrd-bench/run-1/results.json": {
+      "sha256": "9c09bb2a2d66e9a19724f7f2777df9ff924b59a19ab2d1fe8fb371328612e76a",
+      "bytes": 47400
+    },
+    "target/ibd-shrd-bench/run-1/advice-vanilla.log": {
+      "sha256": "a18d7a48bca59f17f50e09e346eb8cbbb6497327e1ce9e12426da6997c442c2f",
+      "bytes": 7044
+    },
+    "target/ibd-shrd-bench/run-1/advice-patched.log": {
+      "sha256": "4d385b19dd659c7743befabcc4724f7be64386dd9208027328db2e24df1afe49",
+      "bytes": 7042
+    },
+    "target/ibd-shrd-bench/run-1/probe-vanilla": {
+      "sha256": "dbf80b885ab308a3e5e6781f258a34949a4f888ea114c50a735a3725bf7b5529",
+      "bytes": 1299344
+    },
+    "target/ibd-shrd-bench/run-1/probe-patched": {
+      "sha256": "0436eb7bfb7ad258d3fe3676db428356678944f8e1e2704b20598dd2a70ec1eb",
+      "bytes": 1282960
+    }
+  },
+  "shrd_existing_timing_summary": {
+    "compressed_parse_and_verify": {
+      "vanilla": {
+        "pass_samples": 18,
+        "process_invocations": 6,
+        "median_cpu_seconds": 0.1932954805,
+        "min_cpu_seconds": 0.186325842,
+        "median_cpu_us_per_sig": 94.38255883789063
+      },
+      "patched": {
+        "pass_samples": 18,
+        "process_invocations": 6,
+        "median_cpu_seconds": 0.18292443200000003,
+        "min_cpu_seconds": 0.17167299,
+        "median_cpu_us_per_sig": 89.31857031250001
+      },
+      "median_reduction_fraction": 0.05365385922719479,
+      "per_process_pair_reduction_fractions": [
+        0.08417562584579763,
+        -0.010212564556064674,
+        -0.00930570956660337,
+        0.10146694453390603,
+        0.08251713062936472,
+        0.13324022606802066
+      ]
+    },
+    "preparsed_verify": {
+      "vanilla": {
+        "pass_samples": 18,
+        "process_invocations": 6,
+        "median_cpu_seconds": 0.1699771315,
+        "min_cpu_seconds": 0.162597581,
+        "median_cpu_us_per_sig": 82.99664624023437
+      },
+      "patched": {
+        "pass_samples": 18,
+        "process_invocations": 6,
+        "median_cpu_seconds": 0.164502777,
+        "min_cpu_seconds": 0.151986263,
+        "median_cpu_us_per_sig": 80.32362158203125
+      },
+      "median_reduction_fraction": 0.03220641772037436,
+      "per_process_pair_reduction_fractions": [
+        0.07279080986486819,
+        -0.008941454677947158,
+        -0.04090871829914211,
+        0.10068660002901719,
+        0.0729241586855276,
+        0.12912198900363114
+      ]
+    }
+  },
+  "advice_existing_timing_summary": {
+    "vanilla": {
+      "generate_synthetic[0]": {
+        "samples": 1,
+        "records": 4096,
+        "median_reported_us_per_sig": 93.973778,
+        "min_reported_us_per_sig": 93.973778,
+        "max_reported_us_per_sig": 93.973778
+      },
+      "produce_advice[0]": {
+        "samples": 1,
+        "records": 4096,
+        "median_reported_us_per_sig": 98.390078,
+        "min_reported_us_per_sig": 98.390078,
+        "max_reported_us_per_sig": 98.390078
+      },
+      "ordinary[1]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 94.4472535,
+        "min_reported_us_per_sig": 93.683588,
+        "max_reported_us_per_sig": 95.210919
+      },
+      "individual_batch_inverse[8]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 94.525626,
+        "min_reported_us_per_sig": 94.355134,
+        "max_reported_us_per_sig": 94.696118
+      },
+      "batch_hint1[8]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 90.843845,
+        "min_reported_us_per_sig": 90.673056,
+        "max_reported_us_per_sig": 91.014634
+      },
+      "batch_y33[8]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 79.105095,
+        "min_reported_us_per_sig": 78.162593,
+        "max_reported_us_per_sig": 80.047597
+      },
+      "individual_batch_inverse[32]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 97.20613499999999,
+        "min_reported_us_per_sig": 93.955119,
+        "max_reported_us_per_sig": 100.457151
+      },
+      "batch_hint1[32]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 88.24112149999999,
+        "min_reported_us_per_sig": 84.053958,
+        "max_reported_us_per_sig": 92.428285
+      },
+      "batch_y33[32]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 76.49354550000001,
+        "min_reported_us_per_sig": 72.370232,
+        "max_reported_us_per_sig": 80.616859
+      },
+      "individual_batch_inverse[128]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 92.23011149999999,
+        "min_reported_us_per_sig": 92.089046,
+        "max_reported_us_per_sig": 92.371177
+      },
+      "batch_hint1[128]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 76.2182875,
+        "min_reported_us_per_sig": 74.019452,
+        "max_reported_us_per_sig": 78.417123
+      },
+      "batch_y33[128]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 64.9941885,
+        "min_reported_us_per_sig": 64.712628,
+        "max_reported_us_per_sig": 65.275749
+      },
+      "individual_batch_inverse[512]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 96.680702,
+        "min_reported_us_per_sig": 95.134079,
+        "max_reported_us_per_sig": 98.227325
+      },
+      "batch_hint1[512]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 64.919933,
+        "min_reported_us_per_sig": 64.081214,
+        "max_reported_us_per_sig": 65.758652
+      },
+      "batch_y33[512]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 53.635681500000004,
+        "min_reported_us_per_sig": 52.522215,
+        "max_reported_us_per_sig": 54.749148
+      },
+      "individual_batch_inverse[2048]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 100.216408,
+        "min_reported_us_per_sig": 94.774466,
+        "max_reported_us_per_sig": 105.65835
+      },
+      "batch_hint1[2048]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 57.8772485,
+        "min_reported_us_per_sig": 55.81344,
+        "max_reported_us_per_sig": 59.941057
+      },
+      "batch_y33[2048]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 46.3081665,
+        "min_reported_us_per_sig": 44.655178,
+        "max_reported_us_per_sig": 47.961155
+      },
+      "individual_batch_inverse[8192]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 93.052009,
+        "min_reported_us_per_sig": 92.973465,
+        "max_reported_us_per_sig": 93.130553
+      },
+      "batch_hint1[8192]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 54.724107000000004,
+        "min_reported_us_per_sig": 53.589096,
+        "max_reported_us_per_sig": 55.859118
+      },
+      "batch_y33[8192]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 42.600319999999996,
+        "min_reported_us_per_sig": 42.297666,
+        "max_reported_us_per_sig": 42.902974
+      },
+      "bad_hint1_fallback[8192]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 151.3099345,
+        "min_reported_us_per_sig": 150.236186,
+        "max_reported_us_per_sig": 152.383683
+      },
+      "bad_y33_fallback[8192]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 138.8079965,
+        "min_reported_us_per_sig": 138.390156,
+        "max_reported_us_per_sig": 139.225837
+      }
+    },
+    "patched": {
+      "generate_synthetic[0]": {
+        "samples": 1,
+        "records": 4096,
+        "median_reported_us_per_sig": 92.131752,
+        "min_reported_us_per_sig": 92.131752,
+        "max_reported_us_per_sig": 92.131752
+      },
+      "produce_advice[0]": {
+        "samples": 1,
+        "records": 4096,
+        "median_reported_us_per_sig": 91.415567,
+        "min_reported_us_per_sig": 91.415567,
+        "max_reported_us_per_sig": 91.415567
+      },
+      "ordinary[1]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 92.410605,
+        "min_reported_us_per_sig": 90.384263,
+        "max_reported_us_per_sig": 94.436947
+      },
+      "individual_batch_inverse[8]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 85.8664575,
+        "min_reported_us_per_sig": 83.16048,
+        "max_reported_us_per_sig": 88.572435
+      },
+      "batch_hint1[8]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 84.3763525,
+        "min_reported_us_per_sig": 83.397029,
+        "max_reported_us_per_sig": 85.355676
+      },
+      "batch_y33[8]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 73.1872255,
+        "min_reported_us_per_sig": 72.187607,
+        "max_reported_us_per_sig": 74.186844
+      },
+      "individual_batch_inverse[32]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 85.80266950000001,
+        "min_reported_us_per_sig": 85.401641,
+        "max_reported_us_per_sig": 86.203698
+      },
+      "batch_hint1[32]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 78.342462,
+        "min_reported_us_per_sig": 76.364611,
+        "max_reported_us_per_sig": 80.320313
+      },
+      "batch_y33[32]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 68.57197500000001,
+        "min_reported_us_per_sig": 67.270131,
+        "max_reported_us_per_sig": 69.873819
+      },
+      "individual_batch_inverse[128]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 86.717511,
+        "min_reported_us_per_sig": 86.601107,
+        "max_reported_us_per_sig": 86.833915
+      },
+      "batch_hint1[128]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 67.0942745,
+        "min_reported_us_per_sig": 67.008613,
+        "max_reported_us_per_sig": 67.179936
+      },
+      "batch_y33[128]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 57.749703,
+        "min_reported_us_per_sig": 57.435072,
+        "max_reported_us_per_sig": 58.064334
+      },
+      "individual_batch_inverse[512]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 88.57061350000001,
+        "min_reported_us_per_sig": 86.781137,
+        "max_reported_us_per_sig": 90.36009
+      },
+      "batch_hint1[512]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 60.1680315,
+        "min_reported_us_per_sig": 57.717309,
+        "max_reported_us_per_sig": 62.618754
+      },
+      "batch_y33[512]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 49.296771,
+        "min_reported_us_per_sig": 48.634087,
+        "max_reported_us_per_sig": 49.959455
+      },
+      "individual_batch_inverse[2048]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 88.987769,
+        "min_reported_us_per_sig": 86.280105,
+        "max_reported_us_per_sig": 91.695433
+      },
+      "batch_hint1[2048]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 52.2969535,
+        "min_reported_us_per_sig": 50.450229,
+        "max_reported_us_per_sig": 54.143678
+      },
+      "batch_y33[2048]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 42.3349575,
+        "min_reported_us_per_sig": 40.360262,
+        "max_reported_us_per_sig": 44.309653
+      },
+      "individual_batch_inverse[8192]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 93.5576095,
+        "min_reported_us_per_sig": 93.514803,
+        "max_reported_us_per_sig": 93.600416
+      },
+      "batch_hint1[8192]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 49.9313565,
+        "min_reported_us_per_sig": 49.455759,
+        "max_reported_us_per_sig": 50.406954
+      },
+      "batch_y33[8192]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 40.265054,
+        "min_reported_us_per_sig": 38.513357,
+        "max_reported_us_per_sig": 42.016751
+      },
+      "bad_hint1_fallback[8192]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 142.434915,
+        "min_reported_us_per_sig": 136.507712,
+        "max_reported_us_per_sig": 148.362118
+      },
+      "bad_y33_fallback[8192]": {
+        "samples": 2,
+        "records": 4096,
+        "median_reported_us_per_sig": 133.4324765,
+        "min_reported_us_per_sig": 132.843673,
+        "max_reported_us_per_sig": 134.02128
+      }
+    }
+  },
+  "reextracted_staged_binary_disassembly": {
+    "vanilla": {
+      "fe_mul_inner": {
+        "mnemonic_counts": {
+          "push": 6,
+          "mov": 108,
+          "xor": 9,
+          "movabs": 7,
+          "sub": 1,
+          "mulq": 23,
+          "add": 31,
+          "adc": 29,
+          "mul": 8,
+          "shrd": 8,
+          "shr": 8,
+          "shl": 1,
+          "and": 9,
+          "or": 1,
+          "pop": 6,
+          "ret": 1
+        },
+        "shrd_mnemonics": 8
+      },
+      "fe_sqr_inner": {
+        "mnemonic_counts": {
+          "push": 6,
+          "xor": 1,
+          "mov": 72,
+          "mul": 17,
+          "lea": 4,
+          "movabs": 7,
+          "mulq": 4,
+          "add": 21,
+          "adc": 19,
+          "shrd": 8,
+          "shr": 8,
+          "shl": 1,
+          "and": 9,
+          "or": 1,
+          "pop": 6,
+          "ret": 1
+        },
+        "shrd_mnemonics": 8
+      }
+    },
+    "patched": {
+      "fe_mul_inner": {
+        "mnemonic_counts": {
+          "push": 6,
+          "mov": 119,
+          "xor": 8,
+          "sub": 1,
+          "movabs": 7,
+          "mulq": 25,
+          "add": 31,
+          "adc": 29,
+          "mul": 6,
+          "shld": 7,
+          "shr": 8,
+          "shl": 1,
+          "and": 9,
+          "or": 1,
+          "shrd": 1,
+          "pop": 6,
+          "ret": 1
+        },
+        "shrd_mnemonics": 1
+      },
+      "fe_sqr_inner": {
+        "mnemonic_counts": {
+          "mov": 87,
+          "push": 6,
+          "xor": 1,
+          "mul": 18,
+          "lea": 4,
+          "movabs": 7,
+          "mulq": 3,
+          "add": 20,
+          "adc": 19,
+          "shld": 7,
+          "shr": 8,
+          "shl": 1,
+          "and": 9,
+          "or": 1,
+          "pop": 6,
+          "shrd": 1,
+          "ret": 1
+        },
+        "shrd_mnemonics": 1
+      }
+    }
+  },
+  "original_disassembly_counts": {
+    "vanilla": {
+      "rustsecp256k1_v0_10_0_fe_mul_inner": {
+        "mul": 0,
+        "mulx": 0,
+        "shrd": 0,
+        "shr": 0,
+        "shl": 0,
+        "adc": 0,
+        "adcx": 0,
+        "adox": 0,
+        "or": 0,
+        "xor": 0,
+        "total_instructions": 265
+      },
+      "rustsecp256k1_v0_10_0_fe_sqr_inner": {
+        "mul": 0,
+        "mulx": 0,
+        "shrd": 0,
+        "shr": 0,
+        "shl": 0,
+        "adc": 0,
+        "adcx": 0,
+        "adox": 0,
+        "or": 0,
+        "xor": 0,
+        "total_instructions": 194
+      }
+    },
+    "patched": {
+      "rustsecp256k1_v0_10_0_fe_mul_inner": {
+        "mul": 0,
+        "mulx": 0,
+        "shrd": 0,
+        "shr": 0,
+        "shl": 0,
+        "adc": 0,
+        "adcx": 0,
+        "adox": 0,
+        "or": 0,
+        "xor": 0,
+        "total_instructions": 276
+      },
+      "rustsecp256k1_v0_10_0_fe_sqr_inner": {
+        "mul": 0,
+        "mulx": 0,
+        "shrd": 0,
+        "shr": 0,
+        "shl": 0,
+        "adc": 0,
+        "adcx": 0,
+        "adox": 0,
+        "or": 0,
+        "xor": 0,
+        "total_instructions": 209
+      }
+    }
+  },
+  "corpus_manifest": {
+    "span_files": [
+      {
+        "file": "data/mainnet/blk00681.dat",
+        "sha256": "a4cb087c2b9d4555f45e1938bb4261bae221ec56af691871c8bf70e7fe77cb07",
+        "records": 313
+      },
+      {
+        "file": "data/mainnet/blk00682.dat",
+        "sha256": "2a8ea048254b14ad677accb19cad878a3b8d4dd438fa88704fd51f3190023d60",
+        "records": 327
+      },
+      {
+        "file": "data/mainnet/blk00683.dat",
+        "sha256": "505626af4974cb6664fe43e8d770279234f00c5d33ca36b67e7add5017c0969d",
+        "records": 369
+      },
+      {
+        "file": "data/mainnet/blk00684.dat",
+        "sha256": "6f75e9fb1a7bc4d6799f4133df42584f81b4660f8a7c1dfedca1641898921e46",
+        "records": 318
+      },
+      {
+        "file": "data/mainnet/blk00685.dat",
+        "sha256": "48e69676e96d5c2481552b426d21be3c7320a3ef41339273ffae8ab483d47b1b",
+        "records": 367
+      },
+      {
+        "file": "data/mainnet/blk00686.dat",
+        "sha256": "5ab1c6f40e374adcea89e607580c7dd17787794e646d371947ac7365aabad5f1",
+        "records": 313
+      },
+      {
+        "file": "data/mainnet/blk00687.dat",
+        "sha256": "c2b9ec40e990fa082881bba0d0a3c88bcae576f82a9ec92bb6a7e41bd9132fa4",
+        "records": 353
+      },
+      {
+        "file": "data/mainnet/blk00688.dat",
+        "sha256": "26fffa4a18d21c98f9205e575b373325eddd44e65cddc174ce856bbf5ef7dd82",
+        "records": 434
+      },
+      {
+        "file": "data/mainnet/blk00689.dat",
+        "sha256": "a0f1103837e788a16dff2643d1b07b7c3047ac7bb18d15fc0833d82dc76936ae",
+        "records": 417
+      },
+      {
+        "file": "data/mainnet/blk00690.dat",
+        "sha256": "98609e62dfe68458a6168e02ef6f9ade3adf8dd51dca20aefa89484701d814ae",
+        "records": 449
+      }
+    ],
+    "window_files": [
+      "data/mainnet/blk00690.dat"
+    ],
+    "labels": {
+      "provenance": "local blk-store scan (corpus-resolved prevouts)",
+      "occurrence_model": "latest (height,txidx) < (spend_height,spend_idx)",
+      "ordering": "blocks sorted by BIP34 height; file order not trusted"
+    },
+    "window": {
+      "height_min": 340787,
+      "height_max": 342234,
+      "stats": {
+        "blocks": 449,
+        "txs": 247193,
+        "inputs": 671771,
+        "resolved": 598267,
+        "unresolved_no_occurrence": 73504,
+        "unresolved_future_only": 0,
+        "unresolved_bad_vout": 0,
+        "coinbase_inputs": 449,
+        "duplicate_txid_occurrences": 0
+      },
+      "corpus_sha256": "608449c4011761cd30c20342ac422d5fe43272309f73fe239f90107e1cb60d4c",
+      "corpus_bytes": 158781585
+    }
+  },
+  "state_reported_join": {
+    "created_records": 7241145,
+    "spent_unique": 6656451,
+    "consumed_created_in_span": 5592555,
+    "outflow_to_history": 1063896,
+    "survivors_at_span_end": 1648590,
+    "survivor_share": 0.2277
+  },
+  "state_ledger_file_sizes_only": {
+    "target/ibd-ledger/341k/created.bin": 347574960,
+    "target/ibd-ledger/341k/spent.bin": 266258040
+  },
+  "workload_model_top_keys": [
+    "scope",
+    "eras",
+    "coverage",
+    "gaps",
+    "era_stats",
+    "full_history_estimate"
+  ],
+  "workload_model_gaps": [
+    "segwit_era"
+  ],
+  "posthoc_arithmetic_not_measurements": {
+    "assumed_attempt_interval": [
+      1650000000,
+      3500000000
+    ],
+    "best_synthetic_receiver_us": 40.265054,
+    "ideal_eight_core_throughput_per_second": 198683.453895281,
+    "conditional_signature_hours": [
+      2.3068520520833333,
+      4.8933225347222224
+    ],
+    "required_sixty_minute_throughput_per_second": [
+      458333.3333333333,
+      972222.2222222222
+    ],
+    "ideal_8core_required_us_per_attempt": [
+      17.454545454545457,
+      8.22857142857143
+    ],
+    "if_6cores_available_required_us_per_attempt": [
+      13.090909090909092,
+      6.171428571428571
+    ],
+    "nominal_y33_advice_bytes_if_33_per_attempt": [
+      54450000000,
+      115500000000
+    ],
+    "window_input_resolution_fraction": 0.8905817607488266,
+    "reported_replayed_input_fraction": 0.767789916504285,
+    "resolved_inputs_in_skipped_transactions": 82488,
+    "window_blocks": 449,
+    "window_height_span_inclusive": 1448,
+    "span_file_records_total": 3660,
+    "workload_json_modeled_inputs_excluding_unmeasured_era": 2391490382.4655614,
+    "raw_768gb_1gbps_minutes": 102.4,
+    "raw_768gb_pcie_coding_ceiling_minutes": 3.250380904012189
+  }
+}
