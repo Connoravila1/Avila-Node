@@ -225,6 +225,7 @@ fn overview(ui: &mut Ui, s: &Scene, peers: &[&PeerView]) {
     let n = est.len();
     let v2 = est.iter().filter(|p| p.v2).count();
     let recon = est.iter().filter(|p| p.recon).count();
+    let cmpct = est.iter().filter(|p| p.cmpct_v2).count();
     let inbound = est.iter().filter(|p| p.inbound).count();
     let recv: u64 = est.iter().map(|p| p.bytes_recv).sum();
     let sent: u64 = est.iter().map(|p| p.bytes_sent).sum();
@@ -251,6 +252,7 @@ fn overview(ui: &mut Ui, s: &Scene, peers: &[&PeerView]) {
         for (k, v) in [
             ("Encrypted", format!("{v2} of {n}")),
             ("Reconciling with Erlay", recon.to_string()),
+            ("Compact blocks (BIP152)", cmpct.to_string()),
             ("Dialed us", inbound.to_string()),
             ("Network groups", groups.to_string()),
             ("Median ping", ping),
@@ -367,6 +369,33 @@ fn detail(ui: &mut Ui, s: &Scene, p: &PeerView, hide: bool) -> bool {
         "Announces each transaction (no Erlay on this link)"
     };
     ui.label(RichText::new(relay).size(13.5).color(pal.text));
+    let cmpct = if !p.cmpct_v2 {
+        "No compact blocks on this link".to_string()
+    } else {
+        match (p.cmpct_hb, p.cmpct_asked_hb) {
+            (true, true) => "Compact blocks (BIP152) — high bandwidth both ways".to_string(),
+            (true, false) => "Compact blocks (BIP152) — they announce high bandwidth".to_string(),
+            (false, true) => "Compact blocks (BIP152) — we announce high bandwidth".to_string(),
+            (false, false) => "Compact blocks (BIP152) — negotiated, low bandwidth".to_string(),
+        }
+    };
+    ui.label(RichText::new(cmpct).size(13.0).color(pal.muted));
+    if p.cmpct_recv > 0 || p.partial_blocks > 0 {
+        let mut stats = format!(
+            "{} compact received · {} rebuilt from the pool",
+            p.cmpct_recv, p.cmpct_hit
+        );
+        if p.cmpct_getblocktxn > 0 {
+            stats += &format!(" · {} patched via getblocktxn", p.cmpct_getblocktxn);
+        }
+        if p.cmpct_fell_back > 0 {
+            stats += &format!(" · {} fell back to full blocks", p.cmpct_fell_back);
+        }
+        if p.partial_blocks > 0 {
+            stats += &format!(" · {} mid-reconstruction", p.partial_blocks);
+        }
+        ui.label(RichText::new(stats).size(12.5).color(pal.muted));
+    }
     let offers = services(p.services);
     if !offers.is_empty() {
         ui.label(

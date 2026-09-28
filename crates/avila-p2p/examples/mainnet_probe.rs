@@ -80,6 +80,16 @@ fn main() -> Result<(), String> {
                 NetEvent::CpuThrottled { peer, rate_ns } => {
                     println!("peer {peer}: cpu-throttled at {rate_ns}ns/s")
                 }
+                NetEvent::CompactReceived { peer, short_ids, .. } => {
+                    println!("peer {peer}: cmpctblock ({short_ids} short ids)")
+                }
+                NetEvent::CompactHit { peer, .. } => println!("peer {peer}: compact hit"),
+                NetEvent::CompactPatchRequest { peer, missing, .. } => {
+                    println!("peer {peer}: getblocktxn for {missing}")
+                }
+                NetEvent::CompactFallback { peer, .. } => {
+                    println!("peer {peer}: compact fallback to full block")
+                }
                 NetEvent::Announced { .. }
                 | NetEvent::TipAdvanced(_)
                 | NetEvent::ProxyUnreachable

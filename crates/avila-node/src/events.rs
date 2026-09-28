@@ -287,6 +287,44 @@ pub fn net_event_json(event: &avila_p2p::manager::NetEvent) -> (&'static str, se
                 "our_misses": our_misses,
             }),
         ),
+        CompactReceived {
+            peer,
+            block,
+            short_ids,
+        } => (
+            "compact_received",
+            serde_json::json!({
+                "peer": peer,
+                "block": block.to_string(),
+                "short_ids": short_ids,
+            }),
+        ),
+        CompactHit { peer, block } => (
+            "compact_hit",
+            serde_json::json!({
+                "peer": peer,
+                "block": block.to_string(),
+            }),
+        ),
+        CompactPatchRequest {
+            peer,
+            block,
+            missing,
+        } => (
+            "compact_patch_request",
+            serde_json::json!({
+                "peer": peer,
+                "block": block.to_string(),
+                "missing": missing,
+            }),
+        ),
+        CompactFallback { peer, block } => (
+            "compact_fallback",
+            serde_json::json!({
+                "peer": peer,
+                "block": block.to_string(),
+            }),
+        ),
     }
 }
 
@@ -442,6 +480,7 @@ mod tests {
                 wtxid_relay: true,
                 addrv2: true,
                 recon: None,
+                cmpct: None,
                 utxproof: false,
             }),
         });

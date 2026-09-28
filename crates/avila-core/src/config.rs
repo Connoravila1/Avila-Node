@@ -139,6 +139,11 @@ pub struct NetConfig {
     /// `connect` names peers or a proxy is set — local DNS lookups
     /// would leak through the resolver in both cases.
     pub dns_seeds: bool,
+    /// Blocks-only mode (Core's `-blocksonly`) — no transaction relay
+    /// in either direction: no tx announcements, no inv-triggered
+    /// fetches, no `mempool` dumps, no recon rounds, no rebroadcast.
+    /// The mempool still exists for the wallet and RPC.
+    pub blocks_only: bool,
 }
 
 impl Default for NetConfig {
@@ -149,6 +154,7 @@ impl Default for NetConfig {
             listen: None,
             asmap: None,
             dns_seeds: true,
+            blocks_only: false,
         }
     }
 }
@@ -275,6 +281,7 @@ impl PolicyConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RelayConfig {
     pub tx: TxRelayConfig,
+    pub block: BlockRelayConfig,
 }
 
 /// `relay.tx.*` — transaction announcement and serving.
@@ -289,6 +296,23 @@ pub struct TxRelayConfig {
     /// outbound}. E.g. "inbound->inbound" keeps inbound-sourced
     /// transactions off inbound links.
     pub deny_pairs: Vec<String>,
+    /// Announce fan-out mode: `all` (default), `private_only`
+    /// (`mempool.private` entries only — everyone else hears nothing),
+    /// `none`.
+    pub announce: String,
+    /// Announce transactions onto inbound links. Default on.
+    pub to_inbound: bool,
+    /// Announce to peers whose `version` said `relay=false` —
+    /// overriding their preference. Default off (Core's behavior).
+    pub to_blocks_only_peers: bool,
+    /// Our mempool floor advertised as `feefilter` to every peer at
+    /// handshake (sat/kvB). `0` sends nothing — Core's default.
+    pub send_feefilter: u64,
+    /// Broadcast-pool retries of locally submitted txs until they
+    /// confirm (Core's `-walletbroadcast` resilience). Default on.
+    pub rebroadcast_local: bool,
+    /// Seconds between broadcast-pool retry passes (floor of 10s).
+    pub rebroadcast_interval: u32,
 }
 
 impl Default for TxRelayConfig {
@@ -296,6 +320,49 @@ impl Default for TxRelayConfig {
         Self {
             stem: true,
             deny_pairs: Vec::new(),
+            announce: "all".to_string(),
+            to_inbound: true,
+            to_blocks_only_peers: false,
+            send_feefilter: 0,
+            rebroadcast_local: true,
+            rebroadcast_interval: 60,
+        }
+    }
+}
+
+/// `relay.block.*` — block announcement and serving.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BlockRelayConfig {
+    /// BIP-152 compact-block relay — negotiate `sendcmpct` and accept
+    /// `cmpctblock` announcements. Default on.
+    pub compact: bool,
+    /// Ask peers for high-bandwidth `cmpctblock` announcements
+    /// (fresh blocks pushed unsolicited). Default on.
+    pub compact_high_bandwidth: bool,
+    /// Serve `cmpctblock` announcements to high-bandwidth requesters
+    /// (≤3 peers, Core's `MAX_CMPCT_HB_PEERS`) and answer
+    /// `getblocktxn` reconstruction requests. Default on.
+    pub compact_serve: bool,
+    /// Tip-announcement override: `""` follows each peer's negotiated
+    /// preference (hb→cmpctblock, sendheaders→headers, else inv;
+    /// Core's behavior), `headers`/`inv` force the wire shape, `none`
+    /// announces nothing.
+    pub announce: String,
+    /// Block-body serving: `full` (default) serves any stored block,
+    /// `tip` only the checked tip's vicinity (reorg slack), `none`
+    /// answers every request `notfound` — we relay, never serve.
+    pub serve: String,
+}
+
+impl Default for BlockRelayConfig {
+    fn default() -> Self {
+        Self {
+            compact: true,
+            compact_high_bandwidth: true,
+            compact_serve: true,
+            announce: String::new(),
+            serve: "full".to_string(),
         }
     }
 }
@@ -382,6 +449,17 @@ pub struct HooksConfig {
     /// holding it. Facts: txid, wtxid, peer id/address/direction/
     /// user-agent. One consult per tx per getdata batch.
     pub tx_serve: Vec<HookSpecConfig>,
+    /// Block serving — one `[[hooks.block_serve]]` table per helper.
+    /// Consulted per block item in a peer's `getdata` and on each
+    /// `getblocktxn`; `reject` answers `notfound`/silence. Facts:
+    /// block hash + peer id/address/direction/user-agent.
+    pub block_serve: Vec<HookSpecConfig>,
+    /// Template veto — one `[[hooks.template_build]]` table per
+    /// helper. Consulted once per `build_template` on the assembled
+    /// shape; `reject` declines the template (no block is built).
+    /// Facts: height, tx count, pooled weight, sigops, total fees.
+    /// Not a hot path — `getblocktemplate`/`generatetoaddress` pace it.
+    pub template_build: Vec<HookSpecConfig>,
 }
 
 /// One `[[hooks.<point>]]` entry. `program` is the only required key.
@@ -488,6 +566,17 @@ pub struct MiningConfig {
     /// candidate is revalidated with consensus rules only; at most
     /// 512 entries are auditioned per template. Default off.
     pub include_extrapool: bool,
+    /// Template block-weight cap — Core's `-blockmaxweight`; values
+    /// above consensus `MAX_BLOCK_WEIGHT` clamp down, never inflate.
+    /// Default leaves the cap at the consensus bound.
+    pub max_weight: Option<usize>,
+    /// Package feerate floor for template selection (sat/kvB) —
+    /// Core's `-blockmintxfee`. `0` takes everything profitable.
+    pub min_tx_fee: i64,
+    /// Weight budgeted for the coinbase + witness commitment during
+    /// selection — Core's `-blockreservedweight` (default 8000,
+    /// floored at 2000 like Core's `MINIMUM_BLOCK_RESERVED_WEIGHT`).
+    pub reserved_weight: Option<usize>,
 }
 
 /// `services.*` — local query interfaces.
@@ -612,6 +701,8 @@ impl NodeConfig {
             ("extrapool_admit", &self.hooks.extrapool_admit),
             ("extrapool_promote", &self.hooks.extrapool_promote),
             ("tx_serve", &self.hooks.tx_serve),
+            ("block_serve", &self.hooks.block_serve),
+            ("template_build", &self.hooks.template_build),
         ] {
             for hook in hooks {
                 if hook.program.as_os_str().is_empty() {
@@ -658,6 +749,17 @@ impl NodeConfig {
             if !CAP_CLASSES.contains(&class.as_str()) {
                 return Err(ConfigError::ExtrapoolCapClass(class.clone()));
             }
+        }
+        if !["all", "private_only", "none"].contains(&self.relay.tx.announce.as_str()) {
+            return Err(ConfigError::TxAnnounceMode(self.relay.tx.announce.clone()));
+        }
+        if !["", "headers", "inv", "none"].contains(&self.relay.block.announce.as_str()) {
+            return Err(ConfigError::BlockAnnounce(
+                self.relay.block.announce.clone(),
+            ));
+        }
+        if !["full", "tip", "none"].contains(&self.relay.block.serve.as_str()) {
+            return Err(ConfigError::BlockServeMode(self.relay.block.serve.clone()));
         }
         let capacity = NonZeroUsize::new(self.diag.event_capacity)
             .ok_or(ConfigError::EventCapacity(self.diag.event_capacity))?;
@@ -709,6 +811,9 @@ impl ValidatedConfig {
             .chain(self.config.hooks.tx_announce.iter_mut())
             .chain(self.config.hooks.extrapool_admit.iter_mut())
             .chain(self.config.hooks.extrapool_promote.iter_mut())
+            .chain(self.config.hooks.tx_serve.iter_mut())
+            .chain(self.config.hooks.block_serve.iter_mut())
+            .chain(self.config.hooks.template_build.iter_mut())
         {
             if !hook.program.as_os_str().is_empty() && hook.program.is_relative() {
                 hook.program = base.join(&hook.program);
@@ -762,6 +867,12 @@ pub enum ConfigError {
         "extrapool.caps class {0:?} — expected nonstandard|fee|hook|rbf|package|finality|capacity|weight|sigops|truc|other"
     )]
     ExtrapoolCapClass(String),
+    #[error("relay.tx.announce {0:?} — expected \"all\", \"private_only\", or \"none\"")]
+    TxAnnounceMode(String),
+    #[error("relay.block.announce {0:?} — expected \"\", \"headers\", \"inv\", or \"none\"")]
+    BlockAnnounce(String),
+    #[error("relay.block.serve {0:?} — expected \"full\", \"tip\", or \"none\"")]
+    BlockServeMode(String),
 }
 
 #[cfg(test)]

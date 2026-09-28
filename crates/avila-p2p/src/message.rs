@@ -295,6 +295,24 @@ pub enum Message {
     CFCheckpt(CFCheckpt),
     /// `reject` — BIP61 rejection notice.
     Reject(Reject),
+    /// `sendcmpct` — BIP152 compact-block negotiation. `announce`
+    /// requests high-bandwidth mode (cmpctblock announcements instead
+    /// of inv); `version` 1 = txid short-ids, 2 = wtxid (segwit).
+    SendCmpct {
+        /// High-bandwidth mode request.
+        announce: bool,
+        /// Negotiated format version.
+        version: u64,
+    },
+    /// `cmpctblock` — BIP152 compact block: header + short-id salt +
+    /// 48-bit short-ids + prefilled transactions.
+    CmpctBlock(CmpctBlock),
+    /// `getblocktxn` — request transactions at indexes in a block the
+    /// requester is reconstructing from a `cmpctblock`.
+    GetBlockTxn(GetBlockTxn),
+    /// `blocktxn` — the requested transactions; index 0 (coinbase)
+    /// implied and not included.
+    BlockTxn(BlockTxn),
     /// `sendrecon` — BIP330 (Erlay) reconciliation-capability handshake:
     /// roles, protocol version and the 64-bit salt that keys the
     /// connection's transaction short-ids.
@@ -427,6 +445,115 @@ pub struct SendRecon {
     pub salt: u64,
 }
 
+/// `sendcmpct` payload — BIP152 negotiation (bool + LE version).
+pub const SENDCMPCT_VERSION_WITNESS: u64 = 2;
+
+/// Upper bound on short-ids / prefilled / requested indexes in the
+/// BIP152 messages — a maximally-packed block cannot hold more than
+/// ~4 M weight / ~60 B-per-tx ≈ 16k transactions, so 20_000 bounds
+/// every valid shape while capping decode allocation.
+const MAX_CMPCT_TX_COUNT: u64 = 20_000;
+
+/// `cmpctblock` body — BIP152.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CmpctBlock {
+    /// The block's header.
+    pub header: BlockHeader,
+    /// Per-block salt feeding the short-id SipHash key.
+    pub nonce: u64,
+    /// 48-bit little-endian short-ids, one per non-prefilled tx.
+    pub shortids: Vec<[u8; 6]>,
+    /// Prefilled txs with differential-encoded indexes.
+    pub prefilled: Vec<PrefilledTx>,
+}
+
+/// One prefilled transaction slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefilledTx {
+    /// Differential index (each value adds onto the previous index) —
+    /// BIP-152 encodes it as a CompactSize, unlike `getblocktxn`'s u16s.
+    pub index_diff: u16,
+    /// The transaction at that slot.
+    pub tx: Transaction,
+}
+
+/// `getblocktxn` — differential indexes into a known block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetBlockTxn {
+    /// The block being reconstructed.
+    pub block_hash: BlockHash,
+    /// Differential-encoded tx indexes requested.
+    pub indexes: Vec<u32>,
+}
+
+/// `blocktxn` — transactions filling the requested indexes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockTxn {
+    /// The block these belong to.
+    pub block_hash: BlockHash,
+    /// Transactions at the requested indexes (coinbase excluded —
+    /// index 0 is served implicitly by being the first requested).
+    pub txs: Vec<Transaction>,
+}
+
+fn get_prefilled(d: &mut Decoder, command: &str) -> Result<Vec<PrefilledTx>, PayloadError> {
+    let count = d.read_compact_size().map_err(|e| payload_err(command, e))?;
+    if count > MAX_CMPCT_TX_COUNT {
+        return Err(payload_err(command, "prefilled count exceeds bound"));
+    }
+    let mut v = Vec::with_capacity(d.bounded_capacity(count, 10));
+    for _ in 0..count {
+        // BIP-152: prefilled indexes are CompactSize differentials —
+        // NOT u16 like getblocktxn's vector. A 2-byte read here eats
+        // the tx's first byte and desyncs the stream.
+        let index_diff = d.read_compact_size().map_err(|e| payload_err(command, e))?;
+        if index_diff > u64::from(u16::MAX) {
+            return Err(payload_err(command, "prefilled index exceeds u16"));
+        }
+        let tx = Transaction::read(d).map_err(|e| payload_err(command, e))?;
+        v.push(PrefilledTx {
+            index_diff: index_diff as u16,
+            tx,
+        });
+    }
+    Ok(v)
+}
+
+fn put_prefilled(out: &mut Vec<u8>, prefilled: &[PrefilledTx]) {
+    write_compact_size(out, prefilled.len() as u64);
+    for p in prefilled {
+        write_compact_size(out, u64::from(p.index_diff));
+        out.extend_from_slice(&p.tx.encode());
+    }
+}
+
+fn get_u32_diffs(d: &mut Decoder, command: &str) -> Result<Vec<u32>, PayloadError> {
+    // BIP-152: a CompactSize-length vector of *u16 LE* differential
+    // indexes (Core's vector<uint16_t> over the wire).
+    let count = d.read_compact_size().map_err(|e| payload_err(command, e))?;
+    if count > MAX_CMPCT_TX_COUNT {
+        return Err(payload_err(command, "index count exceeds bound"));
+    }
+    let mut v = Vec::with_capacity(d.bounded_capacity(count, 2));
+    for _ in 0..count {
+        v.push(u32::from(
+            d.read_u16_le().map_err(|e| payload_err(command, e))?,
+        ));
+    }
+    Ok(v)
+}
+
+fn put_u32_diffs(out: &mut Vec<u8>, indexes: &[u32]) {
+    write_compact_size(out, indexes.len() as u64);
+    for i in indexes {
+        // A diff that can't fit u16 means a tx index beyond the wire
+        // type's range — can't happen in a consensus-possible block
+        // (≤~100k txs, indexes always < u16::MAX), but saturate
+        // rather than wrap.
+        out.extend_from_slice(&u16::try_from(*i).unwrap_or(u16::MAX).to_le_bytes());
+    }
+}
+
 fn get_inv_list(d: &mut Decoder, command: &str) -> Result<Vec<InvVector>, PayloadError> {
     let count = d.read_compact_size().map_err(|e| payload_err(command, e))?;
     if count > MAX_INV_SZ {
@@ -484,6 +611,10 @@ impl Message {
             Self::GetCFCheckpt(_) => "getcfcheckpt",
             Self::CFCheckpt(_) => "cfcheckpt",
             Self::Reject(_) => "reject",
+            Self::SendCmpct { .. } => "sendcmpct",
+            Self::CmpctBlock(_) => "cmpctblock",
+            Self::GetBlockTxn(_) => "getblocktxn",
+            Self::BlockTxn(_) => "blocktxn",
             Self::SendRecon(_) => "sendrecon",
             Self::ReqRecon(_) => "reqrecon",
             Self::Sketch(_) => "sketch",
@@ -605,6 +736,30 @@ impl Message {
             | Self::GetAddr
             | Self::Mempool
             | Self::ReqBisec => {}
+            Self::SendCmpct { announce, version } => {
+                out.push(u8::from(*announce));
+                out.extend_from_slice(&version.to_le_bytes());
+            }
+            Self::CmpctBlock(c) => {
+                out.extend_from_slice(&c.header.encode());
+                out.extend_from_slice(&c.nonce.to_le_bytes());
+                write_compact_size(&mut out, c.shortids.len() as u64);
+                for id in &c.shortids {
+                    out.extend_from_slice(id);
+                }
+                put_prefilled(&mut out, &c.prefilled);
+            }
+            Self::GetBlockTxn(r) => {
+                out.extend_from_slice(r.block_hash.as_bytes());
+                put_u32_diffs(&mut out, &r.indexes);
+            }
+            Self::BlockTxn(b) => {
+                out.extend_from_slice(b.block_hash.as_bytes());
+                write_compact_size(&mut out, b.txs.len() as u64);
+                for tx in &b.txs {
+                    out.extend_from_slice(&tx.encode());
+                }
+            }
             Self::SendRecon(r) => {
                 out.push(u8::from(r.is_sender));
                 out.push(u8::from(r.is_responder));
@@ -866,6 +1021,56 @@ impl Message {
                     data: data.to_vec(),
                 })
             }
+            "sendcmpct" => {
+                // Tolerate a bare 8-byte version (no announce byte).
+                let announce = if payload.len() > 8 {
+                    d.read_u8().map_err(|e| payload_err(name, e))? != 0
+                } else {
+                    false
+                };
+                let version = d.read_u64_le().map_err(|e| payload_err(name, e))?;
+                Self::SendCmpct { announce, version }
+            }
+            "cmpctblock" => {
+                let header = BlockHeader::read(&mut d).map_err(|e| payload_err(name, e))?;
+                let nonce = d.read_u64_le().map_err(|e| payload_err(name, e))?;
+                let count = d.read_compact_size().map_err(|e| payload_err(name, e))?;
+                if count > MAX_CMPCT_TX_COUNT {
+                    return Err(payload_err(name, "shortid count exceeds bound"));
+                }
+                let mut shortids = Vec::with_capacity(d.bounded_capacity(count, 6));
+                for _ in 0..count {
+                    shortids.push(d.read_array::<6>().map_err(|e| payload_err(name, e))?);
+                }
+                let prefilled = get_prefilled(&mut d, name)?;
+                Self::CmpctBlock(CmpctBlock {
+                    header,
+                    nonce,
+                    shortids,
+                    prefilled,
+                })
+            }
+            "getblocktxn" => {
+                let block_hash =
+                    BlockHash::from_bytes(d.read_array::<32>().map_err(|e| payload_err(name, e))?);
+                Self::GetBlockTxn(GetBlockTxn {
+                    block_hash,
+                    indexes: get_u32_diffs(&mut d, name)?,
+                })
+            }
+            "blocktxn" => {
+                let block_hash =
+                    BlockHash::from_bytes(d.read_array::<32>().map_err(|e| payload_err(name, e))?);
+                let count = d.read_compact_size().map_err(|e| payload_err(name, e))?;
+                if count > MAX_CMPCT_TX_COUNT {
+                    return Err(payload_err(name, "tx count exceeds bound"));
+                }
+                let mut txs = Vec::with_capacity(d.bounded_capacity(count, 60));
+                for _ in 0..count {
+                    txs.push(Transaction::read(&mut d).map_err(|e| payload_err(name, e))?);
+                }
+                Self::BlockTxn(BlockTxn { block_hash, txs })
+            }
             "sendrecon" => Self::SendRecon(SendRecon {
                 is_sender: d.read_u8().map_err(|e| payload_err(name, e))? != 0,
                 is_responder: d.read_u8().map_err(|e| payload_err(name, e))? != 0,
@@ -1030,6 +1235,73 @@ mod tests {
         let mut payload = Vec::new();
         write_compact_size(&mut payload, MAX_INV_SZ + 1);
         assert!(Message::decode(&cmd("inv"), &payload).is_err());
+    }
+
+    #[test]
+    fn bip152_messages_round_trip() {
+        let header = genesis_header();
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![],
+            outputs: vec![],
+            lock_time: 0,
+        };
+        for msg in [
+            Message::SendCmpct {
+                announce: true,
+                version: SENDCMPCT_VERSION_WITNESS,
+            },
+            Message::SendCmpct {
+                announce: false,
+                version: 1,
+            },
+            Message::CmpctBlock(CmpctBlock {
+                header,
+                nonce: 0xdead_beef_cafe_f00d,
+                shortids: vec![[1, 2, 3, 4, 5, 6], [0xaa; 6]],
+                prefilled: vec![
+                    PrefilledTx {
+                        index_diff: 0,
+                        tx: tx.clone(),
+                    },
+                    PrefilledTx { index_diff: 3, tx },
+                ],
+            }),
+            Message::GetBlockTxn(GetBlockTxn {
+                block_hash: header.hash(),
+                indexes: vec![0, 2, 0, 7],
+            }),
+            Message::BlockTxn(BlockTxn {
+                block_hash: header.hash(),
+                txs: vec![Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![],
+                    lock_time: 9,
+                }],
+            }),
+        ] {
+            assert_eq!(round_trip(&msg), msg);
+        }
+    }
+
+    #[test]
+    fn cmpctblock_bounds_are_enforced() {
+        let header = genesis_header();
+        // Overlong shortids / prefilled and huge getblocktxn ask all
+        // fail at decode rather than allocating unboundedly.
+        let mut p = header.encode().to_vec();
+        p.extend_from_slice(&0u64.to_le_bytes());
+        write_compact_size(&mut p, MAX_CMPCT_TX_COUNT + 1);
+        assert!(Message::decode(&cmd("cmpctblock"), &p).is_err());
+        let mut p = header.encode().to_vec();
+        p.extend_from_slice(&0u64.to_le_bytes());
+        write_compact_size(&mut p, 0); // no shortids
+        write_compact_size(&mut p, MAX_CMPCT_TX_COUNT + 1); // prefilled
+        assert!(Message::decode(&cmd("cmpctblock"), &p).is_err());
+        let mut p = header.hash().as_bytes().to_vec();
+        write_compact_size(&mut p, MAX_CMPCT_TX_COUNT + 1);
+        assert!(Message::decode(&cmd("getblocktxn"), &p).is_err());
     }
 
     #[test]

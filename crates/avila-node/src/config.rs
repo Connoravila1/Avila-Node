@@ -293,6 +293,74 @@ const KNOB_DOCS: &[(&str, &str)] = &[
         "hooks.extrapool_promote",
         "verdict helpers gating extrapool re-admission",
     ),
+    (
+        "net.blocks_only",
+        "blocks-only mode (-blocksonly) — no tx relay in either direction; mempool still serves the wallet",
+    ),
+    (
+        "relay.tx.announce",
+        "tx fan-out mode — all | private_only (mempool.private entries only) | none",
+    ),
+    (
+        "relay.tx.to_inbound",
+        "announce transactions onto inbound links",
+    ),
+    (
+        "relay.tx.to_blocks_only_peers",
+        "announce to peers whose version said relay=false (overrides their request)",
+    ),
+    (
+        "relay.tx.send_feefilter",
+        "advertise our mempool floor (sat/kvB) as feefilter to peers; 0 = silent like Core",
+    ),
+    (
+        "relay.tx.rebroadcast_local",
+        "retry locally submitted txs until they confirm (-walletbroadcast resilience)",
+    ),
+    (
+        "relay.tx.rebroadcast_interval",
+        "seconds between broadcast-pool retry passes (≥10s)",
+    ),
+    (
+        "relay.block.compact",
+        "BIP152 compact-block relay — negotiate sendcmpct, accept cmpctblock announcements",
+    ),
+    (
+        "relay.block.compact_high_bandwidth",
+        "ask peers to push fresh blocks as cmpctblock (high-bandwidth mode)",
+    ),
+    (
+        "relay.block.compact_serve",
+        "honor peers' hb asks (≤3 links) and answer getblocktxn reconstruction",
+    ),
+    (
+        "relay.block.announce",
+        "tip announce override — '' follows each peer's preference; headers | inv | none",
+    ),
+    (
+        "relay.block.serve",
+        "block-body serving — full | tip (checked tip ± reorg slack) | none",
+    ),
+    (
+        "hooks.block_serve",
+        "block-serving verdict helpers ([[hooks.block_serve]] — per block item in getdata and each getblocktxn)",
+    ),
+    (
+        "hooks.template_build",
+        "template-veto helpers ([[hooks.template_build]] — decline an assembled block template)",
+    ),
+    (
+        "mining.max_weight",
+        "template block-weight cap (-blockmaxweight; clamps to the consensus bound)",
+    ),
+    (
+        "mining.min_tx_fee",
+        "package feerate floor for templates, sat/kvB (-blockmintxfee)",
+    ),
+    (
+        "mining.reserved_weight",
+        "coinbase + witness-commitment weight budget (-blockreservedweight; ≥2000)",
+    ),
 ];
 
 /// Serialize each knob out of the loaded config next to its default —

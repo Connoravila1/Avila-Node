@@ -1,0 +1,27 @@
+# Live regtest harness — pairs against a local `bitcoind -regtest`
+# instance (see experiments/LOG.md). Compact blocks, feefilter, hooks,
+# and the observation pool all exercise on the real wire.
+schema_version = 1
+network = "regtest"
+data_dir = "/tmp/avila-live-a"           # relative to this file
+
+[net]
+connect = ["127.0.0.1:18444", "127.0.0.1:18448"]    # the bitcoind p2p port
+# B listens instead — this node dials it
+dns_seeds = false
+v2transport = false              # cleartext — protocol debuggable
+
+[services.rpc]
+bind = "127.0.0.1:18445"         # `avila-node rpc` endpoint
+
+[extrapool]
+observe = true
+promote_on = ["tip"]
+
+[relay.block]
+compact = true
+compact_high_bandwidth = true
+compact_serve = true
+
+[relay.tx]
+stem = true

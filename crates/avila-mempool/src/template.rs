@@ -102,6 +102,12 @@ pub enum TemplateError {
         /// `MAX_BLOCK_SIGOPS_COST`.
         max: u64,
     },
+    /// `template.build` vetoed this template — the assembled shape
+    /// (height, count, weight, sigops, fees) did not pass the
+    /// operator's verdict. The coinbase was never produced; nothing
+    /// propagates.
+    #[error("template vetoed by operator hook")]
+    HookVetoed,
 }
 
 impl Mempool {
@@ -170,6 +176,16 @@ impl Mempool {
         let fees: i64 = txs.iter().map(|(_, f)| *f).sum();
         let tx_count = txs.len();
 
+        // `template.build` — the operator's veto on the assembled
+        // shape: (height, tx count, pooled weight, sigops, fees). A
+        // reject declines the template; it can never reshape one.
+        if let Some(hook) = self.template_hook.borrow_mut().as_mut() {
+            let weight: u64 = txs.iter().map(|(t, _)| t.weight() as u64).sum();
+            if !hook(height, tx_count, weight, tx_sigops, fees) {
+                return Err(TemplateError::HookVetoed);
+            }
+        }
+
         let block = Self::assemble_block(
             cs,
             miner_script_pubkey,
@@ -219,7 +235,7 @@ impl Mempool {
         use avila_consensus::connect::{UtxoSet, bip68_locks_satisfied, check_tx_inputs};
         use avila_consensus::sigchecker::check_input_scripts;
 
-        let cap = (MAX_BLOCK_WEIGHT as u64).saturating_sub(self.block_reserved_weight as u64);
+        let cap = (self.block_max_weight as u64).saturating_sub(self.block_reserved_weight as u64);
         let sigops_cap = MAX_BLOCK_SIGOPS_COST.saturating_sub(self.coinbase_max_additional_sigops);
         let mut weight_free =
             cap.saturating_sub(chosen.iter().map(|(t, _)| t.weight() as u64).sum::<u64>());
@@ -392,8 +408,6 @@ impl Mempool {
         use avila_consensus::block::WITNESS_SCALE_FACTOR;
         use avila_consensus::check::is_final_tx;
 
-        /// Core's `-blockmintxfee` default (0 sat/kvB): no floor.
-        const BLOCK_MIN_FEE_SAT_PER_KVB: i64 = 0;
         /// Core's `MAX_CONSECUTIVE_FAILURES` — give up once the block
         /// is nearly full and nothing fits.
         const MAX_CONSECUTIVE_FAILURES: i64 = 1000;
@@ -401,7 +415,9 @@ impl Mempool {
         // at the coinbase's budgeted reserve rather than zero; we instead
         // shrink the caps by the same amount and keep the running totals
         // at zero — equivalent, and reuses the existing accounting below.
-        let cap = MAX_BLOCK_WEIGHT.saturating_sub(self.block_reserved_weight);
+        let cap = self
+            .block_max_weight
+            .saturating_sub(self.block_reserved_weight);
         let sigops_cap = MAX_BLOCK_SIGOPS_COST.saturating_sub(self.coinbase_max_additional_sigops);
 
         // Per-entry cached facts: the sigop-adjusted vsize Core calls
@@ -638,7 +654,7 @@ impl Mempool {
             };
 
             // `-blockmintxfee` floor — everything else sorts lower.
-            if package_fees < BLOCK_MIN_FEE_SAT_PER_KVB * package_size as i64 / 1000 {
+            if package_fees < self.block_min_fee * package_size as i64 / 1000 {
                 return (chosen, block_sigops);
             }
 

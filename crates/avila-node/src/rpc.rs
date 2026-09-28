@@ -7663,13 +7663,24 @@ pub(crate) fn dispatch(
                             "misbehavior_score": 0,
                             "permissions": [],
                             // BIP-133 — the peer's advertised minimum
-                            // (0 until one arrives). We never send
-                            // feefilter ourselves.
+                            // (0 until one arrives); ours rides out
+                            // only when `relay.tx.send_feefilter` > 0.
                             "minfeefilter": p.min_fee,
-                            // Compact-block high-bandwidth mode was never
-                            // negotiated.
-                            "bip152_hb_to": false,
-                            "bip152_hb_from": false,
+                            // BIP-152 grant model — sendcmpct announce
+                            // means "the sender will hb-announce".
+                            // `hb_to`: peer is in our announce candidate
+                            // set (v2-capable); `hb_from`: peer offered
+                            // to hb-announce to us.
+                            "bip152_hb_to": p.cmpct_v2,
+                            "bip152_hb_from": p.cmpct_hb,
+                            // Reconstruction telemetry — received,
+                            // full-pool hits, getblocktxn requests,
+                            // full-block fallbacks, in-flight partials.
+                            "cmpct_recv": p.cmpct_recv,
+                            "cmpct_hit": p.cmpct_hit,
+                            "cmpct_getblocktxn": p.cmpct_getblocktxn,
+                            "cmpct_fell_back": p.cmpct_fell_back,
+                            "partial_blocks": p.partial_blocks,
                             "addr_processed": p.addr_processed,
                             "addr_rate_limited": p.addr_rate_limited,
                             "idle_secs": p.idle_secs,
@@ -7979,6 +7990,36 @@ pub(crate) fn dispatch(
                             "event": "cpu_throttled",
                             "peer": peer,
                             "rate_ns": rate_ns,
+                        }),
+                        avila_p2p::manager::NetEvent::CompactReceived {
+                            peer,
+                            block,
+                            short_ids,
+                        } => json!({
+                            "event": "compact_received",
+                            "peer": peer,
+                            "block": block.to_string(),
+                            "short_ids": short_ids,
+                        }),
+                        avila_p2p::manager::NetEvent::CompactHit { peer, block } => json!({
+                            "event": "compact_hit",
+                            "peer": peer,
+                            "block": block.to_string(),
+                        }),
+                        avila_p2p::manager::NetEvent::CompactPatchRequest {
+                            peer,
+                            block,
+                            missing,
+                        } => json!({
+                            "event": "compact_patch_request",
+                            "peer": peer,
+                            "block": block.to_string(),
+                            "missing": missing,
+                        }),
+                        avila_p2p::manager::NetEvent::CompactFallback { peer, block } => json!({
+                            "event": "compact_fallback",
+                            "peer": peer,
+                            "block": block.to_string(),
                         }),
                     })
                     .collect();

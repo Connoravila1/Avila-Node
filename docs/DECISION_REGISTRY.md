@@ -225,17 +225,17 @@ transition.
 
 | Point | Today | Knobs | Hook |
 | --- | --- | --- | --- |
-| Tx announce | wtxid inv; stem on, `STEM_EPOCH=600s` | `relay.tx.stem` (wired); `relay.tx.announce` (inv / none / private-only), `stem.epoch`, `stem.hop` planned | `tx.announce` (wired — verdict per tx×peer link, fan-out + stem hop) |
-| Per-peer matrix | compartment matrix | `relay.tx.deny_pairs` (wired — `"src->dst"` pairs never announce; src: inbound/outbound/local/extrapool, dst: inbound/outbound); `relay.tx.to_inbound`, `to_blocks_only_peers`, `peer_override` planned | `tx.announce` |
+| Tx announce | wtxid inv; stem on, `STEM_EPOCH=600s` | `relay.tx.stem` (wired); `relay.tx.announce` (wired — `all` / `private_only` / `none`); `stem.epoch`, `stem.hop` planned | `tx.announce` (wired — verdict per tx×peer link, fan-out + stem hop) |
+| Per-peer matrix | compartment matrix | `relay.tx.deny_pairs` (wired — `"src->dst"` pairs never announce; src: inbound/outbound/local/extrapool, dst: inbound/outbound); `relay.tx.to_inbound`, `relay.tx.to_blocks_only_peers` (both wired — BIP37/relay=false reach); `peer_override` planned | `tx.announce` |
 | Provenance rules | `TxSource` in announce facts | `relay.tx.min_observed_announces` planned | `tx.announce` (facts carry `source`, `source_peer`, `peer_inbound`, `peer_user_agent`) |
 | Tx serving | `MEMPOOL_REQ_INTERVAL=60s`, `MAX_MEMPOOL_INV=50k`; getdata serves mempool + extrapool | `relay.tx.serve_mempool`, `mempool_req.interval`, `mempool_req.max_inv`, `relay.tx.serve_bip37` (bloom serving, off default) | `tx.serve` (wired — verdict per tx item per getdata; reject answers `notfound`) |
-| feefilter | honored inbound — peer's advertised minimum suppresses sub-rate invs in `send_tx_inv`; reported via `getpeerinfo.minfeefilter`. We never send one ourselves | `relay.tx.send_feefilter` (send our floor outbound) planned | — |
+| feefilter | honored inbound — peer's advertised minimum suppresses sub-rate invs in `send_tx_inv`; reported via `getpeerinfo.minfeefilter` | `relay.tx.send_feefilter` (wired — sat/kvB advertised post-handshake; 0 = silent like Core) | — |
 | Shape / timing | recon 4s | `relay.tx.trickle_ms`, announce jitter, per-peer announce rate cap | `relay.schedule` |
 | Reconciliation | `RECON_INTERVAL=4s`, req ≥250ms, ≤8 violations | `relay.tx.recon`, `recon.interval`, `recon.min_req_interval`, `recon.max_violations` | — |
-| Rebroadcast | broadcast pool exists | `relay.tx.rebroadcast_local`, `relay.tx.rebroadcast_interval` | — |
-| Block serving | `SEND_BUDGET_PER_PEER=8MiB` | `relay.block.serve` (none / tip / full), `send_budget`, `relay.block.blocks_only_mode` | `block.serve` |
-| Compact blocks | — | `relay.block.compact`, `compact.high_bandwidth`, `compact.serve` | `block.announce` |
-| Block announce | sendheaders | `relay.block.announce` (headers / inv / none) | — |
+| Rebroadcast | broadcast pool exists | `relay.tx.rebroadcast_local`, `relay.tx.rebroadcast_interval` (both wired; blocks-only silences) | — |
+| Block serving | `SEND_BUDGET_PER_PEER=8MiB` | `relay.block.serve` (wired — `full` / `tip` / `none`); `send_budget` planned | `block.serve` (wired — verdict per block item in getdata and per `getblocktxn`; reject answers `notfound`) |
+| Compact blocks | BIP-152 v2 (wtxid short-ids): `sendcmpct` negotiation, hb announce/receive, pool reconstruction, `getblocktxn`/`blocktxn` patch path, bounded partial blocks | `relay.block.compact`, `relay.block.compact_high_bandwidth`, `relay.block.compact_serve` (all wired; serve honors ≤3 hb asks) | `block.serve` |
+| Block announce | sendheaders | `relay.block.announce` (wired — `""` = peer's negotiated preference; `headers` / `inv` / `none` override) | — |
 
 ## F. Sync scheduling
 
@@ -247,7 +247,7 @@ performance policy, not correctness.
 | In-flight window | `MAX_BLOCKS_IN_TRANSIT_TOTAL=1024` | `sync.max_in_transit`, `sync.per_peer_in_flight` | `block.fetch` |
 | Headers timeout | base 15min + 1ms/header | `sync.headers_timeout_base/per_header` | — |
 | Freshness | `RECENT_HEADER_WINDOW=24h` | `sync.recent_window` | — |
-| Mode | — | `net.blocks_only` (skip tx relay entirely) | — |
+| Mode | — | `net.blocks_only` (wired — no tx announces/fetches/mempool-dumps/recon/rebroadcast; mempool still serves the wallet) | — |
 
 ## G. Filters, indexes, and data serving
 
@@ -261,7 +261,7 @@ performance policy, not correctness.
 
 | Point | Today | Knobs | Hook |
 | --- | --- | --- | --- |
-| Template shape | `next_block.rs` | `mining.max_weight`, `mining.min_tx_fee`, `mining.reserved_weight`, `mining.refresh_ms` | `template.build` |
+| Template shape | `next_block.rs` | `mining.max_weight` (wired — `u64`, consensus-clamped), `mining.min_tx_fee` (wired — sat/kvB package floor), `mining.reserved_weight` (wired — ≥2000), `mining.refresh_ms` planned | `template.build` (wired — verdict on the assembled template: height, tx_count, weight, sigops, fees) |
 | Extrapool coupling | — | `mining.include_extrapool` (wired, boolean — mine what you won't relay; candidates revalidated under consensus flags, confirmed inputs only, ≤512 auditions, leftover budget) | — |
 | Stratum V2 | `sv2.rs` | `services.sv2.listen`, `sv2.job_declaration`, `sv2.template_provider` | — |
 

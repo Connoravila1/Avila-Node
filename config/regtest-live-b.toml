@@ -1,0 +1,27 @@
+# Second Avila node for the live regtest harness — connected to
+# bitcoind AND the GUI node so compact-block announces traverse a real
+# Avila<->Avila link on every new tip.
+schema_version = 1
+network = "regtest"
+data_dir = "/tmp/avila-live-b"         # relative to this file
+
+[net]
+connect = ["127.0.0.1:18444"]
+listen = "127.0.0.1:18448"       # the GUI node dials this
+dns_seeds = false
+v2transport = false
+
+[services.rpc]
+bind = "127.0.0.1:18447"
+
+[extrapool]
+observe = true
+promote_on = ["tip"]
+
+[relay.block]
+compact = true
+compact_high_bandwidth = true
+compact_serve = true
+
+[relay.tx]
+stem = true

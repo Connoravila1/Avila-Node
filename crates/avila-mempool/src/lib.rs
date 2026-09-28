@@ -291,6 +291,12 @@ pub type AdmitHook = Box<dyn FnMut(&TxAdmitFacts) -> bool + Send>;
 /// reason (for promote). Narrowing only.
 pub type PoolHook = Box<dyn FnMut(&Txid, &str) -> bool + Send>;
 
+/// The `template.build` verdict shape — `(height, tx_count,
+/// block_weight, sigop_cost, total_fees_sat)` of the assembled
+/// template; `false` vetoes it. Narrowing only — it can decline a
+/// template, never shape one.
+pub type TemplateHook = Box<dyn FnMut(u32, usize, u64, u64, i64) -> bool + Send>;
+
 /// One observed policy reject — the tx plus why live policy refused it.
 /// The registry's extrapool is an *observation* pool: these are
 /// consensus-valid transactions that operator policy refused, kept
@@ -928,6 +934,19 @@ pub struct Mempool {
     /// `rolling_min_fee` was last set; decay is computed as elapsed
     /// time since this point.
     last_rolling_fee_update: u32,
+    /// `mining.min_tx_fee` — Core's `-blockmintxfee` (sat/kvB):
+    /// packages below this rate are skipped during template selection.
+    block_min_fee: i64,
+    /// `mining.max_weight` — the template's block-weight cap; the
+    /// effective bound is `min(max_weight, MAX_BLOCK_WEIGHT)
+    /// - block_reserved_weight`. Default `MAX_BLOCK_WEIGHT`.
+    block_max_weight: usize,
+    /// `template.build` verdict — consulted once per `build_template`
+    /// with `(height, tx_count, weight, sigops, total_fees)`; `false`
+    /// vetoes the template (coinbase-minimal mining posture without
+    /// disabling `getblocktemplate`). `RefCell` because
+    /// `build_template` is a `&self` read over a `FnMut` sink.
+    template_hook: std::cell::RefCell<Option<TemplateHook>>,
     /// `mining.include_extrapool` — observation-pool entries audition
     /// for a template's leftover budget after the pool's packages,
     /// each fully revalidated at block height. Default off.
@@ -1025,6 +1044,9 @@ impl Mempool {
             full_rbf: true,
             block_reserved_weight: template::DEFAULT_BLOCK_RESERVED_WEIGHT,
             coinbase_max_additional_sigops: template::DEFAULT_COINBASE_MAX_ADDITIONAL_SIGOPS,
+            block_min_fee: 0,
+            block_max_weight: avila_consensus::block::MAX_BLOCK_WEIGHT,
+            template_hook: std::cell::RefCell::new(None),
             require_standard: true,
             max_datacarrier_bytes: Some(policy::MAX_OP_RETURN_RELAY),
             permit_bare_multisig: policy::DEFAULT_PERMIT_BAREMULTISIG,
@@ -3123,6 +3145,28 @@ impl Mempool {
         self.extrapool.set_relay(relay);
     }
 
+    /// `mining.min_tx_fee` — packages below this rate (sat/kvB) are
+    /// skipped during template selection. Core's `-blockmintxfee`.
+    pub fn set_block_min_fee(&mut self, sat_per_kvb: i64) {
+        self.block_min_fee = sat_per_kvb.max(0);
+    }
+
+    /// `mining.max_weight` — cap a template's block weight below the
+    /// consensus `MAX_BLOCK_WEIGHT` (operator-reserved headroom for
+    /// later injection, e.g. a bigger witness-commitment area or
+    /// externally-added txs). Clamped to the consensus bound — this
+    /// can only ever narrow a template, never inflate past the cap.
+    pub fn set_block_max_weight(&mut self, weight: usize) {
+        self.block_max_weight = weight.min(avila_consensus::block::MAX_BLOCK_WEIGHT);
+    }
+
+    /// The `template.build` verdict — consulted once per
+    /// `build_template` on the assembled shape; `false` vetoes the
+    /// template (the RPC surfaces it as an error, no block is built).
+    pub fn set_template_hook(&mut self, hook: Option<TemplateHook>) {
+        *self.template_hook.borrow_mut() = hook;
+    }
+
     /// `mining.include_extrapool` — when on, `build_template` auditions
     /// observation-pool entries for the block's leftover budget. Every
     /// candidate is revalidated at template height with consensus flags
@@ -3607,6 +3651,12 @@ impl Mempool {
     #[must_use]
     pub fn txids(&self) -> Vec<Txid> {
         self.map.keys().copied().collect()
+    }
+
+    /// Every pooled transaction — BIP152 reconstruction scans these
+    /// for short-id matches; entry order is unspecified.
+    pub fn iter_txs(&self) -> impl Iterator<Item = &Transaction> {
+        self.map.values().map(|e| &e.tx)
     }
 }
 

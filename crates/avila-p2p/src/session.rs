@@ -80,6 +80,10 @@ pub struct PeerInfo {
     /// Whether the peer sent `sendutxproof` — it wants `utxproof`
     /// bundles appended to served blocks (Avila intra-net).
     pub utxproof: bool,
+    /// The peer's BIP152 `sendcmpct`: `(wants_high_bandwidth,
+    /// supported_version)`. `version >= 2` means wtxid short-ids.
+    /// `None` = ordinary `inv`/`headers` block announcements only.
+    pub cmpct: Option<(bool, u64)>,
 }
 
 /// Wire telemetry for one session — what `getpeerinfo` reports. Bytes
@@ -214,6 +218,9 @@ pub struct PeerSession<S> {
     /// proof bundles (utreexo shadow mode). Serving stays unconditional
     /// on the bridge side; this flag is the opt-in ask.
     ask_utxproof: bool,
+    /// BIP152 `sendcmpct` we advertise — `Some(hb)` negotiates
+    /// version-2 compact relay with high-bandwidth request `hb`.
+    ask_cmpct: Option<bool>,
     /// Whether we initiated the connection (Core's outbound vs inbound).
     outbound: bool,
     peer: Option<PeerInfo>,
@@ -366,7 +373,24 @@ impl<S: Read + Write> PeerSession<S> {
             cell_bytes: 0,
             recon_salt,
             ask_utxproof: false,
+            ask_cmpct: None,
         }
+    }
+
+    /// Whether this session advertises `sendcmpct` in the handshake
+    /// burst — `Some(hb)` sends version-2 negotiation with
+    /// high-bandwidth request `hb`; `None` sends nothing (compact
+    /// relay off for this link).
+    pub fn ask_cmpct(&mut self, hb: Option<bool>) {
+        self.ask_cmpct = hb;
+    }
+
+    /// What we asked in `sendcmpct` — `Some(true)` means we requested
+    /// high-bandwidth `cmpctblock` announcements on this link
+    /// (`getpeerinfo`'s `bip152_hb_from` direction).
+    #[must_use]
+    pub fn cmpct_asked(&self) -> Option<bool> {
+        self.ask_cmpct
     }
 
     /// Whether this session advertises `sendutxproof` in the handshake
@@ -667,6 +691,7 @@ impl<S: Read + Write> PeerSession<S> {
                     addrv2: false,
                     recon: None,
                     utxproof: false,
+                    cmpct: None,
                 });
                 // ProcessMessage(VERSION)'s reply burst: inbound answers
                 // with our version first, then negotiation + verack.
@@ -683,6 +708,15 @@ impl<S: Read + Write> PeerSession<S> {
                     // entropy so a peer cannot precompute short-ids.
                     salt: self.recon_salt,
                 }))?;
+                if let Some(hb) = self.ask_cmpct {
+                    // BIP152: announce support before verack. Version 2
+                    // selects wtxid short-ids (segwit-aware); `hb` asks
+                    // the peer for cmpctblock announcements.
+                    self.send(&Message::SendCmpct {
+                        announce: hb,
+                        version: crate::message::SENDCMPCT_VERSION_WITNESS,
+                    })?;
+                }
                 if self.ask_utxproof {
                     self.send(&Message::SendUtxProof)?;
                 }
@@ -700,37 +734,67 @@ impl<S: Read + Write> PeerSession<S> {
                 self.send(&Message::Pong(nonce))?;
                 Ok(None) // pings are transport liveness, not sync data
             }
-            (_, Message::WtxidRelay) => {
-                if self.state == Handshake::Done {
-                    return Err(SessionError::LateNegotiation);
+            // Negotiation messages: Core's reply burst puts its verack
+            // *before* wtxidrelay/sendaddrv2/sendcmpct/etc. — post-Done
+            // arrival is Core-normal, not misbehavior. At Done we still
+            // absorb them into peer caps *and* emit the message so the
+            // manager can update fields mirrored on its PeerEntry.
+            (Handshake::Done, msg @ Message::WtxidRelay) => {
+                if let Some(p) = &mut self.peer {
+                    p.wtxid_relay = true;
                 }
+                Ok(Some(SessionEvent::Message(msg)))
+            }
+            (Handshake::Done, msg @ Message::SendAddrV2) => {
+                if let Some(p) = &mut self.peer {
+                    p.addrv2 = true;
+                }
+                Ok(Some(SessionEvent::Message(msg)))
+            }
+            (Handshake::Done, Message::SendRecon(r)) => {
+                if let Some(p) = &mut self.peer {
+                    p.recon = Some(r.clone());
+                }
+                Ok(Some(SessionEvent::Message(Message::SendRecon(r))))
+            }
+            (Handshake::Done, msg @ Message::SendCmpct { announce, version }) => {
+                if let Some(p) = &mut self.peer {
+                    p.cmpct = Some((announce, version));
+                }
+                Ok(Some(SessionEvent::Message(msg)))
+            }
+            (Handshake::Done, msg @ Message::SendUtxProof) => {
+                if let Some(p) = &mut self.peer {
+                    p.utxproof = true;
+                }
+                Ok(Some(SessionEvent::Message(msg)))
+            }
+            (Handshake::Done, msg @ Message::SendHeaders) => Ok(Some(SessionEvent::Message(msg))),
+            (_, Message::WtxidRelay) => {
                 if let Some(p) = &mut self.peer {
                     p.wtxid_relay = true;
                 }
                 Ok(None)
             }
             (_, Message::SendAddrV2) => {
-                if self.state == Handshake::Done {
-                    return Err(SessionError::LateNegotiation);
-                }
                 if let Some(p) = &mut self.peer {
                     p.addrv2 = true;
                 }
                 Ok(None)
             }
             (_, Message::SendRecon(r)) => {
-                if self.state == Handshake::Done {
-                    return Err(SessionError::LateNegotiation);
-                }
                 if let Some(p) = &mut self.peer {
                     p.recon = Some(r);
                 }
                 Ok(None)
             }
-            (_, Message::SendUtxProof) => {
-                if self.state == Handshake::Done {
-                    return Err(SessionError::LateNegotiation);
+            (_, Message::SendCmpct { announce, version }) => {
+                if let Some(p) = &mut self.peer {
+                    p.cmpct = Some((announce, version));
                 }
+                Ok(None)
+            }
+            (_, Message::SendUtxProof) => {
                 if let Some(p) = &mut self.peer {
                     p.utxproof = true;
                 }
@@ -757,7 +821,7 @@ pub fn build_version(nonce: u64, start_height: i32, addr_recv: NetAddr, now: i64
         nonce,
         user_agent: "/Avila:0.1.0/".to_string(),
         start_height,
-        relay: false, // a sync node doesn't ask for tx relay
+        relay: false, // PeerManager overrides from blocks_only
     }
 }
 
@@ -955,7 +1019,7 @@ mod tests {
     }
 
     #[test]
-    fn wtxidrelay_after_verack_disconnects() {
+    fn wtxidrelay_after_verack_is_absorbed() {
         let (us_end, mut peer_end) = testpipe::pair();
         let mut us = PeerSession::accept(
             us_end,
@@ -967,11 +1031,17 @@ mod tests {
         us.poll().unwrap();
         testpipe::inject(&mut peer_end, MAGIC, &Message::Verack);
         us.poll().unwrap();
+        // Core's burst orders verack *before* its negotiators, so a
+        // post-handshake wtxidrelay is routine — absorbed into caps
+        // and surfaced as an event for the manager's mirror fields.
         testpipe::inject(&mut peer_end, MAGIC, &Message::WtxidRelay);
-        assert_eq!(
-            us.poll().unwrap_err().to_string(),
-            "negotiation message after handshake completed"
+        let ev = us.poll().unwrap();
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, SessionEvent::Message(Message::WtxidRelay))),
+            "{ev:?}"
         );
+        assert!(us.peer().is_some_and(|p| p.wtxid_relay));
     }
 
     #[test]

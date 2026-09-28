@@ -82,6 +82,16 @@ fn main() -> Result<(), String> {
                 }
                 NetEvent::ProxyUnreachable => println!("proxy unreachable — private route down"),
                 NetEvent::V2Downgraded { addr } => println!("{addr}: v2 attempt downgraded to v1"),
+                NetEvent::CompactReceived { peer, short_ids, .. } => {
+                    println!("peer {peer}: cmpctblock ({short_ids} short ids)")
+                }
+                NetEvent::CompactHit { peer, .. } => println!("peer {peer}: compact hit"),
+                NetEvent::CompactPatchRequest { peer, missing, .. } => {
+                    println!("peer {peer}: getblocktxn for {missing}")
+                }
+                NetEvent::CompactFallback { peer, .. } => {
+                    println!("peer {peer}: compact fallback to full block")
+                }
             }
         }
         let tip = cs.chain().len() as i64 - 1;

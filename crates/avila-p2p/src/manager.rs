@@ -220,6 +220,42 @@ pub enum NetEvent {
         /// Cumulative ids they held that our pool lacked.
         our_misses: u64,
     },
+    /// A compact block decoded on a negotiated link — the short-id
+    /// reconstruction attempt has started.
+    CompactReceived {
+        /// The peer id.
+        peer: u64,
+        /// The block hash.
+        block: BlockHash,
+        /// Short-id slots the block carried.
+        short_ids: usize,
+    },
+    /// A compact block reconstructed entirely from the mempool — no
+    /// `getblocktxn` round trip needed.
+    CompactHit {
+        /// The peer id.
+        peer: u64,
+        /// The block hash.
+        block: BlockHash,
+    },
+    /// A compact block had unknown txs — `getblocktxn` went out; the
+    /// partial reconstruction waits on `blocktxn`.
+    CompactPatchRequest {
+        /// The peer id.
+        peer: u64,
+        /// The block hash.
+        block: BlockHash,
+        /// Tx slots we could not resolve locally.
+        missing: usize,
+    },
+    /// The `blocktxn` reply left slots unfilled (lied or raced) —
+    /// fell back to a plain `getdata` for the whole block.
+    CompactFallback {
+        /// The peer id.
+        peer: u64,
+        /// The block hash.
+        block: BlockHash,
+    },
 }
 
 struct PeerEntry<S> {
@@ -356,6 +392,23 @@ struct PeerEntry<S> {
     /// next at `2N + margin`, so capacity tracks the actual diff
     /// rather than the whole pool's size.
     recon_diff_hint: u32,
+    /// BIP152: the peer negotiated `sendcmpct` at version ≥2 — it can
+    /// send us `cmpctblock` and understands `blocktxn`.
+    cmpct_v2: bool,
+    /// BIP152: the peer asked for high-bandwidth announcements — we
+    /// announce new tips to it via `cmpctblock` directly (capped by
+    /// `hb_peers` at the manager level).
+    cmpct_hb: bool,
+    /// Blocks mid-reconstruction from this peer's `cmpctblock`s —
+    /// bounded (`MAX_PARTIAL_BLOCKS`); a `blocktxn` joins by hash.
+    partial_blocks: std::collections::VecDeque<crate::compact::PartialBlock>,
+    /// Reconstruction telemetry — cmpctblocks received, completed
+    /// purely from the pool, completed via `blocktxn`, and full-block
+    /// fallbacks after incomplete replies.
+    pub cmpct_recv: u64,
+    pub cmpct_hit: u64,
+    pub cmpct_getblocktxn: u64,
+    pub cmpct_fell_back: u64,
 }
 
 impl<S> PeerEntry<S> {
@@ -476,6 +529,22 @@ pub struct PeerSnapshot {
     /// Cumulative ids we held that the peer's pool lacked — a
     /// persistently-wide *their-side* diff is the filtering signal.
     pub recon_their_misses: u64,
+    /// BIP152 — the peer's `sendcmpct` negotiated v2 (wtxid shortids).
+    pub cmpct_v2: bool,
+    /// BIP152 — the peer asked for high-bandwidth `cmpctblock`
+    /// announcements.
+    pub cmpct_hb: bool,
+    /// BIP152 — what we asked for in our `sendcmpct` (`Some(true)` =
+    /// hb requested of them); `None` = compact relay off.
+    pub cmpct_asked_hb: Option<bool>,
+    /// `cmpctblock`s received, fully reconstructed, `getblocktxn`s
+    /// asked, and full-block fallbacks on this link.
+    pub cmpct_recv: u64,
+    pub cmpct_hit: u64,
+    pub cmpct_getblocktxn: u64,
+    pub cmpct_fell_back: u64,
+    /// Blocks currently mid-reconstruction.
+    pub partial_blocks: usize,
 }
 
 /// A bounded set of peers sharing one [`Chainstate`].
@@ -600,6 +669,44 @@ pub struct PeerManager<S> {
     /// utreexo spend bundles (shadow connect). See
     /// [`Self::set_utxproof_consumer`].
     ask_utxproof: bool,
+    /// `relay.block.compact` — negotiate BIP152 `sendcmpct` on new
+    /// sessions and accept `cmpctblock` announcements.
+    compact_blocks: bool,
+    /// `relay.block.compact_high_bandwidth` — request hb announcements
+    /// (our `sendcmpct` announce flag).
+    compact_hb: bool,
+    /// `relay.block.serve` — send `cmpctblock` to peers that asked for
+    /// hb, and answer their `getblocktxn` reconstructions.
+    compact_serve: bool,
+    /// `relay.block.announce` — `headers|inv|none`; empty = follow the
+    /// peer's `sendheaders` preference (Core's behavior).
+    block_announce: String,
+    /// `relay.block.serve` — `full` serves any stored block, `tip`
+    /// only the checked tip's vicinity (reorg slack), `none` answers
+    /// every block request `notfound`.
+    block_serve_mode: String,
+    /// The `block.serve` verdict — per-request gate like `tx.serve`.
+    block_serve_verdict: Option<BlockServeVerdict>,
+    /// `relay.tx.announce` — `all` (default), `private_only`
+    /// (`mempool.private` entries only), `none` (no tx invs at all).
+    tx_announce_mode: String,
+    /// `relay.tx.to_inbound` — announce txs onto inbound links.
+    tx_to_inbound: bool,
+    /// `relay.tx.to_blocks_only_peers` — announce to peers whose
+    /// version said `relay=false`. Default off (Core respects the
+    /// flag); on, the operator overrides their preference.
+    tx_to_blocks_only: bool,
+    /// `net.blocks_only` — no tx relay at all: no announces, no
+    /// inv-triggered fetches, no `mempool` dumps, no recon rounds.
+    blocks_only: bool,
+    /// `relay.tx.rebroadcast_local` — broadcast-pool retries of
+    /// locally submitted txs until they confirm.
+    rebroadcast_local: bool,
+    /// `relay.tx.rebroadcast_interval` — seconds between retries.
+    rebroadcast_interval: u32,
+    /// `relay.tx.send_feefilter` — sat/kvB floor advertised to peers
+    /// at handshake; 0 sends nothing (Core's default).
+    send_feefilter: u64,
     /// Last time the eclipse-signal check ran (paced to ~60s).
     eclipse_checked_at: Instant,
     /// Named event ring (queue #33): every NetEvent the tick produces
@@ -809,6 +916,28 @@ pub struct TxServeFacts {
 /// serve what the pools don't hold.
 pub type TxServeVerdict = Box<dyn FnMut(&TxServeFacts) -> bool + Send>;
 
+/// Facts handed to a `block.serve` verdict — one consult per block a
+/// peer asks us for via `getdata` or `getblocktxn`.
+#[derive(Debug)]
+pub struct BlockServeFacts {
+    /// The requested block's hash.
+    pub block_hash: avila_consensus::hash::BlockHash,
+    /// Internal id of the requesting peer (`getpeerinfo`'s `id`).
+    pub peer: u64,
+    /// The peer's remote address string when known.
+    pub peer_addr: Option<String>,
+    /// True when the requester dialed us.
+    pub peer_inbound: bool,
+    /// The peer's advertised user agent, when a version was seen.
+    pub peer_user_agent: Option<String>,
+}
+
+/// A `block.serve` judge — conjunctive gate on outbound block serving;
+/// `false` answers the request `notfound` (or ignores `getblocktxn`),
+/// indistinguishable from never having stored the block. Narrowing
+/// only.
+pub type BlockServeVerdict = Box<dyn FnMut(&BlockServeFacts) -> bool + Send>;
+
 /// NetAddr → "ip:port" for the verdict facts — v4-mapped prints dotted
 /// quad, v6 prints bracketed.
 fn net_addr_string(a: &crate::message::NetAddr) -> String {
@@ -863,6 +992,19 @@ impl<S: Read + Write> PeerManager<S> {
             proxy_failures: 0,
             cell_bytes: 0,
             ask_utxproof: false,
+            compact_blocks: true,
+            compact_hb: true,
+            compact_serve: true,
+            block_announce: String::new(),
+            block_serve_mode: "full".to_string(),
+            block_serve_verdict: None,
+            tx_announce_mode: "all".to_string(),
+            tx_to_inbound: true,
+            tx_to_blocks_only: false,
+            blocks_only: false,
+            rebroadcast_local: true,
+            rebroadcast_interval: 60,
+            send_feefilter: 0,
             discouraged: std::collections::HashMap::new(),
             bans: crate::banman::BanList::new(),
             default_ban_time: crate::banman::DEFAULT_BANTIME,
@@ -1041,6 +1183,14 @@ impl<S: Read + Write> PeerManager<S> {
                     recon_rounds: peer.recon_rounds,
                     recon_misses: peer.recon_misses,
                     recon_their_misses: peer.recon_their_misses,
+                    cmpct_v2: peer.cmpct_v2,
+                    cmpct_hb: peer.cmpct_hb,
+                    cmpct_asked_hb: peer.session.cmpct_asked(),
+                    cmpct_recv: peer.cmpct_recv,
+                    cmpct_hit: peer.cmpct_hit,
+                    cmpct_getblocktxn: peer.cmpct_getblocktxn,
+                    cmpct_fell_back: peer.cmpct_fell_back,
+                    partial_blocks: peer.partial_blocks.len(),
                 }
             })
             .collect();
@@ -1164,6 +1314,14 @@ impl<S: Read + Write> PeerManager<S> {
         session.set_clock(self.clock);
         session.set_cell_bytes(self.cell_bytes);
         session.ask_utxproof(self.ask_utxproof);
+        // BIP-152 `announce` bit = "we will send YOU hb cmpctblock
+        // announcements" — an offer, not a request. Only advertise it
+        // when we actually serve (a peer that can't answer
+        // getblocktxn leaves broken partial blocks).
+        session.ask_cmpct(
+            self.compact_blocks
+                .then_some(self.compact_hb && self.compact_serve),
+        );
         let now = Instant::now();
         // Self-connection detection (Core's `CheckIncomingNonce`):
         // remember the nonce on an outbound dial so a matching inbound
@@ -1217,6 +1375,13 @@ impl<S: Read + Write> PeerManager<S> {
                 recon: None,
                 recon_round: None,
                 recon_map: std::collections::HashMap::new(),
+                cmpct_v2: false,
+                cmpct_hb: false,
+                partial_blocks: std::collections::VecDeque::new(),
+                cmpct_recv: 0,
+                cmpct_hit: 0,
+                cmpct_getblocktxn: 0,
+                cmpct_fell_back: 0,
                 recon_req_last: None,
                 recon_req_violations: 0,
                 recon_rounds: 0,
@@ -1249,6 +1414,8 @@ impl<S: Read + Write> PeerManager<S> {
             outbound_nonces,
             stem_pending,
             tx_serve_verdict,
+            block_serve_verdict,
+            block_serve_mode,
             ..
         } = self;
         // Core's `m_num_preferred_download_peers - state.fPreferredDownload
@@ -1331,6 +1498,12 @@ impl<S: Read + Write> PeerManager<S> {
                             &stem_exclude,
                             &mut self.recent_deliveries,
                             tx_serve_verdict,
+                            block_serve_verdict,
+                            block_serve_mode.as_str(),
+                            self.compact_blocks,
+                            self.compact_serve,
+                            self.blocks_only,
+                            self.send_feefilter,
                         );
                         // Per-peer CPU accounting (PEER_BUDGETS):
                         // time inside dispatch lands on this peer's
@@ -1530,6 +1703,12 @@ impl<S: Read + Write> PeerManager<S> {
         txid: avila_consensus::hash::Txid,
         wtxid: avila_consensus::hash::Wtxid,
     ) {
+        if self.blocks_only || self.tx_announce_mode == "none" {
+            return;
+        }
+        if self.tx_announce_mode == "private_only" && !self.mempool.is_private(&txid) {
+            return;
+        }
         if !self.stem_relay {
             self.announce_tx(txid, wtxid);
             return;
@@ -1713,6 +1892,53 @@ impl<S: Read + Write> PeerManager<S> {
         self.ask_utxproof = on;
     }
 
+    /// BIP152 configuration — `compact` negotiates `sendcmpct` and
+    /// accepts `cmpctblock` on new sessions; `hb` is our
+    /// high-bandwidth request flag; `serve` lets us send `cmpctblock`
+    /// announcements and answer `getblocktxn`; `announce` is
+    /// `headers|inv|none` or empty for the peer's `sendheaders`
+    /// preference. New sessions only, like `sendutxproof`.
+    pub fn set_compact_relay(&mut self, compact: bool, hb: bool, serve: bool, announce: &str) {
+        self.compact_blocks = compact;
+        self.compact_hb = hb;
+        self.compact_serve = serve;
+        self.block_announce = announce.to_string();
+    }
+
+    /// `relay.block.serve` mode + the `block.serve` verdict —
+    /// `mode` is `full|tip|none`; `verdict` gates each requested
+    /// block (and `getblocktxn`) conjunctively.
+    pub fn set_block_serve(&mut self, mode: &str, verdict: Option<BlockServeVerdict>) {
+        self.block_serve_mode = mode.to_string();
+        self.block_serve_verdict = verdict;
+    }
+
+    /// `relay.tx.*` bulk apply — announce mode (`all|private_only|
+    /// none`), inbound/blocks-only target reach, the outbound
+    /// feefilter floor, and broadcast-pool retries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_tx_relay(
+        &mut self,
+        announce: &str,
+        to_inbound: bool,
+        to_blocks_only: bool,
+        send_feefilter: u64,
+        rebroadcast_local: bool,
+        rebroadcast_interval: u32,
+    ) {
+        self.tx_announce_mode = announce.to_string();
+        self.tx_to_inbound = to_inbound;
+        self.tx_to_blocks_only = to_blocks_only;
+        self.send_feefilter = send_feefilter;
+        self.rebroadcast_local = rebroadcast_local;
+        self.rebroadcast_interval = rebroadcast_interval;
+    }
+
+    /// `net.blocks_only` — silence tx relay in every direction.
+    pub fn set_blocks_only(&mut self, on: bool) {
+        self.blocks_only = on;
+    }
+
     /// Loads an AS bucketing map — Erebus mitigation: outbound dialing
     /// deprioritizes ASNs already holding ≥2 slots.
     pub fn set_asmap(&mut self, map: crate::asmap::AsMap) {
@@ -1726,10 +1952,13 @@ impl<S: Read + Write> PeerManager<S> {
     /// (confirmed, or conflicted by a mined tx) can never confirm —
     /// it drops; soft failures back off exponentially.
     fn rebroadcast_pass(&mut self, cs: &mut Chainstate, now: u32) {
+        if !self.rebroadcast_local || self.blocks_only {
+            return;
+        }
         if now < self.next_rebroadcast {
             return;
         }
-        self.next_rebroadcast = now + 60;
+        self.next_rebroadcast = now + self.rebroadcast_interval.max(10);
         for (txid, raw) in self.mempool.broadcast_pending(now) {
             let Ok(tx) = avila_consensus::transaction::Transaction::decode(&raw) else {
                 self.mempool.unmark_broadcast(&txid);
@@ -1771,6 +2000,9 @@ impl<S: Read + Write> PeerManager<S> {
     /// negotiated `sendrecon` and is due, open a sketch round over the
     /// current pool. Failed/finished rounds clear on the next due tick.
     fn recon_pass(&mut self) {
+        if self.blocks_only {
+            return;
+        }
         let now = Instant::now();
         for peer in self.peers.values_mut() {
             let Some(link) = peer.recon else {
@@ -1803,6 +2035,14 @@ impl<S: Read + Write> PeerManager<S> {
         wtxid: &avila_consensus::hash::Wtxid,
         source: TxSource,
     ) {
+        // `net.blocks_only` / `relay.tx.announce` — the whole fan-out
+        // is quiet, or private entries only.
+        if self.blocks_only || self.tx_announce_mode == "none" {
+            return;
+        }
+        if self.tx_announce_mode == "private_only" && !self.mempool.is_private(txid) {
+            return;
+        }
         let src = self.source_compartment(source);
         // BIP-133: the announced tx's feerate (sat/kvB, hoisted — the
         // peer loop borrows &mut self) gates each peer's advertised
@@ -1820,8 +2060,14 @@ impl<S: Read + Write> PeerManager<S> {
             if TxSource::Peer(id) == source || !peer.session.established() {
                 continue;
             }
+            // `relay.tx.to_inbound` — inbound links hear nothing.
+            if peer.inbound && !self.tx_to_inbound {
+                continue;
+            }
             let wants_tx = peer.session.peer().is_some_and(|i| i.relay);
-            if !wants_tx {
+            // `to_blocks_only_peers` overrides the peer's own
+            // relay=false request (default respects it, like Core).
+            if !wants_tx && !self.tx_to_blocks_only {
                 continue;
             }
             // BIP-330: a recon link doesn't get tx announcements — the
@@ -2050,11 +2296,40 @@ impl<S: Read + Write> PeerManager<S> {
         // as verified before its checks actually passed.
         let tip_hash = cs.chain().get(cs.checked_height() as usize).copied();
         let tip_header = tip_hash.and_then(|h| cs.tree().get(&h)).map(|n| n.header);
+        // `relay.block.announce` override — empty follows each peer's
+        // negotiation (Core's behavior); `none` silences block
+        // announcements entirely.
+        let mode = self.block_announce.as_str();
+        if mode == "none" {
+            return;
+        }
+        let compact_serve = self.compact_serve;
+        // Core grants high-bandwidth compact announcements to at most
+        // 3 peers (`MAX_CMPCT_HB_PEERS`) — the block body is built
+        // lazily on the first hb peer.
+        let mut compacted: Option<Message> = None;
+        let mut hb_sent = 0usize;
         for (&id, peer) in &mut self.peers {
             if Some(id) == exclude || !peer.session.established() {
                 continue;
             }
-            let msg = if peer.wants_headers_announce {
+            // High-bandwidth announces go to compact-capable peers —
+            // our sendcmpct(announce=true) advertised the grant; the
+            // <=3 cap is Core's MAX_CMPCT_HB_PEERS.
+            if peer.cmpct_v2 && compact_serve && mode.is_empty() && hb_sent < 3 {
+                if compacted.is_none() {
+                    let Some(hash) = tip_hash else { break };
+                    let Some(body) = cs.body(&hash) else { break };
+                    compacted = Some(Message::CmpctBlock(crate::compact::make_cmpctblock(&body)));
+                }
+                if let Some(msg) = &compacted
+                    && peer.session.send(msg).is_ok()
+                {
+                    hb_sent += 1;
+                }
+                continue;
+            }
+            let msg = if mode == "headers" || (mode.is_empty() && peer.wants_headers_announce) {
                 match tip_header {
                     Some(header) => Message::Headers(vec![header]),
                     None => continue,
@@ -2408,6 +2683,44 @@ impl<S: Read + Write> PeerManager<S> {
         });
     }
 
+    /// `relay.block.serve` mode + the `block.serve` verdict —
+    /// `full` admits every request, `tip` only hashes within reorg
+    /// slack of the checked tip, `none` denies all; the verdict then
+    /// gates conjunctively.
+    fn block_serve_allowed(
+        mode: &str,
+        verdict: &mut Option<BlockServeVerdict>,
+        cs: &Chainstate,
+        hash: &avila_consensus::hash::BlockHash,
+        id: u64,
+        peer: &PeerEntry<S>,
+    ) -> bool {
+        match mode {
+            "none" => return false,
+            "tip" => {
+                let tip = i64::from(cs.checked_height());
+                let height = cs.tree().get(hash).map(|n| i64::from(n.height));
+                // Unknown index entries are unservable anyway; a
+                // header we don't index can't become a `block` reply.
+                if !matches!(height, Some(h) if tip - h <= 2) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        if let Some(v) = verdict {
+            let facts = BlockServeFacts {
+                block_hash: *hash,
+                peer: id,
+                peer_addr: peer.remote.as_ref().map(net_addr_string),
+                peer_inbound: peer.inbound,
+                peer_user_agent: peer.session.peer().map(|i| i.user_agent.clone()),
+            };
+            return v(&facts);
+        }
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn dispatch(
         id: u64,
@@ -2433,6 +2746,12 @@ impl<S: Read + Write> PeerManager<S> {
         stem_exclude: &std::collections::HashSet<avila_consensus::hash::Txid>,
         recent_deliveries: &mut std::collections::VecDeque<(avila_consensus::hash::BlockHash, u64)>,
         tx_serve_verdict: &mut Option<TxServeVerdict>,
+        block_serve_verdict: &mut Option<BlockServeVerdict>,
+        block_serve_mode: &str,
+        compact_enabled: bool,
+        compact_serve: bool,
+        blocks_only: bool,
+        send_feefilter: u64,
     ) {
         match event {
             SessionEvent::Established => {
@@ -2449,6 +2768,7 @@ impl<S: Read + Write> PeerManager<S> {
                     addrv2: false,
                     recon: None,
                     utxproof: false,
+                    cmpct: None,
                 });
                 if let Some(their) = info.recon.clone() {
                     peer.recon = Some(crate::recon::ReconPeer {
@@ -2460,6 +2780,18 @@ impl<S: Read + Write> PeerManager<S> {
                     // First round a few seconds in — let early traffic
                     // (mempool asks, invs) settle first.
                     peer.next_recon = Instant::now() + RECON_FIRST_DELAY;
+                }
+                if let Some((wants_hb, version)) = info.cmpct {
+                    // BIP152 v2 only — wtxid short-ids. The hb flag
+                    // records their *request*; whether we honor it is
+                    // decided at announce time by `relay.block.serve`.
+                    peer.cmpct_v2 = version >= crate::message::SENDCMPCT_VERSION_WITNESS;
+                    peer.cmpct_hb = peer.cmpct_v2 && wants_hb;
+                }
+                // `relay.tx.send_feefilter` — advertise our mempool
+                // floor so peers stop offering what we'd filter.
+                if send_feefilter > 0 {
+                    let _ = peer.session.send(&Message::FeeFilter(send_feefilter));
                 }
                 events.push(NetEvent::Connected {
                     peer: id,
@@ -2538,7 +2870,27 @@ impl<S: Read + Write> PeerManager<S> {
                     });
                 }
                 let before = peer.sync.in_flight();
-                if let Some(req) = peer.sync.on_inv(cs, Some(mempool), &invs, *global_free) {
+                // `net.blocks_only` — block invs still fetch; tx items
+                // are stripped before the scheduler ever sees them.
+                let filtered_vec;
+                let filtered: &[crate::message::InvVector] = if blocks_only {
+                    filtered_vec = invs
+                        .iter()
+                        .filter(|i| {
+                            !matches!(
+                                i.inv_type,
+                                crate::message::InvType::Tx
+                                    | crate::message::InvType::WitnessTx
+                                    | crate::message::InvType::Wtx
+                            )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    &filtered_vec
+                } else {
+                    &invs
+                };
+                if let Some(req) = peer.sync.on_inv(cs, Some(mempool), filtered, *global_free) {
                     *global_free = global_free.saturating_sub(peer.sync.in_flight() - before);
                     let _ = peer.session.send(&req);
                 }
@@ -2634,6 +2986,195 @@ impl<S: Read + Write> PeerManager<S> {
             }
             SessionEvent::Message(Message::SendHeaders) => {
                 peer.wants_headers_announce = true;
+            }
+            SessionEvent::Message(Message::SendCmpct { announce, version }) => {
+                // Core's burst puts sendcmpct after its verack — it
+                // arrives here as a live negotiation update, not a
+                // handshake field. Version 2+ selects wtxid short-ids;
+                // `announce` grants us high-bandwidth cmpctblocks.
+                peer.cmpct_v2 = version >= crate::message::SENDCMPCT_VERSION_WITNESS;
+                peer.cmpct_hb = peer.cmpct_v2 && announce;
+            }
+            SessionEvent::Message(Message::CmpctBlock(cb)) => {
+                // Unnegotiated cmpctblocks (no sendcmpct v2 on this
+                // link) are ignored politely, like Core.
+                if compact_enabled && peer.cmpct_v2 {
+                    peer.cmpct_recv += 1;
+                    // The header must exist in the index before the
+                    // reconstructed body can connect — hb announces
+                    // arrive without a preceding `headers` message.
+                    // Rejects (bad PoW, orphan) drop the whole thing:
+                    // no header, no compact block.
+                    if cs.accept_header(&cb.header, now).is_err() {
+                        return;
+                    }
+                    let recv_block = cb.header.hash();
+                    let recv_short = cb.shortids.len();
+                    match crate::compact::PartialBlock::begin(cb, mempool) {
+                        Ok(crate::compact::Reconstruct::Complete(block)) => {
+                            peer.cmpct_hit += 1;
+                            events.push(NetEvent::CompactReceived {
+                                peer: id,
+                                block: recv_block,
+                                short_ids: recv_short,
+                            });
+                            events.push(NetEvent::CompactHit {
+                                peer: id,
+                                block: recv_block,
+                            });
+                            // The reconstructed block takes the identical
+                            // connect path as a `block` delivery — header,
+                            // merkle, and full checks all re-run.
+                            Self::dispatch(
+                                id,
+                                peer,
+                                SessionEvent::Message(Message::Block(*block)),
+                                cs,
+                                now,
+                                addrbook,
+                                headers_leader,
+                                headers_sync_deadline,
+                                announce_tip,
+                                announce_tx,
+                                mempool,
+                                global_free,
+                                events,
+                                dead,
+                                serve_filters,
+                                outbound_nonces,
+                                stem_exclude,
+                                recent_deliveries,
+                                tx_serve_verdict,
+                                block_serve_verdict,
+                                block_serve_mode,
+                                compact_enabled,
+                                compact_serve,
+                                blocks_only,
+                                send_feefilter,
+                            );
+                        }
+                        Ok(crate::compact::Reconstruct::Partial(p)) => {
+                            peer.cmpct_getblocktxn += 1;
+                            events.push(NetEvent::CompactReceived {
+                                peer: id,
+                                block: recv_block,
+                                short_ids: recv_short,
+                            });
+                            events.push(NetEvent::CompactPatchRequest {
+                                peer: id,
+                                block: p.block_hash,
+                                missing: p.missing_len(),
+                            });
+                            let req = Message::GetBlockTxn(p.getblocktxn());
+                            peer.partial_blocks.push_back(*p);
+                            while peer.partial_blocks.len() > MAX_PARTIAL_BLOCKS {
+                                peer.partial_blocks.pop_front();
+                            }
+                            let _ = peer.session.send(&req);
+                        }
+                        Err(_) => {
+                            // Malformed layout — fall back to asking for
+                            // the whole block rather than disconnecting.
+                            peer.cmpct_fell_back += 1;
+                            events.push(NetEvent::CompactFallback {
+                                peer: id,
+                                block: recv_block,
+                            });
+                        }
+                    }
+                }
+            }
+            SessionEvent::Message(Message::GetBlockTxn(req)) => {
+                // `relay.block.serve`/`block.serve` gate: a blocked
+                // hash is silently ignored — same as never holding it.
+                let block_ok = block_serve_mode != "none"
+                    && Self::block_serve_allowed(
+                        block_serve_mode,
+                        block_serve_verdict,
+                        cs,
+                        &req.block_hash,
+                        id,
+                        peer,
+                    );
+                if compact_serve && block_ok {
+                    // `cs.body` serves any stored block — indexes are
+                    // differential-encoded absolute positions.
+                    if let Some(block) = cs.body(&req.block_hash) {
+                        let mut prev: i64 = -1;
+                        let mut txs = Vec::with_capacity(req.indexes.len());
+                        for &diff in &req.indexes {
+                            let idx = prev + i64::from(diff) + 1;
+                            prev = idx;
+                            if let Some(tx) = block
+                                .transactions
+                                .get(usize::try_from(idx).unwrap_or(usize::MAX))
+                            {
+                                txs.push(tx.clone());
+                            }
+                        }
+                        let _ = peer
+                            .session
+                            .send(&Message::BlockTxn(crate::message::BlockTxn {
+                                block_hash: req.block_hash,
+                                txs,
+                            }));
+                    }
+                }
+            }
+            SessionEvent::Message(Message::BlockTxn(bt)) => {
+                if let Some(pos) = peer
+                    .partial_blocks
+                    .iter()
+                    .position(|p| p.block_hash == bt.block_hash)
+                    && let Some(mut partial) = peer.partial_blocks.remove(pos)
+                {
+                    partial.fill(bt.txs);
+                    if partial.is_complete() {
+                        if let Some(block) = partial.into_block() {
+                            Self::dispatch(
+                                id,
+                                peer,
+                                SessionEvent::Message(Message::Block(block)),
+                                cs,
+                                now,
+                                addrbook,
+                                headers_leader,
+                                headers_sync_deadline,
+                                announce_tip,
+                                announce_tx,
+                                mempool,
+                                global_free,
+                                events,
+                                dead,
+                                serve_filters,
+                                outbound_nonces,
+                                stem_exclude,
+                                recent_deliveries,
+                                tx_serve_verdict,
+                                block_serve_verdict,
+                                block_serve_mode,
+                                compact_enabled,
+                                compact_serve,
+                                blocks_only,
+                                send_feefilter,
+                            );
+                        }
+                    } else {
+                        // Still short — the reply lied or raced;
+                        // ask for the whole block instead.
+                        peer.cmpct_fell_back += 1;
+                        events.push(NetEvent::CompactFallback {
+                            peer: id,
+                            block: bt.block_hash,
+                        });
+                        let _ =
+                            peer.session
+                                .send(&Message::GetData(vec![crate::message::InvVector {
+                                    inv_type: crate::message::InvType::WitnessBlock,
+                                    hash: bt.block_hash,
+                                }]));
+                    }
+                }
             }
             SessionEvent::Message(Message::Tx(tx)) => {
                 peer.last_tx_time = Some(i64::from(now));
@@ -2785,6 +3326,58 @@ impl<S: Read + Write> PeerManager<S> {
                         }
                     }
                     allowed = kept;
+                }
+                // `relay.block.serve` + `block.serve` — the block-side
+                // gate: `MSG_CMPCT_BLOCK` items are served compactly
+                // when negotiated; `block`/`witness-block` items pass
+                // the mode + verdict check or fall to `notfound`.
+                let mut compact_reqs = Vec::new();
+                {
+                    let mut kept = Vec::with_capacity(allowed.len());
+                    for inv in allowed.drain(..) {
+                        match inv.inv_type {
+                            crate::message::InvType::CompactBlock => compact_reqs.push(inv),
+                            crate::message::InvType::Block
+                            | crate::message::InvType::WitnessBlock => {
+                                if Self::block_serve_allowed(
+                                    block_serve_mode,
+                                    block_serve_verdict,
+                                    cs,
+                                    &inv.hash,
+                                    id,
+                                    peer,
+                                ) {
+                                    kept.push(inv);
+                                } else {
+                                    suppressed.push(inv);
+                                }
+                            }
+                            _ => kept.push(inv),
+                        }
+                    }
+                    allowed = kept;
+                }
+                if compact_serve {
+                    for inv in compact_reqs {
+                        let ok = Self::block_serve_allowed(
+                            block_serve_mode,
+                            block_serve_verdict,
+                            cs,
+                            &inv.hash,
+                            id,
+                            peer,
+                        );
+                        match (ok, cs.body(&inv.hash)) {
+                            (true, Some(body)) => {
+                                let _ = peer.session.send(&Message::CmpctBlock(
+                                    crate::compact::make_cmpctblock(&body),
+                                ));
+                            }
+                            _ => suppressed.push(inv),
+                        }
+                    }
+                } else {
+                    suppressed.extend(compact_reqs);
                 }
                 PeerSync::serve_getdata(cs, Some(mempool), &allowed, |reply| {
                     peer.session.send(reply).is_ok()
@@ -2999,7 +3592,7 @@ impl<S: Read + Write> PeerManager<S> {
                 // pool lets it read our mempool over a link it didn't
                 // even open. And one request per interval — repeats
                 // are bandwidth amplification, not sync.
-                if !peer.inbound {
+                if !peer.inbound || blocks_only {
                     return;
                 }
                 if let Some(t) = peer.mempool_req_last
@@ -3456,6 +4049,9 @@ impl PeerManager<TcpStream> {
             return Ok(None);
         }
         let mut version = build_version(our_version, start_height, remote, (self.clock)());
+        // fRelay: ask for transaction announcements unless blocks-only
+        // (Core's -blocksonly suppresses them in both directions).
+        version.relay = !self.blocks_only;
         if use_v2 {
             // GetLocalServices() — advertise NODE_P2P_V2 like Core's
             // `-v2transport`.
@@ -3491,6 +4087,7 @@ impl PeerManager<TcpStream> {
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
         let mut version = build_version(our_version, start_height, remote, (self.clock)());
+        version.relay = !self.blocks_only;
         if self.serve_filters {
             version.services |= crate::message::NODE_COMPACT_FILTERS;
         }
@@ -3519,6 +4116,7 @@ impl PeerManager<TcpStream> {
         let tx = self.inbound_tx.clone();
         let remote_addr = crate::addrman::net_addr_of(remote, 0);
         let mut version = build_version(our_version, start_height, remote_addr, (self.clock)());
+        version.relay = !self.blocks_only;
         if self.serve_filters {
             version.services |= crate::message::NODE_COMPACT_FILTERS;
         }
@@ -3853,6 +4451,7 @@ impl PeerManager<TcpStream> {
         let _ = getrandom::fill(&mut nonce_bytes);
         let nonce = u64::from_le_bytes(nonce_bytes);
         let mut version = build_version(nonce, start_height, remote, (self.clock)());
+        version.relay = !self.blocks_only;
         if use_v2 {
             version.services |= NODE_P2P_V2;
         }
@@ -3971,6 +4570,11 @@ const MAX_MEMPOOL_INV: usize = 50_000;
 /// Inbound handshakes in flight at once — past this cap the listener
 /// drops accepted sockets rather than queue unbounded workers.
 const MAX_PENDING_ACCEPTS: usize = 32;
+
+/// Blocks mid-reconstruction per peer — a `cmpctblock` awaiting its
+/// `blocktxn`. Small: each holds a slot vector sized to the block;
+/// four deep covers reorg bursts without an unbounded buffer.
+const MAX_PARTIAL_BLOCKS: usize = 4;
 
 /// The v1 transport's fixed 16-byte prefix on the wire: network magic
 /// followed by the padded `version` command. An inbound peer sending
@@ -4170,7 +4774,9 @@ mod tests {
     };
     use crate::testchain::{self, chain_blocks, regtest};
     use crate::testpipe::{self, End};
+    use avila_consensus::block::Block;
     use avila_consensus::hash::BlockHash;
+    use avila_consensus::transaction::Transaction;
 
     const MAGIC: [u8; 4] = [0xfa, 0xbf, 0xb5, 0xda]; // regtest
     const NOW: u32 = 1_800_000_000;
@@ -5121,6 +5727,107 @@ mod tests {
         );
     }
 
+    /// The hb-announces path: a compact-negotiated peer receives the
+    /// new tip as `cmpctblock`, not headers/inv — and the block body
+    /// must be readable for `make_cmpctblock` right after connect.
+    #[test]
+    fn connected_tip_announces_cmpctblock_to_negotiated_peers() {
+        let (mut mgr, mut peer_a, _id_a) = managed_peer();
+        mgr.set_compact_relay(true, true, true, "");
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 2);
+        for b in &blocks {
+            cs.accept_header(&b.header, NOW).unwrap();
+        }
+        let (mut peer_b, _id_b) = add_peer(&mut mgr);
+        let (mut peer_c, _id_c) = add_peer(&mut mgr);
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        handshake_peer(&mut mgr, &mut peer_b, &mut cs);
+        handshake_peer(&mut mgr, &mut peer_c, &mut cs);
+        testpipe::drain(&mut peer_a, MAGIC);
+        testpipe::drain(&mut peer_b, MAGIC);
+        testpipe::drain(&mut peer_c, MAGIC);
+        // B negotiates compact v2 (post-verack, the way Core does it);
+        // C does not — it stays on the inv path.
+        testpipe::inject(
+            &mut peer_b,
+            MAGIC,
+            &Message::SendCmpct {
+                announce: true,
+                version: 2,
+            },
+        );
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer_b, MAGIC);
+
+        testpipe::inject(&mut peer_a, MAGIC, &Message::Block(blocks[0].clone()));
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let sent_b = testpipe::drain(&mut peer_b, MAGIC);
+        let sent_c = testpipe::drain(&mut peer_c, MAGIC);
+        assert!(
+            sent_b.iter().any(|m| matches!(
+                m,
+                Message::CmpctBlock(cb) if cb.header.hash() == blocks[0].block_hash()
+            )),
+            "compact peer should get a cmpctblock announce: {sent_b:?}"
+        );
+        assert!(
+            !sent_b
+                .iter()
+                .any(|m| matches!(m, Message::Headers(_) | Message::Inv(_))),
+            "hb peer must not also get a headers/inv announce: {sent_b:?}"
+        );
+        assert!(
+            sent_c.iter().any(|m| matches!(m, Message::Inv(_))),
+            "non-compact peer keeps the inv path: {sent_c:?}"
+        );
+    }
+
+    /// Live-wire shape: a block connected *via compact reconstruction*
+    /// still fans out — the announce loop must not lose the tip when
+    /// the connect happened through `PartialBlock` recursion.
+    #[test]
+    fn compact_connected_tip_is_relayed_to_compact_peers() {
+        let (mut mgr, mut peer_a, _id_a) = managed_peer();
+        mgr.set_compact_relay(true, true, true, "");
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 2);
+        for b in &blocks {
+            cs.accept_header(&b.header, NOW).unwrap();
+        }
+        let (mut peer_b, _id_b) = add_peer(&mut mgr);
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        handshake_peer(&mut mgr, &mut peer_b, &mut cs);
+        for p in [&mut peer_a, &mut peer_b] {
+            testpipe::inject(
+                p,
+                MAGIC,
+                &Message::SendCmpct {
+                    announce: true,
+                    version: 2,
+                },
+            );
+        }
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer_a, MAGIC);
+        testpipe::drain(&mut peer_b, MAGIC);
+
+        // A delivers the tip as a compact block — a full pool hit.
+        let cb = crate::compact::make_cmpctblock(&blocks[0]);
+        testpipe::inject(&mut peer_a, MAGIC, &Message::CmpctBlock(cb));
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let sent_b = testpipe::drain(&mut peer_b, MAGIC);
+        assert!(
+            sent_b.iter().any(|m| matches!(
+                m,
+                Message::CmpctBlock(cb) if cb.header.hash() == blocks[0].block_hash()
+            )),
+            "compact-connected tip must announce compact to B: {sent_b:?}"
+        );
+    }
+
     /// Audit reproducer — a block whose script check fails, delivered
     /// over a real session as the LAST block of a batch shorter than
     /// the speculative window, with no further deliveries: it must
@@ -5446,6 +6153,241 @@ mod tests {
             !sent_a.iter().any(|m| matches!(m, Message::Inv(vs)
                 if vs.iter().any(|v| v.hash.as_bytes() == txid.as_bytes()))),
             "source peer must not hear its own tx back: {sent_a:?}"
+        );
+    }
+
+    /// Drives a handshake where the peer advertises `sendcmpct` —
+    /// `Some(hb)` requests high-bandwidth announcements — plus v2.
+    fn handshake_cmpct(
+        mgr: &mut PeerManager<End>,
+        peer: &mut End,
+        cs: &mut Chainstate,
+        hb: bool,
+    ) -> Vec<NetEvent> {
+        let mut events = mgr.tick(cs, NOW);
+        let _ = testpipe::drain(peer, MAGIC);
+        testpipe::inject(peer, MAGIC, &Message::Version(peer_version(600)));
+        testpipe::inject(
+            peer,
+            MAGIC,
+            &Message::SendCmpct {
+                announce: hb,
+                version: crate::message::SENDCMPCT_VERSION_WITNESS,
+            },
+        );
+        events.extend(mgr.tick(cs, NOW));
+        testpipe::inject(peer, MAGIC, &Message::Verack);
+        events.extend(mgr.tick(cs, NOW));
+        events
+    }
+
+    /// The OP_TRUE spend of `blocks[0]`'s coinbase (mature at 101) —
+    /// the same fixture `accepted_tx_relays_to_other_peers` uses.
+    fn spend_fixture(blocks: &[Block]) -> Transaction {
+        use avila_consensus::transaction::{OutPoint, Script, TxIn, TxOut, Witness};
+        use avila_consensus::{script, transaction::Transaction};
+        Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: blocks[0].transactions[0].txid(),
+                    vout: 0,
+                },
+                script_sig: Script::new(vec![]),
+                sequence: 0xffff_ffff,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 4_999_000_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        }
+    }
+
+    #[test]
+    fn cmpctblock_reconstructs_from_pool_and_connects() {
+        use crate::testchain::{block_on_txs, coinbase_tx};
+        let (mut mgr, mut peer, _id) = managed_peer();
+        mgr.mempool().set_require_standard(false);
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 101);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        handshake_cmpct(&mut mgr, &mut peer, &mut cs, true);
+        testpipe::drain(&mut peer, MAGIC);
+        testpipe::inject(&mut peer, MAGIC, &Message::Headers(vec![]));
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer, MAGIC);
+
+        // The peer relays the spend to us — it lands in the pool, then
+        // the compact block's short-id resolves locally.
+        let tx = spend_fixture(&blocks);
+        testpipe::inject(&mut peer, MAGIC, &Message::Tx(tx.clone()));
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        assert!(mgr.mempool().get(&tx.txid()).is_some());
+        let params = *cs.tree().params();
+        let block = block_on_txs(&blocks[100].header, vec![coinbase_tx(102), tx], &params);
+        let cb = crate::compact::make_cmpctblock(&block);
+        testpipe::inject(&mut peer, MAGIC, &Message::CmpctBlock(cb));
+        // Reconstruct → dispatch as Block → connect; announce → flush.
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        assert_eq!(
+            cs.chain().len(),
+            103,
+            "compact-delivered block should connect"
+        );
+    }
+
+    #[test]
+    fn cmpctblock_missing_tx_roundtrips_getblocktxn() {
+        use crate::testchain::{block_on_txs, coinbase_tx};
+        let (mut mgr, mut peer, _id) = managed_peer();
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 101);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        handshake_cmpct(&mut mgr, &mut peer, &mut cs, false);
+        testpipe::drain(&mut peer, MAGIC);
+        testpipe::inject(&mut peer, MAGIC, &Message::Headers(vec![]));
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer, MAGIC);
+
+        // The block carries a tx we never saw — slot 1 stays missing.
+        use avila_consensus::script;
+        use avila_consensus::transaction::{OutPoint, Script, TxIn, TxOut, Witness};
+        let unseen = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: blocks[0].transactions[0].txid(),
+                    vout: 0,
+                },
+                script_sig: Script::new(vec![]),
+                sequence: 0xffff_ffff,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 4_999_000_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let params = *cs.tree().params();
+        let block = block_on_txs(
+            &blocks[100].header,
+            vec![coinbase_tx(102), unseen.clone()],
+            &params,
+        );
+        let hash = block.block_hash();
+        let cb = crate::compact::make_cmpctblock(&block);
+        testpipe::inject(&mut peer, MAGIC, &Message::CmpctBlock(cb));
+        // Reconstruction finds slot 1 missing → queues getblocktxn,
+        // which flushes on the following tick.
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let sent = testpipe::drain(&mut peer, MAGIC);
+        let ask = sent.iter().find_map(|m| match m {
+            Message::GetBlockTxn(r) => Some(r.clone()),
+            _ => None,
+        });
+        let ask = ask.unwrap_or_else(|| panic!("getblocktxn expected: {sent:?}"));
+        assert_eq!(ask.block_hash, hash);
+        assert_eq!(ask.indexes, vec![1u32], "slot 1's differential index");
+
+        // The peer answers; reconstruction completes and connects.
+        testpipe::inject(
+            &mut peer,
+            MAGIC,
+            &Message::BlockTxn(crate::message::BlockTxn {
+                block_hash: hash,
+                txs: vec![unseen],
+            }),
+        );
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        assert_eq!(cs.chain().len(), 103);
+    }
+
+    #[test]
+    fn cmpctblock_without_negotiation_is_ignored() {
+        let (mut mgr, mut peer, _id) = managed_peer();
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 2);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        handshake(&mut mgr, &mut peer, &mut cs);
+        testpipe::drain(&mut peer, MAGIC);
+        // No sendcmpct was exchanged — a cmpctblock is unsolicited spam;
+        // ignore, don't disconnect (BIP152 doesn't punish it).
+        let cb = crate::compact::make_cmpctblock(&blocks[1]);
+        testpipe::inject(&mut peer, MAGIC, &Message::CmpctBlock(cb));
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, NetEvent::Disconnected { .. })),
+            "{events:?}"
+        );
+        assert_eq!(cs.chain().len(), 3);
+    }
+
+    #[test]
+    fn blocks_only_and_announce_none_silence_tx_relay() {
+        let (mut mgr, mut peer_a, _id_a) = managed_peer();
+        mgr.mempool().set_require_standard(false);
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 101);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        let (mut peer_b, _id_b) = add_peer(&mut mgr);
+        handshake(&mut mgr, &mut peer_a, &mut cs);
+        handshake_peer(&mut mgr, &mut peer_b, &mut cs);
+        for p in [&mut peer_a, &mut peer_b] {
+            testpipe::inject(p, MAGIC, &Message::Headers(vec![]));
+            testpipe::drain(p, MAGIC);
+        }
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer_a, MAGIC);
+        testpipe::drain(&mut peer_b, MAGIC);
+
+        // blocks_only: A's tx announce produces no fetch request.
+        mgr.set_blocks_only(true);
+        let tx = spend_fixture(&blocks);
+        testpipe::inject(
+            &mut peer_a,
+            MAGIC,
+            &Message::Inv(vec![InvVector {
+                inv_type: InvType::Tx,
+                hash: BlockHash::from_bytes(*tx.txid().as_bytes()),
+            }]),
+        );
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let sent = testpipe::drain(&mut peer_a, MAGIC);
+        assert!(
+            !sent.iter().any(|m| matches!(m, Message::GetData(_))),
+            "blocks_only fetches nothing: {sent:?}"
+        );
+
+        // announce=none: a relayed tx never leaves as inv.
+        mgr.set_blocks_only(false);
+        mgr.set_tx_relay("none", true, false, 0, true, 60);
+        testpipe::inject(&mut peer_a, MAGIC, &Message::Tx(tx.clone()));
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer_a, MAGIC);
+        let sent_b = testpipe::drain(&mut peer_b, MAGIC);
+        assert!(
+            !sent_b.iter().any(|m| matches!(m, Message::Inv(vs)
+                if vs.iter().any(|v| v.hash.as_bytes() == tx.txid().as_bytes()))),
+            "announce=none announces nothing: {sent_b:?}"
         );
     }
 

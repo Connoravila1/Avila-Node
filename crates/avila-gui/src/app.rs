@@ -12,7 +12,7 @@ use crate::session::{ActivityKind, Phase, RunSettings, Session};
 use crate::theme::{self, Palette, Skin, font};
 use crate::toybox;
 use crate::widgets::{self, Kind, hatch};
-use crate::{brand, model, xp};
+use crate::{brand, model, phosphor, xp};
 use avila_node::Node;
 use avila_node::events::NodeEvent;
 use eframe::egui::{
@@ -38,7 +38,10 @@ pub struct App {
     peer_sort: PeerSort,
     /// The Chain page's zoom into the ribbon.
     ribbon_view: View,
-    game: toybox::Game,
+    /// The toybox's shelf: every game, the hash-fed toys, the confetti.
+    toys: toybox::Toys,
+    /// The toy a capture posed, so it isn't re-posed every frame.
+    toy_posed: u8,
     /// The preferences last put in force; any change re-applies them.
     applied: Prefs,
     /// The Windows XP skin's desktop.
@@ -96,13 +99,16 @@ impl App {
         if let Some(choice) = theme_override {
             prefs.theme = choice;
         }
-        // `AVILA_GUI_SKIN=xp` (or `julia`) wears a toybox skin for this
-        // run only, for development.
+        // `AVILA_GUI_SKIN=xp` (or `julia`, `tip`, `phosphor`, `classic`)
+        // wears a toybox skin for this run only, for development.
         let skin = std::env::var("AVILA_GUI_SKIN")
             .ok()
             .map(|s| match s.as_str() {
                 "xp" => Skin::Xp,
                 "julia" => Skin::Julia,
+                "tip" => Skin::Tip,
+                "phosphor" => Skin::Phosphor,
+                "classic" => Skin::Classic,
                 _ => Skin::Standard,
             });
         if let Some(skin) = skin {
@@ -123,6 +129,21 @@ impl App {
         // page opens.
         if let Some(mb) = node.config().get().storage.prune_mb {
             run.prune_mib = mb.to_string();
+        }
+        // `net.connect` in the config seeds the same field — running
+        // the GUI against a file should connect to its peers, not the
+        // hardcoded regtest default.
+        let connect = node
+            .config()
+            .get()
+            .net
+            .connect
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !connect.is_empty() {
+            run.connect = connect;
         }
         let applied = prefs.clone();
         let mut session = Session::new(demo);
@@ -179,7 +200,8 @@ impl App {
             sky: Constellation::default(),
             peer_sort: PeerSort::default(),
             ribbon_view: View::default(),
-            game: toybox::Game::default(),
+            toys: toybox::Toys::default(),
+            toy_posed: 0,
             applied,
             xp: xp::Xp::default(),
             history: Vec::new(),
@@ -261,7 +283,7 @@ impl App {
                         self.prefs.hide_addresses,
                     ),
                     Page::Toybox => {
-                        toybox::show(ui, &scene, &mut self.game, &mut self.prefs);
+                        toybox::show(ui, &scene, &mut self.toys, &mut self.prefs);
                         None
                     }
                     Page::Settings => pages::settings::show(
@@ -528,6 +550,15 @@ impl eframe::App for App {
             self.start();
         }
         self.session.poll();
+        // The Tip skin's seed is the tip's hash — a new block repaints
+        // the whole node in the hash's hue.
+        let seed = tip_hash_seed(&self.session);
+        if seed != theme::tip_seed() {
+            theme::set_tip_seed(seed);
+            if Skin::current() == Skin::Tip {
+                theme::set_skin(&ctx, Skin::Tip);
+            }
+        }
         // Stream events into the activity log — bounded per frame so
         // a busy tick can't stall the render.
         if let Some(tail) = &mut self.events_tail {
@@ -563,8 +594,13 @@ impl eframe::App for App {
             {
                 v.eclipse = vec![crate::model::Eclipse::DiversityCollapse];
             }
-            self.prefs.toybox |= pose.page == Page::Toybox || pose.skin != Skin::Standard;
+            self.prefs.toybox |=
+                pose.page == Page::Toybox || pose.skin != Skin::Standard || pose.toy > 0;
             self.prefs.skin = pose.skin;
+            if pose.toy > 0 && self.toy_posed != pose.toy {
+                self.toys.pose(pose.toy);
+            }
+            self.toy_posed = pose.toy;
             self.xp.start_open = pose.desk == crate::capture::Desk::StartMenu;
             self.xp.restored = pose.desk == crate::capture::Desk::Restored;
             self.xp.dialog = match pose.desk {
@@ -573,15 +609,15 @@ impl eframe::App for App {
                 _ => xp::Dialog::None,
             };
             if pose.play {
-                if !self.game.animating() {
-                    self.game.demo();
+                if !self.toys.game.animating() {
+                    self.toys.game.demo();
                 }
             } else if pose.over {
-                if !self.game.over() {
-                    self.game.demo_over();
+                if !self.toys.game.over() {
+                    self.toys.game.demo_over();
                 }
             } else {
-                self.game.shelve();
+                self.toys.game.shelve();
             }
             self.page = pose.page;
             self.prefs.scale = pose.scale;
@@ -704,6 +740,9 @@ impl eframe::App for App {
                             action = page_action;
                         }
                     });
+                    if phosphor::on() {
+                        phosphor::overlay(ui.painter(), top, ui.input(|i| i.time));
+                    }
                 });
         }
 
@@ -754,9 +793,9 @@ impl eframe::App for App {
             .pulse()
             .is_some();
         let settling = (self.page == Page::Peers && self.sky.animating())
-            || (self.page == Page::Toybox && self.game.animating());
+            || (self.page == Page::Toybox && self.toys.animating());
         let benching = self.bench.as_ref().is_some_and(Bench::forcing);
-        if self.capture.is_some() || pulsing || settling || benching {
+        if self.capture.is_some() || pulsing || settling || benching || phosphor::on() {
             ctx.request_repaint();
         } else if self.session.running() {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -822,6 +861,18 @@ fn demo_badge(ui: &mut Ui, pal: Palette) {
     resp.on_hover_text("Started with --demo. Nothing on screen comes from the network.");
 }
 
+/// The Tip skin's seed: the newest block hash's low 64 bits.
+fn tip_hash_seed(session: &Session) -> u64 {
+    session
+        .view
+        .as_ref()
+        .and_then(|v| v.recent.last())
+        .and_then(|(_, h)| {
+            u64::from_str_radix(&h[h.len().saturating_sub(16)..], 16).ok()
+        })
+        .unwrap_or(0xF7_8B)
+}
+
 fn network_name(network: avila_core::Network) -> &'static str {
     match network {
         avila_core::Network::Mainnet => "Mainnet",
@@ -866,6 +917,27 @@ fn stream_text(ev: &serde_json::Value) -> Option<String> {
         ),
         "peer_disconnected" => format!("Peer {} disconnected: {}.", num("peer"), txt("reason")),
         "tip_advanced" => format!("Tip is height {}.", num("height")),
+        "compact_received" => format!(
+            "Peer {} sent a compact block ({} short ids).",
+            num("peer"),
+            num("short_ids")
+        ),
+        "compact_hit" => format!(
+            "Compact block {} rebuilt from the pool — peer {}.",
+            txt("block").chars().take(16).collect::<String>(),
+            num("peer")
+        ),
+        "compact_patch_request" => format!(
+            "Compact block {} missing {} txs — asked peer {} for the patch.",
+            txt("block").chars().take(16).collect::<String>(),
+            num("missing"),
+            num("peer")
+        ),
+        "compact_fallback" => format!(
+            "Compact block {} fell back to a full download — peer {}.",
+            txt("block").chars().take(16).collect::<String>(),
+            num("peer")
+        ),
         "config_risk" => format!("Configuration risk — {}: {}", txt("path"), txt("message")),
         "hook_spawn_failed" => format!(
             "Hook {} failed to start ({}) — answering its timeout default.",

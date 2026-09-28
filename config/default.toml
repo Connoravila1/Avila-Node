@@ -22,6 +22,11 @@ event_capacity = 256
 # listen = "0.0.0.0:8333"             # Core's -listen=<addr>; absent = outbound-only
 # asmap = "asmap.txt"                 # Core's -asmap; relative to this file
 # dns_seeds = true                    # Core's -dnsseed
+# blocks_only = false                 # Core's -blocksonly — no tx relay
+                                     # at all: no announces, no
+                                     # inv-triggered fetches, no mempool
+                                     # dumps, no recon, no rebroadcast.
+                                     # Mempool still serves the wallet.
 
 # [peers]
 # max_connections = 8                 # Core's -maxconnections
@@ -61,6 +66,18 @@ event_capacity = 256
                                      # dst: inbound|outbound
                                      # e.g. ["inbound->inbound",
                                      #       "extrapool->inbound"]
+# announce = "all"                    # tx fan-out: all | private_only
+                                     # (mempool.private entries only) |
+                                     # none (announce nothing)
+# to_inbound = true                   # announce txs onto inbound links
+# to_blocks_only_peers = false        # announce to peers whose version
+                                     # said relay=false (overrides them)
+# send_feefilter = 0                  # advertise our mempool floor
+                                     # (sat/kvB) to peers; 0 = silent
+                                     # like Core
+# rebroadcast_local = true            # retry local txs until they
+                                     # confirm (Core's -walletbroadcast)
+# rebroadcast_interval = 60           # seconds between retry passes
 
 # External verdict helpers — docs/DECISION_REGISTRY.md. Each
 # [[hooks.peer_accept]] is a long-lived subprocess: the node writes
@@ -135,6 +152,7 @@ event_capacity = 256
                                      # ["tip"] retries all entries on
                                      # each connected block (full
                                      # validation, bounded per tip).
+
 # [extrapool.caps]                    # per-reject-class entry caps —
                                      # the oldest of a class evicts when
                                      # it exceeds its cap. Classes:
@@ -153,6 +171,44 @@ event_capacity = 256
                                      # on-chain; conflicts with chosen
                                      # pool txs are skipped. At most 512
                                      # entries audition per template.
+# max_weight = 4000000                # template weight cap — Core's
+                                     # -blockmaxweight; clamps to the
+                                     # consensus bound, never beyond
+# min_tx_fee = 0                      # package floor (sat/kvB) — Core's
+                                     # -blockmintxfee
+# reserved_weight = 8000              # coinbase/commitment budget — Core's
+                                     # -blockreservedweight (≥2000)
+
+# [relay.block]
+# compact = true                      # BIP152 sendcmpct/cmpctblock
+# compact_high_bandwidth = true       # ask peers for hb cmpctblock
+# compact_serve = true                # honor peers' hb asks (≤3 links)
+                                     # and answer getblocktxn
+# announce = ""                       # tip announce: "" = peer's
+                                     # negotiated preference;
+                                     # headers | inv | none override
+# serve = "full"                      # block bodies: full | tip
+                                     # (checked tip ± reorg slack) |
+                                     # none (notfound everything)
+
+# [[hooks.block_serve]] — consulted per block item in getdata and on
+# each getblocktxn; "reject" answers notfound. Facts: block_hash,
+# peer, peer_addr, peer_inbound, peer_user_agent.
+# [[hooks.block_serve]]
+# program = "/usr/local/sbin/serve-block"
+# timeout_ms = 100
+# on_timeout = "reject"
+# on_defer = "reject"
+# max_restarts = 3
+#
+# [[hooks.template_build]] — veto assembled block templates.
+# Facts: height, tx_count, weight, sigops, fees.
+# [[hooks.template_build]]
+# program = "/usr/local/sbin/veto-template"
+# timeout_ms = 1000
+# on_timeout = "accept"
+# on_defer = "accept"
+# max_restarts = 3
 
 # [filters]
 # build = false                       # Core's -blockfilterindex

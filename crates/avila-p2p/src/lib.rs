@@ -27,6 +27,7 @@ pub mod asmap;
 pub mod banman;
 pub mod bip324;
 pub mod codec;
+pub mod compact;
 pub mod headerssync;
 pub mod manager;
 pub mod message;

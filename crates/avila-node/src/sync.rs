@@ -403,6 +403,23 @@ pub struct SyncConfig {
     /// `mining.include_extrapool` — audition observation-pool entries
     /// for a template's leftover budget (consensus-revalidated).
     pub mine_extrapool: bool,
+    /// `block.serve` verdict helpers — per block item on `getdata` and
+    /// each `getblocktxn`; `reject` answers `notfound`.
+    pub block_serve_hooks: Vec<crate::hooks::HookSpec>,
+    /// `template.build` verdict helpers — veto assembled templates.
+    pub template_build_hooks: Vec<crate::hooks::HookSpec>,
+    /// `net.blocks_only` — silence tx relay in every direction.
+    pub blocks_only: bool,
+    /// `relay.block.*` — `(compact, compact_high_bandwidth,
+    /// compact_serve, announce, serve)`.
+    pub relay_block: (bool, bool, bool, String, String),
+    /// `relay.tx.*` announce/reach/retry policy — `(announce_mode,
+    /// to_inbound, to_blocks_only_peers, send_feefilter,
+    /// rebroadcast_local, rebroadcast_interval)`.
+    pub relay_tx: (String, bool, bool, u64, bool, u32),
+    /// `mining.*` template budgets — `(max_weight, min_tx_fee,
+    /// reserved_weight)`.
+    pub mining_budgets: (Option<usize>, i64, Option<usize>),
     /// `[extrapool]` — the observation pool for policy rejects.
     pub extrapool: avila_core::ExtrapoolConfig,
     /// `peers.ban_time` — default `setban` duration (Core's `-bantime`).
@@ -459,6 +476,12 @@ impl Default for SyncConfig {
             private_submissions: false,
             tx_serve_hooks: Vec::new(),
             mine_extrapool: false,
+            block_serve_hooks: Vec::new(),
+            template_build_hooks: Vec::new(),
+            blocks_only: false,
+            relay_block: (true, true, true, String::new(), "full".to_string()),
+            relay_tx: ("all".to_string(), true, false, 0, true, 60),
+            mining_budgets: (None, 0, None),
             shadow_profiles: vec!["strict".to_string()],
             extrapool: avila_core::ExtrapoolConfig::default(),
             ban_time: avila_p2p::banman::DEFAULT_BANTIME,
@@ -925,6 +948,32 @@ pub fn run(
     mgr.set_deny_pairs(cfg.deny_pairs.clone());
     mgr.set_private_submissions(cfg.private_submissions);
     mgr.mempool().set_mine_extrapool(cfg.mine_extrapool);
+    // `relay.block.*` / `net.blocks_only` / `relay.tx.*` / `mining.*`.
+    mgr.set_compact_relay(
+        cfg.relay_block.0,
+        cfg.relay_block.1,
+        cfg.relay_block.2,
+        &cfg.relay_block.3,
+    );
+    mgr.set_blocks_only(cfg.blocks_only);
+    mgr.set_tx_relay(
+        &cfg.relay_tx.0,
+        cfg.relay_tx.1,
+        cfg.relay_tx.2,
+        cfg.relay_tx.3,
+        cfg.relay_tx.4,
+        cfg.relay_tx.5,
+    );
+    mgr.mempool().set_block_min_fee(cfg.mining_budgets.1);
+    if let Some(w) = cfg.mining_budgets.0 {
+        mgr.mempool().set_block_max_weight(w);
+    }
+    if let Some(w) = cfg.mining_budgets.2 {
+        mgr.mempool().set_block_reserved_weight(w);
+    }
+    // `relay.block.serve` mode rides in even without a hook — the
+    // verdict is layered on below when `block.serve` is configured.
+    mgr.set_block_serve(&cfg.relay_block.4, None);
     mgr.set_max_in_flight_total(cfg.max_in_transit);
     mgr.set_default_ban_time(cfg.ban_time);
     // The append-only event plane (docs/DECISION_REGISTRY.md — the
@@ -1320,6 +1369,171 @@ pub fn run(
                             },
                             "txid": txid.as_str(),
                             "peer": peer,
+                            "admit": admit,
+                        }))
+                        .is_err()
+                    {
+                        dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    admit
+                })
+            },
+        )));
+    }
+    // `block.serve` — same conjunctive gate on the block side of
+    // `getdata` (plus `getblocktxn`); facts carry the hash and peer.
+    if !cfg.block_serve_hooks.is_empty() {
+        use avila_core::OnDefault;
+        let mut helpers: Vec<(crate::hooks::HookSpec, Option<crate::hooks::VerdictHelper>)> = cfg
+            .block_serve_hooks
+            .iter()
+            .map(
+                |spec| match crate::hooks::VerdictHelper::spawn(spec.clone()) {
+                    Ok(h) => (spec.clone(), Some(h)),
+                    Err(e) => {
+                        eprintln!(
+                            "hooks.block_serve {}: spawn failed ({e}) — \
+                             answering {:?} for every serve",
+                            spec.program.display(),
+                            spec.on_timeout
+                        );
+                        emit(
+                            &mut stream,
+                            "hook_spawn_failed",
+                            serde_json::json!({
+                                "point": "block.serve",
+                                "program": spec.program.display().to_string(),
+                                "on_timeout": format!("{:?}", spec.on_timeout),
+                            }),
+                        );
+                        (spec.clone(), None)
+                    }
+                },
+            )
+            .collect();
+        let hook_tx = hook_events_tx.clone();
+        let dropped = hook_events_dropped.clone();
+        mgr.set_block_serve(
+            &cfg.relay_block.4,
+            Some(Box::new(
+                move |facts: &avila_p2p::manager::BlockServeFacts| {
+                    let hash = facts.block_hash.to_string();
+                    let peer = facts.peer;
+                    let facts = serde_json::json!({
+                        "block_hash": hash.clone(),
+                        "peer": peer,
+                        "peer_addr": facts.peer_addr,
+                        "peer_inbound": facts.peer_inbound,
+                        "peer_user_agent": facts.peer_user_agent,
+                    });
+                    helpers.iter_mut().all(|(spec, h)| {
+                        let verdict = match h {
+                            Some(h) => h.verdict("block.serve", &facts),
+                            None => match spec.on_timeout {
+                                OnDefault::Accept => crate::hooks::Verdict::Accept,
+                                OnDefault::Reject => crate::hooks::Verdict::Reject,
+                            },
+                        };
+                        let admit = match verdict {
+                            crate::hooks::Verdict::Accept => true,
+                            crate::hooks::Verdict::Reject => false,
+                            crate::hooks::Verdict::Defer => {
+                                matches!(spec.on_defer, OnDefault::Accept)
+                            }
+                        };
+                        if hook_tx
+                            .try_send(serde_json::json!({
+                                "kind": "hook_verdict",
+                                "point": "block.serve",
+                                "helper": spec.program.display().to_string(),
+                                "verdict": match verdict {
+                                    crate::hooks::Verdict::Accept => "accept",
+                                    crate::hooks::Verdict::Reject => "reject",
+                                    crate::hooks::Verdict::Defer => "defer",
+                                },
+                                "block_hash": hash.as_str(),
+                                "peer": peer,
+                                "admit": admit,
+                            }))
+                            .is_err()
+                        {
+                            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        admit
+                    })
+                },
+            )),
+        );
+    }
+    // `template.build` — a per-template veto; the verdict sees the
+    // assembled shape and can only decline it.
+    if !cfg.template_build_hooks.is_empty() {
+        use avila_core::OnDefault;
+        let mut helpers: Vec<(crate::hooks::HookSpec, Option<crate::hooks::VerdictHelper>)> = cfg
+            .template_build_hooks
+            .iter()
+            .map(
+                |spec| match crate::hooks::VerdictHelper::spawn(spec.clone()) {
+                    Ok(h) => (spec.clone(), Some(h)),
+                    Err(e) => {
+                        eprintln!(
+                            "hooks.template_build {}: spawn failed ({e}) — \
+                             answering {:?} for every build",
+                            spec.program.display(),
+                            spec.on_timeout
+                        );
+                        emit(
+                            &mut stream,
+                            "hook_spawn_failed",
+                            serde_json::json!({
+                                "point": "template.build",
+                                "program": spec.program.display().to_string(),
+                                "on_timeout": format!("{:?}", spec.on_timeout),
+                            }),
+                        );
+                        (spec.clone(), None)
+                    }
+                },
+            )
+            .collect();
+        let hook_tx = hook_events_tx.clone();
+        let dropped = hook_events_dropped.clone();
+        mgr.mempool().set_template_hook(Some(Box::new(
+            move |height, tx_count, weight, sigops, fees| {
+                let facts = serde_json::json!({
+                    "height": height,
+                    "tx_count": tx_count,
+                    "weight": weight,
+                    "sigops": sigops,
+                    "fees": fees,
+                });
+                helpers.iter_mut().all(|(spec, h)| {
+                    let verdict = match h {
+                        Some(h) => h.verdict("template.build", &facts),
+                        None => match spec.on_timeout {
+                            OnDefault::Accept => crate::hooks::Verdict::Accept,
+                            OnDefault::Reject => crate::hooks::Verdict::Reject,
+                        },
+                    };
+                    let admit = match verdict {
+                        crate::hooks::Verdict::Accept => true,
+                        crate::hooks::Verdict::Reject => false,
+                        crate::hooks::Verdict::Defer => {
+                            matches!(spec.on_defer, OnDefault::Accept)
+                        }
+                    };
+                    if hook_tx
+                        .try_send(serde_json::json!({
+                            "kind": "hook_verdict",
+                            "point": "template.build",
+                            "helper": spec.program.display().to_string(),
+                            "verdict": match verdict {
+                                crate::hooks::Verdict::Accept => "accept",
+                                crate::hooks::Verdict::Reject => "reject",
+                                crate::hooks::Verdict::Defer => "defer",
+                            },
+                            "height": height,
+                            "tx_count": tx_count,
                             "admit": admit,
                         }))
                         .is_err()
@@ -1777,10 +1991,24 @@ pub fn run(
         {
             eprintln!("sync: deferred script check failed: {e}");
         }
+        let mut deferred_tip = None;
         for (h, hash) in cs.take_checked() {
             if let Some(body) = cs.body(&hash) {
                 mgr.mempool().on_block_connected(&body, h);
             }
+            deferred_tip = Some(h);
+        }
+        // Deferred script checks resolve after the dispatch that
+        // connected them — the manager only emits TipAdvanced for the
+        // set it drained in-tick, so the tail publishes here (one
+        // event per drain's last height, matching its semantics).
+        if let Some(h) = deferred_tip {
+            emit(
+                &mut stream,
+                "tip_advanced",
+                serde_json::json!({"height": h}),
+            );
+            mgr.announce_tip(&cs);
         }
         connected = cs.chain().len() as u32 - 1;
         pace.sample(&cs, connected);
