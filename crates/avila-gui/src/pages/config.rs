@@ -38,6 +38,9 @@ pub struct ConfigPage {
     rejected: BTreeMap<String, String>,
     /// The path filter box.
     pub filter: String,
+    /// What the last preset application did ("applied 5 live knobs;
+    /// TOML for the rest is on the clipboard").
+    preset_note: Option<String>,
 }
 
 impl ConfigPage {
@@ -55,6 +58,7 @@ impl ConfigPage {
                 self.pending.clear();
                 self.overrides.clear();
                 self.rejected.clear();
+                self.preset_note = None;
             }
             "config_changed" if !path.is_empty() => {
                 self.pending.remove(path);
@@ -111,6 +115,129 @@ fn render_value(v: &serde_json::Value) -> String {
     }
 }
 
+/// One named bundle: `live` paths go to the running node through the
+/// control channel; `restart` paths go on the clipboard as a TOML
+/// block to paste into the config file — the app never writes it.
+struct Preset {
+    name: &'static str,
+    blurb: &'static str,
+    /// (path, JSON literal) — parsed at apply time.
+    live: &'static [(&'static str, &'static str)],
+    /// (path, TOML literal) — emitted under `[section]` headers.
+    restart: &'static [(&'static str, &'static str)],
+}
+
+const PRESETS: &[Preset] = &[
+    Preset {
+        name: "Quiet node",
+        blurb: "Blocks in, nothing out: no tx announcements, stem off, \
+                blocks served at the tip only — still watches what it refuses.",
+        live: &[
+            ("net.blocks_only", "true"),
+            ("relay.tx.announce", "\"none\""),
+            ("relay.tx.stem", "false"),
+            ("relay.block.serve", "\"tip\""),
+            ("extrapool.observe", "true"),
+        ],
+        restart: &[],
+    },
+    Preset {
+        name: "Lean laptop",
+        blurb: "Small mempool, two-hour memory, no extrapool — for a box \
+                that syncs and isn't a server.",
+        live: &[
+            ("mempool.max_mb", "64"),
+            ("mempool.expiry_secs", "7200"),
+            ("extrapool.observe", "false"),
+        ],
+        restart: &[("storage.prune_mb", "2000"), ("storage.dbcache_mb", "256")],
+    },
+    Preset {
+        name: "Public server",
+        blurb: "Serve everything: full block serving, compact blocks, \
+                filters and indexes to match.",
+        live: &[
+            ("net.blocks_only", "false"),
+            ("relay.block.serve", "\"full\""),
+            ("relay.tx.announce", "\"all\""),
+            ("relay.block.compact_serve", "true"),
+            ("filters.serve", "true"),
+        ],
+        restart: &[
+            ("indexes.txindex", "true"),
+            ("filters.build", "true"),
+            ("net.listen", "\"0.0.0.0:8333\""),
+        ],
+    },
+];
+
+/// The restart knobs' TOML: `a.b.c = v` grouped under `[a.b]`.
+fn preset_toml(restart: &[(&'static str, &'static str)]) -> String {
+    let mut out = String::new();
+    let mut last = "";
+    for (path, val) in restart {
+        let (sec, key) = match path.rsplit_once('.') {
+            Some(s) => s,
+            None => continue,
+        };
+        if sec != last {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("[{sec}]\n"));
+            last = sec;
+        }
+        out.push_str(&format!("{key} = {val}\n"));
+    }
+    out
+}
+
+fn presets_menu(ui: &mut Ui, state: &mut ConfigPage, control: Option<&Sender<ControlMsg>>) {
+    let pal = crate::theme::Palette::of(ui.ctx());
+    egui::ComboBox::from_id_salt("config-presets")
+        .selected_text(RichText::new("apply a preset…").size(12.0).color(pal.muted))
+        .width(150.0)
+        .show_ui(ui, |ui| {
+            for p in PRESETS {
+                if ui
+                    .selectable_label(false, p.name)
+                    .on_hover_text(p.blurb)
+                    .clicked()
+                {
+                    let mut applied = 0;
+                    if let Some(tx) = control {
+                        for (path, raw) in p.live {
+                            let value =
+                                serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
+                            if tx
+                                .send(ControlMsg::Set {
+                                    path: (*path).to_string(),
+                                    value: value.clone(),
+                                })
+                                .is_ok()
+                            {
+                                state.pending.insert((*path).to_string(), value);
+                                applied += 1;
+                            }
+                        }
+                    }
+                    let mut note = format!(
+                        "{}: {} live knob{} sent",
+                        p.name,
+                        applied,
+                        if applied == 1 { "" } else { "s" },
+                    );
+                    if !p.restart.is_empty() {
+                        ui.ctx().copy_text(preset_toml(p.restart));
+                        note.push_str(" — the restart knobs' TOML is on the clipboard");
+                    }
+                    state.preset_note = Some(note);
+                    ui.close();
+                }
+            }
+        });
+}
+
 /// Parse a draft back into the knob's JSON shape — strings stay
 /// strings, digits become numbers, `a->b, c->d` becomes an array.
 fn draft_value(path: &str, draft: &str, was: &serde_json::Value) -> Option<serde_json::Value> {
@@ -162,6 +289,7 @@ pub fn show(
     dirty: Option<&[String]>,
 ) -> Option<Action> {
     let pal = s.pal;
+    let knobs = describe_config(node.config().get());
     widgets::section(
         ui,
         "Node policy",
@@ -195,8 +323,40 @@ pub fn show(
                     let _ = std::process::Command::new("xdg-open").arg(file).spawn();
                 }
             }
+            if control.is_some() {
+                // Undo every live override by sending the knob's
+                // default back through the channel — the journal gets
+                // the same config_changed receipt as any other edit.
+                if !state.overrides.is_empty()
+                    && widgets::button(ui, "reset live edits", Kind::Quiet)
+                        .on_hover_text(
+                            "Send every live knob its default — the file is untouched; \
+                             restart-only knobs aren't reachable here.",
+                        )
+                        .clicked()
+                {
+                    for k in &knobs {
+                        if state.overrides.contains_key(k.path) && k.edit == EditKind::Live {
+                            let _ = control.as_ref().map(|tx| {
+                                tx.send(ControlMsg::Set {
+                                    path: k.path.to_string(),
+                                    value: k.default.clone(),
+                                })
+                            });
+                            state.pending.insert(k.path.to_string(), k.default.clone());
+                        }
+                    }
+                    state.overrides.clear();
+                    state.drafts.clear();
+                    state.rejected.clear();
+                }
+                presets_menu(ui, state, control.as_ref());
+            }
         });
     });
+    if let Some(note) = &state.preset_note {
+        ui.label(RichText::new(note).size(12.0).color(pal.signal));
+    }
 
     // The file moved on disk — say which knobs drifted, and offer the
     // restart that re-reads it.
@@ -237,7 +397,6 @@ pub fn show(
     }
     ui.add_space(10.0);
 
-    let knobs = describe_config(node.config().get());
     let filter = state.filter.trim().to_lowercase();
     let mut group = String::new();
     let mut first = true;
