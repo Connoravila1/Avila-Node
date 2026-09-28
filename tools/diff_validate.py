@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 diff_validate.py -- state-level differential validation: drive the same
-block stream through Avila and a reference daemon (Bitcoin Core / Knots)
+block stream through Avila and a reference daemon (Bitcoin Core or a fork)
 and compare the resulting consensus state after every block.
 
 WHAT THIS DOES
@@ -43,14 +43,14 @@ UTXO mismatch at height N localizes the fault to block N's connect.
 
 REQUIREMENTS
 ------------
-A running reference daemon (bitcoind/bitcoin-knots -regtest -server) with
+A running reference daemon (a Core-compatible daemon -regtest -server) with
 the wallet enabled, and a running avila-node with --rpc. Both must
 already share the same chain (sync Avila from the reference first —
 e.g. replay the reference's blocks via submitblock).
 
 Usage:
   python3 tools/diff_validate.py \
-      --core 127.0.0.1:38443 --core-cookie /tmp/knots/regtest/.cookie \
+      --core 127.0.0.1:38443 --core-cookie /tmp/ref/regtest/.cookie \
       --avila 127.0.0.1:28332 --avila-cookie /tmp/avila/regtest/.cookie \
       --fund-blocks 101 --tx-blocks 24
 """

@@ -10,6 +10,7 @@ mod chain_profile;
 pub mod config;
 pub mod electrum;
 pub mod events;
+pub mod hooks;
 mod next_block;
 pub mod rpc;
 pub mod signerproc;

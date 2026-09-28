@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn script_address_reproduces_core_addresses() {
-        // Real scriptPubKey → address pairs from a Knots 29.3 wallet
+        // Real scriptPubKey → address pairs from a 29.3-era wallet
         // (regtest prefixes), covering all four standard address forms.
         let params = Network::Regtest.params();
         let cases: &[(&str, &str)] = &[

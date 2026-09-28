@@ -9,7 +9,7 @@
 //! Nothing in this crate can make a block invalid — it only decides
 //! which unconfirmed transactions we keep and relay.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use avila_consensus::check::{TxRuleError, check_transaction};
 use avila_consensus::connect::{
@@ -237,6 +237,239 @@ pub enum MempoolReject {
     /// bare `"TRUC-violation"`; the detail carries the specific rule.
     #[error("TRUC-violation: {0}")]
     TrucViolation(&'static str),
+    /// A `tx.admit` verdict hook refused the tx — operator-configured
+    /// external policy consulted before the built-in checks. Hooks
+    /// narrow only: this cannot admit what consensus or policy refused.
+    #[error("rejected by tx.admit hook")]
+    PolicyHook,
+    /// `extrapoolpromote` named a txid the observation pool doesn't hold.
+    #[error("txid not in extrapool")]
+    NotObserved,
+}
+
+/// Facts a `tx.admit` verdict helper sees — the serializable subset of
+/// the admission decision. `fee`/`feerate` are `None` when any prevout
+/// is unresolvable (an orphan candidate), matching what live policy
+/// can know at that moment.
+pub struct TxAdmitFacts {
+    pub txid: Txid,
+    pub wtxid: Wtxid,
+    pub version: u32,
+    pub lock_time: u32,
+    pub vbytes: usize,
+    pub weight: usize,
+    pub inputs: usize,
+    pub outputs: usize,
+    /// Sum of declared outputs, sats.
+    pub output_value: i64,
+    /// `input_value - output_value`, sats — `None` when a prevout is
+    /// unresolvable.
+    pub fee: Option<i64>,
+    /// sats per kvB when `fee` is known and `vbytes > 0`.
+    pub feerate: Option<i64>,
+    /// BIP125 signaling — any input sequence below 0xFFFFFFFE.
+    pub rbf: bool,
+    pub has_witness: bool,
+    /// Per-output script-type names (witness/p2sh/nulldata/…).
+    pub spk_types: Vec<&'static str>,
+}
+
+/// The `tx.admit` verdict callback — `true` proceeds to the built-in
+/// checks, `false` rejects with [`MempoolReject::PolicyHook`].
+pub type AdmitHook = Box<dyn FnMut(&TxAdmitFacts) -> bool + Send>;
+
+/// One observed policy reject — the tx plus why live policy refused it.
+/// The registry's extrapool is an *observation* pool: these are
+/// consensus-valid transactions that operator policy refused, kept
+/// bounded and inspectable instead of dropped on the floor.
+#[derive(Debug)]
+pub struct ExtraEntry {
+    /// The refused transaction — kept whole so `extrapoolpromote` can
+    /// re-attempt admission after a policy change.
+    pub tx: Transaction,
+    /// The `MempoolReject` display string from the first refusal.
+    pub reason: String,
+    /// First-seen wall time; resubmissions bump `seen` only.
+    pub first_seen: u32,
+    /// How many submissions of this txid have been refused.
+    pub seen: u32,
+    /// Serialized size — the byte-accounting unit for `max_bytes`.
+    pub bytes: usize,
+}
+
+/// Cumulative extrapool counters — `getextrapoolinfo`'s payload and the
+/// event stream's diff source.
+#[derive(Clone, Debug, Default)]
+pub struct ExtraStats {
+    /// Txs ever stored (first-seen; resubmissions don't recount).
+    pub stored: u64,
+    /// Removed to make room at the caps.
+    pub evicted: u64,
+    /// Removed for age.
+    pub expired: u64,
+    /// Re-admitted into the live pool via `promote`.
+    pub promoted: u64,
+    /// Reject-reason → stored count.
+    pub by_reason: BTreeMap<String, u64>,
+}
+
+/// The observation pool for consensus-valid policy rejects — bounded by
+/// entries and serialized bytes, FIFO-evicted, time-expired. Never
+/// announces, never gates: a dead store only loses telemetry.
+#[derive(Default)]
+pub struct Extrapool {
+    map: HashMap<Txid, ExtraEntry>,
+    /// Insertion order — the eviction queue when caps bind.
+    order: VecDeque<Txid>,
+    bytes: usize,
+    observe: bool,
+    max_entries: usize,
+    max_bytes: usize,
+    expiry_secs: u32,
+    stats: ExtraStats,
+}
+
+/// Default entry bound — generous for an observation pool (rejects are
+/// usually the interesting tail, not the bulk).
+const EXTRAPOOL_DEFAULT_MAX_ENTRIES: usize = 10_000;
+/// Default byte bound — 50 MiB of serialized rejects.
+const EXTRAPOOL_DEFAULT_MAX_BYTES: usize = 50_000_000;
+/// Default entry lifetime — a day of rejected traffic.
+const EXTRAPOOL_DEFAULT_EXPIRY_SECS: u32 = 86_400;
+
+impl Extrapool {
+    /// `observe = true` with the default bounds.
+    #[must_use]
+    pub fn observing() -> Self {
+        Self {
+            observe: true,
+            max_entries: EXTRAPOOL_DEFAULT_MAX_ENTRIES,
+            max_bytes: EXTRAPOOL_DEFAULT_MAX_BYTES,
+            expiry_secs: EXTRAPOOL_DEFAULT_EXPIRY_SECS,
+            ..Self::default()
+        }
+    }
+
+    /// Operator settings — `observe` gates the per-submission tx clone.
+    pub fn configure(&mut self, observe: bool, max_entries: usize, max_bytes: usize, expiry: u32) {
+        self.observe = observe;
+        self.max_entries = max_entries.max(1);
+        self.max_bytes = max_bytes.max(1);
+        self.expiry_secs = expiry;
+        self.trim_to_caps();
+    }
+
+    /// Whether rejects are recorded — checked on the admission path.
+    #[must_use]
+    pub fn observes(&self) -> bool {
+        self.observe
+    }
+
+    /// Record a refused tx. A re-submission of an already-held txid
+    /// bumps `seen` without re-storing bytes.
+    fn store(&mut self, tx: Transaction, reason: String, now: u32) {
+        let txid = tx.txid();
+        if let Some(e) = self.map.get_mut(&txid) {
+            e.seen = e.seen.saturating_add(1);
+            return;
+        }
+        let bytes = tx.encode().len();
+        self.map.insert(
+            txid,
+            ExtraEntry {
+                tx,
+                reason: reason.clone(),
+                first_seen: now,
+                seen: 1,
+                bytes,
+            },
+        );
+        self.order.push_back(txid);
+        self.bytes += bytes;
+        self.stats.stored += 1;
+        *self.stats.by_reason.entry(reason).or_insert(0) += 1;
+        self.trim_to_caps();
+    }
+
+    /// FIFO trim until both caps hold.
+    fn trim_to_caps(&mut self) {
+        while self.map.len() > self.max_entries || self.bytes > self.max_bytes {
+            let Some(id) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(e) = self.map.remove(&id) {
+                self.bytes -= e.bytes;
+                self.stats.evicted += 1;
+            }
+        }
+    }
+
+    /// Remove entries older than `expiry_secs` — 0 disables aging.
+    fn expire(&mut self, now: u32) {
+        if self.expiry_secs == 0 {
+            return;
+        }
+        let cutoff = now.saturating_sub(self.expiry_secs);
+        let stale: Vec<Txid> = self
+            .map
+            .iter()
+            .filter(|(_, e)| e.first_seen < cutoff)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &stale {
+            if let Some(e) = self.map.remove(id) {
+                self.bytes -= e.bytes;
+                self.stats.expired += 1;
+            }
+        }
+        if !stale.is_empty() {
+            let live: std::collections::HashSet<Txid> = stale.into_iter().collect();
+            self.order.retain(|id| !live.contains(id));
+        }
+    }
+
+    /// Pull an entry out for re-admission (`extrapoolpromote`).
+    fn take(&mut self, txid: &Txid) -> Option<ExtraEntry> {
+        let e = self.map.remove(txid)?;
+        self.bytes -= e.bytes;
+        self.order.retain(|id| id != txid);
+        Some(e)
+    }
+
+    /// Look up an observed txid.
+    #[must_use]
+    pub fn get(&self, txid: &Txid) -> Option<&ExtraEntry> {
+        self.map.get(txid)
+    }
+
+    /// Entry count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// No entries held.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Live serialized bytes held.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Iterate the entries (listing surfaces).
+    pub fn iter(&self) -> impl Iterator<Item = (&Txid, &ExtraEntry)> {
+        self.map.iter()
+    }
+
+    /// Cumulative counters.
+    #[must_use]
+    pub fn stats(&self) -> &ExtraStats {
+        &self.stats
+    }
 }
 
 /// Core's `DEFAULT_ANCESTOR_LIMIT` — a candidate may not bring its
@@ -478,22 +711,28 @@ pub struct LifecycleStats {
 }
 
 /// The shadow-ruleset observatory (queue #8): every admission is also
-/// scored under a STRICTER relay policy (Knots-style — 42B single
-/// nulldata, no bare multisig). Never gates — a "rejection" here is a
-/// counter, not a verdict; the pool keeps its own rules. The counters
-/// are the live policy-drift signal: how much of today's traffic a
-/// stricter node would refuse.
+/// scored under each configured counterfactual policy. Never gates —
+/// a "rejection" here is a counter, not a verdict; the pool keeps its
+/// own rules. The counters are the live policy-drift signal: how much
+/// of today's traffic a node with THAT ruleset would refuse.
 #[derive(Debug, Default, Clone)]
 pub struct ShadowStats {
-    /// Admissions scored under the shadow ruleset.
+    /// Per-profile counters, keyed by profile name (`policy.shadow`).
+    pub profiles: std::collections::BTreeMap<String, ShadowProfileStats>,
+}
+
+/// One profile's observatory counters.
+#[derive(Debug, Default, Clone)]
+pub struct ShadowProfileStats {
+    /// Admissions scored under this profile.
     pub evaluated: u64,
-    /// Accepted txs the shadow ruleset would reject, by first
-    /// divergence reason.
+    /// Accepted txs the profile would reject, by first divergence
+    /// reason.
     pub divergent: std::collections::BTreeMap<String, u64>,
 }
 
-impl ShadowStats {
-    /// Total shadow-divergent admissions.
+impl ShadowProfileStats {
+    /// Total shadow-divergent admissions under this profile.
     #[must_use]
     pub fn divergent_total(&self) -> u64 {
         self.divergent.values().sum()
@@ -611,6 +850,20 @@ pub struct Mempool {
     lifecycle_ring: std::collections::VecDeque<LifecycleEvent>,
     /// Shadow-ruleset counters — see [`ShadowStats`].
     shadow: ShadowStats,
+    /// The active counterfactual profiles (`policy.shadow`) —
+    /// `(name, rules)` evaluated in order on every admitted tx.
+    /// Default is the strict envelope so the observatory is live even
+    /// with no configuration.
+    shadow_profiles: Vec<(String, policy::ShadowRules)>,
+    /// Optional `tx.admit` verdict callback consulted before the
+    /// built-in checks — narrowing only (`false` → [`MempoolReject::PolicyHook`]).
+    /// The mempool owns the seam; the process machinery lives in the
+    /// node layer.
+    admit_hook: Option<AdmitHook>,
+    /// Observation pool for consensus-valid policy rejects — the
+    /// registry's extrapool. `observing()` by default; set
+    /// `extrapool.observe = false` to drop rejects instead of storing.
+    extrapool: Extrapool,
 }
 
 impl Mempool {
@@ -646,6 +899,9 @@ impl Mempool {
             unbroadcast: HashSet::new(),
             lifecycle: LifecycleStats::default(),
             shadow: ShadowStats::default(),
+            shadow_profiles: vec![("strict".to_string(), policy::SHADOW_STRICT)],
+            admit_hook: None,
+            extrapool: Extrapool::observing(),
             lifecycle_ring: std::collections::VecDeque::new(),
             broadcast: std::collections::HashMap::new(),
             broadcast_bytes: 0,
@@ -1456,23 +1712,80 @@ impl Mempool {
         // Lifecycle admission counters — one per outermost verdict.
         // `InputsMissingOrSpent` always follows a `park_orphan`, so it
         // counts under `parked_orphans`, not `rejected`.
-        // Shadow-ruleset eval (queue #8) runs on the tx BEFORE the
-        // move into `accept_tx_inner` — cheap, and the score is only
-        // recorded when the admission actually succeeds.
-        let shadow_verdict = crate::policy::shadow_standard(&tx, self.dust_relay_fee);
+        // A `tx.admit` verdict hook consults before any built-in
+        // check — it can only narrow (`false` → `PolicyHook`), and a
+        // refused tx never reaches shadow scoring or the counters'
+        // `accepted`.
+        if self.admit_hook.is_some() {
+            let facts = self.admit_facts(&tx, cs);
+            if let Some(hook) = self.admit_hook.as_mut()
+                && !hook(&facts)
+            {
+                self.lifecycle.rejected += 1;
+                if self.extrapool.observes() {
+                    self.extrapool
+                        .store(tx, MempoolReject::PolicyHook.to_string(), now);
+                }
+                return Err(MempoolReject::PolicyHook);
+            }
+        }
+        // Shadow eval (queue #8) runs on the tx BEFORE the move into
+        // `accept_tx_inner` — cheap, and the score is only recorded
+        // when the admission actually succeeds. One evaluation per
+        // configured profile.
+        let shadow_verdicts: Vec<Option<&'static str>> = self
+            .shadow_profiles
+            .iter()
+            .map(|(_, rules)| crate::policy::shadow_eval(&tx, rules).err())
+            .collect();
+        // The extrapool keeps a copy only when observing — one clone
+        // per submission is the price of inspectable rejects.
+        let keep = self.extrapool.observes().then(|| tx.clone());
         let result = self.accept_tx_inner(tx, cs, now);
         match &result {
             Ok(_) => {
                 self.lifecycle.accepted += 1;
-                self.shadow.evaluated += 1;
-                if let Err(reason) = shadow_verdict {
-                    *self.shadow.divergent.entry(reason.to_string()).or_insert(0) += 1;
+                for ((name, _), verdict) in self.shadow_profiles.iter().zip(shadow_verdicts.iter())
+                {
+                    let stats = self.shadow.profiles.entry(name.clone()).or_default();
+                    stats.evaluated += 1;
+                    if let Some(reason) = verdict {
+                        *stats.divergent.entry((*reason).to_string()).or_insert(0) += 1;
+                    }
                 }
             }
             Err(MempoolReject::InputsMissingOrSpent) => self.lifecycle.parked_orphans += 1,
-            Err(_) => self.lifecycle.rejected += 1,
+            Err(e) => {
+                self.lifecycle.rejected += 1;
+                if let (Some(tx), true) = (keep, Self::policy_reject(e)) {
+                    self.extrapool.store(tx, e.to_string(), now);
+                }
+            }
         }
         result
+    }
+
+    /// Is this reject a *policy* verdict — the class the extrapool
+    /// observes — vs a structural one (consensus-invalid, already
+    /// known, orphan, coinbase)? Stored rejects are by definition
+    /// promotable candidates; the rest are garbage or handled elsewhere.
+    fn policy_reject(e: &MempoolReject) -> bool {
+        matches!(
+            e,
+            MempoolReject::NotStandard(_)
+                | MempoolReject::TooHeavy
+                | MempoolReject::TooManySigops
+                | MempoolReject::MinRelayFee
+                | MempoolReject::MempoolMinFeeNotMet
+                | MempoolReject::NotFinal
+                | MempoolReject::TrucViolation(_)
+                | MempoolReject::PackageLimits
+                | MempoolReject::PolicyHook
+                | MempoolReject::Conflict
+                | MempoolReject::SpendsConflict
+                | MempoolReject::TooManyReplacements
+                | MempoolReject::Full
+        )
     }
 
     /// The admission path [`Self::accept_tx`] wraps — kept separate so
@@ -2557,6 +2870,7 @@ impl Mempool {
                 self.remove_recursive_inner(id, RemovalCause::Expired, now, 0);
             }
         }
+        self.extrapool.expire(now);
         before - self.map.len()
     }
 
@@ -2611,6 +2925,107 @@ impl Mempool {
     #[must_use]
     pub fn shadow_stats(&self) -> &ShadowStats {
         &self.shadow
+    }
+
+    /// Replace the counterfactual profile set (`policy.shadow`).
+    /// Empty disables the observatory. Resets the counters — the
+    /// profiles they measure changed, so old numbers are meaningless.
+    pub fn set_shadow_profiles(&mut self, profiles: Vec<(String, policy::ShadowRules)>) {
+        self.shadow_profiles = profiles;
+        self.shadow = ShadowStats::default();
+    }
+
+    /// Install the `tx.admit` verdict callback — consulted on every
+    /// submission, before the built-in checks. `false` rejects with
+    /// [`MempoolReject::PolicyHook`]. Narrowing only.
+    pub fn set_admit_hook(&mut self, hook: Option<AdmitHook>) {
+        self.admit_hook = hook;
+    }
+
+    /// The observation pool of policy rejects.
+    #[must_use]
+    pub fn extrapool(&self) -> &Extrapool {
+        &self.extrapool
+    }
+
+    /// `extrapool.*` operator settings — see [`Extrapool::configure`].
+    pub fn configure_extrapool(
+        &mut self,
+        observe: bool,
+        max_entries: usize,
+        max_bytes: usize,
+        expiry_secs: u32,
+    ) {
+        self.extrapool
+            .configure(observe, max_entries, max_bytes, expiry_secs);
+    }
+
+    /// Re-attempt admission of an observed reject — the registry's
+    /// `extrapool.promote` action. The tx runs the full admission path
+    /// again (fresh facts, hook included); on success it lands in the
+    /// live pool, on a fresh reject it re-stores via the normal
+    /// observation path.
+    pub fn promote(
+        &mut self,
+        txid: &Txid,
+        cs: &avila_consensus::chainstate::Chainstate,
+        now: u32,
+    ) -> Result<Txid, MempoolReject> {
+        let Some(entry) = self.extrapool.take(txid) else {
+            return Err(MempoolReject::NotObserved);
+        };
+        match self.accept_tx(entry.tx, cs, now) {
+            Ok(id) => {
+                self.extrapool.stats.promoted += 1;
+                Ok(id)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Build the facts a `tx.admit` helper judges — cheap fields plus
+    /// prevout resolution for `fee`/`feerate`. A prevout that resolves
+    /// nowhere (orphan candidate) leaves both `None`.
+    fn admit_facts(
+        &self,
+        tx: &Transaction,
+        cs: &avila_consensus::chainstate::Chainstate,
+    ) -> TxAdmitFacts {
+        let output_value: i64 = tx.outputs.iter().map(|o| o.value).sum();
+        let mut input_value: i64 = 0;
+        let mut all_resolved = true;
+        for input in &tx.inputs {
+            match self.resolve(cs, &input.previous_output) {
+                Some(coin) => input_value += coin.out.value,
+                None => {
+                    all_resolved = false;
+                    break;
+                }
+            }
+        }
+        let weight = tx.weight();
+        let vbytes = weight.div_ceil(4);
+        let fee = all_resolved.then_some(input_value - output_value);
+        TxAdmitFacts {
+            txid: tx.txid(),
+            wtxid: tx.wtxid(),
+            version: tx.version,
+            lock_time: tx.lock_time,
+            vbytes,
+            weight,
+            inputs: tx.inputs.len(),
+            outputs: tx.outputs.len(),
+            output_value,
+            fee,
+            feerate: fee.and_then(|f| (vbytes > 0).then_some(f * 1000 / vbytes as i64)),
+            rbf: Self::signals_rbf(tx),
+            has_witness: tx.has_witness(),
+            spk_types: tx
+                .outputs
+                .iter()
+                .map(|o| o.script_pubkey.classify().name())
+                .collect(),
+        }
     }
 
     /// Cumulative lifecycle counters — `getmempoolinfo`'s `lifecycle`
@@ -5324,9 +5739,9 @@ mod tests {
     }
 
     /// Shadow-ruleset observatory (queue #8): accepted txs are still
-    /// scored under the stricter Knots-style envelope — counted,
+    /// scored under the stricter `strict` envelope — counted,
     /// never gated. (The fixture chain's coinbase outputs aren't
-    /// standard-typed, so the pool runs permissive; `shadow_standard`
+    /// standard-typed, so the pool runs permissive; `shadow_eval`
     /// itself gets the strict-vs-ours unit assertions below.)
     #[test]
     fn shadow_observatory_scores_divergence_without_gating() {
@@ -5355,7 +5770,7 @@ mod tests {
         tx2.outputs[0].script_pubkey = Script::new(msig);
         pool.accept_tx(tx2, &cs, NOW).expect("accepted");
 
-        let st = pool.shadow_stats();
+        let st = &pool.shadow_stats().profiles["strict"];
         assert_eq!(st.evaluated, 2);
         assert_eq!(st.divergent.get("shadow:datacarrier"), Some(&1), "{st:?}");
         assert_eq!(st.divergent.get("shadow:bare-multisig"), Some(&1), "{st:?}");
@@ -5363,10 +5778,249 @@ mod tests {
         assert_eq!(pool.len(), 2);
     }
 
-    /// `shadow_standard` vs `is_standard_tx` on standard-shaped txs —
+    /// `policy.shadow` takes several profiles at once: each scores the
+    /// same admissions against its own counters, and a divergent
+    /// profile doesn't shadow a convergent one's signal.
+    #[test]
+    fn shadow_profiles_score_independently() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        pool.set_shadow_profiles(vec![
+            ("core".to_string(), crate::policy::SHADOW_CORE),
+            ("strict".to_string(), crate::policy::SHADOW_STRICT),
+        ]);
+
+        // 62-byte OP_RETURN: under core's byte budget, over strict's 42B.
+        let mut tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let mut p2wpkh = vec![0x00, 20];
+        p2wpkh.extend([7u8; 20]);
+        tx.outputs[0].script_pubkey = Script::new(p2wpkh);
+        let mut nulldata = vec![script::OP_RETURN, 60];
+        nulldata.extend([0u8; 60]);
+        tx.outputs.push(TxOut {
+            value: 0,
+            script_pubkey: Script::new(nulldata),
+        });
+        pool.accept_tx(tx, &cs, NOW).expect("accepted");
+
+        let core = &pool.shadow_stats().profiles["core"];
+        assert_eq!(core.evaluated, 1);
+        assert_eq!(core.divergent_total(), 0);
+        let strict = &pool.shadow_stats().profiles["strict"];
+        assert_eq!(strict.evaluated, 1);
+        assert_eq!(strict.divergent.get("shadow:datacarrier"), Some(&1));
+
+        // Swapping the set resets counters — old profile numbers are
+        // meaningless under a new ruleset.
+        pool.set_shadow_profiles(vec![]);
+        assert!(pool.shadow_stats().profiles.is_empty());
+    }
+
+    /// The `tx.admit` hook seam: consulted before built-in checks,
+    /// narrowing only — a reject lands as `PolicyHook` without touching
+    /// the pool or the shadow counters, and the facts the helper sees
+    /// carry the resolved fee/rate.
+    #[test]
+    fn tx_admit_hook_narrows_admission() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+
+        // Facts capture — assert the helper sees the right shape.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(
+            Txid,
+            Option<i64>,
+            Option<i64>,
+            bool,
+            usize,
+        )>::new()));
+        let seen2 = seen.clone();
+        pool.set_admit_hook(Some(Box::new(move |f: &TxAdmitFacts| {
+            seen2
+                .lock()
+                .unwrap()
+                .push((f.txid, f.fee, f.feerate, f.rbf, f.spk_types.len()));
+            true
+        })));
+        let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_RBF);
+        let txid = tx.txid();
+        let vbytes = tx.weight().div_ceil(4);
+        pool.accept_tx(tx, &cs, NOW).unwrap();
+        {
+            let got = seen.lock().unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].0, txid);
+            // 5_000_000_000 in − 4_999_000_000 out = 1_000_000 sat fee.
+            assert_eq!(got[0].1, Some(1_000_000));
+            assert_eq!(got[0].2, Some(1_000_000 * 1000 / vbytes as i64));
+            assert!(got[0].3, "SEQ_RBF signals");
+            assert_eq!(got[0].4, 1);
+        }
+
+        // Reject-all: PolicyHook, rejected counts, pool untouched, and
+        // the shadow observatory never even scored the refused tx.
+        let rejected_before = pool.lifecycle_stats().rejected;
+        pool.set_admit_hook(Some(Box::new(|_| false)));
+        let tx2 = spend_tx(mature_outpoint(&blocks, 2), 4_999_000_000, SEQ_FINAL);
+        assert!(matches!(
+            pool.accept_tx(tx2, &cs, NOW),
+            Err(MempoolReject::PolicyHook)
+        ));
+        assert_eq!(pool.lifecycle_stats().rejected, rejected_before + 1);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.shadow_stats().profiles["strict"].evaluated, 1);
+
+        // Orphan candidate: prevout resolves nowhere — fee is null.
+        let seen3 = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Option<i64>>::new()));
+        let seen4 = seen3.clone();
+        pool.set_admit_hook(Some(Box::new(move |f: &TxAdmitFacts| {
+            seen4.lock().unwrap().push(f.fee);
+            true
+        })));
+        let orphan = spend_tx(
+            OutPoint {
+                txid: Txid::from_bytes([9u8; 32]),
+                vout: 0,
+            },
+            1_000,
+            SEQ_FINAL,
+        );
+        assert!(matches!(
+            pool.accept_tx(orphan, &cs, NOW),
+            Err(MempoolReject::InputsMissingOrSpent)
+        ));
+        assert_eq!(seen3.lock().unwrap()[0], None);
+    }
+
+    /// The extrapool observes *policy* rejects only: the fee-floor
+    /// refusal lands with its reason; the orphan (structural) doesn't.
+    /// `promote` re-attempts admission after a policy change.
+    #[test]
+    fn extrapool_observes_and_promotes() {
+        let (cs, blocks) = chainstate_at(101);
+        // Permissive pool, but the fee floor is set absurdly high —
+        // the spend is consensus-valid and policy-refused.
+        let mut pool = permissive_pool();
+        pool.set_min_relay_fee(1_000_000_000_000);
+        let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let txid = tx.txid();
+        assert!(matches!(
+            pool.accept_tx(tx, &cs, NOW),
+            Err(MempoolReject::MinRelayFee) | Err(MempoolReject::MempoolMinFeeNotMet)
+        ));
+        let e = pool.extrapool().get(&txid).expect("observed");
+        assert_eq!(e.seen, 1);
+        assert!(!e.reason.is_empty());
+        assert_eq!(pool.extrapool().stats().stored, 1);
+
+        // Structural rejects never observe — orphan stays out.
+        let orphan = spend_tx(
+            OutPoint {
+                txid: Txid::from_bytes([9u8; 32]),
+                vout: 0,
+            },
+            1_000,
+            SEQ_FINAL,
+        );
+        assert!(matches!(
+            pool.accept_tx(orphan, &cs, NOW),
+            Err(MempoolReject::InputsMissingOrSpent)
+        ));
+        assert_eq!(pool.extrapool().len(), 1, "orphans aren't policy signal");
+
+        // Loosen the floor, promote: the held tx re-admits through the
+        // full path and leaves the observation pool.
+        pool.set_min_relay_fee(0);
+        assert_eq!(pool.promote(&txid, &cs, NOW).unwrap(), txid);
+        assert!(pool.extrapool().get(&txid).is_none());
+        assert_eq!(pool.extrapool().stats().promoted, 1);
+        assert_eq!(pool.len(), 1);
+
+        // Unknown txid → the dedicated miss error.
+        assert!(matches!(
+            pool.promote(&Txid::from_bytes([7u8; 32]), &cs, NOW),
+            Err(MempoolReject::NotObserved)
+        ));
+    }
+
+    /// `extrapool.max_entries` is a hard bound — FIFO eviction counts.
+    #[test]
+    fn extrapool_caps_evict_fifo() {
+        // Three mature coinbases need tip ≥ h+100.
+        let (cs, blocks) = chainstate_at(103);
+        let mut pool = permissive_pool();
+        pool.set_min_relay_fee(1_000_000_000_000);
+        pool.configure_extrapool(true, 2, 50_000_000, 0);
+        let mut ids = Vec::new();
+        for h in 1..=3 {
+            let tx = spend_tx(mature_outpoint(&blocks, h), 4_999_000_000, SEQ_FINAL);
+            ids.push(tx.txid());
+            let r = pool.accept_tx(tx, &cs, NOW);
+            assert!(
+                matches!(
+                    r,
+                    Err(MempoolReject::MinRelayFee) | Err(MempoolReject::MempoolMinFeeNotMet)
+                ),
+                "h={h}: {r:?}"
+            );
+        }
+        assert_eq!(pool.extrapool().len(), 2);
+        assert!(pool.extrapool().get(&ids[0]).is_none(), "oldest evicted");
+        assert!(pool.extrapool().get(&ids[2]).is_some(), "newest held");
+        assert_eq!(pool.extrapool().stats().evicted, 1);
+    }
+
+    /// `extrapool.observe = false` drops rejects like Core does; aging
+    /// evicts entries past `expiry_secs`.
+    #[test]
+    fn extrapool_observation_gate_and_expiry() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        pool.set_min_relay_fee(1_000_000_000_000);
+        pool.configure_extrapool(false, 10_000, 50_000_000, 0);
+        let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let id = tx.txid();
+        assert!(matches!(
+            pool.accept_tx(tx, &cs, NOW),
+            Err(MempoolReject::MinRelayFee) | Err(MempoolReject::MempoolMinFeeNotMet)
+        ));
+        assert!(pool.extrapool().get(&id).is_none());
+        assert_eq!(pool.extrapool().stats().stored, 0, "unobserved");
+
+        // Re-enable with a 60s window, store again, age past it.
+        pool.configure_extrapool(true, 10_000, 50_000_000, 60);
+        let tx = spend_tx(mature_outpoint(&blocks, 2), 4_999_000_000, SEQ_FINAL);
+        let id2 = tx.txid();
+        assert!(matches!(
+            pool.accept_tx(tx, &cs, NOW),
+            Err(MempoolReject::MinRelayFee) | Err(MempoolReject::MempoolMinFeeNotMet)
+        ));
+        assert!(pool.extrapool().get(&id2).is_some());
+        pool.expire(NOW + 120);
+        assert!(pool.extrapool().get(&id2).is_none(), "aged out");
+        assert_eq!(pool.extrapool().stats().expired, 1);
+    }
+
+    /// A `tx.admit` hook reject composes with the extrapool — the
+    /// refused tx lands under its hook reason.
+    #[test]
+    fn extrapool_observes_hook_rejects() {
+        let (cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        pool.set_admit_hook(Some(Box::new(|_| false)));
+        let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let txid = tx.txid();
+        assert!(matches!(
+            pool.accept_tx(tx, &cs, NOW),
+            Err(MempoolReject::PolicyHook)
+        ));
+        let e = pool.extrapool().get(&txid).expect("hook rejects observe");
+        assert_eq!(e.reason, "rejected by tx.admit hook");
+    }
+
+    /// `shadow_eval` (strict rules) vs `is_standard_tx` on standard-shaped txs —
     /// the strictness deltas directly.
     #[test]
-    fn shadow_standard_is_strictly_stricter() {
+    fn shadow_eval_is_strictly_stricter() {
         let mk = |out_scripts: Vec<Vec<u8>>| Transaction {
             version: 2,
             inputs: vec![TxIn {
@@ -5396,7 +6050,7 @@ mod tests {
             )
         };
         let shadow =
-            |tx: &Transaction| crate::policy::shadow_standard(tx, crate::policy::DUST_RELAY_TX_FEE);
+            |tx: &Transaction| crate::policy::shadow_eval(tx, &crate::policy::SHADOW_STRICT);
 
         // 62B OP_RETURN: ours accepts (budget >> 42), shadow refuses.
         let mut nulldata = vec![script::OP_RETURN, 60];

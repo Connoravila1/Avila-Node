@@ -901,8 +901,8 @@ mod tests {
     fn agent_names_read_as_words() {
         assert_eq!(agent_name("/Satoshi:29.0.0/"), "Satoshi 29.0.0");
         assert_eq!(
-            agent_name("/Satoshi:28.1.0/Knots:20250305/"),
-            "Satoshi 28.1.0 · Knots 20250305"
+            agent_name("/Satoshi:28.1.0/Extra:20250305/"),
+            "Satoshi 28.1.0 · Extra 20250305"
         );
         assert_eq!(agent_name("//"), "unknown software");
     }

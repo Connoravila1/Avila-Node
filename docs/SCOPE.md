@@ -49,7 +49,7 @@ This project is a Bitcoin node. Only Bitcoin.
 - Bitcoin test networks (regtest, signet, testnet4) are in scope —
   they exist to test Bitcoin.
 - Differential testing against other Bitcoin implementations (Core,
-  Knots, btcd) and shadow comparison of Bitcoin mempool *policy* are
+  btcd, policy-divergent forks) and shadow comparison of Bitcoin mempool *policy* are
   in scope — they measure this node's fidelity to Bitcoin.
 - The test for any proposed work: does it serve a Bitcoin node's
   correctness, performance, privacy, or usability? If it serves another

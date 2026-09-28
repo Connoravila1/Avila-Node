@@ -71,6 +71,40 @@ storage (W4), sync (W3), policy (W7), privacy (W9), and interfaces (W11) are
 profile dimensions; differential testing and the scorecard measure whether the
 seams hold their claims.
 
+## Operator control: decision points and streams
+
+Two laws turn "the node is configurable" and "the node is composable" from
+aspiration into enforced structure.
+
+**The decision-point law.** Every local decision the node makes — who may
+connect, what is admitted, what is relayed, what is served, what is stored —
+is reachable by configuration or by an external verdict program, or both. A
+hardcoded local policy outside the consensus kernel is a defect.
+`docs/DECISION_REGISTRY.md` enumerates the decision points, their knobs, and
+their hook slots, and any code that decides locally must appear there.
+Defaults track Core-compatible behavior; profiles bundle coherent deviations.
+Decision outputs carry the deciding rule and knob so `explain` and shadow
+evaluation can attribute every verdict.
+
+**The stream law.** Every subsystem is operable standalone over documented
+line-oriented streams — commands in, events out — and every binary artifact
+on disk has a decode tool. The GUI, the CLI, and future extensions consume
+the same wire; no consumer holds a privileged channel into consensus state.
+Text streams are the interface contract, not the storage format: hot paths
+keep binary layouts, and inspectability comes from decode tooling rather
+than flat files. The same libraries package as one `avila-node` binary or as
+single-purpose programs behind stdio adapters — decomposition is a
+deployment choice, not a fork in the code.
+
+**External verdict programs narrow only.** A policy helper — spawned once,
+fed one JSON line per decision, answering `accept`/`reject`/`defer` with a
+reason — can reject what built-in rules would accept, and nothing more.
+Verdicts combine by conjunction. The worst outcomes of a buggy hook are
+false rejection and wasted work, matching the untrusted-advice invariants:
+hooks express local preference and consensus correctness never delegates
+across a process boundary. Hooks get bounded queues, timeouts with a
+per-point default verdict, and restart supervision.
+
 ## Data and concurrency
 
 Validation receives explicit chain context and produces typed results. Distinguish
@@ -84,8 +118,10 @@ not perform validation, blocking I/O, or unbounded event draining during paintin
 Coalesce metrics, cap history, make cancellation cooperative, and request repaint
 when new data arrives. GUI failure must not become consensus failure.
 
-The remote/daemon control protocol and process-isolation model remain design
-decisions. A Rust module boundary alone is not a privilege or process boundary.
+The stream law fixes the *shape* of control and event traffic; the daemon
+socket layout, authentication, and which workers run as separate processes
+remain open design decisions. A Rust module boundary alone is not a privilege
+or process boundary.
 
 ## Correctness and trust
 

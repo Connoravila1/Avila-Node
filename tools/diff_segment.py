@@ -34,7 +34,7 @@ Usage:
   python3 tools/diff_segment.py \
       --segment fixtures/mainnet-blocks-000000-000500.dat \
       --magic f9beb4d9 \
-      --core 127.0.0.1:18332 --core-cookie /tmp/knots-main/.cookie \
+      --core 127.0.0.1:18332 --core-cookie /tmp/ref-main/.cookie \
       --avila 127.0.0.1:28332 --avila-cookie /tmp/avila-main/main/.cookie \
       --every 1
 """

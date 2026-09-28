@@ -3579,7 +3579,7 @@ const PING_HELP: &str = "ping\n\nRequests that a ping be sent to all other nodes
 /// Verbatim `help disconnectnode` text (Bitcoin Core 29).
 const DISCONNECTNODE_HELP: &str = "disconnectnode ( \"address\" nodeid )\n\nImmediately disconnects from the specified peer node.\n\nStrictly one out of 'address' and 'nodeid' can be provided to identify the node.\n\nTo disconnect by nodeid, either set 'address' to the empty string, or call using the named 'nodeid' argument only.\n\nArguments:\n1. address    (string, optional, default=fallback to nodeid) The IP address/port of the node\n2. nodeid     (numeric, optional, default=fallback to address) The node ID (see getpeerinfo for node IDs)\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli disconnectnode \"192.168.0.6:8333\"\n> bitcoin-cli disconnectnode \"\" 1\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"disconnectnode\", \"params\": [\"192.168.0.6:8333\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"disconnectnode\", \"params\": [\"\", 1]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
-/// Verbatim `help addnode` text (Knots 29.3).
+/// Verbatim `help addnode` text (v29.3 wire capture).
 const ADDNODE_HELP: &str = "addnode \"node\" \"command\" ( v2transport )\n\nAttempts to add or remove a node from the addnode list.\nOr try a connection to a node once.\nNodes added using addnode (or -connect) are protected from DoS disconnection and are not required to be\nfull nodes/support SegWit as other outbound peers are (though such peers will not be synced from).\nAddnode connections are limited to 8 at a time and are counted separately from the -maxconnections limit.\n\nArguments:\n1. node           (string, required) The address of the peer to connect to\n2. command        (string, required) 'add' to add a node to the list, 'remove' to remove a node from the list, 'onetry' to try a connection to the node once\n3. v2transport    (boolean, optional, default=set by -v2transport) Attempt to connect using BIP324 v2 transport protocol (ignored for 'remove' command)\n\nResult:\nnull    (json null)\n\nExamples:\n> bitcoin-cli addnode \"192.168.0.6:8333\" \"onetry\" true\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"addnode\", \"params\": [\"192.168.0.6:8333\", \"onetry\" true]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
 /// Verbatim `help setnetworkactive` text (Bitcoin Core 29).
@@ -3598,13 +3598,13 @@ const GETNODEADDRESSES_HELP: &str = "getnodeaddresses ( count \"network\" )\n\nR
 /// Verbatim `help addpeeraddress` text (Bitcoin Core 29).
 const ADDPEERADDRESS_HELP: &str = "addpeeraddress \"address\" port ( tried )\n\nAdd the address of a potential peer to an address manager table. This RPC is for testing only.\n\nArguments:\n1. address    (string, required) The IP address of the peer\n2. port       (numeric, required) The port of the peer\n3. tried      (boolean, optional, default=false) If true, attempt to add the peer to the tried addresses table\n\nResult:\n{                            (json object)\n  \"success\" : true|false,    (boolean) whether the peer address was successfully added to the address manager table\n  \"error\" : \"str\"            (string, optional) error description, if the address could not be added\n}\n\nExamples:\n> bitcoin-cli addpeeraddress \"1.2.3.4\" 8333 true\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"addpeeraddress\", \"params\": [\"1.2.3.4\", 8333, true]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
-/// Verbatim `help getdeploymentinfo` text (Knots 29.3).
+/// Verbatim `help getdeploymentinfo` text (v29.3 wire capture).
 const GETDEPLOYMENTINFO_HELP: &str = "getdeploymentinfo ( \"blockhash\" )\n\nReturns an object containing various state info regarding deployments of consensus changes.\n\nArguments:\n1. blockhash    (string, optional, default=\"hash of current chain tip\") The block hash at which to query deployment state\n\nResult:\n{                                       (json object)\n  \"hash\" : \"str\",                       (string) requested block hash (or tip)\n  \"height\" : n,                         (numeric) requested block height (or tip)\n  \"deployments\" : {                     (json object)\n    \"xxxx\" : {                          (json object) name of the deployment\n      \"type\" : \"str\",                   (string) one of \"buried\", \"bip9\"\n      \"height\" : n,                     (numeric, optional) height of the first block which the rules are or will be enforced (only for \"buried\" type, or \"bip9\" type with \"active\" status)\n      \"active\" : true|false,            (boolean) true if the rules are enforced for the mempool and the next block\n      \"bip9\" : {                        (json object, optional) status of bip9 softforks (only for \"bip9\" type)\n        \"bit\" : n,                      (numeric, optional) the bit (0-28) in the block version field used to signal this softfork (only for \"started\" and \"locked_in\" status)\n        \"start_time\" : xxx,             (numeric) the minimum median time past of a block at which the bit gains its meaning\n        \"timeout\" : xxx,                (numeric) the median time past of a block at which the deployment is considered failed if not yet locked in\n        \"min_activation_height\" : n,    (numeric) minimum height of blocks for which the rules may be enforced\n        \"status\" : \"str\",               (string) status of deployment at specified block (one of \"defined\", \"started\", \"locked_in\", \"active\", \"failed\")\n        \"since\" : n,                    (numeric) height of the first block to which the status applies\n        \"status_next\" : \"str\",          (string) status of deployment at the next block\n        \"statistics\" : {                (json object, optional) numeric statistics about signalling for a softfork (only for \"started\" and \"locked_in\" status)\n          \"period\" : n,                 (numeric) the length in blocks of the signalling period\n          \"threshold\" : n,              (numeric, optional) the number of blocks with the version bit set required to activate the feature (only for \"started\" status)\n          \"elapsed\" : n,                (numeric) the number of blocks elapsed since the beginning of the current period\n          \"count\" : n,                  (numeric) the number of blocks with the version bit set in the current period\n          \"possible\" : true|false       (boolean, optional) returns false if there are not enough blocks left in this period to pass activation threshold (only for \"started\" status)\n        },\n        \"signalling\" : \"str\"            (string, optional) indicates blocks that signalled with a # and blocks that did not with a -\n      }\n    },\n    ...\n  }\n}\n\nExamples:\n> bitcoin-cli getdeploymentinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getdeploymentinfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 
-/// Verbatim `help gettxoutproof` text (Knots 29.3 — witness-proof form).
+/// Verbatim `help gettxoutproof` text (v29.3 wire capture — witness-proof form).
 const GETTXOUTPROOF_HELP: &str = "gettxoutproof [\"txid\",...] ( \"blockhash\" {\"prove_witness\":bool,...} )\n\nReturns a hex-encoded proof that \"txid\" was included in a block.\n\nNOTE: By default this function only works sometimes. This is when there is an\nunspent output in the utxo for this transaction. To make it always work,\nyou need to maintain a transaction index, using the -txindex command line option or\nspecify the block in which the transaction is included manually (by blockhash).\n\nArguments:\n1. txids          (json array, required) The txids to filter\n     [\n       \"txid\",    (string) A transaction id\n       ...\n     ]\n2. blockhash      (string, optional) If specified, looks for txid in the block with this hash\n3. options        (json object, optional) Options object that can be used to pass named arguments, listed below.\n\nNamed Arguments:\nprove_witness    (boolean, optional, default=false) If true, proves the associated wtxid/hash of the specified transactions instead of txid\n\nResult (If prove_witness is false or unspecified):\n\"str\"    (string) A string that is a serialized, hex-encoded data for the proof.\n\nResult (If prove_witness is true):\n{                            (json object)\n  \"proof\" : \"str\",           (string) The produced txout proof, hex-encoded.\n  \"proven\" : {               (json object) Information about the proof.\n    \"blockhash\" : \"hex\",     (string) The block hash the proof links to\n    \"blockheight\" : n,       (numeric) The height of the block the proof links to\n    \"tx\" : [                 (json array) Information about transactions\n      {                      (json object) Information about a transaction\n        \"txid\" : \"hex\",      (string) Transaction id this is for (parameter; NOT proven by proof)\n        \"wtxid\" : \"hex\",     (string) Wtxid/hash of a transaction\n        \"blockindex\" : n     (numeric) Index of transaction in block\n      },\n      ...\n    ]\n  }\n}\n";
 
-/// Verbatim `help verifytxoutproof` text (Knots 29.3).
+/// Verbatim `help verifytxoutproof` text (v29.3 wire capture).
 const VERIFYTXOUTPROOF_HELP: &str = "verifytxoutproof \"proof\" ( {\"verify_witness\":bool,...} )\n\nVerifies that a proof points to a transaction in a block, returning the transaction it commits to\nand throwing an RPC error if the block is not in our best chain\n\nArguments:\n1. proof      (string, required) The hex-encoded proof generated by gettxoutproof\n2. options    (json object, optional) Options object that can be used to pass named arguments, listed below.\n\nNamed Arguments:\nverify_witness    (boolean, optional, default=false) If true, also verifies the associated wtxid/hash of the specified transactions (if included in proof)\n\nResult (If verify_witness is false or unspecified):\n[           (json array)\n  \"hex\",    (string) The txid(s) which the proof commits to, or empty array if the proof cannot be validated.\n  ...\n]\n\nResult (If verify_witness is true and the proof valid):\n{                                 (json object)\n  \"blockhash\" : \"hex\",            (string) The block hash this proof links to\n  \"blockheight\" : n,              (numeric) The height of the block this proof links to\n  \"confirmations\" : n,            (numeric, optional) Number of blocks (including the one with the transactions) confirming these transactions\n  \"confirmations_assumed\" : n,    (numeric, optional) The number of unverified blocks confirming these transactions (eg, in an assumed-valid UTXO set)\n  \"tx\" : [                        (json array) Information about transactions\n    {                             (json object) Information about a transaction\n      \"wtxid\" : \"hex\",            (string) Wtxid/hash of a transaction\n      \"blockindex\" : n            (numeric) Index of transaction in block\n    },\n    ...\n  ]\n}\n\nResult (If verify_witness is true and the proof invalid):\n{}    (empty JSON object)\n";
 
 /// Verbatim `help getindexinfo` text (Bitcoin Core 29).
@@ -5114,6 +5114,16 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         "verifyswiftsynchints \"path\"\n\nVerify a SwiftSync hints file against this node's own UTXO set: committed aggregate equality plus survivor-set equality. A wrong file only wastes the optimization — the node writes its own live set either way.\n\nArguments:\n1. path  (string, required) Hints file path.\n\nResult:\n\"verified\" | \"aggregate_mismatch\" | \"survivor_mismatch\"\n",
     ),
     ("getmempoolinfo", &[], GETMEMPOOLINFO_HELP),
+    (
+        "getextrapoolinfo",
+        &[],
+        "getextrapoolinfo\n\nReturns the extrapool — consensus-valid transactions that operator policy refused, held bounded and inspectable. Sizes, lifecycle counters, per-reason totals, and the held entries (txid, reason, first_seen, seen, bytes).",
+    ),
+    (
+        "extrapoolpromote",
+        &[("txid", Some("string"), true)],
+        "extrapoolpromote \"txid\"\n\nRe-attempt admission of a transaction held in the extrapool — for when policy was loosened and the filtered traffic should re-enter the mempool.\n\nArguments:\n1. txid  (string, required) The observed transaction.\n\nResult:\n\"txid\" on admission; a reject reason otherwise.\n",
+    ),
     (
         "getevents",
         &[("count", Some("number"), false)],
@@ -7319,7 +7329,7 @@ pub(crate) fn dispatch(
                         "Block not found in chain".to_string(),
                     ));
                 }
-                // pindex->nTx==0 (no body) is part of Knots' "not in
+                // pindex->nTx==0 (no body) is part of a 29.3 node's "not in
                 // chain" predicate; a count mismatch is an empty result.
                 let n_tx = match cs.body(&block_hash) {
                     Some(b) => b.transactions.len() as u32,
@@ -7717,15 +7727,65 @@ pub(crate) fn dispatch(
                     "explicit": lc.explicit,
                 },
                 // Shadow-ruleset observatory (queue #8): admissions
-                // scored under a stricter Knots-style policy — the
+                // scored under the configured counterfactual profiles —
                 // live policy-drift signal. Never gates acceptance.
                 "shadow": {
-                    "evaluated": pool.shadow_stats().evaluated,
-                    "divergent": pool.shadow_stats().divergent_total(),
-                    "by_reason": pool.shadow_stats().divergent,
+                    "profiles": pool.shadow_stats().profiles.iter().map(|(name, st)| {
+                        (name.clone(), serde_json::json!({
+                            "evaluated": st.evaluated,
+                            "divergent": st.divergent_total(),
+                            "by_reason": st.divergent,
+                        }))
+                    }).collect::<serde_json::Map<_, _>>(),
                 },
             }))
         }),
+        // The extrapool — consensus-valid txs that live policy refused,
+        // held bounded and inspectable. `entries` lists txid + verdict
+        // so an operator can audit what got filtered.
+        "getextrapoolinfo" => chain_query(method, queries, |_, mgr| {
+            let extra = mgr.mempool_ref().extrapool();
+            let st = extra.stats();
+            Ok(json!({
+                "enabled": extra.observes(),
+                "size": extra.len(),
+                "bytes": extra.bytes(),
+                "stored": st.stored,
+                "evicted": st.evicted,
+                "expired": st.expired,
+                "promoted": st.promoted,
+                "by_reason": st.by_reason,
+                "entries": extra.iter().map(|(txid, e)| json!({
+                    "txid": txid.to_string(),
+                    "reason": e.reason,
+                    "first_seen": e.first_seen,
+                    "seen": e.seen,
+                    "bytes": e.bytes,
+                })).collect::<Vec<_>>(),
+            }))
+        }),
+        // Re-attempt admission of an observed reject — for when the
+        // operator loosens policy and wants the filtered traffic back.
+        "extrapoolpromote" => {
+            let Some(txid_hex) = param(params, 0, "txid").and_then(Value::as_str) else {
+                return missing_params("txid");
+            };
+            let Ok(txid) = txid_hex.parse::<Txid>() else {
+                return (
+                    Value::Null,
+                    Some((RPC_INVALID_PARAMETER, "Invalid txid".to_string())),
+                );
+            };
+            chain_query(method, queries, move |cs, mgr| {
+                match mgr
+                    .mempool()
+                    .promote(&txid, cs, crate::time::system_time() as u32)
+                {
+                    Ok(id) => Ok(json!(id.to_string())),
+                    Err(e) => Err((RPC_VERIFY_REJECTED, e.to_string())),
+                }
+            })
+        }
         "getpinningrisk" => {
             let margin = param(params, 0, "margin")
                 .and_then(Value::as_u64)
@@ -13511,7 +13571,7 @@ pub(crate) fn dispatch(
             // `currentblock*` describes the candidate Core refreshes in
             // the background — we build it on demand and report its
             // weight/tx count honestly. Core dropped `currentblocksize`
-            // (Knots still emits it); match Core.
+            // (forks still emit it); match Core.
             let current = mgr
                 .mempool_ref()
                 .build_template(cs, Script::new(vec![avila_consensus::script::OP_1]), now)
@@ -14071,7 +14131,7 @@ pub(crate) fn dispatch(
                             bantime
                         } else {
                             now + if bantime <= 0 {
-                                avila_p2p::banman::DEFAULT_BANTIME
+                                mgr.default_ban_time()
                             } else {
                                 bantime
                             }
@@ -15050,6 +15110,72 @@ mod tests {
         assert_eq!(r.as_str().unwrap().len(), 64);
     }
 
+    /// `getextrapoolinfo`/`extrapoolpromote` — the observation pool's
+    /// RPC face: empty-pool shape plus the not-held error.
+    #[test]
+    fn extrapool_rpc_surface() {
+        let cs = Chainstate::new(&Network::Regtest.params());
+        let queries = query_server(cs);
+        let snap = snap();
+
+        let (r, e) = dispatch(
+            "getextrapoolinfo",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["enabled"], true);
+        assert_eq!(r["size"], 0);
+        assert!(r["entries"].as_array().unwrap().is_empty());
+
+        // Missing/wrong args — arity is checked ahead of the arm.
+        let (_, e) = dispatch(
+            "extrapoolpromote",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(e.is_some());
+        let (_, e) = dispatch(
+            "extrapoolpromote",
+            &json!(["nothex"]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(e.unwrap().0, RPC_INVALID_PARAMETER);
+        // Valid txid, not observed → "txid not in extrapool".
+        let (_, e) = dispatch(
+            "extrapoolpromote",
+            &json!([Txid::ZERO.to_string()]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        let (code, msg) = e.unwrap();
+        assert_eq!(code, RPC_VERIFY_REJECTED);
+        assert!(msg.contains("extrapool"), "{msg}");
+    }
+
     #[test]
     fn chain_queries_answer_from_the_live_chainstate() {
         let cs = Chainstate::new(&Network::Regtest.params());
@@ -15264,7 +15390,7 @@ mod tests {
         assert_eq!(r["fullrbf"], Value::Bool(true));
         assert_eq!(r["maxmempool"].as_u64(), Some(300_000_000));
 
-        // getblocktemplate carries the Core/Knots shape: mandatory
+        // getblocktemplate carries the Core-compat shape: mandatory
         // !segwit, taproot rule, proposal-only capabilities, empty
         // coinbaseaux, vb fields, tip+height longpollid, and the
         // zero-witness-root commitment every post-segwit block needs.
@@ -15513,8 +15639,8 @@ mod tests {
         }
     }
 
-    /// Every expected string below is verbatim Knots 29.3
-    /// `decodescript` output on regtest — asm, desc (with checksum),
+    /// Every expected string below is verbatim `decodescript`
+    /// output from a 29.3-era node on regtest — asm, desc (with checksum),
     /// type, and address all compared against the real thing.
     #[test]
     fn script_pubkey_json_matches_core_shapes() {
@@ -15626,7 +15752,7 @@ mod tests {
 
     /// `sendrawtransaction`'s deterministic paths — param validation,
     /// decode errors, and consensus rejects all carry Core's codes and
-    /// reason strings (verified live against Knots 29.3).
+    /// reason strings (verified live against a 29.3 node).
     #[test]
     fn sendrawtransaction_error_paths() {
         let cs = Chainstate::new(&Network::Regtest.params());
@@ -16294,8 +16420,8 @@ mod tests {
         assert_eq!(r["tx"][0]["wtxid"], json!(&gtxid));
 
         // A witness proof without the flag yields the empty list, and a
-        // classic proof under the flag fails to deserialize — both like
-        // Knots.
+        // classic proof under the flag fails to deserialize — both matching
+        // the reference node's behavior.
         let (r, e) = dispatch(
             "verifytxoutproof",
             &json!([wproof]),
@@ -16311,7 +16437,7 @@ mod tests {
         assert_eq!(r, json!([]));
     }
 
-    /// `gettxoutproof` error contract — Knots' exact codes/wording.
+    /// `gettxoutproof` error contract — the 29.3 wire's exact codes/wording.
     #[test]
     fn txoutproof_error_contract() {
         let params = Network::Regtest.params();

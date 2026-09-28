@@ -1076,3 +1076,269 @@ window-manifest counterparts under `corpus-454k/`.
 
 Suite: all 115 executable checks pass on this tree; `build_rev` records
 `+dirty` where appropriate.
+
+## 2026-09-27f — microarchitectural drill-down: the register-residency unlock
+
+Full byte/cycle-level characterization of the ECDSA verify bottleneck on
+the i3-N305 (8×Gracemont E-cores, no HT, 6MB L3, 2MB L2/4c cluster,
+single-channel DDR5, AVX2+BMI2+ADX, no AVX-512/IFMA).
+
+**Structural decomposition (vendored secp256k1-sys 0.10.1, field_5x52_int128,
+ECMULT_WINDOW_SIZE=15):** verify ≈ 86µs = ~11µs pubkey parse (X-decompress,
+now partially cached: PK_CACHE_HIT measured 30.6% on real window) + ~3.5µs
+scalar_inverse_var + ~72µs ecmult_strauss_wnaf = GLV-split 4×~128-bit
+wnaf halves → ~129 chained gej_doubles (~340ns) + ~58 adds (~600ns) +
+8-entry pre_a build. Field-mul: 25 mulx + ~30 adcx/adox carry ops, ~60µops,
+critical path ~120cyc ≈ 43.5ns serial-dep vs 12.2ns indep — the mulx+flag
+relay is latency-bound; ~80% of each mul is carry latency not throughput.
+
+**Dead ends, all measured (not argued):**
+- ecmult window sweep {15,12,10,8} ×8 threads: medians 27.8k/28.4k/—/23.2k
+  sig/s — noise overlap, no win.
+- AVX2 4-lane fe_mul (10×26-limb, correct mod-p arithmetic): 42.8-45.5ns/mul
+  vs scalar 43.5-52ns → **~1.2×**. vpmuludq 32-bit lanes wrong shape; the
+  lane-parallel prime-field trick needs AVX-512-IFMA vpmadd52, absent.
+- FP/FMA 4-lane fe_mul (10×26 as f64, TwoProdFMA): measured **0.44×**
+  (98.8ns/mul) — accumulator accumulation creates a new serial chain;
+  product-count tax (100 vs 25) cancels FMA throughput. vfmadd ymm
+  throughput measured 1.51 vec-ops/cyc = 6.0 lane-fma/cyc vs imul 1.8/cyc.
+- 4× independent full ecdsa_verify: 92.4µs/verify — wnaf-driven branches
+  prevent OoO overlap across call boundaries.
+- 4× indep gej_double/gej_add calls: ~1.0-1.1× — investigated aliasing
+  (separate named gej locals: same result, ruled out) and branch fusion
+  (identical instruction stream after inlining — parity by construction).
+- Fused gej_double4 (per-lane locals, interleaved ops): 0.98× — same
+  stream as 4 inlined calls.
+- Batch ECDSA: mathematically dead (needs nonce point R; computing R IS
+  the verify). Schnorr batch real but absent pre-709632.
+
+**THE UNLOCK — measured positive result:**
+- Op-mix probes: 4 independent muls interleaved with sqr/add/negate still
+  pipeline at ~11.6ns/mul (vs 43.5 serial) — the point-op op mix was never
+  the blocker.
+- gej_double formula re-emitted on NAMED LOCAL fe vars (register-resident,
+  no pointer/struct access): **1× = 305.5ns/op, 4× interleaved = 149.7ns/op
+  → 2.04× measured.** The pointer-based gej* API's memory traffic
+  (~10×40B load/store per op, store→load forwarding ~5cyc each) was the
+  hidden serial resource saturating the latency budget the OoO needed.
+- ROB capacity ≈ ~4-5 concurrent fe_mul chains (~250µops) — the ILP
+  ceiling on Gracemont, consistent with all measurements.
+
+**Design that follows — merged-4 `verify4`:**
+- 4 signatures' ladders run in one instruction stream; all gej state in
+  locals (never memory); per-step fused dbl×4 + per-lane predicated adds.
+- Bonus: the 4 lanes' pre_a global-Z inversions batch into ONE inversion
+  (Montgomery trick); scalar inverses also batchable.
+- Bound: doubles ~2×, adds ~1.5-2×, batched inversion ~-3µs/verify →
+  verify ~86→~45-55µs → ~1.6-1.9× verify → ~1.8-2.3× window stacked with
+  structure+pkcache. Multi-day build + full differential testing vs
+  libsecp required — new consensus-path crypto, scalar fallback retained.
+
+## 2026-09-27g — merged-4 ecmult prototype: the unlock is real but capped
+
+Harnesses archived in experiments/code/:
+- dbl4_locals_bench.c    — THE unlock: gej_double formula on named-local fe
+  vars (register-resident, no pointer traffic): 1x=305.5ns, 4x=149.7ns/dbl
+  → 2.04x. Pointer-based gej* API memory traffic was the hidden serial
+  resource.
+- add4v.c-equivalent inline in ecmult4_merged_bench.c — var-time add on
+  locals: 1x=605.5 → 4x=447.8ns → 1.35x. (Complete-formula Brier-Joye add
+  measured 0.95x — deeper DAG defeats the ROB; validation doesn't need CT.)
+- ecmult4_merged_bench.c — full merged-4 strauss ladder (4 lanes' gej in
+  named locals, fused dbl x4, per-lane predicated adds, correct shared-Z
+  globalz + beta-aux ordering): differential-verified correct vs scalar
+  ecmult on all lanes. MEASURED: 101.3us vs 120.7us scalar x4 → **1.19x**.
+  The composite is capped by the adds' deep DAGs (~750uops/op >> 250-entry
+  ROB) + sparse-branch stream — exactly the DAG-depth bound predicted.
+- fma_tput_bench.c — vfmadd ymm = 1.51 vec-ops/cyc = 6.0 lane-fma/cyc vs
+  scalar imul 1.8/cyc — FP has 3.3x the per-cycle multiply throughput BUT
+  FP field-mul probe measured 0.44x (accumulator serial chains + 4x
+  product count of 10x26 vs 5x52 limbs).
+- ge_ilp_bench.c — 4x indep gej_double/add calls = ~1.0-1.1x; alias-free
+  named locals same result; the calls emit the same instruction stream
+  after inlining → parity by construction.
+- verify_ilp_bench.c — 4x indep ecdsa_verify = 92.4us/call vs 86.5 serial
+  — wnaf-branch dispatch prevents cross-call overlap.
+- femul4_avx2_bench.c — correct 4-lane 10x26-limb AVX2 field mul:
+  ~1.13-1.22x — vpmuludq 32-bit lanes wrong shape; needs AVX-512-IFMA
+  (absent on i3-N305).
+
+**Where the merged-4 bound lands**: ecmult ~1.19x → verify ~1.15x →
+window ~1.08x on this era. NOT sufficient alone to justify a
+consensus-path rewrite.
+
+**The remaining unexplored axis — hand-interleaved assembly**: C cannot
+express interleaving the four lanes at single-instruction granularity;
+the OoO was expected to perform that reorder but measured shows it does
+not through the adds' deep DAGs. Hand-scheduled round-robin emission of
+the four lanes' mulx/carry ops could approach the proven 12ns/mul
+indep-chain rate (vs ~43ns serial) — ceiling ~1.5-1.8x on verify. Cost:
+multi-week consensus-critical asm + full differential harness. Deferred
+pending decision; C merged-4 result stands as the baseline to beat.
+
+## 2026-09-27h — independent crypto-ledger source and assembly audit
+
+The saved sources do **not** support the ceiling or all of the measurements
+in the preceding entries. Review and proposed experiments:
+`experiments/2026-09-27-crypto-ledger-review.md`. Source hashes, compiler argv,
+generated FMA-loop assembly and correctness evidence:
+`experiments/results/2026-09-27-crypto-ledger-review/`.
+
+- Archived AVX2 field-mul correctness section: **15,004 mismatches / 16,000
+  lanes**, exit 1 under `guard_run.sh --max 512 --reserve 4096` and a
+  20-second timeout. Only the timing section was removed. The 260-to-256-bit
+  conversion drops top bits without folding them modulo p; the first error
+  is exactly `7 * (2^32 + 977)`. This probe does not rule out AVX2.
+- Merged-4's 1.19x comparison times scalar setup but excludes candidate
+  setup, then mutates a table coordinate without its associated data.
+  The initial four comparisons do not validate the timed workload. Its
+  added dbl-only loop keeps infinity set and returns before arithmetic.
+- GCC 15.2 emits one FMA dependency chain and two integer multiply chains
+  from `fma_tput_bench.c`, while its numerators charge eight of each. The
+  reported throughput comparison is invalid for this generated program.
+- The pinned global-Z routine has no field inversion. The earlier 512-record
+  census already records zero field inversions in verification; magnitude
+  metadata is absent in non-VERIFY builds. Those proposed savings are not
+  available. Intel documents a Gracemont dependency between ADCX and ADOX,
+  relevant to the proposed assembly schedule.
+
+This was a bounded correctness/compiler audit, not a new speed benchmark.
+No production change or new speedup is claimed. The review recommends testing
+exact 52-bit-limb FMA, operation-level schedules across independent jobs, and
+amortized affine arithmetic, with complete matched work and separate verdicts.
+
+## 2026-09-28 — 4x64 hand-asm mul + matched merged-4 correction
+
+**fe_mul_4x64_asm (experiments/code/fe_mul_4x64_asm.S)** — row-major
+BMI2/ADX 4x64 field mul, CORRECT (10K differential cases + edges; scheme
+verified on 100K in rowmajor_sim.py). ~184 instructions. MEASURED under
+load-9 machine, pinned core: serial ~58-70ns vs libsecp 5x52 ~50-56ns,
+indep ~50-55 vs ~46-53 — PARITY-TO-WORSE, not faster. Consistent with
+Intel opt-manual §4.1.8.8 (Gracemont tracks arith flags together —
+adcx/adox are NOT independent chains there). The product-count win
+(16 vs 25) was eaten by ~30-deep dual flag chains + ~35 bookkeeping ops.
+**Conclusion: asm 4x64 mul does not beat C 5x52 on Gracemont.**
+
+**MATCHED merged-4 re-measurement (ecmult4_matched_bench.c)** — fixed
+audit item 2 (both sides pay identical work: prep+tables+globalz+beta+
+ladder; same scalar perturbation; all outputs consumed; dbl sub-bench
+uses valid non-infinity points):
+- dbl seq-4 vs fused-4: **0.99x** — the earlier "2.04x locals unlock"
+  was entirely the inf=1 early-return artifact (empty loop measured).
+- merged-4 ecmult matched: **1.01x** — the earlier "1.19x" was the
+  setup-exclusion artifact (candidate skipped prep/tables/beta that
+  scalar paid inside ecmult).
+
+**Both headline numbers were measurement artifacts. The merged-4
+direction is DEAD at ~1.0x.** OoO already extracts all parallelism the
+same-formula-interleave stream can offer. Named-locals "register
+residency" was illusory — 12 fe = 60 limbs can't fit in 16 GPRs anyway.
+
+**Surviving directions (per the audit's recommended designs):**
+1. Exact wide-limb FMA (5x52 SIMD, Emmart-Zheng-Weems ARITH'18 style):
+   25 product pairs, exact split via round+FMA-residual. AVX2 NOT ruled
+   out — earlier rejection used a buggy 10x26 kernel (15K/16K mismatch).
+2. Tiled ready-op scheduling across independent verifies (tile 4-32) —
+   different from merged-4: dispatch a QUEUE of ready field ops rather
+   than whole formulas per lane.
+3. Affine batch coords + Montgomery inversion amortization: amortized
+   add ~(5-3/B)M+S+I/B vs Jacobian 8M+3S (~2x fewer units at B=16-32);
+   affine doubling worse unless sqr cheap — mixed design, needs bench.
+4. Repeat-key comb tables (~30% repeat keys): precomputed spaced-power
+   combos beat 129-tower+128-adds.
+
+**Artifacts:** fe_mul_4x64_asm.S (correct, ~parity), fe_mul_4x64_bench.c,
+fe_mul_4x64_test.c, rowmajor_sim.py, ecmult4_matched_bench.c (corrected
+harness — the standard for future comparisons).
+
+**CRITICAL follow-up (same day):** audit-grade ILP probe (ilp_verify.c —
+consumed outputs, varied lanes, distinct b per lane):
+- serial fe_mul: 42.6ns ; indep4: 39.0ns ; indep4B: 41.9ns
+- **The "3.57x independent-chain ILP" premise is FALSE.** Four independent
+  mul chains run at ~serial rate → the shared serial resource is NOT the
+  ROB — it is the CARRY-FLAG machinery itself. All adc/adcx/adox across
+  all lanes serialize on one flag-tracking structure (consistent with
+  Gracemont §4.1.8.8). Math: ~35-40 flag-hops/mul at ~1/cyc ≈ ~40ns —
+  matches both serial and indep rates.
+
+**This reframes the whole problem: the ONLY way to speed up field ops on
+Gracemont is to stop using carry flags.** Flag-free datapaths:
+- SIMD vpmuludq: 32x32->64 — can't hold 52-bit limbs (needs AVX512-IFMA,
+  absent); 10x26 repr quadruples product count — measured dead.
+- **FMA exact-split (Emmart-Zheng-Weems ARITH'18): 52-bit limbs fit the
+  53-bit double mantissa; product splits exactly via round+FMA residual;
+  carries via vpsrlq/vpand — ZERO flag ops. 25 pairs, ~50 FMA-class ops,
+  FMA tput ~2/cyc → est ~9-15ns/mul if flag theory holds.** THE remaining
+  crypto lever with a mechanism that escapes the measured bottleneck.
+  (Earlier FP probe used wrong 10x26 repr — the audit's point exactly.)
+- data-register carries in scalar: shrd/add-based 5x52 still uses adds
+  (flag ops) — not an escape.
+
+Next: exact-split FMA 5x52 fe_mul probe (4 lanes, ymm), correctness vs
+libsecp, measure serial+interleaved.
+
+## 2026-09-28b — BREAKTHROUGH: EZW-style FMA field mul works
+
+**fe_mul4_ezw (ezw2.c, experiments/code/fe_mul4_ezw.c)** — fused-4-lane
+5x52 field mul using the Emmart-Zheng-Weems ARITH'18 RZ-FMA trick:
+- hi = fma_rz(a,b,2^104): lands product into [2^104,2^105) binade ->
+  bits(hi) - bits(2^104) = p>>52 AS INT BIT-PATTERN (no conversion!)
+- ad = (2^104+2^52) - hi; lo = fma(a,b,ad): -> bits(lo)-bits(2^52) =
+  p mod 2^52. Requires FE_TOWARDZERO (ldmxcsr once per kernel; the
+  round-nearest signed-residual path can't hold a single binade).
+- Column sums accumulate biased bit-patterns via vpaddq; init each
+  column to -nterms*bias (mod-2^64 wraparound exact).
+- Carry-resolve + mod-p fold ENTIRELY in SIMD (vpsrlq/vpand/vpaddq;
+  the out*16C fold uses the same RZ-FMA hi/lo split, C=(2^32+977)).
+- Requires AVX2+FMA (N305 yes); correctness vs libsecp fe_mul:
+  **200K random cases all lanes pass.**
+
+MEASURED (pinned core, load ~9 machine):
+- serial chain: ~115ns/group = ~29ns/mul-equiv
+- independent: **~28ns/group = ~7.1ns/mul-equiv vs ~40ns flag-bound
+  libsecp — ~5.6x throughput**
+- libsecp 5x52 fe_mul: ~40-43ns serial AND ~39-43ns "independent"
+  (flag-resource is the shared serial bottleneck — confirmed).
+
+INTERPRETATION: this is the first datapath that escapes the flag
+bottleneck. In a merged-4 ecmult each DAG-level has ~4 independent
+muls — fused-4 processes them at ~29ns latency-bound to ~7ns
+throughput-bound per mul-equivalent vs ~40ns. Combined with a fused
+ladder (fe_sqr via symmetric products ~15% cheaper, fe_add/negate
+trivial in int lanes), the ecmult mass plausibly lands ~2-3x.
+
+OPEN ITEMS: register pressure (45 live ymm > 16) — needs scheduling/
+blocking; chain latency 115ns has spill overhead; fold's residual
+carry iterations bounded at 2 (verified sufficient on 200K but needs
+proof/exhaustive bound check); MXCSR RZ mode must bracket each kernel
+(ldmxcsr ~10-20cyc, amortize over whole point-op); aliasing/output
+semantics for in-place ops. fe_sqr4 variant next (half the products).
+
+## 2026-09-28c — fused-4 dbl4 correct; latency-bound diagnosis
+
+- fe_sqr4_ezw: correct 100K (off-diag via doubled bit-accumulation,
+  diag via separate accs; noff/ndiag bias tables).
+- gej4_double (fused-4 point double): correct on all coords, all lanes,
+  2000 random cases vs libsecp gej_double.
+- SIMD helpers needed for point formulas: fe4_add/neg/mul_int/half —
+  each emits normalized <2^52 limbs (product binade constraint:
+  operands must be <2^52 or hi=fma(p,2^104) overflows its binade).
+  fe4_neg uses 4p-a with explicit SIMD borrow chain; fe4_half adds p if
+  odd via lane-select, then propagates the carry and >>1s across limbs.
+- fe_mul4 tail bug fixed: F[5] (weight 2^260) folds by *16C into limbs
+  0,1 — NOT into limb4 (2^260 ≡ 16C mod p directly at weight 2^0).
+- TIMING (pinned, noisy machine): fused dbl4 serial chain ~920ns/dbl4
+  = ~230ns/dbl-equiv vs scalar ~343ns = **1.48x**. Interleaving TWO
+  independent dbl4 streams (8 sigs) gains ~0% — the fused ops are
+  LATENCY-bound (~115ns each), not ROB/scheduling-bound.
+- Root cause of latency: ~720 emitted insns (~100 spill refs) — 10 acc
+  + 10 operand + temps > 16 ymm. Merged-acc variant (single column
+  accumulator absorbing both lo-bits and hi-bits via combined bias
+  init) verified correct on 200K — cuts accumulator regs ~45%->~20.
+- NEXT LEVERS: (a) kernel latency — fewer live ymm (mem accumulators
+  or column-streaming), shorter resolve/fold tail (~90 ops mostly
+  serial), maybe merge norm into ops; (b) if latency ~60ns: dbl4 ~2.7x
+  scalar, ecmult4 ~2.5-3x.
+- CEILING model now: verify4 = ~350 fused ops ~100-115ns = ~40us vs
+  ~86us scalar = ~2.2x ceiling at CURRENT latency; ~60ns -> ~4x.
+  This is the crypto mass only (~50-60% of IBD wall).

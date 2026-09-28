@@ -3,7 +3,7 @@
 **Status: measurement specification plus first evidence.** C1 and P1
 have measured baselines (see the Evidence column); the remaining rows
 are unmeasured pending the G1 harness. Functional interop verified
-live against Core 29.4 and Knots 29.3.0 is summarized below the
+live against Core 29.4 and a 29.3-lineage fork is summarized below the
 table — it establishes correctness, not performance leadership.
 
 The aim is to lead the strongest reproducible alternatives across all relevant
@@ -49,7 +49,7 @@ documentation describes Utreexo, a watch-only wallet, Electrum and a
 rust-bitcoinkernel validation boundary. Match actual enabled behavior and distinguish
 independent implementations from shared validation code.
 
-The surveyed field — including btcd, Gocoin, libbitcoin, Knots and specialist
+The surveyed field — including btcd, Gocoin, libbitcoin, fork clients and specialist
 services — with per-row reference assignments and exclusion reasons lives in
 [docs/NODE_LANDSCAPE.md](NODE_LANDSCAPE.md). Add specialist indexers, wallet
 backends, mining services and storage implementations where they provide a
@@ -93,7 +93,7 @@ acceptance claims but do not substitute for the P/Q benchmarks above.
   Core 29.4 regtest including getblocktemplate/getmininginfo
   (experiments/2026-09-14-rpc-compat-matrix.md).
 - **State-level differential**: `tools/diff_validate.py` — the same
-  block stream driven through Avila and Knots on a shared regtest
+  block stream driven through Avila and a 29.3-lineage node on a shared regtest
   chain, comparing `gettxoutsetinfo` (hash_serialized_3, txouts,
   total_amount) and `getblockstats` (totalfee/subsidy/ins/outs) after
   every block. Coverage per run: coinbase-only funding blocks, all four

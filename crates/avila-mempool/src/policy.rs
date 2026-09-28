@@ -150,20 +150,72 @@ pub fn is_standard_tx(
     Ok(())
 }
 
+/// A named counterfactual relay policy — the observatory's unit of
+/// account. Shadow evaluation never gates: a "rejection" feeds
+/// per-profile counters, not the verdict. The point is a live
+/// policy-drift signal — "how much of today's traffic a node with
+/// THESE rules would refuse".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShadowRules {
+    /// Total `OP_RETURN` script-byte budget across the tx (Core's
+    /// `datacarrier_bytes_left` model). 0 = NullData is nonstandard.
+    pub datacarrier_bytes: i64,
+    /// Max nulldata outputs per tx (strict accounting is 1; byte-only profiles bound by bytes).
+    pub max_nulldata: usize,
+    /// `-permitbaremultisig`.
+    pub permit_bare_multisig: bool,
+    /// `-dustrelayfee`, sat/kvB.
+    pub dust_relay_fee: i64,
+}
+
+/// The mainline envelope: byte-bounded datacarrier, bare multisig
+/// relayed, Core's dust rate.
+pub const SHADOW_CORE: ShadowRules = ShadowRules {
+    datacarrier_bytes: MAX_OP_RETURN_RELAY as i64,
+    max_nulldata: usize::MAX,
+    permit_bare_multisig: true,
+    dust_relay_fee: DUST_RELAY_TX_FEE,
+};
+
+/// The strict relay envelope: 42 bytes of datacarrier, one nulldata
+/// output, no bare multisig relay.
+pub const SHADOW_STRICT: ShadowRules = ShadowRules {
+    datacarrier_bytes: 42,
+    max_nulldata: 1,
+    permit_bare_multisig: false,
+    dust_relay_fee: DUST_RELAY_TX_FEE,
+};
+
+/// The permissive envelope — "what would an unfiltered node relay that
+/// I drop": the largest lawful datacarrier, no bare-multisig refusal,
+/// no dust refusal.
+pub const SHADOW_PERMISSIVE: ShadowRules = ShadowRules {
+    datacarrier_bytes: crate::MAX_STANDARD_TX_WEIGHT as i64,
+    max_nulldata: usize::MAX,
+    permit_bare_multisig: true,
+    dust_relay_fee: 0,
+};
+
+/// Resolve a `policy.shadow` name to its ruleset. Names are the
+/// operator-visible contract — the config validator refuses unknown
+/// ones at load, so a typo can never silently shadow nothing.
+pub fn shadow_preset(name: &str) -> Option<ShadowRules> {
+    Some(match name {
+        "core" => SHADOW_CORE,
+        "strict" => SHADOW_STRICT,
+        "permissive" => SHADOW_PERMISSIVE,
+        _ => return None,
+    })
+}
+
 /// The shadow-ruleset observatory (queue #8): evaluate a tx under a
-/// STRICTER relay policy than ours — the Knots-style standardness
-/// envelope — and report the first divergence. Never gates: this runs
-/// after admission and only feeds counters. The point is a live
-/// consensus/policy-drift signal — "how much of today's pool would a
-/// stricter node reject".
-///
-/// Parameters (Knots defaults where they differ):
-/// - `-datacarriersize` = 42 bytes total (ours: `MAX_OP_RETURN_RELAY`)
-/// - at most ONE nulldata output (Knots' datacarrier accounting is
-///   per-output-strict)
-/// - `-permitbaremultisig` = 0 (ours: on)
-/// - everything else identical to [`is_standard_tx`]
-pub fn shadow_standard(tx: &Transaction, dust_relay_fee: i64) -> Result<(), &'static str> {
+/// counterfactual relay policy and report the first divergence.
+/// Never gates — this runs beside admission and only feeds counters.
+/// The standardness envelope (version bounds, scriptsig limits,
+/// script-type standardness) is consensus-shaped and fixed; the
+/// profile's knobs are exactly the ones operators move between
+/// implementations.
+pub fn shadow_eval(tx: &Transaction, rules: &ShadowRules) -> Result<(), &'static str> {
     if tx.version < TX_MIN_STANDARD_VERSION || tx.version > TX_MAX_STANDARD_VERSION {
         return Err("shadow:version");
     }
@@ -175,8 +227,8 @@ pub fn shadow_standard(tx: &Transaction, dust_relay_fee: i64) -> Result<(), &'st
             return Err("shadow:scriptsig-not-pushonly");
         }
     }
-    let mut nulldata_seen = false;
-    let mut datacarrier_bytes_left: i64 = 42;
+    let mut nulldata_seen = 0usize;
+    let mut datacarrier_bytes_left = rules.datacarrier_bytes;
     for output in &tx.outputs {
         let t = output.script_pubkey.classify();
         if !is_standard_script_type(&t) {
@@ -184,22 +236,23 @@ pub fn shadow_standard(tx: &Transaction, dust_relay_fee: i64) -> Result<(), &'st
         }
         match t {
             ScriptType::NullData => {
-                if nulldata_seen {
+                if nulldata_seen >= rules.max_nulldata {
                     return Err("shadow:datacarrier-count");
                 }
-                nulldata_seen = true;
+                nulldata_seen += 1;
                 let size = output.script_pubkey.as_bytes().len() as i64;
                 if size > datacarrier_bytes_left {
                     return Err("shadow:datacarrier");
                 }
                 datacarrier_bytes_left -= size;
             }
-            // Shadow policy: bare multisig is nonstandard to relay.
-            ScriptType::Multisig { .. } => return Err("shadow:bare-multisig"),
+            ScriptType::Multisig { .. } if !rules.permit_bare_multisig => {
+                return Err("shadow:bare-multisig");
+            }
             _ => {}
         }
     }
-    if dust_outputs(tx, dust_relay_fee).len() > MAX_DUST_OUTPUTS_PER_TX {
+    if dust_outputs(tx, rules.dust_relay_fee).len() > MAX_DUST_OUTPUTS_PER_TX {
         return Err("shadow:dust");
     }
     Ok(())

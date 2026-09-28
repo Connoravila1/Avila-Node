@@ -1,13 +1,29 @@
-**Product objective: first launch to full Bitcoin validation within one hour**
+**Product objective: substantially faster fully validated Bitcoin IBD on an ordinary laptop**
+
+Latest user direction, 2026-09-27: the sub-hour objective was not realistic,
+and the reported result does not deliver significant optimization. Prioritize
+demonstrated improvements in the actual node over further physical-floor
+estimates. Every applicable consensus check remains required.
+
+The [optimization work order](IBD_OPTIMIZATION_WORK_ORDER_2026-09-27.md)
+sets a first engineering milestone of at least 2× lower full-validation wall
+time on matched, complete real work, followed by node integration and broader
+validation. This is a target, not an achieved speedup or a promised whole-IBD
+duration. Measure against the existing optimized production path on the same
+laptop. First-launch claims must also include acquisition and durable finish.
+
+**Original one-hour stretch objective and its acceptance boundary**
 
 Accepted by the user on 2026-09-26:
 
 > Install, open, fully validate Bitcoin within an hour on ordinary laptop
 > hardware, under specified connection conditions.
 
-This is an engineering objective. It is not an achieved capability, a forecast,
-or a claim about the physical minimum. Retain the objective while experiments
-establish which implementation and connection conditions can satisfy it.
+This original objective is retained as historical context and a stretch target,
+not a supported forecast or a claim about the physical minimum. The immediate
+performance assignment above takes priority. The following strict timing and
+validation boundary also prevents later speed claims from excluding required
+work; the 3,600-second threshold belongs specifically to the stretch target.
 
 **Acceptance boundary**
 

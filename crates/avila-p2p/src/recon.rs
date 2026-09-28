@@ -10,7 +10,7 @@
 //! does not. Misses come back as `reconcildiff` short-id asks and the
 //! ordinary `tx`/`inv` paths carry the bodies.
 //!
-//! Scope note: this is the intra-Avila protocol — no live Core/Knots
+//! Scope note: this is the intra-Avila protocol — no live Core
 //! peer speaks BIP-330 yet, so wire details follow the BIP-330 draft's
 //! shape while remaining the only implementation either side will see.
 

@@ -3,14 +3,14 @@
 fixture for connect_bench / diff tooling.
 
 Spins up nothing itself: point it at a running regtest reference
-daemon (Knots/Core -regtest -server). Funds a wallet, then produces
+daemon (a Core-compatible -regtest -server node). Funds a wallet, then produces
 BLOCKS blocks each containing SENDS real wallet-signed txs
 (P2WPKH spends — genuine ECDSA checksig work on replay), sealed via
 `generateblock` and dumped in `[magic][len][block]` wire format.
 
 Usage:
   python3 tools/make_spend_fixture.py \
-      --core 127.0.0.1:19500 --core-cookie /tmp/perf-knots/regtest/.cookie \
+      --core 127.0.0.1:19500 --core-cookie /tmp/perf-ref/regtest/.cookie \
       --out /tmp/spend-fixture.dat --blocks 300 --sends 40
 """
 

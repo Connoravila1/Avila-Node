@@ -543,7 +543,14 @@ impl<'a> TransactionSignatureChecker<'a> {
     /// `CPubKey::Verify` normalizes first (`secp256k1_ecdsa_signature_normalize`),
     /// so we do the same (pubkey.cpp:283).
     fn verify_ecdsa_signature(sig: &[u8], pubkey: &[u8], sighash: &[u8; 32]) -> bool {
-        let Ok(pk) = secp256k1::PublicKey::from_slice(pubkey) else {
+        let pk = pk_cache_get(pubkey).unwrap_or_else(|| {
+            let p = secp256k1::PublicKey::from_slice(pubkey);
+            if let Ok(k) = p {
+                pk_cache_put(pubkey, k);
+            }
+            p
+        });
+        let Ok(pk) = pk else {
             return false;
         };
         let Ok(mut sig) = secp256k1::ecdsa::Signature::from_der_lax(sig) else {
@@ -831,6 +838,45 @@ pub static SCHNORR_VERIFY_CALLS: std::sync::atomic::AtomicU64 =
 /// Schnorr attempts actually entering `secp().verify_schnorr`.
 pub static SCHNORR_VERIFY_BACKEND_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Pubkey-parse cache hits (33/65-byte pubkey → parsed `PublicKey`).
+pub static PK_CACHE_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Pubkey-parse cache misses (successful parses are stored).
+pub static PK_CACHE_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Per-worker parsed-pubkey cache — `secp256k1_ec_pubkey_parse` costs
+/// ~11 µs (X decompress + sqrt) and P2PKH repeats the same 33-byte key
+/// across many inputs. Entries are byte-identical to re-parsing; failed
+/// parses are never cached (error path unchanged). Bounded at 2^18 keys
+/// (~26 MB/worker) — full clear on overflow keeps memory bounded.
+const PK_CACHE_CAP: usize = 1 << 18;
+
+thread_local! {
+    static PK_CACHE: std::cell::RefCell<
+        std::collections::HashMap<Box<[u8]>, secp256k1::PublicKey>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn pk_cache_get(pubkey: &[u8]) -> Option<Result<secp256k1::PublicKey, secp256k1::Error>> {
+    PK_CACHE.with(|c| {
+        let hit = c.borrow().get(pubkey).copied();
+        if hit.is_some() {
+            PK_CACHE_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            PK_CACHE_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        hit.map(Ok)
+    })
+}
+
+fn pk_cache_put(pubkey: &[u8], pk: secp256k1::PublicKey) {
+    PK_CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        if m.len() >= PK_CACHE_CAP {
+            m.clear();
+        }
+        m.insert(pubkey.into(), pk);
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Verified-tx cache — mempool→block script-check dedup

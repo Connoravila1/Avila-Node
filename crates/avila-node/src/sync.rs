@@ -350,6 +350,45 @@ pub struct SyncConfig {
     /// preview of the block this node would produce next; other
     /// callers leave it off to skip the extra template-assembly work.
     pub preview_next_block: bool,
+    /// `policy.require_standard` — gate the standardness checks
+    /// (negated Core `-acceptnonstdtxn`; default on).
+    pub require_standard: bool,
+    /// `mempool.min_relay_fee_sat_per_kvb` — admission/relay fee floor
+    /// in sat/kvB (the 0.1 sat/vB post-29.x default is 100).
+    pub min_relay_fee: i64,
+    /// `policy.datacarrier`/`datacarrier_size` — the OP_RETURN byte
+    /// budget per tx; `None` mirrors `-datacarrier=0`.
+    pub datacarrier_bytes: Option<usize>,
+    /// `policy.permit_bare_multisig` (Core's `-permitbaremultisig`).
+    pub permit_bare_multisig: bool,
+    /// `policy.dust_relay_fee_sat_per_kvb` — dust-threshold rate in
+    /// sat/kvB (Core's `-dustrelayfee`, default 3000).
+    pub dust_relay_fee: i64,
+    /// `mempool.expiry_secs` — evict entries older than this (Core's
+    /// `-mempoolexpiry`, 336h).
+    pub mempool_expiry_secs: u32,
+    /// `relay.tx.stem` — route locally-originated transactions through
+    /// one stem hop before flooding (default on).
+    pub stem_relay: bool,
+    /// `sync.max_in_transit` — total blocks-in-flight budget across
+    /// peers (performance policy, not correctness).
+    pub max_in_transit: usize,
+    /// `net.dns_seeds` (Core's `-dnsseed`): seed the address book from
+    /// DNS when no `connect` peers and no proxy are configured.
+    pub dns_seeds: bool,
+    /// `hooks.peer_accept` — external verdict helpers consulted on
+    /// inbound admission (conjunction; narrowing only). Empty = none.
+    pub peer_accept_hooks: Vec<crate::hooks::HookSpec>,
+    /// `tx.admit` verdict helpers — consulted on every mempool
+    /// submission before the built-in checks (hot path).
+    pub tx_admit_hooks: Vec<crate::hooks::HookSpec>,
+    /// `policy.shadow` — counterfactual relay profiles scored on every
+    /// admission. Empty disables the observatory.
+    pub shadow_profiles: Vec<String>,
+    /// `[extrapool]` — the observation pool for policy rejects.
+    pub extrapool: avila_core::ExtrapoolConfig,
+    /// `peers.ban_time` — default `setban` duration (Core's `-bantime`).
+    pub ban_time: i64,
 }
 
 impl Default for SyncConfig {
@@ -380,6 +419,20 @@ impl Default for SyncConfig {
             queries: None,
             waiters: None,
             preview_next_block: false,
+            require_standard: true,
+            min_relay_fee: avila_mempool::DEFAULT_MIN_RELAY_FEE,
+            datacarrier_bytes: Some(avila_mempool::policy::MAX_OP_RETURN_RELAY),
+            permit_bare_multisig: avila_mempool::policy::DEFAULT_PERMIT_BAREMULTISIG,
+            dust_relay_fee: avila_mempool::policy::DUST_RELAY_TX_FEE,
+            mempool_expiry_secs: avila_mempool::DEFAULT_MEMPOOL_EXPIRY_SECS,
+            stem_relay: true,
+            max_in_transit: avila_p2p::manager::MAX_BLOCKS_IN_TRANSIT_TOTAL,
+            dns_seeds: true,
+            peer_accept_hooks: Vec::new(),
+            tx_admit_hooks: Vec::new(),
+            shadow_profiles: vec!["strict".to_string()],
+            extrapool: avila_core::ExtrapoolConfig::default(),
+            ban_time: avila_p2p::banman::DEFAULT_BANTIME,
         }
     }
 }
@@ -804,6 +857,250 @@ pub fn run(
     if let Some(b) = cfg.maxmempool_bytes {
         mgr.set_max_mempool_bytes(b);
     }
+    // Local relay policy — every knob is config/flag-reachable per
+    // docs/DECISION_REGISTRY.md; none of it touches consensus.
+    {
+        let mp = mgr.mempool();
+        mp.set_require_standard(cfg.require_standard);
+        mp.set_min_relay_fee(cfg.min_relay_fee);
+        mp.set_max_datacarrier_bytes(cfg.datacarrier_bytes);
+        mp.set_permit_bare_multisig(cfg.permit_bare_multisig);
+        mp.set_dust_relay_fee(cfg.dust_relay_fee);
+        mp.set_mempool_expiry_secs(cfg.mempool_expiry_secs);
+        // `policy.shadow` — names were validated at load; a name that
+        // fails here anyway means the preset table drifted from the
+        // validator, which is a bug, not config.
+        let profiles: Vec<(String, avila_mempool::policy::ShadowRules)> = cfg
+            .shadow_profiles
+            .iter()
+            .map(|n| {
+                (
+                    n.clone(),
+                    avila_mempool::policy::shadow_preset(n)
+                        .unwrap_or(avila_mempool::policy::SHADOW_STRICT),
+                )
+            })
+            .collect();
+        mp.set_shadow_profiles(profiles);
+        // `[extrapool]` — observation bounds for policy rejects.
+        mp.configure_extrapool(
+            cfg.extrapool.observe,
+            cfg.extrapool.max_entries,
+            cfg.extrapool.max_bytes,
+            cfg.extrapool.expiry_secs,
+        );
+    }
+    mgr.set_stem_relay(cfg.stem_relay);
+    mgr.set_max_in_flight_total(cfg.max_in_transit);
+    mgr.set_default_ban_time(cfg.ban_time);
+    // The append-only event plane (docs/DECISION_REGISTRY.md — the
+    // stream law): one NDJSON line per decision/transition in the
+    // network data dir; `avila-node events --follow` tails it. An
+    // unwritable sink demotes events to stderr-only — diagnostics,
+    // not a startup failure.
+    let mut stream = cfg
+        .data_dir
+        .as_deref()
+        .map(crate::events::EventStream::open)
+        .transpose()
+        .unwrap_or_else(|e| {
+            eprintln!("event stream: cannot open events.ndjson ({e}) — running without it");
+            None
+        });
+    let mut stream_warned = false;
+    let mut emit =
+        |stream: &mut Option<crate::events::EventStream>, kind: &str, fields: serde_json::Value| {
+            if let Some(s) = stream
+                && let Err(e) = s.emit(kind, fields)
+                && !stream_warned
+            {
+                stream_warned = true;
+                eprintln!("event stream write failed ({e}) — further write errors suppressed");
+            }
+        };
+    emit(&mut stream, "run_started", serde_json::json!({}));
+    // Bounded: a flooding hot path (tx.admit per-tx verdicts) can't
+    // grow memory unboundedly — drops land on a counter surfaced as a
+    // `hook_events_dropped` event.
+    let (hook_events_tx, hook_events_rx) = std::sync::mpsc::sync_channel::<serde_json::Value>(4096);
+    let hook_events_dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut hook_drop_seen = 0u64;
+    if !cfg.peer_accept_hooks.is_empty() {
+        use avila_core::OnDefault;
+        // Spawn once, restart-supervised thereafter. A helper that
+        // cannot spawn at all becomes a tombstone answering its
+        // on_timeout default — the registry's narrowing rule means a
+        // dead helper degrades to the point's declared posture, never
+        // to a silent policy hole.
+        let mut helpers: Vec<(crate::hooks::HookSpec, Option<crate::hooks::VerdictHelper>)> = cfg
+            .peer_accept_hooks
+            .iter()
+            .map(
+                |spec| match crate::hooks::VerdictHelper::spawn(spec.clone()) {
+                    Ok(h) => (spec.clone(), Some(h)),
+                    Err(e) => {
+                        eprintln!(
+                            "hooks.peer_accept {}: spawn failed ({e}) — \
+                             answering {:?} for every peer",
+                            spec.program.display(),
+                            spec.on_timeout
+                        );
+                        emit(
+                            &mut stream,
+                            "hook_spawn_failed",
+                            serde_json::json!({
+                                "point": "peer.accept",
+                                "program": spec.program.display().to_string(),
+                                "on_timeout": format!("{:?}", spec.on_timeout),
+                            }),
+                        );
+                        (spec.clone(), None)
+                    }
+                },
+            )
+            .collect();
+        let hook_tx = hook_events_tx.clone();
+        let dropped = hook_events_dropped.clone();
+        mgr.set_inbound_verdict(Some(Box::new(move |facts| {
+            let remote = facts.remote.to_string();
+            let facts = serde_json::json!({
+                "remote": remote.clone(),
+                "services": facts.services,
+                "protocol_version": facts.protocol_version,
+                "user_agent": facts.user_agent,
+                "start_height": facts.start_height,
+                "relay": facts.relay,
+                "wtxid_relay": facts.wtxid_relay,
+                "addrv2": facts.addrv2,
+                "transport": facts.transport,
+            });
+            // Conjunction — any helper's reject kills the connection.
+            helpers.iter_mut().all(|(spec, h)| {
+                let verdict = match h {
+                    Some(h) => h.verdict("peer.accept", &facts),
+                    None => match spec.on_timeout {
+                        OnDefault::Accept => crate::hooks::Verdict::Accept,
+                        OnDefault::Reject => crate::hooks::Verdict::Reject,
+                    },
+                };
+                let admit = match verdict {
+                    crate::hooks::Verdict::Accept => true,
+                    crate::hooks::Verdict::Reject => false,
+                    crate::hooks::Verdict::Defer => {
+                        matches!(spec.on_defer, OnDefault::Accept)
+                    }
+                };
+                if hook_tx
+                    .try_send(serde_json::json!({
+                        "kind": "hook_verdict",
+                        "point": "peer.accept",
+                        "helper": spec.program.display().to_string(),
+                        "verdict": match verdict {
+                            crate::hooks::Verdict::Accept => "accept",
+                            crate::hooks::Verdict::Reject => "reject",
+                            crate::hooks::Verdict::Defer => "defer",
+                        },
+                        "remote": remote.as_str(),
+                        "admit": admit,
+                    }))
+                    .is_err()
+                {
+                    dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                admit
+            })
+        })));
+    }
+    if !cfg.tx_admit_hooks.is_empty() {
+        use avila_core::OnDefault;
+        // Same spawn/tombstone semantics as peer.accept — a dead helper
+        // degrades to its on_timeout posture. This is the hot path:
+        // admission throughput is bounded by helper latency.
+        let mut helpers: Vec<(crate::hooks::HookSpec, Option<crate::hooks::VerdictHelper>)> = cfg
+            .tx_admit_hooks
+            .iter()
+            .map(
+                |spec| match crate::hooks::VerdictHelper::spawn(spec.clone()) {
+                    Ok(h) => (spec.clone(), Some(h)),
+                    Err(e) => {
+                        eprintln!(
+                            "hooks.tx_admit {}: spawn failed ({e}) — \
+                             answering {:?} for every tx",
+                            spec.program.display(),
+                            spec.on_timeout
+                        );
+                        emit(
+                            &mut stream,
+                            "hook_spawn_failed",
+                            serde_json::json!({
+                                "point": "tx.admit",
+                                "program": spec.program.display().to_string(),
+                                "on_timeout": format!("{:?}", spec.on_timeout),
+                            }),
+                        );
+                        (spec.clone(), None)
+                    }
+                },
+            )
+            .collect();
+        let hook_tx = hook_events_tx.clone();
+        let dropped = hook_events_dropped.clone();
+        mgr.mempool().set_admit_hook(Some(Box::new(
+            move |facts: &avila_mempool::TxAdmitFacts| {
+                let txid = facts.txid.to_string();
+                let facts = serde_json::json!({
+                    "txid": txid.clone(),
+                    "wtxid": facts.wtxid.to_string(),
+                    "version": facts.version,
+                    "lock_time": facts.lock_time,
+                    "vbytes": facts.vbytes,
+                    "weight": facts.weight,
+                    "inputs": facts.inputs,
+                    "outputs": facts.outputs,
+                    "output_value": facts.output_value,
+                    "fee": facts.fee,
+                    "feerate": facts.feerate,
+                    "rbf": facts.rbf,
+                    "has_witness": facts.has_witness,
+                    "spk_types": facts.spk_types,
+                });
+                helpers.iter_mut().all(|(spec, h)| {
+                    let verdict = match h {
+                        Some(h) => h.verdict("tx.admit", &facts),
+                        None => match spec.on_timeout {
+                            OnDefault::Accept => crate::hooks::Verdict::Accept,
+                            OnDefault::Reject => crate::hooks::Verdict::Reject,
+                        },
+                    };
+                    let admit = match verdict {
+                        crate::hooks::Verdict::Accept => true,
+                        crate::hooks::Verdict::Reject => false,
+                        crate::hooks::Verdict::Defer => {
+                            matches!(spec.on_defer, OnDefault::Accept)
+                        }
+                    };
+                    if hook_tx
+                        .try_send(serde_json::json!({
+                            "kind": "hook_verdict",
+                            "point": "tx.admit",
+                            "helper": spec.program.display().to_string(),
+                            "verdict": match verdict {
+                                crate::hooks::Verdict::Accept => "accept",
+                                crate::hooks::Verdict::Reject => "reject",
+                                crate::hooks::Verdict::Defer => "defer",
+                            },
+                            "txid": txid.as_str(),
+                            "admit": admit,
+                        }))
+                        .is_err()
+                    {
+                        dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    admit
+                })
+            },
+        )));
+    }
     let started = Instant::now();
     // Core's `GetStartupTime` — wall-clock boot epoch. `uptime` reads
     // `GetTime() - GetStartupTime()`, so a pinned mock shifts it too.
@@ -839,7 +1136,8 @@ pub fn run(
     // DNS lookup, which would leak the resolver to the operator's DNS
     // even though every dial then rides the proxy — the same reason
     // Core's `-onlynet=onion` never touches DNS seeds (queue #13).
-    let seeded = if cfg.connect.is_empty() && cfg.proxy.is_none() {
+    // `net.dns_seeds` (Core's `-dnsseed=0`) is the explicit kill switch.
+    let seeded = if cfg.connect.is_empty() && cfg.proxy.is_none() && cfg.dns_seeds {
         mgr.seed_from_dns(params, unix_now())
     } else {
         0
@@ -894,6 +1192,15 @@ pub fn run(
     let mut established_total = 0u32;
     let mut disconnects = 0u32;
     let mut connected = 0u32;
+    // (profile, reason) → last reported divergence total — the
+    // `shadow_divergence` event emits only when a counter moved.
+    let mut shadow_seen: std::collections::BTreeMap<(String, String), u64> =
+        std::collections::BTreeMap::new();
+    // Extrapool counters — same diff-the-totals emission as shadow.
+    let mut extra_reason_seen: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let mut extra_seen: std::collections::BTreeMap<&'static str, u64> =
+        std::collections::BTreeMap::new();
     // Work/time profile of the best header chain (queue: ChainProfile) —
     // kept across ticks and refreshed incrementally; the Arc is rebuilt
     // only when the tip actually moves, so an unchanged tip costs
@@ -980,6 +1287,10 @@ pub fn run(
         }
         mgr.drain_inbounds();
         for event in mgr.tick_net(&mut cs, unix_now(), params.message_start, 0) {
+            {
+                let (kind, fields) = crate::events::net_event_json(&event);
+                emit(&mut stream, kind, fields);
+            }
             match event {
                 NetEvent::Connected { .. } => established_total += 1,
                 NetEvent::Disconnected { .. } => disconnects += 1,
@@ -1001,6 +1312,85 @@ pub fn run(
                     );
                 }
                 _ => {}
+            }
+        }
+        // Hook verdicts queue on a channel (the verdict closure runs
+        // inside drain_inbounds, not the loop) — drain them into the
+        // stream each tick.
+        while let Ok(mut ev) = hook_events_rx.try_recv() {
+            let kind = ev
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .unwrap_or("hook_verdict")
+                .to_string();
+            if let Some(obj) = ev.as_object_mut() {
+                obj.remove("kind");
+            }
+            emit(&mut stream, &kind, ev);
+        }
+        let dropped_now = hook_events_dropped.load(std::sync::atomic::Ordering::Relaxed);
+        if dropped_now > hook_drop_seen {
+            hook_drop_seen = dropped_now;
+            emit(
+                &mut stream,
+                "hook_events_dropped",
+                serde_json::json!({ "total": dropped_now }),
+            );
+        }
+        // Shadow observatory → events: diff the per-profile divergence
+        // counters against what we've already reported — bounded by
+        // distinct (profile, reason) pairs, so a hot divergence emits
+        // once per new total rather than per tx.
+        for (name, st) in &mgr.mempool().shadow_stats().profiles {
+            for (reason, &n) in &st.divergent {
+                let key = (name.clone(), reason.clone());
+                if shadow_seen.get(&key).copied().unwrap_or(0) < n {
+                    shadow_seen.insert(key, n);
+                    emit(
+                        &mut stream,
+                        "shadow_divergence",
+                        serde_json::json!({
+                            "profile": name,
+                            "reason": reason,
+                            "total": n,
+                        }),
+                    );
+                }
+            }
+        }
+        // Extrapool → events: emits when a per-reason stored count or a
+        // lifecycle counter moves — bounded by distinct counters, so a
+        // flood of one reject kind can't spam the stream.
+        {
+            let extra = mgr.mempool().extrapool();
+            for (reason, &n) in &extra.stats().by_reason {
+                if extra_reason_seen.get(reason).copied().unwrap_or(0) < n {
+                    extra_reason_seen.insert(reason.clone(), n);
+                    emit(
+                        &mut stream,
+                        "extrapool_stored",
+                        serde_json::json!({
+                            "reason": reason,
+                            "total": n,
+                            "size": extra.len(),
+                            "bytes": extra.bytes(),
+                        }),
+                    );
+                }
+            }
+            for (kind, n) in [
+                ("extrapool_evicted", extra.stats().evicted),
+                ("extrapool_expired", extra.stats().expired),
+                ("extrapool_promoted", extra.stats().promoted),
+            ] {
+                if extra_seen.get(kind).copied().unwrap_or(0) < n {
+                    extra_seen.insert(kind, n);
+                    emit(
+                        &mut stream,
+                        kind,
+                        serde_json::json!({"total": n, "size": extra.len()}),
+                    );
+                }
             }
         }
         // Completion boundary for the speculative tail: pending script
@@ -1403,6 +1793,17 @@ pub fn run(
         // must not fail the shutdown: the chainstate is already flushed.
         let _ = mgr.mempool_ref().save(&dir.join("mempool.dat"));
     }
+
+    emit(
+        &mut stream,
+        "run_stopped",
+        serde_json::json!({
+            "connected_height": connected,
+            "established_total": established_total,
+            "disconnects": disconnects,
+            "elapsed_secs": started.elapsed().as_secs(),
+        }),
+    );
 
     Ok(SyncReport {
         explicit_dialed: dialed,

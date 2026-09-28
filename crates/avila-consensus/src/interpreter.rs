@@ -5,7 +5,7 @@
 //! encoding checks they rely on.
 //!
 //! Semantic reference: the pinned Core-29-lineage source at
-//! `.scratch/interpreter_v29.cpp` (Bitcoin Knots v29.3), plus
+//! `.scratch/interpreter_v29.cpp` (v29.3 sources), plus
 //! `.scratch/script_impl_v29.cpp` (`CheckMinimalPush`, `IsOpSuccess`,
 //! `IsPayToAnchor`) and `.scratch/script_error_v29.cpp` (error strings).
 //! Function names below cite the Core function each mirrors.

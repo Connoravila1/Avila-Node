@@ -1,5 +1,15 @@
 **SWE-2 researcher assignment: establish and approach a hardware-specific full-IBD limit**
 
+**Current assignment, updated 2026-09-27:** follow the
+[optimization work order](IBD_OPTIMIZATION_WORK_ORDER_2026-09-27.md).
+The user has clarified that the sub-hour goal was unrealistic but the current
+result does not provide significant optimization. Deliver a measured speedup
+against the existing optimized production path and integrate the winning change
+into the node. The first engineering milestone is 2× on matched complete real
+validation work; it is a target, not a forecast. Reconcile earlier forecasts
+alongside that work rather than blocking implementation on more analysis.
+The assignments below are historical; no closed correctness gate is reopened.
+
 This replaces work order B in
 [the earlier execution audit](IBD_EXECUTION_AUDIT_2026-09-26.md).
 Keep that audit's consensus and provenance requirements. The live IBD agent
@@ -76,6 +86,18 @@ its remaining gap to the one-hour objective. The guard's endpoint load/memory
 readings do not supply process CPU time or sustained clocks: capture those
 with existing monitoring tools during the run. No further correctness repair
 round is assigned by this closure review.
+
+The `3198d50` capacity report is reviewed in
+[the capacity audit](IBD_CAPACITY_AUDIT_2026-09-27.md). The clean complete-window
+run is accepted as a component measurement: approximately 44,459 verified
+inputs/s in its script stage. The 28–30-hour total is a conditional model
+using unqualified full-history quantities and partially admitted era samples;
+the proposed batch/core speedups are unmeasured. Recover the era receipts and
+reconcile the model, then test the strongest existing crypto candidate on
+matched real work with helper costs included. No previous correctness gate
+is reopened. That audit preceded the user's latest prioritization above;
+its instruction to reconcile the model before implementation is superseded
+by the current optimization work order.
 
 Read [the hardware analysis](../experiments/2026-09-26-ibd-hardware-floor.md)
 before using the earlier physics proposal. Its local-corpus targets and

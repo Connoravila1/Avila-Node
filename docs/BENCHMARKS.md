@@ -7,7 +7,7 @@ mechanism observation, not a win.
 ## The baseline
 
 - **Core reference version: 31.1.** Policy is ported from v31.1;
-  consensus comparisons must not cite older releases. Knots policy
+  consensus comparisons must not cite older releases. Fork policy
   divergence is measured live via the shadow observatory
   (`getmempoolinfo.shadow`) — that is our standing cross-implementation
   dataset.

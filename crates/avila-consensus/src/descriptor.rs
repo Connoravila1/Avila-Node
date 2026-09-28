@@ -2359,7 +2359,7 @@ mod tests {
     use crate::params::Network;
     use crate::transaction::Script;
 
-    /// Every desc below was read back from Knots 29.3 `decodescript`.
+    /// Every desc below was read back from a 29.3-era `decodescript`.
     #[test]
     fn script_desc_matches_core() {
         let params = Network::Regtest.params();

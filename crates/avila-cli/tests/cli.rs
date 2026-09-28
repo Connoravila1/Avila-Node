@@ -30,7 +30,7 @@ fn write_config(root: &Path) -> PathBuf {
     let path = root.join("config.toml");
     std::fs::write(
         &path,
-        "schema_version = 1\nnetwork = \"regtest\"\ndata_dir = \"data\"\nevent_capacity = 256\n",
+        "schema_version = 1\nnetwork = \"regtest\"\ndata_dir = \"data\"\n[diag]\nevent_capacity = 256\n",
     )
     .unwrap();
     path
@@ -97,6 +97,60 @@ fn missing_config_is_an_error_not_a_silent_default() {
         .output()
         .unwrap();
     assert!(!output.status.success());
+}
+
+#[test]
+fn events_prints_the_stream_and_after_skips() {
+    let root = scratch_dir("events");
+    let config = write_config(&root);
+    let live = root.join("data").join("regtest");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(
+        live.join("events.ndjson"),
+        concat!(
+            "{\"seq\":0,\"time\":1,\"kind\":\"run_started\"}\n",
+            "{\"seq\":1,\"time\":2,\"kind\":\"tip_advanced\",\"height\":5}\n",
+            "{\"seq\":2,\"time\":3,\"kind\":\"run_stopped\"}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = cli()
+        .args(["--config", config.to_str().unwrap(), "events"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"run_started\""));
+    assert!(stdout.contains("\"tip_advanced\""));
+
+    let output = cli()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "events",
+            "--after",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("\"run_started\""));
+    assert!(stdout.contains("\"tip_advanced\""));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn events_reports_a_missing_stream() {
+    let root = scratch_dir("events-missing");
+    let config = write_config(&root);
+    let output = cli()
+        .args(["--config", config.to_str().unwrap(), "events"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot open"));
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

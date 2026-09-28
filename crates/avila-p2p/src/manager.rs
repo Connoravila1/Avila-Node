@@ -596,6 +596,9 @@ pub struct PeerManager<S> {
     /// Where `bans` persists — `<net-datadir>/banlist.json`, written on
     /// every mutation like Core's `DumpBanlist`.
     banlist_path: Option<std::path::PathBuf>,
+    /// `peers.ban_time` — the default `setban` duration (Core's
+    /// `-bantime`); the RPC arm reads it so the config knob lands.
+    default_ban_time: i64,
     /// Completed dial attempts — workers send `(addr, session result)`
     /// here and `maintain_outbounds` drains it on the tick, so an
     /// unreachable candidate costs a worker's 5s timeout instead of
@@ -641,6 +644,12 @@ pub struct PeerManager<S> {
     /// Accept-side handshakes in flight — bounds the worker pool a
     /// connect-flood could otherwise grow without limit.
     pending_accepts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Inbound-admission hook (docs/DECISION_REGISTRY.md `peer.accept`):
+    /// consulted after the ban check on every completed inbound
+    /// handshake; `false` drops the session. Narrows acceptance only —
+    /// a hook can refuse a peer, never override `network_active`,
+    /// bans, or slot pressure.
+    inbound_verdict: Option<InboundVerdict>,
     /// The node's task queue — Core's `CScheduler`. Periodic work
     /// (`peers.dat` dumps, expirations) runs here so `mockscheduler`
     /// can fast-forward it on regtest.
@@ -663,6 +672,37 @@ pub struct ScheduledTask<S> {
 /// A scheduled job body — `&mut PeerManager` so tasks can touch any
 /// subsystem.
 pub type TaskWork<S> = Box<dyn FnMut(&mut PeerManager<S>) + Send>;
+
+/// What an inbound-admission hook (`peer.accept`) is told about a
+/// completed handshake — the peer's version claims plus the transport
+/// reality. The p2p crate owns no process machinery; the node passes a
+/// plain closure.
+#[derive(Clone, Debug)]
+pub struct InboundFacts {
+    /// The peer's socket address.
+    pub remote: SocketAddr,
+    /// Its claimed `nServices` (bit 0 = NODE_NETWORK, bit 24 =
+    /// NODE_COMPACT_FILTERS).
+    pub services: u64,
+    /// Its claimed protocol version.
+    pub protocol_version: i32,
+    /// Its claimed user agent (`/name:version/`).
+    pub user_agent: String,
+    /// Its claimed tip height.
+    pub start_height: i32,
+    /// Whether it offered to relay transactions to us.
+    pub relay: bool,
+    /// Whether it announced BIP339 wtxid relay.
+    pub wtxid_relay: bool,
+    /// Whether it understands BIP155 addrv2.
+    pub addrv2: bool,
+    /// The negotiated transport: "v1" or "v2" (BIP324).
+    pub transport: &'static str,
+}
+
+/// An inbound-admission judge — `false` drops the session. See
+/// `set_inbound_verdict` and `InboundFacts`.
+pub type InboundVerdict = Box<dyn FnMut(&InboundFacts) -> bool + Send>;
 
 impl<S: Read + Write> PeerManager<S> {
     /// An empty manager — `max_peers` bounds the set.
@@ -704,6 +744,7 @@ impl<S: Read + Write> PeerManager<S> {
             ask_utxproof: false,
             discouraged: std::collections::HashMap::new(),
             bans: crate::banman::BanList::new(),
+            default_ban_time: crate::banman::DEFAULT_BANTIME,
             banlist_path: None,
             dial_tx: dial_channel.0,
             dial_rx: dial_channel.1,
@@ -712,6 +753,7 @@ impl<S: Read + Write> PeerManager<S> {
             inbound_tx: inbound_channel.0,
             inbound_rx: inbound_channel.1,
             pending_accepts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            inbound_verdict: None,
             serve_filters: false,
             clock: wall_epoch,
             v2transport: true,
@@ -753,6 +795,13 @@ impl<S: Read + Write> PeerManager<S> {
     #[must_use]
     pub fn serve_filters(&self) -> bool {
         self.serve_filters
+    }
+
+    /// Install the `peer.accept` decision-point hook: `drain_inbounds`
+    /// consults it after the ban check; `false` drops the session.
+    /// Narrows only — it cannot unban, unidle, or beat slot pressure.
+    pub fn set_inbound_verdict(&mut self, judge: Option<InboundVerdict>) {
+        self.inbound_verdict = judge;
     }
 
     /// `-maxmempool` — the pool's serialized-byte cap (Core default
@@ -2943,6 +2992,18 @@ impl<S: Read + Write> PeerManager<S> {
         true
     }
 
+    /// `peers.ban_time` — the default `setban` duration, like Core's
+    /// `-bantime`.
+    pub fn set_default_ban_time(&mut self, secs: i64) {
+        self.default_ban_time = secs;
+    }
+
+    /// The configured default ban duration.
+    #[must_use]
+    pub fn default_ban_time(&self) -> i64 {
+        self.default_ban_time
+    }
+
     /// `setban remove` — `false` when the subnet wasn't listed
     /// (Core's "not previously manually banned" path).
     pub fn unban(&mut self, net: &crate::banman::SubNet) -> bool {
@@ -3066,8 +3127,9 @@ impl PeerManager<TcpStream> {
         });
     }
 
-    /// Admits every completed inbound handshake — ban check, then
-    /// `add_inbound`'s slot/eviction rules. Returns the admitted ids.
+    /// Admits every completed inbound handshake — ban check, the
+    /// `peer.accept` hook if one is set, then `add_inbound`'s
+    /// slot/eviction rules. Returns the admitted ids.
     pub fn drain_inbounds(&mut self) -> Vec<u64> {
         let mut admitted = Vec::new();
         while let Ok((addr, result)) = self.inbound_rx.try_recv() {
@@ -3075,6 +3137,23 @@ impl PeerManager<TcpStream> {
             let remote = crate::addrman::net_addr_of(addr, 0);
             if !self.network_active || self.bans.is_banned(&remote.ip, (self.clock)()) {
                 continue;
+            }
+            if let Some(judge) = self.inbound_verdict.as_mut() {
+                let info = session.peer();
+                let facts = InboundFacts {
+                    remote: addr,
+                    services: info.map_or(0, |i| i.services),
+                    protocol_version: info.map_or(0, |i| i.version),
+                    user_agent: info.map_or_else(String::new, |i| i.user_agent.clone()),
+                    start_height: info.map_or(0, |i| i.start_height),
+                    relay: info.is_some_and(|i| i.relay),
+                    wtxid_relay: info.is_some_and(|i| i.wtxid_relay),
+                    addrv2: info.is_some_and(|i| i.addrv2),
+                    transport: session.transport_protocol(),
+                };
+                if !judge(&facts) {
+                    continue;
+                }
             }
             if let Some(id) = self.add_inbound_from(session, Some(remote)) {
                 admitted.push(id);
@@ -4771,6 +4850,41 @@ mod tests {
         assert!(mgr.peers.contains_key(&id1), "useful peer survives");
         assert!(!mgr.peers.contains_key(&id2), "stale peer evicted");
         assert!(mgr.peers.contains_key(&id3));
+    }
+
+    /// The `peer.accept` hook consults on the real admission path:
+    /// drive a handshake over a loopback socket, push the completed
+    /// session through the inbound channel, and drain.
+    #[test]
+    fn inbound_verdict_hook_narrows_admission() {
+        use std::net::{TcpListener, TcpStream};
+        let mut mgr = PeerManager::<TcpStream>::new(8);
+        mgr.set_inbound_verdict(Some(Box::new(|f: &InboundFacts| f.remote.port() != 6666)));
+        for port in [40_001u16, 6666] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let ours = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (theirs, _) = listener.accept().unwrap();
+            let responder = std::thread::spawn(move || {
+                PeerSession::accept(
+                    theirs,
+                    MAGIC,
+                    build_version(9, 0, NetAddr::unspecified(), i64::from(NOW)),
+                    BUDGET,
+                )
+            });
+            let session = PeerSession::initiate(
+                ours,
+                MAGIC,
+                build_version(1, 0, NetAddr::unspecified(), i64::from(NOW)),
+                BUDGET,
+            )
+            .expect("handshake");
+            responder.join().unwrap();
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            mgr.inbound_tx.send((addr, Ok(session))).unwrap();
+        }
+        let admitted = mgr.drain_inbounds();
+        assert_eq!(admitted.len(), 1, "port 6666 refused by the hook");
     }
 
     #[test]

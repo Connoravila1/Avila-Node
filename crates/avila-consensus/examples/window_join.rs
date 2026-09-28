@@ -1341,6 +1341,10 @@ fn main() {
         avila_consensus::sigchecker::ECDSA_VERIFY_CALLS.load(std::sync::atomic::Ordering::Relaxed);
     let schnorr_calls = avila_consensus::sigchecker::SCHNORR_VERIFY_CALLS
         .load(std::sync::atomic::Ordering::Relaxed);
+    let pk_cache_hit =
+        avila_consensus::sigchecker::PK_CACHE_HIT.load(std::sync::atomic::Ordering::Relaxed);
+    let pk_cache_miss =
+        avila_consensus::sigchecker::PK_CACHE_MISS.load(std::sync::atomic::Ordering::Relaxed);
 
     // ---- ONE invalidity decision drives exit + export ------------------
     // With a complete supplied state, `Missing` is not a coverage gap:
@@ -1536,7 +1540,7 @@ fn main() {
 \"boundary_load_s\":{:.3},\"join_s\":{:.3},\
 \"predicate_s\":{:.3},\"script_s\":{:.3},\"materialize_s\":{:.3},\
 \"export_s\":{:.3}}},\"wall_s\":{:.3},\"rss_hwm_bytes\":{},\"prof\":{{\"sighash_s\":{:.3},\"verify_s\":{:.3},\
-\"ecdsa_verify_calls\":{},\"schnorr_verify_calls\":{}}},\"workers\":{}}}",
+\"ecdsa_verify_calls\":{},\"schnorr_verify_calls\":{},\"pk_cache_hit\":{},\"pk_cache_miss\":{}}},\"workers\":{}}}",
         window_lo,
         window_hi,
         corpus_bytes,
@@ -1648,6 +1652,8 @@ fn main() {
         verify_s,
         ecdsa_calls,
         schnorr_calls,
+        pk_cache_hit,
+        pk_cache_miss,
         workers,
     );
 

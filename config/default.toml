@@ -5,4 +5,110 @@ network = "regtest"
 # Relative to this configuration file, NOT the current working directory.
 # The selected network is appended, e.g. ../data/regtest.
 data_dir = "../data"
+
+# Operator policy lives under the namespaces of docs/DECISION_REGISTRY.md.
+# Every value shown below is the shipped default — uncommenting changes it.
+
+[diag]
 event_capacity = 256
+
+# [storage]
+# prune_mb = 550                      # Core's -prune; absent = archival
+# dbcache_mb = 450                    # Core's -dbcache
+
+# [net]
+# v2transport = true                  # Core's -v2transport (BIP324 outbound)
+# connect = ["1.2.3.4:8333"]          # Core's -connect; suppresses DNS seeding
+# listen = "0.0.0.0:8333"             # Core's -listen=<addr>; absent = outbound-only
+# asmap = "asmap.txt"                 # Core's -asmap; relative to this file
+# dns_seeds = true                    # Core's -dnsseed
+
+# [peers]
+# max_connections = 8                 # Core's -maxconnections
+# ban_time = 86400                    # default setban duration, seconds
+                                     # (Core's -bantime)
+
+# [privacy]
+# proxy = "127.0.0.1:9050"            # Core's -proxy (SOCKS5)
+# cell_bytes = 0                      # pad v2 writes to this multiple; 0 = off
+
+# [mempool]
+# max_mb = 300                        # Core's -maxmempool
+# min_relay_fee_sat_per_kvb = 100     # Core's -minrelaytxfee (0.1 sat/vB floor)
+# expiry_secs = 1209600               # Core's -mempoolexpiry (336h)
+
+# [policy]
+# require_standard = true             # Core's -acceptnonstdtxn, negated
+# datacarrier = true                  # Core's -datacarrier
+# datacarrier_size = 100000           # Core's -datacarriersize (MAX_OP_RETURN_RELAY)
+# permit_bare_multisig = true         # Core's -permitbaremultisig
+# dust_relay_fee_sat_per_kvb = 3000   # Core's -dustrelayfee
+# shadow = ["strict"]                 # counterfactual policies scored on live
+                                    # admissions — strict | core | permissive;
+                                    # divergence counts land in getmempoolinfo
+                                    # and shadow_divergence events. [] = off
+
+# [relay.tx]
+# stem = true                         # stem-hop announce for local transactions
+
+# External verdict helpers — docs/DECISION_REGISTRY.md. Each
+# [[hooks.peer_accept]] is a long-lived subprocess: the node writes
+# {"point","seq","facts"} on stdin and reads {"verdict":"accept"|
+# "reject"|"defer"} on stdout. Helpers can only NARROW acceptance —
+# they can refuse a peer, never override bans, slots, or consensus.
+# Consulted on inbound admission after the ban check.
+# [[hooks.peer_accept]]
+# program = "/usr/local/sbin/accept-peer"  # relative → config file's dir
+# args = ["--strict"]
+# timeout_ms = 500          # slow = dead; killed and restarted
+# on_timeout = "reject"     # dead helper's verdict — fail-closed
+# on_defer = "reject"       # what a "defer" answer means
+# max_restarts = 3          # exhausted → on_timeout forever
+#
+# [[hooks.tx_admit]] — same protocol, consulted on EVERY transaction
+# submission before the built-in mempool checks (narrowing only).
+# Facts: txid, wtxid, version, lock_time, vbytes, weight, inputs,
+# outputs, output_value, fee, feerate (sat/kvB), rbf, has_witness,
+# spk_types. fee/feerate are null when a prevout doesn't resolve.
+# Hot path: admission throughput is bounded by helper latency.
+# [[hooks.tx_admit]]
+# program = "/usr/local/sbin/admit-tx"
+# args = []
+# timeout_ms = 500
+# on_timeout = "reject"     # dead helper rejects all txs — fail-closed
+# on_defer = "reject"
+# max_restarts = 3
+
+# [extrapool]
+# The observation pool: consensus-valid transactions that live policy
+# refused get stored here (bounded, inspectable) instead of dropped —
+# "what is my node filtering, and could I promote it back?"
+# observe = true                      # record policy rejects
+# max_entries = 10000                 # FIFO eviction past this
+# max_bytes = 50000000                # serialized-bytes cap, ~50 MiB
+# expiry_secs = 86400                 # entry lifetime; 0 = never age out
+
+# [filters]
+# build = false                       # Core's -blockfilterindex
+# serve = false                       # Core's -peerblockfilters (requires build)
+
+# [indexes]
+# txindex = false                     # Core's -txindex
+
+# [sync]
+# max_in_transit = 1024               # total blocks-in-flight budget
+# utreexo = false                     # accumulator shadow validation
+# utreexo_bridge = false              # serve utxproof spend bundles
+
+# [services.rpc]
+# bind = "127.0.0.1:18443"            # absent = RPC off; cookie auth still applies
+# user = "alice"                      # requires password
+# password = "…"
+# whitelist = ["alice:getbalance,getblockcount"]
+# whitelist_default = true
+
+# [services.electrum]
+# listen = "127.0.0.1:50001"          # maintains the scripthash index
+
+# [services.sv2]
+# listen = "127.0.0.1:55001"          # Stratum V2 Template Provider (loopback only)

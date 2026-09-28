@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 diff_fuzz.py -- seeded-mutation differential fuzzing: Avila vs Bitcoin
-Knots `submitblock` verdicts.
+reference `submitblock` verdicts.
 
 WHAT THIS DOES
 --------------
 The existing differential suite (check_blocks_core.py, diff_validate.py)
 compares on *crafted* corpora and real blocks. This tool explores the
-random space: valid blocks are mined on Knots, then mutated under a
+random space: valid blocks are mined on a reference node, then mutated under a
 seeded RNG -- byte flips in header/coinbase/tx regions, merkle-root
 corruption, truncations, zeroed signatures -- and every mutation is
 judged by BOTH engines. Any accept/reject disagreement is a consensus
@@ -43,7 +43,7 @@ from check_blocks_core import Daemon, free_port  # noqa: E402
 
 
 class RpcClient:
-    """Minimal cookie-auth JSON-RPC client (same wire shape Knots uses)."""
+    """Minimal cookie-auth JSON-RPC client (same wire shape a Core-compatible daemon uses)."""
 
     def __init__(self, addr, cookie):
         self.addr = addr

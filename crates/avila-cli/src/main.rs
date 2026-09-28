@@ -36,10 +36,28 @@ enum Command {
     Signer,
     /// Validate configuration without starting services or creating data.
     CheckConfig,
+    /// Audit or dump the resolved configuration file — reports what the
+    /// file says; flag overrides do not apply here.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Inspect this build and configuration, NOT a running daemon.
     Inspect {
         #[arg(long)]
         json: bool,
+    },
+    /// Print the node's append-only event stream
+    /// (<datadir>/<network>/events.ndjson), one NDJSON line per
+    /// event. With --follow, keep printing as the node appends —
+    /// `tail -f`-style; rotation-safe.
+    Events {
+        /// Keep the stream open and print new events as they arrive.
+        #[arg(long)]
+        follow: bool,
+        /// Skip events with seq <= N (resume a previous follower).
+        #[arg(long)]
+        after: Option<u64>,
     },
     /// Run the node: sync to tip, then keep serving and relaying until killed.
     Run {
@@ -56,32 +74,37 @@ enum Command {
         asmap: Option<std::path::PathBuf>,
         /// Pad every v2 link's writes to this byte multiple with
         /// decoy packets (queue #17 — flat traffic shape). 0 = off.
-        #[arg(long, default_value_t = 0)]
-        cell_bytes: usize,
+        /// Overrides privacy.cell_bytes.
+        #[arg(long)]
+        cell_bytes: Option<usize>,
         /// Bind the read-only JSON-RPC query surface to this address
-        /// (e.g. 127.0.0.1:18443).
+        /// (e.g. 127.0.0.1:18443). Overrides services.rpc.bind.
         #[arg(long)]
         rpc: Option<SocketAddr>,
         /// Maintain a txid index (Core's -txindex) so getrawtransaction
-        /// finds transactions without a named block.
-        #[arg(long)]
-        txindex: bool,
+        /// finds transactions without a named block. Overrides
+        /// indexes.txindex.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        txindex: Option<bool>,
         /// Maintain the BIP 158 basic block filter index (Core's
         /// -blockfilterindex) so getblockfilter/scanblocks serve.
-        #[arg(long)]
-        blockfilterindex: bool,
+        /// Overrides filters.build.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        blockfilterindex: Option<bool>,
         /// Serve BIP157 compact filters to peers (Core's
-        /// -peerblockfilters; requires --blockfilterindex).
-        #[arg(long)]
-        peerblockfilters: bool,
+        /// -peerblockfilters; requires --blockfilterindex). Overrides
+        /// filters.serve.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        peerblockfilters: Option<bool>,
         /// Mempool size cap in MB (Core's -maxmempool, default 300).
+        /// Overrides mempool.max_mb.
         #[arg(long)]
         maxmempool: Option<u64>,
         /// Attempt BIP324 v2 transport on outbound peers (Core's
         /// -v2transport, default on). Pass --v2transport=false to
-        /// force cleartext.
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        v2transport: bool,
+        /// force cleartext. Overrides net.v2transport.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        v2transport: Option<bool>,
         /// Skip script checks before this block (Core's -assumevalid).
         /// Pass 0 to verify every historical signature — the full-
         /// verification choice.
@@ -120,13 +143,15 @@ enum Command {
         /// bundles and connect each block through the accumulator
         /// path (no-UTXO validation shape) alongside conventional
         /// connect. Intra-Avila protocol — other impls don't serve it.
-        #[arg(long)]
-        utreexo: bool,
+        /// Overrides sync.utreexo.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        utreexo: Option<bool>,
         /// Utreexo proof bridge: maintain a proving forest and record
         /// a spend bundle per connected block (`proofs.dat`), served
-        /// to peers that sent `sendutxproof`.
-        #[arg(long)]
-        utreexo_bridge: bool,
+        /// to peers that sent `sendutxproof`. Overrides
+        /// sync.utreexo_bridge.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        utreexo_bridge: Option<bool>,
         /// Authenticated RPC user (Core's -rpcuser); pairs with
         /// --rpcpassword. Adds a Basic-auth credential alongside the
         /// cookie.
@@ -152,9 +177,9 @@ enum Command {
         /// Stop after connecting this many blocks (relative to genesis).
         #[arg(long, default_value_t = 100)]
         blocks: u32,
-        /// Peer-set bound.
-        #[arg(long, default_value_t = 8)]
-        max_peers: usize,
+        /// Peer-set bound. Overrides peers.max_connections.
+        #[arg(long)]
+        max_peers: Option<usize>,
         /// Wall-clock bound in seconds.
         #[arg(long, default_value_t = 120)]
         timeout_secs: u64,
@@ -171,34 +196,40 @@ enum Command {
         asmap: Option<std::path::PathBuf>,
         /// Pad every v2 link's writes to this byte multiple with
         /// decoy packets (queue #17 — flat traffic shape). 0 = off.
-        #[arg(long, default_value_t = 0)]
-        cell_bytes: usize,
+        /// Overrides privacy.cell_bytes.
+        #[arg(long)]
+        cell_bytes: Option<usize>,
         /// Persist the chainstate under the configured data directory,
         /// resuming where the last run stopped. Enabled by default;
         /// pass --no-store for an in-memory run.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         store: bool,
         /// Prune blk files to ~this many MiB after syncing (needs --store).
+        /// Overrides storage.prune_mb.
         #[arg(long)]
         prune_mb: Option<u64>,
         /// Maintain a txid index (Core's -txindex) for txid lookups.
-        #[arg(long)]
-        txindex: bool,
+        /// Overrides indexes.txindex.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        txindex: Option<bool>,
         /// Maintain the BIP 158 basic block filter index (Core's
         /// -blockfilterindex) so getblockfilter/scanblocks serve.
-        #[arg(long)]
-        blockfilterindex: bool,
+        /// Overrides filters.build.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        blockfilterindex: Option<bool>,
         /// Serve BIP157 compact filters to peers (Core's
-        /// -peerblockfilters; requires --blockfilterindex).
-        #[arg(long)]
-        peerblockfilters: bool,
+        /// -peerblockfilters; requires --blockfilterindex). Overrides
+        /// filters.serve.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        peerblockfilters: Option<bool>,
         /// Mempool size cap in MB (Core's -maxmempool, default 300).
+        /// Overrides mempool.max_mb.
         #[arg(long)]
         maxmempool: Option<u64>,
         /// Attempt BIP324 v2 transport on outbound peers (Core's
-        /// -v2transport, default on).
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        v2transport: bool,
+        /// -v2transport, default on). Overrides net.v2transport.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        v2transport: Option<bool>,
     },
     /// Call a JSON-RPC method on a running daemon — the bitcoin-cli
     /// analog. Positional params are parsed as raw JSON values, falling
@@ -241,6 +272,97 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigAction {
+    /// List every knob with its effective value, default, and doc.
+    Describe {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Warn about suspect combinations before startup refuses them.
+    Lint,
+}
+
+/// Values print TOML-flavored: strings quoted, everything else bare.
+fn render_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => format!("{s:?}"),
+        other => other.to_string(),
+    }
+}
+
+/// Print the event stream, `tail -f`-style with `--follow`. Rotation
+/// re-reads from the top; `seq` is monotonic across runs so it doubles
+/// as the dedup cursor.
+fn run_events(path: &Path, follow: bool, after: Option<u64>) -> Result<(), Box<dyn Error>> {
+    use std::io::{BufRead, BufReader, Write};
+    let file = std::fs::File::open(path).map_err(|e| {
+        format!(
+            "cannot open {}: {e} — is the node running with a data dir?",
+            path.display()
+        )
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut pos: u64 = 0;
+    let mut last_seq = after;
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Err(e) => return Err(format!("reading {}: {e}", path.display()).into()),
+            Ok(0) => {
+                if !follow {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(u64::MAX);
+                if size < pos {
+                    reader = BufReader::new(
+                        std::fs::File::open(path)
+                            .map_err(|e| format!("reopening {}: {e}", path.display()))?,
+                    );
+                    pos = 0;
+                }
+            }
+            Ok(n) => {
+                pos += n as u64;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let seq = serde_json::from_str::<serde_json::Value>(trimmed)
+                    .ok()
+                    .and_then(|v| v.get("seq")?.as_u64());
+                match (seq, last_seq) {
+                    (Some(s), Some(last)) if s <= last => continue,
+                    _ => {}
+                }
+                if let Some(s) = seq {
+                    last_seq = Some(s);
+                }
+                writeln!(out, "{trimmed}")?;
+                out.flush()?;
+            }
+        }
+    }
+}
+
+/// `hooks.*` config tables → spawn specs (per decision point).
+fn hook_specs(hooks: &[avila_core::HookSpecConfig]) -> Vec<avila_node::hooks::HookSpec> {
+    hooks
+        .iter()
+        .map(|h| avila_node::hooks::HookSpec {
+            program: h.program.clone(),
+            args: h.args.clone(),
+            timeout: std::time::Duration::from_millis(h.timeout_ms),
+            on_timeout: h.on_timeout,
+            on_defer: h.on_defer,
+            max_restarts: h.max_restarts,
+        })
+        .collect()
 }
 
 /// Recursive copy — every file under `src` lands at the same
@@ -471,6 +593,66 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 config.network_data_dir().display()
             );
         }
+        Command::Events { follow, after } => run_events(
+            &config
+                .network_data_dir()
+                .join(avila_node::events::EVENTS_FILENAME),
+            follow,
+            after,
+        )?,
+        Command::Config { action } => match action {
+            ConfigAction::Describe { json } => {
+                use avila_node::config::describe_config;
+                let knobs = describe_config(config.get());
+                if json {
+                    let items: Vec<serde_json::Value> = knobs
+                        .iter()
+                        .map(|k| {
+                            serde_json::json!({
+                                "path": k.path,
+                                "value": k.value,
+                                "default": k.default,
+                                "changed": k.value != k.default,
+                                "doc": k.doc,
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&items)?);
+                } else {
+                    for k in &knobs {
+                        let changed = if k.value != k.default {
+                            format!("   (default: {})", render_value(&k.default))
+                        } else {
+                            String::new()
+                        };
+                        println!("{} = {}{}", k.path, render_value(&k.value), changed);
+                        println!("      {}", k.doc);
+                    }
+                }
+            }
+            ConfigAction::Lint => {
+                use avila_node::config::{LintLevel, lint_config};
+                let findings = lint_config(config.get());
+                if findings.is_empty() {
+                    println!("No findings.");
+                }
+                let mut failed = false;
+                for f in &findings {
+                    let level = match f.level {
+                        LintLevel::Fail => {
+                            failed = true;
+                            "FAIL"
+                        }
+                        LintLevel::Warn => "warn",
+                        LintLevel::Note => "note",
+                    };
+                    println!("{level:<4} {} — {}", f.path, f.message);
+                }
+                if failed {
+                    return Err("config lint: startup-fatal combination present".into());
+                }
+            }
+        },
         Command::Inspect { json } => {
             let node = Node::new(config)?;
             let snapshot = node.snapshot();
@@ -533,6 +715,33 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     })?)
                 };
             }
+            // Flag wins; absent flags fall through to the config file's
+            // namespaced knobs (docs/DECISION_REGISTRY.md). Merged once
+            // here so every consumer below — the initial snapshot
+            // included — sees the same effective values.
+            let c = config.get();
+            let proxy = proxy.or(c.privacy.proxy);
+            let rpc = rpc.or(c.services.rpc.bind);
+            let electrum = electrum.or(c.services.electrum.listen);
+            let sv2tp = sv2tp.or(c.services.sv2.listen);
+            let listen = listen.or(c.net.listen);
+            let asmap = asmap.or(c.net.asmap.clone());
+            let cell_bytes = cell_bytes.unwrap_or(c.privacy.cell_bytes);
+            let connect = if connect.is_empty() {
+                c.net.connect.clone()
+            } else {
+                connect
+            };
+            let prune_bytes = prune
+                .or(c.storage.prune_mb)
+                .map(|m| m.saturating_mul(1024 * 1024));
+            let rpcuser = rpcuser.or(c.services.rpc.user.clone());
+            let rpcpassword = rpcpassword.or(c.services.rpc.password.clone());
+            let rpcwhitelist = if rpcwhitelist.is_empty() {
+                c.services.rpc.whitelist.clone()
+            } else {
+                rpcwhitelist
+            };
             let status: avila_node::rpc::SharedStatus =
                 std::sync::Arc::new(std::sync::RwLock::new(SyncProgress {
                     phase: avila_node::sync::Phase::Opening,
@@ -557,11 +766,11 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     profile: Default::default(),
                     next_block: None,
                     eclipse: Vec::new(),
-                    prune_bytes: None,
+                    prune_bytes,
                     eta_secs: None,
                     eta_lo_secs: None,
                     eta_hi_secs: None,
-                    proxy: None,
+                    proxy,
                 }));
             let (query_tx, query_rx) = std::sync::mpsc::channel();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -628,7 +837,8 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     auth.whitelist(u, methods);
                 }
                 let wl_default = match rpcwhitelistdefault.as_deref() {
-                    None | Some("1") | Some("true") => true,
+                    None => c.services.rpc.whitelist_default,
+                    Some("1") | Some("true") => true,
                     Some("0") | Some("false") => false,
                     Some(other) => {
                         return Err(format!(
@@ -678,32 +888,50 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             let cfg = SyncConfig {
                 connect,
                 target_height: u32::MAX,
-                max_peers: maxconnections.unwrap_or(8),
+                max_peers: maxconnections.unwrap_or(c.peers.max_connections),
                 timeout: Duration::from_secs(u64::MAX),
                 proxy,
                 asmap_path: asmap,
                 cell_bytes,
                 data_dir: Some(data_dir.clone()),
-                dbcache: dbcache.map(|mb| mb * 1024 * 1024),
+                dbcache: dbcache
+                    .or(c.storage.dbcache_mb)
+                    .map(|mb| mb.saturating_mul(1024 * 1024)),
                 cancel: Some(cancel),
                 persist: true,
-                // --prune flag wins; else the config's prune_mb.
-                prune_bytes: prune
-                    .or(config.get().prune_mb)
-                    .map(|m| m.saturating_mul(1024 * 1024)),
-                txindex,
-                blockfilterindex,
-                peerblockfilters,
-                maxmempool_bytes: maxmempool.map(|m| (m * 1024 * 1024) as usize),
-                v2transport,
+                // --prune flag wins; else the config's storage.prune_mb.
+                prune_bytes,
+                txindex: txindex.unwrap_or(c.indexes.txindex),
+                blockfilterindex: blockfilterindex.unwrap_or(c.filters.build),
+                peerblockfilters: peerblockfilters.unwrap_or(c.filters.serve),
+                maxmempool_bytes: Some(
+                    maxmempool
+                        .unwrap_or(c.mempool.max_mb)
+                        .saturating_mul(1024 * 1024) as usize,
+                ),
+                v2transport: v2transport.unwrap_or(c.net.v2transport),
                 listen,
                 electrum,
-                utreexo,
-                utreexo_bridge,
+                utreexo: utreexo.unwrap_or(c.sync.utreexo),
+                utreexo_bridge: utreexo_bridge.unwrap_or(c.sync.utreexo_bridge),
                 status: Some(status),
                 queries: Some(std::sync::Arc::new(std::sync::Mutex::new(query_rx))),
                 waiters: Some(waiters),
                 preview_next_block: false,
+                require_standard: c.policy.require_standard,
+                min_relay_fee: c.mempool.min_relay_fee_sat_per_kvb,
+                datacarrier_bytes: c.policy.datacarrier_bytes(),
+                permit_bare_multisig: c.policy.permit_bare_multisig,
+                dust_relay_fee: c.policy.dust_relay_fee_sat_per_kvb,
+                mempool_expiry_secs: c.mempool.expiry_secs,
+                stem_relay: c.relay.tx.stem,
+                max_in_transit: c.sync.max_in_transit,
+                dns_seeds: c.net.dns_seeds,
+                peer_accept_hooks: hook_specs(&c.hooks.peer_accept),
+                tx_admit_hooks: hook_specs(&c.hooks.tx_admit),
+                shadow_profiles: c.policy.shadow.clone(),
+                extrapool: c.extrapool.clone(),
+                ban_time: c.peers.ban_time,
             };
             println!(
                 "Running {} — syncing to tip, then serving (Ctrl+C to stop)...",
@@ -758,34 +986,67 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 avila_core::Network::Regtest => ConsensusNet::Regtest,
             };
             let params = consensus_net.params();
+            // Same merge rule as `run`: flags win, absent flags fall
+            // through to the config file's namespaces.
+            let c = config.get();
             let cfg = SyncConfig {
-                connect,
+                connect: if connect.is_empty() {
+                    c.net.connect.clone()
+                } else {
+                    connect
+                },
                 target_height: blocks,
-                max_peers,
+                max_peers: max_peers.unwrap_or(c.peers.max_connections),
                 timeout: Duration::from_secs(timeout_secs),
-                proxy,
-                asmap_path: asmap,
-                cell_bytes,
+                proxy: proxy.or(c.privacy.proxy),
+                asmap_path: asmap.or(c.net.asmap.clone()),
+                cell_bytes: cell_bytes.unwrap_or(c.privacy.cell_bytes),
                 data_dir: store.then(|| config.network_data_dir()),
-                dbcache: None,
+                dbcache: c
+                    .storage
+                    .dbcache_mb
+                    .map(|mb| mb.saturating_mul(1024 * 1024)),
                 cancel: None,
                 persist: false,
-                prune_bytes: prune_mb.map(|m| m * 1024 * 1024),
-                txindex,
-                blockfilterindex,
-                peerblockfilters,
-                maxmempool_bytes: maxmempool.map(|m| (m * 1024 * 1024) as usize),
-                v2transport,
+                prune_bytes: prune_mb
+                    .or(c.storage.prune_mb)
+                    .map(|m| m.saturating_mul(1024 * 1024)),
+                txindex: txindex.unwrap_or(c.indexes.txindex),
+                blockfilterindex: blockfilterindex.unwrap_or(c.filters.build),
+                peerblockfilters: peerblockfilters.unwrap_or(c.filters.serve),
+                maxmempool_bytes: Some(
+                    maxmempool
+                        .unwrap_or(c.mempool.max_mb)
+                        .saturating_mul(1024 * 1024) as usize,
+                ),
+                v2transport: v2transport.unwrap_or(c.net.v2transport),
                 listen: None,
                 electrum: None,
-                utreexo: false,
-                utreexo_bridge: false,
+                utreexo: c.sync.utreexo,
+                utreexo_bridge: c.sync.utreexo_bridge,
                 status: None,
                 queries: None,
                 waiters: None,
                 preview_next_block: false,
+                require_standard: c.policy.require_standard,
+                min_relay_fee: c.mempool.min_relay_fee_sat_per_kvb,
+                datacarrier_bytes: c.policy.datacarrier_bytes(),
+                permit_bare_multisig: c.policy.permit_bare_multisig,
+                dust_relay_fee: c.policy.dust_relay_fee_sat_per_kvb,
+                mempool_expiry_secs: c.mempool.expiry_secs,
+                stem_relay: c.relay.tx.stem,
+                max_in_transit: c.sync.max_in_transit,
+                dns_seeds: c.net.dns_seeds,
+                peer_accept_hooks: hook_specs(&c.hooks.peer_accept),
+                tx_admit_hooks: hook_specs(&c.hooks.tx_admit),
+                shadow_profiles: c.policy.shadow.clone(),
+                extrapool: c.extrapool.clone(),
+                ban_time: c.peers.ban_time,
             };
-            println!("Syncing {network} (target height {blocks}, {max_peers} peers max)...");
+            println!(
+                "Syncing {network} (target height {blocks}, {} peers max)...",
+                cfg.max_peers
+            );
             let mut last = (u32::MAX, u32::MAX);
             let mut last_print = Instant::now() - Duration::from_secs(2);
             let report = run_sync(&params, &cfg, move |p| {

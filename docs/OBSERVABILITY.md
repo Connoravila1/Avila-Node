@@ -52,7 +52,7 @@ Beyond Core's fields, each peer reports:
 - `lifecycle` — admission verdicts and per-cause removal counters
   (confirmed, block-conflict, replaced, evicted, expired, reorg-drop).
 - `shadow` — the strict-ruleset observatory (queue #8): `evaluated`,
-  `divergent`, `by_reason` — how much accepted traffic a Knots-style
+  `divergent`, `by_reason` — how much accepted traffic a strict-envelope
   policy would refuse. Never gates.
 - `getmempoolhistory ( count )` — the bounded removal ring with
   per-event cause and (for RBF) the replacing txid.

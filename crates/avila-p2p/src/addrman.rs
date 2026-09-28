@@ -788,7 +788,7 @@ mod tests {
     }
 
     /// `network_of` — `CNetAddr::GetNetClass` for the byte form. These
-    /// cases were checked live against `addpeeraddress` on a Knots 29.3
+    /// cases were checked live against `addpeeraddress` on a 29.3-era
     /// daemon: unroutable inputs are rejected there, so `add` must
     /// refuse them here.
     #[test]

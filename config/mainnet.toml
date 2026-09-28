@@ -3,5 +3,9 @@
 schema_version = 1
 network = "mainnet"
 data_dir = "../data"
+
+[diag]
 event_capacity = 256
+
+[storage]
 prune_mb = 2048

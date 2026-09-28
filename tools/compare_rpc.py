@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Field-level RPC compatibility comparison: Avila vs Bitcoin Core/Knots.
+"""Field-level RPC compatibility comparison: Avila vs a reference implementation.
 
 Calls the same method with the same parameters on both endpoints and
 reports, per method: fields that match exactly, fields whose values
@@ -204,7 +204,7 @@ def build_calls(height):
         ("verifytxoutproof", ["zz"]),
         ("verifytxoutproof", [123]),
         # decodescript: one call per standard template family — the
-        # values below are regtest scripts exercised against Knots.
+        # values below are regtest scripts exercised against a reference node.
         ("decodescript", ["76a914ba602196720c6f0c47c823e106405d9b0dc71dc088ac"]),
         ("decodescript", ["51201d4ade4c044494c4d01633a5595d9b5e1660f8ea81e60564c5377b3f8cc5a2fb"]),
         ("decodescript", ["600228e0"]),

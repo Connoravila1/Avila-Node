@@ -20,7 +20,7 @@ a node rather than being one.
 | Implementation | Lang | Status (survey date) | Validation/storage model | Distinctive properties |
 | --- | --- | --- | --- | --- |
 | **Bitcoin Core 31.1** | C++ | Latest release (2026-07-08); >95% of reachable network | Archival or pruned; assumevalid (script checks skipped below a hardcoded height), headers-first IBD | The de facto spec. Cluster mempool work in flight; libbitcoinkernel extracted for reuse; Guix reproducible releases; `-blockfilterindex`, mining RPC. The reference for nearly every row. |
-| **Bitcoin Knots 29.3** (`.knots20260508`) | C++ | Active; Core 29.3 base | Identical consensus on the main chain | Policy-divergence laboratory: configurable `datacarrier*`, `rejecttokens`, `rejectparasites`, ephemeral-anchor and bare-pubkey policy, `spkreuse`, `-maxtxlegacysigops`, RAM-aware `dbcache`, retained legacy wallet, NAT-PMP. Its **BIP-110/RDTS** build is now the canonical case study in consensus divergence: the mandatory-signaling window opened at height 961,632 (2026-08-08) with 2.53% signaling vs. the 55% threshold; the enforcing chain stalled after 2 blocks at full difficulty and supporters revived it by changing the PoW to Blake2b and cutting blocks to 300 kB — a separate coin, not Bitcoin. Divergence without adoption is a different network. |
+| **Core-29.3 fork, RDTS build** (`v29.3`, 20260508 RDTS build) | C++ | Active; Core 29.3 base | Identical consensus on the main chain | Policy-divergence laboratory: configurable `datacarrier*`, `rejecttokens`, `rejectparasites`, ephemeral-anchor and bare-pubkey policy, `spkreuse`, `-maxtxlegacysigops`, RAM-aware `dbcache`, retained legacy wallet, NAT-PMP. The **BIP-110/RDTS** build is the canonical case study in consensus divergence: the mandatory-signaling window opened at height 961,632 (2026-08-08) with 2.53% signaling vs. the 55% threshold; the enforcing chain stalled after 2 blocks at full difficulty and supporters revived it by changing the PoW to Blake2b and cutting blocks to 300 kB — a separate coin, not Bitcoin. Divergence without adoption is a different network. |
 | **btcd v0.26** | Go | Active; in production since 2013 | Archival or pruned (v0.26 added `--prune`) | Clean-room modular Go packages (wire/tx/script/utxo separable) — the model our crate boundaries emulate. v0.26 claims IBD ~45 h → ~6 h and `testmempoolaccept`. Had security-critical UTXO/reorg cache bugs in the v0.25 era — a reminder that independent implementations pay a correctness tax; mitigated for us by the differential adapter. No built-in wallet (btcwallet). |
 | **Gocoin** | Go | Active | Archival; **whole UTXO set in RAM** | The maximal-speed design point: custom non-GC UTXO memory module, published sync charts vs Core 30.2 (Hetzner i7-7700/64 GB), `LastTrustedBlock` sync speedup, optional `libsecp256k1` acceleration. The opposite end of the memory axis from Floresta — useful as the RAM-spend reference for P1/P3. |
 | **Floresta v0.9.0** | Rust | Active; self-described experimental | **Utreexo accumulator** — UTXO set is a small commitment; pruned-only (<1 GB); PoW fraud proofs | The proof-assisted design point: BIP-183 Utreexo messaging, script validation via `libbitcoinkernel` (shared C++ validation code — a hybrid, not an independent engine; claims ~15× over libbitcoinconsensus), watch-only wallet + Electrum server, Core RPC-compat test rig. Different guarantees → separate scorecard rows where the UTXO model changes the check set. |
@@ -43,17 +43,17 @@ a node rather than being one.
 
 | Row | Primary reference | Secondary / notes |
 | --- | --- | --- |
-| C1 correctness | **Bitcoin Core** (pinned release; functional-test corpus, `submitheader` adapter) | rust-bitcoin dev-differential; Knots consensus-identical on the main chain (its BIP-110 build enforces a different, non-adopted ruleset) |
+| C1 correctness | **Bitcoin Core** (pinned release; functional-test corpus, `submitheader` adapter) | rust-bitcoin dev-differential; the RDTS fork is consensus-identical on the main chain (its BIP-110 build enforces a different, non-adopted ruleset) |
 | P1 initial validation | **Core 31.1** | Gocoin (RAM-resident extreme); Floresta/Utreexo in a *separate* row (different check set via proofs) |
 | P2 tip/reorg latency | **Core** | btcd for a second independent implementation |
 | P3 memory | **Core** | Gocoin (max-RAM) and Floresta (min-RAM) as the axis ends |
 | P4 storage | **Core** (LevelDB chainstate) | Floresta (<1 GB utreexo); libbitcoin (custom db engine) |
-| P5 network | **Core** (incl. Erlay status at run time) | btcd (BIP155); Knots for policy-visible traffic differences |
+| P5 network | **Core** (incl. Erlay status at run time) | btcd (BIP155); a policy-divergent 29.3 fork for policy-visible traffic differences |
 | P6 energy | **Core** | Floresta as the low-power reference |
 | P7 services | Fulcrum / electrs / esplora | vs. our future index services at matched coverage |
-| P8 mempool | **Core** | **Knots** — the richest policy knob set for adversarial/policy cases |
+| P8 mempool | **Core** | the extended-policy fork — richest external policy knob set for adversarial/policy cases |
 | P9 mining | **Core `getblocktemplate`** | Stratum v2 SRI for the template/distribution layer |
-| Q1 privacy | **Core** (Tor/I2P/CJDNS) | Knots policy-level filters as observable-behavior contrast |
+| Q1 privacy | **Core** (Tor/I2P/CJDNS) | a policy-divergent fork's filters as observable-behavior contrast |
 | Q6 supply chain | **Core** (Guix reproducible builds) | btcd's reproducible-build verification process |
 
 ## What we take vs. deliberately differ on
@@ -78,7 +78,7 @@ Deliberately differ:
   alternative.
 - **Observability** — bounded structured events and typed interfaces instead
   of `debug.log` archaeology and bolted-on indexers.
-- **Policy surface** — Knots proves policy configurability is where
+- **Policy surface** — policy-divergent forks prove configurability is where
   implementations legitimately differentiate; ours should be explicit,
   documented and safe-by-default rather than inherited defaults.
 

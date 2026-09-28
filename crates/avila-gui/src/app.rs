@@ -113,10 +113,11 @@ impl App {
         // The proxy choice persists — privacy stays binding across
         // restarts instead of silently reverting to direct dials.
         run.proxy = prefs.proxy.clone();
-        // The config file's prune_mb (Core's -prune in bitcoin.conf)
-        // seeds the settings field — an IBD on a small disk must be
-        // pruned from block one, not after the settings page opens.
-        if let Some(mb) = node.config().get().prune_mb {
+        // The config file's storage.prune_mb (Core's -prune in
+        // bitcoin.conf) seeds the settings field — an IBD on a small
+        // disk must be pruned from block one, not after the settings
+        // page opens.
+        if let Some(mb) = node.config().get().storage.prune_mb {
             run.prune_mib = mb.to_string();
         }
         let applied = prefs.clone();

@@ -7,7 +7,7 @@
 //! validated `Chainstate`.
 //!
 //! Usage: `peer_manager <peer-ip:port> [target-height]`
-//! e.g. against a local Knots/Core regtest node with 120 blocks:
+//! e.g. against a local Core regtest node with 120 blocks:
 //!   peer_manager 127.0.0.1:58322 120
 
 use std::net::SocketAddr;
