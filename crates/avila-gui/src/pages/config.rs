@@ -41,6 +41,8 @@ pub struct ConfigPage {
     /// What the last preset application did ("applied 5 live knobs;
     /// TOML for the rest is on the clipboard").
     preset_note: Option<String>,
+    /// The preset whose preview card is open.
+    preset_open: Option<usize>,
 }
 
 impl ConfigPage {
@@ -120,7 +122,8 @@ fn render_value(v: &serde_json::Value) -> String {
 /// block to paste into the config file — the app never writes it.
 struct Preset {
     name: &'static str,
-    blurb: &'static str,
+    /// Who this is for — one plain line under the name.
+    who: &'static str,
     /// (path, JSON literal) — parsed at apply time.
     live: &'static [(&'static str, &'static str)],
     /// (path, TOML literal) — emitted under `[section]` headers.
@@ -129,9 +132,9 @@ struct Preset {
 
 const PRESETS: &[Preset] = &[
     Preset {
-        name: "Quiet node",
-        blurb: "Blocks in, nothing out: no tx announcements, stem off, \
-                blocks served at the tip only — still watches what it refuses.",
+        name: "Blocks only",
+        who: "For a node that syncs and verifies but doesn't relay or serve \
+              transactions — the extrapool still records what it refused.",
         live: &[
             ("net.blocks_only", "true"),
             ("relay.tx.announce", "\"none\""),
@@ -142,9 +145,9 @@ const PRESETS: &[Preset] = &[
         restart: &[],
     },
     Preset {
-        name: "Lean laptop",
-        blurb: "Small mempool, two-hour memory, no extrapool — for a box \
-                that syncs and isn't a server.",
+        name: "Small footprint",
+        who: "For a laptop or small VPS — a 64 MiB mempool with two-hour \
+              expiry and no extrapool; pruning and dbcache go in the file.",
         live: &[
             ("mempool.max_mb", "64"),
             ("mempool.expiry_secs", "7200"),
@@ -153,9 +156,9 @@ const PRESETS: &[Preset] = &[
         restart: &[("storage.prune_mb", "2000"), ("storage.dbcache_mb", "256")],
     },
     Preset {
-        name: "Public server",
-        blurb: "Serve everything: full block serving, compact blocks, \
-                filters and indexes to match.",
+        name: "Full serving",
+        who: "For a well-connected box meant to serve the network — full \
+              block serving, compact blocks, filters; indexes go in the file.",
         live: &[
             ("net.blocks_only", "false"),
             ("relay.block.serve", "\"full\""),
@@ -192,18 +195,88 @@ fn preset_toml(restart: &[(&'static str, &'static str)]) -> String {
     out
 }
 
-fn presets_menu(ui: &mut Ui, state: &mut ConfigPage, control: Option<&Sender<ControlMsg>>) {
+fn presets_menu(ui: &mut Ui, state: &mut ConfigPage, _control: Option<&Sender<ControlMsg>>) {
     let pal = crate::theme::Palette::of(ui.ctx());
     egui::ComboBox::from_id_salt("config-presets")
-        .selected_text(RichText::new("apply a preset…").size(12.0).color(pal.muted))
-        .width(150.0)
+        .selected_text(RichText::new("presets…").size(12.0).color(pal.muted))
+        .width(140.0)
         .show_ui(ui, |ui| {
-            for p in PRESETS {
+            for (i, p) in PRESETS.iter().enumerate() {
                 if ui
                     .selectable_label(false, p.name)
-                    .on_hover_text(p.blurb)
+                    .on_hover_text(p.who)
                     .clicked()
                 {
+                    state.preset_open = Some(i);
+                    ui.close();
+                }
+            }
+        });
+}
+
+/// The preview card: every knob the preset touches, its value now and
+/// after, what applies live and what lands on the clipboard — then an
+/// explicit apply.
+fn preset_card(
+    ui: &mut Ui,
+    pal: crate::theme::Palette,
+    state: &mut ConfigPage,
+    control: Option<&Sender<ControlMsg>>,
+    knobs: &[avila_node::config::KnobDescription],
+    i: usize,
+) {
+    let Some(p) = PRESETS.get(i) else {
+        state.preset_open = None;
+        return;
+    };
+    ui.add_space(6.0);
+    egui::Frame::new()
+        .fill(pal.well)
+        .stroke(egui::Stroke::new(1.0, pal.hairline))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(16, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(p.name).size(14.0).color(pal.text).strong());
+            ui.label(RichText::new(p.who).size(12.0).color(pal.muted));
+            ui.add_space(6.0);
+            let current = |path: &str| -> String {
+                knobs
+                    .iter()
+                    .find(|k| k.path == path)
+                    .map(|k| render_value(&effective(state, path, &k.value)))
+                    .unwrap_or_else(|| "?".to_string())
+            };
+            for (path, raw) in p.live {
+                let new = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(*path).font(mono(12.0)).color(pal.text));
+                    ui.label(
+                        RichText::new(format!("{} → {}", current(path), render_value(&new)))
+                            .font(mono(12.0))
+                            .color(pal.signal),
+                    );
+                    ui.label(RichText::new("applies now").size(11.0).color(pal.muted));
+                });
+            }
+            for (path, val) in p.restart {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(*path).font(mono(12.0)).color(pal.text));
+                    ui.label(
+                        RichText::new(format!("{} → {}", current(path), val))
+                            .font(mono(12.0))
+                            .color(pal.signal),
+                    );
+                    ui.label(
+                        RichText::new("needs restart — goes on your clipboard")
+                            .size(11.0)
+                            .color(pal.muted),
+                    );
+                });
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if widgets::button(ui, "apply this preset", Kind::Primary).clicked() {
                     let mut applied = 0;
                     if let Some(tx) = control {
                         for (path, raw) in p.live {
@@ -232,10 +305,14 @@ fn presets_menu(ui: &mut Ui, state: &mut ConfigPage, control: Option<&Sender<Con
                         note.push_str(" — the restart knobs' TOML is on the clipboard");
                     }
                     state.preset_note = Some(note);
-                    ui.close();
+                    state.preset_open = None;
                 }
-            }
+                if widgets::button(ui, "cancel", Kind::Quiet).clicked() {
+                    state.preset_open = None;
+                }
+            });
         });
+    ui.add_space(4.0);
 }
 
 /// Parse a draft back into the knob's JSON shape — strings stay
@@ -290,6 +367,13 @@ pub fn show(
 ) -> Option<Action> {
     let pal = s.pal;
     let knobs = describe_config(node.config().get());
+    // `AVILA_PRESET_PREVIEW=<i>` opens a preset card — the capture
+    // harness's way into the preview.
+    if let Ok(i) = std::env::var("AVILA_PRESET_PREVIEW") {
+        if state.preset_open.is_none() {
+            state.preset_open = i.parse().ok().or(Some(0));
+        }
+    }
     widgets::section(
         ui,
         "Node policy",
@@ -328,10 +412,10 @@ pub fn show(
                 // default back through the channel — the journal gets
                 // the same config_changed receipt as any other edit.
                 if !state.overrides.is_empty()
-                    && widgets::button(ui, "reset live edits", Kind::Quiet)
+                    && widgets::button(ui, "restore defaults", Kind::Quiet)
                         .on_hover_text(
-                            "Send every live knob its default — the file is untouched; \
-                             restart-only knobs aren't reachable here.",
+                            "Send every live knob its default value — the file is \
+                             untouched; restart-only knobs aren't reachable here.",
                         )
                         .clicked()
                 {
@@ -356,6 +440,9 @@ pub fn show(
     });
     if let Some(note) = &state.preset_note {
         ui.label(RichText::new(note).size(12.0).color(pal.signal));
+    }
+    if let Some(i) = state.preset_open {
+        preset_card(ui, pal, state, control.as_ref(), &knobs, i);
     }
 
     // The file moved on disk — say which knobs drifted, and offer the
