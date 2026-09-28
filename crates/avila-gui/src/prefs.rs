@@ -21,6 +21,18 @@ pub enum ThemeChoice {
     System,
 }
 
+/// A preset the user saved on the Config page — the name plus every
+/// knob whose effective value differed from its default, split by
+/// apply path (`live` sends to the running node, `restart` stages
+/// into the overlay).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct CustomPreset {
+    pub name: String,
+    /// `(path, serialized value)` pairs — the raw form PRESETS uses.
+    pub live: Vec<(String, String)>,
+    pub restart: Vec<(String, String)>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Prefs {
     pub theme: ThemeChoice,
@@ -62,6 +74,13 @@ pub struct Prefs {
     /// Block Builder's best score, in sats.
     #[serde(default)]
     pub builder_best: u64,
+    /// Presets the user saved on the Config page.
+    #[serde(default)]
+    pub custom_presets: Vec<CustomPreset>,
+    /// Built-in presets the user removed, by name — they can return
+    /// via "restore removed" in the presets menu.
+    #[serde(default)]
+    pub hidden_presets: Vec<String>,
 }
 
 impl Default for Prefs {
@@ -80,6 +99,8 @@ impl Default for Prefs {
             sweep_best: [0; 3],
             snake_best: 0,
             builder_best: 0,
+            custom_presets: Vec::new(),
+            hidden_presets: Vec::new(),
         }
     }
 }

@@ -133,6 +133,13 @@ impl App {
         let capture = Capture::from_env();
         let keep_prefs = capture.is_none() && skin.is_none();
         prefs.apply(ctx);
+        if prefs.skin == Skin::Classic {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(classic::window_icon()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(vec2(705.0, 331.0)));
+            if capture.is_none() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(705.0, 484.0)));
+            }
+        }
         let network = node.config().get().network;
         let mut run = RunSettings::new(network);
         // The proxy choice persists — privacy stays binding across
@@ -388,6 +395,7 @@ impl App {
                         &scene,
                         &mut self.config_page,
                         &self.node,
+                        &mut self.prefs,
                         self.session.control_sender(),
                         self.config_file.as_deref(),
                         self.config_dirty.as_deref(),
@@ -724,7 +732,9 @@ impl eframe::App for App {
             }
             self.prefs.toybox |=
                 pose.page == Page::Toybox || pose.skin != Skin::Standard || pose.toy > 0;
-            self.prefs.skin = pose.skin;
+            if pose.pointer.is_empty() || pose.first {
+                self.prefs.skin = pose.skin;
+            }
             if pose.toy > 0 && self.toy_posed != pose.toy {
                 self.toys.pose(pose.toy);
             }
@@ -747,7 +757,9 @@ impl eframe::App for App {
             } else {
                 self.toys.game.shelve();
             }
-            self.page = pose.page;
+            if pose.pointer.is_empty() || pose.first {
+                self.page = pose.page;
+            }
             self.prefs.scale = pose.scale;
             if pose.select_peer && self.selected_peer.is_none() {
                 self.selected_peer = self
@@ -808,35 +820,47 @@ impl eframe::App for App {
             }
         } else {
             if Skin::current() == Skin::Classic {
-                // The '11 chrome: menus and raised tabs up top, the
-                // counting status bar at the foot — no rail, no
-                // modern status line.
-                egui::Panel::top("qt-chrome")
+                // Bitcoin 0.1's title, two wallet tools, and menus.
+                egui::Panel::top("bitcoin-0.1-chrome")
                     .exact_size(classic::CHROME_H)
                     .resizable(false)
                     .frame(Frame::new().fill(pal.well))
                     .show(ui, |ui| {
-                        match classic::chrome(ui, &mut self.page, &mut self.prefs) {
+                        match classic::chrome(
+                            ui,
+                            self.page,
+                            &mut self.prefs,
+                            self.session.running(),
+                            self.session.demo,
+                            self.session
+                                .view
+                                .as_ref()
+                                .and_then(|v| v.recent.last())
+                                .map(|(_, hash)| hash.as_str()),
+                        ) {
                             Some(classic::Pick::Open(p)) => self.page = p,
                             Some(classic::Pick::Modern) => self.prefs.skin = Skin::Standard,
+                            Some(classic::Pick::Node(a)) => action = Some(a),
                             None => {}
                         }
                     });
-                egui::Panel::bottom("qt-status")
+                egui::Panel::bottom("bitcoin-0.1-status")
                     .exact_size(classic::STATUSBAR_H)
                     .resizable(false)
                     .frame(Frame::new().fill(pal.well))
                     .show(ui, |ui| {
-                        let stats = self
-                            .session
-                            .view
-                            .as_ref()
-                            .map(|v| (v.connected, v.peers.len(), v.mempool_txs));
-                        if let Some(a) =
-                            classic::statusbar(ui, phase.label(), stats, self.session.running())
-                        {
-                            action = Some(a);
-                        }
+                        let stats = self.session.view.as_ref().map(|v| {
+                            (
+                                v.connected,
+                                if self.session.running() {
+                                    v.established().count()
+                                } else {
+                                    0
+                                },
+                                v.mempool_txs,
+                            )
+                        });
+                        classic::statusbar(ui, phase.label(), stats, self.session.demo);
                     });
             } else {
                 egui::Panel::left("rail")
@@ -874,8 +898,18 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                     let top = ui.max_rect();
                     if Skin::current() == Skin::Classic {
-                        // The original sat its pages in a sunken frame.
-                        classic::sunken_frame(ui.painter(), top.shrink(6.0));
+                        classic::content_frame(ui.painter(), top);
+                        // The original notebook expands with the window.
+                        // A page-wide scroll area gives it an unbounded
+                        // height and leaves the list stranded mid-window.
+                        if self.page == Page::Overview {
+                            let page_action =
+                                self.page_body(ui, pal, network, open_advanced, Margin::ZERO);
+                            if page_action.is_some() {
+                                action = page_action;
+                            }
+                            return;
+                        }
                     }
                     if crate::julia::on() {
                         crate::julia::wallpaper(ui.painter(), top, ui.input(|i| i.time));
@@ -895,11 +929,15 @@ impl eframe::App for App {
                             pal,
                             network,
                             open_advanced,
-                            Margin {
-                                left: 32,
-                                right: 32,
-                                top: 26,
-                                bottom: 40,
+                            if Skin::current() == Skin::Classic {
+                                Margin::same(12)
+                            } else {
+                                Margin {
+                                    left: 32,
+                                    right: 32,
+                                    top: 26,
+                                    bottom: 40,
+                                }
                             },
                         );
                         if page_action.is_some() {
@@ -912,6 +950,9 @@ impl eframe::App for App {
                 });
         }
 
+        if Skin::current() == Skin::Classic {
+            classic::resize_frame(ui);
+        }
         match action {
             Some(Action::Start) => {
                 self.prefs.welcomed = true;
@@ -933,6 +974,23 @@ impl eframe::App for App {
         // Preferences changed anywhere (Settings, the toybox, a shortcut)
         // are put in force here, once.
         if self.prefs != self.applied {
+            if self.prefs.skin != self.applied.skin {
+                let icon = if self.prefs.skin == Skin::Classic {
+                    classic::window_icon()
+                } else {
+                    eframe::icon_data::from_png_bytes(brand::LOGO_PNG)
+                        .ok()
+                        .map(std::sync::Arc::new)
+                };
+                ctx.send_viewport_cmd(egui::ViewportCommand::Icon(icon));
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
+                    if self.prefs.skin == Skin::Classic {
+                        vec2(705.0, 331.0)
+                    } else {
+                        vec2(760.0, 480.0)
+                    },
+                ));
+            }
             self.prefs.apply(&ctx);
             self.applied = self.prefs.clone();
         }
@@ -947,8 +1005,8 @@ impl eframe::App for App {
             self.ahead.clear();
             self.seen = self.page;
         }
-        // XP draws its own title bar, so the system's goes while it's on.
-        let framed = Skin::current() != Skin::Xp;
+        // XP and Bitcoin 0.1 draw their own period window chrome.
+        let framed = !matches!(Skin::current(), Skin::Xp | Skin::Classic);
         if self.decorated != Some(framed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(framed));
             self.decorated = Some(framed);

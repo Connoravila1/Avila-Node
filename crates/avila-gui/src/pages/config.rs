@@ -46,7 +46,9 @@ pub struct ConfigPage {
     /// TOML for the rest is on the clipboard").
     preset_note: Option<String>,
     /// The preset whose preview card is open.
-    preset_open: Option<usize>,
+    preset_open: Option<PresetSel>,
+    /// The save-as-preset card's draft name while it's open.
+    saving: Option<String>,
     /// The header's circle-i card — how the layers fit together.
     info_open: bool,
 }
@@ -260,40 +262,191 @@ fn info_card(ui: &mut Ui, pal: crate::theme::Palette) {
         });
 }
 
-fn presets_menu(ui: &mut Ui, state: &mut ConfigPage, _control: Option<&Sender<ControlMsg>>) {
+fn presets_menu(ui: &mut Ui, state: &mut ConfigPage, prefs: &mut crate::prefs::Prefs) {
     let pal = crate::theme::Palette::of(ui.ctx());
     egui::ComboBox::from_id_salt("config-presets")
         .selected_text(RichText::new("presets…").size(12.0).color(pal.muted))
         .width(140.0)
         .show_ui(ui, |ui| {
             for (i, p) in PRESETS.iter().enumerate() {
+                if prefs.hidden_presets.iter().any(|n| n == p.name) {
+                    continue;
+                }
                 if ui
                     .selectable_label(false, p.name)
                     .on_hover_text(p.who)
                     .clicked()
                 {
-                    state.preset_open = Some(i);
+                    state.preset_open = Some(PresetSel::BuiltIn(i));
+                    ui.close();
+                }
+            }
+            if !prefs.custom_presets.is_empty() {
+                ui.separator();
+            }
+            for (i, c) in prefs.custom_presets.iter().enumerate() {
+                if ui
+                    .selectable_label(false, &c.name)
+                    .on_hover_text("your preset")
+                    .clicked()
+                {
+                    state.preset_open = Some(PresetSel::Custom(i));
+                    ui.close();
+                }
+            }
+            if !prefs.hidden_presets.is_empty() {
+                ui.separator();
+                if ui
+                    .selectable_label(
+                        false,
+                        format!("restore removed presets ({})", prefs.hidden_presets.len()),
+                    )
+                    .clicked()
+                {
+                    prefs.hidden_presets.clear();
                     ui.close();
                 }
             }
         });
 }
 
+/// The save-as-preset card — a name, a count of what it captures, and
+/// the save/cancel pair.
+fn save_card(
+    ui: &mut Ui,
+    pal: crate::theme::Palette,
+    state: &mut ConfigPage,
+    knobs: &[avila_node::config::KnobDescription],
+    prefs: &mut crate::prefs::Prefs,
+) {
+    let diverged = |kind: EditKind| -> Vec<(String, String)> {
+        knobs
+            .iter()
+            .filter(|k| k.edit == kind)
+            .filter(|k| effective(state, k.path, &k.value) != k.default)
+            .map(|k| {
+                (
+                    k.path.to_string(),
+                    serde_json::to_string(&effective(state, k.path, &k.value)).unwrap_or_default(),
+                )
+            })
+            .collect()
+    };
+    let live = diverged(EditKind::Live);
+    let restart = diverged(EditKind::Restart);
+    ui.add_space(6.0);
+    egui::Frame::new()
+        .fill(pal.well)
+        .stroke(egui::Stroke::new(1.0, pal.hairline))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(16, 12))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new("save the current values as a preset")
+                    .size(14.0)
+                    .color(pal.text)
+                    .strong(),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "captures {} live knob{} and {} restart knob{} — everything that \
+                     differs from the defaults",
+                    live.len(),
+                    if live.len() == 1 { "" } else { "s" },
+                    restart.len(),
+                    if restart.len() == 1 { "" } else { "s" },
+                ))
+                .size(12.0)
+                .color(pal.muted),
+            );
+            ui.add_space(6.0);
+            let mut saved = false;
+            ui.horizontal(|ui| {
+                if let Some(name) = &mut state.saving {
+                    ui.label(RichText::new("Name").size(12.0).color(pal.muted));
+                    ui.add(TextEdit::singleline(name).desired_width(220.0));
+                    let name = name.trim().to_string();
+                    let ok = !name.is_empty() && !(live.is_empty() && restart.is_empty());
+                    if widgets::button(ui, "save", Kind::Primary)
+                        .on_disabled_hover_text(
+                            "needs a name, and something must differ from defaults",
+                        )
+                        .clicked()
+                        && ok
+                    {
+                        prefs.custom_presets.retain(|c| c.name != name);
+                        prefs.custom_presets.push(crate::prefs::CustomPreset {
+                            name: name.clone(),
+                            live,
+                            restart,
+                        });
+                        state.preset_note = Some(format!("saved preset “{name}”"));
+                        saved = true;
+                    }
+                }
+                if widgets::button(ui, "cancel", Kind::Quiet).clicked() {
+                    saved = true;
+                }
+            });
+            if saved {
+                state.saving = None;
+            }
+        });
+}
+
+/// Which preset a card is showing — one of ours or one the user saved.
+#[derive(Clone, Copy)]
+enum PresetSel {
+    BuiltIn(usize),
+    Custom(usize),
+}
+
 /// The preview card: every knob the preset touches, its value now and
-/// after, what applies live and what lands on the clipboard — then an
-/// explicit apply.
+/// after, what applies live and what stages for restart — then an
+/// explicit apply, plus a remove that hides a built-in or deletes a
+/// saved one.
 fn preset_card(
     ui: &mut Ui,
     pal: crate::theme::Palette,
     state: &mut ConfigPage,
     control: Option<&Sender<ControlMsg>>,
     config_file: Option<&std::path::Path>,
+    prefs: &mut crate::prefs::Prefs,
     knobs: &[avila_node::config::KnobDescription],
-    i: usize,
+    sel: PresetSel,
 ) {
-    let Some(p) = PRESETS.get(i) else {
-        state.preset_open = None;
-        return;
+    // Resolve to owned values so builtins and customs share the loop.
+    let (name, who, live, restart) = match sel {
+        PresetSel::BuiltIn(i) => match PRESETS.get(i) {
+            Some(p) => (
+                p.name.to_string(),
+                p.who.to_string(),
+                p.live
+                    .iter()
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .collect::<Vec<_>>(),
+                p.restart
+                    .iter()
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .collect::<Vec<_>>(),
+            ),
+            None => {
+                state.preset_open = None;
+                return;
+            }
+        },
+        PresetSel::Custom(i) => match prefs.custom_presets.get(i) {
+            Some(c) => (
+                c.name.clone(),
+                "your preset".to_string(),
+                c.live.clone(),
+                c.restart.clone(),
+            ),
+            None => {
+                state.preset_open = None;
+                return;
+            }
+        },
     };
     ui.add_space(6.0);
     egui::Frame::new()
@@ -303,8 +456,8 @@ fn preset_card(
         .inner_margin(egui::Margin::symmetric(16, 12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(p.name).size(14.0).color(pal.text).strong());
-            ui.label(RichText::new(p.who).size(12.0).color(pal.muted));
+            ui.label(RichText::new(&name).size(14.0).color(pal.text).strong());
+            ui.label(RichText::new(&who).size(12.0).color(pal.muted));
             ui.add_space(6.0);
             let current = |path: &str| -> String {
                 knobs
@@ -313,10 +466,10 @@ fn preset_card(
                     .map(|k| render_value(&effective(state, path, &k.value)))
                     .unwrap_or_else(|| "?".to_string())
             };
-            for (path, raw) in p.live {
+            for (path, raw) in &live {
                 let new = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(*path).font(mono(12.0)).color(pal.text));
+                    ui.label(RichText::new(path).font(mono(12.0)).color(pal.text));
                     ui.label(
                         RichText::new(format!("{} → {}", current(path), render_value(&new)))
                             .font(mono(12.0))
@@ -325,11 +478,12 @@ fn preset_card(
                     ui.label(RichText::new("applies now").size(11.0).color(pal.muted));
                 });
             }
-            for (path, val) in p.restart {
+            for (path, raw) in &restart {
+                let new = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(*path).font(mono(12.0)).color(pal.text));
+                    ui.label(RichText::new(path).font(mono(12.0)).color(pal.text));
                     ui.label(
-                        RichText::new(format!("{} → {}", current(path), val))
+                        RichText::new(format!("{} → {}", current(path), render_value(&new)))
                             .font(mono(12.0))
                             .color(pal.signal),
                     );
@@ -345,7 +499,7 @@ fn preset_card(
                 if widgets::button(ui, "apply this preset", Kind::Primary).clicked() {
                     let mut applied = 0;
                     let mut staged_n = 0;
-                    for (path, raw) in p.live {
+                    for (path, raw) in &live {
                         let value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
                         if let Some(file) = config_file {
                             if let Err(e) =
@@ -353,26 +507,26 @@ fn preset_card(
                             {
                                 state
                                     .rejected
-                                    .insert((*path).to_string(), format!("not persisted: {e}"));
+                                    .insert(path.clone(), format!("not persisted: {e}"));
                             }
                         }
                         if let Some(tx) = control {
                             let _ = tx.send(ControlMsg::Set {
-                                path: (*path).to_string(),
+                                path: path.clone(),
                                 value: value.clone(),
                             });
                         }
-                        state.pending.insert((*path).to_string(), value);
+                        state.pending.insert(path.clone(), value);
                         applied += 1;
                     }
-                    for (path, raw) in p.restart {
+                    for (path, raw) in &restart {
                         let value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
                         if let Some(file) = config_file {
                             stage(file, state, path, value);
                             staged_n += 1;
                         }
                     }
-                    let mut note = format!("{}: {} applied now", p.name, applied);
+                    let mut note = format!("{name}: {applied} applied now");
                     if staged_n > 0 {
                         note.push_str(&format!(
                             ", {staged_n} staged for the next start in {}",
@@ -391,6 +545,22 @@ fn preset_card(
                     state.preset_open = None;
                 }
                 if widgets::button(ui, "cancel", Kind::Quiet).clicked() {
+                    state.preset_open = None;
+                }
+                ui.add_space(8.0);
+                if widgets::button(ui, "remove this preset", Kind::Quiet)
+                    .on_hover_text(match sel {
+                        PresetSel::BuiltIn(_) => "Hide it — restore removed presets brings it back",
+                        PresetSel::Custom(_) => "Delete it — saved presets can't be undeleted",
+                    })
+                    .clicked()
+                {
+                    match sel {
+                        PresetSel::BuiltIn(_) => prefs.hidden_presets.push(name.clone()),
+                        PresetSel::Custom(i) => {
+                            prefs.custom_presets.remove(i);
+                        }
+                    }
                     state.preset_open = None;
                 }
             });
@@ -442,6 +612,7 @@ pub fn show(
     s: &Scene,
     state: &mut ConfigPage,
     node: &Node,
+    prefs: &mut crate::prefs::Prefs,
     control: Option<Sender<ControlMsg>>,
     config_file: Option<&std::path::Path>,
     // Knob paths whose on-disk value differs from the running node's
@@ -454,7 +625,7 @@ pub fn show(
     // harness's way into the preview.
     if let Ok(i) = std::env::var("AVILA_PRESET_PREVIEW") {
         if state.preset_open.is_none() {
-            state.preset_open = i.parse().ok().or(Some(0));
+            state.preset_open = Some(PresetSel::BuiltIn(i.parse().unwrap_or(0)));
         }
     }
     widgets::section(
@@ -564,7 +735,15 @@ pub fn show(
                     state.drafts.clear();
                     state.rejected.clear();
                 }
-                presets_menu(ui, state, control.as_ref());
+                presets_menu(ui, state, prefs);
+                if widgets::button(ui, "save as preset…", Kind::Quiet)
+                    .on_hover_text(
+                        "Name the current values — everything that differs from defaults goes in",
+                    )
+                    .clicked()
+                {
+                    state.saving = Some(String::new());
+                }
             }
         });
     });
@@ -574,8 +753,20 @@ pub fn show(
     if let Some(note) = &state.preset_note {
         ui.label(RichText::new(note).size(12.0).color(pal.signal));
     }
-    if let Some(i) = state.preset_open {
-        preset_card(ui, pal, state, control.as_ref(), config_file, &knobs, i);
+    if state.saving.is_some() {
+        save_card(ui, pal, state, &knobs, prefs);
+    }
+    if let Some(sel) = state.preset_open {
+        preset_card(
+            ui,
+            pal,
+            state,
+            control.as_ref(),
+            config_file,
+            prefs,
+            &knobs,
+            sel,
+        );
     }
 
     // The file moved on disk — say which knobs drifted, and offer the
