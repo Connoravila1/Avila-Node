@@ -225,7 +225,7 @@ transition.
 | Per-peer matrix | compartment matrix | `relay.tx.deny_pairs` (wired — `"src->dst"` pairs never announce; src: inbound/outbound/local/extrapool, dst: inbound/outbound); `relay.tx.to_inbound`, `to_blocks_only_peers`, `peer_override` planned | `tx.announce` |
 | Provenance rules | `TxSource` in announce facts | `relay.tx.min_observed_announces` planned | `tx.announce` (facts carry `source`, `source_peer`, `peer_inbound`, `peer_user_agent`) |
 | Tx serving | `MEMPOOL_REQ_INTERVAL=60s`, `MAX_MEMPOOL_INV=50k` | `relay.tx.serve_mempool`, `mempool_req.interval`, `mempool_req.max_inv`, `relay.tx.serve_bip37` (bloom serving, off default) | `tx.serve` |
-| feefilter | honored inbound | `relay.tx.honor_feefilter`, `relay.tx.send_feefilter` | — |
+| feefilter | honored inbound — peer's advertised minimum suppresses sub-rate invs in `send_tx_inv`; reported via `getpeerinfo.minfeefilter`. We never send one ourselves | `relay.tx.send_feefilter` (send our floor outbound) planned | — |
 | Shape / timing | recon 4s | `relay.tx.trickle_ms`, announce jitter, per-peer announce rate cap | `relay.schedule` |
 | Reconciliation | `RECON_INTERVAL=4s`, req ≥250ms, ≤8 violations | `relay.tx.recon`, `recon.interval`, `recon.min_req_interval`, `recon.max_violations` | — |
 | Rebroadcast | broadcast pool exists | `relay.tx.rebroadcast_local`, `relay.tx.rebroadcast_interval` | — |

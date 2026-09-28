@@ -7460,7 +7460,14 @@ pub(crate) fn dispatch(
                             .cloned()
                             .map(|tx| (tx, Some(bh)))
                     })
-                } else if let Some(tx) = mgr.mempool_ref().get(&txid) {
+                } else if let Some(tx) = mgr
+                    .mempool_ref()
+                    .get(&txid)
+                    .filter(|_| !mgr.mempool_ref().is_private(&txid))
+                {
+                    // Private entries don't probe — same hiding as
+                    // getmempoolentry: a caller who knows the txid
+                    // can't distinguish pooled from absent.
                     Some((tx.clone(), None))
                 } else {
                     via_index = true;
@@ -7655,9 +7662,10 @@ pub(crate) fn dispatch(
                             "timeoffset": 0,
                             "misbehavior_score": 0,
                             "permissions": [],
-                            // We never send feefilter — the peer applies
-                            // its own default floor.
-                            "minfeefilter": 0,
+                            // BIP-133 — the peer's advertised minimum
+                            // (0 until one arrives). We never send
+                            // feefilter ourselves.
+                            "minfeefilter": p.min_fee,
                             // Compact-block high-bandwidth mode was never
                             // negotiated.
                             "bip152_hb_to": false,

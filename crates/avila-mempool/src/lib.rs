@@ -339,6 +339,8 @@ pub struct Extrapool {
     /// Per-class FIFO queues — `extrapool.caps` evicts the oldest of a
     /// class when that class exceeds its cap.
     class_order: BTreeMap<&'static str, VecDeque<Txid>>,
+    /// wtxid → txid — `extrapool.relay`'d txs answer MSG_WTX getdata.
+    wtxids: HashMap<Wtxid, Txid>,
     bytes: usize,
     observe: bool,
     max_entries: usize,
@@ -451,6 +453,7 @@ impl Extrapool {
         );
         self.order.push_back(txid);
         self.class_order.entry(class).or_default().push_back(txid);
+        self.wtxids.insert(wtxid, txid);
         self.bytes += bytes;
         self.stats.stored += 1;
         *self.stats.by_reason.entry(reason).or_insert(0) += 1;
@@ -473,6 +476,7 @@ impl Extrapool {
                     self.bytes -= e.bytes;
                     self.stats.evicted += 1;
                     self.order.retain(|x| x != &id);
+                    self.wtxids.remove(&e.tx.wtxid());
                 }
             }
         }
@@ -490,6 +494,7 @@ impl Extrapool {
                 if let Some(q) = self.class_order.get_mut(e.class) {
                     q.retain(|x| x != &id);
                 }
+                self.wtxids.remove(&e.tx.wtxid());
             }
         }
     }
@@ -513,6 +518,7 @@ impl Extrapool {
                 if let Some(q) = self.class_order.get_mut(e.class) {
                     q.retain(|x| x != id);
                 }
+                self.wtxids.remove(&e.tx.wtxid());
             }
         }
         if !stale.is_empty() {
@@ -526,6 +532,7 @@ impl Extrapool {
         let e = self.map.remove(txid)?;
         self.bytes -= e.bytes;
         self.order.retain(|id| id != txid);
+        self.wtxids.remove(&e.tx.wtxid());
         if let Some(q) = self.class_order.get_mut(e.class) {
             q.retain(|x| x != txid);
         }
@@ -536,6 +543,13 @@ impl Extrapool {
     #[must_use]
     pub fn get(&self, txid: &Txid) -> Option<&ExtraEntry> {
         self.map.get(txid)
+    }
+
+    /// Look up by wtxid — `extrapool.relay`'d txs answer MSG_WTX
+    /// getdata through this index.
+    #[must_use]
+    pub fn get_wtxid(&self, wtxid: &Wtxid) -> Option<&ExtraEntry> {
+        self.wtxids.get(wtxid).and_then(|id| self.map.get(id))
     }
 
     /// Entry count.

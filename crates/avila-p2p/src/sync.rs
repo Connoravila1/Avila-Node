@@ -1191,6 +1191,23 @@ impl PeerSync {
                                 *inv.hash.as_bytes(),
                             ))
                         })
+                        // `extrapool.relay` announced it — a getdata we
+                        // can't serve would be a broken inv, so the
+                        // observation pool backs serving too.
+                        .or_else(|| {
+                            m.extrapool()
+                                .get(&avila_consensus::hash::Txid::from_bytes(
+                                    *inv.hash.as_bytes(),
+                                ))
+                                .or_else(|| {
+                                    m.extrapool().get_wtxid(
+                                        &avila_consensus::hash::Wtxid::from_bytes(
+                                            *inv.hash.as_bytes(),
+                                        ),
+                                    )
+                                })
+                                .map(|e| &e.tx)
+                        })
                     });
                     match found {
                         Some(tx) => {
@@ -1869,6 +1886,64 @@ mod tests {
         match &out[1] {
             Message::NotFound(v) => assert_eq!(v[0].hash, unknown),
             other => panic!("expected notfound, got {other:?}"),
+        }
+    }
+
+    /// `extrapool.relay` announced the tx — the same inv must not come
+    /// back `notfound`. Serving falls back from mempool to the
+    /// observation pool, for txid and wtxid requests alike.
+    #[test]
+    fn serve_getdata_falls_back_to_extrapool() {
+        use avila_consensus::transaction::{OutPoint, Script, TxIn, TxOut, Witness};
+        use avila_consensus::{script, transaction::Transaction};
+
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 101);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        let mut pool = avila_mempool::Mempool::new();
+        pool.set_require_standard(false);
+        pool.set_min_relay_fee(1_000_000_000_000);
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: blocks[0].transactions[0].txid(),
+                    vout: 0,
+                },
+                script_sig: Script::new(vec![]),
+                sequence: 0xffff_ffff,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 4_999_000_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let txid = tx.txid();
+        let wtxid = tx.wtxid();
+        // Policy reject → the tx lands in the extrapool, not the pool.
+        assert!(pool.accept_tx(tx, &cs, NOW).is_err());
+        assert!(pool.extrapool().get(&txid).is_some());
+
+        for inv_type in [InvType::Tx, InvType::Wtx] {
+            let hash = match inv_type {
+                InvType::Tx => BlockHash::from_bytes(*txid.as_bytes()),
+                _ => BlockHash::from_bytes(*wtxid.as_bytes()),
+            };
+            let reqs = vec![InvVector { inv_type, hash }];
+            let mut out = Vec::new();
+            PeerSync::serve_getdata(&cs, Some(&pool), &reqs, |m| {
+                out.push(m.clone());
+                true
+            });
+            assert_eq!(out.len(), 1, "{inv_type:?}");
+            match &out[0] {
+                Message::Tx(t) => assert_eq!(t.txid(), txid),
+                other => panic!("{inv_type:?}: expected the observed tx, got {other:?}"),
+            }
         }
     }
 

@@ -77,7 +77,9 @@ fn recon_pool(
         // Stem-pending txs stay out of the sketch until fluff — on a
         // recon link the next scheduled round would leak them inside
         // the stem delay and turn the hop decorative (queue #7).
-        if exclude.contains(&txid) {
+        // `mempool.private` entries never reconcile — the sketch
+        // announces membership to the whole link.
+        if exclude.contains(&txid) || mempool.is_private(&txid) {
             continue;
         }
         let id = crate::recon::short_id(salt, txid.as_bytes());
@@ -308,6 +310,10 @@ struct PeerEntry<S> {
     /// the reply carries the whole pool, so it's inbound-only and
     /// rate-limited rather than free bandwidth amplification.
     mempool_req_last: Option<Instant>,
+    /// BIP-133 `feefilter` — the peer's advertised minimum feerate
+    /// (sat/kvB). Announcements below it are suppressed for this link;
+    /// 0 = the peer hasn't sent one (serve everything).
+    min_fee: u64,
     /// The nonce we sent in our own `version`, when this was an
     /// outbound dial (`None` for inbound accepts, which never register
     /// a nonce to check against). Mirrored into
@@ -446,6 +452,9 @@ pub struct PeerSnapshot {
     pub addr_processed: u64,
     /// Addresses rate-limited from this peer.
     pub addr_rate_limited: u64,
+    /// BIP-133 — the peer's advertised `feefilter` minimum (sat/kvB);
+    /// 0 when unsent. `getpeerinfo`'s `minfeefilter`.
+    pub min_fee: u64,
     /// Outstanding `getdata` block hashes (for `inflight` heights).
     pub in_flight_hashes: Vec<BlockHash>,
     /// `transport_protocol_type` — "v1"/"v2" (Core also has
@@ -983,6 +992,7 @@ impl<S: Read + Write> PeerManager<S> {
                     synced_block_height: peer.synced_block_height,
                     addr_processed: peer.addr_processed,
                     addr_rate_limited: peer.addr_rate_limited,
+                    min_fee: peer.min_fee,
                     in_flight_hashes: peer.sync.in_flight_hashes().collect(),
                     transport_protocol: peer.session.transport_protocol(),
                     v2_session_id: peer.session.v2_session_id(),
@@ -1164,6 +1174,7 @@ impl<S: Read + Write> PeerManager<S> {
                 addr_token_timestamp: now,
                 getaddr_recvd: false,
                 mempool_req_last: None,
+                min_fee: 0,
                 recon: None,
                 recon_round: None,
                 recon_map: std::collections::HashMap::new(),
@@ -1752,6 +1763,14 @@ impl<S: Read + Write> PeerManager<S> {
         source: TxSource,
     ) {
         let src = self.source_compartment(source);
+        // BIP-133: the announced tx's feerate (sat/kvB, hoisted — the
+        // peer loop borrows &mut self) gates each peer's advertised
+        // minimum. Extrapool-relayed txs aren't priced by the store —
+        // they pass ungated.
+        let feerate = self
+            .mempool
+            .entry(txid)
+            .map(|e| e.fee.saturating_mul(1000) / (e.vsize.max(1) as i64));
         // The verdict/matrix are hoisted so the peer-map iteration
         // doesn't fight the borrow on `self`.
         let deny_pairs = std::mem::take(&mut self.deny_pairs);
@@ -1768,6 +1787,13 @@ impl<S: Read + Write> PeerManager<S> {
             // next round reconciles the difference anyway, and skipping
             // the inv is exactly where the bandwidth win lives.
             if peer.recon.is_some() {
+                continue;
+            }
+            // BIP-133 — don't waste an inv on a tx the peer's filter
+            // already refuses.
+            if let Some(rate) = feerate
+                && rate < peer.min_fee as i64
+            {
                 continue;
             }
             let dst = if peer.inbound { "inbound" } else { "outbound" };
@@ -2879,6 +2905,9 @@ impl<S: Read + Write> PeerManager<S> {
                 let invs: Vec<crate::message::InvVector> = mempool
                     .txids()
                     .iter()
+                    // `mempool.private` entries don't bulk-leak either —
+                    // stem is the only announce they get.
+                    .filter(|txid| !mempool.is_private(txid))
                     .take(MAX_MEMPOOL_INV)
                     .filter_map(|txid| {
                         mempool.get(txid).map(|tx| crate::message::InvVector {
@@ -2945,6 +2974,10 @@ impl<S: Read + Write> PeerManager<S> {
                         DisconnectReason::Session("connected to self".to_string()),
                     ));
                 }
+            }
+            SessionEvent::Message(Message::FeeFilter(rate)) => {
+                // BIP-133 — the peer's minimum feerate gates its invs.
+                peer.min_fee = rate;
             }
             SessionEvent::Message(_) => {}
         }
@@ -6249,6 +6282,78 @@ mod tests {
             "private never fluffs: {fluff:?}"
         );
         assert!(mgr.stem_pending.is_empty());
+    }
+
+    /// BIP-133 — a peer's `feefilter` suppresses invs for txs below
+    /// its advertised rate; unaffected links still get the announce.
+    #[test]
+    fn feefilter_suppresses_low_fee_announces() {
+        use avila_consensus::transaction::{OutPoint, Script, TxIn, TxOut, Witness};
+        use avila_consensus::{script, transaction::Transaction};
+
+        let (mut mgr, mut a, _ida) = managed_peer();
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 101);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        handshake(&mut mgr, &mut a, &mut cs);
+        testpipe::drain(&mut a, MAGIC);
+        let (mut b, _idb) = add_peer(&mut mgr);
+        handshake_peer(&mut mgr, &mut b, &mut cs);
+        testpipe::drain(&mut b, MAGIC);
+
+        // A real pool entry: fee 10_000 sat over a ~110vB spend —
+        // ~90k sat/kvB.
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: blocks[0].transactions[0].txid(),
+                    vout: 0,
+                },
+                script_sig: Script::new(vec![]),
+                sequence: 0xffff_ffff,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 4_999_990_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let txid = tx.txid();
+        let wtxid = tx.wtxid();
+        mgr.mempool().set_require_standard(false);
+        mgr.mempool().accept_tx(tx, &cs, NOW).expect("admit");
+
+        // B's filter is well above the tx's feerate.
+        testpipe::inject(&mut b, MAGIC, &Message::FeeFilter(1_000_000));
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut b, MAGIC);
+
+        mgr.announce_tx(txid, wtxid);
+        mgr.tick(&mut cs, NOW);
+        let has_inv = |msgs: &[Message]| msgs.iter().any(|m| matches!(m, Message::Inv(_)));
+        assert!(
+            has_inv(&testpipe::drain(&mut a, MAGIC)),
+            "unfiltered peer got it"
+        );
+        assert!(
+            !has_inv(&testpipe::drain(&mut b, MAGIC)),
+            "feefilter suppressed"
+        );
+
+        // Filter lowered — the same announce reaches B.
+        testpipe::inject(&mut b, MAGIC, &Message::FeeFilter(1));
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut b, MAGIC);
+        mgr.announce_tx(txid, wtxid);
+        mgr.tick(&mut cs, NOW);
+        assert!(
+            has_inv(&testpipe::drain(&mut b, MAGIC)),
+            "lowered filter announces"
+        );
     }
 
     /// Queue #19: the divergence alarm fires once, only past every
