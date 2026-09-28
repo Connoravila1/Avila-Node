@@ -242,17 +242,17 @@ fn info_card(ui: &mut Ui, pal: crate::theme::Palette) {
             );
             ui.add_space(4.0);
             for line in [
-                "Your file is the base — never rewritten. Its overlay, \
-                 <name>.runtime.toml, merges over it at load.",
-                "live — applies to the running node within a tick and persists \
-                 into the overlay. Every change lands on the event journal.",
-                "needs restart — structural knobs (databases, sockets, indexes) \
-                 are opened once at boot. Editing stages the value into the \
-                 overlay; it applies on the next start.",
-                "file watch — edits from outside either file raise a banner: \
-                 live diffs can apply in place, restart diffs need the restart.",
-                "Nothing on this page can change what's valid — consensus rules \
-                 aren't configuration.",
+                "The app never writes your config file. Anything you change \
+                 here goes to <name>.runtime.toml beside it, and that file wins \
+                 when the config loads.",
+                "live — sent to the running node right away, and written to \
+                 the overlay so it survives a restart.",
+                "needs restart — staged into the overlay. The node only reads \
+                 it when it starts.",
+                "If you edit either file yourself, a banner lists what changed. \
+                 Live changes can be applied without restarting.",
+                "Nothing here touches consensus rules — no knob changes what \
+                 makes a block valid.",
             ] {
                 ui.label(RichText::new(line).size(12.0).color(pal.muted));
             }
@@ -468,6 +468,7 @@ pub fn show(
     ui.horizontal(|ui| {
         ui.label(RichText::new("Filter").size(13.0).color(pal.muted));
         ui.add(TextEdit::singleline(&mut state.filter).desired_width(200.0));
+        ui.add_space(14.0);
         // A drawn circle-i — the fonts don't carry ⓘ, so paint it.
         // Left of everything else, where page-level info belongs.
         {
