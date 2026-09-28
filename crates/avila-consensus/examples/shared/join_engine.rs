@@ -289,83 +289,129 @@ pub struct JoinReport {
 /// of those resolve as `BoundaryConflict` (known invalidity, never Coin).
 /// Boundary coins are seeded exactly once per outpoint; a second spend of
 /// a boundary coin resolves as `DupSpend`, not `Coin` again.
-pub fn join_window<B: BoundaryView>(
+pub fn join_window<B: BoundaryView + Sync>(
     created: &[Creation],
     spends: &[Spend],
     boundary: &B,
     conflicted: &std::collections::HashSet<OutPoint>,
 ) -> JoinReport {
+    // Each outpoint's event chain is independent — shard by txid prefix
+    // and walk shards in parallel. Shards are disjoint, so every op is
+    // resolved exactly once and merging is plain concatenation.
+    const SHARDS: usize = 8;
+    let shard_of = |op: &OutPoint| (op.txid.as_bytes()[0] as usize) & (SHARDS - 1);
+    let mut shard_ops: [std::collections::HashSet<OutPoint>; SHARDS] = Default::default();
     let mut created_by_op: HashMap<OutPoint, Vec<usize>> = HashMap::new();
     for (k, c) in created.iter().enumerate() {
         created_by_op.entry(c.op).or_default().push(k);
+        shard_ops[shard_of(&c.op)].insert(c.op);
     }
     let mut spends_by_op: HashMap<OutPoint, Vec<usize>> = HashMap::new();
     for (k, s) in spends.iter().enumerate() {
         spends_by_op.entry(s.op).or_default().push(k);
+        shard_ops[shard_of(&s.op)].insert(s.op);
     }
-    let mut resolved: HashMap<Occ, JoinRes> = HashMap::new();
-    let mut violations: Vec<(Occ, JoinViolation)> = Vec::new();
     // Only ops with in-window events can produce resolutions or
     // violations — a boundary coin never touched contributes nothing, so
     // iterating every boundary key would be wasted work (and would force
     // enumeration APIs that flat tables don't need).
-    let mut keys: std::collections::HashSet<OutPoint> = created_by_op.keys().copied().collect();
-    keys.extend(spends_by_op.keys().copied());
+    type ShardOut = (
+        HashMap<Occ, JoinRes>,
+        Vec<(Occ, JoinViolation)>,
+        usize,
+        usize,
+        Option<Occ>,
+    );
+    let parts: Vec<ShardOut> = std::thread::scope(|sc| {
+        let handles: Vec<_> = shard_ops
+            .iter()
+            .map(|keys| {
+                let created_by_op = &created_by_op;
+                let spends_by_op = &spends_by_op;
+                sc.spawn(move || {
+                    let mut resolved: HashMap<Occ, JoinRes> = HashMap::new();
+                    let mut violations: Vec<(Occ, JoinViolation)> = Vec::new();
+                    let mut dup_spends = 0usize;
+                    let mut missing_spends = 0usize;
+                    let mut first_missing: Option<Occ> = None;
+                    for op in keys {
+                        let mut events: Vec<(Occ, bool, usize)> = Vec::new();
+                        for &k in created_by_op.get(op).map(Vec::as_slice).unwrap_or(&[]) {
+                            events.push((created[k].pos, true, k));
+                        }
+                        for &k in spends_by_op.get(op).map(Vec::as_slice).unwrap_or(&[]) {
+                            events.push((spends[k].pos, false, k));
+                        }
+                        events.sort_by_key(|a| a.0);
+                        // Boundary seed: exactly once. An op that starts alive is
+                        // consumed by its first spend; a second spend is a DupSpend.
+                        let mut alive = boundary.b_contains(op);
+                        let mut boundary_coin: Option<Coin> = boundary.b_get(op);
+                        let mut consumed = false;
+                        for (pos, is_creation, _k) in events {
+                            if is_creation {
+                                if alive {
+                                    violations.push((pos, JoinViolation::DupCreation));
+                                }
+                                alive = true;
+                            } else {
+                                if !alive {
+                                    if consumed {
+                                        resolved.insert(pos, JoinRes::DupSpend(pos));
+                                        dup_spends += 1;
+                                    } else if conflicted.contains(op) {
+                                        resolved.insert(pos, JoinRes::BoundaryConflict);
+                                    } else {
+                                        resolved.insert(pos, JoinRes::Missing);
+                                        missing_spends += 1;
+                                        if first_missing.is_none_or(|f| pos < f) {
+                                            first_missing = Some(pos);
+                                        }
+                                    }
+                                } else {
+                                    // Latest in-window creation before pos, else the
+                                    // boundary coin (re-creation always out-positions the
+                                    // boundary seed since boundary records have no pos).
+                                    let coin = created_by_op
+                                        .get(op)
+                                        .into_iter()
+                                        .flat_map(|v| v.iter())
+                                        .filter(|&&k| created[k].pos < pos)
+                                        .max_by_key(|&&k| created[k].pos)
+                                        .map(|&k| created[k].coin.clone())
+                                        .or_else(|| boundary_coin.take())
+                                        .expect("alive implies a coin exists");
+                                    resolved.insert(pos, JoinRes::Coin(coin));
+                                    consumed = true;
+                                }
+                                alive = false;
+                            }
+                        }
+                    }
+                    (
+                        resolved,
+                        violations,
+                        dup_spends,
+                        missing_spends,
+                        first_missing,
+                    )
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut resolved: HashMap<Occ, JoinRes> = HashMap::new();
+    let mut violations: Vec<(Occ, JoinViolation)> = Vec::new();
     let mut dup_spends = 0usize;
     let mut missing_spends = 0usize;
     let mut first_missing: Option<Occ> = None;
-    for op in keys {
-        let mut events: Vec<(Occ, bool, usize)> = Vec::new();
-        for &k in created_by_op.get(&op).map(Vec::as_slice).unwrap_or(&[]) {
-            events.push((created[k].pos, true, k));
-        }
-        for &k in spends_by_op.get(&op).map(Vec::as_slice).unwrap_or(&[]) {
-            events.push((spends[k].pos, false, k));
-        }
-        events.sort_by_key(|a| a.0);
-        // Boundary seed: exactly once. An op that starts alive is
-        // consumed by its first spend; a second spend is a DupSpend.
-        let mut alive = boundary.b_contains(&op);
-        let mut boundary_coin: Option<Coin> = boundary.b_get(&op);
-        let mut consumed = false;
-        for (pos, is_creation, _k) in events {
-            if is_creation {
-                if alive {
-                    violations.push((pos, JoinViolation::DupCreation));
-                }
-                alive = true;
-            } else {
-                if !alive {
-                    if consumed {
-                        resolved.insert(pos, JoinRes::DupSpend(pos));
-                        dup_spends += 1;
-                    } else if conflicted.contains(&op) {
-                        resolved.insert(pos, JoinRes::BoundaryConflict);
-                    } else {
-                        resolved.insert(pos, JoinRes::Missing);
-                        missing_spends += 1;
-                        if first_missing.is_none_or(|f| pos < f) {
-                            first_missing = Some(pos);
-                        }
-                    }
-                } else {
-                    // Latest in-window creation before pos, else the
-                    // boundary coin (re-creation always out-positions the
-                    // boundary seed since boundary records have no pos).
-                    let coin = created_by_op
-                        .get(&op)
-                        .into_iter()
-                        .flat_map(|v| v.iter())
-                        .filter(|&&k| created[k].pos < pos)
-                        .max_by_key(|&&k| created[k].pos)
-                        .map(|&k| created[k].coin.clone())
-                        .or_else(|| boundary_coin.take())
-                        .expect("alive implies a coin exists");
-                    resolved.insert(pos, JoinRes::Coin(coin));
-                    consumed = true;
-                }
-                alive = false;
-            }
+    for (r, v, d, m, f) in parts {
+        resolved.extend(r);
+        violations.extend(v);
+        dup_spends += d;
+        missing_spends += m;
+        if f.is_some_and(|x| first_missing.is_none_or(|y| x < y)) {
+            first_missing = f;
         }
     }
     violations.sort_by_key(|(p, _)| *p);

@@ -1013,3 +1013,66 @@ Suite: **114 executable checks** — the followup audit's six controls
   clean exit 2 with a regression control.
 - Segwit-era block bodies absent from both datadirs — flagged as the
   model's unmeasured segment.
+
+## 2026-09-27e — structural overlap + measured optimization ledger
+
+**Code (this commit):** `window_join` parallel prologue — boundary
+snapshot load, boundary/header file digests, and `HeaderTree` build now
+start at t=0 as scoped threads overlapping corpus read+parse; the corpus
+sha256 runs concurrent with decode. `join_window` shards resolution by
+`txid[0]&7` across 8 workers (violation ordering and first-missing
+semantics preserved). Boundary-spec conflict check chunked across 4
+threads. Manifest digests reuse bytes already hashed (no ~5.5 GB re-read
+tail). Materialize+export remain serial after scripts: the earlier
+overlap attempt was **measured harmful** — verify CPU 200.9→523.4 s and
+wall 91.9 s vs 83.7 s quiet baseline; the ~3.6 GB stream starves the
+ecmult table footprint on the single memory channel. Comment left in
+`window_join.rs` with the receipt.
+
+**A/B under matched load ~8–13** (alternating `3198d50` baseline binary
+vs candidate, 4 pairs, identical inputs, distinct output paths):
+
+| round | base JSON wall | cand JSON wall | base outer | cand outer |
+|---|---:|---:|---:|---:|
+| 1 | 89.3 | 94.7 | 104 | 97 |
+| 2 | 125.0 | 78.7 | 139 | 79 |
+| 3 | 91.3 | 94.7 | 114 | 97 |
+| 4 | 127.1 | 108.4 | 142 | 109 |
+| med | **108.2** | **94.7** | **126.5** | **97** |
+
+Median JSON wall −12.5% (~1.14×); outer wall −23% (~1.30×). Candidate
+more consistent under contention (79–109 vs 104–142). All runs
+`window_complete`, identical export sha. **Not 2×**: this window's floor
+is ~200 CPU-s of individual ECDSA verifies (~26 s wall at 8 workers);
+the overlappable non-crypto tail was ~45 s, now partially hidden.
+Receipts: `run-manifest-{a-baseline,b-overlap}{1..4}.json` +
+window-manifest counterparts under `corpus-454k/`.
+
+**Optimization ledger — exhaustive, mostly measured:**
+
+- Batch ECDSA: impossible without nonce-point R; computing R is the
+  verify itself (parity-cube: lift_x gives 2^N ambiguity, no monotone
+  bracket — Waddle-style corner coverage degenerates to enumeration).
+  The earlier 34% prototype was advice-dependent; local advice costs the
+  verification.
+- Schnorr batch: advice-free, real — but zero Schnorr calls below
+  709632.
+- libsecp internals already optimal where it matters: projective
+  x-compare (`gej_eq_x_var`, no final inversion), `scalar_inverse_var`,
+  batched inversion of per-pubkey Strauss tables, GLV. Field impl =
+  `5x52_int128` (upstream removed x86 asm as equal).
+- `ECMULT_WINDOW_SIZE` sweep {15,12,10,8} ×8 threads vs vendored source:
+  medians 27.8k/28.4k/—/23.2k sig/s — noise-overlapped, **no win**.
+- **AVX2 4-lane field mul probe** (10×26-limb `fe_mul` faithful port,
+  differential-verified vs scalar on randoms): measured **~1.2×/mul**
+  (42.8 ns vs 51.5 ns scalar). `vpmuludq` 32-bit lanes are the wrong
+  shape for a 64-bit-limb prime; the real lane trick needs AVX-512 IFMA
+  (`vpmadd52luq`) which the i3-N305 lacks. Dead by measurement.
+- Remaining live micro-tranche (~10% verify): pubkey-parse/Q-table cache
+  on repeated keys (~50% hit), fused parse+verify FFI.
+- Rescope note: stacking everything lands ≈1.5× → ~19–21 h full IBD on
+  this box; sub-hour requires assumevalid (policy) or IFMA-class silicon
+  / many cores (hardware) — measured conclusion, receipts above.
+
+Suite: all 115 executable checks pass on this tree; `build_rev` records
+`+dirty` where appropriate.

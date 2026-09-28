@@ -333,12 +333,145 @@ fn main() {
         std::process::exit(2);
     }
 
+    // ---- parallel prologue -------------------------------------------
+    // The donor scan, its manifest file hash, and the header-index build
+    // depend only on their own files — start them all before the corpus
+    // read so they overlap corpus parsing and each other. Every pin/
+    // context check still runs below in the original order; only the
+    // file work moved earlier.
+    let boundary_handle = boundary_path.as_deref().map(|bp| {
+        let bp = bp.to_string();
+        std::thread::spawn(move || {
+            let snap_path = std::path::Path::new(&bp);
+            let expected = snapverify::read_header(
+                &std::fs::File::open(snap_path).expect("boundary readable for header"),
+            )
+            .map(|h| h.coins_count as usize)
+            .unwrap_or(0);
+            let mut fb = FlatBuilder::new(expected);
+            let tb = std::time::Instant::now();
+            // The creation-height bound is enforced after corpus parse;
+            // the loader records the maximum height seen (code >> 1).
+            let mut max_height = 0u32;
+            let loaded = for_each_coin(snap_path, None, |txid_b, vout, code, value, spk| {
+                max_height = max_height.max((code >> 1) as u32);
+                fb.push(txid_b, vout, value, code, spk);
+                Ok(())
+            })
+            .unwrap_or_else(|e| {
+                eprintln!("fatal: --boundary load failed: {e}");
+                std::process::exit(2);
+            });
+            let (flat, dups) = fb.finish();
+            // Manifest file hash — still overlapped with foreground work.
+            let file_sha = file_sha256(&bp);
+            (
+                flat,
+                loaded,
+                dups,
+                max_height,
+                file_sha,
+                tb.elapsed().as_secs_f64(),
+            )
+        })
+    });
+    let headers_handle = headers_path.as_deref().map(|hp| {
+        let hp = hp.to_string();
+        std::thread::spawn(move || {
+            let th = std::time::Instant::now();
+            let data = std::fs::read(&hp).expect("headers manifest readable");
+            let need = |o: usize, n: usize| {
+                if o + n > data.len() {
+                    eprintln!("fatal: headers manifest truncated at byte {o}");
+                    std::process::exit(2);
+                }
+                &data[o..o + n]
+            };
+            if need(0, 8) != b"HCHAIN01".as_slice() {
+                eprintln!("fatal: headers manifest bad magic");
+                std::process::exit(2);
+            }
+            let count = u32::from_le_bytes(need(8, 4).try_into().unwrap()) as usize;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0);
+            let mut t = HeaderTree::new(params);
+            // Selected-chain binding: a header failing production insert only
+            // taints the window if a corpus block carries that hash — track
+            // which hashes failed, don't treat unrelated index entries as
+            // proof the selected chain is invalid.
+            let mut failed_hashes: std::collections::HashSet<BlockHash> = Default::default();
+            let mut unknown_hashes: std::collections::HashSet<BlockHash> = Default::default();
+            let mut inserted = 0usize;
+            let mut unknown_parent = 0usize;
+            let mut failed = 0usize;
+            for i in 0..count {
+                let raw = need(12 + i * 80, 80);
+                let hdr = BlockHeader::decode(raw).unwrap_or_else(|e| {
+                    eprintln!("fatal: headers manifest record {i} undecodable: {e}");
+                    std::process::exit(2);
+                });
+                match t.insert(&hdr, now) {
+                    Ok(InsertStatus::AlreadyKnown { .. }) => {}
+                    Ok(_) => inserted += 1,
+                    Err(avila_consensus::chain::ChainError::UnknownParent(_)) => {
+                        unknown_parent += 1;
+                        unknown_hashes.insert(hdr.hash());
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        failed_hashes.insert(hdr.hash());
+                        if failed <= 3 {
+                            eprintln!("header {} insert failed: {e}", hdr.hash());
+                        }
+                    }
+                }
+            }
+            let tail = 12 + count * 80;
+            if need(tail, 5) != b"CHAIN".as_slice() {
+                eprintln!("fatal: headers manifest missing CHAIN section");
+                std::process::exit(2);
+            }
+            let cc = u32::from_le_bytes(need(tail + 5, 4).try_into().unwrap()) as usize;
+            // The best-chain hash list — index i is the hash at height i.
+            let mut chain_hashes: Vec<[u8; 32]> = Vec::with_capacity(cc);
+            for i in 0..cc {
+                chain_hashes.push(need(tail + 9 + i * 32, 32).try_into().unwrap());
+            }
+            if failed > 0 || unknown_parent > 0 {
+                eprintln!(
+                    "warning: {failed} indexed headers fail production checks; \
+{unknown_parent} have unknown parents"
+                );
+            }
+            let file_sha = avila_consensus::hex::encode(&sha256(&data));
+            (
+                t,
+                chain_hashes,
+                count,
+                inserted,
+                unknown_parent,
+                failed,
+                failed_hashes,
+                unknown_hashes,
+                file_sha,
+                th.elapsed().as_secs_f64(),
+            )
+        })
+    });
+
     // ---- stage: parse ------------------------------------------------
+    // The manifest's corpus digest hashes the same buffer the decoder
+    // reads — run them concurrently.
     let t = std::time::Instant::now();
     let raw = std::fs::read(&path).expect("corpus readable");
     let corpus_bytes = raw.len() as u64;
-    let corpus_sha256 = avila_consensus::hex::encode(&sha256(&raw));
-    let mut blocks = parse_corpus(&raw);
+    let (corpus_sha256, mut blocks) = std::thread::scope(|s| {
+        let hh = s.spawn(|| sha256(&raw));
+        let b = parse_corpus(&raw);
+        (avila_consensus::hex::encode(&hh.join().unwrap()), b)
+    });
     drop(raw);
     if let Some((lo, hi)) = segment {
         blocks.retain(|b| (lo..=hi).contains(&b.height));
@@ -472,72 +605,28 @@ fn main() {
     let mut window_headers_in_tree = 0usize;
     let mut headers_chain_missing = 0usize;
     let mut headers_s = 0f64;
-    if let Some(hp) = &headers_path {
-        let th = std::time::Instant::now();
-        let data = std::fs::read(hp).expect("headers manifest readable");
-        let need = |o: usize, n: usize| {
-            if o + n > data.len() {
-                eprintln!("fatal: headers manifest truncated at byte {o}");
-                std::process::exit(2);
-            }
-            &data[o..o + n]
-        };
-        if need(0, 8) != b"HCHAIN01".as_slice() {
-            eprintln!("fatal: headers manifest bad magic");
-            std::process::exit(2);
-        }
-        let count = u32::from_le_bytes(need(8, 4).try_into().unwrap()) as usize;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0);
-        let mut t = HeaderTree::new(params);
-        // Selected-chain binding: a header failing production insert only
-        // taints the window if a corpus block carries that hash — track
-        // which hashes failed, don't treat unrelated index entries as
-        // proof the selected chain is invalid.
-        let mut failed_hashes: std::collections::HashSet<BlockHash> = Default::default();
-        let mut unknown_hashes: std::collections::HashSet<BlockHash> = Default::default();
-        for i in 0..count {
-            let raw = need(12 + i * 80, 80);
-            let hdr = BlockHeader::decode(raw).unwrap_or_else(|e| {
-                eprintln!("fatal: headers manifest record {i} undecodable: {e}");
-                std::process::exit(2);
-            });
-            match t.insert(&hdr, now) {
-                Ok(InsertStatus::AlreadyKnown { .. }) => {}
-                Ok(_) => headers_inserted += 1,
-                Err(avila_consensus::chain::ChainError::UnknownParent(_)) => {
-                    headers_unknown_parent += 1;
-                    unknown_hashes.insert(hdr.hash());
-                }
-                Err(e) => {
-                    headers_failed += 1;
-                    failed_hashes.insert(hdr.hash());
-                    if headers_failed <= 3 {
-                        eprintln!("header {} insert failed: {e}", hdr.hash());
-                    }
-                }
-            }
-        }
-        let tail = 12 + count * 80;
-        if need(tail, 5) != b"CHAIN".as_slice() {
-            eprintln!("fatal: headers manifest missing CHAIN section");
-            std::process::exit(2);
-        }
-        let cc = u32::from_le_bytes(need(tail + 5, 4).try_into().unwrap()) as usize;
-        // The best-chain hash list — index i is the hash at height i.
-        let mut chain_hashes: Vec<[u8; 32]> = Vec::with_capacity(cc);
-        for i in 0..cc {
-            chain_hashes.push(need(tail + 9 + i * 32, 32).try_into().unwrap());
-        }
-        if headers_failed > 0 || headers_unknown_parent > 0 {
-            eprintln!(
-                "warning: {headers_failed} indexed headers fail production checks; \
-{headers_unknown_parent} have unknown parents"
-            );
-        }
-        headers_loaded = count;
+    let mut headers_file_sha: Option<String> = None;
+    if let Some(hh) = headers_handle {
+        // The prologue thread already inserted every header through the
+        // production HeaderTree and parsed the CHAIN list; join it and
+        // run the per-block selected-chain checks here.
+        let (
+            t,
+            chain_hashes,
+            h_loaded,
+            h_ins,
+            h_unk,
+            h_fail,
+            failed_hashes,
+            unknown_hashes,
+            h_file_sha,
+            hs,
+        ) = hh.join().expect("headers prologue thread");
+        headers_file_sha = Some(h_file_sha);
+        headers_loaded = h_loaded;
+        headers_inserted = h_ins;
+        headers_unknown_parent = h_unk;
+        headers_failed = h_fail;
         // Real parent MTP for every window block whose parent is indexed,
         // plus the selected-chain binding: the header node must exist AND
         // sit at the corpus-labeled height AND (when the chain list covers
@@ -590,7 +679,7 @@ fn main() {
         }
         chain = Some(chain_hashes);
         tree = Some(t);
-        headers_s = th.elapsed().as_secs_f64();
+        headers_s = hs;
     }
 
     // ---- stage A: context-free block checks + ledger emit -------------
@@ -746,9 +835,10 @@ fn main() {
     let mut boundary_dup_outpoints = 0usize;
     let mut boundary_base_height: Option<u32> = None;
     let mut boundary_load_s = 0f64;
+    let mut boundary_file_sha: Option<String> = None;
     let mut boundary_base_hash_json = "null".to_string();
     let mut boundary_txoutset_hash_json = "null".to_string();
-    if let Some(bp) = &boundary_path {
+    if let Some(bh) = boundary_handle {
         // A supplied boundary is meaningful only as the state at the
         // window's parent block: the corpus's first block must name it
         // (the audit's comparison window starts "immediately after" the
@@ -767,36 +857,29 @@ fn main() {
                 std::process::exit(2);
             }
         }
-        // Flat sorted table — pre-sized from the declared coin count so
-        // neither the record vec nor the script blob ever re-allocates.
-        let snap_path = std::path::Path::new(bp);
-        let expected = snapverify::read_header(
-            &std::fs::File::open(snap_path).expect("boundary readable for header"),
-        )
-        .map(|h| h.coins_count as usize)
-        .unwrap_or(0);
-        let mut fb = FlatBuilder::new(expected);
-        let tb = std::time::Instant::now();
-        let loaded = for_each_coin(
-            snap_path,
-            Some(base_height), // creation heights may not exceed the base
-            |txid_b, vout, code, value, spk| {
-                fb.push(txid_b, vout, value, code, spk);
-                Ok(())
-            },
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("fatal: --boundary load failed: {e}");
+        // The prologue thread already streamed the donor into a flat
+        // sorted table (pre-sized from the declared coin count so
+        // neither the record vec nor the script blob ever re-allocates)
+        // and hashed the file for the manifest.
+        let (flat, loaded, dups, max_height, b_file_sha, bload_s) =
+            bh.join().expect("boundary prologue thread");
+        boundary_file_sha = b_file_sha;
+        // Deferred creation-height bound — the loader ran before the
+        // window's first block was parsed, so the `code >> 1 <=
+        // base_height` rejection the parser applies is checked here.
+        if max_height > base_height {
+            eprintln!(
+                "fatal: boundary contains coin created at {max_height} above base {base_height}"
+            );
             std::process::exit(2);
-        });
+        }
         let snap_hdr = loaded.header;
-        let (flat, dups) = fb.finish();
         boundary_dup_outpoints = dups;
         if boundary_dup_outpoints > 0 {
             eprintln!("fatal: boundary contains {boundary_dup_outpoints} duplicate outpoints");
             std::process::exit(2);
         }
-        boundary_load_s = tb.elapsed().as_secs_f64();
+        boundary_load_s = bload_s;
         boundary_load_coins = flat.txids_len();
         if snap_hdr.network != params.message_start {
             eprintln!(
@@ -878,19 +961,39 @@ fn main() {
         boundary_loaded = Some(flat);
     }
     let boundary_supplied = boundary_loaded.is_some();
-    let (boundary, boundary_conflicts, conflict_ops) = if boundary_supplied {
+    let (mut boundary, boundary_conflicts, conflict_ops) = if boundary_supplied {
         // specs vs supplied state: agreement is consistency-verified;
         // disagreement marks the outpoint conflicted (known invalidity).
+        // Each lookup is an independent binary search — shard the specs.
         let loaded = boundary_loaded.take().unwrap();
-        let mut conflict_ops: std::collections::HashSet<OutPoint> = Default::default();
-        for (op, spec_coin) in &boundary_specs {
-            match loaded.b_get(op) {
-                Some(c) if c == *spec_coin => {}
-                _ => {
-                    conflict_ops.insert(*op);
-                }
+        let specs_vec: Vec<&(OutPoint, Coin)> = boundary_specs.iter().collect();
+        let conflict_ops: std::collections::HashSet<OutPoint> = std::thread::scope(|s| {
+            let n_chunks = 4;
+            let chunk = specs_vec.len().div_ceil(n_chunks).max(1);
+            let handles: Vec<_> = specs_vec
+                .chunks(chunk)
+                .map(|ch| {
+                    let loaded = &loaded;
+                    s.spawn(move || {
+                        let mut ops = std::collections::HashSet::new();
+                        for t in ch {
+                            match loaded.b_get(&t.0) {
+                                Some(c) if c == t.1 => {}
+                                _ => {
+                                    ops.insert(t.0);
+                                }
+                            }
+                        }
+                        ops
+                    })
+                })
+                .collect();
+            let mut all = std::collections::HashSet::new();
+            for h in handles {
+                all.extend(h.join().unwrap());
             }
-        }
+            all
+        });
         let n_conflicts = conflict_ops.len();
         (loaded, n_conflicts, conflict_ops)
     } else {
@@ -1166,6 +1269,11 @@ fn main() {
     let pred_s = t.elapsed().as_secs_f64();
 
     // ---- stage D: script verification bound to resolved coins ---------
+    // NOTE: materialize+export were measured running CONCURRENTLY with
+    // this stage (2026-09-27 receipt): the streamed multi-GB write starves
+    // the verify workers' cache/bandwidth and VERIFY_NS went 200.9 →
+    // 523.4 CPU-s. Structural overlap is used only where it doesn't share
+    // the ecmult working set — prologue loads, the join, hashing.
     let t = std::time::Instant::now();
     let queued_tasks = admitted.len();
     let (completed_tasks, succeeded_inputs, inputs_in_failed_txs, failed_tasks);
@@ -1222,6 +1330,17 @@ fn main() {
         }
     }
     let script_s = t.elapsed().as_secs_f64();
+    // Profile split: sighash hashing vs secp verify inside script work.
+    let sighash_s = avila_consensus::sigchecker::SIGHASH_NS
+        .load(std::sync::atomic::Ordering::Relaxed) as f64
+        / 1e9;
+    let verify_s = avila_consensus::sigchecker::VERIFY_NS.load(std::sync::atomic::Ordering::Relaxed)
+        as f64
+        / 1e9;
+    let ecdsa_calls =
+        avila_consensus::sigchecker::ECDSA_VERIFY_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let schnorr_calls = avila_consensus::sigchecker::SCHNORR_VERIFY_CALLS
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     // ---- ONE invalidity decision drives exit + export ------------------
     // With a complete supplied state, `Missing` is not a coverage gap:
@@ -1248,7 +1367,6 @@ fn main() {
     // in-window creations live in `extra` and shadow boundary records
     // (a re-created boundary op kills the boundary bit, then the new
     // coin lives in `extra` — identical to HashMap insert-overwrite).
-    let mut boundary = boundary;
     let mut extra: HashMap<OutPoint, Coin> = HashMap::new();
     let mut order: Vec<(Occ, bool, usize)> = Vec::new();
     for (k, c) in created.iter().enumerate() {
@@ -1347,16 +1465,20 @@ fn main() {
     // state artifact additionally requires full input coverage.
     let t = std::time::Instant::now();
     let mut exported = false;
+    let mut export_digest: Option<[u8; 32]> = None;
     let may_publish =
         !known_invalid && (diagnostic || (resolved_inputs_complete && script_jobs_complete));
     if may_publish {
-        // streamed write + inline digest — no multi-GB output buffer
+        // streamed write + inline digest — no multi-GB output buffer, and
+        // the returned digest is reused by the run manifest instead of
+        // re-reading the multi-GB artifact.
         let (nbytes, digest) = stream_canonical_flat(&export_path, &boundary, &extra)
             .unwrap_or_else(|e| {
                 eprintln!("fatal: export write failed: {e}");
                 std::process::exit(2);
             });
         exported = true;
+        export_digest = Some(digest);
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         println!(
             "{{\"type\":\"export\",\"path\":{},\"bytes\":{},\"sha256\":{},\
@@ -1413,7 +1535,8 @@ fn main() {
 \"stages\":{{\"parse_s\":{:.3},\"emit_s\":{:.3},\"headers_s\":{:.3},\
 \"boundary_load_s\":{:.3},\"join_s\":{:.3},\
 \"predicate_s\":{:.3},\"script_s\":{:.3},\"materialize_s\":{:.3},\
-\"export_s\":{:.3}}},\"wall_s\":{:.3},\"rss_hwm_bytes\":{},\"workers\":{}}}",
+\"export_s\":{:.3}}},\"wall_s\":{:.3},\"rss_hwm_bytes\":{},\"prof\":{{\"sighash_s\":{:.3},\"verify_s\":{:.3},\
+\"ecdsa_verify_calls\":{},\"schnorr_verify_calls\":{}}},\"workers\":{}}}",
         window_lo,
         window_hi,
         corpus_bytes,
@@ -1521,6 +1644,10 @@ fn main() {
         export_s,
         wall_t.elapsed().as_secs_f64(),
         rss,
+        sighash_s,
+        verify_s,
+        ecdsa_calls,
+        schnorr_calls,
         workers,
     );
 
@@ -1573,14 +1700,14 @@ bip68_uneval={} time_locks_uneval={})",
     // is the checkout's runtime HEAD, labeled separately. Streams all
     // file hashes — no whole-file Vec reads at snapshot sizes.
     if let Some(rm) = &run_manifest_path {
+        // Input digests were already computed inside the overlapped
+        // prologue threads / the streamed export — reuse them instead of
+        // re-reading multi-GB files serially at the tail.
         let self_sha = file_sha256("/proc/self/exe");
-        let boundary_sha = boundary_path.as_ref().and_then(|p| file_sha256(p));
-        let headers_sha = headers_path.as_ref().and_then(|p| file_sha256(p));
-        let export_sha = if exported {
-            file_sha256(&export_path)
-        } else {
-            None
-        };
+        let boundary_sha = boundary_file_sha;
+        let headers_sha = headers_file_sha;
+        let export_sha =
+            export_digest.map(|d| d.iter().map(|b| format!("{b:02x}")).collect::<String>());
         let checkout_rev = std::process::Command::new("git")
             .args([
                 "-C",
