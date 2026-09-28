@@ -283,6 +283,12 @@ enum ConfigAction {
     },
     /// Warn about suspect combinations before startup refuses them.
     Lint,
+    /// Show the risk-review findings — postures that depart from stock
+    /// node behavior and warn once at `run` startup.
+    Risks,
+    /// Sign off on the current risk set: writes it to the datadir's
+    /// `risk_ack` so `run` stays quiet until a *new* risk appears.
+    AcceptRisks,
 }
 
 /// Values print TOML-flavored: strings quoted, everything else bare.
@@ -652,6 +658,34 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     return Err("config lint: startup-fatal combination present".into());
                 }
             }
+            ConfigAction::Risks => {
+                use avila_node::config::{risk_ack_set, risk_review, unacknowledged};
+                let risks = risk_review(config.get());
+                if risks.is_empty() {
+                    println!("No risk findings — stock relay posture.");
+                } else {
+                    let acked = risk_ack_set(&config.network_data_dir());
+                    let pending = unacknowledged(&risks, &acked);
+                    for r in &risks {
+                        let mark = if pending.contains(&r) { "new" } else { "ack" };
+                        println!("{mark:<4} {} — {}", r.path, r.message);
+                    }
+                }
+            }
+            ConfigAction::AcceptRisks => {
+                use avila_node::config::{acknowledge_risks, risk_review};
+                let risks = risk_review(config.get());
+                let dir = config.network_data_dir();
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| format!("datadir {}: {e}", dir.display()))?;
+                acknowledge_risks(&dir, &risks).map_err(|e| format!("writing risk_ack: {e}"))?;
+                println!(
+                    "Acknowledged {} risk finding{} in {}",
+                    risks.len(),
+                    if risks.len() == 1 { "" } else { "s" },
+                    dir.join("risk_ack").display()
+                );
+            }
         },
         Command::Inspect { json } => {
             let node = Node::new(config)?;
@@ -932,6 +966,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 shadow_profiles: c.policy.shadow.clone(),
                 extrapool: c.extrapool.clone(),
                 ban_time: c.peers.ban_time,
+                risks: avila_node::config::risk_review(c),
             };
             println!(
                 "Running {} — syncing to tip, then serving (Ctrl+C to stop)...",
@@ -1042,6 +1077,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 shadow_profiles: c.policy.shadow.clone(),
                 extrapool: c.extrapool.clone(),
                 ban_time: c.peers.ban_time,
+                risks: avila_node::config::risk_review(c),
             };
             println!(
                 "Syncing {network} (target height {blocks}, {} peers max)...",

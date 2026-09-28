@@ -397,6 +397,112 @@ pub fn lint_config(c: &NodeConfig) -> Vec<LintFinding> {
     out
 }
 
+/// One entry in the startup risk report — a knob making the node
+/// behave dramatically unlike stock relay policy. Unlike `lint_config`
+/// findings (suspicious combinations), these are deliberate
+/// postures an operator should consciously accept *once*; `run`
+/// re-warns only when a finding it hasn't seen before appears.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RiskFinding {
+    pub path: &'static str,
+    pub message: String,
+}
+
+/// The dramatic-change tripwires — evaluated on the loaded config.
+/// Each returns `(path, human explanation)`; the set is hashed into
+/// the datadir's `risk_ack` so acknowledgment survives restarts and a
+/// *new* risk still surfaces.
+pub fn risk_review(c: &NodeConfig) -> Vec<RiskFinding> {
+    let mut out = Vec::new();
+    let mut push = |path: &'static str, message: String| out.push(RiskFinding { path, message });
+
+    if !c.policy.require_standard {
+        push(
+            "policy.require_standard",
+            "relays consensus-valid-but-nonstandard transactions — departs from every stock node"
+                .into(),
+        );
+    }
+    if c.mempool.min_relay_fee_sat_per_kvb == 0 {
+        push(
+            "mempool.min_relay_fee_sat_per_kvb",
+            "zero fee floor — zero-cost transactions relay freely; bounds are the only brake"
+                .into(),
+        );
+    }
+    if !c.relay.tx.stem {
+        push(
+            "relay.tx.stem",
+            "locally-originated transactions flood immediately — first-hop peers learn the origin"
+                .into(),
+        );
+    }
+    for (point, specs) in [
+        ("peer_accept", &c.hooks.peer_accept),
+        ("tx_admit", &c.hooks.tx_admit),
+    ] {
+        for (i, s) in specs.iter().enumerate() {
+            if matches!(s.on_timeout, avila_core::OnDefault::Accept)
+                || matches!(s.on_defer, avila_core::OnDefault::Accept)
+            {
+                push(
+                    "hooks",
+                    format!(
+                        "{point}[{i}] is fail-open — a dead or wedged helper admits by default"
+                    ),
+                );
+            }
+        }
+    }
+    if c.extrapool.observe && c.extrapool.max_bytes > 256_000_000 {
+        push(
+            "extrapool.max_bytes",
+            format!(
+                "{} MiB of rejected-transaction retention — held in memory for observation",
+                c.extrapool.max_bytes / 1_048_576
+            ),
+        );
+    }
+    if c.peers.ban_time == 0 {
+        push(
+            "peers.ban_time",
+            "zero default ban duration — `setban` entries expire instantly".into(),
+        );
+    }
+    out.sort();
+    out
+}
+
+/// Findings in `risks` not yet acknowledged — the ack file stores the
+/// literal `path: message` lines so `cat` shows exactly what was
+/// signed off. Set semantics: only *new* findings warn.
+pub fn unacknowledged<'a>(
+    risks: &'a [RiskFinding],
+    acked: &std::collections::HashSet<String>,
+) -> Vec<&'a RiskFinding> {
+    risks
+        .iter()
+        .filter(|r| !acked.contains(&format!("{}: {}", r.path, r.message)))
+        .collect()
+}
+
+/// The on-disk acknowledgment set — one `path: message` line each.
+pub fn acknowledge_risks(dir: &std::path::Path, risks: &[RiskFinding]) -> std::io::Result<()> {
+    let lines: Vec<String> = risks
+        .iter()
+        .map(|r| format!("{}: {}", r.path, r.message))
+        .collect();
+    std::fs::write(dir.join("risk_ack"), lines.join("\n") + "\n")
+}
+
+/// Read the acknowledgment set (`risks` file semantics).
+#[must_use]
+pub fn risk_ack_set(dir: &std::path::Path) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(dir.join("risk_ack"))
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -635,6 +741,49 @@ mod tests {
             parse_config("network = 'regtest'\n[extrapool]\nobserve = false\nmax_entries = 0\n")
                 .is_ok()
         );
+    }
+
+    /// The risk review flags dramatic postures once — the ack file
+    /// keeps the literal line set, so only new findings resurface.
+    #[test]
+    fn risk_review_warns_once_until_the_set_changes() {
+        // Stock config is quiet.
+        let clean = parse_config("network = 'regtest'").unwrap();
+        assert!(risk_review(clean.get()).is_empty());
+
+        let risky = parse_config(
+            r#"
+            network = 'regtest'
+            [policy]
+            require_standard = false
+            [[hooks.tx_admit]]
+            program = "/bin/cat"
+            on_timeout = "accept"
+            "#,
+        )
+        .unwrap();
+        let risks = risk_review(risky.get());
+        assert_eq!(risks.len(), 2);
+        assert!(risks.iter().any(|r| r.path == "policy.require_standard"));
+        assert!(risks.iter().any(|r| r.message.contains("fail-open")));
+
+        // Unacknowledged → all fresh; after acknowledge → silent.
+        let dir = std::env::temp_dir().join(format!("avila-risk-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = std::collections::HashSet::new();
+        assert_eq!(unacknowledged(&risks, &empty).len(), 2);
+        acknowledge_risks(&dir, &risks).unwrap();
+        let acked = risk_ack_set(&dir);
+        assert!(unacknowledged(&risks, &acked).is_empty());
+
+        // A new risk added later re-warns alone.
+        let mut extra = risks.clone();
+        extra.push(RiskFinding {
+            path: "peers.ban_time",
+            message: "zero".into(),
+        });
+        extra.sort();
+        assert_eq!(unacknowledged(&extra, &acked).len(), 1);
     }
 
     #[test]

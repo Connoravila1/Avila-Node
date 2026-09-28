@@ -389,6 +389,10 @@ pub struct SyncConfig {
     pub extrapool: avila_core::ExtrapoolConfig,
     /// `peers.ban_time` — default `setban` duration (Core's `-bantime`).
     pub ban_time: i64,
+    /// `config::risk_review` findings, computed at merge time so the
+    /// run loop can warn once per *new* risk (acknowledged via
+    /// `<datadir>/risk_ack` written by `config accept-risks`).
+    pub risks: Vec<crate::config::RiskFinding>,
 }
 
 impl Default for SyncConfig {
@@ -433,6 +437,7 @@ impl Default for SyncConfig {
             shadow_profiles: vec!["strict".to_string()],
             extrapool: avila_core::ExtrapoolConfig::default(),
             ban_time: avila_p2p::banman::DEFAULT_BANTIME,
+            risks: Vec::new(),
         }
     }
 }
@@ -919,6 +924,34 @@ pub fn run(
             }
         };
     emit(&mut stream, "run_started", serde_json::json!({}));
+    // Risk review — warn once per finding set: the ack file holds the
+    // literal lines acknowledged, so only *new* postures print and emit
+    // `config_risk` events. Acknowledged risks stay silent; a config
+    // change that introduces a new one re-warns.
+    if !cfg.risks.is_empty()
+        && let Some(dir) = &cfg.data_dir
+    {
+        let acked = crate::config::risk_ack_set(dir);
+        let fresh = crate::config::unacknowledged(&cfg.risks, &acked);
+        if !fresh.is_empty() {
+            eprintln!(
+                "config risk review — {} unacknowledged finding{}:",
+                fresh.len(),
+                if fresh.len() == 1 { "" } else { "s" }
+            );
+            for r in &fresh {
+                eprintln!("  {}: {}", r.path, r.message);
+            }
+            eprintln!("acknowledge: avila-node config accept-risks");
+            for r in &fresh {
+                emit(
+                    &mut stream,
+                    "config_risk",
+                    serde_json::json!({ "path": r.path, "message": r.message }),
+                );
+            }
+        }
+    }
     // Bounded: a flooding hot path (tx.admit per-tx verdicts) can't
     // grow memory unboundedly — drops land on a counter surfaced as a
     // `hook_events_dropped` event.
