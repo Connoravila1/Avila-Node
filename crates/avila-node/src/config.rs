@@ -73,6 +73,67 @@ pub struct KnobDescription {
     pub doc: &'static str,
     pub value: serde_json::Value,
     pub default: serde_json::Value,
+    /// Whether the running node can take a new value for this path
+    /// without a restart (`Apply`able from the GUI/RPC control
+    /// channel). Policy knobs are hot — they're consulted per-decision;
+    /// structural knobs (datadir, indexes, sockets) are not.
+    pub edit: EditKind,
+}
+
+/// Whether a knob applies live or needs a restart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditKind {
+    /// Applied at the next sync tick; effective until restart.
+    Live,
+    /// Structural — index builds, sockets, datadir — restart required.
+    Restart,
+}
+
+/// The paths a running node accepts on the control channel — every one
+/// resolves to a `set_*` the peer manager or mempool consults per
+/// decision. Anything not listed here is `Restart`.
+const LIVE_PATHS: &[&str] = &[
+    "net.blocks_only",
+    "peers.ban_time",
+    "privacy.cell_bytes",
+    "mempool.max_mb",
+    "mempool.min_relay_fee_sat_per_kvb",
+    "mempool.expiry_secs",
+    "mempool.private",
+    "policy.require_standard",
+    "policy.datacarrier",
+    "policy.datacarrier_size",
+    "policy.permit_bare_multisig",
+    "policy.dust_relay_fee_sat_per_kvb",
+    "relay.tx.stem",
+    "relay.tx.deny_pairs",
+    "relay.tx.announce",
+    "relay.tx.to_inbound",
+    "relay.tx.to_blocks_only_peers",
+    "relay.tx.send_feefilter",
+    "relay.tx.rebroadcast_local",
+    "relay.tx.rebroadcast_interval",
+    "relay.block.compact",
+    "relay.block.compact_high_bandwidth",
+    "relay.block.compact_serve",
+    "relay.block.announce",
+    "relay.block.serve",
+    "extrapool.observe",
+    "extrapool.max_entries",
+    "extrapool.max_bytes",
+    "extrapool.expiry_secs",
+    "extrapool.relay",
+    "mining.include_extrapool",
+    "mining.max_weight",
+    "mining.min_tx_fee",
+    "mining.reserved_weight",
+    "filters.serve",
+    "sync.max_in_transit",
+];
+
+#[must_use]
+pub fn live_knob(path: &str) -> bool {
+    LIVE_PATHS.contains(&path)
 }
 
 /// Every documented knob, in display order. A test asserts this covers
@@ -384,6 +445,11 @@ pub fn describe_config(config: &NodeConfig) -> Vec<KnobDescription> {
                 doc,
                 value,
                 default: defaults.pointer(&pointer).cloned().unwrap_or_default(),
+                edit: if live_knob(path) {
+                    EditKind::Live
+                } else {
+                    EditKind::Restart
+                },
             }
         })
         .collect()

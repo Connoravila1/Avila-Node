@@ -17,6 +17,8 @@ pub enum Page {
     Chain,
     Peers,
     Activity,
+    /// The knob table — every config path, the live ones editable.
+    Config,
     /// Only on the rail while Settings turns the toybox on.
     Toybox,
     Settings,
@@ -24,11 +26,12 @@ pub enum Page {
 
 impl Page {
     /// The node's own pages; the toybox joins them only when it's on.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Overview,
         Self::Chain,
         Self::Peers,
         Self::Activity,
+        Self::Config,
         Self::Settings,
     ];
 
@@ -39,6 +42,7 @@ impl Page {
             Self::Chain => "Chain",
             Self::Peers => "Peers",
             Self::Activity => "Activity",
+            Self::Config => "Config",
             Self::Toybox => "Toybox",
             Self::Settings => "Settings",
         }
@@ -177,6 +181,15 @@ pub fn icon(p: &Painter, page: Page, c: Pos2, fg: Color32, bg: Color32) {
                     [pos2(c.x - 11.0, c.y + dy), pos2(c.x - 11.0 + w, c.y + dy)],
                     s,
                 );
+            }
+        }
+        // A knob card — rows of controls.
+        Page::Config => {
+            for (dy, on) in [(-6.0, true), (0.0, false), (6.0, true)] {
+                let kx = c.x + if on { 4.0 } else { -4.0 };
+                p.line_segment([pos2(c.x - 9.0, c.y + dy), pos2(c.x + 9.0, c.y + dy)], s);
+                p.circle_filled(pos2(kx, c.y + dy), 2.6, fg);
+                p.circle_filled(pos2(kx, c.y + dy), 1.1, bg);
             }
         }
         // A game pad.

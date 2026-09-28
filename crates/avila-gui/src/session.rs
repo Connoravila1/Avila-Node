@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Fifteen minutes of one-per-second samples.
@@ -272,6 +272,9 @@ pub struct Session {
     stopping: bool,
     rx: Option<Receiver<Msg>>,
     cancel: Option<Arc<AtomicBool>>,
+    /// The live knob channel — `set_knob` lands on the running sync
+    /// loop; the journal's `config_changed` confirms the apply.
+    control: Option<Sender<avila_node::sync::ControlMsg>>,
     sim: Option<Demo>,
     /// When the simulator last stepped, session seconds.
     sim_stepped: Option<f64>,
@@ -298,6 +301,7 @@ impl Session {
             stopping: false,
             rx: None,
             cancel: None,
+            control: None,
             sim: None,
             sim_stepped: None,
             origin: Instant::now(),
@@ -424,6 +428,7 @@ impl Session {
             params.assume_valid = None;
         }
         let cancel = Arc::new(AtomicBool::new(false));
+        let (control_tx, control_rx) = channel();
         let cfg = SyncConfig {
             connect: settings.connect_addrs(),
             target_height: settings.stop_after.unwrap_or(u32::MAX),
@@ -455,8 +460,10 @@ impl Session {
             blockfilterindex: settings.blockfilterindex,
             peerblockfilters: settings.peerblockfilters,
             electrum: settings.electrum.trim().parse().ok(),
+            control: Some(Arc::new(std::sync::Mutex::new(control_rx))),
             ..SyncConfig::default()
         };
+        self.control = Some(control_tx);
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let mut last: Option<Instant> = None;
@@ -504,6 +511,13 @@ impl Session {
             cancel.store(true, Ordering::Relaxed);
             self.stopping = true;
         }
+    }
+
+    /// The live knob channel's sending end, cloned — pages send
+    /// edits without mutating the session.
+    #[must_use]
+    pub fn control_sender(&self) -> Option<Sender<avila_node::sync::ControlMsg>> {
+        self.control.clone()
     }
 
     /// Drains the worker, or steps the simulator. Returns whether
@@ -574,6 +588,7 @@ impl Session {
         self.stopping = false;
         self.rx = None;
         self.cancel = None;
+        self.control = None;
     }
 
     /// Folds a new view in at session time `t`.

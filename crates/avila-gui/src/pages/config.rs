@@ -1,0 +1,386 @@
+//! Every configuration knob, as a table — the node's `config
+//! describe`, live. Knobs the sync loop can take mid-run (`Live`)
+//! get an inline control and apply at the next tick; the rest carry
+//! a "restart" mark. Edits are session-scoped: the config file is
+//! never written from here, and a restart reverts to it. Each applied
+//! edit journals `config_changed`, each refusal `config_rejected` —
+//! the activity stream is the receipt.
+
+use super::{Action, Scene};
+use crate::theme::mono;
+use crate::widgets::{self, Kind};
+use avila_node::Node;
+use avila_node::config::{EditKind, describe_config};
+use avila_node::sync::ControlMsg;
+use eframe::egui::{self, RichText, TextEdit, Ui};
+use std::collections::BTreeMap;
+use std::sync::mpsc::Sender;
+
+/// Enum knobs and their legal strings — the same sets `config` and
+/// `apply_knob` validate; the dropdown can't offer an invalid one.
+const CHOICES: &[(&str, &[&str])] = &[
+    ("relay.tx.announce", &["all", "private_only", "none"]),
+    ("relay.block.announce", &["auto", "headers", "inv", "none"]),
+    ("relay.block.serve", &["full", "tip", "none"]),
+    ("extrapool.relay", &["never", "outbound", "all"]),
+];
+
+/// The page's live-edit state — survives navigation, dies with the app.
+#[derive(Default)]
+pub struct ConfigPage {
+    /// Text-edit drafts, per path — the un-applied in-flight value.
+    drafts: BTreeMap<String, String>,
+    /// Sent on the control channel, not yet journaled back.
+    pending: BTreeMap<String, serde_json::Value>,
+    /// Confirmed live this session — what `config_changed` reported.
+    overrides: BTreeMap<String, serde_json::Value>,
+    /// `config_rejected` reasons, per path.
+    rejected: BTreeMap<String, String>,
+    /// The path filter box.
+    pub filter: String,
+}
+
+impl ConfigPage {
+    /// Fold a journal event into the edit state — `config_changed`
+    /// confirms a pending edit, `config_rejected` records the refusal.
+    /// `run_started` wipes the lot: a new run reads the file, not the
+    /// old session's edits.
+    pub fn note(&mut self, ev: &serde_json::Value) {
+        let Some(kind) = ev.get("kind").and_then(|k| k.as_str()) else {
+            return;
+        };
+        let path = ev.get("path").and_then(|p| p.as_str()).unwrap_or("");
+        match kind {
+            "run_started" => {
+                self.pending.clear();
+                self.overrides.clear();
+                self.rejected.clear();
+            }
+            "config_changed" if !path.is_empty() => {
+                self.pending.remove(path);
+                self.rejected.remove(path);
+                if let Some(v) = ev.get("value") {
+                    self.overrides.insert(path.to_string(), v.clone());
+                }
+            }
+            "config_rejected" if !path.is_empty() => {
+                self.pending.remove(path);
+                let reason = ev
+                    .get("reason")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("rejected")
+                    .to_string();
+                self.rejected.insert(path.to_string(), reason);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The knob's effective value this session — the override the journal
+/// confirmed, else what the config file said. Owned so the map stays
+/// free for the row's edits.
+fn effective(state: &ConfigPage, path: &str, file: &serde_json::Value) -> serde_json::Value {
+    state
+        .overrides
+        .get(path)
+        .cloned()
+        .unwrap_or_else(|| file.clone())
+}
+
+fn render_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Bool(b) => (if *b { "on" } else { "off" }).to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "—".to_string(),
+        serde_json::Value::Array(a) => {
+            if a.is_empty() {
+                "—".to_string()
+            } else {
+                a.iter()
+                    .map(|x| {
+                        x.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| x.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Parse a draft back into the knob's JSON shape — strings stay
+/// strings, digits become numbers, `a->b, c->d` becomes an array.
+fn draft_value(path: &str, draft: &str, was: &serde_json::Value) -> Option<serde_json::Value> {
+    match was {
+        serde_json::Value::Bool(_) | serde_json::Value::String(_) => {
+            Some(serde_json::Value::String(draft.trim().to_string()))
+        }
+        serde_json::Value::Number(_) => {
+            let t = draft.trim();
+            t.parse::<u64>()
+                .map(serde_json::Value::from)
+                .ok()
+                .or_else(|| t.parse::<i64>().map(serde_json::Value::from).ok())
+        }
+        serde_json::Value::Array(_) => {
+            let items: Vec<serde_json::Value> = draft
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| serde_json::Value::String(s.to_string()))
+                .collect();
+            Some(serde_json::Value::Array(items))
+        }
+        serde_json::Value::Null => Some(serde_json::Value::String(draft.trim().to_string())),
+        _ => None,
+    }
+    .map(|v| {
+        // `relay.block.announce`'s empty string is "auto" — the UI
+        // shows and accepts the word, the wire takes "".
+        if path == "relay.block.announce"
+            && let serde_json::Value::String(s) = &v
+            && s == "auto"
+        {
+            return serde_json::Value::String(String::new());
+        }
+        v
+    })
+}
+
+pub fn show(
+    ui: &mut Ui,
+    s: &Scene,
+    state: &mut ConfigPage,
+    node: &Node,
+    control: Option<Sender<ControlMsg>>,
+) -> Option<Action> {
+    let pal = s.pal;
+    widgets::section(
+        ui,
+        "Node policy",
+        Some(
+            "Every knob the config file sets. Colored marks apply to the running node this \
+             session — the file is never written; a restart reverts. Dimmer marks need one.",
+        ),
+    );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Filter").size(13.0).color(pal.muted));
+        ui.add(TextEdit::singleline(&mut state.filter).desired_width(200.0));
+        if control.is_none() {
+            ui.label(
+                RichText::new("start the node to edit — live marks apply while it runs")
+                    .size(12.0)
+                    .color(pal.muted),
+            );
+        }
+    });
+    ui.add_space(10.0);
+
+    let knobs = describe_config(node.config().get());
+    let filter = state.filter.trim().to_lowercase();
+    let mut group = String::new();
+    let mut first = true;
+    for k in &knobs {
+        if !filter.is_empty()
+            && !k.path.to_lowercase().contains(&filter)
+            && !k.doc.to_lowercase().contains(&filter)
+        {
+            continue;
+        }
+        // Section the rows by their leading segment ("relay.tx.…" → relay).
+        let head = k.path.split('.').next().unwrap_or("");
+        let title = match k.path.split('.').take(2).collect::<Vec<_>>().as_slice() {
+            ["relay", sub] => format!("relay · {sub}"),
+            _ => head.to_string(),
+        };
+        if title != group {
+            group = title.clone();
+            ui.add_space(if first { 0.0 } else { 14.0 });
+            first = false;
+            ui.label(
+                RichText::new(group.to_uppercase())
+                    .size(11.0)
+                    .color(pal.muted)
+                    .strong(),
+            );
+            ui.add_space(4.0);
+        }
+        row(ui, pal, state, k, control.as_ref());
+    }
+    None
+}
+
+fn row(
+    ui: &mut Ui,
+    pal: crate::theme::Palette,
+    state: &mut ConfigPage,
+    k: &avila_node::config::KnobDescription,
+    control: Option<&Sender<ControlMsg>>,
+) {
+    let live = k.edit == EditKind::Live && control.is_some();
+    let value = effective(state, k.path, &k.value);
+    let changed = state.overrides.contains_key(k.path);
+    let pending = state.pending.contains_key(k.path);
+    let rejected = state.rejected.get(k.path).cloned();
+
+    ui.horizontal(|ui| {
+        // Path + doc take the left half; the control and its marks
+        // take the right.
+        ui.vertical(|ui| {
+            ui.set_min_width(300.0);
+            ui.set_max_width(340.0);
+            ui.label(
+                RichText::new(k.path)
+                    .size(12.5)
+                    .font(mono(12.5))
+                    .color(pal.text),
+            );
+            ui.label(RichText::new(k.doc).size(11.0).color(pal.muted));
+        });
+        ui.add_space(12.0);
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.set_min_width(300.0);
+                control_cell(ui, pal, state, k, &value, live, control);
+                if pending {
+                    ui.label(RichText::new("applying…").size(11.5).color(pal.muted));
+                } else if changed {
+                    ui.label(
+                        RichText::new("live")
+                            .size(11.5)
+                            .color(pal.signal_text)
+                            .strong(),
+                    )
+                    .on_hover_text("Applied to the running node — reverts on restart");
+                } else if k.edit == EditKind::Live {
+                    ui.label(RichText::new("live").size(11.5).color(pal.muted))
+                        .on_hover_text("Applies to the running node without a restart");
+                } else {
+                    ui.label(RichText::new("restart").size(11.5).color(pal.muted))
+                        .on_hover_text("Read at startup — edit the config file");
+                }
+            });
+            if let Some(reason) = rejected {
+                ui.label(
+                    RichText::new(format!("rejected: {reason}"))
+                        .size(11.5)
+                        .color(pal.alert),
+                );
+            }
+        });
+    });
+    ui.add_space(2.0);
+}
+
+/// The right-hand cell — a checkbox, a dropdown, or a text draft,
+/// depending on the knob's value type.
+fn control_cell(
+    ui: &mut Ui,
+    pal: crate::theme::Palette,
+    state: &mut ConfigPage,
+    k: &avila_node::config::KnobDescription,
+    value: &serde_json::Value,
+    live: bool,
+    control: Option<&Sender<ControlMsg>>,
+) {
+    let send = |value: serde_json::Value| {
+        if let Some(tx) = control {
+            let _ = tx.send(ControlMsg::Set {
+                path: k.path.to_string(),
+                value: value.clone(),
+            });
+        }
+    };
+    let choices = CHOICES.iter().find(|(p, _)| *p == k.path).map(|(_, c)| *c);
+    if !live {
+        ui.label(
+            RichText::new(
+                if k.path == "relay.block.announce" && value.as_str() == Some("") {
+                    "auto".to_string()
+                } else {
+                    render_value(value)
+                },
+            )
+            .size(12.5)
+            .font(mono(12.5))
+            .color(if k.edit == EditKind::Live {
+                pal.text
+            } else {
+                pal.muted
+            }),
+        );
+        return;
+    }
+    if let serde_json::Value::Bool(b) = value {
+        let mut on = *b;
+        if ui.checkbox(&mut on, "").changed() {
+            send(serde_json::Value::Bool(on));
+            state
+                .pending
+                .insert(k.path.to_string(), serde_json::Value::Bool(on));
+        }
+        return;
+    }
+    if let Some(choices) = choices {
+        let shown = if k.path == "relay.block.announce" && value.as_str() == Some("") {
+            "auto".to_string()
+        } else {
+            value.as_str().unwrap_or_default().to_string()
+        };
+        let mut picked = shown.clone();
+        egui::ComboBox::from_id_salt(format!("cfg-{}", k.path))
+            .selected_text(RichText::new(&picked).font(mono(12.5)).size(12.5))
+            .width(130.0)
+            .show_ui(ui, |ui| {
+                for c in choices {
+                    ui.selectable_value(&mut picked, (*c).to_string(), *c);
+                }
+            });
+        if picked != shown {
+            let v = if picked == "auto" {
+                String::new()
+            } else {
+                picked
+            };
+            send(serde_json::Value::String(v.clone()));
+            state
+                .pending
+                .insert(k.path.to_string(), serde_json::Value::String(v));
+        }
+        return;
+    }
+    // Numbers, strings, lists — a draft field; Enter or Apply commits.
+    let (draft_text, committed) = {
+        let draft = state
+            .drafts
+            .entry(k.path.to_string())
+            .or_insert_with(|| render_value(value));
+        let resp = ui.add(
+            TextEdit::singleline(draft)
+                .desired_width(160.0)
+                .font(mono(12.5)),
+        );
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        (draft.clone(), enter)
+    };
+    let dirty = draft_text.trim() != render_value(value);
+    let committed = dirty && committed;
+    if dirty && (committed || widgets::button(ui, "apply", Kind::Quiet).clicked()) {
+        match draft_value(k.path, &draft_text, value) {
+            Some(v) => {
+                send(v.clone());
+                state.pending.insert(k.path.to_string(), v);
+                state.drafts.remove(k.path);
+            }
+            None => {
+                state
+                    .rejected
+                    .insert(k.path.to_string(), format!("can't parse {draft_text:?}"));
+            }
+        }
+    }
+}

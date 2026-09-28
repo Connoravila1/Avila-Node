@@ -2,17 +2,20 @@
 //! Nothing here touches the node, and everything is drawn in code, so it
 //! adds next to nothing to the download.
 //!
-//! The page is a shelf: the game, then the skins. Shitcoin Defense opens
-//! only when you press Play. The bitcoin sits in the middle and coins fly
-//! at it from every side: turn the shield to knock the shitcoins away,
-//! and let the sats through to be stacked. Three shitcoins in and it's
-//! over. It comes in waves, each faster and busier than the last.
+//! The page is a shelf: the games, the toys that run on the chain's own
+//! blocks, the odds and ends, then the skins. Each toy opens only when
+//! you press Play; Esc puts anything back on the shelf.
+//!
+//! Shitcoin Defense: the bitcoin sits in the middle and coins fly at it
+//! from every side — turn the shield to knock the shitcoins away, and
+//! let the sats through to be stacked. Three shitcoins in and it's over.
+//! It comes in waves, each faster and busier than the last.
 
 use crate::pages::Scene;
 use crate::prefs::Prefs;
 use crate::theme::{self, MONO_MEDIUM, Palette, Skin, font, mono};
 use crate::widgets::{self, Kind as Button};
-use crate::{julia, model::thousands, xp};
+use crate::{avalanche, builder, gallery, julia, model::thousands, oracle, snake, sweep, xp};
 use eframe::egui::{
     Align, Align2, Color32, CornerRadius, CursorIcon, Id, Key, Layout, Modifiers, Painter, Pos2,
     Rect, RichText, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, Vec2, pos2, vec2,
@@ -577,7 +580,137 @@ impl Game {
 // The shelf
 // ---------------------------------------------------------------------
 
-const SKINS: [(Skin, &str, &str); 3] = [
+/// Everything the shelf holds: the games, the toys that run on the
+/// chain's own blocks, and the confetti a real block drops over it all.
+#[derive(Default)]
+pub struct Toys {
+    pub game: Game,
+    pub sweep: sweep::Sweep,
+    pub snake: snake::Snake,
+    pub builder: builder::Builder,
+    pub gallery: gallery::Gallery,
+    pub oracle: oracle::Oracle,
+    pub avalanche: avalanche::Avalanche,
+    /// Bits of a just-landed block still in the air.
+    confetti: Vec<Piece>,
+    /// The tip the last burst was thrown for.
+    confetti_tip: Option<f64>,
+    seed: u64,
+    last: Option<Instant>,
+}
+
+/// A strip of confetti.
+struct Piece {
+    at: Pos2,
+    vel: Vec2,
+    angle: f32,
+    spin: f32,
+    size: f32,
+    color: Color32,
+    age: f32,
+}
+
+impl Toys {
+    /// Whether anything on the shelf needs a repaint next frame.
+    #[must_use]
+    pub fn animating(&self) -> bool {
+        self.game.animating()
+            || self.sweep.animating()
+            || self.snake.animating()
+            || self.builder.animating()
+            || self.oracle.animating()
+            || !self.confetti.is_empty()
+    }
+
+    /// Poses the capture harness asks for — open a toy mid-scene.
+    pub fn pose(&mut self, toy: u8) {
+        self.game.open = false;
+        self.sweep.open = false;
+        self.snake.open = false;
+        self.builder.open = false;
+        self.gallery.open = false;
+        self.oracle.open = false;
+        self.avalanche.open = false;
+        match toy {
+            1 => self.sweep.demo(),
+            2 => self.snake.demo(),
+            3 => self.builder.demo(),
+            4 => self.gallery.open = true,
+            5 => self.oracle.demo(),
+            6 => self.avalanche.open = true,
+            _ => {}
+        }
+    }
+
+    fn rand(&mut self) -> f32 {
+        self.seed = self.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 40) as f32 / (1_u64 << 24) as f32
+    }
+
+    /// A block connected: throw confetti over whatever's on screen, and
+    /// let a running Blocksweeper take the hint.
+    fn blocks_landed(&mut self, s: &Scene, area: Rect) {
+        let Some(at) = s.session.tip_advanced_at else {
+            return;
+        };
+        if self.confetti_tip == Some(at) {
+            return;
+        }
+        self.confetti_tip = Some(at);
+        self.sweep.gift(at);
+        for _ in 0..72 {
+            let x = area.left() + self.rand() * area.width();
+            let y = area.top() - 10.0 - 60.0 * self.rand();
+            let vel = vec2((self.rand() - 0.5) * 70.0, 40.0 + 90.0 * self.rand());
+            let angle = self.rand() * TAU;
+            let spin = (self.rand() - 0.5) * 9.0;
+            let size = 5.0 + 6.0 * self.rand();
+            let hue_pick = self.rand();
+            self.confetti.push(Piece {
+                at: pos2(x, y),
+                vel,
+                angle,
+                spin,
+                size,
+                color: if hue_pick < 0.5 {
+                    s.pal.signal
+                } else if hue_pick < 0.8 {
+                    s.pal.signal_text
+                } else {
+                    s.pal.muted
+                },
+                age: 0.0,
+            });
+        }
+    }
+
+    /// Steps and draws the confetti over the page.
+    fn draw_confetti(&mut self, p: &Painter, area: Rect, dt: f32) {
+        if self.confetti.is_empty() {
+            return;
+        }
+        for piece in &mut self.confetti {
+            piece.age += dt;
+            piece.at += piece.vel * dt;
+            piece.vel.y += 320.0 * dt;
+            piece.vel.x *= 1.0 - 1.6 * dt;
+            piece.angle += piece.spin * dt;
+        }
+        self.confetti
+            .retain(|c| c.age < 4.0 && c.at.y < area.bottom() + 20.0);
+        for piece in &self.confetti {
+            let fade = (1.0 - piece.age / 4.0).clamp(0.0, 1.0);
+            let s = vec2(piece.size, piece.size * piece.angle.cos().abs().max(0.3));
+            let r = Rect::from_center_size(piece.at, s);
+            p.rect_filled(r, 1, piece.color.gamma_multiply(0.4 + 0.6 * fade));
+        }
+    }
+}
+
+const SKINS: [(Skin, &str, &str); 6] = [
     (
         Skin::Standard,
         "Normal",
@@ -585,17 +718,55 @@ const SKINS: [(Skin, &str, &str); 3] = [
     ),
     (Skin::Xp, "Windows XP", "The whole desktop, Luna blue"),
     (Skin::Julia, "Julia", "Pink, hearts and a bow on top"),
+    (
+        Skin::Tip,
+        "Tip hash",
+        "The accent is the newest block's hash",
+    ),
+    (
+        Skin::Phosphor,
+        "Phosphor",
+        "A green-glass terminal, all mono",
+    ),
+    (
+        Skin::Classic,
+        "Bitcoin '11",
+        "The first wallet's beige chrome",
+    ),
 ];
 
-pub fn show(ui: &mut Ui, s: &Scene, game: &mut Game, prefs: &mut Prefs) {
-    if game.open {
-        play_view(ui, &s.pal, game, prefs);
+pub fn show(ui: &mut Ui, s: &Scene, toys: &mut Toys, prefs: &mut Prefs) {
+    if toys.game.open {
+        play_view(ui, &s.pal, &mut toys.game, prefs);
+    } else if toys.sweep.open {
+        sweep::show(ui, s, &mut toys.sweep, prefs);
+    } else if toys.snake.open {
+        snake::show(ui, &s.pal, &mut toys.snake, prefs);
+    } else if toys.builder.open {
+        builder::show(ui, &s.pal, &mut toys.builder, prefs);
+    } else if toys.gallery.open {
+        gallery::show(ui, s, &mut toys.gallery);
+    } else if toys.oracle.open {
+        oracle::show(ui, s, &mut toys.oracle);
+    } else if toys.avalanche.open {
+        avalanche::show(ui, &s.pal, &mut toys.avalanche);
     } else {
-        shelf(ui, &s.pal, game, prefs);
+        shelf(ui, s, toys, prefs);
     }
+    // Whatever a real block lands on, it lands on confetti first.
+    let now = Instant::now();
+    let dt = toys
+        .last
+        .map_or(0.016, |l| now.duration_since(l).as_secs_f32());
+    toys.last = Some(now);
+    let area = ui.clip_rect();
+    toys.blocks_landed(s, area);
+    let p = ui.painter().clone();
+    toys.draw_confetti(&p, area, dt.min(0.1));
 }
 
-fn shelf(ui: &mut Ui, pal: &Palette, game: &mut Game, prefs: &mut Prefs) {
+fn shelf(ui: &mut Ui, s: &Scene, toys: &mut Toys, prefs: &mut Prefs) {
+    let pal = s.pal;
     ui.label(
         RichText::new("Toybox")
             .font(font(theme::TITLE, 26.0))
@@ -609,15 +780,27 @@ fn shelf(ui: &mut Ui, pal: &Palette, game: &mut Game, prefs: &mut Prefs) {
     ui.add_space(22.0);
     widgets::section(ui, "Games", None);
     ui.add_space(6.0);
-    game_card(ui, pal, game, prefs);
-    ui.add_space(30.0);
+    game_cards(ui, s, toys, prefs);
+    ui.add_space(26.0);
+    widgets::section(
+        ui,
+        "From the chain",
+        Some("each one fed by the blocks your node connects"),
+    );
+    ui.add_space(6.0);
+    chain_cards(ui, s, toys);
+    ui.add_space(26.0);
+    widgets::section(ui, "Odds and ends", None);
+    ui.add_space(6.0);
+    misc_cards(ui, &pal, toys);
+    ui.add_space(26.0);
     widgets::section(
         ui,
         "Skins",
         Some("the whole node wears it while the toybox is on"),
     );
     ui.add_space(6.0);
-    skin_cards(ui, pal, prefs);
+    skin_cards(ui, &pal, prefs);
 }
 
 /// A card on the shelf.
@@ -634,18 +817,138 @@ fn card(p: &Painter, rect: Rect, pal: &Palette, lit: bool) {
     );
 }
 
-fn game_card(ui: &mut Ui, pal: &Palette, game: &mut Game, prefs: &Prefs) {
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 196.0), Sense::hover());
+/// One shelf card: poster art on the left, words and a button on the
+/// right. Returns which button fired, if any did.
+fn shelf_card(
+    ui: &mut Ui,
+    pal: &Palette,
+    title: &str,
+    blurb: &str,
+    meta: &str,
+    poster: impl FnOnce(&Painter, Rect),
+    buttons: &[(&str, Button)],
+) -> Option<usize> {
+    let w = (ui.available_width() - 14.0) / 2.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(w.max(280.0), 148.0), Sense::hover());
     card(ui.painter(), rect, pal, false);
-    let art = Rect::from_min_size(
-        rect.min + vec2(12.0, 12.0),
-        vec2((width * 0.34).clamp(170.0, 280.0), rect.height() - 24.0),
+    let art = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(108.0, 128.0));
+    poster(ui.painter(), art);
+    let text = Rect::from_min_max(
+        pos2(art.right() + 16.0, rect.top() + 14.0),
+        rect.max - vec2(14.0, 12.0),
     );
+    let mut col = ui.new_child(
+        UiBuilder::new()
+            .max_rect(text)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    col.label(
+        RichText::new(title)
+            .font(font(theme::TITLE, 17.5))
+            .color(pal.text),
+    );
+    col.add_space(1.0);
+    col.label(RichText::new(blurb).size(11.5).color(pal.muted));
+    if !meta.is_empty() {
+        col.add_space(4.0);
+        col.label(RichText::new(meta).font(mono(11.5)).color(pal.text));
+    }
+    col.add_space(7.0);
+    let mut fired = None;
+    col.horizontal(|ui| {
+        for (i, (label, kind)) in buttons.iter().enumerate() {
+            if widgets::button(ui, label, *kind).clicked() {
+                fired = Some(i);
+            }
+            ui.add_space(4.0);
+        }
+    });
+    fired
+}
+
+/// The games, two to a row.
+fn game_cards(ui: &mut Ui, s: &Scene, toys: &mut Toys, prefs: &mut Prefs) {
+    let pal = s.pal;
+    let height = s.session.view.as_ref().map(|v| v.connected + 1);
+    let base = s.session.view.as_ref().map_or(0, |v| v.connected);
+
+    // Row one: the defense game (kept tall for its poster) and
+    // Blocksweeper.
+    ui.horizontal(|ui| {
+        let w = (ui.available_width() - 14.0) / 2.0;
+        defense_card(ui, &pal, &mut toys.game, prefs, w);
+        ui.add_space(14.0);
+        let best = prefs.sweep_best[1];
+        let meta = if best > 0 {
+            format!("Best clear {}s", best)
+        } else {
+            String::new()
+        };
+        if shelf_card(
+            ui,
+            &pal,
+            "Blocksweeper",
+            "Bad transactions hid in your block template. Flag each one; trip one and the network rejects the block.",
+            &meta,
+            |p, r| sweep_poster(p, r, &pal),
+            &[("Play", Button::Primary)],
+        )
+        .is_some()
+        {
+            toys.sweep.play(1, height);
+        }
+    });
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        let meta = if prefs.snake_best > 0 {
+            format!("Best {}", thousands(prefs.snake_best.into()))
+        } else {
+            String::new()
+        };
+        if shelf_card(
+            ui,
+            &pal,
+            "Chain Snake",
+            "Every sat mines a block onto your chain, and the subsidy halves as you go. Watch for reorgs.",
+            &meta,
+            |p, r| snake_poster(p, r, &pal),
+            &[("Play", Button::Primary)],
+        )
+        .is_some()
+        {
+            toys.snake.play(base);
+        }
+        ui.add_space(14.0);
+        let meta = if prefs.builder_best > 0 {
+            format!("Best {} sats", thousands(prefs.builder_best.into()))
+        } else {
+            String::new()
+        };
+        if shelf_card(
+            ui,
+            &pal,
+            "Block Builder",
+            "Pack the mempool. Transactions fall with their feerates on; a full row seals the block and pays the fees.",
+            &meta,
+            |p, r| builder_poster(p, r, &pal),
+            &[("Play", Button::Primary)],
+        )
+        .is_some()
+        {
+            toys.builder.play();
+        }
+    });
+}
+
+/// Shitcoin Defense's card, at half width like the rest.
+fn defense_card(ui: &mut Ui, pal: &Palette, game: &mut Game, prefs: &Prefs, w: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(w, 148.0), Sense::hover());
+    card(ui.painter(), rect, pal, false);
+    let art = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(108.0, 128.0));
     poster(ui.painter(), art, pal);
     let text = Rect::from_min_max(
-        pos2(art.right() + 24.0, rect.top() + 18.0),
-        rect.max - vec2(20.0, 16.0),
+        pos2(art.right() + 16.0, rect.top() + 14.0),
+        rect.max - vec2(14.0, 12.0),
     );
     let mut col = ui.new_child(
         UiBuilder::new()
@@ -654,24 +957,22 @@ fn game_card(ui: &mut Ui, pal: &Palette, game: &mut Game, prefs: &Prefs) {
     );
     col.label(
         RichText::new("Shitcoin Defense")
-            .font(font(theme::TITLE, 21.0))
+            .font(font(theme::TITLE, 17.5))
             .color(pal.text),
     );
-    col.add_space(2.0);
+    col.add_space(1.0);
     col.label(
-        RichText::new(
-            "Shitcoins fly at the bitcoin from every side. Turn your shield to knock them away, and let the sats through. Three get in and it's over.",
-        )
-        .size(13.5)
-        .color(pal.muted),
+        RichText::new("Turn the shield; knock the shitcoins away and let the sats through.")
+            .size(11.5)
+            .color(pal.muted),
     );
-    col.add_space(6.0);
+    col.add_space(4.0);
     col.label(
         RichText::new(format!("Best {}", thousands(prefs.game_best.into())))
-            .font(mono(13.0))
+            .font(mono(11.5))
             .color(pal.text),
     );
-    col.add_space(10.0);
+    col.add_space(7.0);
     col.horizontal(|ui| {
         if game.state == State::Paused {
             if widgets::button(ui, "Resume", Button::Primary).clicked() {
@@ -684,6 +985,425 @@ fn game_card(ui: &mut Ui, pal: &Palette, game: &mut Game, prefs: &Prefs) {
             game.play();
         }
     });
+}
+
+/// The toys fed by live blocks.
+fn chain_cards(ui: &mut Ui, s: &Scene, toys: &mut Toys) {
+    let pal = s.pal;
+    ui.horizontal(|ui| {
+        if shelf_card(
+            ui,
+            &pal,
+            "Block gallery",
+            "Every block your node connects hangs on the wall, painted from its own hash.",
+            "",
+            |p, r| gallery_poster(p, r, &pal),
+            &[("Open", Button::Quiet)],
+        )
+        .is_some()
+        {
+            toys.gallery.open = true;
+        }
+        ui.add_space(14.0);
+        let waiting = if s.session.view.is_some() {
+            "the next block resolves it"
+        } else {
+            "your node calls the blocks"
+        };
+        if shelf_card(
+            ui,
+            &pal,
+            "Hash oracle",
+            "Call the last digit of the next block's hash and build a streak. The odds are honest: one in sixteen.",
+            waiting,
+            |p, r| oracle_poster(p, r, &pal),
+            &[("Open", Button::Quiet)],
+        )
+        .is_some()
+        {
+            toys.oracle.open = true;
+        }
+    });
+}
+
+/// The small things: the avalanche toy, and the calendar.
+fn misc_cards(ui: &mut Ui, pal: &Palette, toys: &mut Toys) {
+    ui.horizontal(|ui| {
+        if shelf_card(
+            ui,
+            &pal,
+            "Avalanche",
+            "Two inputs, two SHA-256 grids. Flip one bit and watch half the hash change.",
+            "",
+            |p, r| avalanche_poster(p, r, &pal),
+            &[("Open", Button::Quiet)],
+        )
+        .is_some()
+        {
+            toys.avalanche.open = true;
+        }
+        ui.add_space(14.0);
+        on_this_day(ui, &pal);
+    });
+}
+
+// ---- the cards' little posters ----
+
+/// Blocksweeper's box: a corner of the board, one flag planted.
+fn sweep_poster(p: &Painter, r: Rect, pal: &Palette) {
+    let clip = p.with_clip_rect(r);
+    clip.rect_filled(r, 8, pal.well);
+    let c = 22.0;
+    let at = r.center() - vec2(2.5 * c, 1.5 * c);
+    for row in 0..3 {
+        for col in 0..5 {
+            let cell = Rect::from_min_size(
+                at + vec2(col as f32 * c, row as f32 * c),
+                vec2(c - 1.5, c - 1.5),
+            );
+            clip.rect_filled(cell, 3, pal.raised);
+            clip.rect_stroke(cell, 3, Stroke::new(0.8, pal.hairline), StrokeKind::Inside);
+            match (row, col) {
+                (0, 2) => {
+                    clip.text(
+                        cell.center(),
+                        Align2::CENTER_CENTER,
+                        "1",
+                        font(MONO_MEDIUM, 11.0),
+                        Color32::from_rgb(56, 96, 220),
+                    );
+                }
+                (1, 1) => {
+                    clip.text(
+                        cell.center(),
+                        Align2::CENTER_CENTER,
+                        "2",
+                        font(MONO_MEDIUM, 11.0),
+                        Color32::from_rgb(36, 150, 72),
+                    );
+                }
+                (1, 3) => {
+                    clip.text(
+                        cell.center(),
+                        Align2::CENTER_CENTER,
+                        "3",
+                        font(MONO_MEDIUM, 11.0),
+                        Color32::from_rgb(214, 58, 44),
+                    );
+                }
+                (0, 4) => {
+                    clip.line_segment(
+                        [
+                            cell.left_top() + vec2(6.0, 5.0),
+                            cell.left_bottom() + vec2(6.0, -4.0),
+                        ],
+                        Stroke::new(1.4, pal.muted),
+                    );
+                    clip.add(Shape::convex_polygon(
+                        vec![
+                            cell.left_top() + vec2(7.0, 4.0),
+                            cell.left_top() + vec2(15.0, 7.0),
+                            cell.left_top() + vec2(7.0, 11.0),
+                        ],
+                        pal.signal,
+                        Stroke::NONE,
+                    ));
+                }
+                (2, 4) => {
+                    clip.text(
+                        cell.center(),
+                        Align2::CENTER_CENTER,
+                        "✕",
+                        mono(11.0),
+                        pal.alert,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Chain Snake's box: the chain, mid-grow, heading for a sat.
+fn snake_poster(p: &Painter, r: Rect, pal: &Palette) {
+    let clip = p.with_clip_rect(r);
+    clip.rect_filled(r, 8, pal.well);
+    let c = 16.0;
+    let at = r.center() - vec2(2.0 * c, c);
+    for (i, (dx, dy)) in [(0, 0), (1, 0), (2, 0), (2, -1), (3, -1), (3, -2)]
+        .iter()
+        .enumerate()
+    {
+        let cell = Rect::from_min_size(
+            at + vec2(*dx as f32 * c, *dy as f32 * c),
+            vec2(c - 2.5, c - 2.5),
+        );
+        let fill = if i == 5 {
+            pal.signal
+        } else {
+            pal.text.lerp_to_gamma(pal.well, i as f32 * 0.18)
+        };
+        clip.rect_filled(cell, 4, fill);
+    }
+    clip.circle_filled(at + vec2(4.6 * c, -2.5 * c), 7.0, pal.signal_alpha(0.3));
+    clip.circle_filled(at + vec2(4.6 * c, -2.5 * c), 4.6, pal.signal);
+    clip.text(
+        at + vec2(4.6 * c, -2.5 * c),
+        Align2::CENTER_CENTER,
+        "₿",
+        mono(7.5),
+        pal.on_signal(),
+    );
+}
+
+/// Block Builder's box: a stack mid-pile, one tx still falling.
+fn builder_poster(p: &Painter, r: Rect, pal: &Palette) {
+    let clip = p.with_clip_rect(r);
+    clip.rect_filled(r, 8, pal.well);
+    let c = 15.0;
+    let at = r.center() - vec2(2.5 * c, 2.0 * c);
+    for (dx, dy, fee) in [
+        (0, 0, 88),
+        (1, 0, 40),
+        (2, 0, 62),
+        (4, 0, 20),
+        (0, -1, 55),
+        (1, -1, 30),
+        (4, -1, 74),
+        (1, -2, 90),
+    ] {
+        let cell = Rect::from_min_size(
+            at + vec2(dx as f32 * c, dy as f32 * c),
+            vec2(c - 2.0, c - 2.0),
+        );
+        let t = fee as f32 / 99.0;
+        clip.rect_filled(
+            cell,
+            3,
+            pal.signal.lerp_to_gamma(pal.well, 1.0 - t * 0.9 - 0.06),
+        );
+    }
+    for (dx, dy) in [(3, -3), (4, -3), (3, -4), (4, -4)] {
+        let cell = Rect::from_min_size(
+            at + vec2(dx as f32 * c, dy as f32 * c),
+            vec2(c - 2.0, c - 2.0),
+        );
+        clip.rect_stroke(cell, 3, Stroke::new(1.2, pal.text), StrokeKind::Inside);
+    }
+}
+
+/// The gallery's box: three tiny paintings on a wall.
+fn gallery_poster(p: &Painter, r: Rect, pal: &Palette) {
+    let clip = p.with_clip_rect(r);
+    clip.rect_filled(r, 8, pal.well);
+    for (i, seed) in [0xA1_u8, 0x47, 0xE9].iter().enumerate() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = *seed;
+        for (j, b) in bytes.iter_mut().enumerate().skip(1) {
+            *b = (seed
+                .wrapping_mul(31)
+                .wrapping_add((j as u8).wrapping_mul(17)))
+            .rotate_left(j as u32 % 8);
+        }
+        let frame = Rect::from_min_size(
+            r.min + vec2(8.0 + i as f32 * 34.0, r.height() / 2.0 - 22.0),
+            vec2(30.0, 44.0),
+        );
+        clip.rect_filled(frame.expand(2.0), 2, pal.raised);
+        gallery::painting(&clip, frame, &bytes);
+    }
+}
+
+/// The oracle's box: a row of digits, one lit — and the question mark.
+fn oracle_poster(p: &Painter, r: Rect, pal: &Palette) {
+    let clip = p.with_clip_rect(r);
+    clip.rect_filled(r, 8, pal.well);
+    let w = 16.0;
+    let at = r.center() - vec2(4.0 * w, 9.0);
+    for d in 0..8 {
+        let cell = Rect::from_min_size(at + vec2(d as f32 * w, 0.0), vec2(w - 2.0, 18.0));
+        let lit = d == 5;
+        if lit {
+            clip.rect_filled(cell, 4, pal.signal);
+        } else {
+            clip.rect_stroke(cell, 4, Stroke::new(1.0, pal.hairline), StrokeKind::Inside);
+        }
+        clip.text(
+            cell.center(),
+            Align2::CENTER_CENTER,
+            format!("{:x}", d + 4),
+            mono(9.5),
+            if lit { pal.on_signal() } else { pal.muted },
+        );
+    }
+    clip.text(
+        r.center() + vec2(0.0, 22.0),
+        Align2::CENTER_CENTER,
+        "?",
+        font(theme::TITLE, 20.0),
+        pal.faint,
+    );
+}
+
+/// The avalanche toy's box: two bit-fields, one word apart.
+fn avalanche_poster(p: &Painter, r: Rect, pal: &Palette) {
+    let clip = p.with_clip_rect(r);
+    clip.rect_filled(r, 8, pal.well);
+    let c = 8.0;
+    for grid in 0..2 {
+        let at = r.min + vec2(10.0 + grid as f32 * 52.0, 10.0);
+        for y in 0..8 {
+            for x in 0..5 {
+                let on = (x * 7 + y * 3 + grid * 11) % 3 == 0;
+                let diff = grid == 1 && (x * 5 + y) % 2 == 0;
+                let fill = if diff && on {
+                    pal.alert
+                } else if on {
+                    pal.text
+                } else {
+                    pal.hairline.gamma_multiply(0.5)
+                };
+                clip.rect_filled(
+                    Rect::from_min_size(
+                        at + vec2(x as f32 * c, y as f32 * c),
+                        vec2(c - 1.5, c - 1.5),
+                    ),
+                    1,
+                    fill,
+                );
+            }
+        }
+    }
+}
+
+/// Days worth remembering, for the shelf's little calendar.
+const DAYS: &[(u8, u8, &str)] = &[
+    (1, 3, "the Genesis block is mined"),
+    (1, 9, "Bitcoin v0.1 is released"),
+    (1, 12, "the first transaction — Satoshi pays Hal"),
+    (5, 22, "Pizza Day — 10,000 BTC for two pizzas"),
+    (8, 15, "the value-overflow bug is found and fixed"),
+    (8, 24, "segwit activates"),
+    (10, 31, "the whitepaper posts to metzdowd"),
+    (11, 14, "taproot activates"),
+    (11, 28, "the first halving — 50 becomes 25"),
+    (7, 9, "the second halving — 25 becomes 12.5"),
+    (5, 11, "the third halving — 12.5 becomes 6.25"),
+    (4, 20, "the fourth halving — 6.25 becomes 3.125"),
+];
+
+/// The unix day's month and day (the civil calendar, in four lines).
+fn month_day(unix: u64) -> (u8, u8) {
+    let z = unix / 86_400 + 719_468;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (m as u8, d as u8)
+}
+
+/// The shelf's calendar card: today's milestones, or the next one's
+/// countdown.
+fn on_this_day(ui: &mut Ui, pal: &Palette) {
+    let w = (ui.available_width() - 14.0).max(280.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(w, 148.0), Sense::hover());
+    card(ui.painter(), rect, pal, false);
+    let art = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(108.0, 128.0));
+    let p = ui.painter();
+    p.rect_filled(art, 8, pal.well);
+    let (m, d) = month_day(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    );
+    // A tear-off calendar page, today's date big on it.
+    p.rect_filled(
+        Rect::from_min_size(art.min + vec2(26.0, 24.0), vec2(56.0, 66.0)),
+        4,
+        pal.raised,
+    );
+    p.rect_filled(
+        Rect::from_min_size(art.min + vec2(26.0, 24.0), vec2(56.0, 16.0)),
+        CornerRadius {
+            nw: 4,
+            ne: 4,
+            sw: 0,
+            se: 0,
+        },
+        pal.alert,
+    );
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    p.text(
+        art.min + vec2(54.0, 32.0),
+        Align2::CENTER_CENTER,
+        MONTHS[(m as usize).saturating_sub(1) % 12],
+        font(theme::MEDIUM, 10.0),
+        Color32::WHITE,
+    );
+    p.text(
+        art.min + vec2(54.0, 62.0),
+        Align2::CENTER_CENTER,
+        format!("{d}"),
+        font(theme::TITLE, 26.0),
+        pal.text,
+    );
+    let text = Rect::from_min_max(
+        pos2(art.right() + 16.0, rect.top() + 14.0),
+        rect.max - vec2(14.0, 12.0),
+    );
+    let todays: Vec<&str> = DAYS
+        .iter()
+        .filter(|(em, ed, _)| *em == m && *ed == d)
+        .map(|(.., t)| *t)
+        .collect();
+    let (headline, body) = if todays.is_empty() {
+        // How many days until each, going around the year.
+        let day_num = |m: u8, d: u8| {
+            const CUM: [u64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+            CUM[(m as usize - 1) % 12] + u64::from(d)
+        };
+        let now = day_num(m, d);
+        let (m2, d2, t, wait) = DAYS
+            .iter()
+            .map(|&(m2, d2, t)| {
+                let then = day_num(m2, d2);
+                (m2, d2, t, (then + 365 - now) % 365)
+            })
+            .min_by_key(|&(.., wait)| wait.max(1))
+            .map(|(m2, d2, t, w)| (m2, d2, t, if w == 0 { 365 } else { w }))
+            .unwrap_or((1, 3, "the Genesis block is mined", 0));
+        (
+            "Next up",
+            format!(
+                "{MONTH} {d2} — {t} · {wait} days to go",
+                MONTH = MONTHS[(m2 as usize - 1) % 12]
+            ),
+        )
+    } else {
+        ("On this day", todays.join(" · "))
+    };
+    let mut col = ui.new_child(
+        UiBuilder::new()
+            .max_rect(text)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    col.label(
+        RichText::new(headline)
+            .font(font(theme::TITLE, 17.5))
+            .color(pal.text),
+    );
+    col.add_space(4.0);
+    col.label(RichText::new(body).size(12.0).color(pal.muted));
+    col.add_space(4.0);
+    col.label(
+        RichText::new("the calendar the chain keeps")
+            .font(mono(11.0))
+            .color(pal.faint),
+    );
 }
 
 /// The game's box art: the bitcoin, the shield, and what's coming.
@@ -730,11 +1450,16 @@ fn skin_cards(ui: &mut Ui, pal: &Palette, prefs: &mut Prefs) {
     let width = ui.available_width();
     let w = ((width - 2.0 * gap) / 3.0).max(150.0);
     let shot_h = (w * 0.56).round();
-    let (row, _) = ui.allocate_exact_size(vec2(width, shot_h + 76.0), Sense::hover());
+    let card_h = shot_h + 76.0;
+    let rows = SKINS.len().div_ceil(3);
+    let (row, _) = ui.allocate_exact_size(
+        vec2(width, card_h * rows as f32 + gap * (rows - 1) as f32),
+        Sense::hover(),
+    );
     for (i, (skin, name, blurb)) in SKINS.iter().enumerate() {
         let r = Rect::from_min_size(
-            row.min + vec2(i as f32 * (w + gap), 0.0),
-            vec2(w, row.height()),
+            row.min + vec2((i % 3) as f32 * (w + gap), (i / 3) as f32 * (card_h + gap)),
+            vec2(w, card_h),
         );
         let resp = ui
             .interact(r, Id::new(("skin-card", i)), Sense::click())
@@ -936,6 +1661,125 @@ fn preview(p: &Painter, r: Rect, skin: Skin) {
                 5.0,
                 Color32::WHITE,
             );
+        }
+        Skin::Tip => {
+            // A window whose rail is the hash's hue — with the hash
+            // it was painted from beside it.
+            let seed = theme::tip_seed();
+            let pal = Palette::tip(seed);
+            clip.rect_filled(r, 8, pal.canvas);
+            clip.rect_filled(
+                Rect::from_min_size(r.min, vec2(r.width() * 0.12, r.height())),
+                CornerRadius {
+                    nw: 8,
+                    sw: 8,
+                    ne: 0,
+                    se: 0,
+                },
+                pal.rail,
+            );
+            clip.circle_filled(r.min + vec2(r.width() * 0.06, 10.0), 4.0, pal.rail_ink);
+            bar(18.0, 7.0, 30.0, 4.0, pal.text);
+            bar(18.0, 16.0, 44.0, 7.0, pal.text);
+            bar(18.0, 29.0, 74.0, 7.0, pal.well);
+            bar(18.0, 29.0, 50.0, 7.0, pal.signal);
+            bar(18.0, 42.0, 22.0, 3.0, pal.faint);
+            bar(46.0, 42.0, 22.0, 3.0, pal.faint);
+            bar(74.0, 42.0, 18.0, 3.0, pal.faint);
+            // …and the hues a few blocks from now might bring.
+            for i in 0..4 {
+                let hint = Palette::tip(seed.wrapping_add((i + 1) as u64 * 14_000)).signal;
+                clip.circle_filled(
+                    r.right_top() + vec2(-10.0 - i as f32 * 14.0, 10.0),
+                    4.5,
+                    hint,
+                );
+            }
+        }
+        Skin::Phosphor => {
+            let pal = Palette::PHOSPHOR;
+            clip.rect_filled(r, 8, pal.canvas);
+            clip.rect_filled(
+                Rect::from_min_size(r.min, vec2(r.width() * 0.12, r.height())),
+                CornerRadius {
+                    nw: 8,
+                    sw: 8,
+                    ne: 0,
+                    se: 0,
+                },
+                pal.rail,
+            );
+            clip.circle_filled(r.min + vec2(r.width() * 0.06, 10.0), 4.0, pal.rail_ink);
+            bar(18.0, 7.0, 30.0, 4.0, pal.text);
+            bar(18.0, 16.0, 44.0, 7.0, pal.text);
+            bar(18.0, 29.0, 74.0, 7.0, pal.well);
+            bar(18.0, 29.0, 50.0, 7.0, pal.signal);
+            bar(18.0, 42.0, 22.0, 3.0, pal.faint);
+            bar(46.0, 42.0, 22.0, 3.0, pal.faint);
+            bar(74.0, 42.0, 18.0, 3.0, pal.faint);
+            // The scanlines sell it.
+            let mut y = r.top() + 2.0;
+            while y < r.bottom() {
+                clip.hline(
+                    r.x_range(),
+                    y,
+                    Stroke::new(1.0, Color32::from_black_alpha(28)),
+                );
+                y += 4.0;
+            }
+        }
+        Skin::Classic => {
+            let pal = Palette::CLASSIC;
+            clip.rect_filled(r, 8, pal.canvas);
+            // The menu bar, the way 2011 had it.
+            clip.rect_filled(
+                Rect::from_min_size(r.min, vec2(r.width(), r.height() * 0.09)),
+                CornerRadius {
+                    nw: 8,
+                    ne: 8,
+                    sw: 0,
+                    se: 0,
+                },
+                pal.raised,
+            );
+            clip.hline(
+                r.left() + 4.0..=r.right() - 4.0,
+                r.top() + r.height() * 0.09,
+                Stroke::new(1.0, pal.hairline),
+            );
+            clip.text(
+                r.min + vec2(8.0, r.height() * 0.045),
+                Align2::LEFT_CENTER,
+                "File   Settings   Help",
+                theme::body(9.5),
+                pal.muted,
+            );
+            clip.rect_filled(
+                Rect::from_min_size(
+                    r.min + vec2(0.0, r.height() * 0.09),
+                    vec2(r.width() * 0.12, r.height()),
+                ),
+                CornerRadius {
+                    nw: 0,
+                    sw: 8,
+                    ne: 0,
+                    se: 0,
+                },
+                pal.rail,
+            );
+            // The gold coin it shipped with.
+            clip.circle_filled(
+                r.min + vec2(r.width() * 0.06, r.height() * 0.09 + 12.0),
+                5.0,
+                pal.signal,
+            );
+            bar(18.0, 14.0, 30.0, 4.0, pal.text);
+            bar(18.0, 23.0, 44.0, 7.0, pal.text);
+            bar(18.0, 36.0, 74.0, 7.0, pal.well);
+            bar(18.0, 36.0, 50.0, 7.0, pal.signal);
+            bar(18.0, 48.0, 22.0, 3.0, pal.faint);
+            bar(46.0, 48.0, 22.0, 3.0, pal.faint);
+            bar(74.0, 48.0, 18.0, 3.0, pal.faint);
         }
     }
     clip.rect_stroke(

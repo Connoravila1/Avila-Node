@@ -53,6 +53,15 @@ pub struct Prefs {
     /// Shitcoin Defense's best score.
     #[serde(default)]
     pub game_best: u32,
+    /// Blocksweeper's best clear in seconds, per tier; 0 is unplayed.
+    #[serde(default)]
+    pub sweep_best: [u32; 3],
+    /// Chain Snake's best score, in sats.
+    #[serde(default)]
+    pub snake_best: u64,
+    /// Block Builder's best score, in sats.
+    #[serde(default)]
+    pub builder_best: u64,
 }
 
 impl Default for Prefs {
@@ -68,6 +77,9 @@ impl Default for Prefs {
             proxy: String::new(),
             welcomed: false,
             game_best: 0,
+            sweep_best: [0; 3],
+            snake_best: 0,
+            builder_best: 0,
         }
     }
 }
@@ -168,6 +180,9 @@ mod tests {
             toybox: true,
             skin: Skin::Julia,
             game_best: 42,
+            sweep_best: [61, 0, 240],
+            snake_best: 900,
+            builder_best: 7,
             proxy: "127.0.0.1:9050".into(),
             welcomed: true,
         };
@@ -183,6 +198,9 @@ mod tests {
                 toybox: true,
                 skin: Skin::Julia,
                 game_best: 42,
+                sweep_best: [61, 0, 240],
+                snake_best: 900,
+                builder_best: 7,
                 proxy: "127.0.0.1:9050".into(),
                 welcomed: true,
             }

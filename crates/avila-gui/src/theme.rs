@@ -7,11 +7,11 @@
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle,
-    Theme, Visuals,
+    Theme, Visuals, ecolor::Hsva,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// The logo's orange field, sampled from `assets/avila-node-logo.png`.
 pub const SIGNAL: Color32 = Color32::from_rgb(247, 139, 19);
@@ -161,6 +161,79 @@ impl Palette {
         hearts: true,
     };
 
+    /// Toybox: a green-glass terminal. Near-black panes, phosphor green
+    /// text, everything monospace (the fonts are installed separately).
+    pub const PHOSPHOR: Self = Self {
+        dark: true,
+        canvas: Color32::from_rgb(7, 13, 9),
+        raised: Color32::from_rgb(13, 24, 16),
+        well: Color32::from_rgb(10, 19, 13),
+        hairline: Color32::from_rgb(26, 52, 35),
+        text: Color32::from_rgb(124, 235, 152),
+        muted: Color32::from_rgb(74, 164, 104),
+        faint: Color32::from_rgb(42, 92, 60),
+        signal: Color32::from_rgb(84, 255, 142),
+        signal_text: Color32::from_rgb(148, 255, 186),
+        alert: Color32::from_rgb(255, 178, 36),
+        rail: Color32::from_rgb(10, 26, 16),
+        rail_ink: Color32::from_rgb(124, 235, 152),
+        rail_active: Color32::from_rgb(84, 255, 142),
+        rail_active_ink: Color32::from_rgb(7, 13, 9),
+        primary: Color32::from_rgb(84, 255, 142),
+        on_primary: Color32::from_rgb(7, 13, 9),
+        round: 2,
+        chunky: true,
+        hearts: false,
+    };
+
+    /// Toybox: the 2011 wallet. Qt's beige chrome, a gold coin's signal,
+    /// square corners. Proven is gold here.
+    pub const CLASSIC: Self = Self {
+        dark: false,
+        canvas: Color32::from_rgb(238, 236, 228),
+        raised: Color32::from_rgb(252, 251, 246),
+        well: Color32::from_rgb(228, 225, 214),
+        hairline: Color32::from_rgb(188, 183, 166),
+        text: Color32::from_rgb(24, 23, 18),
+        muted: Color32::from_rgb(94, 90, 76),
+        faint: Color32::from_rgb(152, 147, 130),
+        signal: Color32::from_rgb(206, 148, 26),
+        signal_text: Color32::from_rgb(140, 94, 10),
+        alert: Color32::from_rgb(172, 34, 22),
+        rail: Color32::from_rgb(62, 56, 42),
+        rail_ink: Color32::from_rgb(234, 227, 208),
+        rail_active: Color32::from_rgb(206, 148, 26),
+        rail_active_ink: Color32::from_rgb(30, 27, 16),
+        primary: Color32::from_rgb(66, 112, 60),
+        on_primary: Color32::from_rgb(248, 246, 238),
+        round: 2,
+        chunky: true,
+        hearts: false,
+    };
+
+    /// Toybox: the tip-hash skin — LIGHT's surfaces wearing an accent
+    /// drawn from the newest block's hash. A block lands, the node
+    /// quietly changes color.
+    #[must_use]
+    pub fn tip(seed: u64) -> Self {
+        // The hue is the hash's low sixteen bits; siblings sit close
+        // enough to feel like one family, far enough to notice the turn.
+        let hue = (seed & 0xffff) as f32 / 65_536.0;
+        let paint = |h: f32, s: f32, v: f32| -> Color32 { Hsva { h, s, v, a: 1.0 }.into() };
+        let signal = paint(hue, 0.72, 0.9);
+        Self {
+            signal,
+            signal_text: paint(hue, 0.85, 0.58),
+            rail: signal,
+            rail_ink: if bright(signal) { INK } else { Color32::WHITE },
+            rail_active: Self::LIGHT.text,
+            rail_active_ink: signal,
+            primary: paint(hue, 0.78, 0.42),
+            on_primary: Color32::WHITE,
+            ..Self::LIGHT
+        }
+    }
+
     /// The palette for whatever appearance `ctx` is currently showing:
     /// a toybox skin when one is on, else light or dark.
     #[must_use]
@@ -168,6 +241,9 @@ impl Palette {
         match Skin::current() {
             Skin::Xp => Self::XP,
             Skin::Julia => Self::JULIA,
+            Skin::Phosphor => Self::PHOSPHOR,
+            Skin::Classic => Self::CLASSIC,
+            Skin::Tip => Self::tip(tip_seed()),
             Skin::Standard if ctx.global_style().visuals.dark_mode => Self::DARK,
             Skin::Standard => Self::LIGHT,
         }
@@ -179,6 +255,22 @@ impl Palette {
     pub fn signal_alpha(&self, alpha: f32) -> Color32 {
         self.signal.gamma_multiply(alpha)
     }
+
+    /// What reads on `signal`: ink on the light ones, white on the rest.
+    #[must_use]
+    pub fn on_signal(&self) -> Color32 {
+        if bright(self.signal) {
+            INK
+        } else {
+            Color32::WHITE
+        }
+    }
+}
+
+/// Whether dark ink or white text reads better on `c`.
+fn bright(c: Color32) -> bool {
+    let lum = 0.299 * f32::from(c.r()) + 0.587 * f32::from(c.g()) + 0.114 * f32::from(c.b());
+    lum > 140.0
 }
 
 /// A whole-app skin from the toybox. Skins are light-only and win over
@@ -189,10 +281,30 @@ pub enum Skin {
     Standard,
     Xp,
     Julia,
+    /// The accent is derived from the tip's hash — it turns every block.
+    Tip,
+    /// A green-glass terminal.
+    Phosphor,
+    /// The 2011 wallet's chrome.
+    Classic,
 }
 
 /// The skin in force, read by [`Palette::of`] on every paint.
 static SKIN: AtomicU8 = AtomicU8::new(0);
+
+/// What the Tip skin paints with: the tip hash's low bytes, refreshed
+/// by the app whenever the chain grows.
+static TIP_SEED: AtomicU64 = AtomicU64::new(0xF7_8B);
+
+/// The seed the Tip skin paints with.
+#[must_use]
+pub fn tip_seed() -> u64 {
+    TIP_SEED.load(Ordering::Relaxed)
+}
+
+pub fn set_tip_seed(seed: u64) {
+    TIP_SEED.store(seed, Ordering::Relaxed);
+}
 
 impl Skin {
     #[must_use]
@@ -205,6 +317,9 @@ impl Skin {
             Self::Standard => 0,
             Self::Xp => 1,
             Self::Julia => 2,
+            Self::Tip => 3,
+            Self::Phosphor => 4,
+            Self::Classic => 5,
         }
     }
 
@@ -212,6 +327,9 @@ impl Skin {
         match code {
             1 => Self::Xp,
             2 => Self::Julia,
+            3 => Self::Tip,
+            4 => Self::Phosphor,
+            5 => Self::Classic,
             _ => Self::Standard,
         }
     }
@@ -221,12 +339,18 @@ impl Skin {
 /// match.
 pub fn set_skin(ctx: &egui::Context, skin: Skin) {
     let was = Skin::from_code(SKIN.swap(skin.code(), Ordering::Relaxed));
-    if was == skin {
+    // The Tip skin re-derives its palette from the tip's hash, so it
+    // re-installs even when the skin itself hasn't changed — that's how
+    // a new block repaints the whole app.
+    if was == skin && skin != Skin::Tip {
         return;
     }
     let pal = match skin {
         Skin::Xp => Some(Palette::XP),
         Skin::Julia => Some(Palette::JULIA),
+        Skin::Phosphor => Some(Palette::PHOSPHOR),
+        Skin::Classic => Some(Palette::CLASSIC),
+        Skin::Tip => Some(Palette::tip(tip_seed())),
         Skin::Standard => None,
     };
     let xp = skin == Skin::Xp;
@@ -279,9 +403,11 @@ pub fn mono(size: f32) -> FontId {
 /// Tahoma (or Verdana, its wider sibling) and Trebuchet MS for titles.
 /// None of them ship with the node; without them the bundled faces serve.
 /// The Julia skin sets its titles and big numbers in Pacifico, a subset
-/// of which ships (about 21 KB).
+/// of which ships (about 21 KB). Phosphor runs everything in Plex Mono —
+/// a terminal doesn't do proportional type.
 pub fn install_fonts(ctx: &egui::Context, skin: Skin) {
     let xp = skin == Skin::Xp;
+    let phosphor = skin == Skin::Phosphor;
     let mut fonts = FontDefinitions::default();
     let faces: [(&str, &'static [u8]); 8] = [
         (
@@ -350,7 +476,15 @@ pub fn install_fonts(ctx: &egui::Context, skin: Skin) {
     };
     fonts.families.insert(
         FontFamily::Proportional,
-        chain(&["xp-ui"], "instrument-regular", &proportional_fallback),
+        chain(
+            &["xp-ui"],
+            if phosphor {
+                "plex-mono"
+            } else {
+                "instrument-regular"
+            },
+            &proportional_fallback,
+        ),
     );
     fonts.families.insert(
         FontFamily::Monospace,
@@ -370,8 +504,10 @@ pub fn install_fonts(ctx: &egui::Context, skin: Skin) {
     ] {
         let big = family == DISPLAY || family == TITLE;
         // Without Trebuchet, XP's big type falls back to the interface
-        // face rather than Jost's geometry.
-        let own = if xp && big {
+        // face rather than Jost's geometry. Phosphor's is all mono.
+        let own = if phosphor {
+            if big { "plex-mono-medium" } else { "plex-mono" }
+        } else if xp && big {
             "instrument-semibold"
         } else {
             face
@@ -386,7 +522,11 @@ pub fn install_fonts(ctx: &egui::Context, skin: Skin) {
     }
     fonts.families.insert(
         FontFamily::Name(SCRIPT.into()),
-        chain(&[], "pacifico", &proportional_fallback),
+        chain(
+            &[],
+            if phosphor { "plex-mono" } else { "pacifico" },
+            &proportional_fallback,
+        ),
     );
     fonts.families.insert(
         FontFamily::Name(MONO_MEDIUM.into()),

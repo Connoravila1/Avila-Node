@@ -38,6 +38,8 @@ pub struct App {
     peer_sort: PeerSort,
     /// The Chain page's zoom into the ribbon.
     ribbon_view: View,
+    /// The Config page's live-edit state — drafts, pending, overrides.
+    config_page: pages::config::ConfigPage,
     /// The toybox's shelf: every game, the hash-fed toys, the confetti.
     toys: toybox::Toys,
     /// The toy a capture posed, so it isn't re-posed every frame.
@@ -200,6 +202,7 @@ impl App {
             sky: Constellation::default(),
             peer_sort: PeerSort::default(),
             ribbon_view: View::default(),
+            config_page: pages::config::ConfigPage::default(),
             toys: toybox::Toys::default(),
             toy_posed: 0,
             applied,
@@ -281,6 +284,13 @@ impl App {
                         &scene,
                         &mut self.filter,
                         self.prefs.hide_addresses,
+                    ),
+                    Page::Config => pages::config::show(
+                        ui,
+                        &scene,
+                        &mut self.config_page,
+                        &self.node,
+                        self.session.control_sender(),
                     ),
                     Page::Toybox => {
                         toybox::show(ui, &scene, &mut self.toys, &mut self.prefs);
@@ -563,6 +573,7 @@ impl eframe::App for App {
         // a busy tick can't stall the render.
         if let Some(tail) = &mut self.events_tail {
             for ev in tail.read_new(128) {
+                self.config_page.note(&ev);
                 if let Some(text) = stream_text(&ev) {
                     self.session.log(ActivityKind::Node, text, None, 0.0);
                 }
@@ -867,9 +878,7 @@ fn tip_hash_seed(session: &Session) -> u64 {
         .view
         .as_ref()
         .and_then(|v| v.recent.last())
-        .and_then(|(_, h)| {
-            u64::from_str_radix(&h[h.len().saturating_sub(16)..], 16).ok()
-        })
+        .and_then(|(_, h)| u64::from_str_radix(&h[h.len().saturating_sub(16)..], 16).ok())
         .unwrap_or(0xF7_8B)
 }
 
@@ -939,6 +948,12 @@ fn stream_text(ev: &serde_json::Value) -> Option<String> {
             num("peer")
         ),
         "config_risk" => format!("Configuration risk — {}: {}", txt("path"), txt("message")),
+        "config_changed" => format!(
+            "Knob {} set to {} — live until restart.",
+            txt("path"),
+            txt("value")
+        ),
+        "config_rejected" => format!("Knob {} refused: {}.", txt("path"), txt("reason")),
         "hook_spawn_failed" => format!(
             "Hook {} failed to start ({}) — answering its timeout default.",
             txt("point"),

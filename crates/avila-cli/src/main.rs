@@ -630,6 +630,10 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                                 "value": k.value,
                                 "default": k.default,
                                 "changed": k.value != k.default,
+                                "edit": match k.edit {
+                                    avila_node::config::EditKind::Live => "live",
+                                    avila_node::config::EditKind::Restart => "restart",
+                                },
                                 "doc": k.doc,
                             })
                         })
@@ -642,7 +646,11 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                         } else {
                             String::new()
                         };
-                        println!("{} = {}{}", k.path, render_value(&k.value), changed);
+                        let edit = match k.edit {
+                            avila_node::config::EditKind::Live => "   [live]",
+                            avila_node::config::EditKind::Restart => "   [restart]",
+                        };
+                        println!("{} = {}{}{}", k.path, render_value(&k.value), changed, edit);
                         println!("      {}", k.doc);
                     }
                 }
@@ -1008,6 +1016,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 extrapool: c.extrapool.clone(),
                 ban_time: c.peers.ban_time,
                 risks: avila_node::config::risk_review(c),
+                control: None,
             };
             println!(
                 "Running {} — syncing to tip, then serving (Ctrl+C to stop)...",
@@ -1149,6 +1158,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 extrapool: c.extrapool.clone(),
                 ban_time: c.peers.ban_time,
                 risks: avila_node::config::risk_review(c),
+                control: None,
             };
             println!(
                 "Syncing {network} (target height {blocks}, {} peers max)...",

@@ -1913,6 +1913,12 @@ impl<S: Read + Write> PeerManager<S> {
         self.block_serve_verdict = verdict;
     }
 
+    /// `relay.block.serve` alone — live edits keep a configured
+    /// `block.serve` hook instead of clearing it.
+    pub fn set_block_serve_mode(&mut self, mode: &str) {
+        self.block_serve_mode = mode.to_string();
+    }
+
     /// `relay.tx.*` bulk apply — announce mode (`all|private_only|
     /// none`), inbound/blocks-only target reach, the outbound
     /// feefilter floor, and broadcast-pool retries.

@@ -80,7 +80,9 @@ fn main() -> Result<(), String> {
                 NetEvent::CpuThrottled { peer, rate_ns } => {
                     println!("peer {peer}: cpu-throttled at {rate_ns}ns/s")
                 }
-                NetEvent::CompactReceived { peer, short_ids, .. } => {
+                NetEvent::CompactReceived {
+                    peer, short_ids, ..
+                } => {
                     println!("peer {peer}: cmpctblock ({short_ids} short ids)")
                 }
                 NetEvent::CompactHit { peer, .. } => println!("peer {peer}: compact hit"),

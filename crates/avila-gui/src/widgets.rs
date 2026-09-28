@@ -28,7 +28,7 @@ pub fn section(ui: &mut Ui, title: &str, note: Option<&str>) {
     match Skin::current() {
         Skin::Xp => return xp::group_header(ui, title, note),
         Skin::Julia => return julia::section(ui, title, note),
-        Skin::Standard => {}
+        _ => {}
     }
     let pal = Palette::of(ui.ctx());
     ui.horizontal(|ui| {
@@ -230,7 +230,7 @@ pub fn checkbox(ui: &mut Ui, value: &mut bool, text: &str) -> Response {
     match Skin::current() {
         Skin::Xp => xp::checkbox(ui, value, text),
         Skin::Julia => julia::checkbox(ui, value, text),
-        Skin::Standard => ui.checkbox(value, text),
+        _ => ui.checkbox(value, text),
     }
 }
 

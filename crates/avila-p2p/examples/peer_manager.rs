@@ -82,7 +82,9 @@ fn main() -> Result<(), String> {
                 }
                 NetEvent::ProxyUnreachable => println!("proxy unreachable — private route down"),
                 NetEvent::V2Downgraded { addr } => println!("{addr}: v2 attempt downgraded to v1"),
-                NetEvent::CompactReceived { peer, short_ids, .. } => {
+                NetEvent::CompactReceived {
+                    peer, short_ids, ..
+                } => {
                     println!("peer {peer}: cmpctblock ({short_ids} short ids)")
                 }
                 NetEvent::CompactHit { peer, .. } => println!("peer {peer}: compact hit"),

@@ -3,6 +3,7 @@
 
 pub mod activity;
 pub mod chain;
+pub mod config;
 pub mod overview;
 pub mod peers;
 pub mod settings;

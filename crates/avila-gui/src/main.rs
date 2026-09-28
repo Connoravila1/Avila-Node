@@ -1,4 +1,5 @@
 mod app;
+mod avalanche;
 #[cfg(feature = "devtools")]
 mod bench;
 /// Audit slop: without `devtools` the bench harness compiles to a
@@ -22,6 +23,7 @@ mod bench {
     }
 }
 mod brand;
+mod builder;
 #[cfg(feature = "devtools")]
 mod capture;
 /// Audit slop: without `devtools` the screenshot harness compiles to
@@ -57,6 +59,7 @@ mod capture {
         pub skin: Skin,
         pub play: bool,
         pub over: bool,
+        pub toy: u8,
         pub desk: Desk,
         pub pointer: &'static [Step],
     }
@@ -75,13 +78,18 @@ mod clock;
 mod constellation;
 mod demo;
 mod fingerprint;
+mod gallery;
 mod julia;
 mod model;
+mod oracle;
 mod pages;
+mod phosphor;
 mod prefs;
 mod rail;
 mod ribbon;
 mod session;
+mod snake;
+mod sweep;
 mod theme;
 mod toybox;
 mod widgets;

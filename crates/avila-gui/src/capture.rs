@@ -57,6 +57,8 @@ pub struct Pose {
     pub play: bool,
     /// Open a finished game.
     pub over: bool,
+    /// Open one of the other toys, mid-scene — `Toys::pose`'s index.
+    pub toy: u8,
     pub desk: Desk,
     /// Pointer steps to play once posed: open a menu, hover an item.
     pub pointer: &'static [Step],
@@ -116,6 +118,7 @@ impl Capture {
             skin: Skin::Standard,
             play: false,
             over: false,
+            toy: 0,
             desk: Desk::Window,
             pointer: &[],
         };
@@ -292,6 +295,108 @@ impl Capture {
                 },
                 FULL,
                 "-over",
+            ),
+            // The rest of the shelf, each mid-scene.
+            (
+                Theme::Light,
+                Pose {
+                    toy: 1,
+                    ..pose(Page::Toybox)
+                },
+                FULL,
+                "-sweep",
+            ),
+            (
+                Theme::Dark,
+                Pose {
+                    toy: 1,
+                    ..pose(Page::Toybox)
+                },
+                FULL,
+                "-sweep",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    toy: 2,
+                    ..pose(Page::Toybox)
+                },
+                FULL,
+                "-snake",
+            ),
+            (
+                Theme::Dark,
+                Pose {
+                    toy: 3,
+                    ..pose(Page::Toybox)
+                },
+                FULL,
+                "-builder",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    toy: 4,
+                    ..pose(Page::Toybox)
+                },
+                FULL,
+                "-gallery",
+            ),
+            (
+                Theme::Dark,
+                Pose {
+                    toy: 5,
+                    ..pose(Page::Toybox)
+                },
+                FULL,
+                "-oracle",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    toy: 6,
+                    ..pose(Page::Toybox)
+                },
+                FULL,
+                "-avalanche",
+            ),
+            // The new skins, each over a page and its shelf card.
+            (
+                Theme::Light,
+                Pose {
+                    skin: Skin::Tip,
+                    ..pose(Page::Overview)
+                },
+                FULL,
+                "-tip",
+            ),
+            (
+                Theme::Dark,
+                Pose {
+                    skin: Skin::Phosphor,
+                    ..pose(Page::Overview)
+                },
+                FULL,
+                "-phosphor",
+            ),
+            (
+                Theme::Dark,
+                Pose {
+                    skin: Skin::Phosphor,
+                    toy: 3,
+                    ..pose(Page::Toybox)
+                },
+                FULL,
+                "-phosphor",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    skin: Skin::Classic,
+                    ..pose(Page::Toybox)
+                },
+                FULL,
+                "-classic",
             ),
             (Theme::Light, julia(Page::Chain), FULL, "-julia"),
             (

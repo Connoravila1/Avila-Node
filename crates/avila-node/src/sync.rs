@@ -428,6 +428,33 @@ pub struct SyncConfig {
     /// run loop can warn once per *new* risk (acknowledged via
     /// `<datadir>/risk_ack` written by `config accept-risks`).
     pub risks: Vec<crate::config::RiskFinding>,
+    /// Live knob edits — the GUI/RPC side sends `ControlMsg::Set`;
+    /// the loop drains it each tick. `config::live_knob` names the
+    /// accepted paths; anything else is rejected with a reason.
+    /// `Arc<Mutex<..>>` keeps `SyncConfig: Clone` — `Receiver` alone is
+    /// `!Clone` and `!Sync`.
+    pub control: Option<std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<ControlMsg>>>>,
+}
+
+/// A live knob edit on the control channel — applies at the next sync
+/// tick, journaled as `config_changed`/`config_rejected`.
+#[derive(Debug)]
+pub enum ControlMsg {
+    /// `config describe` path + the new value as JSON.
+    Set {
+        path: String,
+        value: serde_json::Value,
+    },
+}
+
+/// Mutable copies of the tuple knobs — a live edit rewrites one member
+/// and re-applies the whole setter.
+struct LiveKnobs {
+    relay_tx: (String, bool, bool, u64, bool, u32),
+    relay_block: (bool, bool, bool, String, String),
+    extrapool: avila_core::ExtrapoolConfig,
+    mining: (Option<usize>, i64, Option<usize>),
+    datacarrier_bytes: Option<usize>,
 }
 
 impl Default for SyncConfig {
@@ -486,6 +513,7 @@ impl Default for SyncConfig {
             extrapool: avila_core::ExtrapoolConfig::default(),
             ban_time: avila_p2p::banman::DEFAULT_BANTIME,
             risks: Vec::new(),
+            control: None,
         }
     }
 }
@@ -976,6 +1004,15 @@ pub fn run(
     mgr.set_block_serve(&cfg.relay_block.4, None);
     mgr.set_max_in_flight_total(cfg.max_in_transit);
     mgr.set_default_ban_time(cfg.ban_time);
+    // Live knob state — `cfg` is borrowed; tuple members mutate here
+    // and re-apply whole through the same setters.
+    let mut knobs = LiveKnobs {
+        relay_tx: cfg.relay_tx.clone(),
+        relay_block: cfg.relay_block.clone(),
+        extrapool: cfg.extrapool.clone(),
+        mining: cfg.mining_budgets,
+        datacarrier_bytes: cfg.datacarrier_bytes,
+    };
     // The append-only event plane (docs/DECISION_REGISTRY.md — the
     // stream law): one NDJSON line per decision/transition in the
     // network data dir; `avila-node events --follow` tails it. An
@@ -1824,6 +1861,27 @@ pub fn run(
             }
         }
         mgr.drain_inbounds();
+        // Live knob edits apply between ticks — never mid-dispatch —
+        // and each one lands on the journal.
+        if let Some(control) = &cfg.control
+            && let Ok(rx) = control.lock()
+        {
+            while let Ok(msg) = rx.try_recv() {
+                let ControlMsg::Set { path, value } = msg;
+                match apply_knob(&mut mgr, &mut knobs, &path, &value) {
+                    Ok(applied) => emit(
+                        &mut stream,
+                        "config_changed",
+                        serde_json::json!({"path": path, "value": applied}),
+                    ),
+                    Err(reason) => emit(
+                        &mut stream,
+                        "config_rejected",
+                        serde_json::json!({"path": path, "reason": reason}),
+                    ),
+                }
+            }
+        }
         let mut tip_moved = false;
         for event in mgr.tick_net(&mut cs, unix_now(), params.message_start, 0) {
             {
@@ -1939,13 +1997,13 @@ pub fn run(
         // the announce gates with extrapool provenance ("outbound"
         // confines to our chosen routes, "all" fans out fully).
         for (txid, wtxid) in mgr.mempool().take_extrapool_pending() {
-            mgr.announce_extrapool_tx(txid, wtxid, cfg.extrapool.relay == "outbound");
+            mgr.announce_extrapool_tx(txid, wtxid, knobs.extrapool.relay == "outbound");
             emit(
                 &mut stream,
                 "extrapool_relayed",
                 serde_json::json!({
                     "txid": txid.to_string(),
-                    "scope": cfg.extrapool.relay.as_str(),
+                    "scope": knobs.extrapool.relay.as_str(),
                 }),
             );
         }
@@ -2414,4 +2472,348 @@ pub fn run(
         target_reached: connected.saturating_sub(resumed_height) >= cfg.target_height,
         elapsed: started.elapsed(),
     })
+}
+
+/// A live `ControlMsg::Set` → the setter it resolves to. `Ok` returns
+/// the value actually applied (normalized — `"auto"` lands as `""`,
+/// MB lands as bytes semantics are echoed back in the knob's unit).
+/// `Err` carries the rejection reason for `config_rejected`.
+fn apply_knob<S: std::io::Read + std::io::Write>(
+    mgr: &mut avila_p2p::PeerManager<S>,
+    knobs: &mut LiveKnobs,
+    path: &str,
+    value: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use serde_json::Value;
+    let want_bool = |v: &Value| {
+        v.as_bool()
+            .ok_or_else(|| format!("expected true/false, got {v}"))
+    };
+    let want_u64 = |v: &Value| {
+        v.as_u64()
+            .ok_or_else(|| format!("expected a non-negative integer, got {v}"))
+    };
+    let want_i64 = |v: &Value| {
+        v.as_i64()
+            .ok_or_else(|| format!("expected an integer, got {v}"))
+    };
+    let want_str = |v: &Value| {
+        v.as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| format!("expected a string, got {v}"))
+    };
+    let want_enum = |v: &Value, choices: &[&str]| {
+        let s = want_str(v)?;
+        if choices.contains(&s.as_str()) {
+            Ok(s)
+        } else {
+            Err(format!("expected one of {choices:?}, got {s:?}"))
+        }
+    };
+    let applied = match path {
+        "net.blocks_only" => {
+            mgr.set_blocks_only(want_bool(value)?);
+            value.clone()
+        }
+        "peers.ban_time" => {
+            mgr.set_default_ban_time(want_i64(value)?);
+            value.clone()
+        }
+        "privacy.cell_bytes" => {
+            mgr.set_cell_bytes(want_u64(value)? as usize);
+            value.clone()
+        }
+        "mempool.max_mb" => {
+            let mb = want_u64(value)?;
+            mgr.mempool().set_max_bytes(mb as usize * 1_000_000);
+            value.clone()
+        }
+        "mempool.min_relay_fee_sat_per_kvb" => {
+            mgr.mempool().set_min_relay_fee(want_i64(value)?);
+            value.clone()
+        }
+        "mempool.expiry_secs" => {
+            mgr.mempool()
+                .set_mempool_expiry_secs(want_u64(value)? as u32);
+            value.clone()
+        }
+        "mempool.private" => {
+            mgr.set_private_submissions(want_bool(value)?);
+            value.clone()
+        }
+        "policy.require_standard" => {
+            mgr.mempool().set_require_standard(want_bool(value)?);
+            value.clone()
+        }
+        "policy.datacarrier" => {
+            let on = want_bool(value)?;
+            // `false` disables datacarrier outputs (None budget); `true`
+            // restores the last set size (or Core's 83-byte default).
+            let size = knobs
+                .datacarrier_bytes
+                .unwrap_or(avila_mempool::policy::MAX_OP_RETURN_RELAY);
+            knobs.datacarrier_bytes = on.then_some(size);
+            mgr.mempool()
+                .set_max_datacarrier_bytes(knobs.datacarrier_bytes);
+            value.clone()
+        }
+        "policy.datacarrier_size" => {
+            let n = want_u64(value)? as usize;
+            knobs.datacarrier_bytes = Some(n);
+            mgr.mempool().set_max_datacarrier_bytes(Some(n));
+            value.clone()
+        }
+        "policy.permit_bare_multisig" => {
+            mgr.mempool().set_permit_bare_multisig(want_bool(value)?);
+            value.clone()
+        }
+        "policy.dust_relay_fee_sat_per_kvb" => {
+            mgr.mempool().set_dust_relay_fee(want_i64(value)?);
+            value.clone()
+        }
+        "relay.tx.stem" => {
+            mgr.set_stem_relay(want_bool(value)?);
+            value.clone()
+        }
+        "relay.tx.deny_pairs" => {
+            let arr = value
+                .as_array()
+                .ok_or_else(|| format!("expected [\"src->dst\", …], got {value}"))?;
+            let mut pairs = Vec::with_capacity(arr.len());
+            for p in arr {
+                let s = want_str(p)?;
+                let (src, dst) = s
+                    .split_once("->")
+                    .ok_or_else(|| format!("{s:?} — expected \"src->dst\""))?;
+                pairs.push((src.trim().to_string(), dst.trim().to_string()));
+            }
+            mgr.set_deny_pairs(pairs);
+            value.clone()
+        }
+        // relay.tx tuple — mutate one member, re-apply the whole.
+        "relay.tx.announce"
+        | "relay.tx.to_inbound"
+        | "relay.tx.to_blocks_only_peers"
+        | "relay.tx.send_feefilter"
+        | "relay.tx.rebroadcast_local"
+        | "relay.tx.rebroadcast_interval" => {
+            match path {
+                "relay.tx.announce" => {
+                    knobs.relay_tx.0 = want_enum(value, &["all", "private_only", "none"])?
+                }
+                "relay.tx.to_inbound" => knobs.relay_tx.1 = want_bool(value)?,
+                "relay.tx.to_blocks_only_peers" => knobs.relay_tx.2 = want_bool(value)?,
+                "relay.tx.send_feefilter" => knobs.relay_tx.3 = want_u64(value)?,
+                "relay.tx.rebroadcast_local" => knobs.relay_tx.4 = want_bool(value)?,
+                _ => knobs.relay_tx.5 = want_u64(value)? as u32,
+            }
+            mgr.set_tx_relay(
+                &knobs.relay_tx.0,
+                knobs.relay_tx.1,
+                knobs.relay_tx.2,
+                knobs.relay_tx.3,
+                knobs.relay_tx.4,
+                knobs.relay_tx.5,
+            );
+            value.clone()
+        }
+        "relay.block.compact"
+        | "relay.block.compact_high_bandwidth"
+        | "relay.block.compact_serve"
+        | "relay.block.announce" => {
+            match path {
+                "relay.block.compact" => knobs.relay_block.0 = want_bool(value)?,
+                "relay.block.compact_high_bandwidth" => knobs.relay_block.1 = want_bool(value)?,
+                "relay.block.compact_serve" => knobs.relay_block.2 = want_bool(value)?,
+                _ => {
+                    let s = want_enum(value, &["auto", "headers", "inv", "none"])?;
+                    knobs.relay_block.3 = if s == "auto" { String::new() } else { s };
+                }
+            }
+            mgr.set_compact_relay(
+                knobs.relay_block.0,
+                knobs.relay_block.1,
+                knobs.relay_block.2,
+                &knobs.relay_block.3,
+            );
+            value.clone()
+        }
+        "relay.block.serve" => {
+            knobs.relay_block.4 = want_enum(value, &["full", "tip", "none"])?;
+            mgr.set_block_serve_mode(&knobs.relay_block.4);
+            Value::String(knobs.relay_block.4.clone())
+        }
+        "extrapool.observe"
+        | "extrapool.max_entries"
+        | "extrapool.max_bytes"
+        | "extrapool.expiry_secs" => {
+            match path {
+                "extrapool.observe" => knobs.extrapool.observe = want_bool(value)?,
+                "extrapool.max_entries" => knobs.extrapool.max_entries = want_u64(value)? as usize,
+                "extrapool.max_bytes" => knobs.extrapool.max_bytes = want_u64(value)? as usize,
+                _ => knobs.extrapool.expiry_secs = want_u64(value)? as u32,
+            }
+            mgr.mempool().configure_extrapool(
+                knobs.extrapool.observe,
+                knobs.extrapool.max_entries,
+                knobs.extrapool.max_bytes,
+                knobs.extrapool.expiry_secs,
+            );
+            value.clone()
+        }
+        "extrapool.relay" => {
+            knobs.extrapool.relay = want_enum(value, &["never", "outbound", "all"])?;
+            let relay_on = knobs.extrapool.relay != "never";
+            mgr.mempool()
+                .configure_extrapool_detail(knobs.extrapool.caps.clone(), relay_on);
+            Value::String(knobs.extrapool.relay.clone())
+        }
+        "mining.include_extrapool" => {
+            mgr.mempool().set_mine_extrapool(want_bool(value)?);
+            value.clone()
+        }
+        "mining.max_weight" => {
+            let w = want_u64(value)? as usize;
+            if w > avila_consensus::block::MAX_BLOCK_WEIGHT {
+                return Err(format!(
+                    "max {MAX_BLOCK_WEIGHT} — blocks beyond consensus weight are invalid",
+                    MAX_BLOCK_WEIGHT = avila_consensus::block::MAX_BLOCK_WEIGHT
+                ));
+            }
+            knobs.mining.0 = Some(w);
+            mgr.mempool().set_block_max_weight(w);
+            value.clone()
+        }
+        "mining.min_tx_fee" => {
+            let f = want_i64(value)?;
+            knobs.mining.1 = f;
+            mgr.mempool().set_block_min_fee(f);
+            value.clone()
+        }
+        "mining.reserved_weight" => {
+            let w = want_u64(value)? as usize;
+            knobs.mining.2 = Some(w);
+            mgr.mempool().set_block_reserved_weight(w);
+            value.clone()
+        }
+        "filters.serve" => {
+            mgr.set_serve_filters(want_bool(value)?);
+            value.clone()
+        }
+        "sync.max_in_transit" => {
+            mgr.set_max_in_flight_total(want_u64(value)? as usize);
+            value.clone()
+        }
+        _ if crate::config::live_knob(path) => {
+            return Err(format!("{path} is listed live but has no apply mapping"));
+        }
+        _ => return Err(format!("{path} is restart-only (or unknown)")),
+    };
+    Ok(applied)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use avila_core::ExtrapoolConfig;
+    use serde_json::json;
+    use std::io::Cursor;
+
+    /// `PeerManager` over an in-memory stream type — `apply_knob` only
+    /// touches manager/mempool fields, never the transport.
+    fn fixture() -> (PeerManager<Cursor<Vec<u8>>>, LiveKnobs) {
+        (
+            PeerManager::new(8),
+            LiveKnobs {
+                relay_tx: ("all".to_string(), true, false, 0, true, 60),
+                relay_block: (true, true, true, String::new(), "full".to_string()),
+                extrapool: ExtrapoolConfig::default(),
+                mining: (None, 0, None),
+                datacarrier_bytes: Some(avila_mempool::policy::MAX_OP_RETURN_RELAY),
+            },
+        )
+    }
+
+    #[test]
+    fn live_knob_applies_and_normalizes() {
+        let (mut mgr, mut knobs) = fixture();
+        apply_knob(&mut mgr, &mut knobs, "net.blocks_only", &json!(true)).unwrap();
+        apply_knob(
+            &mut mgr,
+            &mut knobs,
+            "relay.block.announce",
+            &json!("headers"),
+        )
+        .unwrap();
+        assert_eq!(knobs.relay_block.3, "headers");
+        // "auto" normalizes to the empty string = negotiated default.
+        apply_knob(&mut mgr, &mut knobs, "relay.block.announce", &json!("auto")).unwrap();
+        assert_eq!(knobs.relay_block.3, "");
+    }
+
+    #[test]
+    fn live_knob_tuple_members_apply_whole() {
+        let (mut mgr, mut knobs) = fixture();
+        apply_knob(&mut mgr, &mut knobs, "relay.tx.announce", &json!("none")).unwrap();
+        assert_eq!(knobs.relay_tx.0, "none");
+        apply_knob(&mut mgr, &mut knobs, "relay.tx.send_feefilter", &json!(500)).unwrap();
+        assert_eq!(knobs.relay_tx.3, 500);
+        assert_eq!(knobs.relay_tx.0, "none");
+    }
+
+    #[test]
+    fn live_knob_rejects_bad_domain_and_unknown() {
+        let (mut mgr, mut knobs) = fixture();
+        assert!(apply_knob(&mut mgr, &mut knobs, "relay.tx.announce", &json!("loud")).is_err());
+        assert!(apply_knob(&mut mgr, &mut knobs, "relay.block.serve", &json!("some")).is_err());
+        assert!(apply_knob(&mut mgr, &mut knobs, "net.connect", &json!(true)).is_err());
+        // Over-consensus mining weight refuses — policy cannot make
+        // an invalid block.
+        assert!(
+            apply_knob(
+                &mut mgr,
+                &mut knobs,
+                "mining.max_weight",
+                &json!(4_000_001u64)
+            )
+            .is_err()
+        );
+        assert!(
+            apply_knob(
+                &mut mgr,
+                &mut knobs,
+                "mining.max_weight",
+                &json!(3_500_000u64)
+            )
+            .is_ok()
+        );
+        // A non-live-but-documented knob reports restart, not success.
+        assert!(apply_knob(&mut mgr, &mut knobs, "indexes.txindex", &json!(true)).is_err());
+    }
+
+    #[test]
+    fn live_knob_types_are_checked() {
+        let (mut mgr, mut knobs) = fixture();
+        assert!(apply_knob(&mut mgr, &mut knobs, "net.blocks_only", &json!("yes")).is_err());
+        assert!(apply_knob(&mut mgr, &mut knobs, "mempool.max_mb", &json!(true)).is_err());
+        assert!(
+            apply_knob(
+                &mut mgr,
+                &mut knobs,
+                "relay.tx.deny_pairs",
+                &json!(["inbound->local", "extrapool->outbound"])
+            )
+            .is_ok()
+        );
+        assert!(
+            apply_knob(
+                &mut mgr,
+                &mut knobs,
+                "relay.tx.deny_pairs",
+                &json!(["no-arrow"])
+            )
+            .is_err()
+        );
+    }
 }
