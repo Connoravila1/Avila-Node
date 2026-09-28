@@ -19,6 +19,7 @@ use std::sync::mpsc::Sender;
 /// Enum knobs and their legal strings — the same sets `config` and
 /// `apply_knob` validate; the dropdown can't offer an invalid one.
 const CHOICES: &[(&str, &[&str])] = &[
+    ("network", &["mainnet", "testnet4", "signet", "regtest"]),
     ("relay.tx.announce", &["all", "private_only", "none"]),
     ("relay.block.announce", &["auto", "headers", "inv", "none"]),
     ("relay.block.serve", &["full", "tip", "none"]),
