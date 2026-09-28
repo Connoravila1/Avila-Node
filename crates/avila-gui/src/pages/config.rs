@@ -254,6 +254,8 @@ fn info_card(ui: &mut Ui, pal: crate::theme::Palette) {
                  it when it starts.",
                 "If you edit either file yourself, a banner lists what changed. \
                  Live changes can be applied without restarting.",
+                "A restart only restarts the node — the app stays open. Stop \
+                 node, start node, done.",
                 "Nothing here touches consensus rules — no knob changes what \
                  makes a block valid.",
             ] {
@@ -268,78 +270,29 @@ fn presets_menu(ui: &mut Ui, state: &mut ConfigPage, prefs: &mut crate::prefs::P
         .selected_text(RichText::new("presets…").size(12.0).color(pal.muted))
         .width(140.0)
         .show_ui(ui, |ui| {
-            // Each row carries a quiet × at its end — removing a preset
-            // shouldn't mean opening it first.
-            let mut remove: Option<PresetSel> = None;
             for (i, p) in PRESETS.iter().enumerate() {
                 if prefs.hidden_presets.iter().any(|n| n == p.name) {
                     continue;
                 }
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(false, p.name)
-                        .on_hover_text(p.who)
-                        .clicked()
-                    {
-                        state.preset_open = Some(PresetSel::BuiltIn(i));
-                        ui.close();
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("×").size(12.0).color(pal.muted))
-                                .frame(false),
-                        )
-                        .on_hover_text("remove — the menu's restore item brings it back")
-                        .clicked()
-                    {
-                        remove = Some(PresetSel::BuiltIn(i));
-                    }
-                });
+                if ui
+                    .selectable_label(false, p.name)
+                    .on_hover_text(p.who)
+                    .clicked()
+                {
+                    state.preset_open = Some(PresetSel::BuiltIn(i));
+                    ui.close();
+                }
             }
             if !prefs.custom_presets.is_empty() {
                 ui.separator();
             }
             for (i, c) in prefs.custom_presets.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(false, &c.name)
-                        .on_hover_text("your preset")
-                        .clicked()
-                    {
-                        state.preset_open = Some(PresetSel::Custom(i));
-                        ui.close();
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("×").size(12.0).color(pal.muted))
-                                .frame(false),
-                        )
-                        .on_hover_text("delete — saved presets can't be undeleted")
-                        .clicked()
-                    {
-                        remove = Some(PresetSel::Custom(i));
-                    }
-                });
-            }
-            match remove {
-                Some(PresetSel::BuiltIn(i)) => {
-                    prefs.hidden_presets.push(PRESETS[i].name.to_string());
-                }
-                Some(PresetSel::Custom(i)) => {
-                    prefs.custom_presets.remove(i);
-                }
-                None => {}
-            }
-            if !prefs.hidden_presets.is_empty() {
-                ui.separator();
                 if ui
-                    .selectable_label(
-                        false,
-                        format!("restore removed presets ({})", prefs.hidden_presets.len()),
-                    )
+                    .selectable_label(false, &c.name)
+                    .on_hover_text("your preset")
                     .clicked()
                 {
-                    prefs.hidden_presets.clear();
+                    state.preset_open = Some(PresetSel::Custom(i));
                     ui.close();
                 }
             }
@@ -585,10 +538,7 @@ fn preset_card(
                 }
                 ui.add_space(8.0);
                 if widgets::button(ui, "remove this preset", Kind::Quiet)
-                    .on_hover_text(match sel {
-                        PresetSel::BuiltIn(_) => "Hide it — restore removed presets brings it back",
-                        PresetSel::Custom(_) => "Delete it — saved presets can't be undeleted",
-                    })
+                    .on_hover_text("Remove it for good")
                     .clicked()
                 {
                     match sel {

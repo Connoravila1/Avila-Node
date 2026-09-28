@@ -77,8 +77,7 @@ pub struct Prefs {
     /// Presets the user saved on the Config page.
     #[serde(default)]
     pub custom_presets: Vec<CustomPreset>,
-    /// Built-in presets the user removed, by name — they can return
-    /// via "restore removed" in the presets menu.
+    /// Built-in presets the user removed, by name — removal deletes.
     #[serde(default)]
     pub hidden_presets: Vec<String>,
 }
