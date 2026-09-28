@@ -156,14 +156,15 @@ pub fn show(
     state: &mut ConfigPage,
     node: &Node,
     control: Option<Sender<ControlMsg>>,
+    config_file: Option<&std::path::Path>,
 ) -> Option<Action> {
     let pal = s.pal;
     widgets::section(
         ui,
         "Node policy",
         Some(
-            "Every knob the config file sets. Colored marks apply to the running node this \
-             session — the file is never written; a restart reverts. Dimmer marks need one.",
+            "Every knob the config file sets. Bright marks edit the running node — dim ones \
+             need a restart. The file is never written; restart reverts.",
         ),
     );
     ui.add_space(6.0);
@@ -177,6 +178,21 @@ pub fn show(
                     .color(pal.muted),
             );
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(file) = config_file {
+                if ui
+                    .link(
+                        RichText::new(format!("edit {}", file.display()))
+                            .size(12.0)
+                            .color(pal.muted),
+                    )
+                    .on_hover_text("Open the config file in your editor")
+                    .clicked()
+                {
+                    let _ = std::process::Command::new("xdg-open").arg(file).spawn();
+                }
+            }
+        });
     });
     ui.add_space(10.0);
 
@@ -209,7 +225,7 @@ pub fn show(
             );
             ui.add_space(4.0);
         }
-        row(ui, pal, state, k, control.as_ref());
+        row(ui, pal, state, k, control.as_ref(), config_file);
     }
     None
 }
@@ -220,6 +236,7 @@ fn row(
     state: &mut ConfigPage,
     k: &avila_node::config::KnobDescription,
     control: Option<&Sender<ControlMsg>>,
+    config_file: Option<&std::path::Path>,
 ) {
     let live = k.edit == EditKind::Live && control.is_some();
     let value = effective(state, k.path, &k.value);
@@ -259,9 +276,30 @@ fn row(
                 } else if k.edit == EditKind::Live {
                     ui.label(RichText::new("live").size(11.5).color(pal.muted))
                         .on_hover_text("Applies to the running node without a restart");
+                } else if let Some(file) = config_file {
+                    let r = ui
+                        .add(
+                            egui::Label::new(
+                                RichText::new("restart →")
+                                    .size(11.5)
+                                    .color(pal.muted)
+                                    .underline(),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text(format!(
+                            "Read at startup — click to edit {}",
+                            file.display()
+                        ));
+                    if r.clicked() {
+                        // The file opens in whatever the desktop hands
+                        // .toml to; the knob's doc line names what to
+                        // find once it lands.
+                        let _ = std::process::Command::new("xdg-open").arg(file).spawn();
+                    }
                 } else {
                     ui.label(RichText::new("restart").size(11.5).color(pal.muted))
-                        .on_hover_text("Read at startup — edit the config file");
+                        .on_hover_text("Read at startup — no config file was loaded");
                 }
             });
             if let Some(reason) = rejected {

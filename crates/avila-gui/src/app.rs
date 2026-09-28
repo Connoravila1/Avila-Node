@@ -12,7 +12,7 @@ use crate::session::{ActivityKind, Phase, RunSettings, Session};
 use crate::theme::{self, Palette, Skin, font};
 use crate::toybox;
 use crate::widgets::{self, Kind, hatch};
-use crate::{brand, model, phosphor, xp};
+use crate::{brand, classic, model, phosphor, xp};
 use avila_node::Node;
 use avila_node::events::NodeEvent;
 use eframe::egui::{
@@ -40,6 +40,9 @@ pub struct App {
     ribbon_view: View,
     /// The Config page's live-edit state — drafts, pending, overrides.
     config_page: pages::config::ConfigPage,
+    /// The TOML this node was loaded from — the Config page offers it
+    /// up for the knobs that only a restart can apply.
+    config_file: Option<std::path::PathBuf>,
     /// The toybox's shelf: every game, the hash-fed toys, the confetti.
     toys: toybox::Toys,
     /// The toy a capture posed, so it isn't re-posed every frame.
@@ -78,6 +81,8 @@ impl App {
         demo: bool,
         theme_override: Option<ThemeChoice>,
         close: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        // The TOML the node was loaded from — restart knobs open it.
+        config_file: Option<std::path::PathBuf>,
     ) -> Self {
         let ctx = &cc.egui_ctx;
         // A signal lands whenever it lands — the window may be idle and
@@ -213,6 +218,7 @@ impl App {
             restart: false,
             events_tail,
             decorated: None,
+            config_file,
         };
         // The compositor may never send a frame callback while the
         // window is occluded — a node must sync anyway, so the worker
@@ -291,6 +297,7 @@ impl App {
                         &mut self.config_page,
                         &self.node,
                         self.session.control_sender(),
+                        self.config_file.as_deref(),
                     ),
                     Page::Toybox => {
                         toybox::show(ui, &scene, &mut self.toys, &mut self.prefs);
@@ -480,6 +487,22 @@ impl App {
             if self.session.demo {
                 ui.add_space(6.0);
                 demo_badge(ui, pal);
+            }
+            // The tip skin wears its block — name it.
+            if Skin::current() == Skin::Tip
+                && let Some((h, hash)) = self
+                    .session
+                    .view
+                    .as_ref()
+                    .and_then(|v| v.recent.last())
+            {
+                ui.add_space(6.0);
+                let tail = &hash[hash.len().saturating_sub(8)..];
+                ui.label(
+                    RichText::new(format!("dressed by {h} · …{tail}"))
+                        .font(font(theme::MONO_MEDIUM, 11.5))
+                        .color(pal.signal_text),
+                );
             }
             if self
                 .session
@@ -690,34 +713,65 @@ impl eframe::App for App {
                 None => {}
             }
         } else {
-            egui::Panel::left("rail")
-                .exact_size(rail::WIDTH)
-                .resizable(false)
-                .show_separator_line(false)
-                .frame(Frame::new().fill(pal.rail))
-                .show(ui, |ui| {
-                    rail::show(
-                        ui,
-                        &mut self.page,
-                        self.swirl.as_ref(),
-                        network_name(network),
-                        phase.live(),
-                        self.prefs.toybox,
-                    );
-                });
-            egui::Panel::top("status")
-                .exact_size(68.0)
-                .resizable(false)
-                .show_separator_line(false)
-                .frame(Frame::new().fill(pal.canvas).inner_margin(Margin {
-                    left: 30,
-                    right: 30,
-                    top: 0,
-                    bottom: 0,
-                }))
-                .show(ui, |ui| {
-                    action = self.status_line(ui, pal, phase);
-                });
+            if Skin::current() == Skin::Classic {
+                // The '11 chrome: menus and raised tabs up top, the
+                // counting status bar at the foot — no rail, no
+                // modern status line.
+                egui::Panel::top("qt-chrome")
+                    .exact_size(classic::CHROME_H)
+                    .resizable(false)
+                    .frame(Frame::new().fill(pal.well))
+                    .show(ui, |ui| {
+                        match classic::chrome(ui, &mut self.page, &mut self.prefs) {
+                            Some(classic::Pick::Open(p)) => self.page = p,
+                            Some(classic::Pick::Modern) => self.prefs.skin = Skin::Standard,
+                            None => {}
+                        }
+                    });
+                egui::Panel::bottom("qt-status")
+                    .exact_size(classic::STATUSBAR_H)
+                    .resizable(false)
+                    .frame(Frame::new().fill(pal.well))
+                    .show(ui, |ui| {
+                        if let Some(a) = classic::statusbar(
+                            ui,
+                            phase.label(),
+                            &self.context_line(),
+                            self.session.running(),
+                        ) {
+                            action = Some(a);
+                        }
+                    });
+            } else {
+                egui::Panel::left("rail")
+                    .exact_size(rail::WIDTH)
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .frame(Frame::new().fill(pal.rail))
+                    .show(ui, |ui| {
+                        rail::show(
+                            ui,
+                            &mut self.page,
+                            self.swirl.as_ref(),
+                            network_name(network),
+                            phase.live(),
+                            self.prefs.toybox,
+                        );
+                    });
+                egui::Panel::top("status")
+                    .exact_size(68.0)
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .frame(Frame::new().fill(pal.canvas).inner_margin(Margin {
+                        left: 30,
+                        right: 30,
+                        top: 0,
+                        bottom: 0,
+                    }))
+                    .show(ui, |ui| {
+                        action = self.status_line(ui, pal, phase);
+                    });
+            }
             egui::CentralPanel::default()
                 .frame(Frame::new().fill(pal.canvas))
                 .show(ui, |ui| {

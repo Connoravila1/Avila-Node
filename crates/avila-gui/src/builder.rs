@@ -8,7 +8,7 @@ use crate::theme::{self, MONO_MEDIUM, Palette, font, mono};
 use crate::widgets::{self, Kind as Button};
 use eframe::egui::{
     Align, Align2, Color32, Key, Layout, Modifiers, Painter, Pos2, Rect, RichText, Sense, Stroke,
-    StrokeKind, Ui, pos2, vec2,
+    StrokeKind, Ui, UiBuilder, pos2, vec2,
 };
 use std::time::Instant;
 
@@ -448,6 +448,9 @@ pub fn show(ui: &mut Ui, pal: &Palette, game: &mut Builder, prefs: &mut Prefs) {
 
     let p = ui.painter_at(rect);
     draw(&p, board, side, pal, game, prefs.builder_best);
+    if game.state == State::Over {
+        over_card(ui, board, pal, game);
+    }
     ui.add_space(8.0);
     ui.label(
         RichText::new(
@@ -589,19 +592,19 @@ fn draw(p: &Painter, board: Rect, side: Rect, pal: &Palette, game: &Builder, bes
         mono(11.5),
         pal.faint,
     );
+    // The tx coming next — a preview only, drawn flat so nothing
+    // suggests it can be clicked.
     p.text(
         side.left_top() + vec2(0.0, 108.0),
         Align2::LEFT_TOP,
-        "next tx",
+        "next in the mempool",
         theme::body(11.5),
         pal.faint,
     );
-    let next_box = Rect::from_min_size(side.left_top() + vec2(0.0, 128.0), vec2(96.0, 84.0));
-    p.rect_filled(next_box, 8, pal.well);
-    let (base, n) = PIECES[game.next.kind];
+    let (base, _) = PIECES[game.next.kind];
     let s = 18.0;
-    let x0 = next_box.center().x - n as f32 * s / 2.0;
-    let y0 = next_box.center().y - s;
+    let x0 = side.left() + 8.0;
+    let y0 = side.top() + 134.0;
     for &(x, y) in base {
         cell(
             p,
@@ -611,28 +614,75 @@ fn draw(p: &Painter, board: Rect, side: Rect, pal: &Palette, game: &Builder, bes
         );
     }
     p.text(
-        next_box.center_bottom() - vec2(0.0, 6.0),
-        Align2::CENTER_CENTER,
+        pos2(x0 + 4.0 * s + 8.0, y0 + s),
+        Align2::LEFT_CENTER,
         format!("{} sat/vB", game.next.fee),
-        mono(10.5),
+        mono(11.0),
         pal.muted,
     );
 
-    match game.state {
-        State::Paused => veil(p, board, pal, "Paused", "Space to go on"),
-        State::Over => veil(
-            p,
-            board,
-            pal,
-            "The mempool won",
-            &format!(
-                "{} sats in {} blocks{} — Space for another shift",
-                thousands(game.score),
-                game.sealed,
-                if game.new_best { " · a new best" } else { "" }
-            ),
+    if game.state == State::Paused {
+        veil(p, board, pal, "Paused", "Space to go on");
+    }
+}
+
+/// The topout — the verdict, the take, and the buttons.
+fn over_card(ui: &mut Ui, board: Rect, pal: &Palette, game: &mut Builder) {
+    let card = Rect::from_center_size(board.center(), vec2(360.0, 210.0));
+    let p = ui.painter_at(board);
+    p.rect_filled(board.expand(6.0), 12, pal.well.gamma_multiply(0.72));
+    p.rect_filled(
+        card.translate(vec2(0.0, 3.0)),
+        14,
+        Color32::from_black_alpha(30),
+    );
+    p.rect_filled(card, 14, pal.raised);
+    p.rect_stroke(card, 14, Stroke::new(1.0, pal.hairline), StrokeKind::Inside);
+    p.text(
+        card.center_top() + vec2(0.0, 34.0),
+        Align2::CENTER_CENTER,
+        "The mempool won",
+        font(theme::TITLE, 28.0),
+        pal.alert,
+    );
+    p.text(
+        card.center_top() + vec2(0.0, 68.0),
+        Align2::CENTER_CENTER,
+        "the pile reached the ceiling",
+        theme::body(13.0),
+        pal.muted,
+    );
+    p.text(
+        card.center_top() + vec2(0.0, 104.0),
+        Align2::CENTER_CENTER,
+        format!(
+            "{} sats in {} blocks{}",
+            thousands(game.score),
+            game.sealed,
+            if game.new_best { " — a new best" } else { "" }
         ),
-        State::Playing => {}
+        font(MONO_MEDIUM, 16.0),
+        if game.new_best {
+            pal.signal_text
+        } else {
+            pal.text
+        },
+    );
+    let row_rect = Rect::from_min_max(
+        card.left_bottom() + vec2(24.0, -56.0),
+        card.right_bottom() - vec2(24.0, 18.0),
+    );
+    let mut row = ui.new_child(
+        UiBuilder::new()
+            .max_rect(row_rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    if widgets::button(&mut row, "Another shift", Button::Primary).clicked() {
+        game.play();
+    }
+    row.add_space(8.0);
+    if widgets::button(&mut row, "Back to the toybox", Button::Quiet).clicked() {
+        game.shelve();
     }
 }
 

@@ -174,7 +174,7 @@ pub fn show(ui: &mut Ui, s: &Scene, oracle: &mut Oracle) {
         .last()
         .and_then(|&c| (c as char).to_digit(16))
         .unwrap_or(0) as usize;
-    draw_hex_row(&p, card.center_top() + vec2(0.0, 74.0), &pal, tail_digit);
+    draw_tip_tail(&p, card.center_top() + vec2(0.0, 70.0), &pal, tail_digit);
 
     // The caller's row: sixteen picks, or the verdict if one's pending.
     match &oracle.pending {
@@ -199,31 +199,25 @@ pub fn show(ui: &mut Ui, s: &Scene, oracle: &mut Oracle) {
     }
 }
 
-/// The sixteen digits in a row; `lit` is raised in the signal color.
-fn draw_hex_row(p: &Painter, at: Pos2, pal: &Palette, lit: usize) {
-    let w = 30.0;
-    let x0 = at.x - 8.0 * w;
-    for (d, ch) in HEX.iter().enumerate() {
-        let r = Rect::from_min_size(pos2(x0 + d as f32 * w, at.y - 17.0), vec2(26.0, 34.0));
-        let hot = d == lit;
-        if hot {
-            p.rect_filled(r, 6, pal.signal);
-        }
-        p.text(
-            r.center(),
-            Align2::CENTER_CENTER,
-            ch.to_string(),
-            font(MONO_MEDIUM, if hot { 17.0 } else { 14.0 }),
-            if hot { pal.on_signal() } else { pal.muted },
-        );
-    }
+/// The tip's own tail digit in a chip — what the oracle just read.
+fn draw_tip_tail(p: &Painter, at: Pos2, pal: &Palette, lit: usize) {
+    let r = Rect::from_center_size(at, vec2(44.0, 44.0));
+    p.rect_filled(r, 9, pal.signal);
+    p.text(
+        r.center(),
+        Align2::CENTER_CENTER,
+        HEX[lit].to_string(),
+        font(MONO_MEDIUM, 22.0),
+        pal.on_signal(),
+    );
 }
 
-/// Sixteen cells to call — each a quiet clickable digit.
+/// Sixteen cells to call — each a quiet clickable digit, nothing
+/// written small enough to squint at.
 fn picks(ui: &mut Ui, card: Rect, pal: &Palette, oracle: &mut Oracle, tip_height: u32) {
     let row = Rect::from_min_size(
-        pos2(card.center().x - 8.0 * 42.0, card.top() + 130.0),
-        vec2(16.0 * 42.0, 54.0),
+        pos2(card.center().x - 8.0 * 42.0, card.top() + 126.0),
+        vec2(16.0 * 42.0, 52.0),
     );
     ui.scope_builder(
         UiBuilder::new()
@@ -232,7 +226,7 @@ fn picks(ui: &mut Ui, card: Rect, pal: &Palette, oracle: &mut Oracle, tip_height
         |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             for (d, ch) in HEX.iter().enumerate() {
-                let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 50.0), Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 52.0), Sense::click());
                 let p = ui.painter_at(rect);
                 let hot = resp.hovered();
                 p.rect_filled(
@@ -251,18 +245,11 @@ fn picks(ui: &mut Ui, card: Rect, pal: &Palette, oracle: &mut Oracle, tip_height
                     StrokeKind::Inside,
                 );
                 p.text(
-                    rect.center() - vec2(0.0, 4.0),
+                    rect.center(),
                     Align2::CENTER_CENTER,
                     ch.to_string(),
-                    font(MONO_MEDIUM, 17.0),
+                    font(MONO_MEDIUM, 20.0),
                     if hot { pal.text } else { pal.muted },
-                );
-                p.text(
-                    rect.center() + vec2(0.0, 12.0),
-                    Align2::CENTER_CENTER,
-                    if d == 0 { "one in sixteen" } else { "" },
-                    theme::body(8.5),
-                    pal.faint,
                 );
                 if resp.clicked() {
                     oracle.pending = Some(Call {
@@ -275,6 +262,14 @@ fn picks(ui: &mut Ui, card: Rect, pal: &Palette, oracle: &mut Oracle, tip_height
                 resp.on_hover_cursor(CursorIcon::PointingHand);
             }
         },
+    );
+    let p = ui.painter_at(row);
+    p.text(
+        row.center_bottom() + vec2(0.0, 20.0),
+        Align2::CENTER_CENTER,
+        "call the next block's last hex digit — an honest one in sixteen",
+        theme::body(12.0),
+        pal.faint,
     );
 }
 

@@ -74,6 +74,7 @@ mod capture {
         }
     }
 }
+mod classic;
 mod clock;
 mod constellation;
 mod demo;
@@ -130,6 +131,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("warning: signal handler for {sig} not installed: {e}");
         }
     }
+    // Keep the file's path: the Config page opens it for the
+    // restart-only knobs it can't edit live.
+    let config_file = args
+        .config
+        .clone()
+        .and_then(|p| p.canonicalize().ok().or(Some(p)));
     let node = Node::new(load_config(args.config.as_deref())?)?;
     let icon = eframe::icon_data::from_png_bytes(brand::LOGO_PNG)?;
     let title = if args.demo {
@@ -152,7 +159,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     eframe::run_native(
         "Avila Node",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, node, demo, theme, close_flag)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::App::new(
+                cc,
+                node,
+                demo,
+                theme,
+                close_flag,
+                config_file,
+            )))
+        }),
     )?;
     Ok(())
 }

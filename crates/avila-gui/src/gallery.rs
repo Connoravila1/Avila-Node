@@ -42,34 +42,35 @@ pub fn hash_bytes(hash: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// One painting: a mirrored tile field in the hash's hue, on a mat.
-/// Eight source columns fold over the middle seam into fifteen.
+/// One painting: a mirrored tile field painted in the hash's own hues,
+/// on a mat. Eight source columns fold over the middle seam into
+/// fifteen. The hash's leading bytes are all zeroes by definition —
+/// the proof-of-work target — so the palette reads the tail, where
+/// the entropy lives.
 pub fn painting(p: &Painter, rect: Rect, hash: &[u8; 32]) {
-    let hue = f32::from(hash[0]) / 255.0;
-    let second = f32::from(hash[1]) / 255.0;
-    let paint = |s: f32, v: f32| -> Color32 {
-        Hsva {
-            h: hue,
-            s,
-            v,
-            a: 1.0,
-        }
-        .into()
-    };
-    p.rect_filled(rect, 2, paint(0.16, 0.92));
+    let tail = &hash[16..];
+    let hue = f32::from(tail[0]) / 255.0;
+    let second = f32::from(tail[4]) / 255.0;
+    let paint = |h: f32, s: f32, v: f32| -> Color32 { Hsva { h, s, v, a: 1.0 }.into() };
+    p.rect_filled(rect, 2, paint(hue, 0.14, 0.93));
     let cell = (rect.width() / (2 * TILES_X - 1) as f32).min(rect.height() / TILES_Y as f32);
     let grid = vec2(cell * (2 * TILES_X - 1) as f32, cell * TILES_Y as f32);
     let at = rect.center() - grid / 2.0;
-    let lit = paint(0.78, 0.62 + 0.2 * second);
-    let dim = paint(0.5, 0.78 + 0.15 * second);
+    let lit = paint(hue, 0.72, 0.55 + 0.25 * second);
+    let dim = paint(second, 0.55, 0.7 + 0.2 * second);
+    let deep = paint(hue, 0.8, 0.34);
     for y in 0..TILES_Y {
         for x in 0..TILES_X {
-            let byte = hash[2 + (x + y * TILES_X) % 30];
+            let byte = tail[(x + y * TILES_X) % tail.len()];
             if byte >> ((x + y) % 8) & 1 == 0 {
                 continue;
             }
-            let accent = hash[2 + (x * 3 + y) % 30] >> (y % 8) & 1 != 0;
-            let fill = if accent { lit } else { dim };
+            let shade = tail[(x * 5 + y * 3) % tail.len()];
+            let fill = match shade % 3 {
+                0 => lit,
+                1 => dim,
+                _ => deep,
+            };
             for col in [x, 2 * TILES_X - 2 - x] {
                 let r = Rect::from_min_size(
                     at + vec2(col as f32 * cell, y as f32 * cell),
@@ -117,10 +118,10 @@ pub fn show(ui: &mut Ui, s: &Scene, gallery: &mut Gallery) {
             "Start the node and every block it connects hangs a painting here.",
         );
     } else {
-        // The wall: frames across, wrapping; each is mat + painting +
-        // height and the hash's tail.
-        let gap = 14.0;
-        let card_w = 176.0;
+        // The wall: frames across, wrapping; each is a matted painting
+        // with a small plaque — the height and the hash's tail.
+        let gap = 16.0;
+        let card_w = 208.0;
         let per_row = ((ui.available_width() + gap) / (card_w + gap)).max(1.0) as usize;
         for row in blocks.chunks(per_row) {
             ui.horizontal(|ui| {
@@ -137,28 +138,36 @@ pub fn show(ui: &mut Ui, s: &Scene, gallery: &mut Gallery) {
     }
 }
 
-/// One frame on the wall.
+/// One frame on the wall: a dark frame, a light mat, the painting,
+/// and a little plaque.
 fn frame(ui: &mut Ui, pal: &Palette, height: u32, hash: &str) {
-    let (rect, _r) = ui.allocate_exact_size(vec2(172.0, 216.0), Sense::hover());
+    let (rect, _r) = ui.allocate_exact_size(vec2(204.0, 252.0), Sense::hover());
     let p = ui.painter_at(rect);
-    p.rect_filled(rect, 8, pal.raised);
-    p.rect_stroke(rect, 8, Stroke::new(1.0, pal.hairline), StrokeKind::Inside);
-    let art = Rect::from_min_max(rect.min + vec2(10.0, 10.0), rect.min + vec2(162.0, 152.0));
+    // Frame.
+    p.rect_filled(rect, 4, pal.rail);
+    p.rect_stroke(rect, 4, Stroke::new(1.0, pal.hairline), StrokeKind::Inside);
+    // Mat.
+    let mat = rect.shrink(10.0);
+    p.rect_filled(mat, 2, pal.canvas);
+    let art = mat.shrink(8.0);
+    let art = Rect::from_min_max(art.min, pos2(art.right(), mat.bottom() - 44.0));
     match hash_bytes(hash) {
         Some(bytes) => painting(&p, art, &bytes),
         None => {
             p.rect_filled(art, 2, pal.well);
         }
     }
+    p.rect_stroke(art, 2, Stroke::new(1.0, pal.hairline), StrokeKind::Inside);
+    // Plaque.
     p.text(
-        pos2(rect.left() + 12.0, rect.top() + 164.0),
+        pos2(mat.left() + 6.0, art.bottom() + 10.0),
         Align2::LEFT_TOP,
         format!("Block {}", thousands(height.into())),
         font(theme::MEDIUM, 12.5),
         pal.text,
     );
     p.text(
-        pos2(rect.left() + 12.0, rect.top() + 186.0),
+        pos2(mat.left() + 6.0, art.bottom() + 28.0),
         Align2::LEFT_TOP,
         format!("…{}", &hash[hash.len().saturating_sub(12)..]),
         mono(10.5),

@@ -13,7 +13,7 @@ use crate::theme::{self, MONO_MEDIUM, Palette, font, mono};
 use crate::widgets::{self, Kind as Button};
 use eframe::egui::{
     Align, Align2, Color32, CursorIcon, Key, Layout, Modifiers, Painter, Pos2, Rect, RichText,
-    Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
+    Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 use std::time::Instant;
 
@@ -566,7 +566,7 @@ fn board(ui: &mut Ui, pal: &Palette, game: &mut Sweep, prefs: &mut Prefs) {
         );
     }
     match game.state {
-        State::Won | State::Lost => end_card(&p, board, pal, game, new_best),
+        State::Won | State::Lost => end_card(ui, board, pal, game, new_best),
         _ => {}
     }
 }
@@ -621,9 +621,10 @@ fn mine(p: &Painter, cr: Rect, pal: &Palette, boom: bool) {
     );
 }
 
-/// The verdict, in the board's middle.
-fn end_card(p: &Painter, board: Rect, pal: &Palette, game: &Sweep, new_best: bool) {
-    let r = Rect::from_center_size(board.center(), vec2(320.0, 150.0));
+/// The verdict, in the board's middle — with the way back in.
+fn end_card(ui: &mut Ui, board: Rect, pal: &Palette, game: &mut Sweep, new_best: bool) {
+    let r = Rect::from_center_size(board.center(), vec2(360.0, 214.0));
+    let p = ui.painter_at(board);
     p.rect_filled(board.expand(6.0), 12, pal.well.gamma_multiply(0.72));
     p.rect_filled(
         r.translate(vec2(0.0, 3.0)),
@@ -667,6 +668,22 @@ fn end_card(p: &Painter, board: Rect, pal: &Palette, game: &Sweep, new_best: boo
         theme::body(13.0),
         pal.muted,
     );
+    let row_rect = Rect::from_min_max(
+        r.left_bottom() + vec2(24.0, -56.0),
+        r.right_bottom() - vec2(24.0, 18.0),
+    );
+    let mut row = ui.new_child(
+        UiBuilder::new()
+            .max_rect(row_rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    if widgets::button(&mut row, "Another template", Button::Primary).clicked() {
+        game.play(game.tier, game.height);
+    }
+    row.add_space(8.0);
+    if widgets::button(&mut row, "Back to the toybox", Button::Quiet).clicked() {
+        game.shelve();
+    }
 }
 
 #[cfg(test)]

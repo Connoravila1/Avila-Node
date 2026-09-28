@@ -580,8 +580,8 @@ impl Game {
 // The shelf
 // ---------------------------------------------------------------------
 
-/// Everything the shelf holds: the games, the toys that run on the
-/// chain's own blocks, and the confetti a real block drops over it all.
+/// Everything the shelf holds: the games and the toys that run on
+/// the chain's own blocks.
 #[derive(Default)]
 pub struct Toys {
     pub game: Game,
@@ -591,23 +591,8 @@ pub struct Toys {
     pub gallery: gallery::Gallery,
     pub oracle: oracle::Oracle,
     pub avalanche: avalanche::Avalanche,
-    /// Bits of a just-landed block still in the air.
-    confetti: Vec<Piece>,
-    /// The tip the last burst was thrown for.
-    confetti_tip: Option<f64>,
-    seed: u64,
-    last: Option<Instant>,
-}
-
-/// A strip of confetti.
-struct Piece {
-    at: Pos2,
-    vel: Vec2,
-    angle: f32,
-    spin: f32,
-    size: f32,
-    color: Color32,
-    age: f32,
+    /// The tip a running Blocksweeper last took its hint from.
+    gifted_tip: Option<f64>,
 }
 
 impl Toys {
@@ -619,7 +604,6 @@ impl Toys {
             || self.snake.animating()
             || self.builder.animating()
             || self.oracle.animating()
-            || !self.confetti.is_empty()
     }
 
     /// Poses the capture harness asks for — open a toy mid-scene.
@@ -642,71 +626,16 @@ impl Toys {
         }
     }
 
-    fn rand(&mut self) -> f32 {
-        self.seed = self.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.seed;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        ((z ^ (z >> 31)) >> 40) as f32 / (1_u64 << 24) as f32
-    }
-
-    /// A block connected: throw confetti over whatever's on screen, and
-    /// let a running Blocksweeper take the hint.
-    fn blocks_landed(&mut self, s: &Scene, area: Rect) {
+    /// A block connected — a running Blocksweeper takes the hint.
+    fn tip_advanced(&mut self, s: &Scene) {
         let Some(at) = s.session.tip_advanced_at else {
             return;
         };
-        if self.confetti_tip == Some(at) {
+        if self.gifted_tip == Some(at) {
             return;
         }
-        self.confetti_tip = Some(at);
+        self.gifted_tip = Some(at);
         self.sweep.gift(at);
-        for _ in 0..72 {
-            let x = area.left() + self.rand() * area.width();
-            let y = area.top() - 10.0 - 60.0 * self.rand();
-            let vel = vec2((self.rand() - 0.5) * 70.0, 40.0 + 90.0 * self.rand());
-            let angle = self.rand() * TAU;
-            let spin = (self.rand() - 0.5) * 9.0;
-            let size = 5.0 + 6.0 * self.rand();
-            let hue_pick = self.rand();
-            self.confetti.push(Piece {
-                at: pos2(x, y),
-                vel,
-                angle,
-                spin,
-                size,
-                color: if hue_pick < 0.5 {
-                    s.pal.signal
-                } else if hue_pick < 0.8 {
-                    s.pal.signal_text
-                } else {
-                    s.pal.muted
-                },
-                age: 0.0,
-            });
-        }
-    }
-
-    /// Steps and draws the confetti over the page.
-    fn draw_confetti(&mut self, p: &Painter, area: Rect, dt: f32) {
-        if self.confetti.is_empty() {
-            return;
-        }
-        for piece in &mut self.confetti {
-            piece.age += dt;
-            piece.at += piece.vel * dt;
-            piece.vel.y += 320.0 * dt;
-            piece.vel.x *= 1.0 - 1.6 * dt;
-            piece.angle += piece.spin * dt;
-        }
-        self.confetti
-            .retain(|c| c.age < 4.0 && c.at.y < area.bottom() + 20.0);
-        for piece in &self.confetti {
-            let fade = (1.0 - piece.age / 4.0).clamp(0.0, 1.0);
-            let s = vec2(piece.size, piece.size * piece.angle.cos().abs().max(0.3));
-            let r = Rect::from_center_size(piece.at, s);
-            p.rect_filled(r, 1, piece.color.gamma_multiply(0.4 + 0.6 * fade));
-        }
     }
 }
 
@@ -753,16 +682,7 @@ pub fn show(ui: &mut Ui, s: &Scene, toys: &mut Toys, prefs: &mut Prefs) {
     } else {
         shelf(ui, s, toys, prefs);
     }
-    // Whatever a real block lands on, it lands on confetti first.
-    let now = Instant::now();
-    let dt = toys
-        .last
-        .map_or(0.016, |l| now.duration_since(l).as_secs_f32());
-    toys.last = Some(now);
-    let area = ui.clip_rect();
-    toys.blocks_landed(s, area);
-    let p = ui.painter().clone();
-    toys.draw_confetti(&p, area, dt.min(0.1));
+    toys.tip_advanced(s);
 }
 
 fn shelf(ui: &mut Ui, s: &Scene, toys: &mut Toys, prefs: &mut Prefs) {
@@ -1014,7 +934,7 @@ fn chain_cards(ui: &mut Ui, s: &Scene, toys: &mut Toys) {
             ui,
             &pal,
             "Hash oracle",
-            "Call the last digit of the next block's hash and build a streak. The odds are honest: one in sixteen.",
+            "Call the next block's last hex digit and build a streak.",
             waiting,
             |p, r| oracle_poster(p, r, &pal),
             &[("Open", Button::Quiet)],

@@ -9,7 +9,7 @@ use crate::theme::{self, MONO_MEDIUM, Palette, font, mono};
 use crate::widgets::{self, Kind as Button};
 use eframe::egui::{
     Align, Align2, Color32, Key, Layout, Modifiers, Painter, Pos2, Rect, RichText, Sense, Stroke,
-    StrokeKind, Ui, pos2, vec2,
+    StrokeKind, Ui, UiBuilder, pos2, vec2,
 };
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -64,6 +64,8 @@ pub struct Snake {
     score: u64,
     mined: u32,
     acc: f32,
+    /// Only ticks while playing — the sat's pulse runs off it.
+    clock: f32,
     reorg_in: f32,
     ghosts: Vec<Ghost>,
     floats: Vec<Float>,
@@ -84,6 +86,7 @@ impl Default for Snake {
             score: 0,
             mined: 0,
             acc: 0.0,
+            clock: 0.0,
             reorg_in: REORG_EVERY,
             ghosts: Vec::new(),
             floats: Vec::new(),
@@ -168,6 +171,17 @@ impl Snake {
             if !self.body.iter().any(|(b, _)| *b == at) {
                 self.food = at;
                 return;
+            }
+        }
+        // The rolls kept landing on the chain — take the first free
+        // cell instead of leaving the sat under the body somewhere.
+        for y in 0..ROWS {
+            for x in 0..COLS {
+                let at = Pos { x, y };
+                if !self.body.iter().any(|(b, _)| *b == at) {
+                    self.food = at;
+                    return;
+                }
             }
         }
     }
@@ -268,6 +282,7 @@ impl Snake {
             return None;
         }
         self.acc += dt;
+        self.clock += dt;
         self.reorg_in -= dt;
         if self.reorg_in <= 0.0 {
             self.reorg_in = REORG_EVERY * (0.7 + 0.6 * self.rand());
@@ -377,6 +392,9 @@ pub fn show(ui: &mut Ui, pal: &Palette, game: &mut Snake, prefs: &mut Prefs) {
     }
 
     draw(&p, board, pal, game, prefs.snake_best);
+    if game.state == State::Over {
+        over_card(ui, board, pal, game);
+    }
     ui.add_space(8.0);
     ui.label(
         RichText::new(
@@ -427,19 +445,38 @@ fn draw(p: &Painter, board: Rect, pal: &Palette, game: &Snake, best: u64) {
             pal.alert.gamma_multiply(f),
         );
     }
-    // The sat, glowing gently.
+    // The sat, pulsing so it can't be mistaken for part of the board.
+    let pulse = 1.0 + 0.12 * (game.clock * 3.5).sin();
     let at = board.min + center(game.food).to_vec2();
-    p.circle_filled(at, CELL * 0.34, pal.signal_alpha(0.22));
-    p.circle_filled(at, CELL * 0.24, pal.signal);
+    p.circle_filled(at, CELL * 0.44 * pulse, pal.signal_alpha(0.22));
+    p.circle_filled(at, CELL * 0.27 * pulse, pal.signal);
     p.text(at, Align2::CENTER_CENTER, "₿", mono(12.0), pal.on_signal());
-    // The chain itself, newest block brightest.
+    // The chain itself, newest block brightest. Each block slides out
+    // of the cell it just vacated — the discrete tick reads as a glide
+    // instead of a strobe.
+    let pace = (0.16 - 0.004 * game.mined as f32).max(0.07);
+    let slide = if game.state == State::Playing {
+        (game.acc / pace).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
     let n = game.body.len().max(1) as f32;
     for (i, (b, h)) in game.body.iter().enumerate() {
+        let came_from = match game.body.get(i + 1) {
+            Some((behind, _)) => *behind,
+            // The tail's old cell fell off the deque — step past it
+            // away from the block ahead and it reads right.
+            None => {
+                let ahead = game.body[i - 1].0;
+                Pos {
+                    x: b.x + b.x - ahead.x,
+                    y: b.y + b.y - ahead.y,
+                }
+            }
+        };
+        let at = center(came_from).lerp(center(*b), slide);
         let t = 1.0 - i as f32 / n;
-        let r = Rect::from_center_size(
-            board.min + center(*b).to_vec2(),
-            vec2(CELL - 5.0, CELL - 5.0),
-        );
+        let r = Rect::from_center_size(board.min + at.to_vec2(), vec2(CELL - 5.0, CELL - 5.0));
         let fill = if i == 0 {
             pal.signal
         } else {
@@ -501,18 +538,66 @@ fn draw(p: &Painter, board: Rect, pal: &Palette, game: &Snake, best: u64) {
     if game.state == State::Paused {
         veil(p, board, pal, "Paused", "Space to go on");
     }
-    if game.state == State::Over {
-        veil(
-            p,
-            board,
-            pal,
-            "Chain invalid",
-            &format!(
-                "{}{} — Space for a fresh chain",
-                btc(game.score as i64),
-                if game.new_best { " · a new best" } else { "" }
-            ),
-        );
+}
+
+/// The end of a run: the verdict, the take, and the buttons to go
+/// again or go home — Space works too, but shouldn't have to.
+fn over_card(ui: &mut Ui, board: Rect, pal: &Palette, game: &mut Snake) {
+    let card = Rect::from_center_size(board.center(), vec2(360.0, 210.0));
+    let p = ui.painter_at(board);
+    p.rect_filled(board.expand(6.0), 12, pal.well.gamma_multiply(0.72));
+    p.rect_filled(
+        card.translate(vec2(0.0, 3.0)),
+        14,
+        Color32::from_black_alpha(30),
+    );
+    p.rect_filled(card, 14, pal.raised);
+    p.rect_stroke(card, 14, Stroke::new(1.0, pal.hairline), StrokeKind::Inside);
+    p.text(
+        card.center_top() + vec2(0.0, 34.0),
+        Align2::CENTER_CENTER,
+        "Chain invalid",
+        font(theme::TITLE, 28.0),
+        pal.alert,
+    );
+    p.text(
+        card.center_top() + vec2(0.0, 68.0),
+        Align2::CENTER_CENTER,
+        "hit a wall or your own blocks — the network moved on",
+        theme::body(13.0),
+        pal.muted,
+    );
+    p.text(
+        card.center_top() + vec2(0.0, 104.0),
+        Align2::CENTER_CENTER,
+        if game.new_best {
+            format!("{} — a new best", btc(game.score as i64))
+        } else {
+            format!("{} stacked", btc(game.score as i64))
+        },
+        font(MONO_MEDIUM, 17.0),
+        if game.new_best {
+            pal.signal_text
+        } else {
+            pal.text
+        },
+    );
+    let row_rect = Rect::from_min_max(
+        card.left_bottom() + vec2(24.0, -56.0),
+        card.right_bottom() - vec2(24.0, 18.0),
+    );
+    let mut row = ui.new_child(
+        UiBuilder::new()
+            .max_rect(row_rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    if widgets::button(&mut row, "Play again", Button::Primary).clicked() {
+        let base = game.body.front().map(|(_, h)| *h).unwrap_or(0);
+        game.play(base);
+    }
+    row.add_space(8.0);
+    if widgets::button(&mut row, "Back to the toybox", Button::Quiet).clicked() {
+        game.shelve();
     }
 }
 
