@@ -202,6 +202,14 @@ const KNOB_DOCS: &[(&str, &str)] = &[
         "tx-admission verdict helpers ([[hooks.tx_admit]] — consulted per tx, before built-in checks; narrowing only)",
     ),
     (
+        "hooks.tx_serve",
+        "tx-serving verdict helpers ([[hooks.tx_serve]] — consulted per tx item in a peer's getdata; a reject answers notfound)",
+    ),
+    (
+        "mining.include_extrapool",
+        "audition extrapool entries for block templates — consensus-revalidated, confirmed inputs only, leftover budget only",
+    ),
+    (
         "filters.build",
         "maintain the BIP158 basic filter index (-blockfilterindex)",
     ),
@@ -475,6 +483,7 @@ pub fn risk_review(c: &NodeConfig) -> Vec<RiskFinding> {
         ("tx_announce", &c.hooks.tx_announce),
         ("extrapool_admit", &c.hooks.extrapool_admit),
         ("extrapool_promote", &c.hooks.extrapool_promote),
+        ("tx_serve", &c.hooks.tx_serve),
     ] {
         for (i, s) in specs.iter().enumerate() {
             if matches!(s.on_timeout, avila_core::OnDefault::Accept)

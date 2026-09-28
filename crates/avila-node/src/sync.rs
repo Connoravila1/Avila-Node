@@ -397,6 +397,12 @@ pub struct SyncConfig {
     pub deny_pairs: Vec<(String, String)>,
     /// `mempool.private` — stem-only, RPC-hidden submissions.
     pub private_submissions: bool,
+    /// `tx.serve` verdict helpers — consulted per tx item on inbound
+    /// `getdata`; `reject` answers that item `notfound`.
+    pub tx_serve_hooks: Vec<crate::hooks::HookSpec>,
+    /// `mining.include_extrapool` — audition observation-pool entries
+    /// for a template's leftover budget (consensus-revalidated).
+    pub mine_extrapool: bool,
     /// `[extrapool]` — the observation pool for policy rejects.
     pub extrapool: avila_core::ExtrapoolConfig,
     /// `peers.ban_time` — default `setban` duration (Core's `-bantime`).
@@ -451,6 +457,8 @@ impl Default for SyncConfig {
             extrapool_promote_hooks: Vec::new(),
             deny_pairs: Vec::new(),
             private_submissions: false,
+            tx_serve_hooks: Vec::new(),
+            mine_extrapool: false,
             shadow_profiles: vec!["strict".to_string()],
             extrapool: avila_core::ExtrapoolConfig::default(),
             ban_time: avila_p2p::banman::DEFAULT_BANTIME,
@@ -916,6 +924,7 @@ pub fn run(
     mgr.set_stem_relay(cfg.stem_relay);
     mgr.set_deny_pairs(cfg.deny_pairs.clone());
     mgr.set_private_submissions(cfg.private_submissions);
+    mgr.mempool().set_mine_extrapool(cfg.mine_extrapool);
     mgr.set_max_in_flight_total(cfg.max_in_transit);
     mgr.set_default_ban_time(cfg.ban_time);
     // The append-only event plane (docs/DECISION_REGISTRY.md — the
@@ -1220,6 +1229,89 @@ pub fn run(
                         .try_send(serde_json::json!({
                             "kind": "hook_verdict",
                             "point": "tx.announce",
+                            "helper": spec.program.display().to_string(),
+                            "verdict": match verdict {
+                                crate::hooks::Verdict::Accept => "accept",
+                                crate::hooks::Verdict::Reject => "reject",
+                                crate::hooks::Verdict::Defer => "defer",
+                            },
+                            "txid": txid.as_str(),
+                            "peer": peer,
+                            "admit": admit,
+                        }))
+                        .is_err()
+                    {
+                        dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    admit
+                })
+            },
+        )));
+    }
+    if !cfg.tx_serve_hooks.is_empty() {
+        use avila_core::OnDefault;
+        // One consult per tx item per getdata — batch frequency makes
+        // this warmer than announce but still per-request bounded.
+        let mut helpers: Vec<(crate::hooks::HookSpec, Option<crate::hooks::VerdictHelper>)> = cfg
+            .tx_serve_hooks
+            .iter()
+            .map(
+                |spec| match crate::hooks::VerdictHelper::spawn(spec.clone()) {
+                    Ok(h) => (spec.clone(), Some(h)),
+                    Err(e) => {
+                        eprintln!(
+                            "hooks.tx_serve {}: spawn failed ({e}) — \
+                             answering {:?} for every serve",
+                            spec.program.display(),
+                            spec.on_timeout
+                        );
+                        emit(
+                            &mut stream,
+                            "hook_spawn_failed",
+                            serde_json::json!({
+                                "point": "tx.serve",
+                                "program": spec.program.display().to_string(),
+                                "on_timeout": format!("{:?}", spec.on_timeout),
+                            }),
+                        );
+                        (spec.clone(), None)
+                    }
+                },
+            )
+            .collect();
+        let hook_tx = hook_events_tx.clone();
+        let dropped = hook_events_dropped.clone();
+        mgr.set_tx_serve_verdict(Some(Box::new(
+            move |facts: &avila_p2p::manager::TxServeFacts| {
+                let txid = facts.txid.to_string();
+                let peer = facts.peer;
+                let facts = serde_json::json!({
+                    "txid": txid.clone(),
+                    "wtxid": facts.wtxid.to_string(),
+                    "peer": peer,
+                    "peer_addr": facts.peer_addr,
+                    "peer_inbound": facts.peer_inbound,
+                    "peer_user_agent": facts.peer_user_agent,
+                });
+                helpers.iter_mut().all(|(spec, h)| {
+                    let verdict = match h {
+                        Some(h) => h.verdict("tx.serve", &facts),
+                        None => match spec.on_timeout {
+                            OnDefault::Accept => crate::hooks::Verdict::Accept,
+                            OnDefault::Reject => crate::hooks::Verdict::Reject,
+                        },
+                    };
+                    let admit = match verdict {
+                        crate::hooks::Verdict::Accept => true,
+                        crate::hooks::Verdict::Reject => false,
+                        crate::hooks::Verdict::Defer => {
+                            matches!(spec.on_defer, OnDefault::Accept)
+                        }
+                    };
+                    if hook_tx
+                        .try_send(serde_json::json!({
+                            "kind": "hook_verdict",
+                            "point": "tx.serve",
                             "helper": spec.program.display().to_string(),
                             "verdict": match verdict {
                                 crate::hooks::Verdict::Accept => "accept",

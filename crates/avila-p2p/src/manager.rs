@@ -577,6 +577,10 @@ pub struct PeerManager<S> {
     /// src ∈ {inbound,outbound,local,extrapool}, dst ∈ {inbound,
     /// outbound}. A pair listed here is never announced across.
     deny_pairs: Vec<(String, String)>,
+    /// `tx.serve` verdict — consulted per tx a peer requests via
+    /// `getdata`; `false` answers the request `notfound`. Narrowing
+    /// only — the verdict can't serve what the pools don't hold.
+    tx_serve_verdict: Option<TxServeVerdict>,
     /// Audit P2P-7: the stem hop is per-EPOCH, not per-tx — a fresh
     /// random relay per transaction lets an observer correlate that
     /// all stem txs leaving through different hops came from one
@@ -779,6 +783,32 @@ pub struct TxAnnounceFacts {
 /// link. Narrows only; all built-in gates still apply.
 pub type TxAnnounceVerdict = Box<dyn FnMut(&TxAnnounceFacts) -> bool + Send>;
 
+/// Facts handed to a `tx.serve` verdict — one consult per tx a peer
+/// asks us for via `getdata`.
+#[derive(Debug)]
+pub struct TxServeFacts {
+    /// The transaction's txid (wtxid requests resolve through the
+    /// mempool/extrapool index — unresolvable requests never reach the
+    /// hook, they'd `notfound` regardless).
+    pub txid: avila_consensus::hash::Txid,
+    /// Witness hash of the same transaction.
+    pub wtxid: avila_consensus::hash::Wtxid,
+    /// Internal id of the requesting peer (`getpeerinfo`'s `id`).
+    pub peer: u64,
+    /// The peer's remote address string when known.
+    pub peer_addr: Option<String>,
+    /// True when the requester dialed us.
+    pub peer_inbound: bool,
+    /// The peer's advertised user agent, when a version was seen.
+    pub peer_user_agent: Option<String>,
+}
+
+/// A `tx.serve` judge — conjunctive per-request gate on outbound tx
+/// serving; `false` answers the request `notfound`, indistinguishable
+/// from never having held the tx. Narrowing only — the verdict can't
+/// serve what the pools don't hold.
+pub type TxServeVerdict = Box<dyn FnMut(&TxServeFacts) -> bool + Send>;
+
 /// NetAddr → "ip:port" for the verdict facts — v4-mapped prints dotted
 /// quad, v6 prints bracketed.
 fn net_addr_string(a: &crate::message::NetAddr) -> String {
@@ -823,6 +853,7 @@ impl<S: Read + Write> PeerManager<S> {
             stem_relay: true,
             private_submissions: false,
             tx_announce_verdict: None,
+            tx_serve_verdict: None,
             deny_pairs: Vec::new(),
             stem_hop: None,
             asmap: crate::asmap::AsMap::empty(),
@@ -904,6 +935,14 @@ impl<S: Read + Write> PeerManager<S> {
     /// is bounded by helper latency × peer count. Keep helpers fast.
     pub fn set_tx_announce_verdict(&mut self, judge: Option<TxAnnounceVerdict>) {
         self.tx_announce_verdict = judge;
+    }
+
+    /// `tx.serve` hook — one conjunctive verdict per tx a peer
+    /// requests via `getdata`; `false` answers that item `notfound`.
+    /// Narrows only — it cannot serve an unpooled tx. Throughput
+    /// caveat: one verdict per tx per getdata — keep helpers fast.
+    pub fn set_tx_serve_verdict(&mut self, judge: Option<TxServeVerdict>) {
+        self.tx_serve_verdict = judge;
     }
 
     /// The compartment matrix (`relay.tx.deny_pairs`): "src->dst" pairs
@@ -1209,6 +1248,7 @@ impl<S: Read + Write> PeerManager<S> {
             mempool,
             outbound_nonces,
             stem_pending,
+            tx_serve_verdict,
             ..
         } = self;
         // Core's `m_num_preferred_download_peers - state.fPreferredDownload
@@ -1290,6 +1330,7 @@ impl<S: Read + Write> PeerManager<S> {
                             outbound_nonces,
                             &stem_exclude,
                             &mut self.recent_deliveries,
+                            tx_serve_verdict,
                         );
                         // Per-peer CPU accounting (PEER_BUDGETS):
                         // time inside dispatch lands on this peer's
@@ -2391,6 +2432,7 @@ impl<S: Read + Write> PeerManager<S> {
         outbound_nonces: &std::collections::HashSet<u64>,
         stem_exclude: &std::collections::HashSet<avila_consensus::hash::Txid>,
         recent_deliveries: &mut std::collections::VecDeque<(avila_consensus::hash::BlockHash, u64)>,
+        tx_serve_verdict: &mut Option<TxServeVerdict>,
     ) {
         match event {
             SessionEvent::Established => {
@@ -2679,15 +2721,83 @@ impl<S: Read + Write> PeerManager<S> {
                         mempool.clear_unbroadcast(&txid);
                     }
                 }
-                PeerSync::serve_getdata(cs, Some(mempool), &reqs, |reply| {
+                // `tx.serve` — conjunctive per-request gate. A denied
+                // item is answered `notfound`, indistinguishable from
+                // never holding it; non-tx requests bypass the hook.
+                let mut suppressed: Vec<crate::message::InvVector> = Vec::new();
+                let mut allowed = reqs;
+                if let Some(v) = tx_serve_verdict.as_mut() {
+                    let mut kept = Vec::with_capacity(allowed.len());
+                    for inv in allowed.drain(..) {
+                        let resolved = match inv.inv_type {
+                            crate::message::InvType::Tx | crate::message::InvType::WitnessTx => {
+                                mempool
+                                    .get(&avila_consensus::hash::Txid::from_bytes(
+                                        inv.hash.to_bytes(),
+                                    ))
+                                    .map(|tx| (tx.txid(), tx.wtxid()))
+                                    .or_else(|| {
+                                        mempool
+                                            .extrapool()
+                                            .get(&avila_consensus::hash::Txid::from_bytes(
+                                                inv.hash.to_bytes(),
+                                            ))
+                                            .map(|e| (e.tx.txid(), e.tx.wtxid()))
+                                    })
+                            }
+                            crate::message::InvType::Wtx => mempool
+                                .get_wtxid(&avila_consensus::hash::Wtxid::from_bytes(
+                                    inv.hash.to_bytes(),
+                                ))
+                                .map(|tx| (tx.txid(), tx.wtxid()))
+                                .or_else(|| {
+                                    mempool
+                                        .extrapool()
+                                        .get_wtxid(&avila_consensus::hash::Wtxid::from_bytes(
+                                            inv.hash.to_bytes(),
+                                        ))
+                                        .map(|e| (e.tx.txid(), e.tx.wtxid()))
+                                }),
+                            _ => None,
+                        };
+                        match resolved {
+                            Some((txid, wtxid)) => {
+                                let facts = TxServeFacts {
+                                    txid,
+                                    wtxid,
+                                    peer: id,
+                                    peer_addr: peer.remote.as_ref().map(net_addr_string),
+                                    peer_inbound: peer.inbound,
+                                    peer_user_agent: peer
+                                        .session
+                                        .peer()
+                                        .map(|i| i.user_agent.clone()),
+                                };
+                                if v(&facts) {
+                                    kept.push(inv);
+                                } else {
+                                    suppressed.push(inv);
+                                }
+                            }
+                            // Unresolvable or non-tx — not the hook's
+                            // domain; serve_getdata notfounds misses.
+                            None => kept.push(inv),
+                        }
+                    }
+                    allowed = kept;
+                }
+                PeerSync::serve_getdata(cs, Some(mempool), &allowed, |reply| {
                     peer.session.send(reply).is_ok()
                 });
+                if !suppressed.is_empty() {
+                    let _ = peer.session.send(&Message::NotFound(suppressed));
+                }
                 // `sendutxproof` peers get the bridge's spend bundle
                 // after each served block — proofs can't be generated
                 // post-hoc, so only blocks this node connected while
                 // bridged carry one.
                 if peer.session.peer().is_some_and(|i| i.utxproof) {
-                    for req in &reqs {
+                    for req in &allowed {
                         if !matches!(
                             req.inv_type,
                             crate::message::InvType::Block | crate::message::InvType::WitnessBlock
@@ -6353,6 +6463,98 @@ mod tests {
         assert!(
             has_inv(&testpipe::drain(&mut b, MAGIC)),
             "lowered filter announces"
+        );
+    }
+
+    /// `tx.serve`: a rejecting verdict withholds the tx as `notfound`;
+    /// the accepted link and non-tx items are untouched.
+    #[test]
+    fn tx_serve_hook_gates_getdata() {
+        use avila_consensus::transaction::{OutPoint, Script, TxIn, TxOut, Witness};
+        use avila_consensus::{script, transaction::Transaction};
+
+        let (mut mgr, mut a, _ida) = managed_peer();
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 101);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        handshake(&mut mgr, &mut a, &mut cs);
+        testpipe::drain(&mut a, MAGIC);
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: blocks[0].transactions[0].txid(),
+                    vout: 0,
+                },
+                script_sig: Script::new(vec![]),
+                sequence: 0xffff_ffff,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 4_999_990_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let txid = tx.txid();
+        mgr.mempool().set_require_standard(false);
+        mgr.mempool().accept_tx(tx, &cs, NOW).expect("admit");
+
+        let req = vec![crate::message::InvVector {
+            inv_type: crate::message::InvType::Tx,
+            hash: BlockHash::from_bytes(txid.to_bytes()),
+        }];
+
+        // Denying verdict — the request answers notfound.
+        let denied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = denied.clone();
+        mgr.set_tx_serve_verdict(Some(Box::new(move |f| {
+            assert_eq!(f.txid, txid);
+            n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        })));
+        testpipe::inject(&mut a, MAGIC, &Message::GetData(req.clone()));
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW); // dispatch-queued replies flush next tick
+        let msgs = testpipe::drain(&mut a, MAGIC);
+        assert!(
+            msgs.iter().any(|m| matches!(m, Message::NotFound(_))),
+            "denied request answers notfound"
+        );
+        assert!(!msgs.iter().any(|m| matches!(m, Message::Tx(_))));
+        assert_eq!(denied.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Accepting verdict — the same request serves the tx.
+        mgr.set_tx_serve_verdict(Some(Box::new(|_| true)));
+        testpipe::inject(&mut a, MAGIC, &Message::GetData(req));
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let msgs = testpipe::drain(&mut a, MAGIC);
+        assert!(
+            msgs.iter().any(|m| matches!(m, Message::Tx(_))),
+            "accepted request serves the tx"
+        );
+
+        // No verdict at all — default serving is unaffected.
+        mgr.set_tx_serve_verdict(None);
+        testpipe::inject(
+            &mut a,
+            MAGIC,
+            &Message::GetData(vec![crate::message::InvVector {
+                inv_type: crate::message::InvType::Tx,
+                hash: BlockHash::from_bytes(txid.to_bytes()),
+            }]),
+        );
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        assert!(
+            testpipe::drain(&mut a, MAGIC)
+                .iter()
+                .any(|m| matches!(m, Message::Tx(_))),
+            "unhooked request serves"
         );
     }
 

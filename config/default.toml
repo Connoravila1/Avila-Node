@@ -106,6 +106,18 @@ event_capacity = 256
 #
 # [[hooks.extrapool_admit]] / [[hooks.extrapool_promote]] — gate the
 # observation pool's store and re-admission. Facts: txid, reason.
+#
+# [[hooks.tx_serve]] — consulted per tx item in a peer's getdata;
+# a "reject" answers notfound, indistinguishable from never holding
+# it. Facts: txid, wtxid, peer, peer_addr, peer_inbound,
+# peer_user_agent. Non-tx requests bypass the hook.
+# [[hooks.tx_serve]]
+# program = "/usr/local/sbin/serve-tx"
+# args = []
+# timeout_ms = 100
+# on_timeout = "reject"     # dead helper withholds all txs — fail-closed
+# on_defer = "reject"
+# max_restarts = 3
 
 # [extrapool]
 # The observation pool: consensus-valid transactions that live policy
@@ -130,6 +142,17 @@ event_capacity = 256
                                      # finality capacity weight sigops
                                      # truc other
 #   fee = 4000
+
+# [mining]
+# include_extrapool = false           # mine what you won't relay —
+                                     # extrapool entries audition for a
+                                     # template's leftover budget, each
+                                     # fully revalidated under consensus
+                                     # rules (never trusted from the
+                                     # record). Inputs must be confirmed
+                                     # on-chain; conflicts with chosen
+                                     # pool txs are skipped. At most 512
+                                     # entries audition per template.
 
 # [filters]
 # build = false                       # Core's -blockfilterindex

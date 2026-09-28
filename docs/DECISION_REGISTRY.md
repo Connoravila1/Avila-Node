@@ -73,7 +73,7 @@ Semantics:
   `timeout_ms` — a slow helper counts as dead, is killed and restarted
   within budget. Consultation never blocks consensus work.
 
-**Status:** five points wired. `peer.accept` (`[[hooks.peer_accept]]`)
+**Status:** six points wired. `peer.accept` (`[[hooks.peer_accept]]`)
 consults in `PeerManager::drain_inbounds`, after the ban check and
 before slot/eviction. `tx.admit` (`[[hooks.tx_admit]]`) consults in
 `Mempool::accept_tx` before any built-in check, narrowing only
@@ -92,7 +92,11 @@ Facts are `txid`, `wtxid`, `source` (inbound|outbound|local|extrapool),
 `extrapool.admit` and `extrapool.promote` (`[[hooks.extrapool_admit]]`,
 `[[hooks.extrapool_promote]]`) see `{txid, reason}` — the former drops
 the observation record only (the tx is rejected regardless), the latter
-keeps the entry on reject. All five fire `hook_verdict` events;
+keeps the entry on reject. `tx.serve` (`[[hooks.tx_serve]]`) consults
+per tx item in a peer's `getdata` — `reject` answers `notfound` for
+that item, indistinguishable from never holding it; facts are `txid`,
+`wtxid`, `peer`, `peer_addr`, `peer_inbound`, `peer_user_agent`.
+All six fire `hook_verdict` events;
 verdict delivery is bounded (sync_channel 4096, drops emit
 `hook_events_dropped`). `peer.accept`'s richer facts (`netgroup`,
 `asn`) arrive when the addrman/asmap lookups expose them at accept
@@ -224,7 +228,7 @@ transition.
 | Tx announce | wtxid inv; stem on, `STEM_EPOCH=600s` | `relay.tx.stem` (wired); `relay.tx.announce` (inv / none / private-only), `stem.epoch`, `stem.hop` planned | `tx.announce` (wired — verdict per tx×peer link, fan-out + stem hop) |
 | Per-peer matrix | compartment matrix | `relay.tx.deny_pairs` (wired — `"src->dst"` pairs never announce; src: inbound/outbound/local/extrapool, dst: inbound/outbound); `relay.tx.to_inbound`, `to_blocks_only_peers`, `peer_override` planned | `tx.announce` |
 | Provenance rules | `TxSource` in announce facts | `relay.tx.min_observed_announces` planned | `tx.announce` (facts carry `source`, `source_peer`, `peer_inbound`, `peer_user_agent`) |
-| Tx serving | `MEMPOOL_REQ_INTERVAL=60s`, `MAX_MEMPOOL_INV=50k` | `relay.tx.serve_mempool`, `mempool_req.interval`, `mempool_req.max_inv`, `relay.tx.serve_bip37` (bloom serving, off default) | `tx.serve` |
+| Tx serving | `MEMPOOL_REQ_INTERVAL=60s`, `MAX_MEMPOOL_INV=50k`; getdata serves mempool + extrapool | `relay.tx.serve_mempool`, `mempool_req.interval`, `mempool_req.max_inv`, `relay.tx.serve_bip37` (bloom serving, off default) | `tx.serve` (wired — verdict per tx item per getdata; reject answers `notfound`) |
 | feefilter | honored inbound — peer's advertised minimum suppresses sub-rate invs in `send_tx_inv`; reported via `getpeerinfo.minfeefilter`. We never send one ourselves | `relay.tx.send_feefilter` (send our floor outbound) planned | — |
 | Shape / timing | recon 4s | `relay.tx.trickle_ms`, announce jitter, per-peer announce rate cap | `relay.schedule` |
 | Reconciliation | `RECON_INTERVAL=4s`, req ≥250ms, ≤8 violations | `relay.tx.recon`, `recon.interval`, `recon.min_req_interval`, `recon.max_violations` | — |
@@ -258,7 +262,7 @@ performance policy, not correctness.
 | Point | Today | Knobs | Hook |
 | --- | --- | --- | --- |
 | Template shape | `next_block.rs` | `mining.max_weight`, `mining.min_tx_fee`, `mining.reserved_weight`, `mining.refresh_ms` | `template.build` |
-| Extrapool coupling | — | `mining.include_extrapool` (none / above-fee / all) — mine what you won't relay; consensus-valid is the only constraint | — |
+| Extrapool coupling | — | `mining.include_extrapool` (wired, boolean — mine what you won't relay; candidates revalidated under consensus flags, confirmed inputs only, ≤512 auditions, leftover budget) | — |
 | Stratum V2 | `sv2.rs` | `services.sv2.listen`, `sv2.job_declaration`, `sv2.template_provider` | — |
 
 ## I. Services and permissions

@@ -39,6 +39,11 @@ pub const DEFAULT_BLOCK_RESERVED_WEIGHT: usize = 8_000;
 /// reserve risks a coinbase that doesn't fit its own budget.
 pub const MINIMUM_BLOCK_RESERVED_WEIGHT: usize = 2_000;
 
+/// How many extrapool entries one template call will audition at
+/// most — each audition is a full consensus recheck (inputs, scripts),
+/// so the cap bounds the RPC's cost regardless of pool occupancy.
+pub const EXTRAPOOL_TEMPLATE_EVALS: usize = 512;
+
 /// Core's `DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS` — sigop cost
 /// budgeted for the coinbase's own outputs (payouts, witness commitment)
 /// out of `MAX_BLOCK_SIGOPS_COST` when selecting mempool transactions.
@@ -144,11 +149,27 @@ impl Mempool {
         let (package, tx_sigops) = self.select_package_txs(height, mtp);
         let chosen: Vec<&crate::MempoolEntry> =
             package.iter().filter_map(|id| self.entry(id)).collect();
-        let fees: i64 = chosen.iter().map(|e| e.fee).sum();
 
         // Coinbase: BIP34 height prefix, subsidy + fees to the miner.
         let subsidy = block_subsidy(height, cs.tree().params());
-        let txs: Vec<(Transaction, i64)> = chosen.iter().map(|e| (e.tx.clone(), e.fee)).collect();
+        let mut txs: Vec<(Transaction, i64)> =
+            chosen.iter().map(|e| (e.tx.clone(), e.fee)).collect();
+        let mut tx_sigops = tx_sigops;
+
+        // `mining.include_extrapool` — mine what you won't relay.
+        // Policy-rejected-but-consensus-valid entries audition for the
+        // leftover budget *after* the pool's packages, revalidated
+        // from scratch (a hook reject can precede any built-in check,
+        // so nothing about an extrapool entry is trusted).
+        if self.mine_extrapool {
+            let (mut extra, extra_sigops) =
+                self.extrapool_template_fill(cs, height, mtp, &tip, &txs, tx_sigops);
+            tx_sigops += extra_sigops;
+            txs.append(&mut extra);
+        }
+        let fees: i64 = txs.iter().map(|(_, f)| *f).sum();
+        let tx_count = txs.len();
+
         let block = Self::assemble_block(
             cs,
             miner_script_pubkey,
@@ -167,8 +188,147 @@ impl Mempool {
             block,
             height,
             fees,
-            tx_count: chosen.len(),
+            tx_count,
         })
+    }
+
+    /// `mining.include_extrapool` fill pass — each candidate is
+    /// revalidated as if at block connect: context-free checks,
+    /// every input a *confirmed* unspent outpoint (no unconfirmed
+    /// parents — that keeps appended ordering trivially legal and a
+    /// policy reject can't smuggle an orphan chain into a block),
+    /// BIP68 sequence locks and locktime finality at the next height,
+    /// consensus script flags only (standardness is exactly what got
+    /// them filtered — deliberately not reimposed), and BIP125-style
+    /// outpoint conflicts against the already-chosen set plus prior
+    /// candidates. Bounded: at most [`EXTRAPOOL_TEMPLATE_EVALS`]
+    /// entries are auditioned per template.
+    ///
+    /// Returns `(tx, fee)` pairs in append order and their summed
+    /// real sigop cost.
+    fn extrapool_template_fill(
+        &self,
+        cs: &avila_consensus::chainstate::Chainstate,
+        height: u32,
+        mtp: u32,
+        tip: &BlockHash,
+        chosen: &[(Transaction, i64)],
+        used_sigops: u64,
+    ) -> (Vec<(Transaction, i64)>, u64) {
+        use avila_consensus::check::{check_transaction, is_final_tx};
+        use avila_consensus::connect::{UtxoSet, bip68_locks_satisfied, check_tx_inputs};
+        use avila_consensus::sigchecker::check_input_scripts;
+
+        let cap = (MAX_BLOCK_WEIGHT as u64).saturating_sub(self.block_reserved_weight as u64);
+        let sigops_cap = MAX_BLOCK_SIGOPS_COST.saturating_sub(self.coinbase_max_additional_sigops);
+        let mut weight_free =
+            cap.saturating_sub(chosen.iter().map(|(t, _)| t.weight() as u64).sum::<u64>());
+        let mut sigops_free = sigops_cap.saturating_sub(used_sigops);
+        if weight_free == 0 {
+            return (Vec::new(), 0);
+        }
+        // Outpoints the pool's chosen set already spends — a candidate
+        // conflicting with one would invalidate the template.
+        let mut claimed: HashSet<OutPoint> = chosen
+            .iter()
+            .flat_map(|(t, _)| t.inputs.iter().map(|i| i.previous_output))
+            .collect();
+
+        // Consensus flags at the next height — the flags the block
+        // itself enforces, none of the mempool's standardness union.
+        let flags = script::block_script_flags(cs.tree().params(), height, tip);
+        let csv_active = cs.tree().params().csv_height <= height;
+
+        // Audition in insertion order (oldest observed first), bounded.
+        struct C {
+            tx: Transaction,
+            fee: i64,
+            weight: u64,
+            sigops: u64,
+            vsize: u64,
+            spends: Vec<OutPoint>,
+        }
+        let mut candidates: Vec<C> = Vec::new();
+        for e in self.extrapool.iter_ordered().take(EXTRAPOOL_TEMPLATE_EVALS) {
+            let tx = &e.tx;
+            if tx.is_coinbase() || self.map.contains_key(&tx.txid()) {
+                continue;
+            }
+            if check_transaction(tx).is_err() {
+                continue;
+            }
+            // Confirmed-inputs-only: an unresolvable or pool/extrapool
+            // parent skips the candidate entirely.
+            let mut coins = Vec::with_capacity(tx.inputs.len());
+            let mut ok = true;
+            for input in &tx.inputs {
+                match cs.utxo().get(&input.previous_output) {
+                    Some(c) => coins.push(c),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let mut overlay = UtxoSet::new();
+            for (input, coin) in tx.inputs.iter().zip(coins.iter()) {
+                overlay.insert_synthetic(input.previous_output, coin.clone());
+            }
+            let Ok((_, fee)) = check_tx_inputs(tx, &overlay, height) else {
+                continue;
+            };
+            if csv_active && !bip68_locks_satisfied(tx, &coins, height, mtp, cs.tree(), tip) {
+                continue;
+            }
+            if !is_final_tx(tx, height, mtp) {
+                continue;
+            }
+            let spent_outs: Vec<_> = coins.iter().map(|c| c.out.clone()).collect();
+            if check_input_scripts(tx, &spent_outs, flags).is_err() {
+                continue;
+            }
+            let sigops = self.real_sigop_cost(cs, tx, flags);
+            let weight = tx.weight() as u64;
+            candidates.push(C {
+                spends: tx.inputs.iter().map(|i| i.previous_output).collect(),
+                vsize: crate::virtual_size(tx.weight(), sigops) as u64,
+                tx: tx.clone(),
+                fee,
+                weight,
+                sigops,
+            });
+        }
+
+        // Highest feerate first (cross-multiplied — no division),
+        // txid breaks exact ties; greedily fit under the remaining
+        // budgets, skipping any candidate that double-spends an
+        // already-claimed outpoint.
+        candidates.sort_by(|a, b| {
+            let ra = a.fee as i128 * b.vsize.max(1) as i128;
+            let rb = b.fee as i128 * a.vsize.max(1) as i128;
+            rb.cmp(&ra).then_with(|| a.tx.txid().cmp(&b.tx.txid()))
+        });
+        let mut out = Vec::new();
+        let mut sigops = 0u64;
+        for c in candidates {
+            if c.weight > weight_free || c.sigops > sigops_free {
+                continue;
+            }
+            if c.spends.iter().any(|op| claimed.contains(op)) {
+                continue;
+            }
+            for op in &c.spends {
+                claimed.insert(*op);
+            }
+            weight_free -= c.weight;
+            sigops_free -= c.sigops;
+            sigops += c.sigops;
+            out.push((c.tx, c.fee));
+        }
+        (out, sigops)
     }
 
     /// A transaction's sigop cost — Core's `GetTransactionSigOpCost`:

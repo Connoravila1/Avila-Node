@@ -61,6 +61,8 @@ pub struct NodeConfig {
     pub indexes: IndexesConfig,
     pub sync: SyncKnobs,
     pub services: ServicesConfig,
+    /// Block-template construction policy (`mining.*`).
+    pub mining: MiningConfig,
 }
 
 impl Default for NodeConfig {
@@ -83,6 +85,7 @@ impl Default for NodeConfig {
             indexes: IndexesConfig::default(),
             sync: SyncKnobs::default(),
             services: ServicesConfig::default(),
+            mining: MiningConfig::default(),
         }
     }
 }
@@ -373,6 +376,12 @@ pub struct HooksConfig {
     /// `extrapoolpromote` re-runs admission; `reject` leaves the entry
     /// in the pool.
     pub extrapool_promote: Vec<HookSpecConfig>,
+    /// Transaction serving — one `[[hooks.tx_serve]]` table per
+    /// helper. Consulted per tx item in a peer's `getdata`; `reject`
+    /// answers that item `notfound`, indistinguishable from never
+    /// holding it. Facts: txid, wtxid, peer id/address/direction/
+    /// user-agent. One consult per tx per getdata batch.
+    pub tx_serve: Vec<HookSpecConfig>,
 }
 
 /// One `[[hooks.<point>]]` entry. `program` is the only required key.
@@ -465,6 +474,20 @@ impl Default for SyncKnobs {
             utreexo_bridge: false,
         }
     }
+}
+
+/// `mining.*` — block-template construction policy. Consensus
+/// validity is never configurable; these knobs only choose *which*
+/// candidate set a template draws from.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MiningConfig {
+    /// When true, `build_template` auditions extrapool (observed,
+    /// policy-rejected) entries for the block's leftover budget after
+    /// the mempool's packages — "mine what you won't relay". Each
+    /// candidate is revalidated with consensus rules only; at most
+    /// 512 entries are auditioned per template. Default off.
+    pub include_extrapool: bool,
 }
 
 /// `services.*` — local query interfaces.
@@ -588,6 +611,7 @@ impl NodeConfig {
             ("tx_announce", &self.hooks.tx_announce),
             ("extrapool_admit", &self.hooks.extrapool_admit),
             ("extrapool_promote", &self.hooks.extrapool_promote),
+            ("tx_serve", &self.hooks.tx_serve),
         ] {
             for hook in hooks {
                 if hook.program.as_os_str().is_empty() {

@@ -575,6 +575,12 @@ impl Extrapool {
         self.map.iter()
     }
 
+    /// Entries in observation order (oldest first) — the deterministic
+    /// audition order for `mining.include_extrapool` template fill.
+    pub(crate) fn iter_ordered(&self) -> impl Iterator<Item = &ExtraEntry> {
+        self.order.iter().filter_map(|id| self.map.get(id))
+    }
+
     /// Cumulative counters.
     #[must_use]
     pub fn stats(&self) -> &ExtraStats {
@@ -922,6 +928,10 @@ pub struct Mempool {
     /// `rolling_min_fee` was last set; decay is computed as elapsed
     /// time since this point.
     last_rolling_fee_update: u32,
+    /// `mining.include_extrapool` — observation-pool entries audition
+    /// for a template's leftover budget after the pool's packages,
+    /// each fully revalidated at block height. Default off.
+    mine_extrapool: bool,
     /// Core's `blockSinceLastRollingFeeBump` — decay is paused (the raw
     /// `rolling_min_fee` applies unchanged) until a block connects.
     block_since_rolling_fee_bump: bool,
@@ -1021,6 +1031,7 @@ impl Mempool {
             dust_relay_fee: policy::DUST_RELAY_TX_FEE,
             rolling_min_fee: 0.0,
             last_rolling_fee_update: 0,
+            mine_extrapool: false,
             block_since_rolling_fee_bump: false,
             mempool_expiry_secs: DEFAULT_MEMPOOL_EXPIRY_SECS,
             last_expire: 0,
@@ -3112,6 +3123,16 @@ impl Mempool {
         self.extrapool.set_relay(relay);
     }
 
+    /// `mining.include_extrapool` — when on, `build_template` auditions
+    /// observation-pool entries for the block's leftover budget. Every
+    /// candidate is revalidated at template height with consensus flags
+    /// (never trusted from the record — a hook reject can precede every
+    /// built-in check), requires all inputs confirmed on-chain, and is
+    /// skipped on conflict with a chosen pool tx.
+    pub fn set_mine_extrapool(&mut self, on: bool) {
+        self.mine_extrapool = on;
+    }
+
     /// Entries awaiting propagation (`extrapool.relay` queue — the
     /// node drains it per tick and announces with extrapool
     /// provenance).
@@ -4917,6 +4938,51 @@ mod tests {
         }
         pool.on_block_connected(&block, 102);
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn template_include_extrapool_revalidates_and_connects() {
+        // `mining.include_extrapool`: a fee-floor reject (policy) sits
+        // in the observation pool; with the knob on it auditions into
+        // the template's leftover budget and the resulting block must
+        // connect — the fill pass re-runs full consensus checks.
+        let (mut cs, blocks) = chainstate_at(101);
+        let mut pool = permissive_pool();
+        pool.set_require_standard(false);
+        let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let txid = tx.txid();
+        // Fee-floor reject → observation pool (consensus-valid).
+        pool.set_min_relay_fee(i64::MAX / (1 << 20));
+        assert!(pool.accept_tx(tx, &cs, NOW).is_err());
+        assert!(pool.extrapool.get(&txid).is_some());
+
+        // Off by default: nothing extra enters the template.
+        let miner_script = Script::new(vec![script::OP_1]);
+        let t_off = pool
+            .build_template(&cs, miner_script.clone(), NOW + 120)
+            .unwrap();
+        assert_eq!(t_off.tx_count, 0, "extrapool stayed out by default");
+
+        pool.set_mine_extrapool(true);
+        let mut t = pool.build_template(&cs, miner_script, NOW + 120).unwrap();
+        assert_eq!(t.tx_count, 1, "extrapool entry auditions in");
+        assert_eq!(t.block.transactions[1].txid(), txid);
+        let subsidy = avila_consensus::connect::block_subsidy(102, cs.tree().params());
+        assert_eq!(t.block.transactions[0].outputs[0].value, subsidy + t.fees);
+        // Decisive: the template must connect as a real block — the
+        // fill pass ran consensus input + script checks, so a stored
+        // "consensus-valid" reject can't produce an invalid block.
+        let params = Network::Regtest.params();
+        while pow::check_proof_of_work(&t.block.block_hash(), t.block.header.bits, &params).is_err()
+        {
+            t.block.header.nonce += 1;
+        }
+        match cs.accept_block(&t.block, NOW + 130).unwrap() {
+            avila_consensus::chainstate::Acceptance::Connected { height, .. } => {
+                assert_eq!(height, 102)
+            }
+            other => panic!("extrapool-inclusive template did not connect: {other:?}"),
+        }
     }
 
     #[test]
