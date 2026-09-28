@@ -1408,3 +1408,15 @@ Closed cheaply today: sha2 0.11 already runtime-dispatches SHA-NI
 arithmetic (32 EUs ≈ ~2-3 cores int throughput ≈ ~5%). perf locked
 (paranoid=4) — port analysis done analytically: fused-mul port floor
 ~40ns vs measured ~95ns → latency/spill-bound with real ~2× headroom.
+
+## 2026-09-28f — session close: handoff ledger written
+
+Full measured ledger at [2026-09-28-crypto-deep-drill-ledger.md]
+(2026-09-28-crypto-deep-drill-ledger.md): every verified artifact,
+every invalidated measurement, mechanism findings (flag serialization,
+op-size-vs-ROB, info-boundedness of batch ECDSA), probed-thin leads
+(CSA/interleaved-SHA-NI/affine/cache), and ranked next investigations.
+Top recommendations: interleaved SHA-NI sighash (cheapest real win),
+fused-4 kernel scheduling to port floor (biggest verified headroom),
+repeat-key census + tower cache, verify4 composite for the honest
+end-to-end number. 46 code artifacts in experiments/code/.

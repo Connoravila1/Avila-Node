@@ -1,0 +1,85 @@
+{
+  "review_date": "2026-09-27",
+  "compiler": "cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+  "scope": "Source and generated-assembly audit plus bounded AVX2 arithmetic correctness test. No new performance claim.",
+  "source_sha256": {
+    "experiments/CRYPTO_BOTTLENECK_LEDGER.md": "c75352530d38fdbcb61e8c8a753dbd95c1f352626b48679c8c1f9c1cb9bcf811",
+    "experiments/code/femul4_avx2_bench.c": "22a9419ec77bac27f7f0c5fc2043dab3442c565a2186195e419bffa162cf8416",
+    "experiments/code/ecmult4_merged_bench.c": "111be22bf1376f334e590b09e6fef3831792b04115957865d3e8d3b4c57fcdda",
+    "experiments/code/dbl4_locals_bench.c": "cd439cfe6e3b7ad317f62c18e8eec00bb181870a2589606e59ffaabecff2730b",
+    "experiments/code/fma_tput_bench.c": "65774a0e46b604dc7c3d8b8365af75b1baa0ec7784e303f48a4396aee34c116e"
+  },
+  "prior_operation_census": {
+    "compressed_parse_and_verify": {
+      "field_mul": 984.70703125,
+      "field_square": 972.603515625,
+      "field_inverse_var": 0.0,
+      "field_sqrt": 1.0,
+      "scalar_inverse_var": 1.0,
+      "point_double_calls": 128.38671875,
+      "point_mixed_add_calls": 50.2578125,
+      "point_zinv_add_calls": 16.97265625,
+      "scalar_mul": 5.0
+    },
+    "preparsed_verify": {
+      "field_mul": 970.70703125,
+      "field_square": 717.603515625,
+      "field_inverse_var": 0.0,
+      "field_sqrt": 0.0,
+      "scalar_inverse_var": 1.0,
+      "point_double_calls": 128.38671875,
+      "point_mixed_add_calls": 50.2578125,
+      "point_zinv_add_calls": 16.97265625,
+      "scalar_mul": 5.0
+    }
+  },
+  "prior_native_field_mul_instructions": {
+    "instruction_counts": {
+      "push": 6,
+      "mov": 82,
+      "xor": 9,
+      "sub": 1,
+      "mulx": 31,
+      "movabs": 7,
+      "add": 31,
+      "adc": 29,
+      "shrd": 8,
+      "shr": 8,
+      "shl": 1,
+      "and": 9,
+      "or": 1,
+      "pop": 6,
+      "ret": 1
+    },
+    "assembly_sha256": "d94e0e89042e448491f195e9e6c2268f8a6c3f93aab8c5ff02624dc96f5dac1a"
+  },
+  "avx2_correctness": {
+    "command": [
+      "tools/guard_run.sh",
+      "--max",
+      "512",
+      "--reserve",
+      "4096",
+      "--",
+      "timeout",
+      "20s",
+      "/tmp/avila-crypto-review/femul4_correctness_only"
+    ],
+    "change_to_archived_probe": "Kept original correctness section unchanged; removed throughput section and returned fails ? 1 : 0.",
+    "exit_code": 1,
+    "failed_lanes": 15004,
+    "total_lanes": 16000,
+    "scope_unit": "run-p2245569-i2258577.scope",
+    "invocation_id": "fc26dcf9770741b5a28046e6f2dda95b",
+    "first_reference": "493f755f4de8919b2a0328694d842e266e6b86e1aa21617c7544ed37b3b0f345",
+    "first_observed": "493f755f4de8919b2a0328694d842e266e6b86e1aa21617c7544ed30b3b0d88e",
+    "first_difference": "0x700001ab7",
+    "first_difference_div_2pow32_plus_977": 7
+  },
+  "assembly_findings": {
+    "fma_loop": "Two dependent vfmadd132pd instructions into ymm2, loop decrements by 2; one FMA chain per original iteration, numerator charges 8.",
+    "integer_loop": "Two imulq instructions per original iteration, numerator charges 8.",
+    "adx": "Zero ADCX/ADOX in the compiled dbl4 and ecmult4 translation units with recorded flags.",
+    "dbl4": "Four-lane path substantially inlined; serial path calls dbl. No final point-output consumer in source. No valid register-residency conclusion."
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "argv": [
+    "cc",
+    "-std=c99",
+    "-O3",
+    "-mbmi2",
+    "-mavx2",
+    "-DUSE_EXTERNAL_DEFAULT_CALLBACKS",
+    "-DECMULT_WINDOW_SIZE=15",
+    "-DECMULT_GEN_PREC_BITS=4",
+    "-ffunction-sections",
+    "-fdata-sections",
+    "-I/home/connoravila/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1",
+    "-I/home/connoravila/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/src",
+    "-I/home/connoravila/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/secp256k1-sys-0.10.1/depend/secp256k1/include",
+    "/tmp/avila-crypto-review/femul4_correctness_only.c",
+    "-Wl,--gc-sections",
+    "-o",
+    "/tmp/avila-crypto-review/femul4_correctness_only"
+  ],
+  "returncode": 0,
+  "stdout": "",
+  "stderr": ""
+}
