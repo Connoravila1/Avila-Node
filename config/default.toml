@@ -8,6 +8,9 @@ data_dir = "../data"
 
 # Operator policy lives under the namespaces of docs/DECISION_REGISTRY.md.
 # Every value shown below is the shipped default — uncommenting changes it.
+#
+# A sibling file "<name>.runtime.toml" is merged over this one at load —
+# that's where GUI edits land, so this file is never rewritten by the app.
 
 [diag]
 event_capacity = 256

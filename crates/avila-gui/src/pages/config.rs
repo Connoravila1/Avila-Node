@@ -36,6 +36,9 @@ pub struct ConfigPage {
     overrides: BTreeMap<String, serde_json::Value>,
     /// `config_rejected` reasons, per path.
     rejected: BTreeMap<String, String>,
+    /// Restart knobs staged into the runtime overlay — what the next
+    /// start will load.
+    staged: BTreeMap<String, serde_json::Value>,
     /// The path filter box.
     pub filter: String,
     /// What the last preset application did ("applied 5 live knobs;
@@ -60,6 +63,7 @@ impl ConfigPage {
                 self.pending.clear();
                 self.overrides.clear();
                 self.rejected.clear();
+                self.staged.clear();
                 self.preset_note = None;
             }
             "config_changed" if !path.is_empty() => {
@@ -81,17 +85,61 @@ impl ConfigPage {
             _ => {}
         }
     }
+
+    /// True when the page's live state already carries `value` for
+    /// `path` — applied or in flight — so a file diff on that knob
+    /// isn't a divergence, it's the edit's persistence landing.
+    pub fn already_live(&self, path: &str, value: &serde_json::Value) -> bool {
+        self.overrides.get(path) == Some(value) || self.pending.get(path) == Some(value)
+    }
 }
 
 /// The knob's effective value this session — the override the journal
-/// confirmed, else what the config file said. Owned so the map stays
-/// free for the row's edits.
+/// confirmed, else the value staged for the next start, else what the
+/// config file said. Owned so the map stays free for the row's edits.
 fn effective(state: &ConfigPage, path: &str, file: &serde_json::Value) -> serde_json::Value {
     state
         .overrides
         .get(path)
+        .or_else(|| state.staged.get(path))
         .cloned()
         .unwrap_or_else(|| file.clone())
+}
+
+/// JSON → TOML for the overlay write; `Null` means "remove the key" —
+/// the file's own value returns.
+fn toml_of(v: &serde_json::Value) -> Option<toml::Value> {
+    match v {
+        serde_json::Value::Bool(b) => Some(toml::Value::Boolean(*b)),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map(toml::Value::Integer)
+            .or_else(|| n.as_f64().map(toml::Value::Float)),
+        serde_json::Value::String(s) => Some(toml::Value::String(s.clone())),
+        serde_json::Value::Array(a) => {
+            Some(toml::Value::Array(a.iter().filter_map(toml_of).collect()))
+        }
+        serde_json::Value::Object(m) => Some(toml::Value::Table(
+            m.iter()
+                .filter_map(|(k, v)| toml_of(v).map(|t| (k.clone(), t)))
+                .collect(),
+        )),
+        serde_json::Value::Null => None,
+    }
+}
+
+/// Persist a knob into the runtime overlay — validated against the
+/// merged config before the file moves. Returns the reason on refusal.
+fn stage(file: &std::path::Path, state: &mut ConfigPage, path: &str, value: serde_json::Value) {
+    match avila_node::config::write_overlay_knob(file, path, toml_of(&value)) {
+        Ok(()) => {
+            state.staged.insert(path.to_string(), value);
+            state.rejected.remove(path);
+        }
+        Err(reason) => {
+            state.rejected.insert(path.to_string(), reason);
+        }
+    }
 }
 
 fn render_value(v: &serde_json::Value) -> String {
@@ -174,27 +222,6 @@ const PRESETS: &[Preset] = &[
     },
 ];
 
-/// The restart knobs' TOML: `a.b.c = v` grouped under `[a.b]`.
-fn preset_toml(restart: &[(&'static str, &'static str)]) -> String {
-    let mut out = String::new();
-    let mut last = "";
-    for (path, val) in restart {
-        let (sec, key) = match path.rsplit_once('.') {
-            Some(s) => s,
-            None => continue,
-        };
-        if sec != last {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&format!("[{sec}]\n"));
-            last = sec;
-        }
-        out.push_str(&format!("{key} = {val}\n"));
-    }
-    out
-}
-
 fn presets_menu(ui: &mut Ui, state: &mut ConfigPage, _control: Option<&Sender<ControlMsg>>) {
     let pal = crate::theme::Palette::of(ui.ctx());
     egui::ComboBox::from_id_salt("config-presets")
@@ -222,6 +249,7 @@ fn preset_card(
     pal: crate::theme::Palette,
     state: &mut ConfigPage,
     control: Option<&Sender<ControlMsg>>,
+    config_file: Option<&std::path::Path>,
     knobs: &[avila_node::config::KnobDescription],
     i: usize,
 ) {
@@ -268,7 +296,7 @@ fn preset_card(
                             .color(pal.signal),
                     );
                     ui.label(
-                        RichText::new("needs restart — goes on your clipboard")
+                        RichText::new("needs restart — staged in the overlay")
                             .size(11.0)
                             .color(pal.muted),
                     );
@@ -278,31 +306,48 @@ fn preset_card(
             ui.horizontal(|ui| {
                 if widgets::button(ui, "apply this preset", Kind::Primary).clicked() {
                     let mut applied = 0;
-                    if let Some(tx) = control {
-                        for (path, raw) in p.live {
-                            let value =
-                                serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
-                            if tx
-                                .send(ControlMsg::Set {
-                                    path: (*path).to_string(),
-                                    value: value.clone(),
-                                })
-                                .is_ok()
+                    let mut staged_n = 0;
+                    for (path, raw) in p.live {
+                        let value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
+                        if let Some(file) = config_file {
+                            if let Err(e) =
+                                avila_node::config::write_overlay_knob(file, path, toml_of(&value))
                             {
-                                state.pending.insert((*path).to_string(), value);
-                                applied += 1;
+                                state
+                                    .rejected
+                                    .insert((*path).to_string(), format!("not persisted: {e}"));
                             }
                         }
+                        if let Some(tx) = control {
+                            let _ = tx.send(ControlMsg::Set {
+                                path: (*path).to_string(),
+                                value: value.clone(),
+                            });
+                        }
+                        state.pending.insert((*path).to_string(), value);
+                        applied += 1;
                     }
-                    let mut note = format!(
-                        "{}: {} live knob{} sent",
-                        p.name,
-                        applied,
-                        if applied == 1 { "" } else { "s" },
-                    );
-                    if !p.restart.is_empty() {
-                        ui.ctx().copy_text(preset_toml(p.restart));
-                        note.push_str(" — the restart knobs' TOML is on the clipboard");
+                    for (path, raw) in p.restart {
+                        let value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
+                        if let Some(file) = config_file {
+                            stage(file, state, path, value);
+                            staged_n += 1;
+                        }
+                    }
+                    let mut note = format!("{}: {} applied now", p.name, applied);
+                    if staged_n > 0 {
+                        note.push_str(&format!(
+                            ", {staged_n} staged for the next start in {}",
+                            config_file
+                                .map(|f| {
+                                    avila_node::config::overlay_path(f)
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("the overlay")
+                                        .to_string()
+                                })
+                                .unwrap_or_else(|| "the overlay".to_string()),
+                        ));
                     }
                     state.preset_note = Some(note);
                     state.preset_open = None;
@@ -378,8 +423,9 @@ pub fn show(
         ui,
         "Node policy",
         Some(
-            "Every knob the config file sets. Bright marks edit the running node — dim ones \
-             need a restart. The file is never written; restart reverts.",
+            "Every knob the node loads. Bright marks apply to the running node; dim ones \
+             apply at the next start. Edits land in the .runtime.toml overlay — the file \
+             itself is never rewritten.",
         ),
     );
     ui.add_space(6.0);
@@ -407,20 +453,34 @@ pub fn show(
                     let _ = std::process::Command::new("xdg-open").arg(file).spawn();
                 }
             }
-            if control.is_some() {
-                // Undo every live override by sending the knob's
-                // default back through the channel — the journal gets
-                // the same config_changed receipt as any other edit.
-                if !state.overrides.is_empty()
+            if control.is_some() || config_file.is_some() {
+                // Put every overridden or staged knob back at its
+                // default — live ones through the channel (the same
+                // config_changed receipt as a hand edit), all of them
+                // into the overlay so the reset survives a restart.
+                if !(state.overrides.is_empty() && state.staged.is_empty())
                     && widgets::button(ui, "restore defaults", Kind::Quiet)
                         .on_hover_text(
-                            "Send every live knob its default value — the file is \
-                             untouched; restart-only knobs aren't reachable here.",
+                            "Every live knob back to its default; every staged value \
+                             defaults too — the overlay carries it.",
                         )
                         .clicked()
                 {
                     for k in &knobs {
-                        if state.overrides.contains_key(k.path) && k.edit == EditKind::Live {
+                        let live = state.overrides.contains_key(k.path) && k.edit == EditKind::Live;
+                        let restart =
+                            state.staged.contains_key(k.path) && k.edit == EditKind::Restart;
+                        if !(live || restart) {
+                            continue;
+                        }
+                        if let Some(file) = config_file {
+                            let _ = avila_node::config::write_overlay_knob(
+                                file,
+                                k.path,
+                                toml_of(&k.default),
+                            );
+                        }
+                        if live {
                             let _ = control.as_ref().map(|tx| {
                                 tx.send(ControlMsg::Set {
                                     path: k.path.to_string(),
@@ -431,6 +491,7 @@ pub fn show(
                         }
                     }
                     state.overrides.clear();
+                    state.staged.clear();
                     state.drafts.clear();
                     state.rejected.clear();
                 }
@@ -442,7 +503,7 @@ pub fn show(
         ui.label(RichText::new(note).size(12.0).color(pal.signal));
     }
     if let Some(i) = state.preset_open {
-        preset_card(ui, pal, state, control.as_ref(), &knobs, i);
+        preset_card(ui, pal, state, control.as_ref(), config_file, &knobs, i);
     }
 
     // The file moved on disk — say which knobs drifted, and offer the
@@ -450,6 +511,7 @@ pub fn show(
     if let Some(diffs) = dirty {
         ui.add_space(8.0);
         let mut action = None;
+        let control = &control;
         ui.horizontal(|ui| {
             if diffs.is_empty() {
                 ui.label(
@@ -472,7 +534,45 @@ pub fn show(
                     .size(12.0)
                     .color(pal.signal),
                 );
-                if widgets::button(ui, "restart node", Kind::Primary).clicked() {
+                // Live knobs in the diff can land without a restart —
+                // send the file's value down the channel.
+                let live_diffs: Vec<&str> = diffs
+                    .iter()
+                    .filter(|p| {
+                        knobs
+                            .iter()
+                            .any(|k| k.path == *p && k.edit == EditKind::Live)
+                    })
+                    .map(|s| s.as_str())
+                    .collect();
+                let restart_diffs = diffs.len() - live_diffs.len();
+                if !live_diffs.is_empty()
+                    && control.is_some()
+                    && widgets::button(ui, "apply live now", Kind::Quiet)
+                        .on_hover_text(
+                            "The changed live knobs send to the running node — no restart.",
+                        )
+                        .clicked()
+                {
+                    if let (Some(tx), Some(file)) = (control.as_ref(), config_file) {
+                        if let Ok(v) = avila_node::config::load_config(Some(file)) {
+                            for k in avila_node::config::describe_config(v.get()) {
+                                if live_diffs.contains(&k.path) {
+                                    let _ = tx.send(ControlMsg::Set {
+                                        path: k.path.to_string(),
+                                        value: k.value.clone(),
+                                    });
+                                    state.pending.insert(k.path.to_string(), k.value.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                if restart_diffs > 0
+                    && widgets::button(ui, "restart node", Kind::Primary)
+                        .on_hover_text("Stop and start again — the file is re-read")
+                        .clicked()
+                {
                     action = Some(Action::Restart);
                 }
             }
@@ -527,8 +627,13 @@ fn row(
     dirty: Option<&[String]>,
 ) {
     let live = k.edit == EditKind::Live && control.is_some();
+    // Live knobs need the channel; restart knobs need the overlay —
+    // either way there's an edit affordance, and both persist through
+    // the overlay when a file is loaded.
+    let editable = live || (k.edit == EditKind::Restart && config_file.is_some());
     let value = effective(state, k.path, &k.value);
     let changed = state.overrides.contains_key(k.path);
+    let staged = state.staged.contains_key(k.path);
     let pending = state.pending.contains_key(k.path);
     let rejected = state.rejected.get(k.path).cloned();
 
@@ -550,7 +655,40 @@ fn row(
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.set_min_width(300.0);
-                control_cell(ui, pal, state, k, &value, live, control);
+                if let Some(v) = control_cell(ui, pal, state, k, &value, editable) {
+                    // Every in-app edit writes the overlay — the file
+                    // survives untouched and the value persists across
+                    // restarts. A write failure only refuses a staged
+                    // restart knob; a live knob still applies, marked
+                    // as not persisted.
+                    match k.edit {
+                        EditKind::Live => {
+                            if let Some(file) = config_file {
+                                if let Err(e) = avila_node::config::write_overlay_knob(
+                                    file,
+                                    k.path,
+                                    toml_of(&v),
+                                ) {
+                                    state
+                                        .rejected
+                                        .insert(k.path.to_string(), format!("not persisted: {e}"));
+                                }
+                            }
+                            if let Some(tx) = control {
+                                let _ = tx.send(ControlMsg::Set {
+                                    path: k.path.to_string(),
+                                    value: v.clone(),
+                                });
+                            }
+                            state.pending.insert(k.path.to_string(), v);
+                        }
+                        EditKind::Restart => {
+                            if let Some(file) = config_file {
+                                stage(file, state, k.path, v);
+                            }
+                        }
+                    }
+                }
                 if pending {
                     ui.label(RichText::new("applying…").size(11.5).color(pal.muted));
                 } else if changed {
@@ -560,7 +698,15 @@ fn row(
                             .color(pal.signal_text)
                             .strong(),
                     )
-                    .on_hover_text("Applied to the running node — reverts on restart");
+                    .on_hover_text("Applied to the running node — and persisted in the overlay");
+                } else if staged {
+                    ui.label(
+                        RichText::new("staged")
+                            .size(11.5)
+                            .color(pal.signal_text)
+                            .strong(),
+                    )
+                    .on_hover_text("In the overlay — applies on the next start");
                 } else if k.edit == EditKind::Live {
                     ui.label(RichText::new("live").size(11.5).color(pal.muted))
                         .on_hover_text("Applies to the running node without a restart");
@@ -577,7 +723,7 @@ fn row(
                         )
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text(format!(
-                            "Applies at startup — click to edit {}",
+                            "Applies at startup — click to open {} in your editor",
                             file.display()
                         ));
                     if r.clicked() {
@@ -592,11 +738,12 @@ fn row(
                 }
             });
             if dirty.is_some_and(|d| d.iter().any(|p| p == k.path)) {
-                ui.label(
-                    RichText::new("file differs — restart to apply")
-                        .size(11.0)
-                        .color(pal.signal),
-                );
+                let text = if staged {
+                    "staged — applies on restart"
+                } else {
+                    "file differs — restart to apply"
+                };
+                ui.label(RichText::new(text).size(11.0).color(pal.signal));
             }
             if let Some(reason) = rejected {
                 ui.label(
@@ -611,26 +758,19 @@ fn row(
 }
 
 /// The right-hand cell — a checkbox, a dropdown, or a text draft,
-/// depending on the knob's value type.
+/// depending on the knob's value type. Returns the committed value;
+/// the caller routes it (channel + overlay for live, overlay for
+/// restart).
 fn control_cell(
     ui: &mut Ui,
     pal: crate::theme::Palette,
     state: &mut ConfigPage,
     k: &avila_node::config::KnobDescription,
     value: &serde_json::Value,
-    live: bool,
-    control: Option<&Sender<ControlMsg>>,
-) {
-    let send = |value: serde_json::Value| {
-        if let Some(tx) = control {
-            let _ = tx.send(ControlMsg::Set {
-                path: k.path.to_string(),
-                value: value.clone(),
-            });
-        }
-    };
+    editable: bool,
+) -> Option<serde_json::Value> {
     let choices = CHOICES.iter().find(|(p, _)| *p == k.path).map(|(_, c)| *c);
-    if !live {
+    if !editable {
         ui.label(
             RichText::new(
                 if k.path == "relay.block.announce" && value.as_str() == Some("") {
@@ -647,17 +787,14 @@ fn control_cell(
                 pal.muted
             }),
         );
-        return;
+        return None;
     }
     if let serde_json::Value::Bool(b) = value {
         let mut on = *b;
         if ui.checkbox(&mut on, "").changed() {
-            send(serde_json::Value::Bool(on));
-            state
-                .pending
-                .insert(k.path.to_string(), serde_json::Value::Bool(on));
+            return Some(serde_json::Value::Bool(on));
         }
-        return;
+        return None;
     }
     if let Some(choices) = choices {
         let shown = if k.path == "relay.block.announce" && value.as_str() == Some("") {
@@ -680,12 +817,9 @@ fn control_cell(
             } else {
                 picked
             };
-            send(serde_json::Value::String(v.clone()));
-            state
-                .pending
-                .insert(k.path.to_string(), serde_json::Value::String(v));
+            return Some(serde_json::Value::String(v));
         }
-        return;
+        return None;
     }
     // Numbers, strings, lists — a draft field; Enter or Apply commits.
     let (draft_text, committed) = {
@@ -706,9 +840,8 @@ fn control_cell(
     if dirty && (committed || widgets::button(ui, "apply", Kind::Quiet).clicked()) {
         match draft_value(k.path, &draft_text, value) {
             Some(v) => {
-                send(v.clone());
-                state.pending.insert(k.path.to_string(), v);
                 state.drafts.remove(k.path);
+                return Some(v);
             }
             None => {
                 state
@@ -717,4 +850,5 @@ fn control_cell(
             }
         }
     }
+    None
 }

@@ -43,9 +43,9 @@ pub struct App {
     /// The TOML this node was loaded from — the Config page offers it
     /// up for the knobs that only a restart can apply.
     config_file: Option<std::path::PathBuf>,
-    /// Last-seen mtime of the config file — the watch that powers the
-    /// "changes detected" banner.
-    config_mtime: Option<std::time::SystemTime>,
+    /// Last-seen mtimes of the config file and its runtime overlay —
+    /// the watch that powers the "changes detected" banner.
+    config_mtime: (Option<std::time::SystemTime>, Option<std::time::SystemTime>),
     /// Knob paths whose on-disk value differs from what the node has
     /// loaded (`Some(vec![])` = the file changed but can't be read).
     config_dirty: Option<Vec<String>>,
@@ -226,10 +226,17 @@ impl App {
             restart: false,
             events_tail,
             decorated: None,
-            config_mtime: config_file
-                .as_ref()
-                .and_then(|f| std::fs::metadata(f).ok())
-                .and_then(|m| m.modified().ok()),
+            config_mtime: (
+                config_file
+                    .as_ref()
+                    .and_then(|f| std::fs::metadata(f).ok())
+                    .and_then(|m| m.modified().ok()),
+                config_file
+                    .as_ref()
+                    .map(|f| avila_node::config::overlay_path(f))
+                    .and_then(|f| std::fs::metadata(f).ok())
+                    .and_then(|m| m.modified().ok()),
+            ),
             config_dirty: None,
             config_checked: std::time::Instant::now(),
             config_file,
@@ -285,8 +292,11 @@ impl App {
         );
     }
 
-    /// Watch the config file's mtime; when it moves, reload and diff
-    /// its knobs against what the node has loaded.
+    /// Watch the config file and its runtime overlay; when either
+    /// moves, reload and diff the merged knobs against what the node
+    /// has loaded. Live edits that already applied (or are in flight)
+    /// with the same value don't count — the file isn't diverged, it's
+    /// just ahead of the loaded snapshot.
     fn poll_config_file(&mut self) {
         let Some(file) = &self.config_file else {
             return;
@@ -295,7 +305,13 @@ impl App {
             return;
         }
         self.config_checked = std::time::Instant::now();
-        let mtime = std::fs::metadata(file).ok().and_then(|m| m.modified().ok());
+        let overlay = avila_node::config::overlay_path(file);
+        let mtime = (
+            std::fs::metadata(file).ok().and_then(|m| m.modified().ok()),
+            std::fs::metadata(&overlay)
+                .ok()
+                .and_then(|m| m.modified().ok()),
+        );
         if mtime == self.config_mtime {
             return;
         }
@@ -311,6 +327,7 @@ impl App {
                 let diffs: Vec<String> = avila_node::config::describe_config(v.get())
                     .iter()
                     .filter(|k| base.get(k.path) != Some(&k.value))
+                    .filter(|k| !self.config_page.already_live(k.path, &k.value))
                     .map(|k| k.path.to_string())
                     .collect();
                 self.config_dirty = (!diffs.is_empty()).then_some(diffs);
@@ -340,6 +357,10 @@ impl App {
                 pages::welcome::show(ui, &scene, &mut self.run)
             } else {
                 match self.page {
+                    Page::Overview if Skin::current() == Skin::Classic => {
+                        classic::overview(ui, &scene);
+                        None
+                    }
                     Page::Overview => pages::overview::show(ui, &scene, &mut self.prefs.scale),
                     Page::Chain => pages::chain::show(
                         ui,
@@ -806,12 +827,14 @@ impl eframe::App for App {
                     .resizable(false)
                     .frame(Frame::new().fill(pal.well))
                     .show(ui, |ui| {
-                        if let Some(a) = classic::statusbar(
-                            ui,
-                            phase.label(),
-                            &self.context_line(),
-                            self.session.running(),
-                        ) {
+                        let stats = self
+                            .session
+                            .view
+                            .as_ref()
+                            .map(|v| (v.connected, v.peers.len(), v.mempool_txs));
+                        if let Some(a) =
+                            classic::statusbar(ui, phase.label(), stats, self.session.running())
+                        {
                             action = Some(a);
                         }
                     });
@@ -850,6 +873,10 @@ impl eframe::App for App {
                 .frame(Frame::new().fill(pal.canvas))
                 .show(ui, |ui| {
                     let top = ui.max_rect();
+                    if Skin::current() == Skin::Classic {
+                        // The original sat its pages in a sunken frame.
+                        classic::sunken_frame(ui.painter(), top.shrink(6.0));
+                    }
                     if crate::julia::on() {
                         crate::julia::wallpaper(ui.painter(), top, ui.input(|i| i.time));
                     }

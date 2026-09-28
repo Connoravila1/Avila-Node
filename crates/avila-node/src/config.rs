@@ -23,8 +23,62 @@ pub fn load_config(path: Option<&Path>) -> Result<ValidatedConfig, LoadConfigErr
             path: path.to_path_buf(),
             source,
         })?;
-    let config = parse_config(&contents)?;
+    if contents.len() > MAX_CONFIG_BYTES {
+        return Err(LoadConfigError::TooLarge);
+    }
+    let mut raw: toml::Value = toml::from_str(&contents)?;
+    // The runtime overlay sits beside the file — `<name>.runtime.toml`
+    // — and merges over it. GUI edits land there so the operator's
+    // hand-written TOML is never rewritten; an operator who edits the
+    // main file still wins where the overlay is silent.
+    let overlay = overlay_path(path);
+    match std::fs::read_to_string(&overlay) {
+        Ok(contents) => {
+            let o: toml::Value =
+                toml::from_str(&contents).map_err(|source| LoadConfigError::Overlay {
+                    path: overlay.clone(),
+                    source,
+                })?;
+            merge(&mut raw, o);
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(LoadConfigError::Read {
+                path: overlay,
+                source,
+            });
+        }
+    };
+    let config = parse_value(raw)?;
     Ok(config.resolve_relative_to(path.parent().unwrap_or_else(|| Path::new("."))))
+}
+
+/// The overlay file for `config.toml` — `config.runtime.toml` in the
+/// same directory.
+pub fn overlay_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("config");
+    path.with_file_name(format!("{stem}.runtime.toml"))
+}
+
+/// Deep-merge `over` into `base`: tables merge recursively, scalars
+/// and arrays replace.
+fn merge(base: &mut toml::Value, over: toml::Value) {
+    match (base, over) {
+        (toml::Value::Table(a), toml::Value::Table(b)) => {
+            for (k, v) in b {
+                match a.get_mut(&k) {
+                    Some(existing) => merge(existing, v),
+                    None => {
+                        a.insert(k, v);
+                    }
+                }
+            }
+        }
+        (base, over) => *base = over,
+    }
 }
 
 /// Pure parsing entry point, also used for tests and future fuzzing.
@@ -32,7 +86,14 @@ pub fn parse_config(contents: &str) -> Result<ValidatedConfig, LoadConfigError> 
     if contents.len() > MAX_CONFIG_BYTES {
         return Err(LoadConfigError::TooLarge);
     }
-    let config: NodeConfig = toml::from_str(contents)?;
+    let raw: toml::Value = toml::from_str(contents)?;
+    parse_value(raw)
+}
+
+/// The shared tail of `parse_config`/`load_config`: deserialize a
+/// merged table into `NodeConfig`, then validate.
+fn parse_value(raw: toml::Value) -> Result<ValidatedConfig, LoadConfigError> {
+    let config: NodeConfig = raw.try_into()?;
     let config = config.validate()?;
     // `policy.shadow` names resolve to mempool-crate presets —
     // validation lives here (not in avila-core) because that's where
@@ -57,6 +118,11 @@ pub enum LoadConfigError {
     TooLarge,
     #[error("invalid TOML configuration: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("runtime overlay {path} is not valid TOML: {source}")]
+    Overlay {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
     #[error(transparent)]
     Invalid(#[from] ConfigError),
     #[error("policy.shadow profile {0:?} is unknown — builtins: strict, core, permissive")]
@@ -681,6 +747,77 @@ pub fn risk_ack_set(dir: &std::path::Path) -> std::collections::HashSet<String> 
         .unwrap_or_default()
 }
 
+/// Write `path = value` into the overlay beside `config_path`,
+/// preserving every other staged key; `None` removes the key.
+/// The merged result goes through the same validation a load does
+/// before the file is touched — a bad write leaves the overlay as
+/// it was.
+pub fn write_overlay_knob(
+    config_path: &Path,
+    path: &str,
+    value: Option<toml::Value>,
+) -> Result<(), String> {
+    let overlay = overlay_path(config_path);
+    let mut table: toml::Table = match std::fs::read_to_string(&overlay) {
+        Ok(s) => toml::from_str(&s).map_err(|e| format!("overlay won't parse: {e}"))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => toml::Table::new(),
+        Err(e) => return Err(format!("can't read {}: {e}", overlay.display())),
+    };
+    // Descend `a.b.c`, creating tables; `None` deletes the leaf.
+    let keys: Vec<&str> = path.split('.').collect();
+    let mut cursor = &mut table;
+    for key in &keys[..keys.len() - 1] {
+        let entry = cursor
+            .entry((*key).to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let Some(t) = entry.as_table_mut() else {
+            return Err(format!("{key} in the overlay isn't a table"));
+        };
+        cursor = t;
+    }
+    match value {
+        Some(v) => {
+            cursor.insert(keys[keys.len() - 1].to_string(), v);
+        }
+        None => {
+            cursor.remove(keys[keys.len() - 1]);
+            prune_empty(&mut table, &keys[..keys.len() - 1]);
+        }
+    }
+    // Validate the merge before the file moves — same path a load
+    // takes, minus the resolve (paths aren't being staged).
+    let main = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("can't read {}: {e}", config_path.display()))?;
+    let mut raw: toml::Value =
+        toml::from_str(&main).map_err(|e| format!("config won't parse: {e}"))?;
+    merge(&mut raw, toml::Value::Table(table.clone()));
+    parse_value(raw).map_err(|e| format!("{e}"))?;
+    let body = toml::to_string_pretty(&table).map_err(|e| e.to_string())?;
+    let text = format!(
+        "# Written by the GUI — merged over {} at load. Edit or delete freely.\n\n{}",
+        config_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("the config"),
+        body,
+    );
+    std::fs::write(&overlay, text).map_err(|e| format!("can't write: {e}"))?;
+    Ok(())
+}
+
+/// Remove any all-empty table chain left by a delete.
+fn prune_empty(table: &mut toml::Table, keys: &[&str]) {
+    if keys.is_empty() {
+        return;
+    }
+    if let Some(toml::Value::Table(t)) = table.get_mut(keys[0]) {
+        prune_empty(t, &keys[1..]);
+        if t.is_empty() {
+            table.remove(keys[0]);
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -694,6 +831,46 @@ mod tests {
         let config = parse_config(include_str!("../../../config/mainnet.toml")).unwrap();
         assert_eq!(config.get().network, Network::Mainnet);
         assert_eq!(config.get().storage.prune_mb, Some(2048));
+    }
+
+    #[test]
+    fn overlay_merges_over_the_file() {
+        let dir = std::env::temp_dir().join(format!("avila-overlay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("n.toml");
+        std::fs::write(
+            &main,
+            "network = \"regtest\"\n\n[storage]\nprune_mb = 500\n\n[mempool]\nmax_mb = 100\n",
+        )
+        .unwrap();
+        // The overlay wins where it speaks; untouched keys survive.
+        std::fs::write(overlay_path(&main), "[mempool]\nmax_mb = 64\n").unwrap();
+        let c = load_config(Some(&main)).unwrap();
+        assert_eq!(c.get().mempool.max_mb, 64);
+        assert_eq!(c.get().storage.prune_mb, Some(500));
+        // A broken overlay fails the load loudly, not silently.
+        std::fs::write(overlay_path(&main), "[mempool\n").unwrap();
+        assert!(matches!(
+            load_config(Some(&main)),
+            Err(LoadConfigError::Overlay { .. })
+        ));
+        // write_overlay_knob stages and validates.
+        std::fs::remove_file(overlay_path(&main)).unwrap();
+        write_overlay_knob(&main, "net.blocks_only", Some(toml::Value::Boolean(true))).unwrap();
+        let c = load_config(Some(&main)).unwrap();
+        assert!(c.get().net.blocks_only);
+        // A bad value is refused before the file changes.
+        let bad = write_overlay_knob(
+            &main,
+            "relay.tx.announce",
+            Some(toml::Value::String("everywhere".to_string())),
+        );
+        assert!(bad.is_err());
+        // None unstages — the file's value returns.
+        write_overlay_knob(&main, "net.blocks_only", None).unwrap();
+        let c = load_config(Some(&main)).unwrap();
+        assert!(!c.get().net.blocks_only);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
