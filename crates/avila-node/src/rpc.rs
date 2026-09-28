@@ -1267,6 +1267,12 @@ fn admit_and_relay(
     let now = crate::time::time() as u32;
     match mgr.mempool().accept_tx(tx, cs, now) {
         Ok(_) => {
+            // `mempool.private` — stem-only relay + hidden from the
+            // listing RPCs. Admitted through the full path first;
+            // only propagation and visibility change.
+            if mgr.private_submissions() {
+                mgr.mempool().mark_private(&txid);
+            }
             // Admitted — relay an inv to every tx-accepting
             // peer (Core's RelayTransaction path), track it
             // as unbroadcast until a peer's getdata
@@ -7707,6 +7713,9 @@ pub(crate) fn dispatch(
                 "minrelaytxfee": value_from_amount(relay),
                 "incrementalrelayfee": value_from_amount(avila_mempool::INCREMENTAL_RELAY_FEE),
                 "unbroadcastcount": pool.unbroadcast_count(),
+                // `mempool.private` submissions — stem-only + hidden
+                // from the listing RPCs.
+                "private": pool.private_count(),
                 // Full-RBF matches deployed Core's -mempoolfullrbf=1:
                 // replacements no longer need BIP125 signaling.
                 "fullrbf": pool.full_rbf(),
@@ -7755,9 +7764,14 @@ pub(crate) fn dispatch(
                 "expired": st.expired,
                 "promoted": st.promoted,
                 "by_reason": st.by_reason,
+                // Per-class occupancy vs caps — the operator-visible
+                // half of extrapool.caps.
+                "by_class": extra.by_class(),
+                "pending_relay": extra.pending_relay(),
                 "entries": extra.iter().map(|(txid, e)| json!({
                     "txid": txid.to_string(),
                     "reason": e.reason,
+                    "class": e.class,
                     "first_seen": e.first_seen,
                     "seen": e.seen,
                     "bytes": e.bytes,
@@ -8025,10 +8039,14 @@ pub(crate) fn dispatch(
                 .unwrap_or(false);
             chain_query(method, queries, move |_, mgr| {
                 let pool = mgr.mempool_ref();
+                // `mempool.private` entries stay out of the listing —
+                // the point is a mempool view that doesn't enumerate
+                // the operator's own submissions.
                 if verbose {
                     let map: serde_json::Map<String, Value> = pool
                         .txids()
                         .iter()
+                        .filter(|txid| !pool.is_private(txid))
                         .filter_map(|txid| {
                             pool.entry(txid)
                                 .map(|e| (txid.to_string(), entry_json(pool, txid, e)))
@@ -8039,6 +8057,7 @@ pub(crate) fn dispatch(
                     Ok(json!(
                         pool.txids()
                             .iter()
+                            .filter(|t| !pool.is_private(t))
                             .map(|t| t.to_string())
                             .collect::<Vec<_>>()
                     ))
@@ -8058,7 +8077,9 @@ pub(crate) fn dispatch(
             let which = method.to_string();
             chain_query(method, queries, move |_, mgr| {
                 let pool = mgr.mempool_ref();
-                let Some(entry) = pool.entry(&txid) else {
+                // `mempool.private` entries answer as absent — the
+                // listing and the per-entry view are equally blind.
+                let Some(entry) = pool.entry(&txid).filter(|e| !e.private) else {
                     return Err((
                         RPC_INVALID_ADDRESS_OR_KEY,
                         "Transaction not in mempool".into(),

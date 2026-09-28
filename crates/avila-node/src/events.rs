@@ -87,23 +87,33 @@ impl EventStream {
     pub fn open(dir: &Path) -> io::Result<Self> {
         let path = dir.join(EVENTS_FILENAME);
         let written = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        // seq continues past the last emitted line — from this file,
+        // or after a rotation, from the rotated tail's last line. The
+        // contract is monotone across restarts AND rotations.
         let mut seq = 0;
-        if written > 0
-            && let Ok(mut f) = File::open(&path)
-        {
-            let tail = written.min(8192);
-            if f.seek(SeekFrom::End(-(tail as i64))).is_ok() {
-                let mut buf = Vec::new();
-                if f.take(tail).read_to_end(&mut buf).is_ok() {
-                    for line in String::from_utf8_lossy(&buf).lines().rev() {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
-                            && let Some(s) = v.get("seq").and_then(|s| s.as_u64())
-                        {
-                            seq = s + 1;
-                            break;
+        for candidate in [&path, &path.with_extension("ndjson.1")] {
+            let size = std::fs::metadata(candidate).map(|m| m.len()).unwrap_or(0);
+            if size == 0 {
+                continue;
+            }
+            if let Ok(mut f) = File::open(candidate) {
+                let tail = size.min(8192);
+                if f.seek(SeekFrom::End(-(tail as i64))).is_ok() {
+                    let mut buf = Vec::new();
+                    if f.take(tail).read_to_end(&mut buf).is_ok() {
+                        for line in String::from_utf8_lossy(&buf).lines().rev() {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+                                && let Some(s) = v.get("seq").and_then(|s| s.as_u64())
+                            {
+                                seq = s + 1;
+                                break;
+                            }
                         }
                     }
                 }
+            }
+            if seq > 0 {
+                break;
             }
         }
         let file = File::options().create(true).append(true).open(&path)?;
@@ -141,6 +151,87 @@ impl EventStream {
         self.seq += 1;
         self.written += bytes.len() as u64;
         Ok(())
+    }
+}
+
+/// A tailing reader for `events.ndjson` — the consumption half of the
+/// stream law. Followers (GUI, external plumbing) keep a byte cursor;
+/// rotation/truncation reset it, malformed lines are skipped, `seq`
+/// dedups replays. Absent file = idle, not an error.
+#[derive(Debug)]
+pub struct EventTail {
+    path: PathBuf,
+    offset: u64,
+    /// High-water `seq` — lines at-or-below it are replays (rotation
+    /// restarted the file with history intact elsewhere).
+    last_seq: Option<u64>,
+}
+
+impl EventTail {
+    /// Follow `<dir>/events.ndjson` from the current end — existing
+    /// history is left to `--follow` tooling; a tail sees new events.
+    #[must_use]
+    pub fn follow(path: PathBuf) -> Self {
+        let offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        Self {
+            path,
+            offset,
+            last_seq: None,
+        }
+    }
+
+    /// Read new events since the cursor, capped at `max` lines —
+    /// a follower on a busy node catches up over frames instead of
+    /// stalling the caller. Rotation or truncation reopens the file.
+    pub fn read_new(&mut self, max: usize) -> Vec<serde_json::Value> {
+        let Ok(mut f) = File::open(&self.path) else {
+            return Vec::new();
+        };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < self.offset {
+            // Truncated or rotated away — start the fresh file over.
+            self.offset = 0;
+        }
+        if f.seek(SeekFrom::Start(self.offset)).is_err() {
+            return Vec::new();
+        }
+        let mut buf = Vec::new();
+        let mut f = f.take((max * 8192) as u64 + 8192);
+        if f.read_to_end(&mut buf).is_err() {
+            return Vec::new();
+        }
+        let text = String::from_utf8_lossy(&buf);
+        // The last line may be torn — a writer mid-append hasn't
+        // terminated it. Only consume newline-terminated lines; the
+        // torn tail stays for the next pass to read whole.
+        let complete = text.ends_with('\n');
+        let mut out = Vec::new();
+        let mut consumed: u64 = 0;
+        let n_lines = text.lines().count();
+        for (i, line) in text.lines().enumerate() {
+            if i >= max || (i == n_lines - 1 && !complete) {
+                break;
+            }
+            consumed += line.len() as u64 + 1;
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let seq = v.get("seq").and_then(|s| s.as_u64());
+            if let (Some(s), Some(hi)) = (seq, self.last_seq)
+                && s <= hi
+            {
+                continue;
+            }
+            if let Some(s) = seq {
+                self.last_seq = Some(self.last_seq.map_or(s, |hi| hi.max(s)));
+            }
+            out.push(v);
+        }
+        self.offset += consumed;
+        out
     }
 }
 
@@ -290,6 +381,48 @@ mod tests {
         drop(s);
         assert!(dir.join("events.ndjson.1").exists());
         assert!(std::fs::metadata(&path).unwrap().len() < MAX_STREAM_BYTES);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tail_follows_appends_and_survives_rotation() {
+        let dir = tmpdir("tail");
+        let path = dir.join(EVENTS_FILENAME);
+        let mut tail = EventTail::follow(path.clone());
+        assert!(tail.read_new(16).is_empty(), "absent file is idle");
+        // A writer starts; a follower at EOF sees only new lines.
+        {
+            let mut s = EventStream::open(&dir).unwrap();
+            s.emit("run_started", serde_json::json!({})).unwrap();
+            s.emit("tip_advanced", serde_json::json!({"height": 1}))
+                .unwrap();
+        }
+        let got = tail.read_new(16);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1]["kind"], "tip_advanced");
+        // A torn write (no newline) is not consumed mid-line.
+        {
+            let mut f = File::options().append(true).open(&path).unwrap();
+            f.write_all(b"{\"seq\": 99, \"kind\": \"partial\"").unwrap();
+        }
+        assert!(tail.read_new(16).is_empty(), "torn tail waits");
+        {
+            let mut f = File::options().append(true).open(&path).unwrap();
+            f.write_all(b"}\n").unwrap();
+        }
+        let got = tail.read_new(16);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["kind"], "partial");
+        // Rotation: the old file left, a fresh one starts — the cursor
+        // resets instead of dying on a shrunk file.
+        std::fs::rename(&path, path.with_extension("ndjson.1")).unwrap();
+        {
+            let mut s = EventStream::open(&dir).unwrap();
+            s.emit("run_started", serde_json::json!({})).unwrap();
+        }
+        let got = tail.read_new(16);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["kind"], "run_started");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -36,6 +36,11 @@ event_capacity = 256
 # max_mb = 300                        # Core's -maxmempool
 # min_relay_fee_sat_per_kvb = 100     # Core's -minrelaytxfee (0.1 sat/vB floor)
 # expiry_secs = 1209600               # Core's -mempoolexpiry (336h)
+# private = false                     # local submissions: stem-only relay,
+                                     # hidden from getrawmempool/
+                                     # getmempoolentry. Full validation
+                                     # unchanged — only propagation and
+                                     # listing differ.
 
 # [policy]
 # require_standard = true             # Core's -acceptnonstdtxn, negated
@@ -50,6 +55,12 @@ event_capacity = 256
 
 # [relay.tx]
 # stem = true                         # stem-hop announce for local transactions
+# deny_pairs = []                     # compartment matrix: "src->dst" pairs
+                                     # never announced across.
+                                     # src: inbound|outbound|local|extrapool
+                                     # dst: inbound|outbound
+                                     # e.g. ["inbound->inbound",
+                                     #       "extrapool->inbound"]
 
 # External verdict helpers — docs/DECISION_REGISTRY.md. Each
 # [[hooks.peer_accept]] is a long-lived subprocess: the node writes
@@ -78,6 +89,23 @@ event_capacity = 256
 # on_timeout = "reject"     # dead helper rejects all txs — fail-closed
 # on_defer = "reject"
 # max_restarts = 3
+#
+# [[hooks.tx_announce]] — same protocol, consulted per (tx, target
+# link) before each inv hop — including the stem hop and extrapool
+# propagation. A "reject" withholds that link only.
+# Facts: txid, wtxid, source (inbound|outbound|local|extrapool),
+# source_peer, peer, peer_addr, peer_inbound, peer_user_agent.
+# The hottest path: announce throughput = helper latency × peers.
+# [[hooks.tx_announce]]
+# program = "/usr/local/sbin/announce-tx"
+# args = []
+# timeout_ms = 100
+# on_timeout = "reject"     # dead helper silences relay — fail-closed
+# on_defer = "reject"
+# max_restarts = 3
+#
+# [[hooks.extrapool_admit]] / [[hooks.extrapool_promote]] — gate the
+# observation pool's store and re-admission. Facts: txid, reason.
 
 # [extrapool]
 # The observation pool: consensus-valid transactions that live policy
@@ -87,6 +115,21 @@ event_capacity = 256
 # max_entries = 10000                 # FIFO eviction past this
 # max_bytes = 50000000                # serialized-bytes cap, ~50 MiB
 # expiry_secs = 86400                 # entry lifetime; 0 = never age out
+# relay = "never"                     # propagate observed txs —
+                                     # never|outbound|all. "outbound"
+                                     # confines to our chosen links.
+                                     # tx.announce still gates each hop.
+# promote_on = []                     # auto re-admission triggers:
+                                     # ["tip"] retries all entries on
+                                     # each connected block (full
+                                     # validation, bounded per tip).
+# [extrapool.caps]                    # per-reject-class entry caps —
+                                     # the oldest of a class evicts when
+                                     # it exceeds its cap. Classes:
+                                     # nonstandard fee hook rbf package
+                                     # finality capacity weight sigops
+                                     # truc other
+#   fee = 4000
 
 # [filters]
 # build = false                       # Core's -blockfilterindex

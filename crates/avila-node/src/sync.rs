@@ -385,6 +385,18 @@ pub struct SyncConfig {
     /// `policy.shadow` — counterfactual relay profiles scored on every
     /// admission. Empty disables the observatory.
     pub shadow_profiles: Vec<String>,
+    /// `tx.announce` verdict helpers — consulted per (tx, link) on
+    /// every announcement hop. The hottest hook path.
+    pub tx_announce_hooks: Vec<crate::hooks::HookSpec>,
+    /// `extrapool.admit` verdict helpers — gate observation records.
+    pub extrapool_admit_hooks: Vec<crate::hooks::HookSpec>,
+    /// `extrapool.promote` verdict helpers — gate re-admission.
+    pub extrapool_promote_hooks: Vec<crate::hooks::HookSpec>,
+    /// `relay.tx.deny_pairs` — the compartment matrix, already split
+    /// into (src, dst) names by the config resolver.
+    pub deny_pairs: Vec<(String, String)>,
+    /// `mempool.private` — stem-only, RPC-hidden submissions.
+    pub private_submissions: bool,
     /// `[extrapool]` — the observation pool for policy rejects.
     pub extrapool: avila_core::ExtrapoolConfig,
     /// `peers.ban_time` — default `setban` duration (Core's `-bantime`).
@@ -434,6 +446,11 @@ impl Default for SyncConfig {
             dns_seeds: true,
             peer_accept_hooks: Vec::new(),
             tx_admit_hooks: Vec::new(),
+            tx_announce_hooks: Vec::new(),
+            extrapool_admit_hooks: Vec::new(),
+            extrapool_promote_hooks: Vec::new(),
+            deny_pairs: Vec::new(),
+            private_submissions: false,
             shadow_profiles: vec!["strict".to_string()],
             extrapool: avila_core::ExtrapoolConfig::default(),
             ban_time: avila_p2p::banman::DEFAULT_BANTIME,
@@ -894,8 +911,11 @@ pub fn run(
             cfg.extrapool.max_bytes,
             cfg.extrapool.expiry_secs,
         );
+        mp.configure_extrapool_detail(cfg.extrapool.caps.clone(), cfg.extrapool.relay != "never");
     }
     mgr.set_stem_relay(cfg.stem_relay);
+    mgr.set_deny_pairs(cfg.deny_pairs.clone());
+    mgr.set_private_submissions(cfg.private_submissions);
     mgr.set_max_in_flight_total(cfg.max_in_transit);
     mgr.set_default_ban_time(cfg.ban_time);
     // The append-only event plane (docs/DECISION_REGISTRY.md — the
@@ -1134,6 +1154,185 @@ pub fn run(
             },
         )));
     }
+    if !cfg.tx_announce_hooks.is_empty() {
+        use avila_core::OnDefault;
+        // The hottest hook path: one verdict per (tx, target link) —
+        // announce rate is bounded by helper latency × peer count.
+        let mut helpers: Vec<(crate::hooks::HookSpec, Option<crate::hooks::VerdictHelper>)> = cfg
+            .tx_announce_hooks
+            .iter()
+            .map(
+                |spec| match crate::hooks::VerdictHelper::spawn(spec.clone()) {
+                    Ok(h) => (spec.clone(), Some(h)),
+                    Err(e) => {
+                        eprintln!(
+                            "hooks.tx_announce {}: spawn failed ({e}) — \
+                             answering {:?} for every announce",
+                            spec.program.display(),
+                            spec.on_timeout
+                        );
+                        emit(
+                            &mut stream,
+                            "hook_spawn_failed",
+                            serde_json::json!({
+                                "point": "tx.announce",
+                                "program": spec.program.display().to_string(),
+                                "on_timeout": format!("{:?}", spec.on_timeout),
+                            }),
+                        );
+                        (spec.clone(), None)
+                    }
+                },
+            )
+            .collect();
+        let hook_tx = hook_events_tx.clone();
+        let dropped = hook_events_dropped.clone();
+        mgr.set_tx_announce_verdict(Some(Box::new(
+            move |facts: &avila_p2p::manager::TxAnnounceFacts| {
+                let txid = facts.txid.to_string();
+                let peer = facts.peer;
+                let facts = serde_json::json!({
+                    "txid": txid.clone(),
+                    "wtxid": facts.wtxid.to_string(),
+                    "source": facts.source,
+                    "source_peer": facts.source_peer,
+                    "peer": peer,
+                    "peer_addr": facts.peer_addr,
+                    "peer_inbound": facts.peer_inbound,
+                    "peer_user_agent": facts.peer_user_agent,
+                });
+                helpers.iter_mut().all(|(spec, h)| {
+                    let verdict = match h {
+                        Some(h) => h.verdict("tx.announce", &facts),
+                        None => match spec.on_timeout {
+                            OnDefault::Accept => crate::hooks::Verdict::Accept,
+                            OnDefault::Reject => crate::hooks::Verdict::Reject,
+                        },
+                    };
+                    let admit = match verdict {
+                        crate::hooks::Verdict::Accept => true,
+                        crate::hooks::Verdict::Reject => false,
+                        crate::hooks::Verdict::Defer => {
+                            matches!(spec.on_defer, OnDefault::Accept)
+                        }
+                    };
+                    if hook_tx
+                        .try_send(serde_json::json!({
+                            "kind": "hook_verdict",
+                            "point": "tx.announce",
+                            "helper": spec.program.display().to_string(),
+                            "verdict": match verdict {
+                                crate::hooks::Verdict::Accept => "accept",
+                                crate::hooks::Verdict::Reject => "reject",
+                                crate::hooks::Verdict::Defer => "defer",
+                            },
+                            "txid": txid.as_str(),
+                            "peer": peer,
+                            "admit": admit,
+                        }))
+                        .is_err()
+                    {
+                        dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    admit
+                })
+            },
+        )));
+    }
+    // `extrapool.admit` / `extrapool.promote` — the observation pool's
+    // own gates. Facts are (txid, reason); a `reject` drops the record
+    // or keeps the entry respectively. Same spawn/tombstone semantics.
+    for (point, specs) in [
+        ("extrapool.admit", &cfg.extrapool_admit_hooks),
+        ("extrapool.promote", &cfg.extrapool_promote_hooks),
+    ] {
+        if specs.is_empty() {
+            continue;
+        }
+        use avila_core::OnDefault;
+        let mut helpers: Vec<(crate::hooks::HookSpec, Option<crate::hooks::VerdictHelper>)> = specs
+            .iter()
+            .map(
+                |spec| match crate::hooks::VerdictHelper::spawn(spec.clone()) {
+                    Ok(h) => (spec.clone(), Some(h)),
+                    Err(e) => {
+                        eprintln!(
+                            "hooks.{} {}: spawn failed ({e}) — \
+                             answering {:?} for every call",
+                            point.replace('.', "_"),
+                            spec.program.display(),
+                            spec.on_timeout
+                        );
+                        emit(
+                            &mut stream,
+                            "hook_spawn_failed",
+                            serde_json::json!({
+                                "point": point,
+                                "program": spec.program.display().to_string(),
+                                "on_timeout": format!("{:?}", spec.on_timeout),
+                            }),
+                        );
+                        (spec.clone(), None)
+                    }
+                },
+            )
+            .collect();
+        let hook_tx = hook_events_tx.clone();
+        let dropped = hook_events_dropped.clone();
+        let point_name: &'static str = point;
+        let judge = move |txid: &avila_consensus::hash::Txid, reason: &str| {
+            let txid_s = txid.to_string();
+            let facts = serde_json::json!({
+                "txid": txid_s.clone(),
+                "reason": reason,
+            });
+            helpers.iter_mut().all(|(spec, h)| {
+                let verdict = match h {
+                    Some(h) => h.verdict(point_name, &facts),
+                    None => match spec.on_timeout {
+                        OnDefault::Accept => crate::hooks::Verdict::Accept,
+                        OnDefault::Reject => crate::hooks::Verdict::Reject,
+                    },
+                };
+                let admit = match verdict {
+                    crate::hooks::Verdict::Accept => true,
+                    crate::hooks::Verdict::Reject => false,
+                    crate::hooks::Verdict::Defer => {
+                        matches!(spec.on_defer, OnDefault::Accept)
+                    }
+                };
+                if hook_tx
+                    .try_send(serde_json::json!({
+                        "kind": "hook_verdict",
+                        "point": point_name,
+                        "helper": spec.program.display().to_string(),
+                        "verdict": match verdict {
+                            crate::hooks::Verdict::Accept => "accept",
+                            crate::hooks::Verdict::Reject => "reject",
+                            crate::hooks::Verdict::Defer => "defer",
+                        },
+                        "txid": txid_s.as_str(),
+                        "reason": reason,
+                        "admit": admit,
+                    }))
+                    .is_err()
+                {
+                    dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                admit
+            })
+        };
+        match point {
+            "extrapool.admit" => {
+                mgr.mempool()
+                    .set_extrapool_admit_hook(Some(Box::new(judge)));
+            }
+            _ => {
+                mgr.mempool()
+                    .set_extrapool_promote_hook(Some(Box::new(judge)));
+            }
+        }
+    }
     let started = Instant::now();
     // Core's `GetStartupTime` — wall-clock boot epoch. `uptime` reads
     // `GetTime() - GetStartupTime()`, so a pinned mock shifts it too.
@@ -1319,10 +1518,14 @@ pub fn run(
             }
         }
         mgr.drain_inbounds();
+        let mut tip_moved = false;
         for event in mgr.tick_net(&mut cs, unix_now(), params.message_start, 0) {
             {
                 let (kind, fields) = crate::events::net_event_json(&event);
                 emit(&mut stream, kind, fields);
+            }
+            if matches!(event, NetEvent::TipAdvanced(_)) {
+                tip_moved = true;
             }
             match event {
                 NetEvent::Connected { .. } => established_total += 1,
@@ -1424,6 +1627,50 @@ pub fn run(
                         serde_json::json!({"total": n, "size": extra.len()}),
                     );
                 }
+            }
+        }
+        // `extrapool.relay` — newly observed entries propagate through
+        // the announce gates with extrapool provenance ("outbound"
+        // confines to our chosen routes, "all" fans out fully).
+        for (txid, wtxid) in mgr.mempool().take_extrapool_pending() {
+            mgr.announce_extrapool_tx(txid, wtxid, cfg.extrapool.relay == "outbound");
+            emit(
+                &mut stream,
+                "extrapool_relayed",
+                serde_json::json!({
+                    "txid": txid.to_string(),
+                    "scope": cfg.extrapool.relay.as_str(),
+                }),
+            );
+        }
+        // `extrapool.promote_on = ["tip"]` — a connected block changes
+        // the fee/UTXO landscape, so re-run full admission on observed
+        // entries. Bounded per tip; the promote hooks still gate.
+        if tip_moved && cfg.extrapool.promote_on.iter().any(|t| t == "tip") {
+            const TIP_PROMOTE_CAP: usize = 256;
+            let candidates: Vec<_> = mgr
+                .mempool()
+                .extrapool()
+                .iter()
+                .map(|(id, _)| *id)
+                .take(TIP_PROMOTE_CAP)
+                .collect();
+            if !candidates.is_empty() {
+                let mut promoted = 0usize;
+                for txid in &candidates {
+                    if mgr.mempool().promote(txid, &cs, unix_now()).is_ok() {
+                        promoted += 1;
+                    }
+                }
+                emit(
+                    &mut stream,
+                    "extrapool_promotion_pass",
+                    serde_json::json!({
+                        "trigger": "tip",
+                        "attempted": candidates.len(),
+                        "promoted": promoted,
+                    }),
+                );
             }
         }
         // Completion boundary for the speculative tail: pending script

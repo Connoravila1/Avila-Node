@@ -27,10 +27,15 @@ kernel and the untrusted-advice invariants — they never appear as knobs here.
   `hook_verdict`, `hook_spawn_failed`, `shadow_divergence` (one per
   changed `(profile, reason)` counter), `extrapool_stored` (per changed
   `reason` total), `extrapool_evicted`, `extrapool_expired`,
-  `extrapool_promoted` (per changed counter), and every `NetEvent` kind
+  `extrapool_promoted` (per changed counter), `extrapool_relayed`
+  (per announce pass), `extrapool_promotion_pass` (per trigger),
+  `hook_events_dropped` (bounded-channel drop counter),
+  `config_risk` (per unacknowledged finding), and every `NetEvent` kind
   (`peer_connected`, `peer_disconnected`, `tip_advanced`,
   `eclipse_suspected`, `proxy_unreachable`, `v2_downgraded`,
-  `cpu_throttled`, `blocks_announced`, `recon_divergence`).
+  `cpu_throttled`, `blocks_announced`, `recon_divergence`). The GUI's
+  activity log follows this file via `events::EventTail` — the same
+  wire `--follow` sees.
 
 ## External verdict programs
 
@@ -68,19 +73,30 @@ Semantics:
   `timeout_ms` — a slow helper counts as dead, is killed and restarted
   within budget. Consultation never blocks consensus work.
 
-**Status:** `peer.accept` is the first wired point — `[[hooks.peer_accept]]`
-entries consult in `PeerManager::drain_inbounds`, after the ban check and
-before slot/eviction. `tx.admit` is wired second —
-`[[hooks.tx_admit]]` entries consult in `Mempool::accept_tx` before any
-built-in check, narrowing only (`reject` → `MempoolReject::PolicyHook`,
-counted in `lifecycle.rejected`, surfaced as "rejected by tx.admit hook"
-through `sendrawtransaction`); facts are `txid`, `wtxid`, `version`,
+**Status:** five points wired. `peer.accept` (`[[hooks.peer_accept]]`)
+consults in `PeerManager::drain_inbounds`, after the ban check and
+before slot/eviction. `tx.admit` (`[[hooks.tx_admit]]`) consults in
+`Mempool::accept_tx` before any built-in check, narrowing only
+(`reject` → `MempoolReject::PolicyHook`, counted in
+`lifecycle.rejected`, surfaced as "rejected by tx.admit hook" through
+`sendrawtransaction`); facts are `txid`, `wtxid`, `version`,
 `lock_time`, `vbytes`, `weight`, `inputs`, `outputs`, `output_value`,
 `fee`, `feerate` (sat/kvB; both null when a prevout is unresolvable),
 `rbf`, `has_witness`, `spk_types`. This is a hot path: admission
-throughput is bounded by helper latency. `peer.accept`'s richer facts
-(`netgroup`, `asn`) arrive when the addrman/asmap lookups expose them
-at accept time.
+throughput is bounded by helper latency. `tx.announce`
+(`[[hooks.tx_announce]]`) consults once per tx×peer link in
+`send_tx_inv` (fan-out + broadcast) and at the stem hop — narrowing
+only per link; a reject suppresses that peer's inv, never the entry.
+Facts are `txid`, `wtxid`, `source` (inbound|outbound|local|extrapool),
+`source_peer`, `peer`, `peer_addr`, `peer_inbound`, `peer_user_agent`.
+`extrapool.admit` and `extrapool.promote` (`[[hooks.extrapool_admit]]`,
+`[[hooks.extrapool_promote]]`) see `{txid, reason}` — the former drops
+the observation record only (the tx is rejected regardless), the latter
+keeps the entry on reject. All five fire `hook_verdict` events;
+verdict delivery is bounded (sync_channel 4096, drops emit
+`hook_events_dropped`). `peer.accept`'s richer facts (`netgroup`,
+`asn`) arrive when the addrman/asmap lookups expose them at accept
+time.
 
 Shadow mode: `policy.shadow = ["strict"]` (wired — named presets
 `strict`, `core`, `permissive`, several concurrent) evaluates counterfactual
@@ -170,29 +186,31 @@ in a bounded, inspectable pool with declared rules. Whether observed
 transactions may promote, relay, or mine is operator policy — never
 consensus, and never automatic.
 
-**Status:** the pool itself is wired — `Mempool::accept_tx` routes every
-policy-class reject (`NotStandard`, fee floors, `PolicyHook`, RBF
-conflicts, package limits, `NotFinal`, capacity, sigops, weight, TRUC) into
-`Extrapool` when `extrapool.observe` is on (default true). Consensus
-failures, duplicates, and orphans never store — structural noise isn't
-signal. Bounds: `extrapool.max_entries`/`max_bytes` (FIFO evict),
-`extrapool.expiry_secs` (0 = never age). Entries carry the reject-reason
-string and a resubmission counter; `extrapoolpromote "txid"` re-runs the
-full admission path (hook included) after a policy change, and
-`getextrapoolinfo` reports size/bytes/counters/`by_reason`/entries.
-`extrapool_stored`/`extrapool_evicted`/`extrapool_expired`/
-`extrapool_promoted` events emit on counter movement only. Per-class
-observe filters, `extrapool.relay` (propagate what others filter — needs
-the `tx.announce` seam), `promote_on` auto-rules, per-class caps, and the
-private pool remain open.
+**Status:** fully wired. `Mempool::accept_tx` routes every policy-class
+reject (`NotStandard`, fee floors, `PolicyHook`, RBF conflicts, package
+limits, `NotFinal`, capacity, sigops, weight, TRUC) into `Extrapool` when
+`extrapool.observe` is on (default true). Consensus failures, duplicates,
+and orphans never store — structural noise isn't signal. Bounds:
+`extrapool.max_entries`/`max_bytes` (FIFO evict), `extrapool.expiry_secs`
+(0 = never age), `extrapool.caps` (per-reject-class FIFO bounds —
+classes: nonstandard, fee, hook, rbf, package, finality, capacity,
+weight, sigops, truc, other). `extrapoolpromote "txid"` re-runs the full
+admission path (hooks included) after a policy change;
+`extrapool.promote_on = ["tip"]` retries up to 256 entries per connected
+block. `extrapool.relay` (never|outbound|all) propagates observed txs
+through the announce gates with `extrapool` provenance — default never.
+`getextrapoolinfo` reports size/bytes/counters/`by_reason`/`by_class`/
+`pending_relay`/entries. Events: `extrapool_stored`, `extrapool_evicted`,
+`extrapool_expired`, `extrapool_promoted`, `extrapool_relayed`,
+`extrapool_promotion_pass`.
 
 | Point | Today | Knobs | Hook |
 | --- | --- | --- | --- |
-| Observation pool | rejects dropped after verdict | `extrapool.observe` (bool — wired), `extrapool.max_bytes`/`max_entries`/`expiry_secs` (wired); `extrapool.per_class_caps` planned | `extrapool.admit` |
-| Promotion | — | `extrapoolpromote "txid"` (wired — manual); `extrapool.promote_on` (never / fee-floor-drop / config-change) planned | `extrapool.promote` |
-| Private pool | — | `pool.private`: wallet/RPC-flagged transactions announce stem-only and are hidden from mempool serving and non-whitelisted RPC | — |
-| Extrapool relay | — | `extrapool.relay` (never / whitelist-only / all) — propagate what others filter; default never | `extrapool.announce` |
-| Reporting | `shadow_standard` counters only | `getextrapoolinfo` + `extrapool_*` events (wired); `extrapool.report` toggle planned | — |
+| Observation pool | policy rejects → bounded store | `extrapool.observe`, `max_bytes`/`max_entries`/`expiry_secs`, `extrapool.caps` (per-class bounds — wired) | `extrapool.admit` (wired — drops the record only) |
+| Promotion | manual RPC + tip trigger | `extrapoolpromote "txid"`, `extrapool.promote_on` (`[]` / `["tip"]` — wired) | `extrapool.promote` (wired — reject keeps the entry) |
+| Private pool | stem-only + RPC-hidden | `mempool.private` (bool — wired): local submissions never fluff and are absent from `getrawmempool`/`getmempoolentry`; `getmempoolinfo` reports `private` count | — |
+| Extrapool relay | — | `extrapool.relay` (never / outbound / all — wired); announce gates + deny_pairs apply | `tx.announce` |
+| Reporting | counters + events | `getextrapoolinfo` + `extrapool_*` events (wired) | — |
 
 ## E. Relay policy — per-peer wire behavior
 
@@ -203,9 +221,9 @@ transition.
 
 | Point | Today | Knobs | Hook |
 | --- | --- | --- | --- |
-| Tx announce | wtxid inv; stem on, `STEM_EPOCH=600s` | `relay.tx.announce` (inv / none / private-only), `relay.tx.stem`, `stem.epoch`, `stem.hop` (outbound-only / any) | `tx.announce` |
-| Per-peer matrix | uniform | `relay.tx.to_inbound`, `relay.tx.to_blocks_only_peers` (Core never tx-announces on block-relay links), `relay.tx.peer_override` for whitelisted peers | `tx.announce` |
-| Provenance rules | — | `relay.tx.min_observed_announces`, `relay.tx.compartments` (e.g. inbound-sourced → outbound-only) | `tx.announce` |
+| Tx announce | wtxid inv; stem on, `STEM_EPOCH=600s` | `relay.tx.stem` (wired); `relay.tx.announce` (inv / none / private-only), `stem.epoch`, `stem.hop` planned | `tx.announce` (wired — verdict per tx×peer link, fan-out + stem hop) |
+| Per-peer matrix | compartment matrix | `relay.tx.deny_pairs` (wired — `"src->dst"` pairs never announce; src: inbound/outbound/local/extrapool, dst: inbound/outbound); `relay.tx.to_inbound`, `to_blocks_only_peers`, `peer_override` planned | `tx.announce` |
+| Provenance rules | `TxSource` in announce facts | `relay.tx.min_observed_announces` planned | `tx.announce` (facts carry `source`, `source_peer`, `peer_inbound`, `peer_user_agent`) |
 | Tx serving | `MEMPOOL_REQ_INTERVAL=60s`, `MAX_MEMPOOL_INV=50k` | `relay.tx.serve_mempool`, `mempool_req.interval`, `mempool_req.max_inv`, `relay.tx.serve_bip37` (bloom serving, off default) | `tx.serve` |
 | feefilter | honored inbound | `relay.tx.honor_feefilter`, `relay.tx.send_feefilter` | — |
 | Shape / timing | recon 4s | `relay.tx.trickle_ms`, announce jitter, per-peer announce rate cap | `relay.schedule` |

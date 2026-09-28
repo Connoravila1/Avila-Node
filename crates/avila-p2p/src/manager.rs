@@ -547,13 +547,27 @@ pub struct PeerManager<S> {
     /// broadcasting to all at once. Entries: (txid, wtxid, fluff_at).
     /// Weaker than full Dandelion (single hop, no protocol change) —
     /// the point is plausible-deniability routing for our own txs.
+    /// `bool` — `mempool.private` flag: never fluffs; the stem hop is
+    /// the only announcement the entry ever makes.
     stem_pending: Vec<(
         avila_consensus::hash::Txid,
         avila_consensus::hash::Wtxid,
         Instant,
+        bool,
     )>,
     /// Whether locally-submitted txs take the stem path — default on.
     stem_relay: bool,
+    /// `mempool.private` — operator submissions are stem-only and
+    /// hidden from the listing RPCs.
+    private_submissions: bool,
+    /// `tx.announce` verdict — consulted per (transaction, target
+    /// link) before every `inv` fan-out hop. `false` skips that link;
+    /// narrowing only, all built-in gates still apply.
+    tx_announce_verdict: Option<TxAnnounceVerdict>,
+    /// Compartment matrix (`relay.tx.deny_pairs`): "src->dst" pairs —
+    /// src ∈ {inbound,outbound,local,extrapool}, dst ∈ {inbound,
+    /// outbound}. A pair listed here is never announced across.
+    deny_pairs: Vec<(String, String)>,
     /// Audit P2P-7: the stem hop is per-EPOCH, not per-tx — a fresh
     /// random relay per transaction lets an observer correlate that
     /// all stem txs leaving through different hops came from one
@@ -704,6 +718,70 @@ pub struct InboundFacts {
 /// `set_inbound_verdict` and `InboundFacts`.
 pub type InboundVerdict = Box<dyn FnMut(&InboundFacts) -> bool + Send>;
 
+/// Where a transaction we're announcing came from — the provenance the
+/// `tx.announce` verdict and the `deny_pairs` compartment matrix judge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TxSource {
+    /// Delivered by this peer's `tx` message — being relayed onward.
+    Peer(u64),
+    /// Operator-submitted (the RPC broadcast path) — stem hop or fluff.
+    Local,
+    /// The observed pool's propagation (`extrapool.relay`).
+    Extrapool,
+}
+
+impl TxSource {
+    /// The supplying peer when peer-sourced.
+    #[must_use]
+    pub fn peer(self) -> Option<u64> {
+        match self {
+            Self::Peer(id) => Some(id),
+            _ => None,
+        }
+    }
+}
+
+/// Facts handed to the `tx.announce` verdict — the object, who we're
+/// about to tell, and where it came from. Consulted once per
+/// (transaction, target link), so per-peer gating is expressible but
+/// announce throughput is bounded by helper latency.
+#[derive(Clone, Debug)]
+pub struct TxAnnounceFacts {
+    /// The transaction being announced.
+    pub txid: avila_consensus::hash::Txid,
+    /// Its witness commitment id.
+    pub wtxid: avila_consensus::hash::Wtxid,
+    /// Source compartment: "inbound" | "outbound" | "local" |
+    /// "extrapool".
+    pub source: &'static str,
+    /// The peer that delivered it, when `source` is link-sourced.
+    pub source_peer: Option<u64>,
+    /// The target link's peer id.
+    pub peer: u64,
+    /// Its address as "ip:port", when known.
+    pub peer_addr: Option<String>,
+    /// Target direction — true when they dialed us.
+    pub peer_inbound: bool,
+    /// The target's claimed user agent, if the handshake ran.
+    pub peer_user_agent: Option<String>,
+}
+
+/// A `tx.announce` judge — `false` withholds the announcement from that
+/// link. Narrows only; all built-in gates still apply.
+pub type TxAnnounceVerdict = Box<dyn FnMut(&TxAnnounceFacts) -> bool + Send>;
+
+/// NetAddr → "ip:port" for the verdict facts — v4-mapped prints dotted
+/// quad, v6 prints bracketed.
+fn net_addr_string(a: &crate::message::NetAddr) -> String {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let ip = if a.ip[..10] == [0; 10] && a.ip[10] == 0xff && a.ip[11] == 0xff {
+        IpAddr::V4(Ipv4Addr::new(a.ip[12], a.ip[13], a.ip[14], a.ip[15]))
+    } else {
+        IpAddr::V6(Ipv6Addr::from(a.ip))
+    };
+    format!("{ip}:{}", a.port)
+}
+
 impl<S: Read + Write> PeerManager<S> {
     /// An empty manager — `max_peers` bounds the set.
     #[must_use]
@@ -734,6 +812,9 @@ impl<S: Read + Write> PeerManager<S> {
             next_rebroadcast: 0,
             stem_pending: Vec::new(),
             stem_relay: true,
+            private_submissions: false,
+            tx_announce_verdict: None,
+            deny_pairs: Vec::new(),
             stem_hop: None,
             asmap: crate::asmap::AsMap::empty(),
             event_ring: std::collections::VecDeque::with_capacity(1025),
@@ -802,6 +883,28 @@ impl<S: Read + Write> PeerManager<S> {
     /// Narrows only — it cannot unban, unidle, or beat slot pressure.
     pub fn set_inbound_verdict(&mut self, judge: Option<InboundVerdict>) {
         self.inbound_verdict = judge;
+    }
+
+    /// Install the `tx.announce` decision-point hook: consulted per
+    /// (transaction, target link) before every `inv` hop, including the
+    /// stem hop and extrapool propagation. `false` withholds the
+    /// announcement from that link. Narrows only — it cannot override
+    /// `relay=false`, recon links, or the compartment matrix.
+    ///
+    /// Throughput caveat: one verdict per link per tx — announce rate
+    /// is bounded by helper latency × peer count. Keep helpers fast.
+    pub fn set_tx_announce_verdict(&mut self, judge: Option<TxAnnounceVerdict>) {
+        self.tx_announce_verdict = judge;
+    }
+
+    /// The compartment matrix (`relay.tx.deny_pairs`): "src->dst" pairs
+    /// that are never announced across — src ∈ {inbound, outbound,
+    /// local, extrapool}, dst ∈ {inbound, outbound}. E.g.
+    /// "inbound->inbound" keeps inbound-sourced transactions off the
+    /// inbound links; "local->inbound" confines locally-originated
+    /// announcements to our chosen outbound routes.
+    pub fn set_deny_pairs(&mut self, pairs: Vec<(String, String)>) {
+        self.deny_pairs = pairs;
     }
 
     /// `-maxmempool` — the pool's serialized-byte cap (Core default
@@ -1107,7 +1210,7 @@ impl<S: Read + Write> PeerManager<S> {
         // Stem-pending txids stay out of recon sketches this tick —
         // a round would leak them inside the stem delay (queue #7).
         let stem_exclude: std::collections::HashSet<_> =
-            stem_pending.iter().map(|(t, _, _)| *t).collect();
+            stem_pending.iter().map(|(t, _, _, _)| *t).collect();
         let mut announce_tip: Option<u64> = None;
         // txid/wtxid to relay at end of tick, and the peer it came from.
         let mut announce_tx: Option<(
@@ -1270,7 +1373,7 @@ impl<S: Read + Write> PeerManager<S> {
         // Relay an accepted tx: wtxid inv for wtxidrelay peers, txid
         // otherwise (Core's BIP339 split); the source peer is excluded.
         if let Some((source, txid, wtxid)) = announce_tx {
-            self.send_tx_inv(Some(source), &txid, &wtxid);
+            self.send_tx_inv(&txid, &wtxid, TxSource::Peer(source));
         }
         self.fill_queues(cs, now);
         self.recon_pass();
@@ -1416,6 +1519,45 @@ impl<S: Read + Write> PeerManager<S> {
                 id
             }
         };
+        // The stem hop answers to the same gates — the compartment
+        // matrix and the tx.announce verdict see source "local" here.
+        let gated = if let Some(peer) = self.peers.get(&hop) {
+            let dst = if peer.inbound { "inbound" } else { "outbound" };
+            let denied = self
+                .deny_pairs
+                .iter()
+                .any(|(s, d)| s == "local" && *d == dst);
+            let facts = TxAnnounceFacts {
+                txid,
+                wtxid,
+                source: "local",
+                source_peer: None,
+                peer: hop,
+                peer_addr: peer.remote.as_ref().map(net_addr_string),
+                peer_inbound: peer.inbound,
+                peer_user_agent: peer.session.peer().map(|i| i.user_agent.clone()),
+            };
+            Some((denied, facts))
+        } else {
+            None
+        };
+        let permitted = match gated {
+            None => false,
+            Some((denied, facts)) => {
+                !denied && self.tx_announce_verdict.as_mut().is_none_or(|v| v(&facts))
+            }
+        };
+        if !permitted {
+            // A denied stem hop isn't fatal — the fluff pass still
+            // offers it to every link the gates allow.
+            self.stem_pending.push((
+                txid,
+                wtxid,
+                Instant::now() + Duration::from_secs(5),
+                self.mempool.is_private(&txid),
+            ));
+            return;
+        }
         if let Some(peer) = self.peers.get_mut(&hop) {
             let (inv_type, hash) = if peer.session.peer().is_some_and(|i| i.wtxid_relay) {
                 (
@@ -1442,6 +1584,7 @@ impl<S: Read + Write> PeerManager<S> {
             txid,
             wtxid,
             Instant::now() + Duration::from_millis(delay_ms),
+            self.mempool.is_private(&txid),
         ));
     }
 
@@ -1453,8 +1596,13 @@ impl<S: Read + Write> PeerManager<S> {
         let mut i = 0;
         while i < self.stem_pending.len() {
             if self.stem_pending[i].2 <= now {
-                let (txid, wtxid, _) = self.stem_pending.remove(i);
-                self.send_tx_inv(None, &txid, &wtxid);
+                let (txid, wtxid, _, private) = self.stem_pending.remove(i);
+                // `mempool.private` entries are stem-only — the hop
+                // already announced; no broadcast follow-up.
+                if private {
+                    continue;
+                }
+                self.send_tx_inv(&txid, &wtxid, TxSource::Local);
             } else {
                 i += 1;
             }
@@ -1464,6 +1612,18 @@ impl<S: Read + Write> PeerManager<S> {
     /// Whether locally submitted txs take the stem path.
     pub fn set_stem_relay(&mut self, on: bool) {
         self.stem_relay = on;
+    }
+
+    /// `mempool.private` — operator submissions are stem-only and
+    /// hidden from the listing RPCs.
+    pub fn set_private_submissions(&mut self, on: bool) {
+        self.private_submissions = on;
+    }
+
+    /// Whether `mempool.private` is on.
+    #[must_use]
+    pub fn private_submissions(&self) -> bool {
+        self.private_submissions
     }
 
     /// Routes every automatic outbound dial through a SOCKS5 proxy —
@@ -1570,7 +1730,7 @@ impl<S: Read + Write> PeerManager<S> {
             peer.next_recon = now + RECON_INTERVAL;
             let salt = link.our_salt ^ link.their_salt;
             let pending: std::collections::HashSet<_> =
-                self.stem_pending.iter().map(|(t, _, _)| *t).collect();
+                self.stem_pending.iter().map(|(t, _, _, _)| *t).collect();
             let (our_ids, our_map) = recon_pool(&self.mempool, salt, &pending);
             let capacity = recon_capacity(peer.recon_diff_hint);
             let (round, req) = crate::recon::ReconRound::open(&our_ids, capacity);
@@ -1582,16 +1742,22 @@ impl<S: Read + Write> PeerManager<S> {
 
     /// Sends a tx inventory announcement to every established peer that
     /// accepts tx relay (BIP339: `wtx` for wtxidrelay peers, `tx`
-    /// otherwise). `exclude` spares the peer that supplied the tx —
-    /// `None` for locally submitted transactions.
+    /// otherwise). `source` carries the provenance — peer-sourced
+    /// relays spare the supplying peer; the compartment matrix and the
+    /// `tx.announce` verdict can still gate individual links.
     fn send_tx_inv(
         &mut self,
-        exclude: Option<u64>,
         txid: &avila_consensus::hash::Txid,
         wtxid: &avila_consensus::hash::Wtxid,
+        source: TxSource,
     ) {
+        let src = self.source_compartment(source);
+        // The verdict/matrix are hoisted so the peer-map iteration
+        // doesn't fight the borrow on `self`.
+        let deny_pairs = std::mem::take(&mut self.deny_pairs);
+        let mut verdict = self.tx_announce_verdict.take();
         for (&id, peer) in &mut self.peers {
-            if Some(id) == exclude || !peer.session.established() {
+            if TxSource::Peer(id) == source || !peer.session.established() {
                 continue;
             }
             let wants_tx = peer.session.peer().is_some_and(|i| i.relay);
@@ -1603,6 +1769,25 @@ impl<S: Read + Write> PeerManager<S> {
             // the inv is exactly where the bandwidth win lives.
             if peer.recon.is_some() {
                 continue;
+            }
+            let dst = if peer.inbound { "inbound" } else { "outbound" };
+            if deny_pairs.iter().any(|(s, d)| s == src && *d == dst) {
+                continue;
+            }
+            if let Some(v) = &mut verdict {
+                let facts = TxAnnounceFacts {
+                    txid: *txid,
+                    wtxid: *wtxid,
+                    source: src,
+                    source_peer: source.peer(),
+                    peer: id,
+                    peer_addr: peer.remote.as_ref().map(net_addr_string),
+                    peer_inbound: peer.inbound,
+                    peer_user_agent: peer.session.peer().map(|i| i.user_agent.clone()),
+                };
+                if !v(&facts) {
+                    continue;
+                }
             }
             let (inv_type, hash) = if peer.session.peer().is_some_and(|i| i.wtxid_relay) {
                 (
@@ -1621,6 +1806,21 @@ impl<S: Read + Write> PeerManager<S> {
                     inv_type,
                     hash,
                 }]));
+        }
+        self.deny_pairs = deny_pairs;
+        self.tx_announce_verdict = verdict;
+    }
+
+    /// Source compartment for the compartment matrix: the direction of
+    /// the delivering link, or the local/extrapool sources.
+    fn source_compartment(&self, source: TxSource) -> &'static str {
+        match source {
+            TxSource::Peer(id) => match self.peers.get(&id) {
+                Some(p) if p.inbound => "inbound",
+                _ => "outbound",
+            },
+            TxSource::Local => "local",
+            TxSource::Extrapool => "extrapool",
         }
     }
 
@@ -1705,7 +1905,71 @@ impl<S: Read + Write> PeerManager<S> {
         txid: avila_consensus::hash::Txid,
         wtxid: avila_consensus::hash::Wtxid,
     ) {
-        self.send_tx_inv(None, &txid, &wtxid);
+        self.send_tx_inv(&txid, &wtxid, TxSource::Local);
+    }
+
+    /// Extrapool propagation (`extrapool.relay` = "outbound"|"all"):
+    /// announces an observed transaction with `extrapool` provenance —
+    /// the compartment matrix and `tx.announce` gate it like any other
+    /// source. `outbound_only` additionally confines it to our chosen
+    /// routes (inbound links never learn we saw it).
+    pub fn announce_extrapool_tx(
+        &mut self,
+        txid: avila_consensus::hash::Txid,
+        wtxid: avila_consensus::hash::Wtxid,
+        outbound_only: bool,
+    ) {
+        let src = TxSource::Extrapool;
+        let comp = self.source_compartment(src);
+        let deny_pairs = std::mem::take(&mut self.deny_pairs);
+        let mut verdict = self.tx_announce_verdict.take();
+        for (&id, peer) in &mut self.peers {
+            if !peer.session.established()
+                || (outbound_only && peer.inbound)
+                || !peer.session.peer().is_some_and(|i| i.relay)
+                || peer.recon.is_some()
+            {
+                continue;
+            }
+            let dst = if peer.inbound { "inbound" } else { "outbound" };
+            if deny_pairs.iter().any(|(s, d)| s == comp && *d == dst) {
+                continue;
+            }
+            if let Some(v) = &mut verdict {
+                let facts = TxAnnounceFacts {
+                    txid,
+                    wtxid,
+                    source: comp,
+                    source_peer: None,
+                    peer: id,
+                    peer_addr: peer.remote.as_ref().map(net_addr_string),
+                    peer_inbound: peer.inbound,
+                    peer_user_agent: peer.session.peer().map(|i| i.user_agent.clone()),
+                };
+                if !v(&facts) {
+                    continue;
+                }
+            }
+            let (inv_type, hash) = if peer.session.peer().is_some_and(|i| i.wtxid_relay) {
+                (
+                    crate::message::InvType::Wtx,
+                    BlockHash::from_bytes(*wtxid.as_bytes()),
+                )
+            } else {
+                (
+                    crate::message::InvType::Tx,
+                    BlockHash::from_bytes(*txid.as_bytes()),
+                )
+            };
+            let _ = peer
+                .session
+                .send(&Message::Inv(vec![crate::message::InvVector {
+                    inv_type,
+                    hash,
+                }]));
+        }
+        self.deny_pairs = deny_pairs;
+        self.tx_announce_verdict = verdict;
     }
 
     /// Announces the connected tip to every established peer — `headers`
@@ -5824,6 +6088,169 @@ mod tests {
         assert!(mgr.stem_pending.is_empty());
     }
 
+    /// `tx.announce` — a per-link verdict can withhold one peer while
+    /// the rest still receive the inv. The hook sees per-peer facts.
+    #[test]
+    fn tx_announce_verdict_gates_one_link() {
+        let (mut mgr, mut a, _ida) = managed_peer();
+        let mut cs = regtest();
+        handshake(&mut mgr, &mut a, &mut cs);
+        testpipe::drain(&mut a, MAGIC);
+        let (mut b, idb) = add_peer(&mut mgr);
+        handshake_peer(&mut mgr, &mut b, &mut cs);
+        testpipe::drain(&mut b, MAGIC);
+
+        let saw_facts = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let check = saw_facts.clone();
+        mgr.set_tx_announce_verdict(Some(Box::new(move |f| {
+            if f.source == "local" && f.source_peer.is_none() {
+                check.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            f.peer != idb
+        })));
+
+        let txid = avila_consensus::hash::Txid::from_bytes([3u8; 32]);
+        let wtxid = avila_consensus::hash::Wtxid::from_bytes([4u8; 32]);
+        mgr.announce_tx(txid, wtxid);
+        mgr.tick(&mut cs, NOW);
+
+        let has_inv = |msgs: &[Message]| {
+            msgs.iter().any(|m| {
+                matches!(m, Message::Inv(v) if v.iter().any(|iv| {
+                    iv.inv_type == crate::message::InvType::Wtx
+                        || iv.inv_type == crate::message::InvType::Tx
+                }))
+            })
+        };
+        assert!(has_inv(&testpipe::drain(&mut a, MAGIC)), "a relays");
+        assert!(!has_inv(&testpipe::drain(&mut b, MAGIC)), "b denied");
+        assert!(
+            saw_facts.load(std::sync::atomic::Ordering::Relaxed),
+            "verdict saw source=local facts"
+        );
+    }
+
+    /// `relay.tx.deny_pairs` — the compartment matrix forbids a
+    /// source→destination class. `local->outbound` silences the
+    /// operator's own broadcast entirely.
+    #[test]
+    fn deny_pairs_silence_a_compartment() {
+        let (mut mgr, mut a, _ida) = managed_peer();
+        let mut cs = regtest();
+        handshake(&mut mgr, &mut a, &mut cs);
+        testpipe::drain(&mut a, MAGIC);
+
+        mgr.set_deny_pairs(vec![("local".into(), "outbound".into())]);
+        let txid = avila_consensus::hash::Txid::from_bytes([5u8; 32]);
+        let wtxid = avila_consensus::hash::Wtxid::from_bytes([6u8; 32]);
+        mgr.announce_tx(txid, wtxid);
+        mgr.tick(&mut cs, NOW);
+        let has_inv = testpipe::drain(&mut a, MAGIC)
+            .iter()
+            .any(|m| matches!(m, Message::Inv(_)));
+        assert!(!has_inv, "local->outbound denied");
+        // The verdict + matrix survive the take-restore — a peer-less
+        // follow-up still consults them.
+        mgr.set_deny_pairs(Vec::new());
+        mgr.announce_tx(txid, wtxid);
+        mgr.tick(&mut cs, NOW);
+        assert!(
+            testpipe::drain(&mut a, MAGIC)
+                .iter()
+                .any(|m| matches!(m, Message::Inv(_))),
+            "cleared matrix announces again"
+        );
+    }
+
+    /// `extrapool.relay = "outbound"` — observed txs propagate only on
+    /// our own links; inbound never learns we saw it.
+    #[test]
+    fn extrapool_relay_outbound_only() {
+        let (mut mgr, mut a, _ida) = managed_peer();
+        let mut cs = regtest();
+        handshake(&mut mgr, &mut a, &mut cs);
+        testpipe::drain(&mut a, MAGIC);
+        let (mut inb, _in_id) = add_inbound_peer(&mut mgr).expect("slot");
+        handshake_peer(&mut mgr, &mut inb, &mut cs);
+        testpipe::drain(&mut inb, MAGIC);
+
+        let txid = avila_consensus::hash::Txid::from_bytes([8u8; 32]);
+        let wtxid = avila_consensus::hash::Wtxid::from_bytes([9u8; 32]);
+        mgr.announce_extrapool_tx(txid, wtxid, true);
+        mgr.tick(&mut cs, NOW);
+        let has_inv = |msgs: &[Message]| msgs.iter().any(|m| matches!(m, Message::Inv(_)));
+        assert!(has_inv(&testpipe::drain(&mut a, MAGIC)), "outbound got it");
+        assert!(!has_inv(&testpipe::drain(&mut inb, MAGIC)), "inbound blind");
+
+        // "all" reaches inbound too.
+        mgr.announce_extrapool_tx(txid, wtxid, false);
+        mgr.tick(&mut cs, NOW);
+        assert!(
+            has_inv(&testpipe::drain(&mut inb, MAGIC)),
+            "all reaches inbound"
+        );
+    }
+
+    /// `mempool.private` — a private submission's stem hop goes out but
+    /// the fluff pass never broadcasts it.
+    #[test]
+    fn private_tx_never_fluffs() {
+        use avila_consensus::transaction::{OutPoint, Script, TxIn, TxOut, Witness};
+        use avila_consensus::{script, transaction::Transaction};
+
+        let (mut mgr, mut a, _ida) = managed_peer();
+        let mut cs = regtest();
+        let blocks = chain_blocks(&cs, 101);
+        for b in &blocks {
+            cs.accept_block(b, NOW).unwrap();
+        }
+        handshake(&mut mgr, &mut a, &mut cs);
+        testpipe::drain(&mut a, MAGIC);
+
+        // A real admitted entry marked private — the stem tuple
+        // records the flag at announce time.
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: blocks[0].transactions[0].txid(),
+                    vout: 0,
+                },
+                script_sig: Script::new(vec![]),
+                sequence: 0xffff_ffff,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: 4_999_000_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let txid = tx.txid();
+        let wtxid = tx.wtxid();
+        mgr.mempool().set_require_standard(false);
+        mgr.mempool().accept_tx(tx, &cs, NOW).expect("admit");
+        mgr.mempool().mark_private(&txid);
+        mgr.stem_announce(txid, wtxid);
+        mgr.tick(&mut cs, NOW);
+        let stem_msgs = testpipe::drain(&mut a, MAGIC);
+        assert!(
+            stem_msgs.iter().any(|m| matches!(m, Message::Inv(_))),
+            "stem hop announced"
+        );
+        // Delay elapsed — a private entry drains the pending slot
+        // without sending anything.
+        mgr.stem_pending[0].2 = Instant::now() - Duration::from_secs(1);
+        mgr.tick(&mut cs, NOW);
+        mgr.tick(&mut cs, NOW);
+        let fluff = testpipe::drain(&mut a, MAGIC);
+        assert!(
+            !fluff.iter().any(|m| matches!(m, Message::Inv(_))),
+            "private never fluffs: {fluff:?}"
+        );
+        assert!(mgr.stem_pending.is_empty());
+    }
+
     /// Queue #19: the divergence alarm fires once, only past every
     /// threshold — rounds, absolute their-side misses, and dominance
     /// over our-side misses.
@@ -6014,7 +6441,7 @@ mod tests {
         // While stem-pending, the tx is absent from the sketch ids.
         let salt = 0xAAu64 ^ 0x66u64; // our_salt ^ their_salt (test salts)
         let pending: std::collections::HashSet<_> =
-            mgr.stem_pending.iter().map(|(t, _, _)| *t).collect();
+            mgr.stem_pending.iter().map(|(t, _, _, _)| *t).collect();
         assert!(pending.contains(&txid), "tx must be stem-pending");
         let (ids, _) = recon_pool(mgr.mempool_ref(), salt, &pending);
         let short = crate::recon::short_id(salt, txid.as_bytes());

@@ -253,6 +253,38 @@ const KNOB_DOCS: &[(&str, &str)] = &[
         "services.sv2.listen",
         "Stratum V2 Template Provider bind; loopback only until Noise lands",
     ),
+    (
+        "mempool.private",
+        "stem-only relay + hidden from getrawmempool/getmempoolentry for local submissions",
+    ),
+    (
+        "relay.tx.deny_pairs",
+        "compartment matrix: 'src->dst' pairs never announced across (src: inbound|outbound|local|extrapool; dst: inbound|outbound)",
+    ),
+    (
+        "extrapool.relay",
+        "propagate observed txs — never|outbound|all (tx.announce gates each hop)",
+    ),
+    (
+        "extrapool.promote_on",
+        "auto re-admission triggers — 'tip' retries all entries per connected block",
+    ),
+    (
+        "extrapool.caps",
+        "per-reject-class entry caps — oldest of a class evicts past its bound",
+    ),
+    (
+        "hooks.tx_announce",
+        "verdict helpers consulted per (tx, link) — reject withholds that announce",
+    ),
+    (
+        "hooks.extrapool_admit",
+        "verdict helpers gating extrapool observation records",
+    ),
+    (
+        "hooks.extrapool_promote",
+        "verdict helpers gating extrapool re-admission",
+    ),
 ];
 
 /// Serialize each knob out of the loaded config next to its default —
@@ -440,6 +472,9 @@ pub fn risk_review(c: &NodeConfig) -> Vec<RiskFinding> {
     for (point, specs) in [
         ("peer_accept", &c.hooks.peer_accept),
         ("tx_admit", &c.hooks.tx_admit),
+        ("tx_announce", &c.hooks.tx_announce),
+        ("extrapool_admit", &c.hooks.extrapool_admit),
+        ("extrapool_promote", &c.hooks.extrapool_promote),
     ] {
         for (i, s) in specs.iter().enumerate() {
             if matches!(s.on_timeout, avila_core::OnDefault::Accept)
@@ -606,7 +641,7 @@ mod tests {
         // without updating KNOB_DOCS — describe would silently drop it.
         fn leaves(v: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
             match v {
-                serde_json::Value::Object(map) => {
+                serde_json::Value::Object(map) if !map.is_empty() => {
                     for (k, sub) in map {
                         let p = if prefix.is_empty() {
                             k.clone()
@@ -616,6 +651,8 @@ mod tests {
                         leaves(sub, &p, out);
                     }
                 }
+                // An empty map/array is still a knob (e.g.
+                // extrapool.caps = {}) — it just has no leaves yet.
                 _ => out.push(prefix.to_string()),
             }
         }
@@ -741,6 +778,41 @@ mod tests {
             parse_config("network = 'regtest'\n[extrapool]\nobserve = false\nmax_entries = 0\n")
                 .is_ok()
         );
+
+        // relay / promote_on / caps accept only their vocabularies.
+        let cfg = parse_config(
+            r#"
+            network = 'regtest'
+            [extrapool]
+            relay = "outbound"
+            promote_on = ["tip"]
+            caps = { fee = 500, hook = 100 }
+            "#,
+        )
+        .unwrap();
+        let x = &cfg.get().extrapool;
+        assert_eq!(x.relay, "outbound");
+        assert_eq!(x.promote_on, ["tip"]);
+        assert_eq!(x.caps["fee"], 500);
+        for bad in [
+            r#"[extrapool]
+relay = "sideways""#,
+            r#"[extrapool]
+promote_on = ["moon"]"#,
+            r#"[extrapool]
+caps = { bogus = 1 }"#,
+            r#"[relay.tx]
+deny_pairs = ["sideways->outbound"]"#,
+            r#"[relay.tx]
+deny_pairs = ["inbound"]"#,
+            r#"[relay.tx]
+deny_pairs = ["local->local"]"#,
+        ] {
+            assert!(
+                parse_config(&format!("network = 'regtest'\n{bad}\n")).is_err(),
+                "{bad} must fail validation"
+            );
+        }
     }
 
     /// The risk review flags dramatic postures once — the ack file

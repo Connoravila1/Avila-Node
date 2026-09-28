@@ -197,6 +197,12 @@ pub struct MempoolConfig {
     /// Entries older than this many seconds are evicted (Core's
     /// `-mempoolexpiry`, 336h).
     pub expiry_secs: u32,
+    /// Private submissions: `sendrawtransaction`/wallet-origin txs get
+    /// stem-only relay (never fluffed to all peers) and are hidden
+    /// from `getrawmempool` and `getmempoolentry`. They still pass
+    /// full consensus and policy validation — only propagation and
+    /// listing change.
+    pub private: bool,
 }
 
 impl Default for MempoolConfig {
@@ -205,6 +211,7 @@ impl Default for MempoolConfig {
             max_mb: 300,
             min_relay_fee_sat_per_kvb: 100,
             expiry_secs: 336 * 60 * 60,
+            private: false,
         }
     }
 }
@@ -274,11 +281,19 @@ pub struct TxRelayConfig {
     /// Route locally-originated transactions through a single stem hop
     /// before flooding (selfish-stem origin privacy; default on).
     pub stem: bool,
+    /// Compartment matrix — "src->dst" pairs never announced across:
+    /// src ∈ {inbound, outbound, local, extrapool}, dst ∈ {inbound,
+    /// outbound}. E.g. "inbound->inbound" keeps inbound-sourced
+    /// transactions off inbound links.
+    pub deny_pairs: Vec<String>,
 }
 
 impl Default for TxRelayConfig {
     fn default() -> Self {
-        Self { stem: true }
+        Self {
+            stem: true,
+            deny_pairs: Vec::new(),
+        }
     }
 }
 
@@ -297,6 +312,19 @@ pub struct ExtrapoolConfig {
     pub max_bytes: usize,
     /// Entry lifetime; `0` keeps entries until evicted or promoted.
     pub expiry_secs: u32,
+    /// Propagation: "never" (default — Core's behavior), "outbound"
+    /// (announce observed txs on outbound links only), or "all".
+    /// The compartment matrix and `tx.announce` still gate each hop.
+    pub relay: String,
+    /// Automatic re-admission triggers: "tip" retries every entry on
+    /// each new checked tip (a connected block changes the fee/UTXO
+    /// landscape). Empty = manual `extrapoolpromote` only.
+    pub promote_on: Vec<String>,
+    /// Per-reject-class entry caps: `[extrapool.caps] fee = 4000`
+    /// bounds that class's share of the pool (per-class FIFO past the
+    /// cap). Classes: nonstandard, fee, hook, rbf, package, finality,
+    /// capacity, weight, sigops, truc, other.
+    pub caps: std::collections::BTreeMap<String, usize>,
 }
 
 impl Default for ExtrapoolConfig {
@@ -306,6 +334,9 @@ impl Default for ExtrapoolConfig {
             max_entries: 10_000,
             max_bytes: 50_000_000,
             expiry_secs: 86_400,
+            relay: "never".to_string(),
+            promote_on: Vec::new(),
+            caps: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -326,6 +357,22 @@ pub struct HooksConfig {
     /// checks; this is a hot path — keep helpers fast (admission
     /// throughput is bounded by helper latency).
     pub tx_admit: Vec<HookSpecConfig>,
+    /// Transaction announcement — one `[[hooks.tx_announce]]` table per
+    /// helper. Consulted per (tx, target link) before each `inv` hop;
+    /// `reject` withholds that link. Facts include provenance
+    /// (source compartment + supplying peer) and the target's
+    /// address/direction/user-agent. The hottest path — announce
+    /// throughput is bounded by helper latency × peer count.
+    pub tx_announce: Vec<HookSpecConfig>,
+    /// Extrapool store — one `[[hooks.extrapool_admit]]` table per
+    /// helper. Consulted before a policy reject is recorded;
+    /// `reject` drops the observation (the tx is still rejected).
+    pub extrapool_admit: Vec<HookSpecConfig>,
+    /// Extrapool promotion — one `[[hooks.extrapool_promote]]` table
+    /// per helper. Consulted before a `promote_on` trigger or manual
+    /// `extrapoolpromote` re-runs admission; `reject` leaves the entry
+    /// in the pool.
+    pub extrapool_promote: Vec<HookSpecConfig>,
 }
 
 /// One `[[hooks.<point>]]` entry. `program` is the only required key.
@@ -538,6 +585,9 @@ impl NodeConfig {
         for (point, hooks) in [
             ("peer_accept", &self.hooks.peer_accept),
             ("tx_admit", &self.hooks.tx_admit),
+            ("tx_announce", &self.hooks.tx_announce),
+            ("extrapool_admit", &self.hooks.extrapool_admit),
+            ("extrapool_promote", &self.hooks.extrapool_promote),
         ] {
             for hook in hooks {
                 if hook.program.as_os_str().is_empty() {
@@ -546,6 +596,43 @@ impl NodeConfig {
                 if !(1..=10_000).contains(&hook.timeout_ms) {
                     return Err(ConfigError::HookTimeout(point));
                 }
+            }
+        }
+        // relay.tx.deny_pairs — "src->dst" over the compartment names.
+        const COMPARTMENTS: [&str; 4] = ["inbound", "outbound", "local", "extrapool"];
+        for pair in &self.relay.tx.deny_pairs {
+            let Some((src, dst)) = pair.split_once("->") else {
+                return Err(ConfigError::DenyPair(pair.clone()));
+            };
+            if !COMPARTMENTS.contains(&src.trim()) || !["inbound", "outbound"].contains(&dst.trim())
+            {
+                return Err(ConfigError::DenyPair(pair.clone()));
+            }
+        }
+        if !["never", "outbound", "all"].contains(&self.extrapool.relay.as_str()) {
+            return Err(ConfigError::ExtrapoolRelay(self.extrapool.relay.clone()));
+        }
+        for trigger in &self.extrapool.promote_on {
+            if trigger != "tip" {
+                return Err(ConfigError::PromoteTrigger(trigger.clone()));
+            }
+        }
+        const CAP_CLASSES: [&str; 11] = [
+            "nonstandard",
+            "fee",
+            "hook",
+            "rbf",
+            "package",
+            "finality",
+            "capacity",
+            "weight",
+            "sigops",
+            "truc",
+            "other",
+        ];
+        for class in self.extrapool.caps.keys() {
+            if !CAP_CLASSES.contains(&class.as_str()) {
+                return Err(ConfigError::ExtrapoolCapClass(class.clone()));
             }
         }
         let capacity = NonZeroUsize::new(self.diag.event_capacity)
@@ -595,6 +682,9 @@ impl ValidatedConfig {
             .peer_accept
             .iter_mut()
             .chain(self.config.hooks.tx_admit.iter_mut())
+            .chain(self.config.hooks.tx_announce.iter_mut())
+            .chain(self.config.hooks.extrapool_admit.iter_mut())
+            .chain(self.config.hooks.extrapool_promote.iter_mut())
         {
             if !hook.program.as_os_str().is_empty() && hook.program.is_relative() {
                 hook.program = base.join(&hook.program);
@@ -636,6 +726,18 @@ pub enum ConfigError {
     HookProgram(&'static str),
     #[error("hooks.{0}.timeout_ms must be 1..=10000 — a hook must never stall a decision point")]
     HookTimeout(&'static str),
+    #[error(
+        "relay.tx.deny_pairs entry {0:?} — expected \"src->dst\", src ∈ inbound|outbound|local|extrapool, dst ∈ inbound|outbound"
+    )]
+    DenyPair(String),
+    #[error("extrapool.relay {0:?} — expected \"never\", \"outbound\", or \"all\"")]
+    ExtrapoolRelay(String),
+    #[error("extrapool.promote_on entry {0:?} — expected \"tip\"")]
+    PromoteTrigger(String),
+    #[error(
+        "extrapool.caps class {0:?} — expected nonstandard|fee|hook|rbf|package|finality|capacity|weight|sigops|truc|other"
+    )]
+    ExtrapoolCapClass(String),
 }
 
 #[cfg(test)]

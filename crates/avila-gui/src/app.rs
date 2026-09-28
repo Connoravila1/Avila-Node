@@ -57,6 +57,10 @@ pub struct App {
     keep_prefs: bool,
     /// The first-open slideshow — `Some(step)` while it runs.
     tour: Option<usize>,
+    /// The node event stream's tail — events.ndjson feeds the
+    /// activity log instead of the in-process journal, so the log
+    /// shows the same truth `--follow` sees (hooks, extrapool, risks).
+    events_tail: Option<avila_node::events::EventTail>,
     /// SIGINT/SIGTERM request — closing through eframe runs on_exit,
     /// which drains the sync worker so state.dat actually writes.
     close: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -131,6 +135,13 @@ impl App {
                 0.0,
             );
         }
+        // From here the live log is the event stream — opened before
+        // the run starts so run_started/risks/spawn failures land.
+        let events_tail = Some(avila_node::events::EventTail::follow(
+            node.config()
+                .network_data_dir()
+                .join(avila_node::events::EVENTS_FILENAME),
+        ));
         // Networks with DNS seeds (or an explicit peer list) start right
         // away, as a node should; tests never touch the network.
         // First launch shows the welcome sheet instead of syncing
@@ -175,6 +186,7 @@ impl App {
             ahead: Vec::new(),
             seen: Page::default(),
             restart: false,
+            events_tail,
             decorated: None,
         };
         // The compositor may never send a frame callback while the
@@ -516,6 +528,15 @@ impl eframe::App for App {
             self.start();
         }
         self.session.poll();
+        // Stream events into the activity log — bounded per frame so
+        // a busy tick can't stall the render.
+        if let Some(tail) = &mut self.events_tail {
+            for ev in tail.read_new(128) {
+                if let Some(text) = stream_text(&ev) {
+                    self.session.log(ActivityKind::Node, text, None, 0.0);
+                }
+            }
+        }
         if self.restart && !self.session.running() && self.session.phase() != Phase::Stopping {
             self.restart = false;
             self.start();
@@ -817,4 +838,84 @@ fn journal_text(event: NodeEvent) -> &'static str {
             "Refused to start the persistent services; they aren’t wired up yet."
         }
     }
+}
+
+/// One line of activity-log text per stream event — `None` for the
+/// kinds a GUI reader doesn't care about (a `jq` consumer still sees
+/// them; the log keeps its signal-to-noise).
+fn stream_text(ev: &serde_json::Value) -> Option<String> {
+    let kind = ev.get("kind")?.as_str()?;
+    let num = |key: &str| ev.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let txt = |key: &str| {
+        ev.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    Some(match kind {
+        "run_started" => "The node is running.".into(),
+        "run_stopped" => "The node stopped.".into(),
+        "peer_connected" => format!(
+            "Peer {} connected{}.",
+            num("peer"),
+            txt("user_agent")
+                .split('/')
+                .nth(1)
+                .map(|ua| format!(" ({ua})"))
+                .unwrap_or_default()
+        ),
+        "peer_disconnected" => format!("Peer {} disconnected: {}.", num("peer"), txt("reason")),
+        "tip_advanced" => format!("Tip is height {}.", num("height")),
+        "config_risk" => format!("Configuration risk — {}: {}", txt("path"), txt("message")),
+        "hook_spawn_failed" => format!(
+            "Hook {} failed to start ({}) — answering its timeout default.",
+            txt("point"),
+            txt("program")
+        ),
+        "hook_verdict" => format!(
+            "{} {}: {} → {}.",
+            txt("point"),
+            txt("helper").rsplit('/').next().unwrap_or_default(),
+            txt("verdict"),
+            txt("admit")
+        ),
+        "hook_events_dropped" => format!(
+            "{} hook verdicts were dropped — the event channel saturated.",
+            num("total")
+        ),
+        "shadow_divergence" => format!(
+            "Shadow profile '{}' diverges: {} ({} total).",
+            txt("profile"),
+            txt("reason"),
+            num("total")
+        ),
+        "extrapool_stored" => format!(
+            "Observed a filtered transaction ({}) — {} held.",
+            txt("reason"),
+            num("total")
+        ),
+        "extrapool_evicted" | "extrapool_expired" => {
+            format!(
+                "Extrapool {} — {} total.",
+                kind.trim_start_matches("extrapool_"),
+                num("total")
+            )
+        }
+        "extrapool_promoted" => {
+            format!("Promoted an observed transaction ({} total).", num("total"))
+        }
+        "extrapool_relayed" => {
+            format!("Relayed an observed transaction ({} scope).", txt("scope"))
+        }
+        "extrapool_promotion_pass" => format!(
+            "Tip-triggered promotion: {}/{} entries re-admitted.",
+            num("promoted"),
+            num("attempted")
+        ),
+        "eclipse_suspected" => "Eclipse indicators — advisory only, cross-checking routes.".into(),
+        "proxy_unreachable" => "The configured proxy is unreachable.".into(),
+        "v2_downgraded" => format!("Peer at {} downgraded to plaintext transport.", txt("addr")),
+        "cpu_throttled" => format!("Peer {} is being CPU-throttled.", num("peer")),
+        _ => return None,
+    })
 }

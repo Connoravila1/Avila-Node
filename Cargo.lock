@@ -507,6 +507,7 @@ dependencies = [
  "clap",
  "eframe",
  "serde",
+ "serde_json",
  "signal-hook",
 ]
 

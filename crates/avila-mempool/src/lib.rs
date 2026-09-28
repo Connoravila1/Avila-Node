@@ -96,6 +96,10 @@ pub struct MempoolEntry {
     /// Core's `GetSizeWithDescendants` — the `vsize` counterpart of
     /// `fees_with_descendants`.
     pub size_with_descendants: usize,
+    /// `mempool.private` — an operator-submitted tx that never takes
+    /// the fluff path and is hidden from the public listing RPCs
+    /// (`getrawmempool` and friends). Dies with the entry.
+    pub private: bool,
 }
 
 impl MempoolEntry {
@@ -245,6 +249,10 @@ pub enum MempoolReject {
     /// `extrapoolpromote` named a txid the observation pool doesn't hold.
     #[error("txid not in extrapool")]
     NotObserved,
+    /// An `extrapool.promote` verdict hook refused re-admission — the
+    /// entry stays in the observation pool.
+    #[error("rejected by extrapool.promote hook")]
+    PromoteHook,
 }
 
 /// Facts a `tx.admit` verdict helper sees — the serializable subset of
@@ -278,6 +286,11 @@ pub struct TxAdmitFacts {
 /// checks, `false` rejects with [`MempoolReject::PolicyHook`].
 pub type AdmitHook = Box<dyn FnMut(&TxAdmitFacts) -> bool + Send>;
 
+/// The `extrapool.admit`/`extrapool.promote` verdict shape — the txid
+/// under consideration and the reject reason (for admit) or stored
+/// reason (for promote). Narrowing only.
+pub type PoolHook = Box<dyn FnMut(&Txid, &str) -> bool + Send>;
+
 /// One observed policy reject — the tx plus why live policy refused it.
 /// The registry's extrapool is an *observation* pool: these are
 /// consensus-valid transactions that operator policy refused, kept
@@ -289,6 +302,8 @@ pub struct ExtraEntry {
     pub tx: Transaction,
     /// The `MempoolReject` display string from the first refusal.
     pub reason: String,
+    /// The reject class — the `extrapool.caps` bucket this counts in.
+    pub class: &'static str,
     /// First-seen wall time; resubmissions bump `seen` only.
     pub first_seen: u32,
     /// How many submissions of this txid have been refused.
@@ -321,12 +336,41 @@ pub struct Extrapool {
     map: HashMap<Txid, ExtraEntry>,
     /// Insertion order — the eviction queue when caps bind.
     order: VecDeque<Txid>,
+    /// Per-class FIFO queues — `extrapool.caps` evicts the oldest of a
+    /// class when that class exceeds its cap.
+    class_order: BTreeMap<&'static str, VecDeque<Txid>>,
     bytes: usize,
     observe: bool,
     max_entries: usize,
     max_bytes: usize,
     expiry_secs: u32,
+    /// `extrapool.caps` — class name → entry cap.
+    caps: BTreeMap<String, usize>,
+    /// `extrapool.relay != "never"` — newly stored txids queue here for
+    /// the node's propagation pass.
+    relay: bool,
+    pending_relay: Vec<(Txid, Wtxid)>,
     stats: ExtraStats,
+}
+
+/// The reject class for `[extrapool.caps]` — the coarse bucket a
+/// policy failure lands in.
+fn classify_reject(e: &MempoolReject) -> &'static str {
+    match e {
+        MempoolReject::NotStandard(_) => "nonstandard",
+        MempoolReject::MinRelayFee | MempoolReject::MempoolMinFeeNotMet => "fee",
+        MempoolReject::PolicyHook => "hook",
+        MempoolReject::Conflict
+        | MempoolReject::SpendsConflict
+        | MempoolReject::TooManyReplacements => "rbf",
+        MempoolReject::PackageLimits => "package",
+        MempoolReject::NotFinal => "finality",
+        MempoolReject::Full => "capacity",
+        MempoolReject::TooHeavy => "weight",
+        MempoolReject::TooManySigops => "sigops",
+        MempoolReject::TrucViolation(_) => "truc",
+        _ => "other",
+    }
 }
 
 /// Default entry bound — generous for an observation pool (rejects are
@@ -359,6 +403,22 @@ impl Extrapool {
         self.trim_to_caps();
     }
 
+    /// `extrapool.caps` — per-class entry bounds.
+    pub fn set_caps(&mut self, caps: BTreeMap<String, usize>) {
+        self.caps = caps;
+    }
+
+    /// `extrapool.relay` — queue newly stored entries for propagation.
+    pub fn set_relay(&mut self, on: bool) {
+        self.relay = on;
+    }
+
+    /// Newly stored entries awaiting announce (`extrapool.relay`).
+    /// Drained per tick by the node's propagation pass.
+    pub fn take_pending_relay(&mut self) -> Vec<(Txid, Wtxid)> {
+        std::mem::take(&mut self.pending_relay)
+    }
+
     /// Whether rejects are recorded — checked on the admission path.
     #[must_use]
     pub fn observes(&self) -> bool {
@@ -366,29 +426,56 @@ impl Extrapool {
     }
 
     /// Record a refused tx. A re-submission of an already-held txid
-    /// bumps `seen` without re-storing bytes.
-    fn store(&mut self, tx: Transaction, reason: String, now: u32) {
+    /// bumps `seen` without re-storing bytes. `wtxid` feeds the relay
+    /// queue when `extrapool.relay` is on.
+    fn store(&mut self, tx: Transaction, reject: &MempoolReject, now: u32) {
         let txid = tx.txid();
         if let Some(e) = self.map.get_mut(&txid) {
             e.seen = e.seen.saturating_add(1);
             return;
         }
+        let class = classify_reject(reject);
+        let reason = reject.to_string();
+        let wtxid = tx.wtxid();
         let bytes = tx.encode().len();
         self.map.insert(
             txid,
             ExtraEntry {
                 tx,
                 reason: reason.clone(),
+                class,
                 first_seen: now,
                 seen: 1,
                 bytes,
             },
         );
         self.order.push_back(txid);
+        self.class_order.entry(class).or_default().push_back(txid);
         self.bytes += bytes;
         self.stats.stored += 1;
         *self.stats.by_reason.entry(reason).or_insert(0) += 1;
+        // `extrapool.relay` — the node drains this queue each tick.
+        if self.relay {
+            self.pending_relay.push((txid, wtxid));
+        }
         self.trim_to_caps();
+        // Per-class cap — evict the oldest *of this class*.
+        if let Some(&cap) = self.caps.get(class) {
+            while self.class_order.get(class).is_some_and(|q| q.len() > cap) {
+                let Some(id) = self
+                    .class_order
+                    .get_mut(class)
+                    .and_then(VecDeque::pop_front)
+                else {
+                    break;
+                };
+                if let Some(e) = self.map.remove(&id) {
+                    self.bytes -= e.bytes;
+                    self.stats.evicted += 1;
+                    self.order.retain(|x| x != &id);
+                }
+            }
+        }
     }
 
     /// FIFO trim until both caps hold.
@@ -400,6 +487,9 @@ impl Extrapool {
             if let Some(e) = self.map.remove(&id) {
                 self.bytes -= e.bytes;
                 self.stats.evicted += 1;
+                if let Some(q) = self.class_order.get_mut(e.class) {
+                    q.retain(|x| x != &id);
+                }
             }
         }
     }
@@ -420,6 +510,9 @@ impl Extrapool {
             if let Some(e) = self.map.remove(id) {
                 self.bytes -= e.bytes;
                 self.stats.expired += 1;
+                if let Some(q) = self.class_order.get_mut(e.class) {
+                    q.retain(|x| x != id);
+                }
             }
         }
         if !stale.is_empty() {
@@ -433,6 +526,9 @@ impl Extrapool {
         let e = self.map.remove(txid)?;
         self.bytes -= e.bytes;
         self.order.retain(|id| id != txid);
+        if let Some(q) = self.class_order.get_mut(e.class) {
+            q.retain(|x| x != txid);
+        }
         Some(e)
     }
 
@@ -469,6 +565,23 @@ impl Extrapool {
     #[must_use]
     pub fn stats(&self) -> &ExtraStats {
         &self.stats
+    }
+
+    /// Live occupancy per reject class — `getextrapoolinfo`'s caps
+    /// view next to `extrapool.caps`.
+    #[must_use]
+    pub fn by_class(&self) -> BTreeMap<&'static str, usize> {
+        let mut out = BTreeMap::new();
+        for e in self.map.values() {
+            *out.entry(e.class).or_insert(0) += 1;
+        }
+        out
+    }
+
+    /// Entries queued for propagation under `extrapool.relay`.
+    #[must_use]
+    pub fn pending_relay(&self) -> usize {
+        self.pending_relay.len()
     }
 }
 
@@ -860,6 +973,12 @@ pub struct Mempool {
     /// The mempool owns the seam; the process machinery lives in the
     /// node layer.
     admit_hook: Option<AdmitHook>,
+    /// `extrapool.admit` — gates whether a policy reject is recorded.
+    /// `FnMut(&Txid, &reason) -> bool`.
+    extrapool_admit_hook: Option<PoolHook>,
+    /// `extrapool.promote` — gates whether an observed entry may
+    /// re-attempt admission.
+    extrapool_promote_hook: Option<PoolHook>,
     /// Observation pool for consensus-valid policy rejects — the
     /// registry's extrapool. `observing()` by default; set
     /// `extrapool.observe = false` to drop rejects instead of storing.
@@ -901,6 +1020,8 @@ impl Mempool {
             shadow: ShadowStats::default(),
             shadow_profiles: vec![("strict".to_string(), policy::SHADOW_STRICT)],
             admit_hook: None,
+            extrapool_admit_hook: None,
+            extrapool_promote_hook: None,
             extrapool: Extrapool::observing(),
             lifecycle_ring: std::collections::VecDeque::new(),
             broadcast: std::collections::HashMap::new(),
@@ -1722,10 +1843,7 @@ impl Mempool {
                 && !hook(&facts)
             {
                 self.lifecycle.rejected += 1;
-                if self.extrapool.observes() {
-                    self.extrapool
-                        .store(tx, MempoolReject::PolicyHook.to_string(), now);
-                }
+                self.extrapool_maybe_store(tx, &MempoolReject::PolicyHook, now);
                 return Err(MempoolReject::PolicyHook);
             }
         }
@@ -1758,11 +1876,26 @@ impl Mempool {
             Err(e) => {
                 self.lifecycle.rejected += 1;
                 if let (Some(tx), true) = (keep, Self::policy_reject(e)) {
-                    self.extrapool.store(tx, e.to_string(), now);
+                    self.extrapool_maybe_store(tx, e, now);
                 }
             }
         }
         result
+    }
+
+    /// `extrapool.admit` gates the observation itself — a `false`
+    /// verdict drops the record (the tx is rejected either way).
+    fn extrapool_maybe_store(&mut self, tx: Transaction, e: &MempoolReject, now: u32) {
+        if !self.extrapool.observes() {
+            return;
+        }
+        if let Some(hook) = self.extrapool_admit_hook.as_mut() {
+            let txid = tx.txid();
+            if !hook(&txid, &e.to_string()) {
+                return;
+            }
+        }
+        self.extrapool.store(tx, e, now);
     }
 
     /// Is this reject a *policy* verdict — the class the extrapool
@@ -2169,6 +2302,9 @@ impl Mempool {
                 // admission adds to this.
                 fees_with_descendants: modified_fee,
                 size_with_descendants: vsize,
+                // The RPC broadcast path flips this on when
+                // `mempool.private` is set — never here.
+                private: false,
             },
         );
         // This entry's own score-index row, then propagate its
@@ -2942,6 +3078,53 @@ impl Mempool {
         self.admit_hook = hook;
     }
 
+    /// The `extrapool.admit` verdict — consulted before a policy
+    /// reject is recorded in the observation pool; `false` drops the
+    /// observation. Narrows only.
+    pub fn set_extrapool_admit_hook(&mut self, hook: Option<PoolHook>) {
+        self.extrapool_admit_hook = hook;
+    }
+
+    /// The `extrapool.promote` verdict — consulted before `promote`
+    /// re-runs admission; `false` keeps the entry and fails the call
+    /// with [`MempoolReject::PromoteHook`]. Narrows only.
+    pub fn set_extrapool_promote_hook(&mut self, hook: Option<PoolHook>) {
+        self.extrapool_promote_hook = hook;
+    }
+
+    /// `extrapool.caps` / `extrapool.relay` — see [`Extrapool`].
+    pub fn configure_extrapool_detail(&mut self, caps: BTreeMap<String, usize>, relay: bool) {
+        self.extrapool.set_caps(caps);
+        self.extrapool.set_relay(relay);
+    }
+
+    /// Entries awaiting propagation (`extrapool.relay` queue — the
+    /// node drains it per tick and announces with extrapool
+    /// provenance).
+    pub fn take_extrapool_pending(&mut self) -> Vec<(Txid, Wtxid)> {
+        self.extrapool.take_pending_relay()
+    }
+
+    /// `mempool.private` — mark a just-admitted entry private:
+    /// stem-only relay and hidden from the listing RPCs.
+    pub fn mark_private(&mut self, txid: &Txid) {
+        if let Some(e) = self.map.get_mut(txid) {
+            e.private = true;
+        }
+    }
+
+    /// Whether the entry is private (`mempool.private` submissions).
+    #[must_use]
+    pub fn is_private(&self, txid: &Txid) -> bool {
+        self.map.get(txid).is_some_and(|e| e.private)
+    }
+
+    /// Live private-entry count — `getmempoolinfo` reports it.
+    #[must_use]
+    pub fn private_count(&self) -> usize {
+        self.map.values().filter(|e| e.private).count()
+    }
+
     /// The observation pool of policy rejects.
     #[must_use]
     pub fn extrapool(&self) -> &Extrapool {
@@ -2971,6 +3154,14 @@ impl Mempool {
         cs: &avila_consensus::chainstate::Chainstate,
         now: u32,
     ) -> Result<Txid, MempoolReject> {
+        // `extrapool.promote` — the verdict narrows re-admission; a
+        // `false` keeps the entry observed rather than dropped.
+        if let Some(hook) = self.extrapool_promote_hook.as_mut()
+            && let Some(entry) = self.extrapool.get(txid)
+            && !hook(txid, &entry.reason)
+        {
+            return Err(MempoolReject::PromoteHook);
+        }
         let Some(entry) = self.extrapool.take(txid) else {
             return Err(MempoolReject::NotObserved);
         };
@@ -6015,6 +6206,77 @@ mod tests {
         ));
         let e = pool.extrapool().get(&txid).expect("hook rejects observe");
         assert_eq!(e.reason, "rejected by tx.admit hook");
+    }
+
+    /// `extrapool.caps` — a class's own FIFO bound sits under the
+    /// global one; other classes keep their entries.
+    #[test]
+    fn extrapool_class_caps_bound_one_reason() {
+        let (cs, blocks) = chainstate_at(103);
+        let mut pool = permissive_pool();
+        pool.set_min_relay_fee(1_000_000_000_000);
+        pool.configure_extrapool(true, 10_000, 50_000_000, 0);
+        pool.configure_extrapool_detail([("fee".to_string(), 1usize)].into_iter().collect(), false);
+        // Two fee rejects — only the newest survives under cap=1.
+        let mut ids = Vec::new();
+        for h in 1..=2 {
+            let tx = spend_tx(mature_outpoint(&blocks, h), 4_999_000_000, SEQ_FINAL);
+            ids.push(tx.txid());
+            let _ = pool.accept_tx(tx, &cs, NOW);
+        }
+        assert_eq!(pool.extrapool().len(), 1);
+        assert!(
+            pool.extrapool().get(&ids[0]).is_none(),
+            "fee cap evicted oldest"
+        );
+        assert!(pool.extrapool().get(&ids[1]).is_some());
+        assert_eq!(pool.extrapool().stats().evicted, 1);
+        // A different class is unaffected — a hook-rejected tx
+        // records under "hook", not "fee".
+        pool.set_admit_hook(Some(Box::new(|_| false)));
+        pool.set_min_relay_fee(0);
+        let hooked = spend_tx(mature_outpoint(&blocks, 3), 4_999_000_000, SEQ_FINAL);
+        let hid = hooked.txid();
+        let _ = pool.accept_tx(hooked, &cs, NOW);
+        assert_eq!(pool.extrapool().get(&hid).unwrap().class, "hook");
+        assert_eq!(pool.extrapool().len(), 2, "hook class isn't fee-capped");
+    }
+
+    /// `extrapool.admit` gates the record (not the verdict), and
+    /// `extrapool.promote` keeps the entry on a reject.
+    #[test]
+    fn extrapool_hooks_gate_observe_and_promote() {
+        let (cs, blocks) = chainstate_at(102);
+        let mut pool = permissive_pool();
+        pool.set_min_relay_fee(1_000_000_000_000);
+        // Admission hook refuses observation for the first tx.
+        let tx = spend_tx(mature_outpoint(&blocks, 1), 4_999_000_000, SEQ_FINAL);
+        let t1 = tx.txid();
+        pool.set_extrapool_admit_hook(Some(Box::new(move |txid, _| *txid != t1)));
+        assert!(matches!(
+            pool.accept_tx(tx, &cs, NOW),
+            Err(MempoolReject::MinRelayFee) | Err(MempoolReject::MempoolMinFeeNotMet)
+        ));
+        assert!(
+            pool.extrapool().get(&t1).is_none(),
+            "admit hook blocked the record"
+        );
+        let tx = spend_tx(mature_outpoint(&blocks, 2), 4_999_000_000, SEQ_FINAL);
+        let t2 = tx.txid();
+        let _ = pool.accept_tx(tx, &cs, NOW);
+        assert!(pool.extrapool().get(&t2).is_some(), "other txs observe");
+
+        // promote hook refuses → entry stays; allow → promotes.
+        pool.set_min_relay_fee(0);
+        pool.set_extrapool_promote_hook(Some(Box::new(|_, reason| !reason.contains("fee"))));
+        assert!(matches!(
+            pool.promote(&t2, &cs, NOW),
+            Err(MempoolReject::PromoteHook)
+        ));
+        assert!(pool.extrapool().get(&t2).is_some(), "hook-kept entry");
+        pool.set_extrapool_promote_hook(Some(Box::new(|_, _| true)));
+        assert_eq!(pool.promote(&t2, &cs, NOW).unwrap(), t2);
+        assert_eq!(pool.len(), 1);
     }
 
     /// `shadow_eval` (strict rules) vs `is_standard_tx` on standard-shaped txs —

@@ -1342,3 +1342,69 @@ semantics for in-place ops. fe_sqr4 variant next (half the products).
 - CEILING model now: verify4 = ~350 fused ops ~100-115ns = ~40us vs
   ~86us scalar = ~2.2x ceiling at CURRENT latency; ~60ns -> ~4x.
   This is the crypto mass only (~50-60% of IBD wall).
+
+## 2026-09-28d — radical-redesign survey + fused add/ladder-cadence measured
+
+Prompt: "you're not thinking radically enough" → surveyed structurally
+different architectures before more kernel tuning.
+
+**Established dead/small (checked against prior artifacts):**
+- Batch-ECDSA on on-chain sigs: math-level dead standalone — R parity is
+  unknowable without computing R' (subset-sum over 2^N). Confirms
+  [feasibility doc](2026-09-23-ecdsa-batch-feasibility.md): only
+  summation-polynomial (~2× @ batch ≤9, novel crypto) or R-advice works.
+- R-advice batch already measured: 1.82–2.27× CPU kernel-side; ~17–23% CPU
+  in the real 8-worker pipeline ([parallel-replay](2026-09-24-ecdsa-parallel-replay.md)).
+  NOT standalone: advice production ≈ verification cost; requires external
+  helper data (peer sidecar). Fits user's experimental-mode plan.
+- Schnorr MSM batch: clean (R in sig) but Schnorr ≈ **8% of sig mass**
+  at 956k census → ~1–2% end-to-end. Deprioritized.
+- Node already runs 8-way script-pool parallelism — per-core kernel gains
+  stack multiplicatively with it.
+
+**New measurements (all differential-validated):**
+- fe_mul4 v3 (memory-resident accs): correct 200K, but worse — store→load
+  acc chains serialize. Register accs confirmed better.
+- Dead-iteration cut (F[5]-drain was folding zeros on iters 2–3):
+  dbl4 serial 877→**687ns** (~172ns/dbl-equiv), ladder mix **1.71×**.
+- gej4_add_ge4 built (8 mul + 3 sqr + 11 add, affine lane operand) —
+  fused 7dbl+1add cadence: 5879ns/8-step/4-lanes = **1.71× vs scalar**.
+- v4 lag-1 column-order (2 live accs): correct 200K, ~parity latency —
+  serial path is intrinsic, not spill-dominated.
+- Latency split: products+resolve = **60ns**, tail = **~53ns** of the
+  ~113ns fused-mul latency. Interleaved folds regressed.
+
+**Ceiling model (unchanged, sharper):** latency-bound serial ladder ≈
+~1.7× now, ~2–3× with kernel/asm work. The one remaining big standalone
+structure is a **static op-schedule engine** (comb-based mul → fixed
+dependency graph → emitted op-list, multi-stream interleave) — targets
+the ~7µs/sig port-throughput bound vs ~30µs serial-latency bound.
+Untested premise: whether sub-256-uop fused ops can overlap in the
+rename window (interleave-2 measured ~0% at 700-insn ops).
+
+Artifacts: /tmp/fma4/{dbl4.c,ezw_body.c,v4.inc,mul4_v4.c,lat_probe.c}
+(working copies; canonical copies archived under experiments/code/).
+
+## 2026-09-28e — SP-batch derivation: it collapses to the advice scheme
+
+Derived the summation-polynomial batch construction from first
+principles (paper PDF unreachable — network). Result: for unmodified
+ECDSA, f3 "exists-a-lift" is exactly ECDSA's sign-agnostic x-check —
+but realizing the batch still requires *lifting* each r_i to a curve
+point = one mod-p sqrt per signature (~380 field ops ≈ ~28% of a
+verify). Fused-4 cost model: MSM saves ~50%, lifts cost ~35% →
+**~1.2× standalone — marginal**. The paper's ~2x@t≤9 comes from
+symbolic resultant elimination (exponential in t, novel-crypto risk).
+
+KEY STRUCTURAL FINDING: SP-batch ≡ advice-batch. The existential lift
+is precisely what R-advice provides for free. The missing bit per
+signature (which of {r, r+n} × ±y) is information not derivable
+cheaply from the signature — the ~2^-128-equivalent of ~2 bits. This
+is the first-principles reason every batch path converges on needing
+external data: not a missing trick, missing information.
+
+Closed cheaply today: sha2 0.11 already runtime-dispatches SHA-NI
+(confirmed in vendored source, sigchecker→sha2 path). iGPU killed on
+arithmetic (32 EUs ≈ ~2-3 cores int throughput ≈ ~5%). perf locked
+(paranoid=4) — port analysis done analytically: fused-mul port floor
+~40ns vs measured ~95ns → latency/spill-bound with real ~2× headroom.

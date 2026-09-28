@@ -357,6 +357,17 @@ fn run_events(path: &Path, follow: bool, after: Option<u64>) -> Result<(), Box<d
 }
 
 /// `hooks.*` config tables → spawn specs (per decision point).
+/// `relay.tx.deny_pairs` strings → (src, dst) tuples. `validate()`
+/// already rejected malformed entries, so unparseable input can't
+/// reach here — the filter is a belt to the parser's suspenders.
+fn deny_pairs(pairs: &[String]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .filter_map(|p| p.split_once("->"))
+        .map(|(s, d)| (s.trim().to_string(), d.trim().to_string()))
+        .collect()
+}
+
 fn hook_specs(hooks: &[avila_core::HookSpecConfig]) -> Vec<avila_node::hooks::HookSpec> {
     hooks
         .iter()
@@ -963,6 +974,11 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 dns_seeds: c.net.dns_seeds,
                 peer_accept_hooks: hook_specs(&c.hooks.peer_accept),
                 tx_admit_hooks: hook_specs(&c.hooks.tx_admit),
+                tx_announce_hooks: hook_specs(&c.hooks.tx_announce),
+                extrapool_admit_hooks: hook_specs(&c.hooks.extrapool_admit),
+                extrapool_promote_hooks: hook_specs(&c.hooks.extrapool_promote),
+                deny_pairs: deny_pairs(&c.relay.tx.deny_pairs),
+                private_submissions: c.mempool.private,
                 shadow_profiles: c.policy.shadow.clone(),
                 extrapool: c.extrapool.clone(),
                 ban_time: c.peers.ban_time,
@@ -1074,6 +1090,11 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 dns_seeds: c.net.dns_seeds,
                 peer_accept_hooks: hook_specs(&c.hooks.peer_accept),
                 tx_admit_hooks: hook_specs(&c.hooks.tx_admit),
+                tx_announce_hooks: hook_specs(&c.hooks.tx_announce),
+                extrapool_admit_hooks: hook_specs(&c.hooks.extrapool_admit),
+                extrapool_promote_hooks: hook_specs(&c.hooks.extrapool_promote),
+                deny_pairs: deny_pairs(&c.relay.tx.deny_pairs),
+                private_submissions: c.mempool.private,
                 shadow_profiles: c.policy.shadow.clone(),
                 extrapool: c.extrapool.clone(),
                 ban_time: c.peers.ban_time,
