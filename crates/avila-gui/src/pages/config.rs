@@ -440,6 +440,36 @@ pub fn show(
             );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // How the layering works — pinned open with a click.
+            ui.menu_button(RichText::new("ⓘ").size(13.0).color(pal.muted), |ui| {
+                ui.set_max_width(340.0);
+                for line in [
+                    ("how this page works", true),
+                    ("", false),
+                    ("Your file is the base — never written by the app. Its overlay,", false),
+                    ("<name>.runtime.toml, merges over it at load.", false),
+                    ("", false),
+                    ("live — applies to the running node within a tick and persists", false),
+                    ("    into the overlay. Every change lands on the event journal.", false),
+                    ("", false),
+                    ("needs restart — structural knobs (the database, sockets, indexes)", false),
+                    ("    are opened once at boot. Editing stages the value into the", false),
+                    ("    overlay; it applies on the next start.", false),
+                    ("", false),
+                    ("file watch — edits from outside either file raise a banner:", false),
+                    ("    live diffs can apply in place, restart diffs need the", false),
+                    ("    restart button.", false),
+                    ("", false),
+                    ("Nothing on this page can change what's valid — consensus", false),
+                    ("rules aren't configuration.", false),
+                ] {
+                    ui.label(
+                        RichText::new(line.0)
+                            .size(12.0)
+                            .color(if line.1 { pal.text } else { pal.muted }),
+                    );
+                }
+            });
             if let Some(file) = config_file {
                 if ui
                     .link(
