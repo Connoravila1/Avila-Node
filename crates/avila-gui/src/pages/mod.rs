@@ -30,6 +30,9 @@ pub struct Scene<'a> {
 pub enum Action {
     Start,
     Stop,
+    /// Stop, then start again once the worker is out — the file is
+    /// re-read, so restart-only edits land.
+    Restart,
     Open(crate::rail::Page),
     /// Re-run the first-open slideshow.
     ReplayTour,

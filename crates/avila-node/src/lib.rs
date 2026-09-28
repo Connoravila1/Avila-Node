@@ -47,6 +47,12 @@ impl Node {
         &self.config
     }
 
+    /// Swap the configuration — used when the file is re-read between
+    /// runs so an edited TOML actually lands on the next start.
+    pub fn replace_config(&mut self, config: ValidatedConfig) {
+        self.config = config;
+    }
+
     pub fn events(&self) -> &EventJournal {
         &self.events
     }

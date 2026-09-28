@@ -56,6 +56,8 @@ pub fn show(
     network: &str,
     live: bool,
     toybox: bool,
+    // The config file changed on disk — badge the Config item.
+    config_dirty: bool,
 ) {
     let pal = Palette::of(ui.ctx());
     let rect = ui.max_rect();
@@ -108,6 +110,9 @@ pub fn show(
             fg,
             if selected { pal.rail_active } else { pal.rail },
         );
+        if item == Page::Config && config_dirty {
+            p.circle_filled(r.right_top() - vec2(9.0, -9.0), 3.5, pal.alert);
+        }
         p.text(
             pos2(r.center().x, middle + 14.0),
             Align2::CENTER_CENTER,

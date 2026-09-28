@@ -366,6 +366,10 @@ impl Session {
         network: avila_core::Network,
         data_dir: PathBuf,
         settings: &RunSettings,
+        // The loaded node config — the policy plane (relay, extrapool,
+        // hooks, mining…) comes from the file; the run settings only
+        // own the GUI's start-shaped fields.
+        config: &avila_core::NodeConfig,
     ) {
         if self.running {
             return;
@@ -445,9 +449,57 @@ impl Session {
                 .parse::<u64>()
                 .ok()
                 .map(|mib| mib.saturating_mul(1024 * 1024)),
-            v2transport: true,
+            v2transport: config.net.v2transport,
             // The overview draws the block this mempool would build next.
             preview_next_block: true,
+            // The file's policy plane — the same map `run` applies.
+            require_standard: config.policy.require_standard,
+            min_relay_fee: config.mempool.min_relay_fee_sat_per_kvb,
+            datacarrier_bytes: config.policy.datacarrier_bytes(),
+            permit_bare_multisig: config.policy.permit_bare_multisig,
+            dust_relay_fee: config.policy.dust_relay_fee_sat_per_kvb,
+            mempool_expiry_secs: config.mempool.expiry_secs,
+            stem_relay: config.relay.tx.stem,
+            max_in_transit: config.sync.max_in_transit,
+            dns_seeds: config.net.dns_seeds,
+            peer_accept_hooks: hook_specs(&config.hooks.peer_accept),
+            tx_admit_hooks: hook_specs(&config.hooks.tx_admit),
+            tx_announce_hooks: hook_specs(&config.hooks.tx_announce),
+            extrapool_admit_hooks: hook_specs(&config.hooks.extrapool_admit),
+            extrapool_promote_hooks: hook_specs(&config.hooks.extrapool_promote),
+            tx_serve_hooks: hook_specs(&config.hooks.tx_serve),
+            block_serve_hooks: hook_specs(&config.hooks.block_serve),
+            template_build_hooks: hook_specs(&config.hooks.template_build),
+            deny_pairs: deny_pairs(&config.relay.tx.deny_pairs),
+            private_submissions: config.mempool.private,
+            mine_extrapool: config.mining.include_extrapool,
+            blocks_only: config.net.blocks_only,
+            utreexo: config.sync.utreexo,
+            utreexo_bridge: config.sync.utreexo_bridge,
+            relay_block: (
+                config.relay.block.compact,
+                config.relay.block.compact_high_bandwidth,
+                config.relay.block.compact_serve,
+                config.relay.block.announce.clone(),
+                config.relay.block.serve.clone(),
+            ),
+            relay_tx: (
+                config.relay.tx.announce.clone(),
+                config.relay.tx.to_inbound,
+                config.relay.tx.to_blocks_only_peers,
+                config.relay.tx.send_feefilter,
+                config.relay.tx.rebroadcast_local,
+                config.relay.tx.rebroadcast_interval,
+            ),
+            mining_budgets: (
+                config.mining.max_weight,
+                config.mining.min_tx_fee,
+                config.mining.reserved_weight,
+            ),
+            shadow_profiles: config.policy.shadow.clone(),
+            extrapool: config.extrapool.clone(),
+            ban_time: config.peers.ban_time,
+            risks: avila_node::config::risk_review(config),
             listen: settings.listen_addr(),
             dbcache: RunSettings::mib(&settings.dbcache_mib),
             maxmempool_bytes: settings
@@ -891,6 +943,30 @@ pub fn agent_name(agent: &str) -> String {
         Some((cut, _)) => format!("{}…", &name[..cut]),
         None => name,
     }
+}
+
+/// `[[hooks.*]]` rows → spawnable `HookSpec`s — the same map `run` uses.
+fn hook_specs(hooks: &[avila_core::HookSpecConfig]) -> Vec<avila_node::hooks::HookSpec> {
+    hooks
+        .iter()
+        .map(|h| avila_node::hooks::HookSpec {
+            program: h.program.clone(),
+            args: h.args.clone(),
+            timeout: std::time::Duration::from_millis(h.timeout_ms),
+            on_timeout: h.on_timeout,
+            on_defer: h.on_defer,
+            max_restarts: h.max_restarts,
+        })
+        .collect()
+}
+
+/// `deny_pairs` strings ("low_fee->mining") → typed class pairs.
+fn deny_pairs(pairs: &[String]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .filter_map(|p| p.split_once("->"))
+        .map(|(s, d)| (s.trim().to_string(), d.trim().to_string()))
+        .collect()
 }
 
 #[cfg(test)]

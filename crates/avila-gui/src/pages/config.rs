@@ -157,6 +157,9 @@ pub fn show(
     node: &Node,
     control: Option<Sender<ControlMsg>>,
     config_file: Option<&std::path::Path>,
+    // Knob paths whose on-disk value differs from the running node's
+    // (`Some(vec![])` = the file changed but no longer parses).
+    dirty: Option<&[String]>,
 ) -> Option<Action> {
     let pal = s.pal;
     widgets::section(
@@ -194,6 +197,44 @@ pub fn show(
             }
         });
     });
+
+    // The file moved on disk — say which knobs drifted, and offer the
+    // restart that re-reads it.
+    if let Some(diffs) = dirty {
+        ui.add_space(8.0);
+        let mut action = None;
+        ui.horizontal(|ui| {
+            if diffs.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "the config file changed but doesn't parse — the node keeps its loaded values",
+                    )
+                    .size(12.0)
+                    .color(pal.alert),
+                );
+            } else {
+                ui.label(
+                    RichText::new(format!(
+                        "config file changed — {} knob{} differ{}: {}",
+                        diffs.len(),
+                        if diffs.len() == 1 { "" } else { "s" },
+                        if diffs.len() == 1 { "s" } else { "" },
+                        diffs.iter().take(4).cloned().collect::<Vec<_>>().join(", ")
+                            + if diffs.len() > 4 { ", …" } else { "" },
+                    ))
+                    .size(12.0)
+                    .color(pal.signal),
+                );
+                if widgets::button(ui, "restart node", Kind::Primary).clicked() {
+                    action = Some(Action::Restart);
+                }
+            }
+        });
+        ui.add_space(2.0);
+        if action.is_some() {
+            return action;
+        }
+    }
     ui.add_space(10.0);
 
     let knobs = describe_config(node.config().get());
@@ -225,7 +266,7 @@ pub fn show(
             );
             ui.add_space(4.0);
         }
-        row(ui, pal, state, k, control.as_ref(), config_file);
+        row(ui, pal, state, k, control.as_ref(), config_file, dirty);
     }
     None
 }
@@ -237,6 +278,7 @@ fn row(
     k: &avila_node::config::KnobDescription,
     control: Option<&Sender<ControlMsg>>,
     config_file: Option<&std::path::Path>,
+    dirty: Option<&[String]>,
 ) {
     let live = k.edit == EditKind::Live && control.is_some();
     let value = effective(state, k.path, &k.value);
@@ -280,15 +322,16 @@ fn row(
                     let r = ui
                         .add(
                             egui::Label::new(
-                                RichText::new("restart →")
+                                RichText::new("needs restart →")
                                     .size(11.5)
                                     .color(pal.muted)
                                     .underline(),
                             )
                             .sense(egui::Sense::click()),
                         )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text(format!(
-                            "Read at startup — click to edit {}",
+                            "Applies at startup — click to edit {}",
                             file.display()
                         ));
                     if r.clicked() {
@@ -298,10 +341,17 @@ fn row(
                         let _ = std::process::Command::new("xdg-open").arg(file).spawn();
                     }
                 } else {
-                    ui.label(RichText::new("restart").size(11.5).color(pal.muted))
-                        .on_hover_text("Read at startup — no config file was loaded");
+                    ui.label(RichText::new("needs restart").size(11.5).color(pal.muted))
+                        .on_hover_text("Applies at startup — no config file was loaded");
                 }
             });
+            if dirty.is_some_and(|d| d.iter().any(|p| p == k.path)) {
+                ui.label(
+                    RichText::new("file differs — restart to apply")
+                        .size(11.0)
+                        .color(pal.signal),
+                );
+            }
             if let Some(reason) = rejected {
                 ui.label(
                     RichText::new(format!("rejected: {reason}"))

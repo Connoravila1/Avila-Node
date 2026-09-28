@@ -43,6 +43,14 @@ pub struct App {
     /// The TOML this node was loaded from — the Config page offers it
     /// up for the knobs that only a restart can apply.
     config_file: Option<std::path::PathBuf>,
+    /// Last-seen mtime of the config file — the watch that powers the
+    /// "changes detected" banner.
+    config_mtime: Option<std::time::SystemTime>,
+    /// Knob paths whose on-disk value differs from what the node has
+    /// loaded (`Some(vec![])` = the file changed but can't be read).
+    config_dirty: Option<Vec<String>>,
+    /// The file-watch's last stat — polling every frame is rude.
+    config_checked: std::time::Instant,
     /// The toybox's shelf: every game, the hash-fed toys, the confetti.
     toys: toybox::Toys,
     /// The toy a capture posed, so it isn't re-posed every frame.
@@ -218,6 +226,12 @@ impl App {
             restart: false,
             events_tail,
             decorated: None,
+            config_mtime: config_file
+                .as_ref()
+                .and_then(|f| std::fs::metadata(f).ok())
+                .and_then(|m| m.modified().ok()),
+            config_dirty: None,
+            config_checked: std::time::Instant::now(),
             config_file,
         };
         // The compositor may never send a frame callback while the
@@ -244,8 +258,65 @@ impl App {
     }
 
     fn start(&mut self) {
+        // Re-read the file so edits made between runs actually land —
+        // the Config page's "restart to apply" banner depends on it.
+        if let Some(file) = &self.config_file {
+            match avila_node::config::load_config(Some(file)) {
+                Ok(v) => {
+                    self.node.replace_config(v);
+                    self.config_dirty = None;
+                }
+                Err(_) => {
+                    self.session.log(
+                        ActivityKind::Node,
+                        "The config file doesn't parse — keeping the loaded configuration.".into(),
+                        None,
+                        self.session.now(),
+                    );
+                }
+            }
+        }
         let data_dir = self.node.config().network_data_dir();
-        self.session.start(self.network(), data_dir, &self.run);
+        self.session.start(
+            self.network(),
+            data_dir,
+            &self.run,
+            self.node.config().get(),
+        );
+    }
+
+    /// Watch the config file's mtime; when it moves, reload and diff
+    /// its knobs against what the node has loaded.
+    fn poll_config_file(&mut self) {
+        let Some(file) = &self.config_file else {
+            return;
+        };
+        if self.config_checked.elapsed() < std::time::Duration::from_millis(700) {
+            return;
+        }
+        self.config_checked = std::time::Instant::now();
+        let mtime = std::fs::metadata(file).ok().and_then(|m| m.modified().ok());
+        if mtime == self.config_mtime {
+            return;
+        }
+        self.config_mtime = mtime;
+        match avila_node::config::load_config(Some(file)) {
+            Ok(v) => {
+                use std::collections::HashMap;
+                let base: HashMap<String, serde_json::Value> =
+                    avila_node::config::describe_config(self.node.config().get())
+                        .iter()
+                        .map(|k| (k.path.to_string(), k.value.clone()))
+                        .collect();
+                let diffs: Vec<String> = avila_node::config::describe_config(v.get())
+                    .iter()
+                    .filter(|k| base.get(k.path) != Some(&k.value))
+                    .map(|k| k.path.to_string())
+                    .collect();
+                self.config_dirty = (!diffs.is_empty()).then_some(diffs);
+            }
+            Err(_) => self.config_dirty = Some(vec![]),
+        }
     }
 
     /// The current page inside its margins; either layout wraps it.
@@ -298,6 +369,7 @@ impl App {
                         &self.node,
                         self.session.control_sender(),
                         self.config_file.as_deref(),
+                        self.config_dirty.as_deref(),
                     ),
                     Page::Toybox => {
                         toybox::show(ui, &scene, &mut self.toys, &mut self.prefs);
@@ -583,6 +655,7 @@ impl eframe::App for App {
             self.start();
         }
         self.session.poll();
+        self.poll_config_file();
         // The Tip skin's seed is the tip's hash — a new block repaints
         // the whole node in the hash's hue.
         let seed = tip_hash_seed(&self.session);
@@ -756,6 +829,7 @@ impl eframe::App for App {
                             network_name(network),
                             phase.live(),
                             self.prefs.toybox,
+                            self.config_dirty.is_some(),
                         );
                     });
                 egui::Panel::top("status")
@@ -817,6 +891,14 @@ impl eframe::App for App {
                 self.start();
             }
             Some(Action::Stop) => self.session.stop(),
+            Some(Action::Restart) => {
+                if self.session.running() {
+                    self.session.stop();
+                    self.restart = true;
+                } else {
+                    self.start();
+                }
+            }
             Some(Action::Open(page)) => self.page = page,
             Some(Action::ReplayTour) => self.tour = Some(0),
             None => {}
