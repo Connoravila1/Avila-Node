@@ -183,6 +183,15 @@ pub struct UtxoSet {
     /// checkpoint by [`UtxoSet::release_swiftsync_hold`], after which
     /// normal flushing resumes while tracking continues.
     swift_hold: bool,
+    /// RAM-resident mirror of the committed layers (backend ∪
+    /// snapshot) — the measured ~0.1–0.4 µs/probe flat table that
+    /// replaces disk `get`/`have` on the hot path. `None` disables it;
+    /// `Some` is populated at enable time and updated with the same
+    /// delta the backend commits, so a flat miss is authoritative.
+    /// Never consulted while `base` is `Some` (a simulation overlay
+    /// shadows the committed layers entirely — `get` returns through
+    /// `base` before reaching `flat`).
+    flat: Option<crate::flatmap::FlatCoins>,
 }
 
 impl Default for UtxoSet {
@@ -198,6 +207,7 @@ impl Default for UtxoSet {
             born: std::collections::HashSet::new(),
             swift: None,
             swift_hold: false,
+            flat: None,
         }
     }
 }
@@ -221,6 +231,9 @@ impl UtxoSet {
     /// in-memory map.
     pub fn attach_backend(&mut self, backend: crate::coinsdb::CoinsBackend) {
         self.backend = Some(std::sync::Arc::new(backend));
+        if self.flat.is_some() {
+            self.rebuild_flat(usize::MAX);
+        }
     }
 
     /// Attaches an already-shared backend handle — the chainstate
@@ -228,18 +241,82 @@ impl UtxoSet {
     /// the same one here.
     pub fn attach_shared(&mut self, backend: std::sync::Arc<crate::coinsdb::CoinsBackend>) {
         self.backend = Some(backend);
+        if self.flat.is_some() {
+            self.rebuild_flat(usize::MAX);
+        }
     }
 
     /// Attaches an immutable snapshot run as the lowest read layer —
     /// the delta-overlay base for a SnapshotRun-loaded chainstate.
     pub fn attach_snapshot(&mut self, run: crate::sortedrun::SnapshotRun) {
         self.snapshot = Some(std::sync::Arc::new(run));
+        if self.flat.is_some() {
+            self.rebuild_flat(usize::MAX);
+        }
     }
 
     /// Attaches an already-shared snapshot run — the chainstate holds
     /// the `Arc` and hands the same one here (mirrors `attach_shared`).
     pub fn attach_shared_snapshot(&mut self, run: std::sync::Arc<crate::sortedrun::SnapshotRun>) {
         self.snapshot = Some(run);
+        if self.flat.is_some() {
+            self.rebuild_flat(usize::MAX);
+        }
+    }
+
+    /// Enables the RAM-resident flat mirror of the committed layers —
+    /// the measured fast lookup path. Streams snapshot + backend once;
+    /// `byte_cap` bounds the resident footprint (`0` disables the cap).
+    /// Returns `false` without enabling when the estimate exceeds the
+    /// cap — the caller should leave the disk path in place then.
+    ///
+    /// Must be called *after* backend/snapshot attach. Cheap at genesis
+    /// (empty committed layers), O(utxo) on an already-synced set —
+    /// the restart cost the experimental path pays for its probe speed.
+    pub fn enable_flat(&mut self, byte_cap: usize) -> bool {
+        let committed = self
+            .backend
+            .as_deref()
+            .map_or(0, |b| b.coins_len() as usize)
+            .saturating_add(self.snapshot.as_ref().map_or(0, |s| s.len()) as usize);
+        if byte_cap != 0 && crate::flatmap::FlatCoins::estimate_bytes(committed) > byte_cap {
+            return false;
+        }
+        self.rebuild_flat(byte_cap);
+        true
+    }
+
+    /// `true` when the flat mirror is live.
+    #[must_use]
+    pub fn flat_enabled(&self) -> bool {
+        self.flat.is_some()
+    }
+
+    /// (Re)builds the flat table from the committed layers: snapshot
+    /// first, then backend — matching `get`'s shadowing priority
+    /// (backend hits shadow snapshot hits).
+    fn rebuild_flat(&mut self, byte_cap: usize) {
+        let committed = self
+            .backend
+            .as_deref()
+            .map_or(0, |b| b.coins_len() as usize)
+            .saturating_add(self.snapshot.as_ref().map_or(0, |s| s.len()) as usize);
+        if byte_cap != 0 && crate::flatmap::FlatCoins::estimate_bytes(committed) > byte_cap {
+            self.flat = None;
+            return;
+        }
+        let mut f = crate::flatmap::FlatCoins::with_capacity(committed);
+        if let Some(snap) = &self.snapshot {
+            for (op, c) in snap.iter().unwrap_or_default() {
+                f.insert(&op, &c);
+            }
+        }
+        if let Some(be) = &self.backend {
+            for (op, c) in be.iter_coins() {
+                f.insert(&op, &c);
+            }
+        }
+        self.flat = Some(f);
     }
 
     /// `true` when a disk backend is attached.
@@ -421,6 +498,9 @@ impl UtxoSet {
         if let Some(base) = &self.base {
             return base.get(outpoint);
         }
+        if let Some(f) = &self.flat {
+            return f.get(outpoint);
+        }
         if let Some(be) = &self.backend {
             return be.get(outpoint);
         }
@@ -448,6 +528,9 @@ impl UtxoSet {
         if let Some(base) = &self.base {
             return base.have(outpoint);
         }
+        if let Some(f) = &self.flat {
+            return f.have(outpoint);
+        }
         if self.backend.as_ref().is_some_and(|be| be.have(outpoint)) {
             return true;
         }
@@ -462,13 +545,19 @@ impl UtxoSet {
     /// callers all collect anyway.
     #[must_use]
     pub fn iter(&self) -> Vec<(OutPoint, Coin)> {
-        let mut all: HashMap<OutPoint, Coin> = match &self.backend {
-            Some(be) => be.iter_coins().into_iter().collect(),
-            None => HashMap::new(),
+        let mut all: HashMap<OutPoint, Coin> = if let Some(f) = &self.flat {
+            f.iter().into_iter().collect()
+        } else {
+            match &self.backend {
+                Some(be) => be.iter_coins().into_iter().collect(),
+                None => HashMap::new(),
+            }
         };
         // The snapshot file is the lowest layer — everything above
-        // shadows it.
-        if let Some(snap) = &self.snapshot {
+        // shadows it. (When `flat` exists it already mirrors this merge.)
+        if self.flat.is_none()
+            && let Some(snap) = &self.snapshot
+        {
             for (op, c) in snap.iter().unwrap_or_default() {
                 all.insert(op, c);
             }
@@ -496,9 +585,17 @@ impl UtxoSet {
     /// base and must not be serialized into it.
     #[must_use]
     pub fn iter_delta(&self) -> Vec<(OutPoint, Coin)> {
-        let mut all: HashMap<OutPoint, Coin> = match &self.backend {
-            Some(be) => be.iter_coins().into_iter().collect(),
-            None => HashMap::new(),
+        // `flat` mirrors backend ∪ snapshot, but this view must exclude
+        // the snapshot by contract (state.dat persists only the delta).
+        // When a snapshot is attached, fall back to the backend scan.
+        let flat_ok = self.flat.is_some() && self.snapshot.is_none();
+        let mut all: HashMap<OutPoint, Coin> = if flat_ok {
+            self.flat.iter().flat_map(|f| f.iter()).collect()
+        } else {
+            match &self.backend {
+                Some(be) => be.iter_coins().into_iter().collect(),
+                None => HashMap::new(),
+            }
         };
         if let Some(base) = &self.base {
             for (op, c) in base.iter() {
@@ -536,6 +633,7 @@ impl UtxoSet {
         self.base
             .as_deref()
             .and_then(|b| b.get(outpoint))
+            .or_else(|| self.flat.as_ref().and_then(|f| f.get(outpoint)))
             .or_else(|| self.backend.as_deref().and_then(|be| be.get(outpoint)))
             .or_else(|| self.snapshot.as_ref().and_then(|s| s.get(outpoint)))
     }
@@ -543,6 +641,7 @@ impl UtxoSet {
     /// `true` if any layer below `map` holds `outpoint`.
     fn lower_live(&self, outpoint: &OutPoint) -> bool {
         self.base.as_deref().is_some_and(|b| b.have(outpoint))
+            || self.flat.as_ref().is_some_and(|f| f.have(outpoint))
             || self.backend.as_deref().is_some_and(|be| be.have(outpoint))
             || self
                 .snapshot
@@ -740,6 +839,7 @@ impl UtxoSet {
             born: std::collections::HashSet::new(),
             swift: None,
             swift_hold: false,
+            flat: None,
         }
     }
 
@@ -791,6 +891,9 @@ impl UtxoSet {
             self.map.retain(|op, e| e.is_some() || !born.contains(op));
         }
         be.commit(&self.map, new_undos, tip)?;
+        if let Some(f) = &mut self.flat {
+            f.apply_delta(&self.map);
+        }
         self.map.clear();
         self.map_bytes = 0;
         self.live_delta = 0;
@@ -811,6 +914,9 @@ impl UtxoSet {
             self.map.retain(|op, e| e.is_some() || !born.contains(op));
         }
         be.commit_partial(&self.map)?;
+        if let Some(f) = &mut self.flat {
+            f.apply_delta(&self.map);
+        }
         self.map.clear();
         self.map_bytes = 0;
         self.live_delta = 0;
@@ -832,6 +938,7 @@ impl Clone for UtxoSet {
             born: self.born.clone(),
             swift: self.swift,
             swift_hold: self.swift_hold,
+            flat: None,
         }
     }
 }
@@ -3053,5 +3160,100 @@ mod tests {
         set.flush_to_backend(&[], 1).unwrap();
         assert_eq!(set.swiftsync_agg().unwrap(), tag_sum(&set));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Flat-mirror lockstep: the same op stream (inserts, spends,
+    /// flushes) replayed through a backend-only set and a flat-enabled
+    /// set must produce identical `get`/`have`/`len`/`iter` after every
+    /// round — a divergence = a flat-consistency bug, the exact failure
+    /// class the mirror must never have.
+    #[test]
+    fn flat_mirror_lockstep() {
+        let dir_a = std::env::temp_dir().join(format!("avila-flat-a-{}", std::process::id()));
+        let dir_b = std::env::temp_dir().join(format!("avila-flat-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let mut plain = UtxoSet::new();
+        plain.attach_backend(crate::coinsdb::CoinsBackend::open(&dir_a).unwrap());
+        let mut flat = UtxoSet::new();
+        flat.attach_backend(crate::coinsdb::CoinsBackend::open(&dir_b).unwrap());
+        assert!(flat.enable_flat(0)); // empty committed set — cheap enable
+
+        let mut rng: u64 = 0xFEED_FACE_1234_5678;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mk_op = |s: u64| {
+            let mut t = [0u8; 32];
+            for (j, c) in t.chunks_mut(8).enumerate() {
+                c.copy_from_slice(&s.wrapping_add(j as u64).to_be_bytes());
+            }
+            OutPoint {
+                txid: Txid::from_bytes(t),
+                vout: (s % 5) as u32,
+            }
+        };
+        let mk_coin = |s: u64| Coin {
+            out: txout(
+                (s % 21_000_000) as i64 * 1000,
+                vec![0x76; (20 + (s % 40)) as usize], // mix inline + spill sizes
+            ),
+            height: (s % 800_000) as u32,
+            coinbase: s.is_multiple_of(97),
+        };
+
+        // Track live ops for spendable queries.
+        let mut live: Vec<OutPoint> = Vec::new();
+        let mut tip = 0u32;
+        for round in 0..60 {
+            for _ in 0..(next() % 200 + 1) {
+                let op = mk_op(next() % 0xF_FFFF);
+                match next() % 3 {
+                    0 | 1 => {
+                        let c = mk_coin(next());
+                        plain.insert_synthetic(op, c.clone());
+                        flat.insert_synthetic(op, c);
+                        live.push(op);
+                    }
+                    _ => {
+                        // spend a live or arbitrary op — tombstone path
+                        let victim = if !live.is_empty() && next() % 4 != 0 {
+                            live[(next() as usize) % live.len()]
+                        } else {
+                            op
+                        };
+                        let a = plain.spend_coin(&victim);
+                        let b = flat.spend_coin(&victim);
+                        assert_eq!(a, b, "spend diverged round {round}");
+                    }
+                }
+            }
+            if round % 4 == 3 {
+                tip += 1;
+                plain.flush_to_backend(&[], tip).unwrap();
+                flat.flush_to_backend(&[], tip).unwrap();
+            }
+            // post-round consistency: probe a sample incl. spends and misses
+            for _ in 0..256 {
+                let op = mk_op(next() % 0xF_FFFF);
+                let (a, b) = (plain.get(&op), flat.get(&op));
+                assert_eq!(a, b, "get diverged round {round}");
+                assert_eq!(plain.have(&op), flat.have(&op));
+            }
+            for op in live.iter().step_by(7).take(64) {
+                let (a, b) = (plain.get(op), flat.get(op));
+                assert_eq!(a, b, "live probe diverged round {round}");
+            }
+            assert_eq!(plain.len(), flat.len(), "len diverged round {round}");
+        }
+        // Full-set equality — iter must agree too.
+        let a: HashMap<OutPoint, Coin> = plain.iter().into_iter().collect();
+        let b: HashMap<OutPoint, Coin> = flat.iter().into_iter().collect();
+        assert_eq!(a, b, "iter diverged");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 }

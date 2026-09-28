@@ -7,8 +7,8 @@ use crate::pages::Scene;
 use crate::theme::{self, MONO_MEDIUM, Palette, font, mono};
 use crate::widgets::{self, Kind as Button};
 use eframe::egui::{
-    Align, Align2, CursorIcon, Key, Layout, Modifiers, Painter, Pos2, Rect, RichText, Sense,
-    Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2,
+    Align, Align2, CursorIcon, Key, Layout, Modifiers, Painter, Rect, RichText, Sense, Stroke,
+    StrokeKind, Ui, UiBuilder, pos2, vec2,
 };
 use std::time::Instant;
 
@@ -160,27 +160,58 @@ pub fn show(ui: &mut Ui, s: &Scene, oracle: &mut Oracle) {
         return;
     };
 
-    // The current tip, mono'd, its tail digit glowing — that's the digit
-    // the oracle reads.
+    // The bet is on the NEXT block — the chip is a question mark, not
+    // a digit; there's nothing to reveal yet.
     p.text(
         card.center_top() + vec2(0.0, 28.0),
         Align2::CENTER_CENTER,
-        format!("tip {} ends in", thousands(u64::from(tip_height))),
+        format!(
+            "block {} hasn't been mined. Its hash ends in",
+            thousands(u64::from(tip_height + 1))
+        ),
         theme::body(13.0),
         pal.muted,
     );
-    let tail_digit = tip_hash
-        .as_bytes()
-        .last()
-        .and_then(|&c| (c as char).to_digit(16))
-        .unwrap_or(0) as usize;
-    draw_tip_tail(&p, card.center_top() + vec2(0.0, 70.0), &pal, tail_digit);
+    let r = Rect::from_center_size(card.center_top() + vec2(0.0, 70.0), vec2(44.0, 44.0));
+    p.rect_filled(r, 9, pal.signal.gamma_multiply(0.45));
+    p.text(
+        r.center(),
+        Align2::CENTER_CENTER,
+        "?",
+        font(MONO_MEDIUM, 22.0),
+        pal.on_signal(),
+    );
+    // How it works, in one line under the chip.
+    p.text(
+        card.center_top() + vec2(0.0, 102.0),
+        Align2::CENTER_CENTER,
+        "Call its last hex digit — 0 through f. When your node connects the block, it settles the bet.",
+        theme::body(12.0),
+        pal.muted,
+    );
 
     // The caller's row: sixteen picks, or the verdict if one's pending.
     match &oracle.pending {
         Some(call) => verdict(&p, card, &pal, call),
         None => picks(ui, card, &pal, oracle, tip_height),
     }
+    // The settled tip, small — history, not the question.
+    let tail_digit = tip_hash
+        .as_bytes()
+        .last()
+        .and_then(|&c| (c as char).to_digit(16))
+        .unwrap_or(0) as usize;
+    p.text(
+        card.center_bottom() - vec2(0.0, 22.0),
+        Align2::CENTER_CENTER,
+        format!(
+            "block {} ended in {}",
+            thousands(u64::from(tip_height)),
+            HEX[tail_digit]
+        ),
+        theme::body(11.0),
+        pal.faint,
+    );
     // History, dots lit green or dimmed red, latest on the left.
     let dots = card.center_bottom() - vec2(oracle.history.len() as f32 * 11.0 - 5.0, 34.0);
     for (i, hit) in oracle.history.iter().enumerate() {
@@ -197,19 +228,6 @@ pub fn show(ui: &mut Ui, s: &Scene, oracle: &mut Oracle) {
     if leave {
         oracle.shelve();
     }
-}
-
-/// The tip's own tail digit in a chip — what the oracle just read.
-fn draw_tip_tail(p: &Painter, at: Pos2, pal: &Palette, lit: usize) {
-    let r = Rect::from_center_size(at, vec2(44.0, 44.0));
-    p.rect_filled(r, 9, pal.signal);
-    p.text(
-        r.center(),
-        Align2::CENTER_CENTER,
-        HEX[lit].to_string(),
-        font(MONO_MEDIUM, 22.0),
-        pal.on_signal(),
-    );
 }
 
 /// Sixteen cells to call — each a quiet clickable digit, nothing
@@ -262,14 +280,6 @@ fn picks(ui: &mut Ui, card: Rect, pal: &Palette, oracle: &mut Oracle, tip_height
                 resp.on_hover_cursor(CursorIcon::PointingHand);
             }
         },
-    );
-    let p = ui.painter_at(row);
-    p.text(
-        row.center_bottom() + vec2(0.0, 20.0),
-        Align2::CENTER_CENTER,
-        "call the next block's last hex digit — an honest one in sixteen",
-        theme::body(12.0),
-        pal.faint,
     );
 }
 

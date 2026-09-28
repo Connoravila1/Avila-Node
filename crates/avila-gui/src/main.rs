@@ -62,6 +62,7 @@ mod capture {
         pub toy: u8,
         pub desk: Desk,
         pub pointer: &'static [Step],
+        pub first: bool,
     }
     pub struct Capture;
     impl Capture {
@@ -71,6 +72,16 @@ mod capture {
         pub fn feed(&mut self, _raw: &mut RawInput) {}
         pub fn drive(&mut self, _ctx: &Context) -> Option<Pose> {
             None
+        }
+        pub fn observe(
+            &mut self,
+            _ctx: &Context,
+            _page: Page,
+            _skin: Skin,
+            _phase: &str,
+            _running: bool,
+            _tip: Option<&str>,
+        ) {
         }
     }
 }

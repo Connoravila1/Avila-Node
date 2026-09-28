@@ -301,6 +301,7 @@ fn presets_menu(ui: &mut Ui, state: &mut ConfigPage, prefs: &mut crate::prefs::P
 
 /// The save-as-preset card — a name, a count of what it captures, and
 /// the save/cancel pair.
+#[allow(clippy::too_many_arguments)]
 fn save_card(
     ui: &mut Ui,
     pal: crate::theme::Palette,
@@ -394,6 +395,7 @@ enum PresetSel {
 /// after, what applies live and what stages for restart — then an
 /// explicit apply, plus a remove that hides a built-in or deletes a
 /// saved one.
+#[allow(clippy::too_many_arguments)]
 fn preset_card(
     ui: &mut Ui,
     pal: crate::theme::Palette,
@@ -490,14 +492,13 @@ fn preset_card(
                     let mut staged_n = 0;
                     for (path, raw) in &live {
                         let value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
-                        if let Some(file) = config_file {
-                            if let Err(e) =
+                        if let Some(file) = config_file
+                            && let Err(e) =
                                 avila_node::config::write_overlay_knob(file, path, toml_of(&value))
-                            {
-                                state
-                                    .rejected
-                                    .insert(path.clone(), format!("not persisted: {e}"));
-                            }
+                        {
+                            state
+                                .rejected
+                                .insert(path.clone(), format!("not persisted: {e}"));
                         }
                         if let Some(tx) = control {
                             let _ = tx.send(ControlMsg::Set {
@@ -593,6 +594,7 @@ fn draft_value(path: &str, draft: &str, was: &serde_json::Value) -> Option<serde
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
     s: &Scene,
@@ -609,10 +611,10 @@ pub fn show(
     let knobs = describe_config(node.config().get());
     // `AVILA_PRESET_PREVIEW=<i>` opens a preset card — the capture
     // harness's way into the preview.
-    if let Ok(i) = std::env::var("AVILA_PRESET_PREVIEW") {
-        if state.preset_open.is_none() {
-            state.preset_open = Some(PresetSel::BuiltIn(i.parse().unwrap_or(0)));
-        }
+    if let Ok(i) = std::env::var("AVILA_PRESET_PREVIEW")
+        && state.preset_open.is_none()
+    {
+        state.preset_open = Some(PresetSel::BuiltIn(i.parse().unwrap_or(0)));
     }
     widgets::section(
         ui,
@@ -800,23 +802,21 @@ pub fn show(
                 let restart_diffs = diffs.len() - live_diffs.len();
                 if !live_diffs.is_empty()
                     && control.is_some()
+                    && let (Some(tx), Some(file)) = (control.as_ref(), config_file)
+                    && let Ok(v) = avila_node::config::load_config(Some(file))
                     && widgets::button(ui, "apply live now", Kind::Quiet)
                         .on_hover_text(
                             "The changed live knobs send to the running node — no restart.",
                         )
                         .clicked()
                 {
-                    if let (Some(tx), Some(file)) = (control.as_ref(), config_file) {
-                        if let Ok(v) = avila_node::config::load_config(Some(file)) {
-                            for k in avila_node::config::describe_config(v.get()) {
-                                if live_diffs.contains(&k.path) {
-                                    let _ = tx.send(ControlMsg::Set {
-                                        path: k.path.to_string(),
-                                        value: k.value.clone(),
-                                    });
-                                    state.pending.insert(k.path.to_string(), k.value.clone());
-                                }
-                            }
+                    for k in avila_node::config::describe_config(v.get()) {
+                        if live_diffs.contains(&k.path) {
+                            let _ = tx.send(ControlMsg::Set {
+                                path: k.path.to_string(),
+                                value: k.value.clone(),
+                            });
+                            state.pending.insert(k.path.to_string(), k.value.clone());
                         }
                     }
                 }
@@ -925,16 +925,16 @@ fn row(
                     match (k.edit, control.is_some()) {
                         // Live + running: persist and apply now.
                         (EditKind::Live, true) => {
-                            if let Some(file) = config_file {
-                                if let Err(e) = avila_node::config::write_overlay_knob(
+                            if let Some(file) = config_file
+                                && let Err(e) = avila_node::config::write_overlay_knob(
                                     file,
                                     k.path,
                                     toml_of(&v),
-                                ) {
-                                    state
-                                        .rejected
-                                        .insert(k.path.to_string(), format!("not persisted: {e}"));
-                                }
+                                )
+                            {
+                                state
+                                    .rejected
+                                    .insert(k.path.to_string(), format!("not persisted: {e}"));
                             }
                             let _ = control.as_ref().map(|tx| {
                                 tx.send(ControlMsg::Set {

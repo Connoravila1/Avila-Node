@@ -8,7 +8,7 @@ data_dir = "/tmp/avila-live-a"           # relative to this file
 [net]
 connect = ["127.0.0.1:18444", "127.0.0.1:18448"]    # the bitcoind p2p port
 # B listens instead — this node dials it
-dns_seeds = false
+dns_seeds = true
 v2transport = false              # cleartext — protocol debuggable
 
 [services.rpc]

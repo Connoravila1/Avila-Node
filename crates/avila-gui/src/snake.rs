@@ -384,11 +384,11 @@ pub fn show(ui: &mut Ui, pal: &Palette, game: &mut Snake, prefs: &mut Prefs) {
         };
     }
     let p = ui.painter_at(board);
-    if let Some(score) = game.step(dt.min(0.1), origin) {
-        if score > prefs.snake_best {
-            prefs.snake_best = score;
-            game.new_best = true;
-        }
+    if let Some(score) = game.step(dt.min(0.1), origin)
+        && score > prefs.snake_best
+    {
+        prefs.snake_best = score;
+        game.new_best = true;
     }
 
     draw(&p, board, pal, game, prefs.snake_best);

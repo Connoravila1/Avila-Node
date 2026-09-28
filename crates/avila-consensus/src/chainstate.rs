@@ -2579,6 +2579,18 @@ impl Chainstate {
         Ok(())
     }
 
+    /// Turns on the RAM-resident flat mirror of the committed coins —
+    /// the measured ~0.34 µs/input lookup path (~8× the disk cascade).
+    /// `byte_cap` bounds resident bytes; a cap refusal leaves the
+    /// ordinary backend path in place (returns `false`).
+    ///
+    /// On a freshly-opened chainstate the mirror streams the committed
+    /// set once (~1.6 s / 3M coins measured) — the restart tax; at
+    /// genesis it costs nothing and grows through normal commits.
+    pub fn enable_flat_utxo(&mut self, byte_cap: usize) -> bool {
+        self.utxo.enable_flat(byte_cap)
+    }
+
     /// Turns on SwiftSync tracking on the coins view — see
     /// [`UtxoSet::enable_swiftsync`].
     pub fn enable_swiftsync(&mut self) {

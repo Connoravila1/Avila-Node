@@ -593,6 +593,8 @@ pub struct Toys {
     pub avalanche: avalanche::Avalanche,
     /// The tip a running Blocksweeper last took its hint from.
     gifted_tip: Option<f64>,
+    /// The shelf calendar opened into its year view.
+    pub calendar_open: bool,
 }
 
 impl Toys {
@@ -615,6 +617,7 @@ impl Toys {
         self.gallery.open = false;
         self.oracle.open = false;
         self.avalanche.open = false;
+        self.calendar_open = false;
         match toy {
             1 => self.sweep.demo(),
             2 => self.snake.demo(),
@@ -622,6 +625,7 @@ impl Toys {
             4 => self.gallery.open = true,
             5 => self.oracle.demo(),
             6 => self.avalanche.open = true,
+            7 => self.calendar_open = true,
             _ => {}
         }
     }
@@ -659,8 +663,8 @@ const SKINS: [(Skin, &str, &str); 6] = [
     ),
     (
         Skin::Classic,
-        "Bitcoin '11",
-        "The first wallet's beige chrome",
+        "OG Bitcoin",
+        "The original client, January 2009",
     ),
 ];
 
@@ -679,6 +683,8 @@ pub fn show(ui: &mut Ui, s: &Scene, toys: &mut Toys, prefs: &mut Prefs) {
         oracle::show(ui, s, &mut toys.oracle);
     } else if toys.avalanche.open {
         avalanche::show(ui, &s.pal, &mut toys.avalanche);
+    } else if toys.calendar_open {
+        calendar_view(ui, s, toys);
     } else {
         shelf(ui, s, toys, prefs);
     }
@@ -739,19 +745,20 @@ fn card(p: &Painter, rect: Rect, pal: &Palette, lit: bool) {
 
 /// One shelf card: poster art on the left, words and a button on the
 /// right. Returns which button fired, if any did.
+#[allow(clippy::too_many_arguments)]
 fn shelf_card(
     ui: &mut Ui,
     pal: &Palette,
+    w: f32,
     title: &str,
     blurb: &str,
     meta: &str,
     poster: impl FnOnce(&Painter, Rect),
     buttons: &[(&str, Button)],
 ) -> Option<usize> {
-    let w = (ui.available_width() - 14.0) / 2.0;
-    let (rect, _) = ui.allocate_exact_size(vec2(w.max(280.0), 148.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(vec2(w.max(280.0), 172.0), Sense::hover());
     card(ui.painter(), rect, pal, false);
-    let art = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(108.0, 128.0));
+    let art = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(100.0, 152.0));
     poster(ui.painter(), art);
     let text = Rect::from_min_max(
         pos2(art.right() + 16.0, rect.top() + 14.0),
@@ -773,16 +780,24 @@ fn shelf_card(
         col.add_space(4.0);
         col.label(RichText::new(meta).font(mono(11.5)).color(pal.text));
     }
-    col.add_space(7.0);
+    // Buttons sit on the card's bottom edge — every card's row lands
+    // on the same line.
+    let row = Rect::from_min_max(
+        pos2(text.left(), rect.bottom() - 44.0),
+        pos2(text.right(), rect.bottom() - 12.0),
+    );
+    let mut row_ui = ui.new_child(
+        UiBuilder::new()
+            .max_rect(row)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
     let mut fired = None;
-    col.horizontal(|ui| {
-        for (i, (label, kind)) in buttons.iter().enumerate() {
-            if widgets::button(ui, label, *kind).clicked() {
-                fired = Some(i);
-            }
-            ui.add_space(4.0);
+    for (i, (label, kind)) in buttons.iter().enumerate() {
+        if widgets::button(&mut row_ui, label, *kind).clicked() {
+            fired = Some(i);
         }
-    });
+        row_ui.add_space(4.0);
+    }
     fired
 }
 
@@ -807,6 +822,7 @@ fn game_cards(ui: &mut Ui, s: &Scene, toys: &mut Toys, prefs: &mut Prefs) {
         if shelf_card(
             ui,
             &pal,
+            w,
             "Blocksweeper",
             "Bad transactions hid in your block template. Flag each one; trip one and the network rejects the block.",
             &meta,
@@ -820,14 +836,16 @@ fn game_cards(ui: &mut Ui, s: &Scene, toys: &mut Toys, prefs: &mut Prefs) {
     });
     ui.add_space(14.0);
     ui.horizontal(|ui| {
+        let w = (ui.available_width() - 14.0) / 2.0;
         let meta = if prefs.snake_best > 0 {
-            format!("Best {}", thousands(prefs.snake_best.into()))
+            format!("Best {}", thousands(prefs.snake_best))
         } else {
             String::new()
         };
         if shelf_card(
             ui,
             &pal,
+            w,
             "Chain Snake",
             "Every sat mines a block onto your chain, and the subsidy halves as you go. Watch for reorgs.",
             &meta,
@@ -840,13 +858,14 @@ fn game_cards(ui: &mut Ui, s: &Scene, toys: &mut Toys, prefs: &mut Prefs) {
         }
         ui.add_space(14.0);
         let meta = if prefs.builder_best > 0 {
-            format!("Best {} sats", thousands(prefs.builder_best.into()))
+            format!("Best {} sats", thousands(prefs.builder_best))
         } else {
             String::new()
         };
         if shelf_card(
             ui,
             &pal,
+            w,
             "Block Builder",
             "Pack the mempool. Transactions fall with their feerates on; a full row seals the block and pays the fees.",
             &meta,
@@ -862,9 +881,9 @@ fn game_cards(ui: &mut Ui, s: &Scene, toys: &mut Toys, prefs: &mut Prefs) {
 
 /// Shitcoin Defense's card, at half width like the rest.
 fn defense_card(ui: &mut Ui, pal: &Palette, game: &mut Game, prefs: &Prefs, w: f32) {
-    let (rect, _) = ui.allocate_exact_size(vec2(w, 148.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(vec2(w, 172.0), Sense::hover());
     card(ui.painter(), rect, pal, false);
-    let art = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(108.0, 128.0));
+    let art = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(100.0, 152.0));
     poster(ui.painter(), art, pal);
     let text = Rect::from_min_max(
         pos2(art.right() + 16.0, rect.top() + 14.0),
@@ -892,28 +911,37 @@ fn defense_card(ui: &mut Ui, pal: &Palette, game: &mut Game, prefs: &Prefs, w: f
             .font(mono(11.5))
             .color(pal.text),
     );
-    col.add_space(7.0);
-    col.horizontal(|ui| {
-        if game.state == State::Paused {
-            if widgets::button(ui, "Resume", Button::Primary).clicked() {
-                game.open = true;
-            }
-            if widgets::button(ui, "New game", Button::Quiet).clicked() {
-                game.play();
-            }
-        } else if widgets::button(ui, "Play", Button::Primary).clicked() {
+    let row = Rect::from_min_max(
+        pos2(text.left(), rect.bottom() - 44.0),
+        pos2(text.right(), rect.bottom() - 12.0),
+    );
+    let mut row_ui = ui.new_child(
+        UiBuilder::new()
+            .max_rect(row)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    if game.state == State::Paused {
+        if widgets::button(&mut row_ui, "Resume", Button::Primary).clicked() {
+            game.open = true;
+        }
+        row_ui.add_space(4.0);
+        if widgets::button(&mut row_ui, "New game", Button::Quiet).clicked() {
             game.play();
         }
-    });
+    } else if widgets::button(&mut row_ui, "Play", Button::Primary).clicked() {
+        game.play();
+    }
 }
 
 /// The toys fed by live blocks.
 fn chain_cards(ui: &mut Ui, s: &Scene, toys: &mut Toys) {
     let pal = s.pal;
     ui.horizontal(|ui| {
+        let w = (ui.available_width() - 14.0) / 2.0;
         if shelf_card(
             ui,
             &pal,
+            w,
             "Block gallery",
             "Every block your node connects hangs on the wall, painted from its own hash.",
             "",
@@ -933,6 +961,7 @@ fn chain_cards(ui: &mut Ui, s: &Scene, toys: &mut Toys) {
         if shelf_card(
             ui,
             &pal,
+            w,
             "Hash oracle",
             "Call the next block's last hex digit and build a streak.",
             waiting,
@@ -949,13 +978,15 @@ fn chain_cards(ui: &mut Ui, s: &Scene, toys: &mut Toys) {
 /// The small things: the avalanche toy, and the calendar.
 fn misc_cards(ui: &mut Ui, pal: &Palette, toys: &mut Toys) {
     ui.horizontal(|ui| {
+        let w = (ui.available_width() - 14.0) / 2.0;
         if shelf_card(
             ui,
-            &pal,
-            "Avalanche",
+            pal,
+            w,
+            "See hashing work",
             "Two inputs, two SHA-256 grids. Flip one bit and watch half the hash change.",
             "",
-            |p, r| avalanche_poster(p, r, &pal),
+            |p, r| avalanche_poster(p, r, pal),
             &[("Open", Button::Quiet)],
         )
         .is_some()
@@ -963,7 +994,9 @@ fn misc_cards(ui: &mut Ui, pal: &Palette, toys: &mut Toys) {
             toys.avalanche.open = true;
         }
         ui.add_space(14.0);
-        on_this_day(ui, &pal);
+        if on_this_day(ui, pal, w) {
+            toys.calendar_open = true;
+        }
     });
 }
 
@@ -1225,12 +1258,11 @@ fn month_day(unix: u64) -> (u8, u8) {
 }
 
 /// The shelf's calendar card: today's milestones, or the next one's
-/// countdown.
-fn on_this_day(ui: &mut Ui, pal: &Palette) {
-    let w = (ui.available_width() - 14.0).max(280.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(w, 148.0), Sense::hover());
+/// countdown. Clicking opens the year view. Returns whether it was.
+fn on_this_day(ui: &mut Ui, pal: &Palette, w: f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(w.max(280.0), 172.0), Sense::click());
     card(ui.painter(), rect, pal, false);
-    let art = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(108.0, 128.0));
+    let art = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(100.0, 152.0));
     let p = ui.painter();
     p.rect_filled(art, 8, pal.well);
     let (m, d) = month_day(
@@ -1297,9 +1329,9 @@ fn on_this_day(ui: &mut Ui, pal: &Palette) {
             .map(|(m2, d2, t, w)| (m2, d2, t, if w == 0 { 365 } else { w }))
             .unwrap_or((1, 3, "the Genesis block is mined", 0));
         (
-            "Next up",
+            "On this day",
             format!(
-                "{MONTH} {d2} — {t} · {wait} days to go",
+                "nothing marked today — in {wait} days: {MONTH} {d2}, {t}",
                 MONTH = MONTHS[(m2 as usize - 1) % 12]
             ),
         )
@@ -1318,12 +1350,237 @@ fn on_this_day(ui: &mut Ui, pal: &Palette) {
     );
     col.add_space(4.0);
     col.label(RichText::new(body).size(12.0).color(pal.muted));
-    col.add_space(4.0);
-    col.label(
-        RichText::new("the calendar the chain keeps")
+    // Bottom-right: the way in — it reads as affordance, not noise.
+    col.with_layout(Layout::bottom_up(Align::Max), |ui| {
+        ui.label(
+            RichText::new(if resp.hovered() {
+                "see the whole year →"
+            } else {
+                "dates the chain outgrew · see the year →"
+            })
             .font(mono(11.0))
+            .color(if resp.hovered() {
+                pal.signal_text
+            } else {
+                pal.faint
+            }),
+        );
+    });
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Open the year's milestones")
+        .clicked()
+}
+
+/// Days since the epoch for a civil date — Hinnant's inverse of
+/// [`month_day`], needed to know which weekday a month starts on.
+fn days_from_civil(y: i64, m: u8, d: u8) -> i64 {
+    let (m, d) = (i64::from(m), i64::from(d));
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The year's civil parts: (year, month, day, weekday) with Monday
+/// first — weekday 0 = Monday, matching the grid below.
+fn civil(unix: u64) -> (i64, u8, u8, u8) {
+    let (m, d) = month_day(unix);
+    let days = (unix / 86_400) as i64;
+    // The same Hinnant pass again, keeping the year's era.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    // Epoch was a Thursday; shift so Monday is column zero.
+    let weekday = ((days + 3).rem_euclid(7)) as u8;
+    (y, m, d, weekday)
+}
+
+/// The calendar card opened: the whole year on one wall, every day the
+/// chain outgrew marked and hoverable. Esc or ← goes back to the shelf.
+fn calendar_view(ui: &mut Ui, s: &Scene, toys: &mut Toys) {
+    let pal = s.pal;
+    let mut leave = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+    ui.horizontal(|ui| {
+        leave |= widgets::button(ui, "← Toybox", Button::Quiet).clicked();
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("On this day")
+                .font(font(theme::TITLE, 21.0))
+                .color(pal.text),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("the dates the chain outgrew")
+                .font(theme::body(12.5))
+                .color(pal.muted),
+        );
+    });
+    if leave {
+        toys.calendar_open = false;
+        return;
+    }
+    ui.add_space(14.0);
+
+    let (year, today_m, today_d, _) = civil(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    );
+    // Days the year keeps. A mark, in the palette's signal color.
+    let marked = |m: u8, d: u8| DAYS.iter().find(|&&(em, ed, _)| em == m && ed == d);
+    let dim_of = |m: u8| {
+        if m == 2 {
+            28 + u8::from(year % 4 == 0 && (year % 100 != 0 || year % 400 == 0))
+        } else if matches!(m, 4 | 6 | 9 | 11) {
+            30
+        } else {
+            31
+        }
+    };
+
+    // Four columns of months; each month a Monday-first mini grid.
+    let gap = 10.0;
+    let cols = 4.0;
+    let mw = (ui.available_width() - gap * (cols - 1.0)) / cols;
+    const MONTH_NAMES: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut hovered_event: Option<&'static str> = None;
+    for row in 0..3 {
+        ui.horizontal(|ui| {
+            for col in 0..4 {
+                let m = (row * 4 + col + 1) as u8;
+                let (cell, _) = ui.allocate_exact_size(vec2(mw, 118.0), Sense::hover());
+                let p = ui.painter_at(cell);
+                card(&p, cell, &pal, false);
+                p.text(
+                    cell.left_top() + vec2(9.0, 6.0),
+                    Align2::LEFT_TOP,
+                    MONTH_NAMES[m as usize - 1],
+                    font(theme::STRONG, 12.5),
+                    pal.text,
+                );
+                // The month's grid: seven columns, up to six rows.
+                let grid = Rect::from_min_max(
+                    cell.left_top() + vec2(9.0, 26.0),
+                    cell.right_bottom() - vec2(9.0, 9.0),
+                );
+                let cw = (grid.width() / 7.0).min(16.0);
+                let ch = (grid.height() / 6.0).min(15.0);
+                let first = (days_from_civil(year, m, 1) + 3).rem_euclid(7) as u8;
+                for day in 1..=dim_of(m) {
+                    let slot = u32::from(first) + u32::from(day) - 1;
+                    let gx = slot % 7;
+                    let gy = slot / 7;
+                    let r = Rect::from_center_size(
+                        grid.left_top()
+                            + vec2(gx as f32 * cw + cw / 2.0, gy as f32 * ch + ch / 2.0),
+                        vec2(cw - 2.0, ch - 2.0),
+                    );
+                    let event = marked(m, day);
+                    let is_today = m == today_m && day == today_d;
+                    if event.is_some() {
+                        p.rect_filled(r, 3, pal.signal);
+                    }
+                    if is_today {
+                        p.rect_stroke(r, 3, Stroke::new(1.2, pal.text), StrokeKind::Inside);
+                    }
+                    let ink = if event.is_some() {
+                        pal.on_signal()
+                    } else {
+                        pal.faint
+                    };
+                    p.text(
+                        r.center(),
+                        Align2::CENTER_CENTER,
+                        format!("{day}"),
+                        mono(9.0),
+                        ink,
+                    );
+                    // A marked day under the pointer names itself on
+                    // the line under the year's grid.
+                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos())
+                        && r.contains(pos)
+                        && let Some((_, _, text)) = event
+                    {
+                        hovered_event = Some(text);
+                    }
+                }
+            }
+            ui.add_space(0.0);
+        });
+        ui.add_space(gap);
+    }
+    ui.label(
+        RichText::new(hovered_event.unwrap_or("marked days are milestones — hover one"))
+            .font(theme::body(12.0))
+            .color(if hovered_event.is_some() {
+                pal.signal_text
+            } else {
+                pal.faint
+            }),
+    );
+    ui.add_space(4.0);
+    let day_num = |m: u8, d: u8| {
+        const CUM: [u64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+        CUM[(m as usize - 1) % 12] + u64::from(d)
+    };
+    let now = day_num(today_m, today_d);
+    let mut rows: Vec<(u8, u8, &str, u64)> = DAYS
+        .iter()
+        .map(|&(m, d, t)| (m, d, t, (day_num(m, d) + 365 - now) % 365))
+        .collect();
+    rows.sort_by_key(|&(.., wait)| wait.max(1));
+    ui.label(
+        RichText::new("the year in order")
+            .font(theme::body(12.0))
             .color(pal.faint),
     );
+    ui.add_space(6.0);
+    for (m, d, text, wait) in rows {
+        let past_today = m == today_m && d == today_d;
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "{MONTH_NAME:>4} {d:>2}",
+                    MONTH_NAME = MONTH_NAMES[m as usize - 1]
+                ))
+                .font(mono(12.0))
+                .color(if past_today {
+                    pal.signal_text
+                } else {
+                    pal.text
+                }),
+            );
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(text)
+                    .font(theme::body(12.5))
+                    .color(if past_today {
+                        pal.signal_text
+                    } else {
+                        pal.muted
+                    }),
+            );
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(if past_today {
+                    "today".to_string()
+                } else if wait == 0 {
+                    "yesterday".to_string()
+                } else {
+                    format!("in {wait} days")
+                })
+                .font(theme::body(11.5))
+                .color(pal.faint),
+            );
+        });
+    }
 }
 
 /// The game's box art: the bitcoin, the shield, and what's coming.
@@ -1648,59 +1905,7 @@ fn preview(p: &Painter, r: Rect, skin: Skin) {
                 y += 4.0;
             }
         }
-        Skin::Classic => {
-            let pal = Palette::CLASSIC;
-            clip.rect_filled(r, 8, pal.canvas);
-            // The menu bar, the way 2011 had it.
-            clip.rect_filled(
-                Rect::from_min_size(r.min, vec2(r.width(), r.height() * 0.09)),
-                CornerRadius {
-                    nw: 8,
-                    ne: 8,
-                    sw: 0,
-                    se: 0,
-                },
-                pal.raised,
-            );
-            clip.hline(
-                r.left() + 4.0..=r.right() - 4.0,
-                r.top() + r.height() * 0.09,
-                Stroke::new(1.0, pal.hairline),
-            );
-            clip.text(
-                r.min + vec2(8.0, r.height() * 0.045),
-                Align2::LEFT_CENTER,
-                "File   Settings   Help",
-                theme::body(9.5),
-                pal.muted,
-            );
-            clip.rect_filled(
-                Rect::from_min_size(
-                    r.min + vec2(0.0, r.height() * 0.09),
-                    vec2(r.width() * 0.12, r.height()),
-                ),
-                CornerRadius {
-                    nw: 0,
-                    sw: 8,
-                    ne: 0,
-                    se: 0,
-                },
-                pal.rail,
-            );
-            // The gold coin it shipped with.
-            clip.circle_filled(
-                r.min + vec2(r.width() * 0.06, r.height() * 0.09 + 12.0),
-                5.0,
-                pal.signal,
-            );
-            bar(18.0, 14.0, 30.0, 4.0, pal.text);
-            bar(18.0, 23.0, 44.0, 7.0, pal.text);
-            bar(18.0, 36.0, 74.0, 7.0, pal.well);
-            bar(18.0, 36.0, 50.0, 7.0, pal.signal);
-            bar(18.0, 48.0, 22.0, 3.0, pal.faint);
-            bar(46.0, 48.0, 22.0, 3.0, pal.faint);
-            bar(74.0, 48.0, 18.0, 3.0, pal.faint);
-        }
+        Skin::Classic => crate::classic::preview(&clip, r),
     }
     clip.rect_stroke(
         r,

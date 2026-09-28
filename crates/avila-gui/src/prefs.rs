@@ -205,6 +205,8 @@ mod tests {
             builder_best: 7,
             proxy: "127.0.0.1:9050".into(),
             welcomed: true,
+            custom_presets: Vec::new(),
+            hidden_presets: Vec::new(),
         };
         prefs.save(&mut storage);
         assert_eq!(
@@ -223,6 +225,8 @@ mod tests {
                 builder_best: 7,
                 proxy: "127.0.0.1:9050".into(),
                 welcomed: true,
+                custom_presets: Vec::new(),
+                hidden_presets: Vec::new(),
             }
         );
         assert_eq!(storage.0.len(), 1);

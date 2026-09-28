@@ -1,0 +1,734 @@
+{
+  "review": "Capacity forecast at 3198d50",
+  "recorded_utc": "2026-09-27T20:55:06.386597+00:00",
+  "head": "3198d50d59bde33881f435c3bc2bf5dc13817435",
+  "method": "Read-only local source, small JSON/log/manifest artifacts, bounded top-level /tmp filename search, saved-artifact arithmetic, primary documentation and CI queries. No benchmarks, tests, builds, examples, live RPC/node/service operations or large corpus/snapshot/header-index/export reads/hashes/comparisons.",
+  "ci": {
+    "run_id": 36348331368,
+    "head_sha": "3198d50d59bde33881f435c3bc2bf5dc13817435",
+    "url": "https://github.com/Connoravila1/Avila-Node/actions/runs/36348331368",
+    "conclusion": "success",
+    "executable_job": 108701949207,
+    "pass_lines": 115,
+    "fail_lines": 0,
+    "binary_sha256": "7a029554f7843ef38d971cb5df39f574e0a2873e2fd406ea1e2cdaf548db15c8",
+    "manifest_build_rev": "3198d50d59bde33881f435c3bc2bf5dc13817435",
+    "verified": "Read-only run/job metadata and executable-step log."
+  },
+  "files": {
+    "docs/IBD_CAPACITY_MEASUREMENTS_2026-09-27.md": {
+      "bytes": 4081,
+      "sha256": "f65b271d85132b9bc66fbf2eb4770d8f2b3531fde33e55a70405f86739422dd5"
+    },
+    "docs/IBD_PRODUCT_OBJECTIVE.md": {
+      "bytes": 4189,
+      "sha256": "10d1259106756da297f6d5a4a03f90f13f12f65c6f392e19d05e92ddf27a2617"
+    },
+    "tools/guard_run.sh": {
+      "bytes": 4324,
+      "sha256": "fa8050919af9b5513f27b1b28f4ac9cf6ea2543ceb399102d8089b100d43ae75"
+    },
+    "tools/ibd_workload.py": {
+      "bytes": 4240,
+      "sha256": "f117cea8d123c1091fd2f0da155f659e088606e05119049af6f7d0574a50b5dd"
+    },
+    "crates/avila-consensus/examples/window_join.rs": {
+      "bytes": 65278,
+      "sha256": "1f268e2dce4607f4760fa8a4c17df86cdd45e957c31e410283839156f413e88f"
+    },
+    "crates/avila-consensus/src/sigchecker.rs": {
+      "bytes": 35586,
+      "sha256": "c9950211ea89f1f8dacefe56e02f228ed549d36777a3567fccf95c5abcc5c346"
+    },
+    "experiments/2026-09-26-ibd-shrd-replacement.md": {
+      "bytes": 6252,
+      "sha256": "c33812f5dcd64a2cc5caeb6d7cc0f5bff807b7af5b4d4cf02641b572711cab60"
+    },
+    "experiments/results/census-2026-09-26/workload.json": {
+      "bytes": 33718,
+      "sha256": "707bef87d4ab0cadc109127f7e175e65b2450efff1d86c33cbee5129a24dc427"
+    },
+    "experiments/results/gate4/corpus-454k/run.stderr": {
+      "bytes": 2947,
+      "sha256": "de4baa86ad16c6d04a69232a4cc3abc6d2d7e09b3c4f76ef6bd30ed2e22789a1"
+    },
+    "experiments/results/gate4/corpus-454k/run-manifest.json": {
+      "bytes": 1335,
+      "sha256": "613073414f5a933e274a4ab707815c03bfdfef576d5512bedce8a594e3043f69"
+    },
+    "experiments/results/gate4/era/corpus-232/manifest.json": {
+      "bytes": 1741,
+      "sha256": "5f3699d5a27af04084aded1bd2df8d95933adc81c479173071d17ce5bdb4abdf"
+    },
+    "experiments/results/gate4/era/corpus-310/manifest.json": {
+      "bytes": 1352,
+      "sha256": "e7290ed3427978fb59b233dfe0ffaee9a1ba143a34a802f366dabf201bfa7f9d"
+    },
+    "experiments/results/gate4/era/corpus-345/manifest.json": {
+      "bytes": 1741,
+      "sha256": "79ce11665943fb720fdec19efd92e10b3d6f7ff76c1d6f60cc48d5f1a470f68a"
+    },
+    "experiments/results/gate4/era/corpus-380/manifest.json": {
+      "bytes": 1155,
+      "sha256": "07ca76aeb10ad2605c8dee7c2f0226a27a1698e23dfb03b2390b3fb56df592e4"
+    },
+    "experiments/results/gate4/era/corpus-421/manifest.json": {
+      "bytes": 1545,
+      "sha256": "b7713005364c3a724f930cb9d74583164d639e183b7717799af66685a835808e"
+    },
+    "experiments/results/gate4/era/corpus-956/manifest.json": {
+      "bytes": 2650,
+      "sha256": "c7440b5cdb82977ac05fae58ae3ab3a44a1dad5df53da5c8dfec1d0b0cde36f9"
+    }
+  },
+  "saved_complete_window": [
+    {
+      "type": "export",
+      "path": "experiments/results/gate4/corpus-454k/window-454k.canonical",
+      "bytes": 3594371786,
+      "sha256": "865d32cfaea57e15352ece551685dd71d9b96ea39f8118cc0ca0152b44cd3168",
+      "chainstate_complete": true,
+      "projection": "valid_prefix"
+    },
+    {
+      "type": "window_join",
+      "window": [
+        454001,
+        454301
+      ],
+      "corpus_bytes": 1276970754,
+      "blocks_present": 301,
+      "heights_span": 301,
+      "heights_missing": 0,
+      "duplicate_heights": 0,
+      "longest_contiguous_run": 301,
+      "header_hash_verified": 301,
+      "linkage_checked": 300,
+      "linkage_broken": 0,
+      "mtp_computable": 290,
+      "context_free_failed": 0,
+      "txs": 615804,
+      "inputs_noncb": 1303682,
+      "srcs_resolved": 1193423,
+      "srcs_unresolved": 110259,
+      "gap_height_sourced": 0,
+      "spend_records": 1303682,
+      "creation_records": 1438746,
+      "boundary_coins": 45616695,
+      "boundary_conflicts": 0,
+      "join_dup_creations": 0,
+      "join_dup_spends": 0,
+      "join_missing_spends": 0,
+      "fully_resolved_txs": 615503,
+      "excluded_txs": 0,
+      "resolved_spec_unjoined": 0,
+      "unresolved_spec_inputs": 0,
+      "blocks_fully_covered": 301,
+      "exec_inputs": 1303682,
+      "queued_tasks": 615503,
+      "completed_tasks": 615503,
+      "verified_inputs": 1303682,
+      "inputs_in_failed_txs": 0,
+      "script_failure_txs": 0,
+      "immature_violations": 0,
+      "value_violations": 0,
+      "nonfinal_violations": 0,
+      "time_locks_unevaluated": 0,
+      "sigop_violations": 0,
+      "bip68_evaluated": 615503,
+      "bip68_violations": 0,
+      "bip68_unevaluated": 0,
+      "cb_bound_checks": 301,
+      "cb_bound_violations": 0,
+      "headers_loaded": 968779,
+      "headers_inserted": 968778,
+      "headers_unknown_parent": 0,
+      "headers_failed": 0,
+      "window_headers_in_tree": 301,
+      "headers_height_mismatch": 0,
+      "headers_chain_mismatch": 0,
+      "headers_failed_selected": 0,
+      "headers_missing_selected": 0,
+      "headers_chain_missing": 0,
+      "ctx_block_evaluated": 301,
+      "ctx_block_failed": 0,
+      "ctx_block_unevaluated": 0,
+      "survivor_records": 45751759,
+      "applied_events": 2742428,
+      "first_bad_height": null,
+      "first_bad": null,
+      "known_invalid": false,
+      "resolved_inputs_complete": true,
+      "script_jobs_complete": true,
+      "starting_state_complete": true,
+      "boundary_loaded_coins": 45616695,
+      "boundary_base_height": 454000,
+      "boundary_base_hash": "0000000000000000024e8bd568de4d4624d340370e62223b04a11e460262817d",
+      "boundary_txoutset_hash": "00617975f4a08fd15201ca9417b0fc2b274a03298c8e2d3a79e47fdba51f581c",
+      "boundary_dup_outpoints": 0,
+      "first_missing_height": null,
+      "header_context_checked": true,
+      "header_context_full": true,
+      "contextual_blocks_complete": true,
+      "all_donor_pins": true,
+      "window_complete": true,
+      "context_free_checks_complete": true,
+      "coverage_endpoints": true,
+      "coverage_complete": true,
+      "chainstate_complete": true,
+      "exported": true,
+      "stages": {
+        "parse_s": 5.219,
+        "emit_s": 0.994,
+        "headers_s": 3.049,
+        "boundary_load_s": 10.297,
+        "join_s": 21.326,
+        "predicate_s": 0.813,
+        "script_s": 29.323,
+        "materialize_s": 3.928,
+        "export_s": 18.441
+      },
+      "wall_s": 83.142,
+      "rss_hwm_bytes": 7057682432,
+      "workers": 8
+    }
+  ],
+  "saved_complete_run_manifest": {
+    "type": "run_manifest",
+    "build_rev": "9986ea517634dcfe439dbf34f7e3d245f67775b9",
+    "checkout_rev": "9986ea517634dcfe439dbf34f7e3d245f67775b9",
+    "binary_sha256": "3a177854965cf27aded9a5d2524dbc1aab82c2d9848fa086a4848fb0cd3ae7d7",
+    "corpus_sha256": "55216ff423ae36af6bd826fde5da649b9c448816a0ed7ef7ba51cb3c3d8ac05d",
+    "boundary_sha256": "582aa9592e8784bc5f84214a2f1f07728fdc1a6ecd60a7c1c4e673ce6453f805",
+    "headers_sha256": "57c73d99a1f2e06df1e5aefa27271bbf8dafea69957e293c3bbae6c7ebdabafa",
+    "export_sha256": "865d32cfaea57e15352ece551685dd71d9b96ea39f8118cc0ca0152b44cd3168",
+    "argv": [
+      "experiments/results/gate4/corpus-454k/corpus.bin",
+      "--params",
+      "mainnet",
+      "--segment",
+      "454001:454301",
+      "--boundary",
+      "experiments/results/gate4/donor-454000.utxo",
+      "--boundary-base-height",
+      "454000",
+      "--boundary-base-hash",
+      "0000000000000000024e8bd568de4d4624d340370e62223b04a11e460262817d",
+      "--boundary-txoutset-hash",
+      "00617975f4a08fd15201ca9417b0fc2b274a03298c8e2d3a79e47fdba51f581c",
+      "--headers",
+      "experiments/results/gate4/headers-full.hchain",
+      "--workers",
+      "8",
+      "--manifest",
+      "experiments/results/gate4/corpus-454k/window-manifest.jsonl",
+      "--export",
+      "experiments/results/gate4/corpus-454k/window-454k.canonical",
+      "--run-manifest",
+      "experiments/results/gate4/corpus-454k/run-manifest.json",
+      "--require-complete"
+    ],
+    "exit_code": 0,
+    "known_invalid": false,
+    "exported": true,
+    "wall_s_total": 96.874
+  },
+  "saved_guard_receipt": "guard_run: exit=0 cap=10240MiB peak=10239MiB wall_s=98 cpu_s=n/a mhz=799737/2918465/3475873(min/mean/max) load=1.98 1.40 1.68\u21924.07 2.40 2.01 memavail=20502\u219220497MiB unit=run-p1844161-i1851492.scope",
+  "era_execution_claims_and_builder_artifacts": [
+    {
+      "tag": "232",
+      "builder_manifest": {
+        "span_files": [
+          {
+            "file": "data/mainnet/blk00519.dat",
+            "sha256": "c730a1ca77afef4003b59cda8cda3dc85a6db702ca10cac6f78b1a4c65754a10",
+            "records": 833
+          },
+          {
+            "file": "data/mainnet/blk00520.dat",
+            "sha256": "1ca53c82148f4c225455e7b18624237d15120048a2ef209458d8cb5cf45c1b13",
+            "records": 873
+          },
+          {
+            "file": "data/mainnet/blk00521.dat",
+            "sha256": "c1db7e534118183ce7d7e30714ab067c1656d94eeb8be9cb21f3d5d993b02d28",
+            "records": 756
+          },
+          {
+            "file": "data/mainnet/blk00522.dat",
+            "sha256": "572fe9461c98927946ffeb9901f91f0ef779b11fecddbbfbdc028d22825c701b",
+            "records": 809
+          },
+          {
+            "file": "data/mainnet/blk00523.dat",
+            "sha256": "548c2e0af1307c0a5224403ae14086c0f988cbc594ba2a9f74f0eab5f1a34d07",
+            "records": 722
+          }
+        ],
+        "window_files": [
+          "data/mainnet/blk00519.dat",
+          "data/mainnet/blk00520.dat",
+          "data/mainnet/blk00521.dat",
+          "data/mainnet/blk00522.dat",
+          "data/mainnet/blk00523.dat"
+        ],
+        "labels": {
+          "provenance": "local blk-store scan (corpus-resolved prevouts)",
+          "occurrence_model": "latest (height,txidx) < (spend_height,spend_idx)",
+          "ordering": "blocks sorted by BIP34 height; file order not trusted"
+        },
+        "window": {
+          "height_min": 231969,
+          "height_max": 236076,
+          "stats": {
+            "blocks": 3993,
+            "txs": 1366474,
+            "inputs": 3074093,
+            "resolved": 2716304,
+            "unresolved_no_occurrence": 357789,
+            "unresolved_future_only": 0,
+            "unresolved_bad_vout": 0,
+            "coinbase_inputs": 3993,
+            "duplicate_txid_occurrences": 0
+          },
+          "corpus_sha256": "515b902f08358425fae37942179c4993d06c61611b25b6a77df5ffc8cfd6fb6f",
+          "corpus_bytes": 799818489
+        }
+      },
+      "reported_executed_inputs": 2564033,
+      "reported_script_s_rounded": 31.7,
+      "reported_rate": 80989,
+      "executed_share_pct": 83.40778889903461,
+      "source_of_execution_statistics": "Capacity report prose/table; no era run JSONL, per-run manifest or guard receipt located in reviewed experiments/results paths or matching top-level /tmp filenames.",
+      "height_span": 4108,
+      "unique_heights_verified_from_small_headers_manifest": 3993,
+      "missing_heights": 115
+    },
+    {
+      "tag": "310",
+      "builder_manifest": {
+        "span_files": [
+          {
+            "file": "data/mainnet/blk00620.dat",
+            "sha256": "5ed1bc0f0faad1f346c5b5c951bb0b598ae909f63fe6ed0574fbe22c9b66c627",
+            "records": 569
+          },
+          {
+            "file": "data/mainnet/blk00621.dat",
+            "sha256": "820d5e4de9c556cdc24aeb31edd06c91dea9c35726b38e877685011c9a2cce62",
+            "records": 590
+          },
+          {
+            "file": "data/mainnet/blk00622.dat",
+            "sha256": "bf3b3ace1075e533c015d1548ad1888b7883b9d9afaf20e2f03597a9b74dbbc8",
+            "records": 564
+          }
+        ],
+        "window_files": [
+          "data/mainnet/blk00620.dat",
+          "data/mainnet/blk00621.dat",
+          "data/mainnet/blk00622.dat"
+        ],
+        "labels": {
+          "provenance": "local blk-store scan (corpus-resolved prevouts)",
+          "occurrence_model": "latest (height,txidx) < (spend_height,spend_idx)",
+          "ordering": "blocks sorted by BIP34 height; file order not trusted"
+        },
+        "window": {
+          "height_min": 309782,
+          "height_max": 312053,
+          "stats": {
+            "blocks": 1723,
+            "txs": 678784,
+            "inputs": 1943716,
+            "resolved": 1509519,
+            "unresolved_no_occurrence": 434197,
+            "unresolved_future_only": 0,
+            "unresolved_bad_vout": 0,
+            "coinbase_inputs": 1723,
+            "duplicate_txid_occurrences": 0
+          },
+          "corpus_sha256": "59b9aaba78a86e9245177db8d0e14597692566cd88d92c1b4db0ab17c0cc822c",
+          "corpus_bytes": 472691527
+        }
+      },
+      "reported_executed_inputs": 1294680,
+      "reported_script_s_rounded": 16.7,
+      "reported_rate": 77745,
+      "executed_share_pct": 66.60849630295785,
+      "source_of_execution_statistics": "Capacity report prose/table; no era run JSONL, per-run manifest or guard receipt located in reviewed experiments/results paths or matching top-level /tmp filenames.",
+      "height_span": 2272,
+      "unique_heights_verified_from_small_headers_manifest": 1723,
+      "missing_heights": 549
+    },
+    {
+      "tag": "345",
+      "builder_manifest": {
+        "span_files": [
+          {
+            "file": "data/mainnet/blk00700.dat",
+            "sha256": "357afb88d0335aa0240d7849f39084b32d5ced6d176b66efded0567c87e66450",
+            "records": 342
+          },
+          {
+            "file": "data/mainnet/blk00701.dat",
+            "sha256": "a7ee300717b36f3e2bb9cbc3a51e4b281b1be473d507ec696116e7f876e59ab1",
+            "records": 321
+          },
+          {
+            "file": "data/mainnet/blk00702.dat",
+            "sha256": "8189d9f3ff4331b8d4c2eee909a8243d899f5a150693813eab22a5e675e05352",
+            "records": 309
+          },
+          {
+            "file": "data/mainnet/blk00703.dat",
+            "sha256": "6da724c48dd95e9751eadd6d55683b44c7e94fa1e560bb5499472b762008f5ae",
+            "records": 337
+          },
+          {
+            "file": "data/mainnet/blk00704.dat",
+            "sha256": "670a52d84a942dbe1fe568e19fde177416e8ea0e2b5519d81081548a626e7fa5",
+            "records": 328
+          }
+        ],
+        "window_files": [
+          "data/mainnet/blk00700.dat",
+          "data/mainnet/blk00701.dat",
+          "data/mainnet/blk00702.dat",
+          "data/mainnet/blk00703.dat",
+          "data/mainnet/blk00704.dat"
+        ],
+        "labels": {
+          "provenance": "local blk-store scan (corpus-resolved prevouts)",
+          "occurrence_model": "latest (height,txidx) < (spend_height,spend_idx)",
+          "ordering": "blocks sorted by BIP34 height; file order not trusted"
+        },
+        "window": {
+          "height_min": 345223,
+          "height_max": 347025,
+          "stats": {
+            "blocks": 1637,
+            "txs": 1101058,
+            "inputs": 3374835,
+            "resolved": 2453056,
+            "unresolved_no_occurrence": 921779,
+            "unresolved_future_only": 0,
+            "unresolved_bad_vout": 0,
+            "coinbase_inputs": 1637,
+            "duplicate_txid_occurrences": 0
+          },
+          "corpus_sha256": "a48c967b26cda1763605aabec5df53b02a2ae6da8fc45332dc46d1cb210d214d",
+          "corpus_bytes": 783647039
+        }
+      },
+      "reported_executed_inputs": 1982898,
+      "reported_script_s_rounded": 26.2,
+      "reported_rate": 75594,
+      "executed_share_pct": 58.75540581984008,
+      "source_of_execution_statistics": "Capacity report prose/table; no era run JSONL, per-run manifest or guard receipt located in reviewed experiments/results paths or matching top-level /tmp filenames.",
+      "height_span": 1803,
+      "unique_heights_verified_from_small_headers_manifest": 1637,
+      "missing_heights": 166
+    },
+    {
+      "tag": "380",
+      "builder_manifest": {
+        "span_files": [
+          {
+            "file": "data/mainnet/blk00810.dat",
+            "sha256": "b9915f186ec370e92d3ab550ea87148cd8895e2450fcc46d2aad6d14210748f3",
+            "records": 225
+          },
+          {
+            "file": "data/mainnet/blk00811.dat",
+            "sha256": "079030940906193ce99ff7885fbfbda3e75e386341027fdb149e39cda4ff047c",
+            "records": 250
+          }
+        ],
+        "window_files": [
+          "data/mainnet/blk00810.dat",
+          "data/mainnet/blk00811.dat"
+        ],
+        "labels": {
+          "provenance": "local blk-store scan (corpus-resolved prevouts)",
+          "occurrence_model": "latest (height,txidx) < (spend_height,spend_idx)",
+          "ordering": "blocks sorted by BIP34 height; file order not trusted"
+        },
+        "window": {
+          "height_min": 380498,
+          "height_max": 381362,
+          "stats": {
+            "blocks": 475,
+            "txs": 504532,
+            "inputs": 1362984,
+            "resolved": 817883,
+            "unresolved_no_occurrence": 545101,
+            "unresolved_future_only": 0,
+            "unresolved_bad_vout": 0,
+            "coinbase_inputs": 475,
+            "duplicate_txid_occurrences": 0
+          },
+          "corpus_sha256": "3feae91d97fb16acf089fd0bf4ef7e704f7fc1945810d1c7d6286fa5a4faf2b9",
+          "corpus_bytes": 307408229
+        }
+      },
+      "reported_executed_inputs": 674086,
+      "reported_script_s_rounded": 10.0,
+      "reported_rate": 67173,
+      "executed_share_pct": 49.45663338674555,
+      "source_of_execution_statistics": "Capacity report prose/table; no era run JSONL, per-run manifest or guard receipt located in reviewed experiments/results paths or matching top-level /tmp filenames.",
+      "height_span": 865,
+      "unique_heights_verified_from_small_headers_manifest": 475,
+      "missing_heights": 390
+    },
+    {
+      "tag": "421",
+      "builder_manifest": {
+        "span_files": [
+          {
+            "file": "data/mainnet/blk01026.dat",
+            "sha256": "fa1ee3d835e9294e78aefc1e2d5c0adaad012f85041aadc50834ac2341d5cceb",
+            "records": 171
+          },
+          {
+            "file": "data/mainnet/blk01027.dat",
+            "sha256": "2b57eaa7552be42fbce4f34ad8e439d1ae534de53d25c4033f1681af5fa6d2c7",
+            "records": 155
+          },
+          {
+            "file": "data/mainnet/blk01028.dat",
+            "sha256": "5fe01356c7b069d4441f4403e91929bc8df10e00351df0c0d70c1ad6aa3d8713",
+            "records": 151
+          },
+          {
+            "file": "data/mainnet/blk01029.dat",
+            "sha256": "a50cc6d7b6e16f0826f5df7394d5181490da6dccbe134f4f3360ab60f34f810b",
+            "records": 146
+          }
+        ],
+        "window_files": [
+          "data/mainnet/blk01026.dat",
+          "data/mainnet/blk01027.dat",
+          "data/mainnet/blk01028.dat",
+          "data/mainnet/blk01029.dat"
+        ],
+        "labels": {
+          "provenance": "local blk-store scan (corpus-resolved prevouts)",
+          "occurrence_model": "latest (height,txidx) < (spend_height,spend_idx)",
+          "ordering": "blocks sorted by BIP34 height; file order not trusted"
+        },
+        "window": {
+          "height_min": 420732,
+          "height_max": 422540,
+          "stats": {
+            "blocks": 623,
+            "txs": 1032100,
+            "inputs": 2399736,
+            "resolved": 1464091,
+            "unresolved_no_occurrence": 935645,
+            "unresolved_future_only": 0,
+            "unresolved_bad_vout": 0,
+            "coinbase_inputs": 623,
+            "duplicate_txid_occurrences": 0
+          },
+          "corpus_sha256": "84f710739d25e7e6bc5527d6b5dbb7861c6db8863ff90039c579d71ea273be5e",
+          "corpus_bytes": 606462197
+        }
+      },
+      "reported_executed_inputs": 1122845,
+      "reported_script_s_rounded": 28.4,
+      "reported_rate": 39528,
+      "executed_share_pct": 46.7903552724133,
+      "source_of_execution_statistics": "Capacity report prose/table; no era run JSONL, per-run manifest or guard receipt located in reviewed experiments/results paths or matching top-level /tmp filenames.",
+      "height_span": 1809,
+      "unique_heights_verified_from_small_headers_manifest": 623,
+      "missing_heights": 1186
+    },
+    {
+      "tag": "956",
+      "builder_manifest": {
+        "span_files": [
+          {
+            "file": "/home/connoravila/.bitcoin/blocks/blk05625.dat",
+            "sha256": "e7b182ddc187d4886d877dc69ca32c2e32a8377b4746fe6160be1b436f58c03e",
+            "records": 83
+          },
+          {
+            "file": "/home/connoravila/.bitcoin/blocks/blk05626.dat",
+            "sha256": "10137d88ebf00635f8a14399a41f78baf7e5ff6c4e3d53673aac901127188277",
+            "records": 81
+          },
+          {
+            "file": "/home/connoravila/.bitcoin/blocks/blk05627.dat",
+            "sha256": "4a63f703dfcddea43a7dbb35d9f3e418c846b7e37d3dbb375a2ec7b5cfab8b9f",
+            "records": 81
+          },
+          {
+            "file": "/home/connoravila/.bitcoin/blocks/blk05628.dat",
+            "sha256": "491af5e12195c1d0fbd03076ff3365804a8754660699a0bde53680618b4068d5",
+            "records": 84
+          },
+          {
+            "file": "/home/connoravila/.bitcoin/blocks/blk05629.dat",
+            "sha256": "9f692f3aa97c298ef432fe32523f3f15e691112cdbba1c1b13574b35cf5228bc",
+            "records": 82
+          },
+          {
+            "file": "/home/connoravila/.bitcoin/blocks/blk05630.dat",
+            "sha256": "b44c086abb2e14b493b006f267974b217ca6f2dadfe4604a60cec52f9c0eae48",
+            "records": 83
+          },
+          {
+            "file": "/home/connoravila/.bitcoin/blocks/blk05631.dat",
+            "sha256": "e9b34b33c8879a7a6b96e3ba501144b16d8058556dd08328d969dec5592556be",
+            "records": 86
+          },
+          {
+            "file": "/home/connoravila/.bitcoin/blocks/blk05632.dat",
+            "sha256": "427bae4c2cd5e1ff16adb6d45b8798f32ef70c1c84262c7b9c54aac9bdaf8e3e",
+            "records": 82
+          }
+        ],
+        "window_files": [
+          "/home/connoravila/.bitcoin/blocks/blk05625.dat",
+          "/home/connoravila/.bitcoin/blocks/blk05626.dat",
+          "/home/connoravila/.bitcoin/blocks/blk05627.dat",
+          "/home/connoravila/.bitcoin/blocks/blk05628.dat",
+          "/home/connoravila/.bitcoin/blocks/blk05629.dat",
+          "/home/connoravila/.bitcoin/blocks/blk05630.dat",
+          "/home/connoravila/.bitcoin/blocks/blk05631.dat",
+          "/home/connoravila/.bitcoin/blocks/blk05632.dat"
+        ],
+        "labels": {
+          "provenance": "local blk-store scan (corpus-resolved prevouts)",
+          "occurrence_model": "latest (height,txidx) < (spend_height,spend_idx)",
+          "ordering": "blocks sorted by BIP34 height; file order not trusted"
+        },
+        "window": {
+          "height_min": 955931,
+          "height_max": 956718,
+          "stats": {
+            "blocks": 662,
+            "txs": 2932455,
+            "inputs": 5123793,
+            "resolved": 4136128,
+            "unresolved_no_occurrence": 987665,
+            "unresolved_future_only": 0,
+            "unresolved_bad_vout": 0,
+            "coinbase_inputs": 662,
+            "duplicate_txid_occurrences": 0
+          },
+          "corpus_sha256": "ed0bbee2e72ebf7c9635f5154b9e0b55236654d031ea3495d068c1b1e1c85395",
+          "corpus_bytes": 1259251055
+        }
+      },
+      "reported_executed_inputs": 3746089,
+      "reported_script_s_rounded": 95.0,
+      "reported_rate": 39451,
+      "executed_share_pct": 73.11163819459529,
+      "source_of_execution_statistics": "Capacity report prose/table; no era run JSONL, per-run manifest or guard receipt located in reviewed experiments/results paths or matching top-level /tmp filenames.",
+      "height_span": 788,
+      "unique_heights_verified_from_small_headers_manifest": 662,
+      "missing_heights": 126
+    }
+  ],
+  "old_workload_model_estimates": {
+    "genesis_sparse": {
+      "inputs": {
+        "basis": "sample_extrapolation",
+        "value": 4549.520958083833,
+        "note": "genesis_sparse density measured over [0, 0]"
+      },
+      "inputs_coinbase": {
+        "basis": "sample_extrapolation",
+        "value": 227931.0,
+        "note": "genesis_sparse density measured over [0, 0]"
+      }
+    },
+    "pre_segwit": {
+      "inputs": {
+        "basis": "sample_extrapolation",
+        "value": 400993873.09201384,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      },
+      "inputs_coinbase": {
+        "basis": "sample_extrapolation",
+        "value": 253893.0,
+        "note": "pre_segwit density measured over [276342, 968679]"
+      }
+    },
+    "segwit_era": {
+      "_basis": "unmeasured_assumption",
+      "_note": "no local corpus coverage for segwit_era; carry bounded ranges only"
+    },
+    "taproot_era": {
+      "inputs": {
+        "basis": "sample_extrapolation",
+        "value": 1990491959.8525896,
+        "note": "taproot_era density measured over [956468, 956718]"
+      },
+      "inputs_coinbase": {
+        "basis": "sample_extrapolation",
+        "value": 260369.0,
+        "note": "taproot_era density measured over [956468, 956718]"
+      }
+    }
+  },
+  "forecast_assumptions_as_reported": {
+    "era_inputs": {
+      "genesis": 40000000.0,
+      "pre_segwit": 500000000.0,
+      "segwit": 1200000000.0,
+      "taproot_era": 2000000000.0
+    },
+    "raw_bytes": 500000000000.0,
+    "final_coins": 140000000.0,
+    "state_wall_s_per_input": 6e-06,
+    "batch_ecdsa_speedup": [
+      3,
+      5
+    ],
+    "batch_schnorr_speedup": [
+      2,
+      4
+    ],
+    "32core_scaling": 4,
+    "overlap_speedup": 1.2,
+    "qualification": "Report assumptions/proposals; no pinned full-history derivation or measured end-to-end optimized implementation was supplied."
+  },
+  "calculations": {
+    "complete_window_inputs_per_script_second": 44459.36636769771,
+    "prior_rate_from_saved_2d77ad7_run": 41037.5849911861,
+    "script_stage_rate_ratio_vs_prior_uncontrolled": 1.0833816458070458,
+    "script_hours_per_billion_comparable_inputs": 6.24790230882821,
+    "reported_era_counts_sum": 3740000000.0,
+    "required_inputs_per_second_if_counts_hold": 1038888.8888888889,
+    "script_hours_using_early_presegwit_rate": 23.341677405298665,
+    "script_hours_using_late_presegwit_rate": 25.01091660122396,
+    "state_hours_if_6us_applies": 6.233333333333333,
+    "serial_hours_script24_state6_after_5x_scripts": 10.8,
+    "serial_hours_script24_state6_after_3x_scripts": 14.0,
+    "rss_MiB": 6730.73046875,
+    "500GB_at_25MBps_hours": 5.555555555555555,
+    "500GB_one_hour_payload_Mbps": 1111.111111111111
+  },
+  "measurement_limitations": [
+    "Latest complete-run receipt records cpu_s=n/a; later guard source samples CPU usage but cannot retroactively supply it.",
+    "Guard mhz fields contain unconverted kHz read from scaling_cur_freq, averaged over cores and time across the whole run. These are not script-stage cycle counts or proof of thermal throttling.",
+    "Era executed shares range approximately 47% to 83%; they are admitted subsets, not complete-state era validations.",
+    "Throughput changes by era do not isolate script class cost without matching mix, execution coverage and CPU conditions.",
+    "Report row 454k still uses the prior 31.8s / 41k rate, while the clean rerun records 29.323s / 44.46k.",
+    "3.7B inputs, 500GB, 140M survivors and projected batch/core gains need source/assumption labels, pinned tip and sensitivity ranges."
+  ],
+  "primary_sources": [
+    {
+      "url": "https://bips.dev/340/",
+      "use": "Schnorr batching and distinction from efficient standard-ECDSA batching without additional witness data; not a measured speedup."
+    },
+    {
+      "url": "https://docs.kernel.org/admin-guide/pm/cpufreq.html",
+      "use": "scaling_cur_freq units and interpretation limits."
+    }
+  ],
+  "disposition": "Current implementation has a serious measured throughput gap; 28-30h is a conditional model, not a measured full IBD or physical floor. Retain sub-hour as a high-risk research objective. Reconcile existing evidence/model and run one bounded existing-crypto candidate experiment before claiming optimized whole-node times."
+}

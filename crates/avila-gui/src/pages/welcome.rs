@@ -7,7 +7,7 @@ use super::{Action, Scene};
 use crate::session::RunSettings;
 use crate::theme::{self, mono};
 use crate::widgets::{self, Kind};
-use eframe::egui::{Align, Layout, RichText, TextEdit, Ui, vec2};
+use eframe::egui::{self, Align, Layout, RichText, TextEdit, Ui, vec2};
 
 pub fn show(ui: &mut Ui, s: &Scene, run: &mut RunSettings) -> Option<Action> {
     let pal = s.pal;
@@ -80,6 +80,51 @@ pub fn show(ui: &mut Ui, s: &Scene, run: &mut RunSettings) -> Option<Action> {
                      script checks — each block's receipt reports which \
                      ran.",
             );
+            ui.add_space(14.0);
+
+            widgets::label(ui, "First sync engine");
+            row(ui, |ui| {
+                widgets::segmented(
+                    ui,
+                    &mut run.fast_ibd,
+                    &[(false, "Standard"), (true, "Experimental")],
+                );
+            });
+            ui.add_space(2.0);
+            egui::CollapsingHeader::new(
+                RichText::new("What “experimental” means")
+                    .font(theme::font(theme::MEDIUM, 13.0))
+                    .color(pal.muted),
+            )
+            .id_salt("fast_ibd_details")
+            .show(ui, |ui| {
+                note(
+                    ui,
+                    s,
+                    "Both modes verify every block, every transaction, \
+                     every signature, every consensus rule — nothing is \
+                     skipped or trusted. Experimental changes speed, not \
+                     trust: the same chain state results either way, \
+                     byte-for-byte.",
+                );
+                note(
+                    ui,
+                    s,
+                    "It keeps the committed coins table resident in \
+                     memory instead of on disk — measured ~8× faster on \
+                     the lookup that dominates the first sync. Anything \
+                     not yet accelerated by the fast path runs exactly \
+                     as it does in Standard.",
+                );
+                note(
+                    ui,
+                    s,
+                    "Trade-offs: less-tested code, ~17 GiB of RAM on \
+                     mainnet today, and a few minutes of table-building \
+                     on every restart. If memory runs low it refuses \
+                     politely and stays on the ordinary path.",
+                );
+            });
             ui.add_space(14.0);
 
             widgets::label(ui, "Proxy (optional)");

@@ -96,7 +96,26 @@ fn torn_dat_tail_loses_coins_detectably() {
     let d = dir("dat-tail");
     let be = CoinsBackend::open_with_engine(&d, Engine::Hash).unwrap();
     let ops: Vec<(u8, u32)> = (0..64).map(|n| (n, 0)).collect();
-    be.commit(&put(&ops, 100, 1), &[], 1).unwrap();
+    // Spill-sized scripts — a 1-byte script fits the inline slot and
+    // never touches coins.dat; a torn dat tail only costs spilled
+    // records.
+    let spills: HashMap<OutPoint, Option<Coin>> = ops
+        .iter()
+        .map(|&(n, v)| {
+            (
+                op(n, v),
+                Some(Coin {
+                    out: TxOut {
+                        value: 100,
+                        script_pubkey: Script::new(vec![0x51; 96]),
+                    },
+                    height: 1,
+                    coinbase: false,
+                }),
+            )
+        })
+        .collect();
+    be.commit(&spills, &[], 1).unwrap();
     drop(be);
 
     // Truncate the log tail — the tail block's records are gone.

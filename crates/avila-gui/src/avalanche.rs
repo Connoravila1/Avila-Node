@@ -73,7 +73,7 @@ pub fn show(ui: &mut Ui, pal: &Palette, toy: &mut Avalanche) {
         leave |= widgets::button(ui, "← Toybox", Button::Quiet).clicked();
         ui.add_space(12.0);
         ui.label(
-            RichText::new("Avalanche")
+            RichText::new("See hashing work")
                 .font(font(theme::TITLE, 21.0))
                 .color(pal.text),
         );

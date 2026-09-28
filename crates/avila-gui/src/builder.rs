@@ -574,7 +574,7 @@ fn draw(p: &Painter, board: Rect, side: Rect, pal: &Palette, game: &Builder, bes
     p.text(
         side.left_top() + vec2(0.0, 24.0),
         Align2::LEFT_TOP,
-        format!("{}", thousands(game.score)),
+        thousands(game.score).to_string(),
         font(MONO_MEDIUM, 20.0),
         pal.text,
     );
@@ -592,33 +592,43 @@ fn draw(p: &Painter, board: Rect, side: Rect, pal: &Palette, game: &Builder, bes
         mono(11.5),
         pal.faint,
     );
-    // The tx coming next — a preview only, drawn flat so nothing
-    // suggests it can be clicked.
-    p.text(
-        side.left_top() + vec2(0.0, 108.0),
-        Align2::LEFT_TOP,
-        "next in the mempool",
-        theme::body(11.5),
-        pal.faint,
-    );
+    // The mempool's next entry waits at the door it falls through —
+    // ghosted in the spawn cells, where it will actually appear.
     let (base, _) = PIECES[game.next.kind];
-    let s = 18.0;
-    let x0 = side.left() + 8.0;
-    let y0 = side.top() + 134.0;
+    let ghost = fee_fill(game.next.fee, pal);
     for &(x, y) in base {
-        cell(
-            p,
-            pos2(x0 + x as f32 * s, y0 + y as f32 * s),
-            game.next.fee,
-            pal,
+        let r = Rect::from_min_size(
+            board.min + vec2((x + 4) as f32 * CELL + 1.5, y as f32 * CELL + 1.5),
+            vec2(CELL - 3.0, CELL - 3.0),
+        );
+        p.rect_filled(r, 3, ghost.gamma_multiply(0.22));
+        p.rect_stroke(
+            r,
+            3,
+            Stroke::new(1.0, ghost.gamma_multiply(0.75)),
+            StrokeKind::Inside,
         );
     }
     p.text(
-        pos2(x0 + 4.0 * s + 8.0, y0 + s),
-        Align2::LEFT_CENTER,
-        format!("{} sat/vB", game.next.fee),
-        mono(11.0),
+        side.left_top() + vec2(0.0, 108.0),
+        Align2::LEFT_TOP,
+        "the mempool",
+        theme::body(11.5),
+        pal.faint,
+    );
+    p.text(
+        side.left_top() + vec2(0.0, 126.0),
+        Align2::LEFT_TOP,
+        format!("next piece · {} sat/vB", game.next.fee),
+        mono(12.0),
         pal.muted,
+    );
+    p.text(
+        side.left_top() + vec2(0.0, 146.0),
+        Align2::LEFT_TOP,
+        "the ghost at the top of the\nwell — it falls in on its\nown, you only steer it",
+        theme::body(11.5),
+        pal.faint,
     );
 
     if game.state == State::Paused {

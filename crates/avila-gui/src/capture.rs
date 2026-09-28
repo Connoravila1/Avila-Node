@@ -62,6 +62,8 @@ pub struct Pose {
     pub desk: Desk,
     /// Pointer steps to play once posed: open a menu, hover an item.
     pub pointer: &'static [Step],
+    /// Identity is posed once for pointer-driven navigation captures.
+    pub first: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -82,6 +84,8 @@ pub struct Capture {
     posed: bool,
     /// Frames since it was.
     posed_frames: u32,
+    observation: serde_json::Value,
+    copied_tip: bool,
 }
 
 fn file_name(shot: &Shot) -> String {
@@ -121,6 +125,7 @@ impl Capture {
             toy: 0,
             desk: Desk::Window,
             pointer: &[],
+            first: true,
         };
         let mut shots = Vec::new();
         for theme in [Theme::Light, Theme::Dark] {
@@ -360,6 +365,15 @@ impl Capture {
                 FULL,
                 "-avalanche",
             ),
+            (
+                Theme::Light,
+                Pose {
+                    toy: 7,
+                    ..pose(Page::Toybox)
+                },
+                FULL,
+                "-calendar",
+            ),
             // The new skins, each over a page and its shelf card.
             (
                 Theme::Light,
@@ -388,6 +402,15 @@ impl Capture {
                 },
                 FULL,
                 "-phosphor",
+            ),
+            (
+                Theme::Light,
+                Pose {
+                    skin: Skin::Classic,
+                    ..pose(Page::Overview)
+                },
+                FULL,
+                "-classic-overview",
             ),
             (
                 Theme::Light,
@@ -513,6 +536,116 @@ impl Capture {
                 name,
             });
         }
+        // OG fidelity and real widget interactions, including the source
+        // frame's 705 x 484 size. Each shot runs in the native GUI.
+        for page in Page::ALL.into_iter().filter(|page| *page != Page::Overview) {
+            shots.push(Shot {
+                theme: Theme::Light,
+                pose: Pose {
+                    skin: Skin::Classic,
+                    ..pose(page)
+                },
+                size: FULL,
+                name: "-classic-page",
+            });
+        }
+        for (name, pointer) in [
+            (
+                "-classic-original-size",
+                &[(55.0, 154.0, true), (600.0, 320.0, false)][..],
+            ),
+            (
+                "-classic-blocks",
+                &[(165.0, 154.0, true), (600.0, 320.0, false)][..],
+            ),
+            (
+                "-classic-selected",
+                &[
+                    (165.0, 154.0, true),
+                    (145.0, 200.0, true),
+                    (600.0, 320.0, false),
+                ][..],
+            ),
+            (
+                "-classic-copy",
+                &[
+                    (165.0, 154.0, true),
+                    (430.0, 94.0, true),
+                    (600.0, 320.0, false),
+                ][..],
+            ),
+            (
+                "-classic-menu",
+                &[(136.0, 40.0, true), (165.0, 150.0, false)][..],
+            ),
+            (
+                "-classic-navigate-chain",
+                &[
+                    (136.0, 40.0, true),
+                    (165.0, 149.0, true),
+                    (600.0, 320.0, false),
+                ][..],
+            ),
+            (
+                "-classic-stop",
+                &[
+                    (136.0, 40.0, true),
+                    (165.0, 64.0, true),
+                    (600.0, 320.0, false),
+                ][..],
+            ),
+            (
+                "-classic-start",
+                &[
+                    (136.0, 40.0, true),
+                    (165.0, 64.0, true),
+                    (600.0, 320.0, false),
+                ][..],
+            ),
+            (
+                "-classic-about",
+                &[
+                    (99.0, 40.0, true),
+                    (120.0, 64.0, true),
+                    (600.0, 320.0, false),
+                ][..],
+            ),
+        ] {
+            shots.push(Shot {
+                theme: Theme::Light,
+                pose: Pose {
+                    skin: Skin::Classic,
+                    pointer,
+                    ..pose(Page::Overview)
+                },
+                size: [705.0, 484.0],
+                name,
+            });
+        }
+        shots.push(Shot {
+            theme: Theme::Light,
+            pose: Pose {
+                skin: Skin::Classic,
+                pointer: &[(55.0, 154.0, true), (600.0, 280.0, false)],
+                ..pose(Page::Overview)
+            },
+            size: [705.0, 331.0],
+            name: "-classic-archive-size",
+        });
+        shots.push(Shot {
+            theme: Theme::Light,
+            pose: Pose {
+                skin: Skin::Classic,
+                pointer: &[
+                    (136.0, 40.0, true),
+                    (180.0, 356.0, true),
+                    (600.0, 320.0, false),
+                ],
+                ..pose(Page::Overview)
+            },
+            size: [705.0, 484.0],
+            name: "-classic-return-modern",
+        });
         // `AVILA_GUI_CAPTURE_ONLY=xp` takes just the shots so named.
         if let Ok(only) = std::env::var("AVILA_GUI_CAPTURE_ONLY") {
             shots.retain(|shot| file_name(shot).contains(&only));
@@ -525,7 +658,37 @@ impl Capture {
             requested: false,
             posed: false,
             posed_frames: 0,
+            observation: serde_json::Value::Null,
+            copied_tip: false,
         })
+    }
+
+    /// Record the actual state after widgets and actions have run. A
+    /// pointer-driven capture must verify its outcome, not just its pose.
+    pub fn observe(
+        &mut self,
+        ctx: &Context,
+        page: Page,
+        skin: Skin,
+        phase: &str,
+        running: bool,
+        tip: Option<&str>,
+    ) {
+        self.copied_tip |= ctx.output(|output| {
+            output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if tip == Some(text.as_str()))
+            })
+        });
+        let size = ctx.viewport_rect().size();
+        self.observation = serde_json::json!({
+            "page": page.label(),
+            "skin": skin,
+            "phase": phase,
+            "running": running,
+            "copied_chain_tip": self.copied_tip,
+            "viewport_points": [size.x, size.y],
+            "pixels_per_point": ctx.pixels_per_point(),
+        });
     }
 
     /// Plays the current shot's pointer steps into egui's input, before
@@ -578,6 +741,17 @@ impl Capture {
             if let Err(e) = std::fs::write(self.dir.join(&name), png(&image)) {
                 eprintln!("capture: couldn't write {name}: {e}");
             }
+            let receipt = serde_json::json!({
+                "screenshot": name,
+                "pixels": image.size,
+                "actual": self.observation,
+            });
+            if let Err(e) = std::fs::write(
+                self.dir.join(name.replace(".png", ".json")),
+                serde_json::to_vec_pretty(&receipt).unwrap_or_default(),
+            ) {
+                eprintln!("capture: couldn't write state receipt: {e}");
+            }
             self.next += 1;
             self.requested = false;
             self.posed = false;
@@ -586,7 +760,12 @@ impl Capture {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return None;
         };
-        if !self.posed {
+        let first = !self.posed;
+        if first {
+            egui::Popup::close_all(ctx);
+            ctx.data_mut(|d| d.remove::<bool>(egui::Id::new("bitcoin-0.1-about")));
+            self.observation = serde_json::Value::Null;
+            self.copied_tip = false;
             self.posed = true;
             self.posed_frames = 0;
             let steps = STEP_START + STEP * shot.pose.pointer.len() as u32 + 30;
@@ -610,7 +789,7 @@ impl Capture {
             }
         }
         ctx.request_repaint();
-        Some(shot.pose)
+        Some(Pose { first, ..shot.pose })
     }
 }
 

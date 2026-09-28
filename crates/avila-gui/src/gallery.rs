@@ -7,8 +7,10 @@ use crate::model::thousands;
 use crate::pages::Scene;
 use crate::theme::{self, Palette, font, mono};
 use crate::widgets::{self, Kind as Button};
+use std::time::Instant;
+
 use eframe::egui::{
-    Align, Align2, Color32, Key, Layout, Modifiers, Painter, Rect, RichText, Sense, Stroke,
+    self, Align, Align2, Color32, Key, Layout, Modifiers, Painter, Rect, RichText, Sense, Stroke,
     StrokeKind, Ui, ecolor::Hsva, pos2, vec2,
 };
 
@@ -16,9 +18,28 @@ use eframe::egui::{
 const TILES_X: usize = 8;
 const TILES_Y: usize = 14;
 
+/// What the envious mutter, in rotation.
+const MUTTERS: &[&str] = &[
+    "Wish I was the favorite…",
+    "All that time being mined, and I'm not even the favorite.",
+    "I had a nonce too, you know.",
+    "Twenty trillion hashes and this is my reward.",
+    "The favorite doesn't even have better entropy.",
+    "Fine. I didn't want to be the favorite anyway.",
+    "My coinbase paid real fees. Just saying.",
+    "One reorg and the favorite is nobody.",
+];
+
 #[derive(Default)]
 pub struct Gallery {
     pub open: bool,
+    /// The block height on the wall's favorite — `None` until one
+    /// gets pinned.
+    favorite: Option<u32>,
+    /// When the favorite was crowned — the mutter clock runs off it.
+    fav_at: Option<Instant>,
+    /// Star-pinning mode: the cursor carries a ★ until it's placed.
+    picking: bool,
 }
 
 impl Gallery {
@@ -34,7 +55,7 @@ pub fn hash_bytes(hash: &str) -> Option<[u8; 32]> {
     if bytes.len() < 64 {
         return None;
     }
-    for (i, pair) in bytes[..64].chunks_exact(2).enumerate() {
+    for (i, pair) in bytes[..64].as_chunks::<2>().0.iter().enumerate() {
         let hi = (pair[0] as char).to_digit(16)?;
         let lo = (pair[1] as char).to_digit(16)?;
         out[i] = ((hi << 4) | lo) as u8;
@@ -86,7 +107,11 @@ pub fn painting(p: &Painter, rect: Rect, hash: &[u8; 32]) {
 pub fn show(ui: &mut Ui, s: &Scene, gallery: &mut Gallery) {
     let pal = s.pal;
     let escape = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
-    let mut leave = escape;
+    let was_picking = gallery.picking;
+    if escape && was_picking {
+        gallery.picking = false;
+    }
+    let mut leave = escape && !was_picking;
     ui.horizontal(|ui| {
         leave |= widgets::button(ui, "← Toybox", Button::Quiet).clicked();
         ui.add_space(12.0);
@@ -96,6 +121,22 @@ pub fn show(ui: &mut Ui, s: &Scene, gallery: &mut Gallery) {
                 .color(pal.text),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if gallery.picking {
+                ui.label(
+                    RichText::new("pin the star on a painting — Esc to put it away")
+                        .font(theme::body(12.5))
+                        .color(pal.signal_text),
+                );
+            } else if widgets::button(
+                ui,
+                "Pick a favorite — make the others jealous",
+                Button::Quiet,
+            )
+            .clicked()
+            {
+                gallery.picking = true;
+            }
+            ui.add_space(10.0);
             ui.label(
                 RichText::new("each painting is the block's own hash")
                     .font(theme::body(12.5))
@@ -120,17 +161,76 @@ pub fn show(ui: &mut Ui, s: &Scene, gallery: &mut Gallery) {
     } else {
         // The wall: frames across, wrapping; each is a matted painting
         // with a small plaque — the height and the hash's tail.
+        // While a favorite reigns, someone mutters about it: one
+        // non-favorite per ~6s, typed out live.
+        let mutter_for: Option<(u32, (&'static str, usize))> = gallery.favorite.and_then(|fav| {
+            let since = gallery.fav_at?.elapsed().as_secs_f32();
+            let cycle = (since / 6.0) as usize;
+            let phase = since % 6.0;
+            let others: Vec<u32> = blocks
+                .iter()
+                .map(|(h, _)| *h)
+                .filter(|h| *h != fav)
+                .collect();
+            if phase < 4.0 && !others.is_empty() {
+                let speaker = others[cycle % others.len()];
+                let msg = MUTTERS[(cycle + speaker as usize) % MUTTERS.len()];
+                let typed = ((phase * 26.0) as usize).min(msg.len());
+                Some((speaker, (msg, typed)))
+            } else {
+                None
+            }
+        });
         let gap = 16.0;
         let card_w = 208.0;
         let per_row = ((ui.available_width() + gap) / (card_w + gap)).max(1.0) as usize;
         for row in blocks.chunks(per_row) {
             ui.horizontal(|ui| {
                 for (height, hash) in row {
-                    frame(ui, &pal, *height, hash);
+                    let mutter = mutter_for
+                        .as_ref()
+                        .filter(|(h, _)| *h == *height)
+                        .map(|(_, m)| *m);
+                    if frame(
+                        ui,
+                        &pal,
+                        *height,
+                        hash,
+                        gallery.favorite,
+                        gallery.picking,
+                        mutter,
+                    ) {
+                        gallery.favorite = Some(*height);
+                        gallery.fav_at = Some(Instant::now());
+                        gallery.picking = false;
+                    }
                     ui.add_space(gap - 4.0);
                 }
             });
             ui.add_space(gap);
+        }
+        // While pinning, the cursor carries the star.
+        if gallery.picking {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+            if let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
+                ui.ctx()
+                    .layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("favorite-star"),
+                    ))
+                    .text(
+                        pos + vec2(4.0, -4.0),
+                        Align2::CENTER_CENTER,
+                        "★",
+                        font(theme::TITLE, 18.0),
+                        Color32::from_rgb(196, 154, 58),
+                    );
+            }
+            ui.ctx().request_repaint();
+        }
+        // The typewriter needs its frames.
+        if mutter_for.is_some() {
+            ui.ctx().request_repaint();
         }
     }
     if leave {
@@ -139,13 +239,33 @@ pub fn show(ui: &mut Ui, s: &Scene, gallery: &mut Gallery) {
 }
 
 /// One frame on the wall: a dark frame, a light mat, the painting,
-/// and a little plaque.
-fn frame(ui: &mut Ui, pal: &Palette, height: u32, hash: &str) {
-    let (rect, _r) = ui.allocate_exact_size(vec2(204.0, 252.0), Sense::hover());
+/// and a little plaque. Once a favorite is crowned the rest of the
+/// wall turns jealous.
+fn frame(
+    ui: &mut Ui,
+    pal: &Palette,
+    height: u32,
+    hash: &str,
+    favorite: Option<u32>,
+    picking: bool,
+    mutter: Option<(&'static str, usize)>,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(
+        vec2(204.0, 252.0),
+        if picking {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
     let p = ui.painter_at(rect);
-    // Frame.
-    p.rect_filled(rect, 4, pal.rail);
-    p.rect_stroke(rect, 4, Stroke::new(1.0, pal.hairline), StrokeKind::Inside);
+    let favored = favorite == Some(height);
+    // Frame — gold for the favorite; glows when the star hovers.
+    let gilt = Color32::from_rgb(196, 154, 58);
+    p.rect_filled(rect, 4, if favored { gilt } else { pal.rail });
+    if picking && resp.hovered() {
+        p.rect_stroke(rect, 4, Stroke::new(2.0, gilt), StrokeKind::Inside);
+    }
     // Mat.
     let mat = rect.shrink(10.0);
     p.rect_filled(mat, 2, pal.canvas);
@@ -158,7 +278,41 @@ fn frame(ui: &mut Ui, pal: &Palette, height: u32, hash: &str) {
         }
     }
     p.rect_stroke(art, 2, Stroke::new(1.0, pal.hairline), StrokeKind::Inside);
-    // Plaque.
+    // A jealous block mutters — a little bubble over the painting,
+    // typed out a character at a time.
+    if let Some((full, typed)) = mutter {
+        let w = (p
+            .layout_no_wrap(full.to_string(), mono(9.5), pal.text)
+            .size()
+            .x
+            + 18.0)
+            .max(60.0);
+        let bub = Rect::from_min_size(
+            pos2(art.center().x - w / 2.0, art.top() + 8.0),
+            vec2(w, 24.0),
+        );
+        p.rect_filled(bub, 6, pal.canvas);
+        p.rect_stroke(bub, 6, Stroke::new(1.0, pal.hairline), StrokeKind::Inside);
+        // Tail pointing at the painting.
+        let tail = [
+            pos2(bub.center().x - 4.0, bub.bottom()),
+            pos2(bub.center().x + 4.0, bub.bottom()),
+            pos2(bub.center().x, bub.bottom() + 7.0),
+        ];
+        p.add(egui::Shape::convex_polygon(
+            tail.to_vec(),
+            pal.canvas,
+            Stroke::new(1.0, pal.hairline),
+        ));
+        p.text(
+            pos2(bub.left() + 9.0, bub.center().y),
+            Align2::LEFT_CENTER,
+            &full[..typed],
+            mono(9.5),
+            pal.text,
+        );
+    }
+    // Plaque — the favorite's says so.
     p.text(
         pos2(mat.left() + 6.0, art.bottom() + 10.0),
         Align2::LEFT_TOP,
@@ -166,13 +320,24 @@ fn frame(ui: &mut Ui, pal: &Palette, height: u32, hash: &str) {
         font(theme::MEDIUM, 12.5),
         pal.text,
     );
-    p.text(
-        pos2(mat.left() + 6.0, art.bottom() + 28.0),
-        Align2::LEFT_TOP,
-        format!("…{}", &hash[hash.len().saturating_sub(12)..]),
-        mono(10.5),
-        pal.muted,
-    );
+    if favored {
+        p.text(
+            pos2(mat.left() + 6.0, art.bottom() + 28.0),
+            Align2::LEFT_TOP,
+            "★ the favorite",
+            mono(10.5),
+            Color32::from_rgb(150, 112, 30),
+        );
+    } else {
+        p.text(
+            pos2(mat.left() + 6.0, art.bottom() + 28.0),
+            Align2::LEFT_TOP,
+            format!("…{}", &hash[hash.len().saturating_sub(12)..]),
+            mono(10.5),
+            pal.muted,
+        );
+    }
+    resp.clicked()
 }
 
 #[cfg(test)]

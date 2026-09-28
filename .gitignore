@@ -27,3 +27,7 @@ __pycache__/
 /tmp/
 .lock
 data/
+# GUI-written config overlay — runtime state, not source.
+*.runtime.toml
+# Flat-utxo experiment datadir.
+/data-flat/

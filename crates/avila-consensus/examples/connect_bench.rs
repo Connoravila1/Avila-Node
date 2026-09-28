@@ -52,6 +52,11 @@ fn main() {
         .unwrap_or(512 << 20);
     let mut cs = Chainstate::with_store_coinsdb(&dir, &params, now(), budget)
         .unwrap_or_else(|e| panic!("chainstate: {e}"));
+    let flat = std::env::var("AVILA_FLAT_UTXO").as_deref() == Ok("1");
+    if flat {
+        assert!(cs.enable_flat_utxo(0));
+        eprintln!("flat-utxo: enabled");
+    }
     let spec = args.any(|a| a == "--spec");
     if spec {
         cs.enable_speculative_connect();
@@ -84,11 +89,17 @@ fn main() {
         .total_ns
         .saturating_sub(t.read_ns + t.apply_ns + t.script_ns + t.bip30_ns);
     println!(
-        "blocks: {n} in {:.1?} — {:.0} blocks/s (cache {} MiB, spec={})",
+        "blocks: {n} in {:.1?} — {:.0} blocks/s (cache {} MiB, mode={})",
         wall,
         n as f64 / wall.as_secs_f64(),
         budget >> 20,
-        spec
+        if flat {
+            "flat"
+        } else if spec {
+            "spec"
+        } else {
+            "std"
+        }
     );
     println!("connect_block breakdown (cum over {n} blocks):");
     println!("  total   {:>9.0} ms", ms(t.total_ns));

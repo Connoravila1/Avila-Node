@@ -16,6 +16,7 @@ pub mod connect;
 pub mod descriptor;
 pub mod encode;
 pub mod extended_key;
+pub mod flatmap;
 pub mod gcs;
 pub mod hash;
 pub mod hashstore;

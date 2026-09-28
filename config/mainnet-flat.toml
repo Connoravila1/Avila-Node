@@ -1,0 +1,18 @@
+# Experimental fast-IBD run — fresh datadir, flat UTXO mirror enabled
+# via --flat-utxo-mib on the command line (kept out of the file so the
+# config can't silently carry an experimental flag into other runs).
+# Soft prune at 32 GiB — blk files older than that are deleted; the
+# undo data they carried is already inside coinsdb.redb, so a deep
+# reorg still rewinds.
+schema_version = 1
+network = "mainnet"
+data_dir = "../data-flat"
+
+[diag]
+event_capacity = 256
+
+[storage]
+prune_mb = 32768
+
+[services.rpc]
+bind = "127.0.0.1:8332"

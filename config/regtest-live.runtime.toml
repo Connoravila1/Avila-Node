@@ -1,4 +1,32 @@
 # Written by the GUI — merged over regtest-live.toml at load. Edit or delete freely.
 
+data_dir = "/tmp/avila-live-a"
+
+[extrapool]
+observe = true
+promote_on = ["tip"]
+
 [mempool]
 max_mb = 64
+
+[net]
+blocks_only = true
+connect = [
+    "127.0.0.1:18444",
+    "127.0.0.1:18448",
+]
+v2transport = false
+
+[policy]
+datacarrier_size = 100
+require_standard = true
+
+[relay.block]
+serve = "tip"
+
+[relay.tx]
+announce = "none"
+stem = false
+
+[services.rpc]
+bind = "127.0.0.1:18445"

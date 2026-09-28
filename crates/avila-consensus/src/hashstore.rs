@@ -8,17 +8,21 @@
 //!
 //! ## Files
 //!
-//! * `coins.idx` — header + `cap` fixed 48-byte slots
-//!   `[key 36 | off u64 | len u32]`; `off == 0` marks empty (the log
-//!   starts with a 32-byte header, so offset 0 is never a record).
-//!   Linear probing, SipHash-1-3 keyed by a per-database random seed
-//!   stored in the header — outpoints are attacker-influenced, so the
-//!   hash must be keyed or a mined-txid cluster becomes a probe-length
-//!   DoS.
+//! * `coins.idx` — header + `cap` fixed 96-byte slots
+//!   `[key 36 | ctl u32 | payload 56]`; `ctl == 0` marks empty.
+//!   `ctl` with `INLINE` set stores the whole record (`tag4 + coin`,
+//!   ≤56 B — ~100% of real UTXOs) in the payload: a hit costs ONE
+//!   index page, no log touch. `ctl` without it is the record length
+//!   and payload[0..8] the log offset — oversized scripts spill to
+//!   `coins.dat` exactly like the old layout. Linear probing,
+//!   SipHash-1-3 keyed by a per-database random seed stored in the
+//!   header — outpoints are attacker-influenced, so the hash must be
+//!   keyed or a mined-txid cluster becomes a probe-length DoS.
 //! * `coins.dat` — header + append-only compact-coin records (the
-//!   [`CoinFormat::Compact`] encoding). Updates append a new version
-//!   and repoint the slot; when the new record fits the old allocation
-//!   it overwrites in place instead, so churn doesn't grow the log.
+//!   [`CoinFormat::Compact`] encoding) for spilled records only.
+//!   Updates append a new version and repoint the slot; when the new
+//!   record fits the old allocation it overwrites in place instead,
+//!   so churn doesn't grow the log.
 //!
 //! ## Consistency
 //!
@@ -41,18 +45,23 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const IDX_MAGIC: &[u8; 8] = b"AVUCIDX1";
-const DAT_MAGIC: &[u8; 8] = b"AVUCDAT1";
+const IDX_MAGIC: &[u8; 8] = b"AVUCIDX2";
+const DAT_MAGIC: &[u8; 8] = b"AVUCDAT2";
 const IDX_HDR: u64 = 64;
 const DAT_HDR: u64 = 32;
-/// `[key 36][offset 8][len 4]`.
-const SLOT: u64 = 48;
+/// `[key 36][ctl u32][payload 56]` — the wide slot: small records
+/// inline into the payload instead of pointing into the log.
+const SLOT: u64 = 96;
+/// Bytes the slot payload carries when `ctl` has the inline bit.
+const PAYLOAD: usize = 56;
+/// `ctl` bit — the record itself is stored in the slot payload.
+const INLINE: u32 = 0x8000_0000;
 const SLOT_US: usize = SLOT as usize;
 /// Grow when live entries would exceed 70% of slots.
 const MAX_LOAD_NUM: u64 = 7;
 const MAX_LOAD_DEN: u64 = 10;
 const INIT_CAP: u64 = 1024;
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 /// SipHash-1-3 over the 36-byte key — keyed so a mined-txid cluster
 /// can't target one bucket chain.
@@ -228,7 +237,7 @@ impl Inner {
         let s: &[u8; SLOT_US] = self.page.1[off..off + SLOT_US]
             .try_into()
             .unwrap_or(&[0u8; SLOT_US]);
-        if u64::from_le_bytes(s[36..44].try_into().unwrap_or_default()) == 0 {
+        if u32::from_le_bytes(s[36..40].try_into().unwrap_or_default()) == 0 {
             return Ok(None);
         }
         Ok(Some(*s))
@@ -238,7 +247,7 @@ impl Inner {
     fn slot_direct(&self, i: u64) -> io::Result<Option<[u8; SLOT_US]>> {
         let mut b = [0u8; SLOT_US];
         self.idx.read_exact_at(&mut b, IDX_HDR + i * SLOT)?;
-        if u64::from_le_bytes(b[36..44].try_into().unwrap_or_default()) == 0 {
+        if u32::from_le_bytes(b[36..40].try_into().unwrap_or_default()) == 0 {
             return Ok(None);
         }
         Ok(Some(b))
@@ -482,19 +491,27 @@ impl HashStore {
         sip13(key, self.k0, self.k1) & (cap - 1)
     }
 
-    /// The stored `(offset, len)` for a present slot.
-    fn slot_rec(s: &[u8; SLOT_US]) -> (u64, u32) {
-        (
-            u64::from_le_bytes(s[36..44].try_into().unwrap_or_default()),
-            u32::from_le_bytes(s[44..48].try_into().unwrap_or_default()),
-        )
+    /// What a present slot's `ctl` points at: an inline record living
+    /// in the slot payload, or a `(offset, len)` into the log for
+    /// oversized scripts that spill.
+    fn slot_rec(s: &[u8; SLOT_US]) -> Result<Vec<u8>, (u64, u32)> {
+        let ctl = u32::from_le_bytes(s[36..40].try_into().unwrap_or_default());
+        if ctl & INLINE != 0 {
+            let len = (ctl & !INLINE) as usize;
+            return Ok(s[40..40 + len.min(PAYLOAD)].to_vec());
+        }
+        Err((
+            u64::from_le_bytes(s[40..48].try_into().unwrap_or_default()),
+            ctl,
+        ))
     }
 
     fn slot_key(s: &[u8; SLOT_US]) -> &[u8; 36] {
         s[..36].try_into().unwrap_or(&[0u8; 36])
     }
 
-    /// The persisted coin at `key` — a probe then one log read.
+    /// The persisted coin at `key` — a probe, then zero or one log
+    /// read (records ≤56 B answer from the slot itself).
     #[must_use]
     pub fn get(&self, key: &[u8; 36]) -> Option<Coin> {
         let mut inner = self.inner.lock().ok()?;
@@ -503,9 +520,14 @@ impl HashStore {
             return None;
         }
         let s = inner.slot(i).ok()??;
-        let (off, len) = Self::slot_rec(&s);
-        let mut b = vec![0u8; len as usize];
-        inner.dat.read_exact_at(&mut b, off).ok()?;
+        let b = match Self::slot_rec(&s) {
+            Ok(inline) => inline,
+            Err((off, len)) => {
+                let mut b = vec![0u8; len as usize];
+                inner.dat.read_exact_at(&mut b, off).ok()?;
+                b
+            }
+        };
         // Torn-write check: the stored 4-byte tag must match
         // key+record — a mismatch is a detectable miss, never a
         // silently-wrong coin.
@@ -613,39 +635,55 @@ impl HashStore {
                     let mut stored = Vec::with_capacity(4 + rec.len());
                     stored.extend_from_slice(&tag);
                     stored.extend_from_slice(&rec);
+                    let inline = stored.len() <= PAYLOAD;
                     let (i, found) = self.probe_staged(&mut inner, &stage, &key)?;
                     if found {
                         let Some(s) = Self::slot_at(&mut inner, &stage, i)? else {
                             continue;
                         };
-                        let (off, old_len) = Self::slot_rec(&s);
-                        if stored.len() as u32 <= old_len {
-                            // Fits the old allocation — overwrite in
-                            // place, no log growth.
+                        // Spill→spill in-place when the new record fits
+                        // the old allocation — no log growth.
+                        if let Err((off, old_len)) = Self::slot_rec(&s)
+                            && !inline
+                            && stored.len() as u32 <= old_len
+                        {
                             inner.dat.write_all_at(&stored, off)?;
                             if stored.len() as u32 != old_len {
                                 let mut ns = s;
-                                ns[44..48].copy_from_slice(&(stored.len() as u32).to_le_bytes());
+                                ns[36..40].copy_from_slice(&(stored.len() as u32).to_le_bytes());
                                 stage.insert(i, Some(ns));
                             }
                             continue;
                         }
-                        // Doesn't fit — append and repoint.
-                        let new_off = dat_len;
-                        dat_appends.extend_from_slice(&stored);
-                        dat_len += stored.len() as u64;
                         let mut ns = s;
-                        ns[36..44].copy_from_slice(&new_off.to_le_bytes());
-                        ns[44..48].copy_from_slice(&(stored.len() as u32).to_le_bytes());
+                        if inline {
+                            ns[36..40]
+                                .copy_from_slice(&(INLINE | stored.len() as u32).to_le_bytes());
+                            ns[40..40 + stored.len()].copy_from_slice(&stored);
+                            ns[40 + stored.len()..].fill(0);
+                        } else {
+                            let new_off = dat_len;
+                            dat_appends.extend_from_slice(&stored);
+                            dat_len += stored.len() as u64;
+                            ns[36..40].copy_from_slice(&(stored.len() as u32).to_le_bytes());
+                            ns[40..48].copy_from_slice(&new_off.to_le_bytes());
+                            ns[48..].fill(0);
+                        }
                         stage.insert(i, Some(ns));
                     } else {
-                        let new_off = dat_len;
-                        dat_appends.extend_from_slice(&stored);
-                        dat_len += stored.len() as u64;
                         let mut ns = [0u8; SLOT_US];
                         ns[..36].copy_from_slice(&key);
-                        ns[36..44].copy_from_slice(&new_off.to_le_bytes());
-                        ns[44..48].copy_from_slice(&(stored.len() as u32).to_le_bytes());
+                        if inline {
+                            ns[36..40]
+                                .copy_from_slice(&(INLINE | stored.len() as u32).to_le_bytes());
+                            ns[40..40 + stored.len()].copy_from_slice(&stored);
+                        } else {
+                            let new_off = dat_len;
+                            dat_appends.extend_from_slice(&stored);
+                            dat_len += stored.len() as u64;
+                            ns[36..40].copy_from_slice(&(stored.len() as u32).to_le_bytes());
+                            ns[40..48].copy_from_slice(&new_off.to_le_bytes());
+                        }
                         stage.insert(i, Some(ns));
                         delta += 1;
                     }
@@ -775,15 +813,16 @@ impl HashStore {
             buf.truncate(want);
             inner.idx.read_exact_at(&mut buf, off)?;
             for s in buf.as_chunks_mut::<SLOT_US>().0 {
-                let roff = u64::from_le_bytes(s[36..44].try_into().unwrap_or_default());
-                let rlen = u32::from_le_bytes(s[44..48].try_into().unwrap_or_default());
-                if roff == 0 {
-                    continue;
+                let ctl = u32::from_le_bytes(s[36..40].try_into().unwrap_or_default());
+                if ctl == 0 || ctl & INLINE != 0 {
+                    continue; // empty, or the record lives in the slot
                 }
+                let roff = u64::from_le_bytes(s[40..48].try_into().unwrap_or_default());
+                let rlen = ctl;
                 let mut rec = vec![0u8; rlen as usize];
                 inner.dat.read_exact_at(&mut rec, roff)?;
                 ndat.write_all_at(&rec, noff)?;
-                s[36..44].copy_from_slice(&noff.to_le_bytes());
+                s[40..48].copy_from_slice(&noff.to_le_bytes());
                 noff += rlen as u64;
             }
             nidx.write_all_at(&buf, off)?;
@@ -863,14 +902,14 @@ impl HashStore {
                 buf.truncate(want);
                 inner.idx.read_exact_at(&mut buf, off)?;
                 for s in buf.as_chunks::<SLOT_US>().0 {
-                    if u64::from_le_bytes(s[36..44].try_into().unwrap_or_default()) == 0 {
+                    if u32::from_le_bytes(s[36..40].try_into().unwrap_or_default()) == 0 {
                         continue;
                     }
                     let mut i = sip13(Self::slot_key(s), self.k0, self.k1) & (new_cap - 1);
                     loop {
                         let mut probe = [0u8; SLOT_US];
                         nidx.read_exact_at(&mut probe, IDX_HDR + i * SLOT)?;
-                        if u64::from_le_bytes(probe[36..44].try_into().unwrap_or_default()) == 0 {
+                        if u32::from_le_bytes(probe[36..40].try_into().unwrap_or_default()) == 0 {
                             nidx.write_all_at(s, IDX_HDR + i * SLOT)?;
                             break;
                         }
@@ -934,12 +973,22 @@ impl HashStore {
                 break;
             }
             for s in buf.as_chunks::<SLOT_US>().0 {
-                let (roff, rlen) = Self::slot_rec(s);
-                if roff == 0 {
+                let ctl = u32::from_le_bytes(s[36..40].try_into().unwrap_or_default());
+                if ctl == 0 {
                     continue;
                 }
-                let Some(rec) = dat.get(roff as usize..roff as usize + rlen as usize) else {
-                    continue;
+                let rec: &[u8] = match Self::slot_rec(s) {
+                    Ok(_) => {
+                        let len = (ctl & !INLINE) as usize;
+                        &s[40..40 + len.min(PAYLOAD)]
+                    }
+                    Err((roff, rlen)) => {
+                        let Some(rec) = dat.get(roff as usize..roff as usize + rlen as usize)
+                        else {
+                            continue;
+                        };
+                        rec
+                    }
                 };
                 // Skip + verify the 4B integrity tag — torn records
                 // are dropped from the iteration, never mis-decoded.
@@ -1005,6 +1054,60 @@ mod tests {
             height: h,
             coinbase: false,
         }
+    }
+
+    /// Wide-slot inline/spill boundary: a coin whose record exceeds
+    /// the 56-byte payload spills to the log; updating it back under
+    /// the cap re-inlines; a small→large update goes inline→spill.
+    /// Every state must round-trip `get`/`have`/compact/`reopen`.
+    #[test]
+    fn inline_spill_boundary() {
+        let d = dir("inline_spill");
+        let s = HashStore::open(&d).unwrap();
+        let big = |v: i64| Coin {
+            out: TxOut {
+                value: v,
+                script_pubkey: Script::new(vec![0x61; 400]),
+            },
+            height: 7,
+            coinbase: false,
+        };
+        let small = coin(11, 3);
+        let key_of = |o: &OutPoint| crate::coinsdb::key_of(o);
+
+        // Spill path: big record writes to the log, reads back.
+        let mut dirty = HashMap::new();
+        dirty.insert(op(1), Some(big(100)));
+        dirty.insert(op(2), Some(small.clone()));
+        s.commit_coins(&dirty, None).unwrap();
+        assert_eq!(s.get(&key_of(&op(1))).unwrap().out.value, 100);
+        assert_eq!(s.get(&key_of(&op(2))).unwrap().out.value, 11);
+
+        // Spill→spill in-place overwrite (same size bucket).
+        dirty.clear();
+        dirty.insert(op(1), Some(big(200)));
+        s.commit_coins(&dirty, None).unwrap();
+        assert_eq!(s.get(&key_of(&op(1))).unwrap().out.value, 200);
+
+        // Spill→inline: big record replaced by a small one.
+        dirty.clear();
+        dirty.insert(op(1), Some(coin(300, 9)));
+        s.commit_coins(&dirty, None).unwrap();
+        assert_eq!(s.get(&key_of(&op(1))).unwrap().out.value, 300);
+
+        // Inline→spill: small record replaced by a big one.
+        dirty.clear();
+        dirty.insert(op(2), Some(big(400)));
+        s.commit_coins(&dirty, None).unwrap();
+        assert_eq!(s.get(&key_of(&op(2))).unwrap().out.value, 400);
+
+        // Compact + reopen preserve both classes.
+        s.compact().unwrap();
+        drop(s);
+        let s = HashStore::open(&d).unwrap();
+        assert_eq!(s.get(&key_of(&op(1))).unwrap().out.value, 300);
+        assert_eq!(s.get(&key_of(&op(2))).unwrap().out.value, 400);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -28,7 +28,9 @@
 
 #define S(name) rustsecp256k1_v0_10_0_##name
 #define MAX_BATCH 8192
+#ifndef SCRATCH_BYTES
 #define SCRATCH_BYTES (16u << 20)
+#endif
 #define REQUIRE(x) do { if (!(x)) { \
     fprintf(stderr, "failed: %s at %s:%d\n", #x, __FILE__, __LINE__); exit(1); \
 } } while (0)
@@ -39,11 +41,13 @@ typedef struct {
     unsigned char pub[33];
     unsigned char hint; /* bit 0: y parity; bit 1: x = r+n instead of r */
     unsigned char y[32]; /* only used by the larger-advice experiment */
+    unsigned char qy[32]; /* advised pubkey affine y: verify, don't sqrt */
 } Record;
 
 typedef struct {
     S(scalar) r, s, z, prefix, inverse;
     S(ge) q;
+    uint32_t group; /* coalesced-batch key group id (1-based), unused else */
 } InversionWork;
 
 typedef struct {
@@ -205,6 +209,98 @@ static int produce_hint(Engine *e, Record *record) {
     return 1;
 }
 
+/* Batched producer: same reconstruction (parse + s^-1 + ecmult) but the
+ * affine normalization — one field inversion per hint in the serial
+ * path — becomes ONE Montgomery batch over all z's: 1 inversion +
+ * ~3 muls per element instead of 1 inversion each. */
+static int produce_hints_batch(Engine *e, Record *records, size_t n) {
+    size_t i;
+    S(gej) *results;
+    S(fe) *pref, *zinv, acc;
+    if (n == 0) return 1;
+    results = malloc(n * sizeof(*results));
+    pref = malloc(n * sizeof(*pref));
+    zinv = malloc(n * sizeof(*zinv));
+    REQUIRE(results && pref && zinv);
+    for (i = 0; i < n; ++i) {
+        S(scalar) r, s, z, inverse, u1, u2;
+        S(ge) q;
+        S(gej) qj;
+        if (!parse(e, &records[i], &r, &s, &z, &q)) { free(results); free(pref); free(zinv); return 0; }
+        S(scalar_inverse_var)(&inverse, &s);
+        S(scalar_mul)(&u1, &inverse, &z);
+        S(scalar_mul)(&u2, &inverse, &r);
+        S(gej_set_ge)(&qj, &q);
+        S(ecmult)(&results[i], &qj, &u2, &u1);
+        e->inversion[i].r = r; /* keep r for the x==r check */
+    }
+    /* Montgomery: pref[i] = z0..z_{i-1}, then unroll */
+    S(fe_set_int)(&acc, 1);
+    for (i = 0; i < n; ++i) {
+        pref[i] = acc;
+        if (!S(gej_is_infinity)(&results[i]))
+            S(fe_mul)(&acc, &acc, &results[i].z);
+    }
+    S(fe_inv)(&acc, &acc); /* acc = (prod live z)^-1 */
+    for (i = n; i-- > 0;) {
+        if (S(gej_is_infinity)(&results[i])) continue;
+        S(fe_mul)(&zinv[i], &acc, &pref[i]);
+        S(fe_mul)(&acc, &acc, &results[i].z);
+    }
+    for (i = 0; i < n; ++i) {
+        S(fe) x, y, z2;
+        unsigned char xb[32];
+        S(scalar) rx;
+        int carry;
+        if (S(gej_is_infinity)(&results[i])) { free(results); free(pref); free(zinv); return 0; }
+        S(fe_sqr)(&z2, &zinv[i]);            /* z^-2 */
+        S(fe_mul)(&x, &results[i].x, &z2);   /* x = X/z^2 */
+        S(fe_mul)(&y, &results[i].y, &zinv[i]);
+        S(fe_mul)(&y, &y, &z2);              /* y = Y/z^3 */
+        S(fe_normalize_var)(&x);
+        S(fe_normalize_var)(&y);
+        S(fe_get_b32)(xb, &x);
+        S(scalar_set_b32)(&rx, xb, &carry);
+        if (!S(scalar_eq)(&rx, &e->inversion[i].r)) { free(results); free(pref); free(zinv); return 0; }
+        records[i].hint = (unsigned char)(S(fe_is_odd)(&y) | (carry << 1));
+        S(fe_get_b32)(records[i].y, &y);
+    }
+    free(results); free(pref); free(zinv);
+    return 1;
+}
+
+/* Advised pubkey y: take x from the compressed key bytes, y from the hint,
+ * then check the curve equation and parity — ~2 field ops instead of a
+ * mod-p sqrt. A bad hint can only waste effort (wrong point fails the batch
+ * and falls back), never produce a false accept. */
+static int key_from_hint(const Record *r, S(ge) *q) {
+    S(fe) x, y;
+    int odd;
+    if (r->pub[0] != 0x02 && r->pub[0] != 0x03) return 0;
+    odd = r->pub[0] == 0x03;
+    if (!S(fe_set_b32_limit)(&x, r->pub + 1)) return 0;
+    if (!S(fe_set_b32_limit)(&y, r->qy)) return 0;
+    if (S(fe_is_odd)(&y) != odd) return 0;
+    S(ge_set_xy)(q, &x, &y);
+    return S(ge_is_valid_var)(q);
+}
+
+/* parse() variant: same signature scalars, but the pubkey comes from the
+ * y-hint verified by key_from_hint; falls back to real decompression. */
+static int parse_keyy(Engine *e, const Record *r, S(scalar) *rr, S(scalar) *ss,
+                      S(scalar) *z, S(ge) *q) {
+    S(pubkey) pk;
+    S(ecdsa_signature) sig;
+    if (!S(ecdsa_signature_parse_compact)(e->ctx, &sig, r->sig)) return 0;
+    S(ecdsa_signature_normalize)(e->ctx, &sig, &sig);
+    S(ecdsa_signature_load)(e->ctx, rr, ss, &sig);
+    if (S(scalar_is_zero)(rr) || S(scalar_is_zero)(ss)) return 0;
+    S(scalar_set_b32)(z, r->msg, NULL);
+    if (key_from_hint(r, q)) return 1;
+    if (!S(ec_pubkey_parse)(e->ctx, &pk, r->pub, sizeof(r->pub))) return 0;
+    return S(pubkey_load)(e->ctx, q, &pk);
+}
+
 static int nonce_from_hint(const Record *record, const S(scalar) *r,
                            S(ge) *nonce, int full_y) {
     unsigned char xbytes[32];
@@ -271,6 +367,197 @@ static int batch(Engine *e, const Record *records, size_t n, int full_y, int one
     return S(gej_is_infinity)(&result);
 }
 
+/* Short-coefficient variant: rewrite each equation as
+ *   R_i - u_i*G - v_i*Q_i = 0    u_i = z_i*s_i^-1,  v_i = r_i*s_i^-1
+ * then batch  Σa_i·P_i = Σa_i R_i - (Σa_i u_i) G - Σ(a_i v_i) Q_i = 0.
+ * The R_i scalar is the k-bit coefficient itself — (96+256)/w adds/sig
+ * instead of (256+256)/w. The s_i^-1s are one Montgomery batch.
+ * Soundness: a cheating advisor sees a_i only after the batch commits;
+ * P_i != 0 passes with prob ~2^-96. */
+#define SHORT_BYTES 12 /* 96-bit coefficients */
+static void scalar_inverse_batch(Engine *e, size_t n) {
+    S(scalar) running;
+    size_t i;
+    S(scalar_set_int)(&running, 1);
+    for (i = 0; i < n; ++i) {
+        e->inversion[i].prefix = running;
+        S(scalar_mul)(&running, &running, &e->inversion[i].s);
+    }
+    S(scalar_inverse_var)(&running, &running);
+    for (i = n; i-- > 0;) {
+        S(scalar_mul)(&e->inversion[i].inverse, &e->inversion[i].prefix,
+                      &running);
+        S(scalar_mul)(&running, &running, &e->inversion[i].s);
+    }
+}
+
+static int batch_short(Engine *e, const Record *records, size_t n,
+                       int full_y) {
+    S(scalar) generator;
+    S(gej) result;
+    size_t i;
+    if (n > MAX_BATCH) return 0;
+    if (n == 0) return 1;
+    entropy(e->random, n * 32);
+    for (i = 0; i < n; ++i) {
+        if (!parse(e, &records[i], &e->inversion[i].r, &e->inversion[i].s,
+                   &e->inversion[i].z, &e->inversion[i].q)) return 0;
+    }
+    scalar_inverse_batch(e, n);
+    S(scalar_set_int)(&generator, 0);
+    for (i = 0; i < n; ++i) {
+        S(scalar) a, u, v;
+        unsigned char a32[32];
+        if (!nonce_from_hint(&records[i], &e->inversion[i].r,
+                             &e->points[2*i], full_y)) return 0;
+        memset(a32, 0, 32);
+        memcpy(a32 + 32 - SHORT_BYTES, e->random + 32*i, SHORT_BYTES);
+        for (;;) {
+            int ov;
+            S(scalar_set_b32)(&a, a32, &ov);
+            if (!ov && !S(scalar_is_zero)(&a)) break;
+            entropy(e->random + 32*i, 32);
+            memcpy(a32 + 32 - SHORT_BYTES, e->random + 32*i, SHORT_BYTES);
+        }
+        e->scalars[2*i] = a;              /* R_i · a_i  (96-bit) */
+        e->points[2*i+1] = e->inversion[i].q;
+        S(scalar_mul)(&v, &e->inversion[i].r, &e->inversion[i].inverse);
+        S(scalar_mul)(&e->scalars[2*i+1], &a, &v);
+        S(scalar_negate)(&e->scalars[2*i+1], &e->scalars[2*i+1]);
+        S(scalar_mul)(&u, &e->inversion[i].z, &e->inversion[i].inverse);
+        S(scalar_mul)(&u, &a, &u);
+        S(scalar_add)(&generator, &generator, &u);
+    }
+    S(scalar_negate)(&generator, &generator);
+    REQUIRE(S(ecmult_multi_var)(&e->ctx->error_callback, &e->scratch, &result,
+                                &generator, term, e, 2*n));
+    REQUIRE(e->scratch.alloc_size == 0);
+    return S(gej_is_infinity)(&result);
+}
+
+/* batch_short with advised pubkey-y: per-sig key cost drops from a mod-p
+ * sqrt to a curve-equation check. Same soundness + fallback shape. */
+static int batch_short_keyy(Engine *e, const Record *records, size_t n,
+                            int full_y) {
+    S(scalar) generator;
+    S(gej) result;
+    size_t i;
+    if (n > MAX_BATCH) return 0;
+    if (n == 0) return 1;
+    entropy(e->random, n * 32);
+    for (i = 0; i < n; ++i) {
+        if (!parse_keyy(e, &records[i], &e->inversion[i].r,
+                        &e->inversion[i].s, &e->inversion[i].z,
+                        &e->inversion[i].q)) return 0;
+    }
+    scalar_inverse_batch(e, n);
+    S(scalar_set_int)(&generator, 0);
+    for (i = 0; i < n; ++i) {
+        S(scalar) a, u, v;
+        unsigned char a32[32];
+        if (!nonce_from_hint(&records[i], &e->inversion[i].r,
+                             &e->points[2*i], full_y)) return 0;
+        memset(a32, 0, 32);
+        memcpy(a32 + 32 - SHORT_BYTES, e->random + 32*i, SHORT_BYTES);
+        for (;;) {
+            int ov;
+            S(scalar_set_b32)(&a, a32, &ov);
+            if (!ov && !S(scalar_is_zero)(&a)) break;
+            entropy(e->random + 32*i, 32);
+            memcpy(a32 + 32 - SHORT_BYTES, e->random + 32*i, SHORT_BYTES);
+        }
+        e->scalars[2*i] = a;
+        e->points[2*i+1] = e->inversion[i].q;
+        S(scalar_mul)(&v, &e->inversion[i].r, &e->inversion[i].inverse);
+        S(scalar_mul)(&e->scalars[2*i+1], &a, &v);
+        S(scalar_negate)(&e->scalars[2*i+1], &e->scalars[2*i+1]);
+        S(scalar_mul)(&u, &e->inversion[i].z, &e->inversion[i].inverse);
+        S(scalar_mul)(&u, &a, &u);
+        S(scalar_add)(&generator, &generator, &u);
+    }
+    S(scalar_negate)(&generator, &generator);
+    REQUIRE(S(ecmult_multi_var)(&e->ctx->error_callback, &e->scratch, &result,
+                                &generator, term, e, 2*n));
+    REQUIRE(e->scratch.alloc_size == 0);
+    return S(gej_is_infinity)(&result);
+}
+
+/* Repeat-key coalescing on top of batch_short_keyy: signatures sharing a
+ * pubkey merge into ONE Q-term — Σ_j (Σ_{i∈j} a_i v_i) Q_j — since the
+ * batch equation is linear. MSM terms drop 2n -> n + n_unique.
+ * Soundness unchanged: a_i stays a fresh per-sig random; grouping only
+ * sums fixed linear combinations. A tiny open-addr map does the
+ * pub33 -> group routing inside the timed region. */
+typedef struct { unsigned char key[33]; uint32_t idx; } GroupSlot;
+static int batch_short_keyy_coal(Engine *e, const Record *records, size_t n,
+                                 int full_y) {
+    S(scalar) generator;
+    S(gej) result;
+    size_t i, g = 0, cap = 1;
+    GroupSlot *groups;
+    if (n > MAX_BATCH) return 0; /* points/scalars hold 2*MAX_BATCH: n+g<=2n */
+    if (n == 0) return 1;
+    entropy(e->random, n * 32);
+    while (cap < n * 2) cap <<= 1;
+    groups = calloc(cap, sizeof(*groups));
+    REQUIRE(groups);
+    for (i = 0; i < n; ++i) {
+        if (!parse_keyy(e, &records[i], &e->inversion[i].r,
+                        &e->inversion[i].s, &e->inversion[i].z,
+                        &e->inversion[i].q)) { free(groups); return 0; }
+        /* route to a group slot by pub key bytes */
+        {
+            uint64_t h; size_t j;
+            memcpy(&h, records[i].pub, 8);
+            j = (h * 0x9E3779B97F4A7C15ULL) & (cap - 1);
+            while (groups[j].idx) {
+                if (!memcmp(groups[j].key, records[i].pub, 33)) break;
+                j = (j + 1) & (cap - 1);
+            }
+            if (!groups[j].idx) {
+                ++g;
+                memcpy(groups[j].key, records[i].pub, 33);
+                groups[j].idx = (uint32_t)g;          /* 1-based */
+                e->points[n + g - 1] = e->inversion[i].q;
+                S(scalar_set_int)(&e->scalars[n + g - 1], 0);
+            }
+            e->inversion[i].group = groups[j].idx;   /* stash group id */
+        }
+    }
+    scalar_inverse_batch(e, n);
+    S(scalar_set_int)(&generator, 0);
+    for (i = 0; i < n; ++i) {
+        S(scalar) a, u, v;
+        unsigned char a32[32];
+        size_t gi = e->inversion[i].group - 1;
+        if (!nonce_from_hint(&records[i], &e->inversion[i].r,
+                             &e->points[i], full_y)) { free(groups); return 0; }
+        memset(a32, 0, 32);
+        memcpy(a32 + 32 - SHORT_BYTES, e->random + 32*i, SHORT_BYTES);
+        for (;;) {
+            int ov;
+            S(scalar_set_b32)(&a, a32, &ov);
+            if (!ov && !S(scalar_is_zero)(&a)) break;
+            entropy(e->random + 32*i, 32);
+            memcpy(a32 + 32 - SHORT_BYTES, e->random + 32*i, SHORT_BYTES);
+        }
+        e->scalars[i] = a;                            /* R_i · a_i */
+        S(scalar_mul)(&v, &e->inversion[i].r, &e->inversion[i].inverse);
+        S(scalar_mul)(&v, &a, &v);
+        S(scalar_negate)(&v, &v);
+        S(scalar_add)(&e->scalars[n + gi], &e->scalars[n + gi], &v);
+        S(scalar_mul)(&u, &e->inversion[i].z, &e->inversion[i].inverse);
+        S(scalar_mul)(&u, &a, &u);
+        S(scalar_add)(&generator, &generator, &u);
+    }
+    S(scalar_negate)(&generator, &generator);
+    free(groups);
+    REQUIRE(S(ecmult_multi_var)(&e->ctx->error_callback, &e->scratch, &result,
+                                &generator, term, e, n + g));
+    REQUIRE(e->scratch.alloc_size == 0);
+    return S(gej_is_infinity)(&result);
+}
+
 static void with_fallback(Engine *e, const Record *r, size_t n, int full_y,
                           unsigned char *out) {
     size_t i;
@@ -304,6 +591,40 @@ static void make_records(Engine *e, Record *records, size_t n) {
         REQUIRE(S(ec_pubkey_create)(e->ctx, &pk, secret));
         REQUIRE(S(ec_pubkey_serialize)(e->ctx, records[i].pub, &len, &pk, SECP256K1_EC_COMPRESSED));
         REQUIRE(len == 33);
+        { S(ge) q;
+          REQUIRE(S(pubkey_load)(e->ctx, &q, &pk));
+          S(fe_normalize_var)(&q.y);
+          S(fe_get_b32)(records[i].qy, &q.y); }
+        REQUIRE(S(ecdsa_sign)(e->ctx, &sig, records[i].msg, secret, NULL, NULL));
+        REQUIRE(S(ecdsa_signature_serialize_compact)(e->ctx, records[i].sig, &sig));
+        memset(secret, 0, sizeof(secret));
+    }
+}
+
+/* ~dup_frac of records reuse a random earlier key — the corpus-measured
+ * ~30% repeat-key shape. Valid sigs (fresh msg signed by the reused
+ * secret) under a shared pubkey: exactly what coalescing eats. */
+static void make_records_dup(Engine *e, Record *records, size_t n,
+                             int dup_pct) {
+    size_t i;
+    for (i = 0; i < n; ++i) {
+        unsigned char secret[32], sel[32];
+        S(pubkey) pk;
+        S(ecdsa_signature) sig;
+        size_t len = 33;
+        uint64_t key_idx = i;
+        deterministic_bytes(sel, (uint64_t)i, 9);
+        if (i > 0 && (sel[0] % 100) < dup_pct)
+            key_idx = ((uint64_t)sel[1] << 8 | sel[2]) % i;
+        deterministic_bytes(secret, key_idx, 1);
+        deterministic_bytes(records[i].msg, (uint64_t)i, 2);
+        REQUIRE(S(ec_pubkey_create)(e->ctx, &pk, secret));
+        REQUIRE(S(ec_pubkey_serialize)(e->ctx, records[i].pub, &len, &pk, SECP256K1_EC_COMPRESSED));
+        REQUIRE(len == 33);
+        { S(ge) q;
+          REQUIRE(S(pubkey_load)(e->ctx, &q, &pk));
+          S(fe_normalize_var)(&q.y);
+          S(fe_get_b32)(records[i].qy, &q.y); }
         REQUIRE(S(ecdsa_sign)(e->ctx, &sig, records[i].msg, secret, NULL, NULL));
         REQUIRE(S(ecdsa_signature_serialize_compact)(e->ctx, records[i].sig, &sig));
         memset(secret, 0, sizeof(secret));
@@ -338,6 +659,9 @@ static Record rare_carry(Engine *e) {
     S(ge_set_gej_var)(&q, &qj);
     S(pubkey_save)(&pk, &q);
     REQUIRE(S(ec_pubkey_serialize)(e->ctx, record.pub, &len, &pk, SECP256K1_EC_COMPRESSED));
+    { S(fe) qyn = q.y;
+      S(fe_normalize_var)(&qyn);
+      S(fe_get_b32)(record.qy, &qyn); }
     S(ecdsa_signature_save)(&sig, &r, &s);
     REQUIRE(S(ecdsa_signature_serialize_compact)(e->ctx, record.sig, &sig));
     S(scalar_get_b32)(record.msg, &z);

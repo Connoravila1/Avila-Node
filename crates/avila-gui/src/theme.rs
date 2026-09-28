@@ -29,6 +29,8 @@ pub const CAPTION: &str = "caption";
 pub const START: &str = "start";
 /// Pacifico: Julia's script, and the Julia card's name in the toybox.
 pub const SCRIPT: &str = "script";
+/// Bitcoin 0.1's Windows interface face, independent of modern typography.
+pub const CLASSIC_UI: &str = "bitcoin-0.1-ui";
 
 /// Every surface and text color, resolved for one appearance.
 #[derive(Clone, Copy, Debug)]
@@ -186,17 +188,16 @@ impl Palette {
         hearts: false,
     };
 
-    /// Toybox: the 2011 wallet. Qt's beige chrome, a gold coin's signal,
-    /// square corners. Proven is gold here.
+    /// Toybox: Bitcoin 0.1's Windows XP Silver / wxWidgets surfaces.
     pub const CLASSIC: Self = Self {
         dark: false,
-        canvas: Color32::from_rgb(238, 236, 228),
-        raised: Color32::from_rgb(252, 251, 246),
-        well: Color32::from_rgb(228, 225, 214),
-        hairline: Color32::from_rgb(188, 183, 166),
-        text: Color32::from_rgb(24, 23, 18),
-        muted: Color32::from_rgb(94, 90, 76),
-        faint: Color32::from_rgb(152, 147, 130),
+        canvas: Color32::from_rgb(224, 223, 227),
+        raised: Color32::from_rgb(239, 238, 242),
+        well: Color32::from_rgb(224, 223, 227),
+        hairline: Color32::from_rgb(157, 157, 161),
+        text: Color32::BLACK,
+        muted: Color32::from_rgb(80, 80, 80),
+        faint: Color32::from_rgb(128, 128, 128),
         signal: Color32::from_rgb(206, 148, 26),
         signal_text: Color32::from_rgb(140, 94, 10),
         alert: Color32::from_rgb(172, 34, 22),
@@ -204,9 +205,9 @@ impl Palette {
         rail_ink: Color32::from_rgb(234, 227, 208),
         rail_active: Color32::from_rgb(206, 148, 26),
         rail_active_ink: Color32::from_rgb(30, 27, 16),
-        primary: Color32::from_rgb(66, 112, 60),
-        on_primary: Color32::from_rgb(248, 246, 238),
-        round: 2,
+        primary: Color32::from_rgb(49, 106, 197),
+        on_primary: Color32::WHITE,
+        round: 0,
         chunky: true,
         hearts: false,
     };
@@ -285,7 +286,7 @@ pub enum Skin {
     Tip,
     /// A green-glass terminal.
     Phosphor,
-    /// The 2011 wallet's chrome.
+    /// Bitcoin 0.1's January 2009 wxWidgets window.
     Classic,
 }
 
@@ -345,6 +346,9 @@ pub fn set_skin(ctx: &egui::Context, skin: Skin) {
     if was == skin && skin != Skin::Tip {
         return;
     }
+    // Restore the normal spacing as well as the colors when leaving a
+    // skin. Classic's compact menus must not leak into the other skins.
+    install_style(ctx);
     let pal = match skin {
         Skin::Xp => Some(Palette::XP),
         Skin::Julia => Some(Palette::JULIA),
@@ -354,6 +358,7 @@ pub fn set_skin(ctx: &egui::Context, skin: Skin) {
         Skin::Standard => None,
     };
     let xp = skin == Skin::Xp;
+    let classic = skin == Skin::Classic;
     for theme in [Theme::Light, Theme::Dark] {
         let base = match (pal, theme) {
             (Some(p), _) => p,
@@ -363,10 +368,12 @@ pub fn set_skin(ctx: &egui::Context, skin: Skin) {
         let mut v = visuals(&base);
         if xp {
             xp_visuals(&mut v);
+        } else if classic {
+            classic_visuals(&mut v);
         }
         ctx.set_visuals_of(theme, v);
         ctx.style_mut_of(theme, |style| {
-            style.spacing.scroll = if xp {
+            style.spacing.scroll = if xp || classic {
                 egui::style::ScrollStyle {
                     foreground_color: false,
                     ..egui::style::ScrollStyle::solid()
@@ -374,6 +381,21 @@ pub fn set_skin(ctx: &egui::Context, skin: Skin) {
             } else {
                 egui::style::ScrollStyle::floating()
             };
+            if classic {
+                style.text_styles = [
+                    (TextStyle::Small, font(CLASSIC_UI, 11.0)),
+                    (TextStyle::Body, font(CLASSIC_UI, 11.0)),
+                    (TextStyle::Button, font(CLASSIC_UI, 11.0)),
+                    (TextStyle::Monospace, font(CLASSIC_UI, 11.0)),
+                    (TextStyle::Heading, font(STRONG, 13.0)),
+                ]
+                .into();
+                style.spacing.item_spacing = egui::vec2(5.0, 4.0);
+                style.spacing.button_padding = egui::vec2(6.0, 3.0);
+                style.spacing.interact_size = egui::vec2(0.0, 21.0);
+                style.spacing.menu_margin = egui::Margin::same(2);
+                style.spacing.window_margin = egui::Margin::same(10);
+            }
         });
     }
     install_fonts(ctx, skin);
@@ -382,17 +404,36 @@ pub fn set_skin(ctx: &egui::Context, skin: Skin) {
 /// A font of one of the named families.
 #[must_use]
 pub fn font(family: &str, size: f32) -> FontId {
+    let size = if Skin::current() == Skin::Classic {
+        match family {
+            CLASSIC_UI | CAPTION => size,
+            DISPLAY => size.min(18.0),
+            TITLE => size.min(16.0),
+            STRONG => size.min(13.0),
+            _ => size.min(11.0),
+        }
+    } else {
+        size
+    };
     FontId::new(size, FontFamily::Name(family.into()))
 }
 
 #[must_use]
 pub fn body(size: f32) -> FontId {
-    FontId::proportional(size)
+    FontId::proportional(if Skin::current() == Skin::Classic {
+        size.min(11.0)
+    } else {
+        size
+    })
 }
 
 #[must_use]
 pub fn mono(size: f32) -> FontId {
-    FontId::monospace(size)
+    FontId::monospace(if Skin::current() == Skin::Classic {
+        size.min(11.0)
+    } else {
+        size
+    })
 }
 
 /// Jost (display, titles — the wordmark's geometry), Instrument Sans
@@ -407,6 +448,7 @@ pub fn mono(size: f32) -> FontId {
 /// a terminal doesn't do proportional type.
 pub fn install_fonts(ctx: &egui::Context, skin: Skin) {
     let xp = skin == Skin::Xp;
+    let classic = skin == Skin::Classic;
     let phosphor = skin == Skin::Phosphor;
     let mut fonts = FontDefinitions::default();
     let faces: [(&str, &'static [u8]); 8] = [
@@ -448,7 +490,29 @@ pub fn install_fonts(ctx: &egui::Context, skin: Skin) {
             .font_data
             .insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
     }
-    let borrowed: &[(&str, Arc<FontData>)] = if xp { xp_faces() } else { &[] };
+    if classic {
+        for (name, bytes) in [
+            (
+                "wine-tahoma",
+                include_bytes!("../assets/fonts/WineTahoma-Regular.ttf").as_slice(),
+            ),
+            (
+                "wine-tahoma-bold",
+                include_bytes!("../assets/fonts/WineTahoma-Bold.ttf").as_slice(),
+            ),
+        ] {
+            fonts
+                .font_data
+                .insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
+        }
+    }
+    let borrowed: &[(&str, Arc<FontData>)] = if xp {
+        xp_faces()
+    } else if classic {
+        classic_faces()
+    } else {
+        &[]
+    };
     for (name, data) in borrowed {
         fonts.font_data.insert((*name).to_owned(), data.clone());
     }
@@ -477,8 +541,10 @@ pub fn install_fonts(ctx: &egui::Context, skin: Skin) {
     fonts.families.insert(
         FontFamily::Proportional,
         chain(
-            &["xp-ui"],
-            if phosphor {
+            if classic { &["classic-ui"] } else { &["xp-ui"] },
+            if classic {
+                "wine-tahoma"
+            } else if phosphor {
                 "plex-mono"
             } else {
                 "instrument-regular"
@@ -488,7 +554,11 @@ pub fn install_fonts(ctx: &egui::Context, skin: Skin) {
     );
     fonts.families.insert(
         FontFamily::Monospace,
-        chain(&[], "plex-mono", &mono_fallback),
+        if classic {
+            chain(&["classic-ui"], "wine-tahoma", &proportional_fallback)
+        } else {
+            chain(&[], "plex-mono", &mono_fallback)
+        },
     );
     for (family, xp_face, face) in [
         (DISPLAY, &["xp-display"][..], "jost-light"),
@@ -513,6 +583,23 @@ pub fn install_fonts(ctx: &egui::Context, skin: Skin) {
             face
         };
         let mut faces = chain(xp_face, own, &proportional_fallback);
+        if classic {
+            faces = if family == CAPTION {
+                chain(
+                    &["classic-caption", "classic-bold"],
+                    "wine-tahoma-bold",
+                    &proportional_fallback,
+                )
+            } else if family == STRONG {
+                chain(
+                    &["classic-bold"],
+                    "wine-tahoma-bold",
+                    &proportional_fallback,
+                )
+            } else {
+                chain(&["classic-ui"], "wine-tahoma", &proportional_fallback)
+            };
+        }
         if skin == Skin::Julia && big {
             faces.insert(0, "pacifico".to_owned());
         }
@@ -532,7 +619,90 @@ pub fn install_fonts(ctx: &egui::Context, skin: Skin) {
         FontFamily::Name(MONO_MEDIUM.into()),
         chain(&[], "plex-mono-medium", &mono_fallback),
     );
+    if classic {
+        fonts.families.insert(
+            FontFamily::Name(CLASSIC_UI.into()),
+            chain(&["classic-ui"], "wine-tahoma", &proportional_fallback),
+        );
+        fonts.families.insert(
+            FontFamily::Name(MONO_MEDIUM.into()),
+            chain(
+                &["classic-bold"],
+                "wine-tahoma-bold",
+                &proportional_fallback,
+            ),
+        );
+    }
     ctx.set_fonts(fonts);
+}
+
+/// Prefer genuine installed Windows faces. Wine's redistributable Tahoma
+/// is bundled so this skin also has period typography on a fresh Linux.
+fn classic_faces() -> &'static [(&'static str, Arc<FontData>)] {
+    static FACES: std::sync::OnceLock<Vec<(&'static str, Arc<FontData>)>> =
+        std::sync::OnceLock::new();
+    FACES.get_or_init(|| {
+        [
+            ("classic-ui", &["tahoma.ttf", "Tahoma.ttf"][..], "Tahoma"),
+            (
+                "classic-bold",
+                &["tahomabd.ttf", "Tahoma Bold.ttf"][..],
+                "Tahoma:bold",
+            ),
+            (
+                "classic-caption",
+                &[
+                    "trebucbd.ttf",
+                    "Trebuchet_MS_Bold.ttf",
+                    "Trebuchet MS Bold.ttf",
+                ][..],
+                "Trebuchet MS:bold",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(role, files, pattern)| {
+            system_font(files, pattern).map(|bytes| (role, Arc::new(FontData::from_owned(bytes))))
+        })
+        .collect()
+    })
+}
+
+fn classic_visuals(v: &mut Visuals) {
+    let edge = Stroke::new(1.0, Color32::from_rgb(157, 157, 161));
+    let select = Color32::from_rgb(49, 106, 197);
+    v.override_text_color = None;
+    v.window_corner_radius = CornerRadius::ZERO;
+    v.menu_corner_radius = CornerRadius::ZERO;
+    v.window_stroke = edge;
+    v.popup_shadow = egui::Shadow {
+        offset: [2, 2],
+        blur: 0,
+        spread: 0,
+        color: Color32::from_black_alpha(90),
+    };
+    v.selection.bg_fill = select;
+    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    for state in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        state.corner_radius = CornerRadius::ZERO;
+        state.expansion = 0.0;
+    }
+    v.widgets.inactive.bg_stroke = edge;
+    v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    for state in [
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        state.bg_fill = select;
+        state.weak_bg_fill = select;
+        state.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    }
 }
 
 /// XP's faces found on this system, looked up once.

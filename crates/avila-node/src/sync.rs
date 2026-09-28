@@ -331,6 +331,13 @@ pub struct SyncConfig {
     /// spend bundle per connected block (`proofs.dat`), served to
     /// peers who sent `sendutxproof`.
     pub utreexo_bridge: bool,
+    /// Experimental fast-IBD path: mirror the committed coins into a
+    /// RAM-resident flat table (~0.34 µs/input measured vs ~2.8 µs
+    /// through the disk cascade — `coins_flat_bench`, experiment
+    /// 09-28s). The value is the flat table's resident-byte cap; `0`
+    /// means uncapped. When unset or over-budget the ordinary disk
+    /// path runs — verification is identical either way.
+    pub flat_utxo_bytes: Option<usize>,
     /// When set, publish each tick's progress into this snapshot so a
     /// query surface (RPC, GUI) can read it without blocking sync.
     pub status: Option<crate::rpc::SharedStatus>,
@@ -481,6 +488,7 @@ impl Default for SyncConfig {
             electrum: None,
             utreexo: false,
             utreexo_bridge: false,
+            flat_utxo_bytes: None,
             status: None,
             queries: None,
             waiters: None,
@@ -858,6 +866,16 @@ pub fn run(
         }
         None => Chainstate::new(params),
     };
+    if let Some(cap) = cfg.flat_utxo_bytes {
+        if cs.enable_flat_utxo(cap) {
+            eprintln!("flat-utxo: enabled (cap {} bytes)", cap);
+        } else {
+            eprintln!(
+                "flat-utxo: refused by cap {} bytes — staying on disk path",
+                cap
+            );
+        }
+    }
     if cfg.txindex {
         cs.enable_txindex(cfg.data_dir.as_deref())
             .map_err(SyncError::Store)?;

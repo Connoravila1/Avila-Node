@@ -1,0 +1,507 @@
+{
+  "checks": {
+    "navigate_chain": true,
+    "stop_node": true,
+    "start_node": true,
+    "return_modern": true,
+    "copy_tip": true,
+    "compact_size": true,
+    "original_size": true
+  },
+  "screenshots": {
+    "original-size": {
+      "screenshot": "light-overview-classic-original-size.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "compact": {
+      "screenshot": "light-overview-classic-archive-size.png",
+      "pixels": [
+        1175,
+        552
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          331.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "recent-blocks": {
+      "screenshot": "light-overview-classic-blocks.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "node-menu": {
+      "screenshot": "light-overview-classic-menu.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "navigate-chain": {
+      "screenshot": "light-overview-classic-navigate-chain.png",
+      "pixels": [
+        1867,
+        1273
+      ],
+      "actual": {
+        "page": "Chain",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          1120.1875,
+          763.8125
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "stopped": {
+      "screenshot": "light-overview-classic-stop.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Stopped",
+        "running": false,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "started": {
+      "screenshot": "light-overview-classic-start.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "modern-return": {
+      "screenshot": "light-overview-classic-return-modern.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Standard",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-activity-classic-page": {
+      "screenshot": "light-activity-classic-page.png",
+      "pixels": [
+        1867,
+        1267
+      ],
+      "actual": {
+        "page": "Activity",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          1120.1875,
+          760.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-chain-classic-page": {
+      "screenshot": "light-chain-classic-page.png",
+      "pixels": [
+        1867,
+        1267
+      ],
+      "actual": {
+        "page": "Chain",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          1120.1875,
+          760.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-config-classic-page": {
+      "screenshot": "light-config-classic-page.png",
+      "pixels": [
+        1867,
+        1267
+      ],
+      "actual": {
+        "page": "Config",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          1120.1875,
+          760.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-overview-classic-about": {
+      "screenshot": "light-overview-classic-about.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-overview-classic-archive-size": {
+      "screenshot": "light-overview-classic-archive-size.png",
+      "pixels": [
+        1175,
+        552
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          331.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-overview-classic-blocks": {
+      "screenshot": "light-overview-classic-blocks.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-overview-classic-copy": {
+      "screenshot": "light-overview-classic-copy.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": true,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-overview-classic-menu": {
+      "screenshot": "light-overview-classic-menu.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-overview-classic-navigate-chain": {
+      "screenshot": "light-overview-classic-navigate-chain.png",
+      "pixels": [
+        1867,
+        1273
+      ],
+      "actual": {
+        "page": "Chain",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          1120.1875,
+          763.8125
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-overview-classic-original-size": {
+      "screenshot": "light-overview-classic-original-size.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-overview-classic-overview": {
+      "screenshot": "light-overview-classic-overview.png",
+      "pixels": [
+        1867,
+        1273
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          1120.1875,
+          763.8125
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-overview-classic-return-modern": {
+      "screenshot": "light-overview-classic-return-modern.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Standard",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-overview-classic-selected": {
+      "screenshot": "light-overview-classic-selected.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-overview-classic-start": {
+      "screenshot": "light-overview-classic-start.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-overview-classic-stop": {
+      "screenshot": "light-overview-classic-stop.png",
+      "pixels": [
+        1175,
+        807
+      ],
+      "actual": {
+        "page": "Overview",
+        "skin": "Classic",
+        "phase": "Stopped",
+        "running": false,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          705.0,
+          484.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-peers-classic-page": {
+      "screenshot": "light-peers-classic-page.png",
+      "pixels": [
+        1867,
+        1267
+      ],
+      "actual": {
+        "page": "Peers",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          1120.1875,
+          760.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-settings-classic-page": {
+      "screenshot": "light-settings-classic-page.png",
+      "pixels": [
+        1867,
+        1267
+      ],
+      "actual": {
+        "page": "Settings",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          1120.1875,
+          760.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    },
+    "light-toybox-classic": {
+      "screenshot": "light-toybox-classic.png",
+      "pixels": [
+        1867,
+        1267
+      ],
+      "actual": {
+        "page": "Toybox",
+        "skin": "Classic",
+        "phase": "Up to date",
+        "running": true,
+        "copied_chain_tip": false,
+        "viewport_points": [
+          1120.1875,
+          760.1875
+        ],
+        "pixels_per_point": 1.6666666
+      }
+    }
+  }
+}

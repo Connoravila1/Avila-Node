@@ -69,6 +69,8 @@ pub struct App {
     /// Whether the system draws the window's frame (not under XP, which
     /// draws its own); `None` until first asked.
     decorated: Option<bool>,
+    /// Restore the user's window size after the original client's compact frame.
+    classic_restore_size: Option<egui::Vec2>,
     /// Save preferences on exit (not for captures or one-run skins).
     keep_prefs: bool,
     /// The first-open slideshow — `Some(step)` while it runs.
@@ -233,6 +235,7 @@ impl App {
             restart: false,
             events_tail,
             decorated: None,
+            classic_restore_size: None,
             config_mtime: (
                 config_file
                     .as_ref()
@@ -975,6 +978,17 @@ impl eframe::App for App {
         // are put in force here, once.
         if self.prefs != self.applied {
             if self.prefs.skin != self.applied.skin {
+                if self.capture.is_none() {
+                    if self.prefs.skin == Skin::Classic {
+                        self.classic_restore_size = Some(ctx.viewport_rect().size());
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(705.0, 484.0)));
+                        self.page = Page::Overview;
+                    } else if self.applied.skin == Skin::Classic
+                        && let Some(size) = self.classic_restore_size.take()
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                    }
+                }
                 let icon = if self.prefs.skin == Skin::Classic {
                     classic::window_icon()
                 } else {
@@ -1033,6 +1047,20 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(250));
         } else {
             ctx.request_repaint_after(Duration::from_secs(1));
+        }
+        if let Some(capture) = &mut self.capture {
+            capture.observe(
+                &ctx,
+                self.page,
+                Skin::current(),
+                self.session.phase().label(),
+                self.session.running(),
+                self.session
+                    .view
+                    .as_ref()
+                    .and_then(|v| v.recent.last())
+                    .map(|(_, hash)| hash.as_str()),
+            );
         }
     }
 

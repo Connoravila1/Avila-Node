@@ -1420,3 +1420,399 @@ Top recommendations: interleaved SHA-NI sighash (cheapest real win),
 fused-4 kernel scheduling to port floor (biggest verified headroom),
 repeat-key census + tower cache, verify4 composite for the honest
 end-to-end number. 46 code artifacts in experiments/code/.
+
+## 2026-09-28g — byte-level review of the deep-drill ledger (fresh-eyes pass)
+
+Second-instance review of the 09-28 crypto ledger + surrounding IBD
+experiments. Re-derived the load-bearing algebra (SP/lift ≡ advice,
+~2 bits/sig info gap, Ω(N) sig bound) — it holds; the standalone
+~4–6 h envelope on the N305 holds. The rigidity was in the *framing*:
+sighash, parse, join, and advice production treated as fixed-cost
+stages. Byte-level findings (analysis, unmeasured):
+
+- **Legacy sighash is a splice family.** Current code materializes the
+  whole preimage in a Vec per input (`sigchecker.rs:392`). But
+  preimage_i = shared-blanked-prefix ‖ scriptCode_i ‖ shared-suffix:
+  one streaming pass snapshots SHA-256 midstates at every input
+  boundary (O(txsize) once, not O(n·txsize)); the n per-input
+  continuations are independent chains → multiway lanes. ~½ the
+  compression count before parallelism + no preimage allocation.
+  Sized honestly at ~1.5–4% of script wall today (instrumented 1.4%
+  at ~341k), becomes the binding term once sigs accelerate.
+- **Advice production is ~free, not +16%.** `produce_hint` pays one
+  Jacobian→affine inversion per sig; Montgomery-batch the Z⁻¹
+  extraction across a block → ~5 field muls/sig ≈ +0.2%. Every
+  verifying node emits AVHINT04 as a byproduct — the advice plane is
+  seedable infrastructure (incl. the user's already-synced node).
+- **Positional outpoints + template scriptPubKeys are a lossless
+  internal rep, not just wire encoding.** txid is derivable from the
+  in-corpus creating tx; join keys shrink 36B→~8B; scriptCode is
+  synthesized not stored. Expected total ~25–35% lossless reduction —
+  measure before claiming the 45%/940Mbps scenario.
+- **The transcript frame:** the corpus is closed under re-derivation;
+  the only genuinely external data in all of historical validation is
+  the ~2 bits/sig R-parity hints (~0.3–0.6 GB total). Everything else
+  is one fused hash pass + integer anti-join + batched algebraic check.
+
+Follow-up stack correction (same pass): the measured 40.27us advised
+batch is ~3x above its own floor — 2 MSM terms/sig (G column collapses
+to one scalar mul per batch) + ~60% non-MSM overhead. The
+6us/input serial join (6.2 CPU-h, larger than the optimized sig plane)
+is a hash-map implementation cost, not physics — partition+positional
+u64 keys -> ~15-90min wall.
+
+MEASURED (msm_decomp_bench.c + msm_add4_probe.c + add8_il_probe.c,
+pinned, guard-capped): the 38us advised batch decomposes as MSM 26.1us
+(69%, ~13us/term at 16k terms) + pubkey-decompress 11us (29%) + ~0.5us.
+Fused-4 point adds: ~270-285ns/lane-add serial AND independent —
+streams + instruction-interleaved pairs overlap ~0% (each op ~9k uops
+>> ROB) -> MSM floor ~300ns/lane-add incl. gather/scatter, only
+~1.5-1.6x vs scalar, NOT the 5-8x the throughput figure implied. The
+EZ"independent mul ~7ns" regime needs ops <~450 uops; unreachable at
+whole-formula granularity (x2 interleave probe: +3%). gej4_add_ge4
+correct 0/16000 non-degenerate lanes; needs h==0 lane fixup for real
+MSM. Advised-batch floor ~16-23us CPU/sig -> **~0.9-2.3h sig wall @8c**
+(vs 2.3-4.9h at unimproved 40us). Stacked envelope corpus-local
+~1.5-3h honest; sub-hour needs a sub-450-uop scheduler (uncertain)
+plus acquisition (~350-450GB transcript encoding).
+
+SHORT-COEFFICIENT BATCH (batch_short, measured + tamper-checked):
+re-derive the per-sig equation as R_i - u_i*G - v_i*Q_i = 0 with
+u_i=z_i/s_i, v_i=r_i/s_i — then the R_i MSM scalar is the coefficient
+a_i itself, which only needs ~96 bits for soundness (advisor sees a_i
+after committing). Adds/sig: (256+256)/w -> (96+256)/w; the s^-1 batch
+is one Montgomery pass (~0.16us/sig). MEASURED: batch() 36.9us/sig ->
+batch_short() 30.8us/sig (-17%), tamper check PASS. With repeat-key
+coalescing on the full-width Q side (~23 adds/sig) + affine-y key
+advice (parse -> ~0.5us) the advised sig models at ~9-13us CPU ->
+~0.45-1.2h wall @8c. Also measured: w=16 Pippenger is WORSE than w=12
+(30.9 vs 13.0us/term — bucket-table cache pressure); ~21 adds/term is
+priced-in.
+
+JOIN-PROBE (join_probe.rs, 40M tx / 12M live / 2M inputs, pinned,
+guard-capped): flat HashMap<36B-OutPoint,Coin> probe = ~390ns/input;
+HashMap<u64,Coin> = ~233ns; u64 open-addr live table = **~98ns** —
+the raw lookup is NOT the 6us/input pipeline cost (that figure is ~94%
+layered-cascade + commit + dispatch + disk work). A naive two-stage
+positional path (txid->pos partition binary-search + u64 live probe)
+measured ~1.8us — the index-resolution probe dominates (~1355ns) and
+needs an O(1)-probe design or advice-carrying + verification, not a
+sorted partition. Byte-level verdict: the live-set side really does
+shrink to a ~2GB u64 table at scale (vs ~5GB+ hashmap) — the win is
+RAM-residency at production size, not per-probe speed. The index
+resolution remains the hard sub-problem.
+
+Ranked path forward and full writeup:
+[2026-09-28-byte-level-avenues.md](2026-09-28-byte-level-avenues.md).
+Top next: fused-4 scheduling to port floor; batched-extraction advice
+producer + AVHINT04 into sync; MSM-on-EZW batch engine (~3x inside the
+advised path); partitioned positional anti-join; sighash splice+stream
+rewrite vs blk00765 corpus.
+
+09-28h — FUSED-4 PIPPENGER MSM ENGINE: REAL KERNEL BUG FOUND + FIXED;
+first correct-and-faster measurement (msm_ezw.c, guard-capped, pinned):
+
+THE BUG (latent in ALL copies of the EZW-4 kernel — msm_ezw.c,
+msm_add4_probe.c, add8_il_probe.c, dbl4_ezw.c — every probe that
+"passed" simply never hit it): fe4_neg computed limb borrows by
+letting P4[i]-av wrap into a negative int64 and relying on fe4_norm.
+But norm's logical-shift carry treats the wrapped limb as UNSIGNED —
+it emits a +4095 carry while the explicit bor flag ALSO debited the
+next limb. Net error: +4096*2^{52i} = +2^{64+52i} in the result,
+nonzero mod p. Trigger: a[i]+bor > P4[i], which only P4[0]=
+0xFFFFBFFFFF0BC (<2^52) can cause — rate ~2^-18 per neg -> invisible
+below ~4096 terms, certain by ~8192. Diagnosed via scalar-shadow
+bisect (W11/lane3/bucket20) + a standalone reproducer
+(msm_edge_repro.c) isolating each fused intermediate: z12..r.z EQ,
+h2pre EQ, post-neg h2 NE, diff exactly +4095*2^52. Fix: on borrow add
+one base unit (2^52) back to the limb instead of leaving the 2^64
+wrap. Three-line change, +1 vector op.
+
+ALSO CONFIRMED: the fused mul/sqr hi/lo split REQUIRES
+fesetround(FE_TOWARDZERO) (the probe files do it in main; any caller
+that forgets corrupts ~half of all limb-products). This is a global
+ABI footgun to document anywhere the kernels get used.
+
+RESULTS (16384 terms, pinned, guard): all correctness gates green at
+BW=8,9,10,11,12 — brute vs scal4, brute vs msm4, per-window traces,
+degen lanes, and final equality vs scalar ecmult_multi_var.
+
+  BW   fused us/term   scalar us/term   verdict
+   8      14.3              14.4         parity
+   9      13.1              13.8         fused ~5% faster
+  10      14.1              14.8         fused ~4-5% faster
+  11      18.3              15.1         fold too big
+  12      23.2              15.3         fold dominates
+
+BW=10 split: accum 148.6us + fold 64.5us. Fold halves per -1 BW and
+accum grows ~9%, so BW=9-10 is the sweet spot at this term count.
+
+HONEST VERDICT: end-to-end fused-4 MSM is ~5-10% faster than scalar
+ecmult_multi_var at the advised-batch term counts — a real but modest
+win, far below the ~275ns/lane-add microbenchmark implied (the
+plumbing — gather/transpose/normalize/scatter/degenerate-check +
+scalar fold — is the true cost). Composes with the short-coefficient
+batch on the accumulate side (leading-zero windows skip automatically),
+worth ~another ~20% inside accum. Estimated advised-batch saving ~2-3
+us/sig -> batch_short ~28us/sig. NOT the 3x lever hypothesized;
+keeping the engine as the correct fast path is justified only after
+the scalar-fold path itself gets fused or the superbucket merge lands.
+
+09-28i — AFFINE-Y KEY ADVICE: MEASURED, the parse wall collapses
+(ecdsa_advice.c + msm_decomp_bench.c, guard-capped, pinned, n=8192):
+
+Advice stream carries the pubkey's affine y (32B/sig); the verifier
+takes x from the compressed key bytes, checks parity + curve equation
+(y^2 = x^3 + 7 via ge_is_valid_var) — verification replaces the mod-p
+sqrt. Soundness: for a given x only +-y exist and parity disambiguates;
+any y passing the check IS the real key. Bad hints waste effort only
+— the batch equation is unchanged and failure falls back to ordinary
+decompress+verify.
+
+  A  parse (sqrt path)        : 12.40 us/sig
+  A2 parse-keyy (y-hint+check):  0.22 us/sig   (56x on parse)
+  H2 key_from_hint alone      :  0.18 us/sig
+  E  batch()                  : 43.95 us/sig
+  E2 batch_short (96-bit R)   : 36.53 us/sig
+  E3 batch_keyy (E2 + key-y)  : 23.68 us/sig   (-35% vs E2)
+  G  ordinary                 : 99.48 us/sig
+  tampers: bad qy -> fallback verified PASS; bad sig -> rejected PASS
+
+ordinary -> batch_keyy = 4.2x measured on the sig plane. The MSM is
+now ~85% of the batch (~20us of 23.7): remaining sig levers are
+repeat-key coalescing (~30% off Q terms -> ~18us/sig plausible) and
+the fused-4 MSM's ~5-10%. Sig wall @8c: 23.7us -> ~1.4h (1.65B) /
+~2.9h (3.5B); ~18us -> ~1.0-2.2h. The y-advice adds 32B/sig to the
+hint stream (~53-112GB for the corpus) — compressible (parity bit
+already implies the y; could send only when keys repeat).
+
+09-28j — JOIN PLANE: O(1) TXID->POS INDEX TESTED; FLAT TABLE WINS
+(join_probe2.rs, 40M tx / 8M live / 2M inputs, guard-capped, pinned):
+
+The two-stage positional design died of indirection, not hashing:
+  D1 txhash index (open-addr u64 slots, tag32|pos27 packed, FULL
+     32B txid memcmp verify at pos — exact, consensus-safe): 306ns
+  D2 index + u64 live probe                        : 577ns
+  E  flat36 open-addr, one 64B slot = {txid,vout,coin}: 172ns  <- WIN
+  F  batch-16 software pipelining                  : flat 201 / pos 560
+  HashMap<OutPoint36B,Coin> baseline               : 505ns
+
+Verdict: flat36 beats HashMap ~3x AND positional ~3.4x. The positional
+indirection pays a second dependent miss (slot + txid-verify) before
+the live probe starts — structural, not fixable by hashing tricks.
+Pipelining did not help (single-miss path already saturates; extra
+bookkeeping cost slightly more than the overlap saved).
+
+The trade-off that remains is RAM, not speed: flat36 ~64B/entry vs
+positional ~22B/entry — at 100M live that's ~6.4GB vs ~2.2GB. On a
+30GB laptop flat36 wins outright; the "RAM residency" argument for
+positionals was overstated at this scale.
+
+JOIN REVISION: the ~6us/input pipeline figure decomposes to ~0.17us
+probe + ~5.8us of layered-cascade/commit/dispatch overhead. The probe
+floor is now measured — a flat open-addr table over the live set is
+the right shape; the remaining work is eliminating the cascade, not
+the hash.
+
+09-28k — JOIN PLANE: REAL CASCADE MEASURED, FLAT TABLE CONFIRMED
+(coins_flat_bench example, real UtxoSet::get spend path, 3M committed
+coins + 200k dirty entries, 1M inputs, guard-capped, pinned):
+
+  path                          redb    hash
+  utxo.get() cascade (real)    2963ns  2455ns
+  backend.get() alone          2954    2638
+  mem-only UtxoSet (HashMap)    429     394
+  flat36 one-probe               95      94   <- winner
+  dirty-map + flat overlay      358     329   <- deployable shape
+
+The ~5.8us-of-layering claim CONFIRMED: backend disk probes carry
+~2.6-3.0us (redb B-tree or hashstore alike — the hash engine is still
+file-backed, so O(1)-on-disk buys only ~12%). The win is RAM
+residency: flat36 = 1 miss + compare = ~95ns.
+
+Deployable shape: dirty HashMap (tombstone semantics preserved,
+map-first ordering) over a flat committed-set table = ~330-360ns/in
+end-to-end = ~8-9x the real cascade. Fully-collapsed single flat
+table (dirty bookkeeping separated for commit) = ~95ns = ~30x.
+
+At corpus scale (~150M live): flat ~80B x 1.4 load ~= 17GB — fits the
+30GB laptop budget; positional's RAM edge (~22B/entry) only matters
+if that doesn't hold. Input-side wall estimate for ~1.1-1.3B inputs:
+cascade ~55-65min CPU @ ~3us -> overlay ~6-8min CPU (~0.35us) ->
+flat ~2min CPU (~0.1us). The join plane's CPU bill is essentially
+deleted; what remains is populate cost + parse-side I/O.
+
+09-28l — REPEAT-KEY COALESCING: MEASURED −22% on dup-heavy records
+(ecdsa_advice.c batch_short_keyy_coal + msm_decomp_bench E4, n=8192,
+25.9% dup keys generated, guard-capped, pinned):
+
+Group sigs by pubkey bytes (open-addr map inside the timed region);
+one Q-term per unique key: scalars[n+j] = -sum_{i in j} a_i*v_i.
+MSM terms: 2n -> n + n_unique = 8192 + 6068 = 14260.
+
+  keyy on dup set (no coal) : 25.89 us/sig
+  keyy + coalesce           : 20.32 us/sig   (-22%)
+  tamper on coalesced batch : PASS (rejected)
+
+ordinary -> advised+coalesced = 4.9x measured end-to-end on the sig
+plane (99.1 -> 20.3 us/sig). At corpus-measured ~30.6% dup the term
+count improves further (~1.69n). Sig wall @8c: ~1.15-2.4h for
+1.65-3.5B attempts. Remaining sig lever: fused-4 MSM ~5-10% of the
+~15us MSM share. The batch is now ~75% MSM, ~10% scalar-prep,
+~15% parse+lift+inversion — the non-MSM mass is nearly gone.
+
+09-28m — HASH PLANE PRICED: splice verified byte-equal, bounded win
+(sighash_splice_bench example, midstate-capable scalar SHA-256 verified
+vs crate sha256d on every sampled input; SIGHASH_ALL continuation =
+varint+scriptCode+seq+blanked-slots+outputs+lt+ht from snapshot at the
+slot varint):
+
+  sha256d (crate, SHA-NI) : 1454 MB/s  <- SHA-NI is active on N305
+  scalar probe Sha        :  147 MB/s
+
+  n_in   real sig_hash   spliced(scalar)   ratio
+    50      1.9us/in        9.2us/in      0.2x
+   200      6.3            31.2           0.2x
+   800     24.7           120.4           0.2x
+  2000    115.7           288.0           0.45x
+
+  Structural win exists (~4x less byte mass at n=2000: one 82KB
+  forward pass + sum of shrinking suffixes vs n full preimages) but
+  ONLY pays at SHA-NI-rate continuations — at that rate spliced lands
+  ~30us/in vs 116us (~4x) on consolidation txs. Multiway AVX2 lanes
+  (~2-4GB/s aggregate) bounded ~2x more, large kernel build.
+
+VERDICT: hash plane is NOT the gate. Legacy sighash ~1.4% of script
+wall at corpus checkpoint; real path already at SHA-NI rate. Splice
+worth doing IF the sha256 fork lands anyway (midstate API needed —
+sha2 crate doesn't expose one), else bounded win on small share.
+Priced and logged; no kernel build justified yet.
+
+09-28n — TRANSCRIPT WIRE REP MEASURED on real mainnet window
+(transcript_probe example, corpus-454k: 1118 blocks h453549-968774,
+2.18M txs, 4.89M inputs, 1069.5MB wire, field shares all accounted):
+
+  scriptSig  63.1% (entropy)   prevout 16.5% (dict)   spk 12.5%
+  witness     0.2% (window is 99.4% legacy — entropy lives in
+  scriptSig there; modern era moves the same sig/key mass to witness)
+  seq/value/fixed 7.7%
+
+  Positional prevouts @4-8B + spk templates -> ~83-87% of wire.
+  Entropy floor ~63% (sigs + pubkey bytes are irreducible — the spk's
+  hash160 commits the key but verification needs the key bytes).
+
+  VERDICT: transcript rep ~0.85x wire = ~1.45h @1Gbps vs 1.7h raw.
+  Earlier "~350-450GB transcript" estimate was optimistic — it priced
+  away entropy that can't leave. Real but modest; acquisition remains
+  the binding constraint. Corrected in roadmap.
+
+09-28o — ADVICE PRODUCER BATCHED: real but tiny (produce_hints_batch,
+Montgomery-normalize over all ecmult z's, hints byte-identical):
+
+  serial produce_hint    : 111.50 us/sig
+  batched produce_hints  : 110.01 us/sig   (-1.3%)
+
+  The normalize inversion is ~1.4us of ~110us — producer cost is
+  dominated by the R-reconstruction ecmult + s^-1 + key decompress.
+  Standalone advice production ~= ordinary re-verification. The
+  economically-sound path is byproduct capture during relay-time
+  ordinary verify (batch verify materializes only the sum point — no
+  per-sig R to harvest), Montgomery-batched across the block.
+  "+0.2%" holds only for byproduct extraction; standalone ~110us/sig.
+
+09-28p — COMPOSITE ON REAL DATA (corpus_extract + composite_bench):
+3,212,697 REAL mainnet sigs extracted (72.4% of resolved inputs are
+2-push legacy sig|pub spends), real DER parse + real signature_hash
+against resolved coins (2.16us/input measured), then advised+coalesced
+batch on the real records, 8192-chunk:
+
+  unique pubs 2,176,901 / 3,212,697 -> 32.2% dup (real corpus rate)
+  batch_short_keyy_coal : 21.16 us/sig  (0 chunk failures)
+  tamper                : PASS (rejected)
+
+  Composite per-input on real data: sighash 2.16 + batch 21.16 +
+  join ~0.35 ~= ~24us/input all-measured.
+
+09-28q — SUB-MUL OP-SCHEDULE: headroom exists, already harvested
+(mul_sched_probe): dependent fe_mul chain 27.3ns/mul; 2 streams 26.4;
+4 streams 13.4ns/mul — ~2x throughput at 4-way independence. But this
+IS the resource the fused-4 EZW kernel taps (4 SIMD lanes = same port
+floor) — it netted only ~5-10% end-to-end because MSM plumbing
+dominates. VERDICT: no additional below-ROB lever; #6 closed.
+
+  == ROADMAP CLOSED: all items measured ==
+  sig 20.3-21.2us/sig real | join ~0.33us/input real path |
+  hash ~1.4% wall (SHA-NI already) | transcript ~0.85x wire |
+  producer ~110us/sig standalone (byproduct-only economics) |
+  sub-mul = EZW's floor, closed
+
+09-28r — MODERN-ERA CENSUS (sig_census example, 13 real Core blk files
+blk05625-05637, XOR-deobfuscated, 1017 blocks / 4.58M txs / 7.86M spend
+inputs, July 2026 era):
+
+  P2WPKH (ECDSA/witness) 79.4% | taproot keypath 7.2% | legacy 9.1%
+  P2WSH/other v0 3.4% | taproot script-path 0.9%
+
+  SIGS: ECDSA 7,326,301 (91.9%) vs schnorr 648,334 (8.1%).
+  ECDSA batch path covers ~92% of modern sigs — the 454k-era composite
+  number generalizes. Schnorr batch (sum sG-eP-R=0, same MSM) is the
+  remaining unmeasured ~8%; a second measured column, not a blocker.
+
+09-28s — FLAT LAYER INTEGRATED + MEASURED ON THE REAL PATH
+(crates/avila-consensus/src/flatmap.rs + UtxoSet.flat field):
+FlatCoins = 96B slots (36B key + value + height + flags + 40B inline
+spk, spill pool for longer), exact mirror of committed layers, updated
+per-flush via apply_delta. Lockstep test (60 rounds random insert/
+spend/flush vs backend-only set): identical get/have/len/iter — PASS.
+
+  utxo.get cascade : 2754 ns/in
+  utxo.get + flat  :  339 ns/in  (8.1x, identical results)
+  enable_flat populate: 1.6s / 3M coins (~80s extrapolated @150M —
+                    the restart tax; genesis-fresh enable is free)
+  flat36 raw probe : 79 ns/in — the ~260ns delta is the dirty-map
+                    check ordered before flat (semantics, not waste)
+
+  Deployment contract: enable_flat(byte_cap) after attach; cap refuse
+  -> stays on disk path; overlay/reorg sims shadow flat via base
+  early-return; clone drops flat (correct, slower).
+
+09-28t — FLAT LAYER: CORPUS LOCKSTEP + WIRED END-TO-END
+flat_lockstep_corpus: 2.19M txs / 4.44M real spends through
+plain-vs-flat UtxoSets — every spend identical, final iter() sets
+equal (2.07M live). connect_bench on real mainnet blocks 0-500:
+identical connect on both modes. CLI: --flat-utxo-mib on `run` and
+`sync`; GUI welcome page: Standard/Experimental segmented + honest
+"what experimental means" disclosure. Env AVILA_FLAT_UTXO=1 also
+works (connect_bench reads it).
+
+
+## 2026-09-28 — OG Bitcoin 0.1 visual fidelity
+
+Replaced the GUI's 2011/Qt interpretation with the January 2009 wxWidgets
+client from trottier/original-bitcoin: original masked toolbar bitmaps and
+BC icons, Tahoma-compatible period typography, XP Silver chrome, compact
+source geometry, address/balance fields, transaction notebook, and original
+status-strip structure. Existing Avila node data/actions remain available
+through the added Node menu and Recent Blocks tab. Selecting the skin opens
+the original-size window; leaving restores the previous size. Other AI
+instances' shared-tree changes were retained.
+
+Evidence: docs/design-qa-og-bitcoin.md and docs/evidence/og-bitcoin/. Native
+eframe demo captures were compared together with the archived source, at
+705x484 and 705x331 logical sizes plus larger extra-page views. Seven receipt
+checks pass: native Chain navigation, stop, start, tip clipboard, modern
+return, and both original/compact viewport sizes. Navigation was repeated in
+a fresh process to avoid an earlier capture's open-menu state. No protocol
+or consensus implementation changed, and no performance win is claimed.
+The user reviewed and accepted the preview, then requested wrap-up.
+
+Final preview: cargo build --offline --release -p avila-gui --features devtools
+-j 2, under guard_run --max 3072 --reserve 4096: exit 0, peak 1101 MiB, wall
+194 s (including shared Cargo lock waiting). Private executable and build
+source hashes avoided concurrent overwrites of target/release/avila-gui.
+
+Validation: cargo test --offline --release -p avila-gui --features devtools
+-j 2, same guard: 56 passed, 0 failed; peak 779 MiB, wall 60 s. An initial
+test compile encountered missing custom_presets/hidden_presets fields in
+existing preference fixtures; the other instance fixed those fixtures and
+the rerun passed. git diff --check passed.

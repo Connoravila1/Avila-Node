@@ -170,6 +170,13 @@ enum Command {
         /// Accepts 0/1/true/false like Core's bool parser.
         #[arg(long)]
         rpcwhitelistdefault: Option<String>,
+        /// Experimental fast IBD: RAM-resident flat UTXO mirror
+        /// (~8x measured on the spend-lookup path). Full consensus
+        /// verification unchanged — every block, tx, signature, and
+        /// rule still runs. Costs ~17 GiB RAM at today's UTXO count;
+        /// value is the resident cap in MiB — 0 (bare flag) = uncapped.
+        #[arg(long, num_args = 0..=1, default_missing_value = "0")]
+        flat_utxo_mib: Option<u64>,
     },
     /// Sync headers and blocks from live peers (headers-first, full
     /// consensus validation). Bounded by target height and timeout.
@@ -230,6 +237,14 @@ enum Command {
         /// -v2transport, default on). Overrides net.v2transport.
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         v2transport: Option<bool>,
+        /// Experimental fast IBD: keep the committed UTXO set in a
+        /// RAM-resident flat table (~8x measured on the spend-lookup
+        /// path). Full consensus verification is unchanged — every
+        /// block, tx, signature, and rule still runs. Costs RAM
+        /// (~17 GiB at today's UTXO count); the value is the resident
+        /// cap in MiB — omit for uncapped, omit flag for off.
+        #[arg(long, num_args = 0..=1, default_missing_value = "0")]
+        flat_utxo_mib: Option<u64>,
     },
     /// Call a JSON-RPC method on a running daemon — the bitcoin-cli
     /// analog. Positional params are parsed as raw JSON values, falling
@@ -745,6 +760,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             rpcpassword,
             rpcwhitelist,
             rpcwhitelistdefault,
+            flat_utxo_mib,
         } => {
             // A real daemon: unbounded headers-first sync — sync to the
             // tip, then keep serving, relaying, and announcing until
@@ -967,6 +983,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 electrum,
                 utreexo: utreexo.unwrap_or(c.sync.utreexo),
                 utreexo_bridge: utreexo_bridge.unwrap_or(c.sync.utreexo_bridge),
+                flat_utxo_bytes: flat_utxo_mib.map(|mib| mib.saturating_mul(1024 * 1024) as usize),
                 status: Some(status),
                 queries: Some(std::sync::Arc::new(std::sync::Mutex::new(query_rx))),
                 waiters: Some(waiters),
@@ -1061,6 +1078,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             peerblockfilters,
             maxmempool,
             v2transport,
+            flat_utxo_mib,
         } => {
             use avila_consensus::params::Network as ConsensusNet;
             let network = config.get().network;
@@ -1109,6 +1127,7 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 electrum: None,
                 utreexo: c.sync.utreexo,
                 utreexo_bridge: c.sync.utreexo_bridge,
+                flat_utxo_bytes: flat_utxo_mib.map(|mib| mib.saturating_mul(1024 * 1024) as usize),
                 status: None,
                 queries: None,
                 waiters: None,

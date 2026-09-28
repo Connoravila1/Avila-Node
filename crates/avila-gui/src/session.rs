@@ -55,6 +55,10 @@ pub struct RunSettings {
     /// Verify every historical signature — no assumevalid checkpoint
     /// skip. Slower sync; the receipts prove every check ran.
     pub full_verify: bool,
+    /// Experimental fast IBD: RAM-resident flat UTXO mirror (measured
+    /// ~8× on the spend-lookup path). Full verification unchanged —
+    /// every block, tx, and consensus rule still runs.
+    pub fast_ibd: bool,
 }
 
 impl RunSettings {
@@ -80,6 +84,7 @@ impl RunSettings {
             peerblockfilters: false,
             electrum: String::new(),
             full_verify: false,
+            fast_ibd: false,
         }
     }
 
@@ -512,6 +517,7 @@ impl Session {
             blockfilterindex: settings.blockfilterindex,
             peerblockfilters: settings.peerblockfilters,
             electrum: settings.electrum.trim().parse().ok(),
+            flat_utxo_bytes: settings.fast_ibd.then_some(0), // uncapped — the laptop run is dedicated
             control: Some(Arc::new(std::sync::Mutex::new(control_rx))),
             ..SyncConfig::default()
         };
@@ -1002,7 +1008,12 @@ mod tests {
     fn demo_session_backfills_history_and_activity() {
         let net = avila_core::Network::Mainnet;
         let mut s = Session::new(true);
-        s.start(net, PathBuf::new(), &RunSettings::new(net));
+        s.start(
+            net,
+            PathBuf::new(),
+            &RunSettings::new(net),
+            &avila_core::NodeConfig::default(),
+        );
         assert!(s.running());
         assert!(s.history.len() >= 590, "{} samples", s.history.len());
         let kinds: Vec<_> = s.activity.iter().map(|a| a.kind).collect();

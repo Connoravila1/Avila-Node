@@ -73,12 +73,15 @@ static const uint64_t FE4_P4[5] = {
     0xFFFFFFFFFFFFFULL, 0x3FFFFFFFFFFFFULL
 };
 static inline void fe4_neg(fe4 r, const fe4 a){
+    /* base-2^52 borrow: wrapped limbs need +2^52, not the raw 2^64 word. */
     vi bor=_mm256_setzero_si256(), one=_mm256_set1_epi64x(1);
+    vi base=_mm256_set1_epi64x(1LL<<52);
     for(int i=0;i<5;i++){
         vi av=_mm256_add_epi64(a[i],bor);
-        r[i]=_mm256_sub_epi64(_mm256_set1_epi64x(FE4_P4[i]),av);
-        bor=_mm256_and_si256(
-            _mm256_cmpgt_epi64(av,_mm256_set1_epi64x(FE4_P4[i])),one);
+        vi d=_mm256_sub_epi64(_mm256_set1_epi64x(FE4_P4[i]),av);
+        vi msk=_mm256_cmpgt_epi64(av,_mm256_set1_epi64x(FE4_P4[i]));
+        r[i]=_mm256_add_epi64(d,_mm256_and_si256(msk,base));
+        bor=_mm256_and_si256(msk,one);
     }
     fe4_norm(r);
 }

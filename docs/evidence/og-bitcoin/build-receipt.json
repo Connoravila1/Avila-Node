@@ -1,0 +1,22 @@
+{
+  "executable": "/tmp/avila-og-reference/avila-gui-preview",
+  "features": [
+    "default",
+    "devtools"
+  ],
+  "sha256": "ff8a41a42f4877d9d64597526cf2a085d08389477d540ce5c33266024455456f",
+  "source_before": {
+    "crates/avila-gui/src/classic.rs": "4a93e8483789e60b21979c8176c9f6a44240351a6d10f415ec5360f076834504",
+    "crates/avila-gui/src/theme.rs": "48b25b3df2d430fa15bfbbb4ee2ccf5f65bfd3bd40d7fe1c4fe9d56b98dc17f6",
+    "crates/avila-gui/src/app.rs": "f696ab6d599f949fe7ba2bcdd951f9f257a3c252ea183b7648a087fd6c193d4a",
+    "crates/avila-gui/src/capture.rs": "1ff503bfb12dbed25c7a46ecea2651f3329c7554a1a656c6e952e9eeef1f3067",
+    "crates/avila-gui/src/main.rs": "f70b6dd70a514aeeb413f5d4bf173c8472b3a8263a65612985fe31138f4ae02f"
+  },
+  "source_after": {
+    "crates/avila-gui/src/classic.rs": "4a93e8483789e60b21979c8176c9f6a44240351a6d10f415ec5360f076834504",
+    "crates/avila-gui/src/theme.rs": "48b25b3df2d430fa15bfbbb4ee2ccf5f65bfd3bd40d7fe1c4fe9d56b98dc17f6",
+    "crates/avila-gui/src/app.rs": "f696ab6d599f949fe7ba2bcdd951f9f257a3c252ea183b7648a087fd6c193d4a",
+    "crates/avila-gui/src/capture.rs": "1ff503bfb12dbed25c7a46ecea2651f3329c7554a1a656c6e952e9eeef1f3067",
+    "crates/avila-gui/src/main.rs": "f70b6dd70a514aeeb413f5d4bf173c8472b3a8263a65612985fe31138f4ae02f"
+  }
+}
