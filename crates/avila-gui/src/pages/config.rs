@@ -46,6 +46,8 @@ pub struct ConfigPage {
     preset_note: Option<String>,
     /// The preset whose preview card is open.
     preset_open: Option<usize>,
+    /// The header's circle-i card — how the layers fit together.
+    info_open: bool,
 }
 
 impl ConfigPage {
@@ -221,6 +223,41 @@ const PRESETS: &[Preset] = &[
         ],
     },
 ];
+
+/// The header's circle-i card — the layer model in six lines.
+fn info_card(ui: &mut Ui, pal: crate::theme::Palette) {
+    ui.add_space(4.0);
+    egui::Frame::new()
+        .fill(pal.well)
+        .stroke(egui::Stroke::new(1.0, pal.hairline))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_max_width(560.0);
+            ui.label(
+                RichText::new("how this page works")
+                    .size(12.0)
+                    .strong()
+                    .color(pal.text),
+            );
+            ui.add_space(4.0);
+            for line in [
+                "Your file is the base — never rewritten. Its overlay, \
+                 <name>.runtime.toml, merges over it at load.",
+                "live — applies to the running node within a tick and persists \
+                 into the overlay. Every change lands on the event journal.",
+                "needs restart — structural knobs (databases, sockets, indexes) \
+                 are opened once at boot. Editing stages the value into the \
+                 overlay; it applies on the next start.",
+                "file watch — edits from outside either file raise a banner: \
+                 live diffs can apply in place, restart diffs need the restart.",
+                "Nothing on this page can change what's valid — consensus rules \
+                 aren't configuration.",
+            ] {
+                ui.label(RichText::new(line).size(12.0).color(pal.muted));
+            }
+        });
+}
 
 fn presets_menu(ui: &mut Ui, state: &mut ConfigPage, _control: Option<&Sender<ControlMsg>>) {
     let pal = crate::theme::Palette::of(ui.ctx());
@@ -423,61 +460,61 @@ pub fn show(
         ui,
         "Node policy",
         Some(
-            "Every knob the node loads. Bright marks apply to the running node; dim ones \
-             apply at the next start. Edits land in the .runtime.toml overlay — the file \
-             itself is never rewritten.",
+            "Bright marks apply now; dim ones at the next start. Edits land in the \
+             .runtime.toml overlay — the file itself is never rewritten.",
         ),
     );
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.label(RichText::new("Filter").size(13.0).color(pal.muted));
         ui.add(TextEdit::singleline(&mut state.filter).desired_width(200.0));
+        // A drawn circle-i — the fonts don't carry ⓘ, so paint it.
+        // Left of everything else, where page-level info belongs.
+        {
+            let (r, resp) = ui.allocate_exact_size(egui::vec2(17.0, 17.0), egui::Sense::click());
+            let p = ui.painter_at(r);
+            let on = state.info_open;
+            p.circle_stroke(
+                r.center(),
+                7.5,
+                egui::Stroke::new(1.0, if on { pal.signal_text } else { pal.muted }),
+            );
+            p.text(
+                r.center() - egui::vec2(0.0, 0.5),
+                egui::Align2::CENTER_CENTER,
+                "i",
+                egui::FontId::proportional(11.0),
+                if on { pal.signal_text } else { pal.muted },
+            );
+            let resp = resp
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("how this page works");
+            if resp.clicked() {
+                state.info_open = !state.info_open;
+            }
+        }
         if control.is_none() {
             ui.label(
-                RichText::new("start the node to edit — live marks apply while it runs")
+                RichText::new("stopped — edits stage into the overlay and apply at the next start")
                     .size(12.0)
                     .color(pal.muted),
             );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // How the layering works — pinned open with a click.
-            ui.menu_button(RichText::new("ⓘ").size(13.0).color(pal.muted), |ui| {
-                ui.set_max_width(340.0);
-                for line in [
-                    ("how this page works", true),
-                    ("", false),
-                    ("Your file is the base — never written by the app. Its overlay,", false),
-                    ("<name>.runtime.toml, merges over it at load.", false),
-                    ("", false),
-                    ("live — applies to the running node within a tick and persists", false),
-                    ("    into the overlay. Every change lands on the event journal.", false),
-                    ("", false),
-                    ("needs restart — structural knobs (the database, sockets, indexes)", false),
-                    ("    are opened once at boot. Editing stages the value into the", false),
-                    ("    overlay; it applies on the next start.", false),
-                    ("", false),
-                    ("file watch — edits from outside either file raise a banner:", false),
-                    ("    live diffs can apply in place, restart diffs need the", false),
-                    ("    restart button.", false),
-                    ("", false),
-                    ("Nothing on this page can change what's valid — consensus", false),
-                    ("rules aren't configuration.", false),
-                ] {
-                    ui.label(
-                        RichText::new(line.0)
-                            .size(12.0)
-                            .color(if line.1 { pal.text } else { pal.muted }),
-                    );
-                }
-            });
             if let Some(file) = config_file {
+                // Just the name — the full path is the hover; a long
+                // path would push the row off the window's edge.
+                let name = file
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("the config");
                 if ui
                     .link(
-                        RichText::new(format!("edit {}", file.display()))
+                        RichText::new(format!("edit {name}"))
                             .size(12.0)
                             .color(pal.muted),
                     )
-                    .on_hover_text("Open the config file in your editor")
+                    .on_hover_text(format!("Open {} in your editor", file.display()))
                     .clicked()
                 {
                     let _ = std::process::Command::new("xdg-open").arg(file).spawn();
@@ -529,6 +566,9 @@ pub fn show(
             }
         });
     });
+    if state.info_open {
+        info_card(ui, pal);
+    }
     if let Some(note) = &state.preset_note {
         ui.label(RichText::new(note).size(12.0).color(pal.signal));
     }
@@ -599,9 +639,17 @@ pub fn show(
                     }
                 }
                 if restart_diffs > 0
-                    && widgets::button(ui, "restart node", Kind::Primary)
-                        .on_hover_text("Stop and start again — the file is re-read")
-                        .clicked()
+                    && widgets::button(
+                        ui,
+                        if control.is_some() {
+                            "restart node"
+                        } else {
+                            "start node"
+                        },
+                        Kind::Primary,
+                    )
+                    .on_hover_text("Stop and start again — the file is re-read")
+                    .clicked()
                 {
                     action = Some(Action::Restart);
                 }
@@ -656,11 +704,12 @@ fn row(
     config_file: Option<&std::path::Path>,
     dirty: Option<&[String]>,
 ) {
-    let live = k.edit == EditKind::Live && control.is_some();
-    // Live knobs need the channel; restart knobs need the overlay —
-    // either way there's an edit affordance, and both persist through
-    // the overlay when a file is loaded.
-    let editable = live || (k.edit == EditKind::Restart && config_file.is_some());
+    // Live knobs need the channel to apply now; without it (stopped),
+    // or for restart knobs, the overlay still takes the edit.
+    let editable = match k.edit {
+        EditKind::Live => control.is_some() || config_file.is_some(),
+        EditKind::Restart => config_file.is_some(),
+    };
     let value = effective(state, k.path, &k.value);
     let changed = state.overrides.contains_key(k.path);
     let staged = state.staged.contains_key(k.path);
@@ -691,8 +740,9 @@ fn row(
                     // restarts. A write failure only refuses a staged
                     // restart knob; a live knob still applies, marked
                     // as not persisted.
-                    match k.edit {
-                        EditKind::Live => {
+                    match (k.edit, control.is_some()) {
+                        // Live + running: persist and apply now.
+                        (EditKind::Live, true) => {
                             if let Some(file) = config_file {
                                 if let Err(e) = avila_node::config::write_overlay_knob(
                                     file,
@@ -704,15 +754,17 @@ fn row(
                                         .insert(k.path.to_string(), format!("not persisted: {e}"));
                                 }
                             }
-                            if let Some(tx) = control {
-                                let _ = tx.send(ControlMsg::Set {
+                            let _ = control.as_ref().map(|tx| {
+                                tx.send(ControlMsg::Set {
                                     path: k.path.to_string(),
                                     value: v.clone(),
-                                });
-                            }
+                                })
+                            });
                             state.pending.insert(k.path.to_string(), v);
                         }
-                        EditKind::Restart => {
+                        // Live-but-stopped or restart — the overlay
+                        // carries it to the next start.
+                        _ => {
                             if let Some(file) = config_file {
                                 stage(file, state, k.path, v);
                             }
