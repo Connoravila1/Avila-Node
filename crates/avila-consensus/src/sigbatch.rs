@@ -112,10 +112,7 @@ fn pubkey_point(rec: &Record) -> Option<AffinePoint> {
     ))
     .filter(|p| bool::from(p.y_is_odd()) == bool::from(odd));
     hinted.or_else(|| {
-        Option::<AffinePoint>::from(AffinePoint::decompress(
-            &FieldBytes::from(xb),
-            odd,
-        ))
+        Option::<AffinePoint>::from(AffinePoint::decompress(&FieldBytes::from(xb), odd))
     })
 }
 
@@ -279,8 +276,7 @@ pub fn batch_verify(records: &[Record]) -> Outcome {
         return Outcome::Fallback;
     }
 
-    let mut terms: Vec<(AffinePoint, Scalar, bool)> =
-        Vec::with_capacity(n + group_acc.len() + 1);
+    let mut terms: Vec<(AffinePoint, Scalar, bool)> = Vec::with_capacity(n + group_acc.len() + 1);
     let mut gen_scalar = Scalar::ZERO;
     for (i, rec) in records.iter().enumerate() {
         let Some(nonce) = nonce_point(rec, &r[i]) else {
@@ -320,8 +316,7 @@ pub fn produce_advice(z: &[u8; 32], sig: &[u8; 64], pubkey: &[u8; 33]) -> Option
     ))?;
     let sinv = Option::<Scalar>::from(s.invert_vartime())?;
     // R = s^-1·(z·G + r·Q)
-    let rproj = ProjectivePoint::GENERATOR * (zz * sinv)
-        + ProjectivePoint::from(q) * (r * sinv);
+    let rproj = ProjectivePoint::GENERATOR * (zz * sinv) + ProjectivePoint::from(q) * (r * sinv);
     if bool::from(rproj.is_identity()) {
         return None;
     }
@@ -448,9 +443,8 @@ mod tests {
             (z, sig, pub33)
         };
         // Flip s -> n - s (the other valid ECDSA form).
-        let n = U256::from_be_hex(
-            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
-        );
+        let n =
+            U256::from_be_hex("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
         let sv = U256::from_be_slice(&sig[32..]);
         let s_hi = n.wrapping_sub(&sv);
         let mut hi = sig;
@@ -592,7 +586,12 @@ mod stagebench {
 
         eprintln!(
             "n={n}: parse {:.0}us | invert {:.0}us | lift {:.0}us | coeff {:.0}us | msm(terms={}) {:.0}us",
-            parse_us, inv_us, lift_us, coeff_us, terms.len(), msm_us
+            parse_us,
+            inv_us,
+            lift_us,
+            coeff_us,
+            terms.len(),
+            msm_us
         );
     }
 }

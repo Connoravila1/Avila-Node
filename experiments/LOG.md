@@ -2018,7 +2018,8 @@ async flush residual 2061→470ms; runs epoch write 229ms/commit with
 zero btree commits; live rates — async+flat ~3–5 blk/s bursts vs
 runs+no-flat ~1.5 blk/s. 24-peer delivery changed nothing (connect-
 bound); 4GB page-cache and uncapped flat both OOM'd (the flat mirror
-was the night's crash driver, ~16GB RSS during restore).
+was the night's crash driver, ~16GB RSS during restore) — all three
+failures computable from arithmetic before running.
 
 **Real bugs fixed:** mark_invalid/restore_tip phantom-best-tip stall
 (f6bab34); get/have runs-layer miss; scan_window EOF; in-flight

@@ -55,12 +55,15 @@ optimization moved the pain; none removed it.
   with flat refused for memory, reads hit disk — rate ~1.5 blk/s,
   flat-to-slower than baseline.
 
-**Negative results (equally valuable):**
+**Failed attempts — all predictable in advance:**
 - 24 peers vs 8: no rate change — connect-bound, not delivery-bound.
 - `AVILA_COINS_CACHE_MB=4096`: OOM — page cache + double buffer +
   replay map exceeds 12GB.
 - Uncapped flat mirror: 16.3GB RSS during restore — the night's
   actual OOM driver (fixed via `AVILA_FLAT_MIB` cap override).
+  Each of these outcomes was computable from memory/arrival-rate
+  arithmetic before running the experiment; none required the
+  laptop's hours to discover.
 
 **Real bugs found by the harness:**
 - `mark_invalid` never demoted tip → phantom invalid header stayed

@@ -17,12 +17,12 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use avila_consensus::block::Block;
+use avila_consensus::chain::HeaderTree;
 use avila_consensus::connect::{
     ConnectContext, ConnectError, ScriptPool, UtxoSet, block_subsidy, connect_block_full,
 };
 use avila_consensus::hash::{BlockHash, Txid};
 use avila_consensus::header::BlockHeader;
-use avila_consensus::chain::HeaderTree;
 use avila_consensus::params::{Network, Params};
 use avila_consensus::script;
 use avila_consensus::sigchecker::signature_hash;
@@ -145,14 +145,18 @@ impl Harness {
         block: &Block,
         advice: Option<&HashMap<Txid, Vec<u8>>>,
         collect: bool,
-    ) -> Result<(BlockHash, Option<std::sync::Arc<avila_consensus::connect::BlockCheck>>), ConnectError>
-    {
+    ) -> Result<
+        (
+            BlockHash,
+            Option<std::sync::Arc<avila_consensus::connect::BlockCheck>>,
+        ),
+        ConnectError,
+    > {
         self.tree
             .insert(&block.header, u32::MAX / 2)
             .map_err(|_| ConnectError::Internal("header insert"))?;
-        let collect_map: std::sync::Arc<
-            std::sync::Mutex<HashMap<Txid, Vec<u8>>>,
-        > = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let collect_map: std::sync::Arc<std::sync::Mutex<HashMap<Txid, Vec<u8>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
         let ctx = ConnectContext {
             params: &self.params,
             tree: &self.tree,
@@ -171,7 +175,10 @@ impl Harness {
 
 /// Wait on every outstanding check (the pending-scripts drain).
 fn drain(
-    pending: Vec<(BlockHash, Option<std::sync::Arc<avila_consensus::connect::BlockCheck>>)>,
+    pending: Vec<(
+        BlockHash,
+        Option<std::sync::Arc<avila_consensus::connect::BlockCheck>>,
+    )>,
 ) -> HashMap<BlockHash, HashMap<Txid, Vec<u8>>> {
     let mut out = HashMap::new();
     for (hash, check) in pending {
@@ -193,9 +200,13 @@ type Coin_ = (u32, OutPoint, i64);
 /// `n_spend` blocks each draining up to `max_spends` mature coins and
 /// fanning each into 4 fresh P2PKH outputs (no maturity — non-coinbase).
 /// Returns the blocks and the total signature count.
-fn plan(params: &Params, spk: &[u8], sk: &secp256k1::SecretKey, n_spend: u32, max_spends: usize)
-    -> (Vec<Block>, u64)
-{
+fn plan(
+    params: &Params,
+    spk: &[u8],
+    sk: &secp256k1::SecretKey,
+    n_spend: u32,
+    max_spends: usize,
+) -> (Vec<Block>, u64) {
     let mut blocks = Vec::new();
     let mut tip = params.genesis_header;
     // A spendable coin needs no UTXO here — planning only needs txids.
@@ -278,7 +289,10 @@ fn main() {
     let params = Network::Regtest.params();
 
     let (blocks, sigs) = plan(&params, &spk, &sk, n_spend, max_spends);
-    eprintln!("plan: {} blocks (incl. scaffold), {sigs} signed spends", blocks.len());
+    eprintln!(
+        "plan: {} blocks (incl. scaffold), {sigs} signed spends",
+        blocks.len()
+    );
 
     let mut advice_store: HashMap<BlockHash, HashMap<Txid, Vec<u8>>> = HashMap::new();
     let mut results = HashMap::new();

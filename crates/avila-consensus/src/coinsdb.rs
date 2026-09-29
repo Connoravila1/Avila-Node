@@ -212,7 +212,11 @@ fn decode_coin_from(d: &mut Decoder<'_>) -> Option<Coin> {
 /// Undo record codec — the connecting block's hash followed by the
 /// `BlockUndo` in `store::put_undo` layout. Coins inside carry the
 /// database's [`CoinFormat`].
-pub(crate) fn encode_undo(hash: &crate::hash::BlockHash, u: &BlockUndo, fmt: CoinFormat) -> Vec<u8> {
+pub(crate) fn encode_undo(
+    hash: &crate::hash::BlockHash,
+    u: &BlockUndo,
+    fmt: CoinFormat,
+) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(hash.as_bytes());
     crate::encode::write_compact_size(&mut v, u.txs.len() as u64);
@@ -234,7 +238,10 @@ pub(crate) fn encode_undo(hash: &crate::hash::BlockHash, u: &BlockUndo, fmt: Coi
 /// `(block hash, undo)` — `None` on malformed records. Legacy coins
 /// decode through `Decoder`; compact coins through a slice cursor —
 /// the two varint schemes differ, so each branch keeps one cursor.
-pub(crate) fn decode_undo(b: &[u8], fmt: CoinFormat) -> Option<(crate::hash::BlockHash, BlockUndo)> {
+pub(crate) fn decode_undo(
+    b: &[u8],
+    fmt: CoinFormat,
+) -> Option<(crate::hash::BlockHash, BlockUndo)> {
     match fmt {
         CoinFormat::Legacy => decode_undo_legacy(b),
         CoinFormat::Compact => decode_undo_compact(b),

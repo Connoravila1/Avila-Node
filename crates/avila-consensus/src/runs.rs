@@ -26,12 +26,12 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::connect::BlockUndo;
 use crate::coinsdb::{self, CoinFormat};
+use crate::connect::BlockUndo;
+use crate::connect::Coin;
 use crate::hash::BlockHash;
 use crate::sortedrun::{RunBuilder, SortedRun};
 use crate::transaction::OutPoint;
-use crate::connect::Coin;
 
 /// Filename pieces for one flush epoch. `seq` orders epochs within a
 /// process; `tip` is the highest connected height the files cover —
@@ -94,10 +94,7 @@ pub fn write_epoch(
     // so one pass writes both).
     {
         let mut run = RunBuilder::create(&paths.run)?;
-        let mut del = BufWriter::with_capacity(
-            1 << 22,
-            File::create(&paths.del)?,
-        );
+        let mut del = BufWriter::with_capacity(1 << 22, File::create(&paths.del)?);
         let mut dels: u64 = 0;
         for (key, entry) in &ordered {
             match entry {
@@ -191,9 +188,7 @@ impl EpochLayer {
     /// `Some(Some(coin))` coin hit, `Some(None)` deleted by this
     /// epoch, `None` untouched — probe the next-older layer.
     pub fn probe(&self, key: &[u8; 36]) -> Option<Option<Coin>> {
-        if !self.del.is_empty()
-            && self.del.binary_search(key).is_ok()
-        {
+        if !self.del.is_empty() && self.del.binary_search(key).is_ok() {
             return Some(None);
         }
         if let Some(c) = self.run.get_key(key) {
@@ -245,15 +240,12 @@ fn load_undos(path: &Path) -> io::Result<Vec<(u32, BlockHash, BlockUndo)>> {
     let mut pos = 0usize;
     while pos + 8 <= buf.len() {
         let h = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap_or([0; 4]));
-        let len =
-            u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap_or([0; 4])) as usize;
+        let len = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap_or([0; 4])) as usize;
         pos += 8;
         if pos + len > buf.len() {
             break;
         }
-        if let Some((hash, u)) =
-            coinsdb::decode_undo(&buf[pos..pos + len], CoinFormat::Compact)
-        {
+        if let Some((hash, u)) = coinsdb::decode_undo(&buf[pos..pos + len], CoinFormat::Compact) {
             out.push((h, hash, u));
         }
         pos += len;
@@ -280,10 +272,7 @@ pub fn scan_epochs(dir: &Path) -> io::Result<Vec<(u64, u32)>> {
         let stem = &name[..name.len() - 3];
         let mut parts = stem.split('-');
         let _e = parts.next();
-        let seq: u64 = parts
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let seq: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let tip: u32 = match parts.next().and_then(|s| s.parse().ok()) {
             Some(t) => t,
             None => continue,

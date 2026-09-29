@@ -785,8 +785,8 @@ mod tests {
             block_hash: block.block_hash(),
             script_checks: true,
             script_pool: None,
-                advice: None,
-                advice_collect: None,
+            advice: None,
+            advice_collect: None,
         };
         let (spends, proof) = bridge.bundle(&block);
         assert_eq!(spends.len(), 2);
@@ -909,8 +909,8 @@ mod tests {
             block_hash: block.block_hash(),
             script_checks: true,
             script_pool: None,
-                advice: None,
-                advice_collect: None,
+            advice: None,
+            advice_collect: None,
         };
         match connect_block_proven(&block, &mut acc, &[], &Proof::default(), &ctx) {
             Err(ProvenConnectError::MissingSpend(o)) => assert_eq!(o, fake),

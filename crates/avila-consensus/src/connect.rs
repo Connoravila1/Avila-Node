@@ -205,8 +205,7 @@ pub struct UtxoSet {
     /// outlives the real set's flush bookkeeping). In runs mode the
     /// worker returns `Some(EpochWrite)` instead of committing to the
     /// backend — the epoch lands as files, attached at join.
-    flush_join:
-        Option<std::thread::JoinHandle<std::io::Result<Option<crate::runs::EpochWrite>>>>,
+    flush_join: Option<std::thread::JoinHandle<std::io::Result<Option<crate::runs::EpochWrite>>>>,
     /// Attached sorted-run epochs, oldest→newest by covered tip —
     /// the LSM read layers between `flat` and `backend`. Populated
     /// only in runs mode (`runs_dir` set); reads probe newest→oldest,
@@ -340,7 +339,14 @@ impl UtxoSet {
     pub fn drop_epochs_above(&mut self, tip: u32) {
         while self.runs.last().is_some_and(|l| l.tip > tip) {
             let l = self.runs.pop().expect("checked");
-            crate::runs::remove_epoch(l.paths.run.parent().unwrap_or_else(|| std::path::Path::new(".")), l.seq, l.tip);
+            crate::runs::remove_epoch(
+                l.paths
+                    .run
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+                l.seq,
+                l.tip,
+            );
         }
     }
 
@@ -580,10 +586,7 @@ impl UtxoSet {
             (Some(l), Some(be)) if be.tip_height() < l.tip => l.delta,
             _ => 0,
         };
-        lower
-            .saturating_add_signed(
-                (self.live_delta + flushing_delta + self.runs_delta()) as isize,
-            )
+        lower.saturating_add_signed((self.live_delta + flushing_delta + self.runs_delta()) as isize)
     }
 
     /// `true` if no coins are tracked.
@@ -1160,8 +1163,7 @@ impl UtxoSet {
             let seq = self.runs_seq;
             self.runs_seq += 1;
             self.flush_join = Some(std::thread::spawn(move || {
-                crate::runs::write_epoch(&dir, seq, tip, delta, snap.as_ref(), &undos)
-                    .map(Some)
+                crate::runs::write_epoch(&dir, seq, tip, delta, snap.as_ref(), &undos).map(Some)
             }));
         } else {
             self.flush_join = Some(std::thread::spawn(move || {
@@ -1186,11 +1188,9 @@ impl UtxoSet {
             .unwrap_or_else(|_| Err(std::io::Error::other("flush worker panicked")));
         match result {
             Ok(Some(epoch)) => {
-                let dir = self
-                    .runs_dir
-                    .clone()
-                    .expect("epoch write without runs_dir");
-                let l = crate::runs::EpochLayer::open(&dir, epoch.seq, epoch.tip, Some(epoch.delta))?;
+                let dir = self.runs_dir.clone().expect("epoch write without runs_dir");
+                let l =
+                    crate::runs::EpochLayer::open(&dir, epoch.seq, epoch.tip, Some(epoch.delta))?;
                 debug_assert!(
                     self.runs.last().is_none_or(|prev| prev.tip < l.tip),
                     "run layers must attach in ascending tip order"
@@ -1211,10 +1211,7 @@ impl UtxoSet {
     /// backend's undo table, probed newest→oldest over attached
     /// epochs. `None` when no attached epoch covers the height.
     pub fn epoch_undo(&self, height: u32) -> Option<BlockUndo> {
-        self.runs
-            .iter()
-            .rev()
-            .find_map(|l| l.undo(height).cloned())
+        self.runs.iter().rev().find_map(|l| l.undo(height).cloned())
     }
 
     /// Attached run epochs' net live-coin delta — `len()`'s share of
@@ -1375,7 +1372,6 @@ pub struct ConnectContext<'a> {
     /// synchronous paths; the caller drains the map after the check.
     pub advice_collect:
         Option<&'a std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>>>,
-
 }
 
 /// A machine-checkable record of one block's connect — the
@@ -1980,8 +1976,6 @@ impl BlockCheck {
     }
 }
 
-
-
 /// One queued unit of script-check work — owned so the worker never
 /// borrows block memory (the block may be disconnected before the job
 /// runs). `Barrier` resolves the block's deferred sig batch on a pool
@@ -2054,9 +2048,8 @@ impl ScriptPool {
                     }
                 };
                 drop(sink);
-                let errored: Vec<u32> = std::mem::take(
-                    &mut *bc.eval_errored.lock().unwrap_or_else(|e| e.into_inner()),
-                );
+                let errored: Vec<u32> =
+                    std::mem::take(&mut *bc.eval_errored.lock().unwrap_or_else(|e| e.into_inner()));
                 for tag in errored {
                     if !recheck.contains(&tag) {
                         recheck.push(tag);
@@ -2096,10 +2089,7 @@ impl ScriptPool {
             let result = if let Some(sink_map) = &job.collect {
                 let out = std::cell::RefCell::new(Vec::new());
                 let r = crate::sigchecker::check_input_scripts_capture(
-                    &job.tx,
-                    &job.outs,
-                    job.flags,
-                    &out,
+                    &job.tx, &job.outs, job.flags, &out,
                 );
                 sink_map
                     .lock()
@@ -2339,8 +2329,12 @@ fn connect_block_inner(
     // on the UTXO mutations happening around it.
     // `(tx, spent outs, advice, collect sink)` — the pool path lifts
     // these into `JobData`; the sync path runs them directly.
-    let mut script_jobs: Vec<(&Transaction, Vec<TxOut>, Option<Vec<u8>>, Option<CollectSink>)> =
-        Vec::new();
+    let mut script_jobs: Vec<(
+        &Transaction,
+        Vec<TxOut>,
+        Option<Vec<u8>>,
+        Option<CollectSink>,
+    )> = Vec::new();
     let mut owned_jobs: Vec<std::sync::Arc<JobData>> = Vec::new();
 
     // Receipt accumulation (queue #5): the delta stream commits, per
@@ -2397,10 +2391,7 @@ fn connect_block_inner(
             {
                 let spent_outs: Vec<TxOut> = spent.iter().map(|c| c.out.clone()).collect();
                 scripts_queued += 1;
-                let advice = ctx
-                    .advice
-                    .and_then(|m| m.get(&tx.txid()))
-                    .cloned();
+                let advice = ctx.advice.and_then(|m| m.get(&tx.txid())).cloned();
                 if ctx.script_pool.is_some() {
                     owned_jobs.push(std::sync::Arc::new(JobData {
                         tx: tx.clone(),
@@ -2499,7 +2490,11 @@ fn connect_block_inner(
                 // The barrier resolves the sink once every tx job has
                 // pushed its records — count it so `wait` holds until
                 // the batch is settled.
-                check.state.lock().unwrap_or_else(|e| e.into_inner()).remaining += 1;
+                check
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remaining += 1;
             }
             for job in jobs {
                 pool.submit(ScriptJob::Tx {
@@ -2575,11 +2570,15 @@ fn connect_block_inner(
 /// once after all evals, and only the dirty jobs re-run the ordinary
 /// path. Consensus-exact — advice failure costs time, never verdict.
 /// The produce-mode sink: `txid -> entry stream`, one map per block.
-type CollectSink =
-    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>>;
+type CollectSink = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>>;
 
 fn run_script_checks_advised(
-    jobs: &[(&Transaction, Vec<TxOut>, Option<Vec<u8>>, Option<CollectSink>)],
+    jobs: &[(
+        &Transaction,
+        Vec<TxOut>,
+        Option<Vec<u8>>,
+        Option<CollectSink>,
+    )],
     flags: crate::script::ScriptFlags,
 ) -> Result<(), crate::interpreter::ScriptError> {
     let sink = std::cell::RefCell::new(crate::sigchecker::DeferredSink::default());
@@ -2602,13 +2601,7 @@ fn run_script_checks_advised(
         }
         let entries: &[u8] = advice.as_deref().unwrap_or(&[]);
         if crate::sigchecker::check_input_scripts_advised(
-            tx,
-            outs,
-            flags,
-            entries,
-            &sink,
-            i as u32,
-            &stat,
+            tx, outs, flags, entries, &sink, i as u32, &stat,
         )
         .is_err()
         {
@@ -2634,7 +2627,12 @@ fn run_script_checks_advised(
 }
 
 fn run_script_checks(
-    jobs: &[(&Transaction, Vec<TxOut>, Option<Vec<u8>>, Option<CollectSink>)],
+    jobs: &[(
+        &Transaction,
+        Vec<TxOut>,
+        Option<Vec<u8>>,
+        Option<CollectSink>,
+    )],
     flags: crate::script::ScriptFlags,
 ) -> Result<(), crate::interpreter::ScriptError> {
     let workers = std::thread::available_parallelism()
@@ -2902,9 +2900,9 @@ mod tests {
                 block_hash: block.block_hash(),
                 script_checks: true,
                 script_pool: None,
-            advice: None,
-            advice_collect: None,
-        };
+                advice: None,
+                advice_collect: None,
+            };
             connect_block(&block, &mut self.utxo, &ctx)?;
             self.tip = block.block_hash();
             self.tip_header = block.header;
@@ -3013,9 +3011,7 @@ mod tests {
         let mut der = sig.serialize_der().to_vec();
         der.push(1);
         let mut script_sig = script::push_slice(&der);
-        script_sig.extend_from_slice(&script::push_slice(
-            &sk.public_key(&secp).serialize(),
-        ));
+        script_sig.extend_from_slice(&script::push_slice(&sk.public_key(&secp).serialize()));
         spend.inputs[0].script_sig = Script::new(script_sig);
         spend
     }
@@ -3045,15 +3041,10 @@ mod tests {
         let spend = signed_spend(out, &spk, SUBSIDY, &sk);
         let spend_txid = spend.txid();
         let pool = ScriptPool::new(2);
-        let block = block_on(
-            &tip,
-            vec![coinbase(102, SUBSIDY), spend],
-            &chain.params,
-        );
+        let block = block_on(&tip, vec![coinbase(102, SUBSIDY), spend], &chain.params);
         chain.tree.insert(&block.header, chain.now).unwrap();
-        let collect_map = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        ));
+        let collect_map =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let ctx = ConnectContext {
             params: &chain.params,
             tree: &chain.tree,
@@ -3063,8 +3054,7 @@ mod tests {
             advice: None,
             advice_collect: Some(&collect_map),
         };
-        let (_undo, check, _receipt) =
-            connect_block_full(&block, &mut chain.utxo, &ctx).unwrap();
+        let (_undo, check, _receipt) = connect_block_full(&block, &mut chain.utxo, &ctx).unwrap();
         let check = check.expect("pool path returns a check");
         check.wait().unwrap();
         let map = check.take_advice_map();
@@ -3079,11 +3069,7 @@ mod tests {
         let (mut chain2, out2, spk2, tip2) = chain_with_p2pkh_coin(&pk33);
         assert_eq!(out2, out);
         let spend2 = signed_spend(out2, &spk2, SUBSIDY, &sk);
-        let block2 = block_on(
-            &tip2,
-            vec![coinbase(102, SUBSIDY), spend2],
-            &chain2.params,
-        );
+        let block2 = block_on(&tip2, vec![coinbase(102, SUBSIDY), spend2], &chain2.params);
         assert_eq!(block2.block_hash(), block.block_hash());
         chain2.tree.insert(&block2.header, chain2.now).unwrap();
         let pool2 = ScriptPool::new(2);
@@ -3096,8 +3082,7 @@ mod tests {
             advice: Some(&map),
             advice_collect: None,
         };
-        let (undo2, check2, _r) =
-            connect_block_full(&block2, &mut chain2.utxo, &ctx2).unwrap();
+        let (undo2, check2, _r) = connect_block_full(&block2, &mut chain2.utxo, &ctx2).unwrap();
         check2.unwrap().wait().unwrap();
         // The spend must actually have applied (not silently skipped),
         // and the deferred batch must have run — the stat counters are
@@ -3120,11 +3105,7 @@ mod tests {
         e[32] ^= 0x01;
         let (mut chain3, out3, spk3, tip3) = chain_with_p2pkh_coin(&pk33);
         let spend3 = signed_spend(out3, &spk3, SUBSIDY, &sk);
-        let block3 = block_on(
-            &tip3,
-            vec![coinbase(102, SUBSIDY), spend3],
-            &chain3.params,
-        );
+        let block3 = block_on(&tip3, vec![coinbase(102, SUBSIDY), spend3], &chain3.params);
         chain3.tree.insert(&block3.header, chain3.now).unwrap();
         let pool3 = ScriptPool::new(2);
         let ctx3 = ConnectContext {
@@ -3136,8 +3117,7 @@ mod tests {
             advice: Some(&tampered),
             advice_collect: None,
         };
-        let (undo3, check3, _r) =
-            connect_block_full(&block3, &mut chain3.utxo, &ctx3).unwrap();
+        let (undo3, check3, _r) = connect_block_full(&block3, &mut chain3.utxo, &ctx3).unwrap();
         check3.unwrap().wait().unwrap();
         assert!(chain3.utxo.get(&out3).is_none());
         let _ = (undo2, undo3);
@@ -3637,8 +3617,8 @@ mod tests {
             block_hash: block.block_hash(),
             script_checks: true,
             script_pool: None,
-                advice: None,
-                advice_collect: None,
+            advice: None,
+            advice_collect: None,
         };
         // Re-run connect on a clone to capture the undo (extend already applied
         // it); disconnect must restore `before` exactly.
@@ -3681,8 +3661,8 @@ mod tests {
             block_hash: block.block_hash(),
             script_checks: true,
             script_pool: None,
-                advice: None,
-                advice_collect: None,
+            advice: None,
+            advice_collect: None,
         };
         assert_eq!(
             connect_block(&block, &mut chain.utxo, &ctx).unwrap_err(),
@@ -3792,8 +3772,8 @@ mod tests {
             block_hash: block.block_hash(),
             script_checks: true,
             script_pool: None,
-                advice: None,
-                advice_collect: None,
+            advice: None,
+            advice_collect: None,
         };
         let base = chain.utxo.clone();
         let undo = connect_block(&block, &mut chain.utxo, &ctx).unwrap();
@@ -4101,7 +4081,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_b);
     }
 
-
     /// Async flush semantics: the dirty map becomes a readable layer
     /// while the worker commits; the next epoch's writes (including a
     /// spend of a snap-held coin) stay correct, and serialized flushes
@@ -4110,12 +4089,9 @@ mod tests {
     /// but-unjoined one, so `join_flush` at the end covers both.
     #[test]
     fn flush_async_reads_layer_and_serializes() {
-        let dir = std::env::temp_dir()
-            .join(format!("avila-flush-async-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("avila-flush-async-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let be = std::sync::Arc::new(
-            crate::coinsdb::CoinsBackend::open(&dir).unwrap(),
-        );
+        let be = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open(&dir).unwrap());
         let mut set = UtxoSet::new();
         set.attach_shared(be.clone());
 
@@ -4145,7 +4121,10 @@ mod tests {
         // coin only the snapshot holds), create C. Reads must resolve
         // through the layer — a miss here means connect saw a coin
         // that shouldn't exist (or vice versa).
-        assert!(set.spend_coin(&a_op).is_some(), "spend must hit the flushing layer");
+        assert!(
+            set.spend_coin(&a_op).is_some(),
+            "spend must hit the flushing layer"
+        );
         set.insert_synthetic(c_op, mk_coin(300, 2));
         assert_eq!(set.get(&a_op), None);
         assert_eq!(set.get(&b_op).map(|c| c.out.value), Some(200));
@@ -4174,13 +4153,10 @@ mod tests {
     /// epoch is abandoned (replay covers it).
     #[test]
     fn runs_flush_layers_and_reopens() {
-        let dir = std::env::temp_dir()
-            .join(format!("avila-runs-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("avila-runs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let be = std::sync::Arc::new(
-            crate::coinsdb::CoinsBackend::open(&dir).unwrap(),
-        );
+        let be = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open(&dir).unwrap());
         let mut set = UtxoSet::new();
         set.attach_shared(be.clone());
         set.enable_runs(&dir).unwrap();
@@ -4201,8 +4177,11 @@ mod tests {
         set.insert_synthetic(b_op, mk_coin(200, 1));
 
         // Epoch 1 → run files, not a backend commit.
-        set.flush_to_backend(&[(1, BlockHash::from_bytes([9; 32]), BlockUndo::default())], 1)
-            .unwrap();
+        set.flush_to_backend(
+            &[(1, BlockHash::from_bytes([9; 32]), BlockUndo::default())],
+            1,
+        )
+        .unwrap();
         set.join_flush().unwrap();
         assert_eq!(be.tip_height(), 0, "runs mode must not stamp meta.tip");
         assert_eq!(set.runs.len(), 1);
@@ -4212,8 +4191,11 @@ mod tests {
         // Epoch 2: spend A (lives in run 1), create C.
         assert!(set.spend_coin(&a_op).is_some());
         set.insert_synthetic(c_op, mk_coin(300, 2));
-        set.flush_to_backend(&[(2, BlockHash::from_bytes([8; 32]), BlockUndo::default())], 2)
-            .unwrap();
+        set.flush_to_backend(
+            &[(2, BlockHash::from_bytes([8; 32]), BlockUndo::default())],
+            2,
+        )
+        .unwrap();
         set.join_flush().unwrap();
         assert_eq!(set.runs.len(), 2);
         assert_eq!(set.get(&a_op), None, "del must shadow the run-1 coin");
@@ -4228,11 +4210,8 @@ mod tests {
 
         // Reopen: the two epochs re-attach; a markerless partial is dropped.
         let runs_dir = dir.join("runs");
-        crate::runs::write_epoch(
-            &runs_dir, 7, 3, 0,
-            &std::collections::HashMap::new(), &[],
-        )
-        .unwrap();
+        crate::runs::write_epoch(&runs_dir, 7, 3, 0, &std::collections::HashMap::new(), &[])
+            .unwrap();
         let _ = std::fs::remove_file(runs_dir.join("e-000007-3.ok"));
         let mut set2 = UtxoSet::new();
         set2.attach_shared(be.clone());

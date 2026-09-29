@@ -1546,10 +1546,7 @@ impl Chainstate {
                 })?;
         }
         chain.reverse();
-        self.committed_coins_tip = self
-            .coins_backend
-            .as_ref()
-            .map_or(0, |b| b.tip_height());
+        self.committed_coins_tip = self.coins_backend.as_ref().map_or(0, |b| b.tip_height());
         self.inflight_flush = None;
         self.utxo = utxo;
         self.chain = chain;
@@ -2610,7 +2607,9 @@ impl Chainstate {
         // The joined watermark — not the live `be.tip_height()`, which
         // can race ahead while a flush worker's commit is in flight.
         // `undos[i]` always describes height `committed_coins_tip + i`.
-        self.coins_backend.as_ref().map_or(0, |_| self.committed_coins_tip)
+        self.coins_backend
+            .as_ref()
+            .map_or(0, |_| self.committed_coins_tip)
     }
 
     /// Waits for the in-flight coins commit (if any) and folds its
@@ -2624,8 +2623,8 @@ impl Chainstate {
             // Drain the covered prefix: entries describe heights
             // committed_coins_tip+1..=tip. A reorg may already have
             // truncated them — `min` keeps the drain honest.
-            let drain = (tip.saturating_sub(self.committed_coins_tip) as usize)
-                .min(self.undos.len());
+            let drain =
+                (tip.saturating_sub(self.committed_coins_tip) as usize).min(self.undos.len());
             self.undos.drain(..drain);
             self.committed_coins_tip = tip;
         }
@@ -2647,14 +2646,11 @@ impl Chainstate {
             // In runs mode the backend's meta tip stalls below the
             // watermark — heights in between are covered by attached
             // epoch layers' undo sidecars, then the table below it.
-            return self
-                .utxo
-                .epoch_undo(height)
-                .or_else(|| {
-                    self.coins_backend
-                        .as_deref()
-                        .and_then(|b| b.undo_at(height))
-                });
+            return self.utxo.epoch_undo(height).or_else(|| {
+                self.coins_backend
+                    .as_deref()
+                    .and_then(|b| b.undo_at(height))
+            });
         }
         self.undos.get((height - base - 1) as usize).cloned()
     }
@@ -3410,9 +3406,7 @@ impl Chainstate {
                 script_checks: self.script_checks(&hash, &params),
                 script_pool: self.script_pool.as_deref(),
                 advice: advice_map.as_ref(),
-                advice_collect: self
-                    .advice_collect
-                    .then(|| &collect_map),
+                advice_collect: self.advice_collect.then(|| &collect_map),
             };
             match connect::connect_block_full(block, &mut self.utxo, &ctx) {
                 Ok((undo, check, receipt)) => {
@@ -4159,9 +4153,7 @@ impl Chainstate {
                 script_checks: self.script_checks(&hash, &params),
                 script_pool: pool.as_deref(),
                 advice: advice_map.as_ref(),
-                advice_collect: self
-                    .advice_collect
-                    .then(|| &collect_map),
+                advice_collect: self.advice_collect.then(|| &collect_map),
             };
             match connect::connect_block_full(&block, &mut bg.utxo, &ctx) {
                 Ok((_undo, check, receipt)) => {
@@ -4488,8 +4480,8 @@ mod tests {
     #[test]
     fn advice_collect_writes_sidecar_on_accept() {
         let params = params();
-        let dir = std::env::temp_dir()
-            .join(format!("avila-adv-{}-{}", std::process::id(), "collect"));
+        let dir =
+            std::env::temp_dir().join(format!("avila-adv-{}-{}", std::process::id(), "collect"));
         std::fs::create_dir_all(&dir).unwrap();
         let secp = secp256k1::Secp256k1::new();
         let sk = secp256k1::SecretKey::from_slice(&[0x11; 32]).unwrap();
@@ -4511,7 +4503,13 @@ mod tests {
             }
             let block = block_on(&parent, vec![cb.clone()], &params);
             if height == 1 {
-                spend_out = Some((OutPoint { txid: cb.txid(), vout: 0 }, subsidy(height)));
+                spend_out = Some((
+                    OutPoint {
+                        txid: cb.txid(),
+                        vout: 0,
+                    },
+                    subsidy(height),
+                ));
             }
             parent = block.header;
             cs.accept_block(&block, NOW).unwrap();
@@ -4558,10 +4556,9 @@ mod tests {
         cs.accept_block(&block, NOW).unwrap();
         cs.drain_scripts().unwrap();
         let file = dir.join(crate::advice::advice_name(&bh));
-        let data = std::fs::read(&file)
-            .unwrap_or_else(|_| panic!("sidecar missing: {}", file.display()));
-        let (hash, map) = crate::advice::decode_advice_block(&data)
-            .expect("sidecar decodes");
+        let data =
+            std::fs::read(&file).unwrap_or_else(|_| panic!("sidecar missing: {}", file.display()));
+        let (hash, map) = crate::advice::decode_advice_block(&data).expect("sidecar decodes");
         assert_eq!(hash, bh);
         assert_eq!(map.len(), 1, "one non-coinbase tx's stream");
         let stream = map.values().next().unwrap();

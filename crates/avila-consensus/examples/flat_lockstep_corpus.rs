@@ -38,13 +38,20 @@ fn main() {
 
     let dir_a = std::env::temp_dir().join(format!("avila-corplock-a-{}", std::process::id()));
     let dir_b = std::env::temp_dir().join(format!("avila-corplock-b-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir_a);
-    let _ = std::fs::remove_dir_all(&dir_b);
+    let dir_c = std::env::temp_dir().join(format!("avila-corplock-c-{}", std::process::id()));
+    for d in [&dir_a, &dir_b, &dir_c] {
+        let _ = std::fs::remove_dir_all(d);
+    }
     let mut plain = UtxoSet::new();
     plain.attach_backend(CoinsBackend::open(&dir_a).unwrap());
     let mut flat = UtxoSet::new();
     flat.attach_backend(CoinsBackend::open(&dir_b).unwrap());
     assert!(flat.enable_flat(0));
+    // Third leg: sorted-run flush mode — same ops, epochs land as
+    // run files; every read must agree with the btree legs.
+    let mut runs = UtxoSet::new();
+    runs.attach_backend(CoinsBackend::open(&dir_c).unwrap());
+    runs.enable_runs(&dir_c).unwrap();
 
     let (mut n_tx, mut n_spend, mut n_seed, mut n_create) = (0u64, 0u64, 0u64, 0u64);
     let (mut t_read, mut t_flatread) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
@@ -88,7 +95,8 @@ fn main() {
                             coinbase: cb,
                         };
                         plain.insert_synthetic(inp.previous_output, seed.clone());
-                        flat.insert_synthetic(inp.previous_output, seed);
+                        flat.insert_synthetic(inp.previous_output, seed.clone());
+                        runs.insert_synthetic(inp.previous_output, seed);
                         n_seed += 1;
                     }
                     let t = Instant::now();
@@ -97,7 +105,9 @@ fn main() {
                     let t = Instant::now();
                     let b = flat.spend_coin(&inp.previous_output);
                     t_flatread += t.elapsed();
+                    let c = runs.spend_coin(&inp.previous_output);
                     assert_eq!(a, b, "spend diverged at height {height}");
+                    assert_eq!(a, c, "runs spend diverged at height {height}");
                     assert!(a.is_some(), "seeded coin unspendable at {height}");
                     n_spend += 1;
                 }
@@ -120,7 +130,8 @@ fn main() {
                     vout: vout as u32,
                 };
                 plain.insert_synthetic(op, c.clone());
-                flat.insert_synthetic(op, c);
+                flat.insert_synthetic(op, c.clone());
+                runs.insert_synthetic(op, c);
                 n_create += 1;
             }
             n_tx += 1;
@@ -128,6 +139,7 @@ fn main() {
                 tip += 1;
                 plain.flush_to_backend(&[], tip).unwrap();
                 flat.flush_to_backend(&[], tip).unwrap();
+                runs.flush_to_backend(&[], tip).unwrap();
                 eprintln!(
                     "  tx {n_tx}  spends {n_spend}  seeds {n_seed}  live plain={} flat={}",
                     plain.len(),
@@ -142,11 +154,15 @@ fn main() {
     tip += 1;
     plain.flush_to_backend(&[], tip).unwrap();
     flat.flush_to_backend(&[], tip).unwrap();
+    runs.flush_to_backend(&[], tip).unwrap();
+    runs.join_flush().unwrap();
 
     // Final equivalence: identical committed views.
     let a: HashMap<OutPoint, Coin> = plain.iter().into_iter().collect();
     let b: HashMap<OutPoint, Coin> = flat.iter().into_iter().collect();
+    let c: HashMap<OutPoint, Coin> = runs.iter().into_iter().collect();
     assert_eq!(a, b, "iter diverged — flat mirror inconsistency");
+    assert_eq!(a, c, "iter diverged — runs layering inconsistency");
 
     eprintln!(
         "DONE: txs {n_tx}  spends {n_spend}  seeds {n_seed}  creates {n_create}  live {}",
@@ -159,6 +175,7 @@ fn main() {
         t_read.as_secs_f64() / t_flatread.as_secs_f64().max(1e-9),
         t_all.elapsed()
     );
-    let _ = std::fs::remove_dir_all(&dir_a);
-    let _ = std::fs::remove_dir_all(&dir_b);
+    for d in [&dir_a, &dir_b, &dir_c] {
+        let _ = std::fs::remove_dir_all(d);
+    }
 }

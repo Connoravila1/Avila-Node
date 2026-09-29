@@ -24,17 +24,15 @@
 //!   exercise the fallback path under corruption.
 
 use avila_consensus::hash::BlockHash;
+use avila_consensus::interpreter::{ExecutionData, ScriptError, SigVersion, SignatureChecker};
 use avila_consensus::params::Network;
 use avila_consensus::script::block_script_flags;
-use avila_consensus::sigchecker::{
-    check_input_scripts, check_input_scripts_advised, resolve_sink, DeferredSink,
-    PrecomputedTransactionData, TransactionSignatureChecker, ADVICE_ABSENT,
-};
 use avila_consensus::sigbatch;
-use avila_consensus::transaction::{Script, Transaction, TxOut};
-use avila_consensus::interpreter::{
-    ExecutionData, SigVersion, SignatureChecker, ScriptError,
+use avila_consensus::sigchecker::{
+    ADVICE_ABSENT, DeferredSink, PrecomputedTransactionData, TransactionSignatureChecker,
+    check_input_scripts, check_input_scripts_advised, resolve_sink,
 };
+use avila_consensus::transaction::{Script, Transaction, TxOut};
 
 struct Source {
     out: TxOut,
@@ -72,7 +70,11 @@ fn der_compact_parts(sig: &[u8]) -> Option<([u8; 32], [u8; 32], u8)> {
         b[32 - k..].copy_from_slice(&v[v.len() - k..]);
         b
     };
-    Some((pad(&sig[r_off..r_off + rlen]), pad(&sig[s_off..s_off + slen]), 0))
+    Some((
+        pad(&sig[r_off..r_off + rlen]),
+        pad(&sig[s_off..s_off + slen]),
+        0,
+    ))
 }
 
 fn u32at(b: &[u8], o: &mut usize) -> u32 {
@@ -85,7 +87,10 @@ fn parse_corpus(raw: &[u8]) -> Vec<Rec> {
     // AVCORP02: block = height ‖ hash32 ‖ txs
     // AVCORP03: block = height ‖ hash32 ‖ header80 ‖ txs
     let v3 = &raw[..8] == b"AVCORP03";
-    assert!(v3 || &raw[..8] == b"AVCORP02", "bad magic (expect AVCORP02/03)");
+    assert!(
+        v3 || &raw[..8] == b"AVCORP02",
+        "bad magic (expect AVCORP02/03)"
+    );
     let mut o = 8usize;
     let mut blocks = Vec::new();
     while o < raw.len() {
@@ -257,9 +262,7 @@ impl SignatureChecker for CaptureChecker<'_> {
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next().unwrap_or_else(|| {
-        eprintln!(
-            "usage: advice_ab <corpus.bin|dir> [--workers N] [--inject-bad-hint P]"
-        );
+        eprintln!("usage: advice_ab <corpus.bin|dir> [--workers N] [--inject-bad-hint P]");
         std::process::exit(2);
     });
     let rest: Vec<String> = args.collect();
@@ -269,8 +272,7 @@ fn main() {
             .and_then(|i| rest.get(i + 1).cloned())
     };
     let workers: usize = opt("--workers").map_or(1, |s| s.parse().unwrap());
-    let inject_every: u64 = opt("--inject-bad-hint")
-        .map_or(0, |s| s.parse().unwrap());
+    let inject_every: u64 = opt("--inject-bad-hint").map_or(0, |s| s.parse().unwrap());
     let max_blocks: usize = opt("--max-blocks").map_or(usize::MAX, |s| s.parse().unwrap());
     let corpus_path = if std::path::Path::new(&path).is_dir() {
         format!("{path}/corpus.bin")
@@ -328,8 +330,10 @@ fn main() {
 
     // ---- Phase 1: produce advice (capture during real verification) ----
     let t0 = std::time::Instant::now();
-    let advice: Vec<std::cell::RefCell<Vec<u8>>> =
-        tasks.iter().map(|_| std::cell::RefCell::new(Vec::new())).collect();
+    let advice: Vec<std::cell::RefCell<Vec<u8>>> = tasks
+        .iter()
+        .map(|_| std::cell::RefCell::new(Vec::new()))
+        .collect();
     let mut produced_sigs = 0u64;
     let mut sentinels = 0u64;
     for (ti, t) in tasks.iter().enumerate() {
@@ -337,12 +341,7 @@ fn main() {
         let out = &advice[ti];
         for (i, input) in t.tx.inputs.iter().enumerate() {
             let checker = CaptureChecker {
-                inner: TransactionSignatureChecker::new(
-                    &t.tx,
-                    i,
-                    t.outs[i].value,
-                    &txdata,
-                ),
+                inner: TransactionSignatureChecker::new(&t.tx, i, t.outs[i].value, &txdata),
                 out,
             };
             avila_consensus::interpreter::verify_script(
@@ -378,8 +377,10 @@ fn main() {
     // Freeze advice into a shareable form; optionally corrupt every
     // P-th record's parity bit to exercise the fallback path.
     let mut inject_count = 0u64;
-    let mut advice: Vec<Vec<u8>> =
-        advice.into_iter().map(std::cell::RefCell::into_inner).collect();
+    let mut advice: Vec<Vec<u8>> = advice
+        .into_iter()
+        .map(std::cell::RefCell::into_inner)
+        .collect();
     if inject_every != 0 {
         for entries in &mut advice {
             let mut o = 0usize;
@@ -407,14 +408,16 @@ fn main() {
                 let cursor = &cursor;
                 let ord_fail = &ord_fail;
                 let tasks = &tasks;
-                s.spawn(move || loop {
-                    let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if i >= tasks.len() {
-                        break;
-                    }
-                    let t = &tasks[i];
-                    if check_input_scripts(&t.tx, &t.outs, t.flags).is_err() {
-                        ord_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                s.spawn(move || {
+                    loop {
+                        let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= tasks.len() {
+                            break;
+                        }
+                        let t = &tasks[i];
+                        if check_input_scripts(&t.tx, &t.outs, t.flags).is_err() {
+                            ord_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 });
             }
@@ -460,60 +463,58 @@ fn main() {
                 let batches_bad = &batches_bad;
                 let dirty_recovered = &dirty_recovered;
                 let ranges = &ranges;
-                s.spawn(move || loop {
-                    let r = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if r >= ranges.len() {
-                        break;
-                    }
-                    let (lo, hi) = ranges[r];
-                    let sink = std::cell::RefCell::new(DeferredSink::default());
-                    let stat = std::cell::Cell::new((0u64, 0u64));
-                    let mut eval_errored: Vec<(u32, &Task)> = Vec::new();
-                    for (ti, t) in tasks[lo..hi].iter().enumerate() {
-                        let entries = &advice[lo + ti];
-                        let tag = ti as u32;
-                        if check_input_scripts_advised(
-                            &t.tx,
-                            &t.outs,
-                            t.flags,
-                            entries,
-                            &sink,
-                            tag,
-                            &stat,
-                        )
-                        .is_err()
-                        {
-                            // Deferred-mode eval errors are provisional;
-                            // resolve before believing them.
-                            eval_errored.push((tag, t));
+                s.spawn(move || {
+                    loop {
+                        let r = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if r >= ranges.len() {
+                            break;
                         }
-                    }
-                    let (a, inl) = stat.get();
-                    advised.fetch_add(a, std::sync::atomic::Ordering::Relaxed);
-                    inline.fetch_add(inl, std::sync::atomic::Ordering::Relaxed);
-                    let dirty = match resolve_sink(&sink.borrow()) {
-                        Ok(()) => Vec::new(),
-                        Err(d) => {
-                            batches_bad.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            dirty_recovered
-                                .fetch_add(d.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                            d
+                        let (lo, hi) = ranges[r];
+                        let sink = std::cell::RefCell::new(DeferredSink::default());
+                        let stat = std::cell::Cell::new((0u64, 0u64));
+                        let mut eval_errored: Vec<(u32, &Task)> = Vec::new();
+                        for (ti, t) in tasks[lo..hi].iter().enumerate() {
+                            let entries = &advice[lo + ti];
+                            let tag = ti as u32;
+                            if check_input_scripts_advised(
+                                &t.tx, &t.outs, t.flags, entries, &sink, tag, &stat,
+                            )
+                            .is_err()
+                            {
+                                // Deferred-mode eval errors are provisional;
+                                // resolve before believing them.
+                                eval_errored.push((tag, t));
+                            }
                         }
-                    };
-                    // Re-check: dirty txs (batch says a record failed —
-                    // provisional eval was wrong) + any tx whose deferred
-                    // eval errored (its true verdict is unknown until the
-                    // batch proves the pushes).
-                    let mut recheck: Vec<u32> = dirty;
-                    for (tag, _) in &eval_errored {
-                        if !recheck.contains(tag) {
-                            recheck.push(*tag);
+                        let (a, inl) = stat.get();
+                        advised.fetch_add(a, std::sync::atomic::Ordering::Relaxed);
+                        inline.fetch_add(inl, std::sync::atomic::Ordering::Relaxed);
+                        let dirty = match resolve_sink(&sink.borrow()) {
+                            Ok(()) => Vec::new(),
+                            Err(d) => {
+                                batches_bad.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                dirty_recovered.fetch_add(
+                                    d.len() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                d
+                            }
+                        };
+                        // Re-check: dirty txs (batch says a record failed —
+                        // provisional eval was wrong) + any tx whose deferred
+                        // eval errored (its true verdict is unknown until the
+                        // batch proves the pushes).
+                        let mut recheck: Vec<u32> = dirty;
+                        for (tag, _) in &eval_errored {
+                            if !recheck.contains(tag) {
+                                recheck.push(*tag);
+                            }
                         }
-                    }
-                    for tag in recheck {
-                        let t = &tasks[lo..hi][tag as usize];
-                        if check_input_scripts(&t.tx, &t.outs, t.flags).is_err() {
-                            adv_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        for tag in recheck {
+                            let t = &tasks[lo..hi][tag as usize];
+                            if check_input_scripts(&t.tx, &t.outs, t.flags).is_err() {
+                                adv_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                     }
                 });

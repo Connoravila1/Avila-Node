@@ -3463,15 +3463,9 @@ impl<S: Read + Write> PeerManager<S> {
                 // when absent (the requester's fetch timeout falls
                 // back to ordinary verification either way).
                 if let Some(dir) = cs.advice_dir() {
-                    if let Some(map) =
-                        avila_consensus::advice::read_advice_file(dir, &block_hash)
-                    {
-                        let data =
-                            avila_consensus::advice::encode_advice_block(&block_hash, &map);
-                        let _ = peer.session.send(&Message::Advice {
-                            block_hash,
-                            data,
-                        });
+                    if let Some(map) = avila_consensus::advice::read_advice_file(dir, &block_hash) {
+                        let data = avila_consensus::advice::encode_advice_block(&block_hash, &map);
+                        let _ = peer.session.send(&Message::Advice { block_hash, data });
                     }
                 }
             }
@@ -3482,9 +3476,7 @@ impl<S: Read + Write> PeerManager<S> {
                 // at connect time, so a bad stream wastes bytes, never
                 // corrupts state).
                 if let Some(dir) = cs.advice_dir() {
-                    if let Some((hash, map)) =
-                        avila_consensus::advice::decode_advice_block(&data)
-                    {
+                    if let Some((hash, map)) = avila_consensus::advice::decode_advice_block(&data) {
                         if hash == block_hash {
                             let _ =
                                 avila_consensus::advice::write_advice_file(dir, &block_hash, &map);

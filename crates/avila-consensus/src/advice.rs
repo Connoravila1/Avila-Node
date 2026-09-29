@@ -69,7 +69,10 @@ pub fn write_advice_file(
     map: &HashMap<Txid, Vec<u8>>,
 ) -> std::io::Result<()> {
     let _ = std::fs::create_dir_all(dir);
-    std::fs::write(dir.join(advice_name(block_hash)), encode_advice_block(block_hash, map))
+    std::fs::write(
+        dir.join(advice_name(block_hash)),
+        encode_advice_block(block_hash, map),
+    )
 }
 
 /// Load `<dir>/<blockhash>.adv` if present — `None` (not `Err`) on

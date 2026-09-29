@@ -125,7 +125,8 @@ fn main() {
             ph.reverse();
             let height: u32 = args[3].parse().unwrap();
             let time: u32 = args[4].parse::<u32>().unwrap() + 1;
-            let spend = Transaction::decode(&avila_consensus::hex::decode(&args[5]).unwrap()).unwrap();
+            let spend =
+                Transaction::decode(&avila_consensus::hex::decode(&args[5]).unwrap()).unwrap();
             let params = Network::Regtest.params();
             let fee: i64 = 1000;
             let mut cb_sig = script::push_int(i64::from(height));
@@ -157,7 +158,8 @@ fn main() {
             };
             let (root, _) = block.merkle_root();
             block.header.merkle_root = root;
-            while pow::check_proof_of_work(&block.block_hash(), block.header.bits, &params).is_err() {
+            while pow::check_proof_of_work(&block.block_hash(), block.header.bits, &params).is_err()
+            {
                 block.header.nonce = block.header.nonce.wrapping_add(1);
                 if block.header.nonce == 0 {
                     block.header.time += 1;
@@ -165,6 +167,8 @@ fn main() {
             }
             println!("{}", avila_consensus::hex::encode(&block.encode()));
         }
-        _ => eprintln!("usage: regtest_advice_spend addr|spend <txid> <vout> <sats>|block <prevhash> <height> <prevtime> <rawtx>"),
+        _ => eprintln!(
+            "usage: regtest_advice_spend addr|spend <txid> <vout> <sats>|block <prevhash> <height> <prevtime> <rawtx>"
+        ),
     }
 }

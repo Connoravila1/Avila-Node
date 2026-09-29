@@ -535,10 +535,17 @@ impl Session {
             electrum: settings.electrum.trim().parse().ok(),
             // fast_ibd picks the flat committed-coin mirror; flat_mib
             // bounds it, empty means uncapped. `--fast-ibd` sets the
-            // flag; the cap stays a Settings-field choice.
-            flat_utxo_bytes: settings
-                .fast_ibd
-                .then(|| RunSettings::mib(&settings.flat_mib).unwrap_or(0)),
+            // flag; the cap stays a Settings-field choice. AVILA_FLAT_MIB
+            // overrides the persisted value for guarded experiments —
+            // an uncapped mirror over a mid-chain backend exceeds the
+            // laptop's cgroup envelope, and a refused cap disables flat.
+            flat_utxo_bytes: settings.fast_ibd.then(|| {
+                std::env::var("AVILA_FLAT_MIB")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .map(|mib| mib.saturating_mul(1 << 20))
+                    .unwrap_or_else(|| RunSettings::mib(&settings.flat_mib).unwrap_or(0))
+            }),
             advice_dir: {
                 let d = settings.advice_dir.trim();
                 (!d.is_empty()).then(|| std::path::PathBuf::from(d))

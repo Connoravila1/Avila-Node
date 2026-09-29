@@ -1154,8 +1154,14 @@ impl SignatureChecker for DeferredChecker<'_> {
                         "desync tag={} at={} entry_r={} sig_r={} sentinel={}",
                         self.tag,
                         self.advice.get(),
-                        entry_r[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                        sig64[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        entry_r[..8]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>(),
+                        sig64[..8]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>(),
                         adv.is_none(),
                     );
                 }
@@ -1198,9 +1204,7 @@ impl SignatureChecker for DeferredChecker<'_> {
                     sigversion,
                     self.inner.txdata,
                 );
-                let r = TransactionSignatureChecker::verify_ecdsa_signature(
-                    sig, pubkey, &sighash,
-                );
+                let r = TransactionSignatureChecker::verify_ecdsa_signature(sig, pubkey, &sighash);
                 let (a, i) = self.stat.get();
                 self.stat.set((a, i + 1));
                 r
@@ -1307,16 +1311,23 @@ pub fn advice_stats() -> (u64, u64, u64) {
 /// corrupt or sigs were bad, `Ok` — with `dirty` empty — when all is
 /// verified. `batch_ok`/`fallback_used` feed status reporting.
 pub fn resolve_sink(sink: &DeferredSink) -> Result<(), Vec<u32>> {
-    ADVICE_STATS.fetch_add(sink.records.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    ADVICE_STATS.fetch_add(
+        sink.records.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     match crate::sigbatch::batch_verify(&sink.records) {
         crate::sigbatch::Outcome::Valid => {
-            ADVICE_BATCHED
-                .fetch_add(sink.records.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            ADVICE_BATCHED.fetch_add(
+                sink.records.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             Ok(())
         }
         crate::sigbatch::Outcome::Fallback => {
-            ADVICE_FALLBACK
-                .fetch_add(sink.records.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            ADVICE_FALLBACK.fetch_add(
+                sink.records.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let mut dirty: Vec<u32> = Vec::new();
             for (i, r) in sink.records.iter().enumerate() {
                 // Ordinary verification of the exact same (z, r‖s, pub)
