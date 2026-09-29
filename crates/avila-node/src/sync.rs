@@ -2277,8 +2277,13 @@ pub fn run(
             } else {
                 String::new()
             };
+            let fl = cs
+                .utxo()
+                .flushing_stats()
+                .map(|(n, _)| format!(" fl={n}"))
+                .unwrap_or_default();
             eprintln!(
-                "sync: peers={} connected={} headers={} buffered={} in_flight={} rss={}MB map={}n/{}MB undos={} pend={} eta={} w={} | ms/blk[{} blk] total={} read={} apply={} scripts={} drain={} bip30={} other={} | accept={}ms reorg={}ms{}",
+                "sync: peers={} connected={} headers={} buffered={} in_flight={} rss={}MB map={}n/{}MB undos={} pend={} eta={} w={}{} | ms/blk[{} blk] total={} read={} apply={} scripts={} drain={} bip30={} other={} | accept={}ms reorg={}ms{}",
                 mgr.len(),
                 connected,
                 cs.tree().tip().height,
@@ -2291,6 +2296,7 @@ pub fn run(
                 pending_n,
                 format_args!("{eta} {fit}"),
                 pace.windows.len(),
+                fl,
                 d_blocks,
                 d(t.total_ns, hb_prev_t.total_ns),
                 d(t.read_ns, hb_prev_t.read_ns),

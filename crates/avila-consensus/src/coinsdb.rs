@@ -382,7 +382,14 @@ impl CoinsBackend {
             Ok("redb") => Some(Engine::Redb),
             _ => None,
         };
-        let mut be = Self::open_inner(dir, None, None, eng)?;
+        // `AVILA_COINS_CACHE_MB` — redb page-cache budget for the coins
+        // btree; the default (~1 GiB) thrashes random insert paths on
+        // a 30 GB+ database. Experiment knob, not consensus.
+        let cache_bytes = std::env::var("AVILA_COINS_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| mb * 1024 * 1024);
+        let mut be = Self::open_inner(dir, None, cache_bytes, eng)?;
         if std::env::var("AVILA_COINS_DUAL").as_deref() == Ok("1") {
             let other = if be.engine == Engine::Redb {
                 Engine::Hash

@@ -216,6 +216,10 @@ struct FlushLayer {
     snap: std::sync::Arc<CacheMap>,
     /// `snap`'s net contribution to the live-coin count.
     delta: i64,
+    /// `snap`'s accounted bytes — kept so `over_budget` bounds
+    /// map+in-flight together (the double-buffer can't silently
+    /// double the RAM window).
+    bytes: usize,
     /// The tip the worker's commit advances the backend to — lets
     /// `len()` stop counting `delta` the moment the backend's own
     /// `coins_len` includes it (the land-before-join window).
@@ -373,7 +377,12 @@ impl UtxoSet {
         // `swift_hold` keeps the whole window transient — the
         // aggregate is only worth anything if nothing flushes
         // mid-window.
-        self.backend.is_some() && !self.swift_hold && self.map_bytes > self.budget
+        self.backend.is_some()
+            && !self.swift_hold
+            && self
+                .map_bytes
+                .saturating_add(self.flushing.as_ref().map_or(0, |l| l.bytes))
+                > self.budget
     }
 
     /// Live entries in the write-back map — the flush trigger's second
@@ -522,6 +531,14 @@ impl UtxoSet {
     #[must_use]
     pub fn map_stats(&self) -> (usize, usize) {
         (self.map.len(), self.map_bytes)
+    }
+
+    /// In-flight flush state: `Some((entries, delta))` while a commit
+    /// worker runs, `None` otherwise. Telemetry only — the layer is
+    /// readable through `get`/`have`/`iter` as always.
+    #[must_use]
+    pub fn flushing_stats(&self) -> Option<(usize, i64)> {
+        self.flushing.as_ref().map(|l| (l.snap.len(), l.delta))
     }
 
     /// The coin at `outpoint` — layered lookup: dirty map, then the
@@ -995,6 +1012,7 @@ impl UtxoSet {
         let snap: CacheMap = std::mem::take(&mut self.map);
         let born = std::mem::take(&mut self.born);
         let delta = self.live_delta;
+        let bytes_taken = self.map_bytes;
         self.live_delta = 0;
         self.map_bytes = 0;
         let _ = born; // elision already applied; the next epoch starts fresh
@@ -1002,6 +1020,7 @@ impl UtxoSet {
         self.flushing = Some(FlushLayer {
             snap: snap.clone(),
             delta,
+            bytes: bytes_taken,
             tip,
         });
         let undos: Vec<(u32, crate::hash::BlockHash, BlockUndo)> = new_undos.to_vec();
@@ -1075,6 +1094,7 @@ impl Clone for UtxoSet {
             flushing: self.flushing.as_ref().map(|l| FlushLayer {
                 snap: l.snap.clone(),
                 delta: l.delta,
+                bytes: l.bytes,
                 tip: l.tip,
             }),
             // A clone never inherits the commit worker — joining is the
