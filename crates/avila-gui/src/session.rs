@@ -1129,8 +1129,10 @@ mod tests {
 
     #[test]
     fn gui_start_fields_follow_the_resolved_config() {
-        let mut c = avila_core::NodeConfig::default();
-        c.network = avila_core::Network::Mainnet;
+        let mut c = avila_core::NodeConfig {
+            network: avila_core::Network::Mainnet,
+            ..Default::default()
+        };
         c.net.connect = vec!["127.0.0.1:8333".parse().unwrap()];
         c.net.listen = Some("0.0.0.0:8333".parse().unwrap());
         c.privacy.proxy = Some("127.0.0.1:9050".parse().unwrap());

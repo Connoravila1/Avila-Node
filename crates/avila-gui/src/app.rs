@@ -151,14 +151,14 @@ impl App {
         // canonical overlay. Never silently turn a private run direct.
         if run.proxy.is_empty() && !prefs.proxy.is_empty() {
             run.proxy = prefs.proxy.clone();
-            if let Some(file) = &config_file {
-                if let Err(e) = avila_node::config::write_overlay_knob(
+            if let Some(file) = &config_file
+                && let Err(e) = avila_node::config::write_overlay_knob(
                     file,
                     "privacy.proxy",
                     Some(toml::Value::String(run.proxy.clone())),
-                ) {
-                    settings_error = Some(format!("Proxy could not be saved: {e}"));
-                }
+                )
+            {
+                settings_error = Some(format!("Proxy could not be saved: {e}"));
             }
         }
         let applied = prefs.clone();
