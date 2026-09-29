@@ -803,7 +803,7 @@ impl PeerSync {
     }
 
     /// Enqueues `getadvice` for each block hash this peer hasn't been
-    /// asked about yet — deduped like [`Self::wanted`] so the fan-out
+    /// asked about yet — deduped like `wanted` so the fan-out
     /// asks once per block per peer. Returns the messages to send.
     pub fn want_advice(&mut self, hashes: &[BlockHash]) -> Vec<Message> {
         hashes

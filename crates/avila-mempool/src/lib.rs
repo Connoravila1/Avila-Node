@@ -5531,25 +5531,33 @@ mod tests {
     /// `invalidateblock` semantics: only the first `max_blocks`
     /// disconnect-order blocks feed the pool — Core's
     /// `(++disconnected <= 10)` gate on deep invalidations.
+    ///
+    /// The invalidated tail must sit high enough that its coinbase
+    /// spends stay mature at the *post-disconnect* tip — below
+    /// `height + 100` Core's `AcceptToMemoryPool` rejects them as
+    /// `bad-txns-premature-spend-of-coinbase` and nothing readmits.
+    /// (The builders mint a fixed-50 subsidy, so the whole chain stays
+    /// below the regtest halving at 150.)
     #[test]
     fn refill_caps_invalidation_depth() {
-        let (mut cs, blocks) = chainstate_at(101);
+        let (mut cs, blocks) = chainstate_at(130);
         let params = Network::Regtest.params();
-        // Blocks h102..h113 each carry one spend of a distinct mature
-        // coinbase (h1..h12) so none conflict.
+        // Blocks h131..h142 each carry one spend of a distinct mature
+        // coinbase (h1..h12 — depth >= 119 at the post-invalidate tip)
+        // so none conflict.
         let mut txs = Vec::new();
-        let mut prev = blocks[100].header;
+        let mut prev = blocks[129].header;
         for i in 0..12usize {
-            let h = 102 + i as u32;
+            let h = 131 + i as u32;
             let spend = spend_tx(mature_outpoint(&blocks, i + 1), 4_999_000_000, SEQ_FINAL);
             txs.push(spend.txid());
             let b = block_with(&prev, h, spend, &params);
             cs.accept_block(&b, NOW).unwrap();
             prev = b.header;
         }
-        // Invalidate h102 — twelve blocks disconnect, but the refill cap
+        // Invalidate h131 — twelve blocks disconnect, but the refill cap
         // keeps the deepest two out of the pool.
-        let target = cs.chain()[102];
+        let target = cs.chain()[131];
         assert_eq!(cs.invalidate_block(&target), Ok(Some(12)));
         let gone = cs.take_disconnected();
         assert_eq!(gone.len(), 12);
@@ -5557,8 +5565,8 @@ mod tests {
         let mut pool = permissive_pool();
         pool.set_require_standard(false);
         let n = pool.refill_from_disconnected(&gone, &cs, NOW, false, 10);
-        // Disconnect order is tip-first: h113's spend feeds first,
-        // h103/h102's are past the cap.
+        // Disconnect order is tip-first: h142's spend feeds first,
+        // h132/h131's are past the cap.
         assert_eq!(n, 10);
         assert_eq!(pool.len(), 10);
         assert!(pool.get(&txs[11]).is_some());
