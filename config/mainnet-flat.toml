@@ -13,6 +13,7 @@ event_capacity = 256
 
 [storage]
 prune_mb = 32768
+dbcache_mb = 6144
 
 [services.rpc]
 bind = "127.0.0.1:8332"
