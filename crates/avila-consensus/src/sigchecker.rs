@@ -1282,6 +1282,24 @@ pub fn check_input_scripts_advised(
     Ok(())
 }
 
+/// Running totals for the advised path: `(sigs deferred, sigs
+/// batch-verified, records re-verified inline after a batch miss)`.
+/// Exposed so the node can prove the fast path actually ran — a sidecar
+/// on disk doesn't distinguish "consumed" from "never consulted".
+static ADVICE_STATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ADVICE_BATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ADVICE_FALLBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the advice-path counters (see [`ADVICE_STATS`]).
+#[must_use]
+pub fn advice_stats() -> (u64, u64, u64) {
+    (
+        ADVICE_STATS.load(std::sync::atomic::Ordering::Relaxed),
+        ADVICE_BATCHED.load(std::sync::atomic::Ordering::Relaxed),
+        ADVICE_FALLBACK.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Resolve a batch scope: verify every deferred record. On batch
 /// failure each record is verified the ordinary way; the set of job
 /// indices whose records failed is returned so the caller re-runs only
@@ -1289,9 +1307,16 @@ pub fn check_input_scripts_advised(
 /// corrupt or sigs were bad, `Ok` — with `dirty` empty — when all is
 /// verified. `batch_ok`/`fallback_used` feed status reporting.
 pub fn resolve_sink(sink: &DeferredSink) -> Result<(), Vec<u32>> {
+    ADVICE_STATS.fetch_add(sink.records.len() as u64, std::sync::atomic::Ordering::Relaxed);
     match crate::sigbatch::batch_verify(&sink.records) {
-        crate::sigbatch::Outcome::Valid => Ok(()),
+        crate::sigbatch::Outcome::Valid => {
+            ADVICE_BATCHED
+                .fetch_add(sink.records.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
         crate::sigbatch::Outcome::Fallback => {
+            ADVICE_FALLBACK
+                .fetch_add(sink.records.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let mut dirty: Vec<u32> = Vec::new();
             for (i, r) in sink.records.iter().enumerate() {
                 // Ordinary verification of the exact same (z, r‖s, pub)

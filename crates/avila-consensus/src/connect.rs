@@ -2748,8 +2748,13 @@ mod tests {
         let (undo2, check2, _r) =
             connect_block_full(&block2, &mut chain2.utxo, &ctx2).unwrap();
         check2.unwrap().wait().unwrap();
-        // The spend must actually have applied (not silently skipped).
+        // The spend must actually have applied (not silently skipped),
+        // and the deferred batch must have run — the stat counters are
+        // the observable proof the advice path executed, not just that
+        // the block connected.
         assert!(chain2.utxo.get(&out).is_none(), "spent coin must be gone");
+        let (d, b, _f) = crate::sigchecker::advice_stats();
+        assert!(d > 0 && b > 0, "advised connect must batch-verify: {d}/{b}");
 
         // Sidecar round-trip: encode → decode → same map.
         let buf = crate::advice::encode_advice_block(&block.block_hash(), &map);

@@ -2270,8 +2270,15 @@ pub fn run(
             };
             let d_ms = |cur: u64, prev: u64| cur.saturating_sub(prev) / 1_000_000;
             let pending_n = cs.pending_scripts_len();
+            let (adv_deferred, adv_batched, adv_fallback) =
+                avila_consensus::sigchecker::advice_stats();
+            let adv = if adv_deferred > 0 {
+                format!(" adv[d={adv_deferred} b={adv_batched} f={adv_fallback}]")
+            } else {
+                String::new()
+            };
             eprintln!(
-                "sync: peers={} connected={} headers={} buffered={} in_flight={} rss={}MB map={}n/{}MB undos={} pend={} eta={} w={} | ms/blk[{} blk] total={} read={} apply={} scripts={} drain={} bip30={} other={} | accept={}ms reorg={}ms",
+                "sync: peers={} connected={} headers={} buffered={} in_flight={} rss={}MB map={}n/{}MB undos={} pend={} eta={} w={} | ms/blk[{} blk] total={} read={} apply={} scripts={} drain={} bip30={} other={} | accept={}ms reorg={}ms{}",
                 mgr.len(),
                 connected,
                 cs.tree().tip().height,
@@ -2303,6 +2310,7 @@ pub fn run(
                 ),
                 d_ms(t.accept_ns, hb_prev_t.accept_ns),
                 d_ms(t.reorg_ns, hb_prev_t.reorg_ns),
+                adv,
             );
             hb_prev_t = t;
             hb_prev_connected = connected;
