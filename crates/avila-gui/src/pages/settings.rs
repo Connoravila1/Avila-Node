@@ -17,8 +17,12 @@ pub fn show(
     prefs: &mut Prefs,
     node: &Node,
     open_advanced: bool,
+    settings_error: Option<&str>,
 ) -> Option<Action> {
     starting(ui, s, run, node, open_advanced);
+    if let Some(error) = settings_error {
+        ui.label(RichText::new(error).size(13.0).color(s.pal.alert));
+    }
     ui.add_space(30.0);
     privacy(ui, s, prefs);
     ui.add_space(30.0);

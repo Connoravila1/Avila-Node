@@ -34,12 +34,16 @@ pub fn load_config(path: Option<&Path>) -> Result<ValidatedConfig, LoadConfigErr
     let overlay = overlay_path(path);
     match std::fs::read_to_string(&overlay) {
         Ok(contents) => {
-            let o: toml::Value =
+            let mut o: toml::Value =
                 toml::from_str(&contents).map_err(|source| LoadConfigError::Overlay {
                     path: overlay.clone(),
                     source,
                 })?;
+            let unsets = take_unsets(&mut o).map_err(LoadConfigError::OverlayUnset)?;
             merge(&mut raw, o);
+            for path in unsets {
+                remove_path(&mut raw, &path);
+            }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(source) => {
@@ -78,6 +82,63 @@ fn merge(base: &mut toml::Value, over: toml::Value) {
             }
         }
         (base, over) => *base = over,
+    }
+}
+
+/// `_unset` is an overlay-only tombstone for optional values which are
+/// explicitly disabled even when the original TOML supplies a value.
+fn take_unsets(overlay: &mut toml::Value) -> Result<Vec<String>, String> {
+    let Some(table) = overlay.as_table_mut() else {
+        return Err("overlay must be a TOML table".into());
+    };
+    let Some(value) = table.remove("_unset") else {
+        return Ok(Vec::new());
+    };
+    let toml::Value::Array(items) = value else {
+        return Err("_unset must be an array of paths".into());
+    };
+    items
+        .into_iter()
+        .map(|v| match v {
+            toml::Value::String(path) if nullable_knob(&path) => Ok(path),
+            _ => Err("_unset may contain only optional configuration paths".into()),
+        })
+        .collect()
+}
+
+fn nullable_knob(path: &str) -> bool {
+    matches!(
+        path,
+        "storage.prune_mb"
+            | "storage.dbcache_mb"
+            | "net.listen"
+            | "net.asmap"
+            | "privacy.proxy"
+            | "mining.max_weight"
+            | "mining.reserved_weight"
+            | "services.rpc.bind"
+            | "services.rpc.user"
+            | "services.rpc.password"
+            | "services.electrum.listen"
+            | "services.sv2.listen"
+    )
+}
+
+fn remove_path(root: &mut toml::Value, path: &str) {
+    let mut pieces = path.split('.').peekable();
+    let mut current = root;
+    while let Some(piece) = pieces.next() {
+        let Some(table) = current.as_table_mut() else {
+            return;
+        };
+        if pieces.peek().is_none() {
+            table.remove(piece);
+            return;
+        }
+        let Some(next) = table.get_mut(piece) else {
+            return;
+        };
+        current = next;
     }
 }
 
@@ -123,6 +184,8 @@ pub enum LoadConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("invalid runtime overlay _unset: {0}")]
+    OverlayUnset(String),
     #[error(transparent)]
     Invalid(#[from] ConfigError),
     #[error("policy.shadow profile {0:?} is unknown — builtins: strict, core, permissive")]
@@ -558,6 +621,13 @@ pub fn lint_config(c: &NodeConfig) -> Vec<LintFinding> {
             "requires filters.build — startup refuses -peerblockfilters without the index".into(),
         );
     }
+    if c.indexes.txindex && c.storage.prune_mb.is_some() {
+        push(
+            LintLevel::Fail,
+            "indexes.txindex",
+            "transaction index and pruning cannot be enabled together".into(),
+        );
+    }
     if let Some(mb) = c.storage.prune_mb
         && mb < 550
     {
@@ -757,32 +827,90 @@ pub fn write_overlay_knob(
     path: &str,
     value: Option<toml::Value>,
 ) -> Result<(), String> {
+    write_overlay_knobs(config_path, &[(path, value)])
+}
+
+/// Stage a complete edit as one validated overlay update. A failed
+/// preset cannot leave the first few knobs written and the rest absent.
+pub fn write_overlay_knobs(
+    config_path: &Path,
+    changes: &[(&str, Option<toml::Value>)],
+) -> Result<(), String> {
+    let edits: Vec<_> = changes
+        .iter()
+        .map(|(path, value)| {
+            (
+                *path,
+                match value {
+                    Some(v) => OverlayEdit::Set(v.clone()),
+                    None => OverlayEdit::Inherit,
+                },
+            )
+        })
+        .collect();
+    write_overlay_edits(config_path, &edits)
+}
+
+/// Set a value, reveal the base file, or explicitly disable an optional
+/// value that the base file may have supplied.
+pub enum OverlayEdit {
+    Set(toml::Value),
+    Inherit,
+    Unset,
+}
+
+pub fn write_overlay_edits(
+    config_path: &Path,
+    changes: &[(&str, OverlayEdit)],
+) -> Result<(), String> {
     let overlay = overlay_path(config_path);
     let mut table: toml::Table = match std::fs::read_to_string(&overlay) {
         Ok(s) => toml::from_str(&s).map_err(|e| format!("overlay won't parse: {e}"))?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => toml::Table::new(),
         Err(e) => return Err(format!("can't read {}: {e}", overlay.display())),
     };
-    // Descend `a.b.c`, creating tables; `None` deletes the leaf.
-    let keys: Vec<&str> = path.split('.').collect();
-    let mut cursor = &mut table;
-    for key in &keys[..keys.len() - 1] {
-        let entry = cursor
-            .entry((*key).to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let Some(t) = entry.as_table_mut() else {
-            return Err(format!("{key} in the overlay isn't a table"));
-        };
-        cursor = t;
+    let mut existing = toml::Value::Table(table.clone());
+    let mut unsets = take_unsets(&mut existing)?
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    table.remove("_unset");
+    for (path, value) in changes {
+        if !KNOB_DOCS.iter().any(|(known, _)| known == path) {
+            return Err(format!("unknown configuration path {path}"));
+        }
+        unsets.remove(*path);
+        if matches!(value, OverlayEdit::Unset) {
+            if !nullable_knob(path) {
+                return Err(format!("{path} cannot be unset"));
+            }
+            unsets.insert((*path).to_string());
+        }
+        let keys: Vec<&str> = path.split('.').collect();
+        let mut cursor = &mut table;
+        for key in &keys[..keys.len() - 1] {
+            let entry = cursor
+                .entry((*key).to_string())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            let Some(t) = entry.as_table_mut() else {
+                return Err(format!("{key} in the overlay isn't a table"));
+            };
+            cursor = t;
+        }
+        match value {
+            OverlayEdit::Set(v) => {
+                cursor.insert(keys[keys.len() - 1].to_string(), v.clone());
+            }
+            OverlayEdit::Inherit | OverlayEdit::Unset => {
+                cursor.remove(keys[keys.len() - 1]);
+                prune_empty(&mut table, &keys[..keys.len() - 1]);
+            }
+        }
     }
-    match value {
-        Some(v) => {
-            cursor.insert(keys[keys.len() - 1].to_string(), v);
-        }
-        None => {
-            cursor.remove(keys[keys.len() - 1]);
-            prune_empty(&mut table, &keys[..keys.len() - 1]);
-        }
+    if !unsets.is_empty() {
+        table.insert(
+            "_unset".into(),
+            toml::Value::Array(unsets.into_iter().map(toml::Value::String).collect()),
+        );
     }
     // Validate the merge before the file moves — same path a load
     // takes, minus the resolve (paths aren't being staged).
@@ -790,8 +918,19 @@ pub fn write_overlay_knob(
         .map_err(|e| format!("can't read {}: {e}", config_path.display()))?;
     let mut raw: toml::Value =
         toml::from_str(&main).map_err(|e| format!("config won't parse: {e}"))?;
-    merge(&mut raw, toml::Value::Table(table.clone()));
-    parse_value(raw).map_err(|e| format!("{e}"))?;
+    let mut overlay_raw = toml::Value::Table(table.clone());
+    let unsets = take_unsets(&mut overlay_raw)?;
+    merge(&mut raw, overlay_raw);
+    for path in unsets {
+        remove_path(&mut raw, &path);
+    }
+    let checked = parse_value(raw).map_err(|e| format!("{e}"))?;
+    if let Some(finding) = lint_config(checked.get())
+        .into_iter()
+        .find(|f| f.level == LintLevel::Fail)
+    {
+        return Err(format!("{}: {}", finding.path, finding.message));
+    }
     let body = toml::to_string_pretty(&table).map_err(|e| e.to_string())?;
     let text = format!(
         "# Written by the GUI — merged over {} at load. Edit or delete freely.\n\n{}",
@@ -801,7 +940,14 @@ pub fn write_overlay_knob(
             .unwrap_or("the config"),
         body,
     );
-    std::fs::write(&overlay, text).map_err(|e| format!("can't write: {e}"))?;
+    // Rename a complete temporary file so a process interruption cannot
+    // expose a partially written TOML file to the next start.
+    let temp = overlay.with_extension(format!("runtime-{}.tmp", std::process::id()));
+    std::fs::write(&temp, text).map_err(|e| format!("can't write: {e}"))?;
+    if let Err(e) = std::fs::rename(&temp, &overlay) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("can't replace {}: {e}", overlay.display()));
+    }
     Ok(())
 }
 
@@ -840,14 +986,14 @@ mod tests {
         let main = dir.join("n.toml");
         std::fs::write(
             &main,
-            "network = \"regtest\"\n\n[storage]\nprune_mb = 500\n\n[mempool]\nmax_mb = 100\n",
+            "network = \"regtest\"\n\n[storage]\nprune_mb = 550\n\n[mempool]\nmax_mb = 100\n",
         )
         .unwrap();
         // The overlay wins where it speaks; untouched keys survive.
         std::fs::write(overlay_path(&main), "[mempool]\nmax_mb = 64\n").unwrap();
         let c = load_config(Some(&main)).unwrap();
         assert_eq!(c.get().mempool.max_mb, 64);
-        assert_eq!(c.get().storage.prune_mb, Some(500));
+        assert_eq!(c.get().storage.prune_mb, Some(550));
         // A broken overlay fails the load loudly, not silently.
         std::fs::write(overlay_path(&main), "[mempool\n").unwrap();
         assert!(matches!(
@@ -871,6 +1017,85 @@ mod tests {
         let c = load_config(Some(&main)).unwrap();
         assert!(!c.get().net.blocks_only);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preset_overlay_is_validated_and_written_as_one_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "avila-preset-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("n.toml");
+        std::fs::write(&main, "network = \"regtest\"\n").unwrap();
+        write_overlay_knobs(
+            &main,
+            &[
+                ("filters.build", Some(toml::Value::Boolean(true))),
+                ("filters.serve", Some(toml::Value::Boolean(true))),
+            ],
+        )
+        .unwrap();
+        let previous = std::fs::read(overlay_path(&main)).unwrap();
+        let result = write_overlay_knobs(
+            &main,
+            &[
+                ("mempool.max_mb", Some(toml::Value::Integer(64))),
+                (
+                    "relay.tx.announce",
+                    Some(toml::Value::String("invalid".into())),
+                ),
+            ],
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(overlay_path(&main)).unwrap(), previous);
+        assert_eq!(load_config(Some(&main)).unwrap().get().mempool.max_mb, 300);
+        // The dependency is validated against the complete candidate,
+        // rather than leaving the node unable to start after a partial edit.
+        assert!(
+            write_overlay_knob(&main, "filters.build", Some(toml::Value::Boolean(false))).is_err()
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn explicit_unset_disables_a_value_from_the_main_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "avila-unset-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("n.toml");
+        std::fs::write(
+            &main,
+            "network = \"regtest\"\n[privacy]\nproxy = \"127.0.0.1:9050\"\n[net]\nlisten = \"127.0.0.1:18444\"\n",
+        )
+        .unwrap();
+        write_overlay_edits(
+            &main,
+            &[
+                ("privacy.proxy", OverlayEdit::Unset),
+                ("net.listen", OverlayEdit::Unset),
+            ],
+        )
+        .unwrap();
+        let c = load_config(Some(&main)).unwrap();
+        assert_eq!(c.get().privacy.proxy, None);
+        assert_eq!(c.get().net.listen, None);
+        write_overlay_edits(&main, &[("privacy.proxy", OverlayEdit::Inherit)]).unwrap();
+        assert_eq!(
+            load_config(Some(&main))
+                .unwrap()
+                .get()
+                .privacy
+                .proxy
+                .unwrap()
+                .port(),
+            9050
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
