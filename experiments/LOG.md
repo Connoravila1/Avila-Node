@@ -2005,3 +2005,26 @@ previously returned `None` for tail keys.
 **Honest caveat:** run files accumulate without compaction (each
 probe walks all layers on a miss); depth is bounded by flush cadence
 (~1M entries/epoch) and bloom/merge layers remain future work.
+
+## Experiment #34 — session verdict: the wall is the working set
+
+**One-line answer:** the IBD wall at ~460k is the ~180M-coin UTXO
+set vs a ~16GB memory envelope — flat RAM mirror (fast reads) and
+sorted-run flushes (fast writes) cannot coexist under the cap; the
+night's optimizations each moved the pain, none removed it.
+
+**Measured:** sig batching 2.06–2.5× (bench, proven on real sockets);
+async flush residual 2061→470ms; runs epoch write 229ms/commit with
+zero btree commits; live rates — async+flat ~3–5 blk/s bursts vs
+runs+no-flat ~1.5 blk/s. 24-peer delivery changed nothing (connect-
+bound); 4GB page-cache and uncapped flat both OOM'd (the flat mirror
+was the night's crash driver, ~16GB RSS during restore).
+
+**Real bugs fixed:** mark_invalid/restore_tip phantom-best-tip stall
+(f6bab34); get/have runs-layer miss; scan_window EOF; in-flight
+flush memory accounting; getadvice dedupe + request-at-header-accept.
+
+**Not proven:** a faster end-to-end IBD. Next levers ranked:
+bounded flat mirror, per-run bloom filters, run compaction,
+swiftsync transient mode, utreexo. Full analysis:
+[2026-09-29-ibd-wall-analysis.md](2026-09-29-ibd-wall-analysis.md)
