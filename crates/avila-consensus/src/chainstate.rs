@@ -1894,12 +1894,20 @@ impl Chainstate {
                     eprintln!("restore: state.dat rejected ({err}) — rebuilding from blk files");
                     let store = cs.store.take();
                     let backend = cs.coins_backend.take();
+                    // Runs files may cover heights the backend attests
+                    // differently — drop them before re-attaching.
+                    if cs.utxo.runs_enabled() {
+                        let _ = crate::runs::purge(&dir.join("runs"));
+                    }
                     cs = Self::new(cs.tree.params());
                     cs.store = store;
                     cs.coins_backend = backend;
                     if let Some(be) = &cs.coins_backend {
                         cs.committed_coins_tip = be.tip_height();
                         cs.utxo.attach_shared(be.clone());
+                        if std::env::var("AVILA_RUNS").as_deref() == Ok("1") {
+                            cs.utxo.enable_runs(dir)?;
+                        }
                     }
                     cs.stored_positions(&HashSet::new())
                 }
@@ -1939,6 +1947,11 @@ impl Chainstate {
                         eprintln!("restore: backend rewind failed ({err}) — rebuilding coinsdb");
                         cs.coins_backend = None;
                         cs.utxo = UtxoSet::new();
+                        // Stale run epochs describe a coins view the
+                        // rebuilt backend no longer shares — a later
+                        // AVILA_RUNS restart would attach them and skip
+                        // the replay range they cover. Purge with the db.
+                        let _ = crate::runs::purge(&dir.join("runs"));
                         for name in [
                             "coinsdb.redb",
                             "coinsdb.shadow.redb",
@@ -1950,6 +1963,9 @@ impl Chainstate {
                         let fresh = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open(dir)?);
                         cs.committed_coins_tip = fresh.tip_height();
                         cs.utxo.attach_shared(fresh.clone());
+                        if std::env::var("AVILA_RUNS").as_deref() == Ok("1") {
+                            cs.utxo.enable_runs(dir)?;
+                        }
                         cs.coins_backend = Some(fresh);
                         eprintln!("restore: coinsdb rebuilt empty; bodies replay over it");
                     }
