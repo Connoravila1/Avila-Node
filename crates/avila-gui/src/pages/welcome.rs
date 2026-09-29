@@ -90,6 +90,13 @@ pub fn show(ui: &mut Ui, s: &Scene, run: &mut RunSettings) -> Option<Action> {
                     &[(false, "Standard"), (true, "Experimental")],
                 );
             });
+            if run.fast_ibd {
+                ui.add_space(4.0);
+                row(ui, |ui| {
+                    field(ui, &mut run.flat_mib, "RAM budget (MiB)", 140.0);
+                    widgets::label(ui, "MiB — empty means uncapped");
+                });
+            }
             ui.add_space(2.0);
             egui::CollapsingHeader::new(
                 RichText::new("What “experimental” means")

@@ -1816,3 +1816,20 @@ Validation: cargo test --offline --release -p avila-gui --features devtools
 test compile encountered missing custom_presets/hidden_presets fields in
 existing preference fixtures; the other instance fixed those fixtures and
 the rerun passed. git diff --check passed.
+
+## 2026-09-28 (evening) — flat-IBD overnight run launched
+
+- Vehicle: `avila-gui --config config/mainnet-flat.toml --fast-ibd` (GUI
+  in-process sync, `--fast-ibd` flag added tonight; `--flat-utxo-mib`
+  remains the CLI surface). Datadir `data-flat/mainnet` resumes from the
+  pre-flight's ~279k.
+- Guard: `tools/guard_run.sh --max 22528 --reserve 1024` (kernel cgroup
+  MemoryMax). Box dedicated: ~25.5 GiB free at launch, load ~0.6.
+- Pre-flight deaths: two clean OOM-kills at 4 GiB and 6 GiB caps
+  (heights ~224k and ~279k). Both recovered via
+  `restore: backend reconciled` + body replay — crash-resume verified
+  live, flat table repopulates from the committed set on open.
+- Monitor: `tools/ibd_monitor.sh` → `data-flat/mainnet/ibd_monitor.log`
+  (60 s: height, RSS, CPU%, MemAvailable, temp, blk/coinsdb sizes).
+- Comparison baseline (standard path, shared desktop, Sep 25–27):
+  genesis→968,779 ≈ 42 h wall (~3.6 h/s late-era).

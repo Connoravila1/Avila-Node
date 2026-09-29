@@ -128,6 +128,11 @@ struct Args {
     /// network, and every screen says the data is simulated.
     #[arg(long)]
     demo: bool,
+    /// Experimental fast IBD: keep the committed coin set in a RAM-resident
+    /// flat table from first start. Verification is identical; the trade is
+    /// ~17 GiB RAM at mainnet tip and a less-tested code path.
+    #[arg(long)]
+    fast_ibd: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -175,6 +180,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 cc,
                 node,
                 demo,
+                args.fast_ibd,
                 theme,
                 close_flag,
                 config_file,

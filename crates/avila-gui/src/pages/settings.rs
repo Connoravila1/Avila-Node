@@ -163,6 +163,30 @@ fn starting(ui: &mut Ui, s: &Scene, run: &mut RunSettings, node: &Node, open_adv
             );
         });
         ui.end_row();
+
+        key(ui, s, "First sync engine");
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                widgets::segmented(
+                    ui,
+                    &mut run.fast_ibd,
+                    &[(false, "Standard"), (true, "Experimental")],
+                );
+                if run.fast_ibd {
+                    field(ui, &mut run.flat_mib, "RAM MiB", 90.0);
+                    help(ui, s, "empty = uncapped");
+                }
+            });
+            help(
+                ui,
+                s,
+                "Experimental keeps the committed coins table in memory — measured ~8× on the \
+                 lookup that dominates the first sync. Verification is identical either way; \
+                 the trade is RAM (~17 GiB at mainnet tip) and a less-tested code path. If the \
+                 table can't fit the budget it falls back to the disk path — slower, never wrong.",
+            );
+        });
+        ui.end_row();
     });
     ui.add_space(10.0);
     let mut header = egui::CollapsingHeader::new(

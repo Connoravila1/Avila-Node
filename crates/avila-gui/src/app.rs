@@ -89,6 +89,7 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         node: Node,
         demo: bool,
+        fast_ibd: bool,
         theme_override: Option<ThemeChoice>,
         close: std::sync::Arc<std::sync::atomic::AtomicBool>,
         // The TOML the node was loaded from — restart knobs open it.
@@ -168,6 +169,11 @@ impl App {
             .join(", ");
         if !connect.is_empty() {
             run.connect = connect;
+        }
+        // `--fast-ibd` overrides the welcome/settings default for this
+        // launch — the running node's choice, not a persisted pref.
+        if fast_ibd {
+            run.fast_ibd = true;
         }
         let applied = prefs.clone();
         let mut session = Session::new(demo);

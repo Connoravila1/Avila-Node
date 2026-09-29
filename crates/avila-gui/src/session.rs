@@ -59,6 +59,10 @@ pub struct RunSettings {
     /// ~8× on the spend-lookup path). Full verification unchanged —
     /// every block, tx, and consensus rule still runs.
     pub fast_ibd: bool,
+    /// RAM budget for the flat table, in MiB; empty means uncapped.
+    /// If the committed set outgrows the cap the node politely stays
+    /// on the disk path — never a wrong answer, just slower.
+    pub flat_mib: String,
 }
 
 impl RunSettings {
@@ -85,6 +89,7 @@ impl RunSettings {
             electrum: String::new(),
             full_verify: false,
             fast_ibd: false,
+            flat_mib: String::new(),
         }
     }
 
@@ -134,6 +139,7 @@ impl RunSettings {
         for (value, what) in [
             (&self.dbcache_mib, "The cache size"),
             (&self.maxmempool_mb, "The mempool limit"),
+            (&self.flat_mib, "The flat-table RAM budget"),
         ] {
             let v = value.trim();
             if !v.is_empty() && v.parse::<usize>().is_err() {
@@ -517,7 +523,12 @@ impl Session {
             blockfilterindex: settings.blockfilterindex,
             peerblockfilters: settings.peerblockfilters,
             electrum: settings.electrum.trim().parse().ok(),
-            flat_utxo_bytes: settings.fast_ibd.then_some(0), // uncapped — the laptop run is dedicated
+            // fast_ibd picks the flat committed-coin mirror; flat_mib
+            // bounds it, empty means uncapped. `--fast-ibd` sets the
+            // flag; the cap stays a Settings-field choice.
+            flat_utxo_bytes: settings
+                .fast_ibd
+                .then(|| RunSettings::mib(&settings.flat_mib).unwrap_or(0)),
             control: Some(Arc::new(std::sync::Mutex::new(control_rx))),
             ..SyncConfig::default()
         };

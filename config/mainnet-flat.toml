@@ -16,3 +16,9 @@ prune_mb = 32768
 
 [services.rpc]
 bind = "127.0.0.1:8332"
+
+[peers]
+max_connections = 24
+
+[sync]
+max_in_transit = 384
