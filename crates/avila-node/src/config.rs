@@ -1022,7 +1022,9 @@ mod tests {
     #[test]
     fn preset_overlay_is_validated_and_written_as_one_change() {
         let dir = std::env::temp_dir().join(format!(
-            "avila-preset-{}-{:?}", std::process::id(), std::thread::current().id()
+            "avila-preset-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let main = dir.join("n.toml");
@@ -1051,15 +1053,18 @@ mod tests {
         assert_eq!(load_config(Some(&main)).unwrap().get().mempool.max_mb, 300);
         // The dependency is validated against the complete candidate,
         // rather than leaving the node unable to start after a partial edit.
-        assert!(write_overlay_knob(&main, "filters.build", Some(toml::Value::Boolean(false)))
-            .is_err());
+        assert!(
+            write_overlay_knob(&main, "filters.build", Some(toml::Value::Boolean(false))).is_err()
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn explicit_unset_disables_a_value_from_the_main_file() {
         let dir = std::env::temp_dir().join(format!(
-            "avila-unset-{}-{:?}", std::process::id(), std::thread::current().id()
+            "avila-unset-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let main = dir.join("n.toml");

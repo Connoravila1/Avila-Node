@@ -347,7 +347,9 @@ impl App {
                 return;
             }
         };
-        let edits = self.run.config_changes(&RunSettings::from_config(saved.get()));
+        let edits = self
+            .run
+            .config_changes(&RunSettings::from_config(saved.get()));
         if edits.is_empty() {
             self.settings_error = None;
             return;

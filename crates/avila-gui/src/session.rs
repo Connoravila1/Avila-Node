@@ -110,13 +110,19 @@ impl RunSettings {
                 .join(", ")
         };
         self.proxy = c.privacy.proxy.map_or_else(String::new, |v| v.to_string());
-        self.prune_mib = c.storage.prune_mb.map_or_else(String::new, |v| v.to_string());
+        self.prune_mib = c
+            .storage
+            .prune_mb
+            .map_or_else(String::new, |v| v.to_string());
         self.listen = c.net.listen.is_some();
         self.listen_port = c.net.listen.map_or_else(
             || params(c.network).default_port.to_string(),
             |v| v.port().to_string(),
         );
-        self.dbcache_mib = c.storage.dbcache_mb.map_or_else(String::new, |v| v.to_string());
+        self.dbcache_mib = c
+            .storage
+            .dbcache_mb
+            .map_or_else(String::new, |v| v.to_string());
         self.maxmempool_mb = c.mempool.max_mb.to_string();
         self.txindex = c.indexes.txindex;
         self.blockfilterindex = c.filters.build;
@@ -154,10 +160,7 @@ impl RunSettings {
             if self.proxy.trim().is_empty() {
                 edits.push(("privacy.proxy", None));
             } else if let Ok(addr) = self.proxy.trim().parse::<SocketAddr>() {
-                edits.push((
-                    "privacy.proxy",
-                    Some(toml::Value::String(addr.to_string())),
-                ));
+                edits.push(("privacy.proxy", Some(toml::Value::String(addr.to_string()))));
             }
         }
         if self.prune_mib != before.prune_mib {
@@ -173,10 +176,7 @@ impl RunSettings {
             if !self.listen {
                 edits.push(("net.listen", None));
             } else if let Some(addr) = self.listen_addr() {
-                edits.push((
-                    "net.listen",
-                    Some(toml::Value::String(addr.to_string())),
-                ));
+                edits.push(("net.listen", Some(toml::Value::String(addr.to_string()))));
             }
         }
         for (path, now, old) in [
@@ -187,9 +187,12 @@ impl RunSettings {
                 if now.trim().is_empty() && path == "storage.dbcache_mb" {
                     edits.push((path, None));
                 } else if now.trim().is_empty() && path == "mempool.max_mb" {
-                    edits.push((path, Some(toml::Value::Integer(
-                        avila_core::NodeConfig::default().mempool.max_mb as i64,
-                    ))));
+                    edits.push((
+                        path,
+                        Some(toml::Value::Integer(
+                            avila_core::NodeConfig::default().mempool.max_mb as i64,
+                        )),
+                    ));
                 } else if let Ok(n) = now.trim().parse::<i64>() {
                     edits.push((path, Some(toml::Value::Integer(n))));
                 }
@@ -197,8 +200,16 @@ impl RunSettings {
         }
         for (path, now, old) in [
             ("indexes.txindex", self.txindex, before.txindex),
-            ("filters.build", self.blockfilterindex, before.blockfilterindex),
-            ("filters.serve", self.peerblockfilters, before.peerblockfilters),
+            (
+                "filters.build",
+                self.blockfilterindex,
+                before.blockfilterindex,
+            ),
+            (
+                "filters.serve",
+                self.peerblockfilters,
+                before.peerblockfilters,
+            ),
         ] {
             if now != old {
                 edits.push((path, Some(toml::Value::Boolean(now))));
@@ -256,7 +267,11 @@ impl RunSettings {
         let prune = self.prune_mib.trim();
         if !prune.is_empty() && prune.parse::<u64>().is_err() {
             out.push("The prune target is a whole number of MiB, like 5000.".into());
-        } else if !prune.is_empty() && prune.parse::<u64>().is_ok_and(|v| v < 550 || v > i64::MAX as u64) {
+        } else if !prune.is_empty()
+            && prune
+                .parse::<u64>()
+                .is_ok_and(|v| v < 550 || v > i64::MAX as u64)
+        {
             out.push("The prune target must be between 550 and 9223372036854775807 MiB.".into());
         }
         if self.listen && !self.listen_port.trim().parse::<u16>().is_ok_and(|v| v > 0) {

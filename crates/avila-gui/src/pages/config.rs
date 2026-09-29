@@ -560,8 +560,8 @@ fn apply_preset(
         if path == "services.rpc.password" {
             return Err("RPC passwords cannot be stored in presets".into());
         }
-        let value: serde_json::Value = serde_json::from_str(raw)
-            .map_err(|e| format!("{path}: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| format!("{path}: {e}"))?;
         parsed.push((path.as_str(), value));
     }
     let edits: Vec<_> = parsed
@@ -608,10 +608,14 @@ fn draft_value(path: &str, draft: &str, was: &serde_json::Value) -> Option<serde
         };
     }
     if path.starts_with("hooks.") {
-        return serde_json::from_str::<serde_json::Value>(draft).ok().filter(|v| v.is_array());
+        return serde_json::from_str::<serde_json::Value>(draft)
+            .ok()
+            .filter(|v| v.is_array());
     }
     if path == "extrapool.caps" {
-        return serde_json::from_str::<serde_json::Value>(draft).ok().filter(|v| v.is_object());
+        return serde_json::from_str::<serde_json::Value>(draft)
+            .ok()
+            .filter(|v| v.is_object());
     }
     if was.is_null() && draft.is_empty() {
         return Some(serde_json::Value::Null);
@@ -937,7 +941,9 @@ fn clear_gui_overrides(
     state.drafts.clear();
     state.rejected.clear();
     for k in original {
-        if let Some(tx) = control && k.edit == EditKind::Live {
+        if let Some(tx) = control
+            && k.edit == EditKind::Live
+        {
             if tx
                 .send(ControlMsg::Set {
                     path: k.path.to_string(),
