@@ -1887,3 +1887,46 @@ into the consumer's dir before its block connects. Tests: codec
 round-trips + truncation, session-pipe handshake capability +
 message flow (190 p2p tests green). Caveat: 4 MiB payload cap bounds
 advice to blocks under ~40k sigs — denser blocks simply unserved.
+
+## Advice wire protocol — live two-node regtest (2026-09-29)
+
+Setup: node A `run --config data-adv/A.toml --advice-dir --advice-collect`
+(P2P 29444/RPC 29445), node B `--advice-dir` connecting to A (39444/39445).
+A mined 110 blocks to a fixed test key, then accepted a coinbase-spend
+block via `submitblock` (mempool-free path — mempool accept would
+mark_scripts_verified and skip connect's capture entirely).
+
+Result:
+- A wrote `<blockhash>.adv` (177 B, one tx's stream) on connect —
+  `advice_collect_writes_sidecar_on_accept` reproduces it in a unit test.
+- B negotiated `sendadvice` both ways, sent ~148 deduped `getadvice`
+  requests alongside its `getdata` fan-out, received one 234-byte
+  `advice` reply, decoded + hash-checked it, wrote the sidecar into its
+  own advice dir, and connected the spend block as tip (getpeerinfo
+  byte counters confirm the flow on both ends).
+
+Bugs the rig surfaced and fixed:
+- `HeaderTree::mark_invalid` never demoted `self.tip`: a failed block's
+  header that won the equal-work insert race stayed best-header, so
+  `best_chain()`/`getheaders` served a dead-end branch and every peer
+  fetching it stalled on notfound forever. Now re-tips to the maximal
+  non-failed node; `restore_tip` likewise resolves a persisted
+  best_header that fails again on reload.
+- `getadvice` fan-out lacked dedupe — one request per tick per
+  unfetched hash (~26k msgs on a 113-block chain). Now
+  `PeerSync::wanted_advice` asks once per hash per peer.
+
+Open: whether the consumer's batch path actually verified block 111's
+sigs (sidecar landed before connect, but no counter distinguishes
+advised-vs-inline yet). Tamper-on-wire still covered only by unit
+tests; want one live mutation test.
+
+Update (same session, resolved): the "open" consumption question is
+closed. B's sync line shows `adv[d=1 b=1 f=0]` — the spend block's one
+sig deferred into the block batch and verified clean. Earlier runs
+read a stale log (a `pkill -f` match killed the launch shell before
+nohup started — the printed pid belonged to the dead wrapper). Wiring
+change: `getadvice` requests now ride at header-accept (`fetchable`
+outcome) and `inv` handling — the fetch-time request raced the body
+and the sidecar could land after connect. Dedupe remains once per
+hash per peer via `PeerSync::wanted_advice`.

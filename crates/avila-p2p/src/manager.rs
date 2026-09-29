@@ -2632,16 +2632,6 @@ impl<S: Read + Write> PeerManager<S> {
             };
             if let Some(req) = peer.sync.want_blocks_excluding(cs, &unfetched, &reserved) {
                 let _ = peer.session.send(&req);
-                // Advice-capable peers get a sidecar request per
-                // fetched block — once per hash (want_advice dedupes),
-                // so the stream lands in the advice dir before connect.
-                if cs.advice_dir().is_some()
-                    && peer.session.peer().is_some_and(|p| p.advice)
-                {
-                    for msg in peer.sync.want_advice(&unfetched) {
-                        let _ = peer.session.send(&msg);
-                    }
-                }
             }
             if !limited_only {
                 next += take;
@@ -2870,6 +2860,17 @@ impl<S: Read + Write> PeerManager<S> {
                         if !outcome.fetchable.is_empty() {
                             let offer =
                                 &outcome.fetchable[..outcome.fetchable.len().min(*global_free)];
+                            // Sidecar requests ride at header-accept
+                            // time — the advice file must be on disk
+                            // before the block's connect runs, which a
+                            // fetch-time request races.
+                            if cs.advice_dir().is_some()
+                                && peer.session.peer().is_some_and(|p| p.advice)
+                            {
+                                for msg in peer.sync.want_advice(offer) {
+                                    let _ = peer.session.send(&msg);
+                                }
+                            }
                             let before = peer.sync.in_flight();
                             if let Some(req) = peer.sync.want_blocks(cs, offer) {
                                 *global_free =
@@ -2920,6 +2921,17 @@ impl<S: Read + Write> PeerManager<S> {
                 } else {
                     &invs
                 };
+                // Steady-state announces likewise deserve advice —
+                // deduped per hash, so a re-announced block costs
+                // nothing extra.
+                if !missing.is_empty()
+                    && cs.advice_dir().is_some()
+                    && peer.session.peer().is_some_and(|p| p.advice)
+                {
+                    for msg in peer.sync.want_advice(&missing) {
+                        let _ = peer.session.send(&msg);
+                    }
+                }
                 if let Some(req) = peer.sync.on_inv(cs, Some(mempool), filtered, *global_free) {
                     *global_free = global_free.saturating_sub(peer.sync.in_flight() - before);
                     let _ = peer.session.send(&req);
