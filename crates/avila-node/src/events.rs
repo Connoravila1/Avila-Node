@@ -482,6 +482,7 @@ mod tests {
                 recon: None,
                 cmpct: None,
                 utxproof: false,
+                advice: false,
             }),
         });
         assert_eq!(kind, "peer_connected");
