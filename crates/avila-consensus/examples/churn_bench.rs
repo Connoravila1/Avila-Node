@@ -54,6 +54,7 @@ fn run(name: &str, engine: Engine, budget_mb: usize) {
 
     let mut gross: u64 = 0;
     let mut flushes: u64 = 0;
+    let mut flush_ns: u64 = 0;
     let mut cohorts: Vec<Vec<OutPoint>> = Vec::new();
     let mut n = 0u64;
     for r in 0..ROUNDS {
@@ -74,22 +75,30 @@ fn run(name: &str, engine: Engine, budget_mb: usize) {
                 gross += 1;
             }
         }
-        if set.over_budget() {
+        if set.over_budget() || set.map_stats().0 >= UtxoSet::DIRTY_FLUSH_ENTRIES {
+            let t = std::time::Instant::now();
             set.flush_to_backend(&[], r)
                 .unwrap_or_else(|e| panic!("flush: {e}"));
+            // The flush returns immediately now — the join cost is
+            // paid inside the NEXT flush's entry (or the final join).
+            flush_ns += t.elapsed().as_nanos() as u64;
             flushes += 1;
         }
     }
+    let t = std::time::Instant::now();
     set.flush_to_backend(&[], ROUNDS)
         .unwrap_or_else(|e| panic!("final: {e}"));
+    set.join_flush().unwrap_or_else(|e| panic!("join: {e}"));
+    flush_ns += t.elapsed().as_nanos() as u64;
 
     let (commits, puts, dels) = be.write_stats();
     let disk = puts + dels;
     println!(
         "{name:>8} | budget {budget_mb:>4}M | gross {gross:>9} | flushes {flushes} \
          | backend commits {commits:>3} puts {puts:>9} dels {dels:>9} \
-         | disk/gross {:.2}",
-        disk as f64 / gross as f64
+         | disk/gross {:.2} | flush_ms/commit {:.1}",
+        disk as f64 / gross as f64,
+        flush_ns as f64 / 1e6 / (flushes.max(1) + 1) as f64
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -305,6 +305,8 @@ fn run_incremental(
             block_hash: hh,
             script_checks: true,
             script_pool: None,
+            advice: None,
+            advice_collect: None,
         };
         if let Err(e) = check_block(b, params) {
             rejected = Some((h, format!("check_block: {e}")));

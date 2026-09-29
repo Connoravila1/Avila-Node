@@ -360,6 +360,18 @@ pub struct Chainstate {
     pending_bundles: HashMap<BlockHash, Vec<u8>>,
     /// Height the shadow accumulator has applied through; 0 = genesis.
     acc_height: u32,
+    /// The coins backend's committed tip *as this chainstate knows it*.
+    /// Advances only when a flush worker's commit is joined — the live
+    /// `be.tip_height()` can race ahead mid-flight, which would shift
+    /// `undo`/`undos` indexing under lookups still keyed to the old
+    /// watermark. Equals `undo_base()`'s answer everywhere; initialized
+    /// from the backend at attach and by `reconcile_backend`.
+    committed_coins_tip: u32,
+    /// The in-flight flush's commit target — `(committed tip, count of
+    /// leading `self.undos` entries the worker is writing)`. `undos`
+    /// stays populated through the flight so `undo()` keeps answering;
+    /// the covered prefix drains when the join lands.
+    inflight_flush: Option<(u32, usize)>,
 }
 
 /// The background validation replay beneath an active snapshot — a
@@ -1029,6 +1041,8 @@ impl Chainstate {
             pending_last_push: std::time::Instant::now(),
             checked_feed: std::collections::VecDeque::new(),
             spec_failed: None,
+            committed_coins_tip: 0,
+            inflight_flush: None,
         }
     }
 
@@ -1532,6 +1546,11 @@ impl Chainstate {
                 })?;
         }
         chain.reverse();
+        self.committed_coins_tip = self
+            .coins_backend
+            .as_ref()
+            .map_or(0, |b| b.tip_height());
+        self.inflight_flush = None;
         self.utxo = utxo;
         self.chain = chain;
         self.undos = if self.coins_backend.is_some() {
@@ -1879,6 +1898,7 @@ impl Chainstate {
                     cs.store = store;
                     cs.coins_backend = backend;
                     if let Some(be) = &cs.coins_backend {
+                        cs.committed_coins_tip = be.tip_height();
                         cs.utxo.attach_shared(be.clone());
                     }
                     cs.stored_positions(&HashSet::new())
@@ -1928,6 +1948,7 @@ impl Chainstate {
                             let _ = std::fs::remove_file(dir.join(name));
                         }
                         let fresh = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open(dir)?);
+                        cs.committed_coins_tip = fresh.tip_height();
                         cs.utxo.attach_shared(fresh.clone());
                         cs.coins_backend = Some(fresh);
                         eprintln!("restore: coinsdb rebuilt empty; bodies replay over it");
@@ -2460,6 +2481,10 @@ impl Chainstate {
         // committed undo records. The reverse order would leave the
         // backend *behind* — unrecoverable without a full replay.
         self.flush_coins()?;
+        // `flush_coins` now hands the commit to a worker — join it so
+        // `state.dat` can never describe a height the backend hasn't
+        // durably reached.
+        self.join_coins_flush()?;
         store::write_state(&dir, magic, &self.snapshot())?;
         self.state_tip_persisted = self.chain.len() as u32 - 1;
         Ok(())
@@ -2566,7 +2591,29 @@ impl Chainstate {
     /// vec holds one entry per height (empty placeholders below the
     /// assumeutxo base) so the tail starts at 0.
     fn undo_base(&self) -> u32 {
-        self.coins_backend.as_ref().map_or(0, |b| b.tip_height())
+        // The joined watermark — not the live `be.tip_height()`, which
+        // can race ahead while a flush worker's commit is in flight.
+        // `undos[i]` always describes height `committed_coins_tip + i`.
+        self.coins_backend.as_ref().map_or(0, |_| self.committed_coins_tip)
+    }
+
+    /// Waits for the in-flight coins commit (if any) and folds its
+    /// bookkeeping: the backend watermark advances to the committed
+    /// tip and the covered `undos` prefix drains. Call before any path
+    /// that must observe committed state — `state.dat` writes, undo
+    /// lookups below the watermark, the next flush.
+    fn join_coins_flush(&mut self) -> std::io::Result<()> {
+        self.utxo.join_flush()?;
+        if let Some((tip, _)) = self.inflight_flush.take() {
+            // Drain the covered prefix: entries describe heights
+            // committed_coins_tip+1..=tip. A reorg may already have
+            // truncated them — `min` keeps the drain honest.
+            let drain = (tip.saturating_sub(self.committed_coins_tip) as usize)
+                .min(self.undos.len());
+            self.undos.drain(..drain);
+            self.committed_coins_tip = tip;
+        }
+        Ok(())
     }
 
     /// The undo data for the *active-chain* block at `height` — Core's
@@ -2601,6 +2648,7 @@ impl Chainstate {
         cache_bytes: usize,
     ) -> std::io::Result<()> {
         let backend = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open(dir)?);
+        self.committed_coins_tip = backend.tip_height();
         self.utxo.attach_shared(backend.clone());
         self.utxo.set_budget(cache_bytes);
         // `AVILA_SWIFTSYNC=1` — transient-IBD mode: tag aggregate
@@ -2698,14 +2746,22 @@ impl Chainstate {
             // forbids forking at or below it).
             return Ok(());
         }
+        // Fold the previous in-flight commit first — its bookkeeping
+        // (watermark, `undos` prefix) must settle before this epoch's
+        // pending set is labeled.
+        self.join_coins_flush()?;
         let base = self.undo_base();
         let mut pending: Vec<(u32, crate::hash::BlockHash, BlockUndo)> = extra.to_vec();
+        let covered = self.undos.len();
         pending.extend(self.undos.iter().enumerate().map(|(i, u)| {
             let h = base + 1 + i as u32;
             (h, self.chain[h as usize], u.clone())
         }));
         self.utxo.flush_to_backend(&pending, tip)?;
-        self.undos.clear();
+        // `undos` is NOT cleared — the in-flight heights must stay
+        // answerable until the join (a reorg mid-flight reads them for
+        // disconnect). The join drains the covered prefix.
+        self.inflight_flush = Some((tip, covered));
         Ok(())
     }
 
@@ -2766,6 +2822,11 @@ impl Chainstate {
                 scratch.flush_to_backend(&[], h - 1)?;
             }
         }
+        // The last flush is asynchronous — join it before callers
+        // resume against the backend's committed tip.
+        scratch.join_flush()?;
+        self.committed_coins_tip = state_tip;
+        self.inflight_flush = None;
         Ok(())
     }
 
@@ -6585,7 +6646,8 @@ mod tests {
             branch.push(b);
         }
         for block in &branch {
-            assert!(cs.accept_block(block, NOW).is_ok());
+            let r = cs.accept_block(block, NOW);
+            assert!(r.is_ok(), "accept_block: {r:?}");
         }
         // 23-work branch tip vs 20-work active tip — reorged.
         assert_eq!(cs.tip_hash(), branch.last().unwrap().block_hash());

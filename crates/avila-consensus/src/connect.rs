@@ -192,6 +192,34 @@ pub struct UtxoSet {
     /// shadows the committed layers entirely — `get` returns through
     /// `base` before reaching `flat`).
     flat: Option<crate::flatmap::FlatCoins>,
+    /// The write-back map's contents while a backend commit is in
+    /// flight — moved out of `map` at flush start so connect proceeds
+    /// on a fresh map while the worker thread runs the redb commit.
+    /// Reads consult this layer after `map` and before `base`; it is
+    /// dropped when the join confirms the commit landed. `delta` is
+    /// the snap's net coin contribution for `len()`'s O(1) tracking
+    /// (the backend's `coins_len` only reflects it after commit).
+    flushing: Option<FlushLayer>,
+    /// The commit worker's handle — joined before the next flush and
+    /// by [`UtxoSet::join_flush`]. `None` in clones (an overlay never
+    /// outlives the real set's flush bookkeeping).
+    flush_join: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+}
+
+/// In-flight commit state — see [`UtxoSet::flushing`]. Flushes
+/// serialize (a new one joins the prior), so by the time `map`'s next
+/// epoch commits, every snap-born key is backend-resident — no `born`
+/// bookkeeping crosses the boundary.
+#[derive(Debug)]
+struct FlushLayer {
+    /// Immutable snapshot of the write-back map being committed.
+    snap: std::sync::Arc<CacheMap>,
+    /// `snap`'s net contribution to the live-coin count.
+    delta: i64,
+    /// The tip the worker's commit advances the backend to — lets
+    /// `len()` stop counting `delta` the moment the backend's own
+    /// `coins_len` includes it (the land-before-join window).
+    tip: u32,
 }
 
 impl Default for UtxoSet {
@@ -208,6 +236,8 @@ impl Default for UtxoSet {
             swift: None,
             swift_hold: false,
             flat: None,
+            flushing: None,
+            flush_join: None,
         }
     }
 }
@@ -470,7 +500,15 @@ impl UtxoSet {
                     .map_or(0, |b| b.coins_len() as usize),
             )
             .saturating_add(self.snapshot.as_ref().map_or(0, |s| s.len()) as usize);
-        lower.saturating_add_signed(self.live_delta as isize)
+        // The flushing delta counts only while the commit is still
+        // in flight — once the backend tip reaches it, `coins_len`
+        // already includes it.
+        let flushing_delta = match (&self.flushing, &self.backend) {
+            (Some(l), Some(be)) if be.tip_height() < l.tip => l.delta,
+            _ => 0,
+        };
+        lower
+            .saturating_add_signed((self.live_delta + flushing_delta) as isize)
     }
 
     /// `true` if no coins are tracked.
@@ -493,6 +531,11 @@ impl UtxoSet {
     #[must_use]
     pub fn get(&self, outpoint: &OutPoint) -> Option<Coin> {
         if let Some(entry) = self.map.get(outpoint) {
+            return entry.clone();
+        }
+        if let Some(layer) = &self.flushing
+            && let Some(entry) = layer.snap.get(outpoint)
+        {
             return entry.clone();
         }
         if let Some(base) = &self.base {
@@ -523,6 +566,11 @@ impl UtxoSet {
     #[must_use]
     pub fn have(&self, outpoint: &OutPoint) -> bool {
         if let Some(entry) = self.map.get(outpoint) {
+            return entry.is_some();
+        }
+        if let Some(layer) = &self.flushing
+            && let Some(entry) = layer.snap.get(outpoint)
+        {
             return entry.is_some();
         }
         if let Some(base) = &self.base {
@@ -567,6 +615,18 @@ impl UtxoSet {
                 all.insert(op, c);
             }
         }
+        if let Some(layer) = &self.flushing {
+            for (op, entry) in layer.snap.iter() {
+                match entry {
+                    Some(c) => {
+                        all.insert(*op, c.clone());
+                    }
+                    None => {
+                        all.remove(op);
+                    }
+                }
+            }
+        }
         for (op, entry) in &self.map {
             match entry {
                 Some(c) => {
@@ -602,6 +662,18 @@ impl UtxoSet {
                 all.insert(op, c);
             }
         }
+        if let Some(layer) = &self.flushing {
+            for (op, entry) in layer.snap.iter() {
+                match entry {
+                    Some(c) => {
+                        all.insert(*op, c.clone());
+                    }
+                    None => {
+                        all.remove(op);
+                    }
+                }
+            }
+        }
         for (op, entry) in &self.map {
             match entry {
                 Some(c) => {
@@ -628,8 +700,17 @@ impl UtxoSet {
         self.spend(outpoint)
     }
 
-    /// Read-through to the layers below `map`.
+    /// Read-through to the layers below `map` — the in-flight flush
+    /// snapshot counts as a lower layer while a commit runs, and its
+    /// tombstones shadow everything below exactly like `map`'s (a coin
+    /// deleted by the in-flight commit must not resurface through a
+    /// stale flat/backend read).
     fn lower_get(&self, outpoint: &OutPoint) -> Option<Coin> {
+        if let Some(l) = &self.flushing
+            && let Some(entry) = l.snap.get(outpoint)
+        {
+            return entry.clone();
+        }
         self.base
             .as_deref()
             .and_then(|b| b.get(outpoint))
@@ -638,8 +719,14 @@ impl UtxoSet {
             .or_else(|| self.snapshot.as_ref().and_then(|s| s.get(outpoint)))
     }
 
-    /// `true` if any layer below `map` holds `outpoint`.
+    /// `true` if any layer below `map` holds `outpoint` — flushing
+    /// tombstones count as a definitive absence.
     fn lower_live(&self, outpoint: &OutPoint) -> bool {
+        if let Some(l) = &self.flushing
+            && let Some(entry) = l.snap.get(outpoint)
+        {
+            return entry.is_some();
+        }
         self.base.as_deref().is_some_and(|b| b.have(outpoint))
             || self.flat.as_ref().is_some_and(|f| f.have(outpoint))
             || self.backend.as_deref().is_some_and(|be| be.have(outpoint))
@@ -840,6 +927,8 @@ impl UtxoSet {
             swift: None,
             swift_hold: false,
             flat: None,
+            flushing: None,
+            flush_join: None,
         }
     }
 
@@ -853,8 +942,8 @@ impl UtxoSet {
     /// back untouched. `commit == true`: adopt the overlay — `self`
     /// becomes `overlay` flattened (its base restored, its pending
     /// writes merged on top).
-    pub fn unoverlay(&mut self, overlay: UtxoSet, commit: bool) {
-        let Some(base) = overlay.base else {
+    pub fn unoverlay(&mut self, mut overlay: UtxoSet, commit: bool) {
+        let Some(base) = overlay.base.take() else {
             return;
         };
         if !commit {
@@ -864,7 +953,7 @@ impl UtxoSet {
         // Adopt: restore the base into self, then replay the overlay's
         // pending writes on top — same layering the backend gives.
         *self = *base;
-        for (op, entry) in overlay.map {
+        for (op, entry) in std::mem::take(&mut overlay.map) {
             self.put(op, entry);
         }
     }
@@ -875,14 +964,27 @@ impl UtxoSet {
     ///
     /// # Errors
     /// `io::Error` on backend transaction failure.
+    /// Starts the commit on a worker thread and returns immediately —
+    /// the dirty map becomes the immutable [`FlushLayer`] read source
+    /// while `connect` proceeds on a fresh map. Crash safety is
+    /// unchanged: the backend tip only advances inside the commit
+    /// transaction, so an uncommitted flush replays identically. Call
+    /// sites treat this as fire-and-continue; the next flush (or any
+    /// path needing committed-state visibility) joins via
+    /// [`Self::join_flush`]. Errors surface at the join — a failed
+    /// commit is still fatal, just reported one boundary later.
     pub fn flush_to_backend(
         &mut self,
         new_undos: &[(u32, crate::hash::BlockHash, BlockUndo)],
         tip: u32,
     ) -> std::io::Result<()> {
-        let Some(be) = &self.backend else {
+        let Some(be) = self.backend.clone() else {
             return Ok(());
         };
+        // Flushes serialize: a second commit can't start until the
+        // first lands (a snap-born key must be backend-resident before
+        // the next epoch's deletes are interpreted against it).
+        self.join_flush()?;
         // Tombstone elision: a `None` entry over a born key deletes a
         // coin the backend never saw — drop it before commit instead
         // of issuing a useless backend delete.
@@ -890,15 +992,42 @@ impl UtxoSet {
             let born = &self.born;
             self.map.retain(|op, e| e.is_some() || !born.contains(op));
         }
-        be.commit(&self.map, new_undos, tip)?;
-        if let Some(f) = &mut self.flat {
-            f.apply_delta(&self.map);
-        }
-        self.map.clear();
-        self.map_bytes = 0;
+        let snap: CacheMap = std::mem::take(&mut self.map);
+        let born = std::mem::take(&mut self.born);
+        let delta = self.live_delta;
         self.live_delta = 0;
-        self.born.clear();
+        self.map_bytes = 0;
+        let _ = born; // elision already applied; the next epoch starts fresh
+        let snap = std::sync::Arc::new(snap);
+        self.flushing = Some(FlushLayer {
+            snap: snap.clone(),
+            delta,
+            tip,
+        });
+        let undos: Vec<(u32, crate::hash::BlockHash, BlockUndo)> = new_undos.to_vec();
+        self.flush_join = Some(std::thread::spawn(move || {
+            be.commit(snap.as_ref(), &undos, tip)
+        }));
         Ok(())
+    }
+
+    /// Waits for the in-flight commit (if any) and folds its result
+    /// back into the set: drops the snap layer, applies the flat
+    /// delta, propagates a commit failure.
+    pub fn join_flush(&mut self) -> std::io::Result<()> {
+        let Some(handle) = self.flush_join.take() else {
+            return Ok(());
+        };
+        let layer = self.flushing.take().expect("join without layer");
+        let result = handle
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("flush worker panicked")));
+        if result.is_ok()
+            && let Some(f) = &mut self.flat
+        {
+            f.apply_delta(&layer.snap);
+        }
+        result
     }
 
     /// Coins-only flush that does NOT advance the backend tip — the
@@ -906,9 +1035,13 @@ impl UtxoSet {
     /// batches leaves the backend at its old committed tip with extra
     /// coins orphaned (re-import overwrites them), never a false tip.
     pub fn flush_partial_to_backend(&mut self) -> std::io::Result<()> {
-        let Some(be) = &self.backend else {
+        let Some(be) = self.backend.clone() else {
             return Ok(());
         };
+        // Partial commits are synchronous — snapshot-import batches
+        // are already off the connect critical path, and a mid-import
+        // flush must land before the next (interleaved ordering kept).
+        self.join_flush()?;
         if !self.born.is_empty() {
             let born = &self.born;
             self.map.retain(|op, e| e.is_some() || !born.contains(op));
@@ -939,6 +1072,25 @@ impl Clone for UtxoSet {
             swift: self.swift,
             swift_hold: self.swift_hold,
             flat: None,
+            flushing: self.flushing.as_ref().map(|l| FlushLayer {
+                snap: l.snap.clone(),
+                delta: l.delta,
+                tip: l.tip,
+            }),
+            // A clone never inherits the commit worker — joining is the
+            // owning set's job (the snap layer carries the read state).
+            flush_join: None,
+        }
+    }
+}
+
+impl Drop for UtxoSet {
+    /// A dropped set joins its commit worker — the thread holds an
+    /// `Arc` to the backend, so without the join a close+reopen races
+    /// the still-running commit's file lock.
+    fn drop(&mut self) {
+        if let Some(handle) = self.flush_join.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -3748,5 +3900,72 @@ mod tests {
         assert_eq!(a, b, "iter diverged");
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+
+    /// Async flush semantics: the dirty map becomes a readable layer
+    /// while the worker commits; the next epoch's writes (including a
+    /// spend of a snap-held coin) stay correct, and serialized flushes
+    /// land in order. Exercises the exact layering `connect` sees
+    /// mid-IBD — a flush in flight is indistinguishable from a done-
+    /// but-unjoined one, so `join_flush` at the end covers both.
+    #[test]
+    fn flush_async_reads_layer_and_serializes() {
+        let dir = std::env::temp_dir()
+            .join(format!("avila-flush-async-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let be = std::sync::Arc::new(
+            crate::coinsdb::CoinsBackend::open(&dir).unwrap(),
+        );
+        let mut set = UtxoSet::new();
+        set.attach_shared(be.clone());
+
+        let mk_op = |b: u8| OutPoint {
+            txid: Txid::from_bytes([b; 32]),
+            vout: 0,
+        };
+        let mk_coin = |v: i64, h: u32| Coin {
+            out: txout(v, vec![0x51]),
+            height: h,
+            coinbase: false,
+        };
+        let a_op = mk_op(0xA1);
+        let b_op = mk_op(0xB2);
+        let c_op = mk_op(0xC3);
+        set.insert_synthetic(a_op, mk_coin(100, 1));
+        set.insert_synthetic(b_op, mk_coin(200, 1));
+        assert_eq!(set.len(), 2);
+
+        // Epoch 1 → worker. `map` is now empty; A and B live in the
+        // flushing snapshot.
+        set.flush_to_backend(&[], 1).unwrap();
+        assert_eq!(set.map_stats().0, 0);
+        assert_eq!(set.len(), 2, "len must count the flushing layer");
+
+        // Epoch 2 writes while the commit is in flight: spend A (a
+        // coin only the snapshot holds), create C. Reads must resolve
+        // through the layer — a miss here means connect saw a coin
+        // that shouldn't exist (or vice versa).
+        assert!(set.spend_coin(&a_op).is_some(), "spend must hit the flushing layer");
+        set.insert_synthetic(c_op, mk_coin(300, 2));
+        assert_eq!(set.get(&a_op), None);
+        assert_eq!(set.get(&b_op).map(|c| c.out.value), Some(200));
+        assert_eq!(set.get(&c_op).map(|c| c.out.value), Some(300));
+        assert!(!set.have(&a_op));
+        assert_eq!(set.len(), 2, "A gone, B and C live");
+
+        // Epoch 2 flush serializes behind epoch 1's commit.
+        set.flush_to_backend(&[], 2).unwrap();
+        set.join_flush().unwrap();
+
+        // Committed truth: A deleted (born epoch1, backend-resident by
+        // the time epoch2's tombstone lands), B and C present.
+        assert_eq!(be.get(&a_op), None);
+        assert_eq!(be.get(&b_op).map(|c| c.out.value), Some(200));
+        assert_eq!(be.get(&c_op).map(|c| c.out.value), Some(300));
+        assert_eq!(be.tip_height(), 2);
+        assert_eq!(set.len(), 2);
+        assert!(set.flushing.is_none() && set.flush_join.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
