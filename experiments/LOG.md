@@ -1859,3 +1859,31 @@ consensus-exact (advice verified, never trusted).
 spiking on flush) doesn't fit a 30 GiB laptop through dense era.
 Restarted on the standard path + peers.max_connections=24 (plumbing
 bug found: GUI never read the config's peer cap — was locked at 8).
+
+## 2026-09-29 (02:20) — acquisition A/B: 24 peers changed nothing
+
+Restarted the run on the standard path (flat OOM'd at 438,390 —
+peak 24.97 GiB vs the 25 GiB cgroup). Fixed a real bug: the GUI's
+SyncConfig never read `peers.max_connections` — the daemon had been
+silently capped at 8 peers regardless of config.
+
+With the fix live (24 peers, 384 in-flight, 23 established TCPs):
+**~1.4–2 blk/s at heights 439–441k — identical to the 8-peer rate.**
+The process sits at ~90% of one core; peers deliver faster than the
+serial apply path consumes (`buffered=0` wasn't a shortage signal —
+it was connect keeping pace). Delivery was never the gate tonight:
+the single-core connect path is. That also means the advice batch's
+real home is per-block connect time — the 2.5× consume speedup is
+the lever that exists; peer breadth is settled as "not it".
+
+## Wire protocol landed (Avila-to-Avila advice)
+
+`sendadvice` capability + `getadvice(hash)` → `advice(hash, AVADV01)`
+messages, wired through session handshake, per-peer capability flags,
+manager dispatch, and the block-fetch fan-out (advice-capable peers
+get a sidecar request per fetched block). Serving is read-only from
+the node's advice dir; received streams are hash-checked and written
+into the consumer's dir before its block connects. Tests: codec
+round-trips + truncation, session-pipe handshake capability +
+message flow (190 p2p tests green). Caveat: 4 MiB payload cap bounds
+advice to blocks under ~40k sigs — denser blocks simply unserved.
