@@ -2628,10 +2628,17 @@ impl Chainstate {
         }
         let base = self.undo_base();
         if height <= base {
+            // In runs mode the backend's meta tip stalls below the
+            // watermark — heights in between are covered by attached
+            // epoch layers' undo sidecars, then the table below it.
             return self
-                .coins_backend
-                .as_deref()
-                .and_then(|b| b.undo_at(height));
+                .utxo
+                .epoch_undo(height)
+                .or_else(|| {
+                    self.coins_backend
+                        .as_deref()
+                        .and_then(|b| b.undo_at(height))
+                });
         }
         self.undos.get((height - base - 1) as usize).cloned()
     }
@@ -2650,6 +2657,13 @@ impl Chainstate {
         let backend = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open(dir)?);
         self.committed_coins_tip = backend.tip_height();
         self.utxo.attach_shared(backend.clone());
+        // `AVILA_RUNS=1` — LSM flush: epochs land as sorted-run files
+        // instead of B-tree commits. Restored epochs raise the
+        // committed watermark past the backend's stale meta tip.
+        if std::env::var("AVILA_RUNS").as_deref() == Ok("1") {
+            let runs_tip = self.utxo.enable_runs(dir)?;
+            self.committed_coins_tip = self.committed_coins_tip.max(runs_tip);
+        }
         self.utxo.set_budget(cache_bytes);
         // `AVILA_SWIFTSYNC=1` — transient-IBD mode: tag aggregate
         // tracks every mutation and the window never flushes (the
@@ -2781,6 +2795,24 @@ impl Chainstate {
         // populated undo table must still rewind — it cannot be the
         // genesis state.
         let db_tip = be.tip_height().max(be.max_undo_height());
+        if self.utxo.runs_enabled() {
+            // Epochs above `state_tip` describe state.dat never
+            // attested — dropping their layers rewinds the UTXO view
+            // to the highest covered tip; replay redoes the dropped
+            // range against it (files removed so a restart can't
+            // re-attach stale layers).
+            self.utxo.drop_epochs_above(state_tip);
+            let covered_tip = db_tip.max(self.utxo.runs_tip());
+            if covered_tip <= state_tip {
+                // Runs coverage (or plain body replay) spans the gap —
+                // the watermark sits at the highest durable layer.
+                self.committed_coins_tip = covered_tip;
+                self.inflight_flush = None;
+                return Ok(());
+            }
+            // covered_tip > state_tip can only mean the backend's own
+            // tables are ahead — the ordinary rewind handles it.
+        }
         if db_tip < state_tip {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

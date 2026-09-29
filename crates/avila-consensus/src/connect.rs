@@ -202,8 +202,22 @@ pub struct UtxoSet {
     flushing: Option<FlushLayer>,
     /// The commit worker's handle — joined before the next flush and
     /// by [`UtxoSet::join_flush`]. `None` in clones (an overlay never
-    /// outlives the real set's flush bookkeeping).
-    flush_join: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    /// outlives the real set's flush bookkeeping). In runs mode the
+    /// worker returns `Some(EpochWrite)` instead of committing to the
+    /// backend — the epoch lands as files, attached at join.
+    flush_join:
+        Option<std::thread::JoinHandle<std::io::Result<Option<crate::runs::EpochWrite>>>>,
+    /// Attached sorted-run epochs, oldest→newest by covered tip —
+    /// the LSM read layers between `flat` and `backend`. Populated
+    /// only in runs mode (`runs_dir` set); reads probe newest→oldest,
+    /// a del-list hit is a definitive absence.
+    runs: Vec<crate::runs::EpochLayer>,
+    /// Filename sequence for flush epochs — orders files written
+    /// within one process lifetime.
+    runs_seq: u64,
+    /// `coinsdb/runs/` — `Some` selects the sorted-run flush path
+    /// (`AVILA_RUNS=1` at backend attach).
+    runs_dir: Option<std::path::PathBuf>,
 }
 
 /// In-flight commit state — see [`UtxoSet::flushing`]. Flushes
@@ -242,6 +256,9 @@ impl Default for UtxoSet {
             flat: None,
             flushing: None,
             flush_join: None,
+            runs: Vec::new(),
+            runs_seq: 0,
+            runs_dir: None,
         }
     }
 }
@@ -277,6 +294,53 @@ impl UtxoSet {
         self.backend = Some(backend);
         if self.flat.is_some() {
             self.rebuild_flat(usize::MAX);
+        }
+    }
+
+    /// Enables the sorted-run flush path (`AVILA_RUNS=1`): flush
+    /// epochs become sequential `.sr`/`.del`/`.und` files under
+    /// `<dbdir>/runs/` instead of `redb` B-tree commits. Re-attaches
+    /// any epochs that survived a crash (`.ok` marker present).
+    ///
+    /// Returns the highest covered tip so the caller can raise its
+    /// committed-coins watermark past the backend's stale meta tip.
+    pub fn enable_runs(&mut self, dbdir: &std::path::Path) -> std::io::Result<u32> {
+        let dir = dbdir.join("runs");
+        std::fs::create_dir_all(&dir)?;
+        // Partial epochs — no `.ok` marker — never finished their
+        // fsync sequence; drop them (replay covers their heights).
+        for (seq, tip) in crate::runs::scan_epochs(&dir)? {
+            let l = crate::runs::EpochLayer::open(&dir, seq, tip, None)?;
+            // Post-restore deltas are approximated as run-minus-del:
+            // exact deltas need lower-layer probes; `len()` is
+            // telemetry-only, so the approximation is safe here.
+            self.runs.push(l);
+            self.runs_seq = self.runs_seq.max(seq + 1);
+        }
+        self.runs.sort_by_key(|l| l.tip);
+        self.runs_dir = Some(dir);
+        Ok(self.runs.last().map_or(0, |l| l.tip))
+    }
+
+    /// `true` while the sorted-run flush path is active.
+    #[must_use]
+    pub fn runs_enabled(&self) -> bool {
+        self.runs_dir.is_some()
+    }
+
+    /// Highest tip covered by an attached run epoch — `0` with none.
+    #[must_use]
+    pub fn runs_tip(&self) -> u32 {
+        self.runs.last().map_or(0, |l| l.tip)
+    }
+
+    /// Drops attached epochs above `tip` and deletes their files —
+    /// used when `state.dat` sits behind an attached run (replay
+    /// covers the dropped range against the remaining layers).
+    pub fn drop_epochs_above(&mut self, tip: u32) {
+        while self.runs.last().is_some_and(|l| l.tip > tip) {
+            let l = self.runs.pop().expect("checked");
+            crate::runs::remove_epoch(l.paths.run.parent().unwrap_or_else(|| std::path::Path::new(".")), l.seq, l.tip);
         }
     }
 
@@ -517,7 +581,9 @@ impl UtxoSet {
             _ => 0,
         };
         lower
-            .saturating_add_signed((self.live_delta + flushing_delta) as isize)
+            .saturating_add_signed(
+                (self.live_delta + flushing_delta + self.runs_delta()) as isize,
+            )
     }
 
     /// `true` if no coins are tracked.
@@ -558,6 +624,14 @@ impl UtxoSet {
         if let Some(base) = &self.base {
             return base.get(outpoint);
         }
+        if !self.runs.is_empty() {
+            let key = crate::utxo_snapshot::outpoint_key(outpoint);
+            for l in self.runs.iter().rev() {
+                if let Some(hit) = l.probe(&key) {
+                    return hit;
+                }
+            }
+        }
         if let Some(f) = &self.flat {
             return f.get(outpoint);
         }
@@ -592,6 +666,14 @@ impl UtxoSet {
         }
         if let Some(base) = &self.base {
             return base.have(outpoint);
+        }
+        if !self.runs.is_empty() {
+            let key = crate::utxo_snapshot::outpoint_key(outpoint);
+            for l in self.runs.iter().rev() {
+                if let Some(hit) = l.probe(&key) {
+                    return hit.is_some();
+                }
+            }
         }
         if let Some(f) = &self.flat {
             return f.have(outpoint);
@@ -630,6 +712,16 @@ impl UtxoSet {
         if let Some(base) = &self.base {
             for (op, c) in base.iter() {
                 all.insert(op, c);
+            }
+        }
+        // Run epochs merge in ascending-tip order — a newer epoch
+        // overwrites or deletes an older layer's record.
+        for l in &self.runs {
+            for (op, c) in l.iter_records().unwrap_or_default() {
+                all.insert(op, c);
+            }
+            for key in l.del_keys() {
+                all.remove(&crate::runs::key_to_outpoint(key));
             }
         }
         if let Some(layer) = &self.flushing {
@@ -677,6 +769,16 @@ impl UtxoSet {
         if let Some(base) = &self.base {
             for (op, c) in base.iter() {
                 all.insert(op, c);
+            }
+        }
+        // Run epochs merge in ascending-tip order — a newer epoch
+        // overwrites or deletes an older layer's record.
+        for l in &self.runs {
+            for (op, c) in l.iter_records().unwrap_or_default() {
+                all.insert(op, c);
+            }
+            for key in l.del_keys() {
+                all.remove(&crate::runs::key_to_outpoint(key));
             }
         }
         if let Some(layer) = &self.flushing {
@@ -728,10 +830,20 @@ impl UtxoSet {
         {
             return entry.clone();
         }
-        self.base
-            .as_deref()
-            .and_then(|b| b.get(outpoint))
-            .or_else(|| self.flat.as_ref().and_then(|f| f.get(outpoint)))
+        if let Some(c) = self.base.as_deref().and_then(|b| b.get(outpoint)) {
+            return Some(c);
+        }
+        if !self.runs.is_empty() {
+            let key = crate::utxo_snapshot::outpoint_key(outpoint);
+            for l in self.runs.iter().rev() {
+                if let Some(hit) = l.probe(&key) {
+                    return hit;
+                }
+            }
+        }
+        self.flat
+            .as_ref()
+            .and_then(|f| f.get(outpoint))
             .or_else(|| self.backend.as_deref().and_then(|be| be.get(outpoint)))
             .or_else(|| self.snapshot.as_ref().and_then(|s| s.get(outpoint)))
     }
@@ -744,8 +856,21 @@ impl UtxoSet {
         {
             return entry.is_some();
         }
-        self.base.as_deref().is_some_and(|b| b.have(outpoint))
-            || self.flat.as_ref().is_some_and(|f| f.have(outpoint))
+        if self.base.as_deref().is_some_and(|b| b.have(outpoint)) {
+            return true;
+        }
+        if !self.runs.is_empty() {
+            let key = crate::utxo_snapshot::outpoint_key(outpoint);
+            for l in self.runs.iter().rev() {
+                // A run-layer answer is definitive — a del-list hit
+                // is absence, a coin hit is presence. Only silence
+                // falls through to older layers.
+                if let Some(hit) = l.probe(&key) {
+                    return hit.is_some();
+                }
+            }
+        }
+        self.flat.as_ref().is_some_and(|f| f.have(outpoint))
             || self.backend.as_deref().is_some_and(|be| be.have(outpoint))
             || self
                 .snapshot
@@ -946,6 +1071,9 @@ impl UtxoSet {
             flat: None,
             flushing: None,
             flush_join: None,
+            runs: Vec::new(),
+            runs_seq: 0,
+            runs_dir: None,
         }
     }
 
@@ -1024,15 +1152,30 @@ impl UtxoSet {
             tip,
         });
         let undos: Vec<(u32, crate::hash::BlockHash, BlockUndo)> = new_undos.to_vec();
-        self.flush_join = Some(std::thread::spawn(move || {
-            be.commit(snap.as_ref(), &undos, tip)
-        }));
+        if let Some(dir) = self.runs_dir.clone() {
+            // LSM path: the worker writes the epoch as sorted-run
+            // files (sequential IO) instead of a B-tree commit. The
+            // backend's meta tip stops moving per-epoch — attached
+            // runs carry the heights above it.
+            let seq = self.runs_seq;
+            self.runs_seq += 1;
+            self.flush_join = Some(std::thread::spawn(move || {
+                crate::runs::write_epoch(&dir, seq, tip, delta, snap.as_ref(), &undos)
+                    .map(Some)
+            }));
+        } else {
+            self.flush_join = Some(std::thread::spawn(move || {
+                be.commit(snap.as_ref(), &undos, tip).map(|()| None)
+            }));
+        }
         Ok(())
     }
 
     /// Waits for the in-flight commit (if any) and folds its result
     /// back into the set: drops the snap layer, applies the flat
-    /// delta, propagates a commit failure.
+    /// delta, propagates a commit failure. In runs mode the worker's
+    /// `EpochWrite` opens as a read layer here — attached in
+    /// ascending-tip order (flushes serialize, so pushes stay sorted).
     pub fn join_flush(&mut self) -> std::io::Result<()> {
         let Some(handle) = self.flush_join.take() else {
             return Ok(());
@@ -1041,12 +1184,43 @@ impl UtxoSet {
         let result = handle
             .join()
             .unwrap_or_else(|_| Err(std::io::Error::other("flush worker panicked")));
-        if result.is_ok()
-            && let Some(f) = &mut self.flat
-        {
-            f.apply_delta(&layer.snap);
+        match result {
+            Ok(Some(epoch)) => {
+                let dir = self
+                    .runs_dir
+                    .clone()
+                    .expect("epoch write without runs_dir");
+                let l = crate::runs::EpochLayer::open(&dir, epoch.seq, epoch.tip, Some(epoch.delta))?;
+                debug_assert!(
+                    self.runs.last().is_none_or(|prev| prev.tip < l.tip),
+                    "run layers must attach in ascending tip order"
+                );
+                self.runs.push(l);
+            }
+            Ok(None) => {
+                if let Some(f) = &mut self.flat {
+                    f.apply_delta(&layer.snap);
+                }
+            }
+            Err(e) => return Err(e),
         }
-        result
+        Ok(())
+    }
+
+    /// Undo records for `height` — the run-mode equivalent of the
+    /// backend's undo table, probed newest→oldest over attached
+    /// epochs. `None` when no attached epoch covers the height.
+    pub fn epoch_undo(&self, height: u32) -> Option<BlockUndo> {
+        self.runs
+            .iter()
+            .rev()
+            .find_map(|l| l.undo(height).cloned())
+    }
+
+    /// Attached run epochs' net live-coin delta — `len()`'s share of
+    /// the run layers (they are already-durable committed state).
+    fn runs_delta(&self) -> i64 {
+        self.runs.iter().map(|l| l.delta).sum()
     }
 
     /// Coins-only flush that does NOT advance the backend tip — the
@@ -1100,6 +1274,11 @@ impl Clone for UtxoSet {
             // A clone never inherits the commit worker — joining is the
             // owning set's job (the snap layer carries the read state).
             flush_join: None,
+            // Overlays read runs through `base`; a cloned map view
+            // needs none of its own (and EpochLayer isn't Clone).
+            runs: Vec::new(),
+            runs_seq: self.runs_seq,
+            runs_dir: self.runs_dir.clone(),
         }
     }
 }
@@ -3986,6 +4165,85 @@ mod tests {
         assert_eq!(be.tip_height(), 2);
         assert_eq!(set.len(), 2);
         assert!(set.flushing.is_none() && set.flush_join.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sorted-run flush: epochs land as `.sr`/`.del`/`.und` files,
+    /// reads layer correctly across runs+backend, undos answer from
+    /// sidecars, a reopened set re-attaches the runs, and a markerless
+    /// epoch is abandoned (replay covers it).
+    #[test]
+    fn runs_flush_layers_and_reopens() {
+        let dir = std::env::temp_dir()
+            .join(format!("avila-runs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let be = std::sync::Arc::new(
+            crate::coinsdb::CoinsBackend::open(&dir).unwrap(),
+        );
+        let mut set = UtxoSet::new();
+        set.attach_shared(be.clone());
+        set.enable_runs(&dir).unwrap();
+
+        let mk_op = |b: u8| OutPoint {
+            txid: Txid::from_bytes([b; 32]),
+            vout: 0,
+        };
+        let mk_coin = |v: i64, h: u32| Coin {
+            out: txout(v, vec![0x51]),
+            height: h,
+            coinbase: false,
+        };
+        let a_op = mk_op(0xA1);
+        let b_op = mk_op(0xB2);
+        let c_op = mk_op(0xC3);
+        set.insert_synthetic(a_op, mk_coin(100, 1));
+        set.insert_synthetic(b_op, mk_coin(200, 1));
+
+        // Epoch 1 → run files, not a backend commit.
+        set.flush_to_backend(&[(1, BlockHash::from_bytes([9; 32]), BlockUndo::default())], 1)
+            .unwrap();
+        set.join_flush().unwrap();
+        assert_eq!(be.tip_height(), 0, "runs mode must not stamp meta.tip");
+        assert_eq!(set.runs.len(), 1);
+        assert_eq!(set.get(&a_op).map(|c| c.out.value), Some(100));
+        assert_eq!(set.get(&b_op).map(|c| c.out.value), Some(200));
+
+        // Epoch 2: spend A (lives in run 1), create C.
+        assert!(set.spend_coin(&a_op).is_some());
+        set.insert_synthetic(c_op, mk_coin(300, 2));
+        set.flush_to_backend(&[(2, BlockHash::from_bytes([8; 32]), BlockUndo::default())], 2)
+            .unwrap();
+        set.join_flush().unwrap();
+        assert_eq!(set.runs.len(), 2);
+        assert_eq!(set.get(&a_op), None, "del must shadow the run-1 coin");
+        assert_eq!(set.get(&b_op).map(|c| c.out.value), Some(200));
+        assert_eq!(set.get(&c_op).map(|c| c.out.value), Some(300));
+        assert_eq!(set.len(), 2);
+        // Undo sidecars answer through the layers.
+        assert!(set.epoch_undo(1).is_some());
+        assert!(set.epoch_undo(2).is_some());
+        assert!(set.epoch_undo(3).is_none());
+        drop(set);
+
+        // Reopen: the two epochs re-attach; a markerless partial is dropped.
+        let runs_dir = dir.join("runs");
+        crate::runs::write_epoch(
+            &runs_dir, 7, 3, 0,
+            &std::collections::HashMap::new(), &[],
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(runs_dir.join("e-000007-3.ok"));
+        let mut set2 = UtxoSet::new();
+        set2.attach_shared(be.clone());
+        let tip = set2.enable_runs(&dir).unwrap();
+        assert_eq!(tip, 2, "only marked epochs attach");
+        assert_eq!(set2.runs.len(), 2);
+        assert_eq!(set2.get(&a_op), None);
+        assert_eq!(set2.get(&b_op).map(|c| c.out.value), Some(200));
+        assert_eq!(set2.get(&c_op).map(|c| c.out.value), Some(300));
+        assert!(set2.epoch_undo(1).is_some() && set2.epoch_undo(2).is_some());
+        drop(set2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

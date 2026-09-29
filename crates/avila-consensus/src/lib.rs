@@ -32,6 +32,7 @@ pub mod params;
 pub mod pow;
 pub mod psbt;
 pub mod rules;
+pub mod runs;
 pub mod script;
 pub mod sigbatch;
 pub mod sigchecker;

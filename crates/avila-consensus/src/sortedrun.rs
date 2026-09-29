@@ -228,13 +228,52 @@ impl SortedRun {
         self.scan_window(off_lo, off_hi, key)
     }
 
+    /// Sequential read of every record — merge/iter paths only, never
+    /// the hot lookup loop.
+    pub fn iter(&self) -> std::io::Result<Vec<(OutPoint, Coin)>> {
+        let f = self.f.lock().map_err(|_| io::Error::other("run lock"))?;
+        let mut out = Vec::with_capacity(self.count.min(usize::MAX as u64) as usize);
+        let mut pos = HDR;
+        let mut left = self.count;
+        while left > 0 {
+            let mut hdr = [0u8; 40];
+            f.read_exact_at(&mut hdr, pos)?;
+            let key: [u8; 36] = hdr[..36].try_into().unwrap_or([0u8; 36]);
+            let len = u32::from_le_bytes(hdr[36..].try_into().unwrap_or([0; 4])) as u64;
+            let mut body = vec![0u8; len as usize];
+            f.read_exact_at(&mut body, pos + 40)?;
+            if let Some(c) = coinsdb::decode_coin(&body, CoinFormat::Compact) {
+                let mut tx = [0u8; 32];
+                tx.copy_from_slice(&key[..32]);
+                let vout = u32::from_be_bytes(key[32..].try_into().unwrap_or([0; 4]));
+                out.push((
+                    OutPoint {
+                        txid: crate::hash::Txid::from_bytes(tx),
+                        vout,
+                    },
+                    c,
+                ));
+            }
+            pos += 40 + len;
+            left -= 1;
+        }
+        Ok(out)
+    }
+
     fn scan_window(&self, off_lo: u64, off_hi: u64, key: &[u8; 36]) -> Option<Coin> {
         // Read enough bytes for `stride` records (~40KB typical).
         let cap = (u64::from(self.stride) * 84)
             .min(off_hi.saturating_sub(off_lo))
             .max(84);
-        let mut buf = vec![0u8; cap as usize];
         let f = self.f.lock().ok()?;
+        // Clamp to the file tail — the last window is often shorter
+        // than stride×84 and `read_exact_at` would error past EOF.
+        let file_len = f.metadata().ok()?.len();
+        let cap = cap.min(file_len.saturating_sub(off_lo)) as usize;
+        if cap < 40 {
+            return None;
+        }
+        let mut buf = vec![0u8; cap];
         if f.read_exact_at(&mut buf, off_lo).is_err() {
             return None;
         }

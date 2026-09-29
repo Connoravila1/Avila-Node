@@ -42,7 +42,7 @@ fn coin(n: u64) -> Coin {
     }
 }
 
-fn run(name: &str, engine: Engine, budget_mb: usize) {
+fn run(name: &str, engine: Engine, budget_mb: usize, runs: bool) {
     let dir = std::env::temp_dir().join(format!("avila-churn-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let be = std::sync::Arc::new(
@@ -50,6 +50,9 @@ fn run(name: &str, engine: Engine, budget_mb: usize) {
     );
     let mut set = UtxoSet::new();
     set.attach_shared(be.clone());
+    if runs {
+        set.enable_runs(&dir).unwrap();
+    }
     set.set_budget(budget_mb << 20);
 
     let mut gross: u64 = 0;
@@ -108,6 +111,14 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(64);
-    run("redb", Engine::Redb, budget);
-    run("hash", Engine::Hash, budget);
+    // `CHURN_RUNS=1` swaps the commit target: epochs land as sorted-run
+    // files (sequential IO) instead of B-tree inserts. Backend stays
+    // redb for the pre-run baseline of the same schema.
+    let runs = std::env::var("CHURN_RUNS").as_deref() == Ok("1");
+    if runs {
+        run("runs", Engine::Redb, budget, true);
+    } else {
+        run("redb", Engine::Redb, budget, false);
+        run("hash", Engine::Hash, budget, false);
+    }
 }
