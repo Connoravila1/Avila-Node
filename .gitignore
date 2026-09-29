@@ -31,3 +31,4 @@ data/
 *.runtime.toml
 # Flat-utxo experiment datadir.
 /data-flat/
+data-adv/

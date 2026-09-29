@@ -1,8 +1,0 @@
-{"seq":0,"time":1790665150,"kind":"run_started"}
-{"seq":1,"time":1790665238,"kind":"peer_connected","peer":0,"user_agent":"/Avila:0.1.0/","services":9,"protocol_version":70016,"start_height":1}
-{"seq":2,"time":1790665239,"kind":"compact_received","peer":0,"block":"424014d6d5af3257713de3583105ad35115fac10bd28b4d3d5283f923b06233d","short_ids":1}
-{"seq":3,"time":1790665239,"kind":"compact_patch_request","peer":0,"block":"424014d6d5af3257713de3583105ad35115fac10bd28b4d3d5283f923b06233d","missing":1}
-{"seq":4,"time":1790665872,"kind":"peer_disconnected","peer":0,"reason":"Session(\"peer closed the connection\")"}
-{"seq":5,"time":1790666872,"kind":"peer_connected","peer":1,"user_agent":"/Avila:0.1.0/","services":9,"protocol_version":70016,"start_height":1}
-{"seq":6,"time":1790666872,"kind":"compact_received","peer":1,"block":"424014d6d5af3257713de3583105ad35115fac10bd28b4d3d5283f923b06233d","short_ids":1}
-{"seq":7,"time":1790666872,"kind":"compact_patch_request","peer":1,"block":"424014d6d5af3257713de3583105ad35115fac10bd28b4d3d5283f923b06233d","missing":1}
