@@ -1930,3 +1930,46 @@ change: `getadvice` requests now ride at header-accept (`fetchable`
 outcome) and `inv` handling — the fetch-time request raced the body
 and the sidecar could land after connect. Dedupe remains once per
 hash per peer via `PeerSync::wanted_advice`.
+
+## #32 — Async UTXO backend flush (double-buffered commit)
+
+**Hypothesis:** the apply-plane wall wasn't per-block apply but the
+~70-240s `accept` stall when the 1M-entry dirty map committed to
+redb — serialized connect → commit → connect. Overlap the commit
+with the next epoch's connect.
+
+**Mechanism:** `UtxoSet::flush_to_backend` moves the dirty map into
+an immutable `FlushLayer` (Arc'd snap + net delta + target tip),
+spawns `be.commit` on a worker, returns. Reads resolve
+map → flushing snap → base/flat/backend; a snap tombstone shadows
+lower layers (a coin deleted by the in-flight commit must not
+resurface through stale flat/backend — `flat_mirror_lockstep`
+caught it). `len()` stops counting the layer once
+`be.tip_height()` reaches its commit tip (the land-before-join
+window double-counted). `Chainstate` keeps `undos` populated
+through the flight so mid-flight reorg disconnects keep working;
+`undo_base` keys off a chainstate-side `committed_coins_tip`
+watermark that advances at join, not the live backend tip (which
+races ahead mid-commit and would shift `undos` indexing under
+lookups). `state.dat` writes join the worker first — a crash still
+replays an uncommitted epoch identically. `Drop` joins the worker
+so close+reopen can't race the commit's file lock
+(`coinsdb_crash_ahead_rewinds` caught the lock leak).
+
+**Evidence:**
+- churn_bench @2048M, flush-stall ms attributed to the connect
+  loop (spawn + join residual): redb 2061→470, hash 2773→248.
+- Live mainnet (459k, dense era, 24 peers): `fl=` counters show
+  700k-1.4M-entry commits overlapping connect; map cycles 9k→854k
+  while commits run. Rate in the last 709-block window ≈2.95
+  blk/s vs ~1.42-4/blk/s pre-change baseline — modest, and
+  apply/blk rose ~30% (snap probes on every miss). RSS 5.7GB
+  (double-buffered). Net: burst stalls convert to spread overhead
+  — commit (~60-80s on 1.2M entries vs 30GB redb) still outlasts
+  the ~40-60s window, so joins block the remainder.
+
+**Verdict:** real overlap, correctness clean (568 tests), but the
+redb commit itself is the wall — overlap alone can't win when the
+commit outruns the window. Next levers: shrink what gets
+committed (swiftsync transient + spill-to-disk, or hash engine on
+a fresh datadir), not just hide it.
