@@ -977,6 +977,27 @@ pub struct DeferredSink {
     pub job_of: Vec<u32>,
 }
 
+/// Destination for deferred records — `RefCell` for single-threaded
+/// scopes, `Mutex` when workers share the sink across a pool.
+pub trait Sink {
+    /// Append a deferred record tagged with its job index.
+    fn push(&self, record: crate::sigbatch::Record, tag: u32);
+}
+impl Sink for std::cell::RefCell<DeferredSink> {
+    fn push(&self, record: crate::sigbatch::Record, tag: u32) {
+        let mut s = self.borrow_mut();
+        s.records.push(record);
+        s.job_of.push(tag);
+    }
+}
+impl Sink for std::sync::Mutex<DeferredSink> {
+    fn push(&self, record: crate::sigbatch::Record, tag: u32) {
+        let mut s = self.lock().unwrap_or_else(|e| e.into_inner());
+        s.records.push(record);
+        s.job_of.push(tag);
+    }
+}
+
 /// A [`SignatureChecker`] that defers advised ECDSA checks into `sink`
 /// and verifies unadvised ones inline. `advice` is consumed in
 /// evaluation order — one entry per `check_ecdsa_signature` call that
@@ -993,7 +1014,7 @@ pub struct DeferredChecker<'a> {
     /// The per-tx advice entries.
     entries: &'a [u8],
     /// Shared sink (per-batch-scope; callers isolate threads).
-    sink: &'a std::cell::RefCell<DeferredSink>,
+    sink: &'a dyn Sink,
     /// Index of this tx's job inside the batch scope.
     tag: u32,
     /// Counts for reporting: deferred vs inline checks.
@@ -1015,7 +1036,7 @@ impl<'a> DeferredChecker<'a> {
         amount: i64,
         txdata: &'a PrecomputedTransactionData,
         entries: &'a [u8],
-        sink: &'a std::cell::RefCell<DeferredSink>,
+        sink: &'a dyn Sink,
         tag: u32,
         stat: &'a std::cell::Cell<(u64, u64)>,
         advice: &'a std::cell::Cell<usize>,
@@ -1145,15 +1166,15 @@ impl SignatureChecker for DeferredChecker<'_> {
                     sigversion,
                     self.inner.txdata,
                 );
-                let mut s = self.sink.borrow_mut();
-                s.records.push(crate::sigbatch::Record {
-                    z: sighash,
-                    sig: sig64,
-                    pubkey: pub33,
-                    advice,
-                });
-                s.job_of.push(self.tag);
-                drop(s);
+                self.sink.push(
+                    crate::sigbatch::Record {
+                        z: sighash,
+                        sig: sig64,
+                        pubkey: pub33,
+                        advice,
+                    },
+                    self.tag,
+                );
                 let (a, i) = self.stat.get();
                 self.stat.set((a + 1, i));
                 true
@@ -1220,7 +1241,7 @@ pub fn check_input_scripts_advised(
     spent_outputs: &[TxOut],
     flags: crate::script::ScriptFlags,
     entries: &[u8],
-    sink: &std::cell::RefCell<DeferredSink>,
+    sink: &dyn Sink,
     tag: u32,
     stat: &std::cell::Cell<(u64, u64)>,
 ) -> Result<(), ScriptError> {

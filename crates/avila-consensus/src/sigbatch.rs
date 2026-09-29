@@ -581,9 +581,12 @@ mod stagebench {
         }
         terms.push((ProjectivePoint::GENERATOR, -gsum));
         let t0 = Instant::now();
-        let res = <ProjectivePoint as LinearCombination<
-            [(ProjectivePoint, Scalar)],
-        >>::lincomb_vartime(terms.as_slice());
+        let res = msm_vartime(
+            &terms
+                .iter()
+                .map(|(p, s)| (AffinePoint::from(*p), *s, false))
+                .collect::<Vec<_>>(),
+        );
         let msm_us = t0.elapsed().as_micros();
         assert!(bool::from(res.is_identity()) || !bool::from(res.is_identity()));
 

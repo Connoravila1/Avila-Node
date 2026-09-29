@@ -2888,6 +2888,7 @@ impl Chainstate {
                     block_hash: hash,
                     script_checks: self.script_checks(&hash, &params),
                     script_pool: None,
+                    advice: None,
                 };
                 if connect::connect_block(&block, utxo, &cctx).is_err() {
                     return false;
@@ -3045,6 +3046,7 @@ impl Chainstate {
                 block_hash: hash,
                 script_checks: self.script_checks(&hash, self.tree.params()),
                 script_pool: None,
+                advice: None,
             };
             let Some(acc) = self.utreexo_acc.as_mut() else {
                 break;
@@ -3254,6 +3256,7 @@ impl Chainstate {
                 block_hash: hash,
                 script_checks: self.script_checks(&hash, &params),
                 script_pool: self.script_pool.as_deref(),
+                advice: None,
             };
             match connect::connect_block_full(block, &mut self.utxo, &ctx) {
                 Ok((undo, check, receipt)) => {
@@ -3719,6 +3722,7 @@ impl Chainstate {
                 block_hash: *branch_hash,
                 script_checks: checks,
                 script_pool: None,
+                advice: None,
             };
             match connect::connect_block_full(&block, sim, &ctx) {
                 Ok((undo, check, receipt)) => {
@@ -3963,6 +3967,7 @@ impl Chainstate {
                 block_hash: hash,
                 script_checks: self.script_checks(&hash, &params),
                 script_pool: pool.as_deref(),
+                advice: None,
             };
             match connect::connect_block_full(&block, &mut bg.utxo, &ctx) {
                 Ok((_undo, check, receipt)) => {
@@ -7072,6 +7077,7 @@ mod tests {
                 block_hash: hash,
                 script_checks: true,
                 script_pool: None,
+                advice: None,
             };
             crate::utreexo::connect_block_proven(block, &mut acc, &spends, &proof, &ctx)
                 .unwrap_or_else(|e| panic!("proven connect h{}: {e}", i + 1));

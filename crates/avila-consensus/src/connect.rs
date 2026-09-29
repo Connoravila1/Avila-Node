@@ -1011,6 +1011,12 @@ pub struct ConnectContext<'a> {
     /// decides when to wait (`Chainstate`'s speculative pipeline waits
     /// a bounded window of blocks back, overlapping serial passes).
     pub script_pool: Option<&'a ScriptPool>,
+    /// Optional per-tx signature advice — the sigbatch sidecar mapping
+    /// `txid → entry stream`. When set, advised ECDSA checks defer into
+    /// a block-scoped batch resolved at the script-check barrier; a
+    /// batch failure re-verifies per-signature and re-runs the affected
+    /// transactions — advice is never trusted.
+    pub advice: Option<&'a std::collections::HashMap<Txid, Vec<u8>>>,
 }
 
 /// A machine-checkable record of one block's connect — the
@@ -1511,6 +1517,19 @@ struct CheckState {
     error: Option<crate::interpreter::ScriptError>,
 }
 
+/// One job's retained data — shared between the pool queue and the
+/// [`BlockCheck`] so a batch failure can re-run the affected
+/// transactions without re-fetching block memory.
+struct JobData {
+    tx: Transaction,
+    outs: Vec<TxOut>,
+    flags: crate::script::ScriptFlags,
+    /// Job index inside the block (the deferred-record tag).
+    idx: u32,
+    /// This tx's advice stream, if the caller supplied one.
+    advice: Option<Vec<u8>>,
+}
+
 /// A block's outstanding script checks: workers decrement
 /// `remaining` as each tx verifies; `wait` returns when all pass or
 /// the first failure lands. The block's UTXO effects are already
@@ -1518,26 +1537,90 @@ struct CheckState {
 pub struct BlockCheck {
     state: std::sync::Mutex<CheckState>,
     done: std::sync::Condvar,
+    /// Deferred sig-batch records pooled across workers (present only
+    /// when the caller supplied an advice index).
+    sink: std::sync::Mutex<crate::sigchecker::DeferredSink>,
+    /// Job indices whose deferred-mode eval errored — provisional until
+    /// the batch commits, so they're recorded, not immediately fatal.
+    eval_errored: std::sync::Mutex<Vec<u32>>,
+    /// Retained jobs for the fallback re-run (empty when no advice).
+    jobs: Vec<std::sync::Arc<JobData>>,
+    /// Deferred/inline check counts for status reporting.
+    pub advised_checks: std::sync::atomic::AtomicU64,
+    /// Unadvised checks that verified inline.
+    pub inline_checks: std::sync::atomic::AtomicU64,
 }
 
 impl BlockCheck {
-    fn new(jobs: usize) -> Self {
+    fn new(jobs: Vec<std::sync::Arc<JobData>>) -> Self {
+        Self {
+            state: std::sync::Mutex::new(CheckState {
+                remaining: jobs.len() as u64,
+                error: None,
+            }),
+            done: std::sync::Condvar::new(),
+            sink: std::sync::Mutex::new(crate::sigchecker::DeferredSink::default()),
+            eval_errored: std::sync::Mutex::new(Vec::new()),
+            jobs,
+            advised_checks: std::sync::atomic::AtomicU64::new(0),
+            inline_checks: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Backward-compatible constructor for callers that only need a
+    /// drain barrier (no deferred records, no re-runs).
+    fn barrier(jobs: usize) -> Self {
         Self {
             state: std::sync::Mutex::new(CheckState {
                 remaining: jobs as u64,
                 error: None,
             }),
             done: std::sync::Condvar::new(),
+            sink: std::sync::Mutex::new(crate::sigchecker::DeferredSink::default()),
+            eval_errored: std::sync::Mutex::new(Vec::new()),
+            jobs: Vec::new(),
+            advised_checks: std::sync::atomic::AtomicU64::new(0),
+            inline_checks: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Blocks until the block's script queue drains; returns the first
+    /// Blocks until the block's script queue drains; resolves the
+    /// deferred sig batch (when records exist) and re-runs any
+    /// transactions the batch couldn't commit — then returns the first
     /// verification failure, if any.
     pub fn wait(&self) -> Result<(), crate::interpreter::ScriptError> {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         while guard.remaining != 0 {
             guard = self.done.wait(guard).unwrap_or_else(|e| e.into_inner());
         }
+        drop(guard);
+        // Batch resolution — provisional pushes stand only if the
+        // aggregate verifies. Fallback re-verifies each record and
+        // re-runs the dirty txs (plus any whose deferred eval errored).
+        let sink = self.sink.lock().unwrap_or_else(|e| e.into_inner());
+        if !sink.records.is_empty() {
+            let mut recheck = match crate::sigchecker::resolve_sink(&sink) {
+                Ok(()) => Vec::new(),
+                Err(dirty) => dirty,
+            };
+            drop(sink);
+            let errored: Vec<u32> =
+                std::mem::take(&mut *self.eval_errored.lock().unwrap_or_else(|e| e.into_inner()));
+            for tag in errored {
+                if !recheck.contains(&tag) {
+                    recheck.push(tag);
+                }
+            }
+            for tag in recheck {
+                let job = &self.jobs[tag as usize];
+                if let Err(err) =
+                    crate::sigchecker::check_input_scripts(&job.tx, &job.outs, job.flags)
+                {
+                    return Err(err);
+                }
+            }
+        }
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match guard.error {
             Some(err) => Err(err),
             None => Ok(()),
@@ -1545,12 +1628,12 @@ impl BlockCheck {
     }
 }
 
+
+
 /// One queued script verification — owned so the worker never borrows
 /// block memory (the block may be disconnected before the job runs).
 struct ScriptJob {
-    tx: Transaction,
-    outs: Vec<TxOut>,
-    flags: crate::script::ScriptFlags,
+    job: std::sync::Arc<JobData>,
     check: std::sync::Arc<BlockCheck>,
 }
 
@@ -1591,7 +1674,38 @@ impl ScriptPool {
                     q = self.avail.wait(q).unwrap_or_else(|e| e.into_inner());
                 }
             };
-            let result = check_input_scripts(&job.tx, &job.outs, job.flags);
+            let result = if job.job.advice.is_some() {
+                // Deferred mode: eval errors are provisional — the
+                // pushed sig results aren't proven until the batch
+                // commits, so record the tag for wait()'s re-run list.
+                let stat = std::cell::Cell::new((0u64, 0u64));
+                let r = crate::sigchecker::check_input_scripts_advised(
+                    &job.job.tx,
+                    &job.job.outs,
+                    job.job.flags,
+                    job.job.advice.as_deref().unwrap_or(&[]),
+                    &job.check.sink,
+                    job.job.idx,
+                    &stat,
+                );
+                let (a, i) = stat.get();
+                job.check
+                    .advised_checks
+                    .fetch_add(a, std::sync::atomic::Ordering::Relaxed);
+                job.check
+                    .inline_checks
+                    .fetch_add(i, std::sync::atomic::Ordering::Relaxed);
+                if r.is_err() {
+                    job.check
+                        .eval_errored
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(job.job.idx);
+                }
+                Ok(())
+            } else {
+                check_input_scripts(&job.job.tx, &job.job.outs, job.job.flags)
+            };
             // The predicate `wait` loops on (`remaining`) and the error
             // slot are updated under the same mutex `wait` holds while
             // checking them, and the notify happens before it's
@@ -1741,7 +1855,7 @@ pub fn connect_block_deferred(
     let Some(check) = pending else {
         // Pool was absent — nothing outstanding; report an
         // already-complete handle so callers don't branch.
-        let done = std::sync::Arc::new(BlockCheck::new(0));
+        let done = std::sync::Arc::new(BlockCheck::barrier(0));
         return Ok((undo, done));
     };
     Ok((undo, check))
@@ -1796,8 +1910,8 @@ fn connect_block_inner(
     // parallel after — Core's `scriptcheckqueue` shape. A tx's check
     // only needs its resolved prevouts, so it carries no dependence
     // on the UTXO mutations happening around it.
-    let mut script_jobs: Vec<(&Transaction, Vec<TxOut>)> = Vec::new();
-    let mut owned_jobs: Vec<(Transaction, Vec<TxOut>)> = Vec::new();
+    let mut script_jobs: Vec<(&Transaction, Vec<TxOut>, Option<Vec<u8>>)> = Vec::new();
+    let mut owned_jobs: Vec<std::sync::Arc<JobData>> = Vec::new();
 
     // Receipt accumulation (queue #5): the delta stream commits, per
     // transaction in block order — txid, spend count, each spent
@@ -1853,10 +1967,20 @@ fn connect_block_inner(
             {
                 let spent_outs: Vec<TxOut> = spent.iter().map(|c| c.out.clone()).collect();
                 scripts_queued += 1;
+                let advice = ctx
+                    .advice
+                    .and_then(|m| m.get(&tx.txid()))
+                    .cloned();
                 if ctx.script_pool.is_some() {
-                    owned_jobs.push((tx.clone(), spent_outs));
+                    owned_jobs.push(std::sync::Arc::new(JobData {
+                        tx: tx.clone(),
+                        outs: spent_outs,
+                        flags,
+                        idx: 0, // set after the loop — see below
+                        advice,
+                    }));
                 } else {
-                    script_jobs.push((tx, spent_outs));
+                    script_jobs.push((tx, spent_outs, advice));
                 }
             }
             // Apply (Core's UpdateCoins): spend inputs, then add outputs.
@@ -1928,12 +2052,16 @@ fn connect_block_inner(
         // own tx + prevouts.
         let t_script = std::time::Instant::now();
         if let Some(pool) = ctx.script_pool {
-            let check = std::sync::Arc::new(BlockCheck::new(owned_jobs.len()));
-            for (tx, outs) in owned_jobs {
+            let mut jobs = owned_jobs;
+            for (i, j) in jobs.iter_mut().enumerate() {
+                if let Some(d) = std::sync::Arc::get_mut(j) {
+                    d.idx = i as u32;
+                }
+            }
+            let check = std::sync::Arc::new(BlockCheck::new(jobs.clone()));
+            for job in jobs {
                 pool.submit(ScriptJob {
-                    tx,
-                    outs,
-                    flags,
+                    job,
                     check: check.clone(),
                 });
             }
@@ -1941,7 +2069,12 @@ fn connect_block_inner(
             return Ok(Some(check));
         }
         if !script_jobs.is_empty() {
-            run_script_checks(&script_jobs, flags).map_err(ConnectError::ScriptVerify)?;
+            if ctx.advice.is_some() {
+                run_script_checks_advised(&script_jobs, flags)
+                    .map_err(ConnectError::ScriptVerify)?;
+            } else {
+                run_script_checks(&script_jobs, flags).map_err(ConnectError::ScriptVerify)?;
+            }
         }
         tick(4, t_script);
         Ok(None)
@@ -1992,8 +2125,53 @@ fn connect_block_inner(
 /// work over `available_parallelism` scoped threads — the role of
 /// Core's `scriptcheckqueue` workers. A single-thread fallback keeps
 /// tiny blocks (and machines reporting one core) off the spawn path.
+/// `run_script_checks` with a block-scoped sig batch: each job carries
+/// its advice stream; deferred records collect in one sink, resolve
+/// once after all evals, and only the dirty jobs re-run the ordinary
+/// path. Consensus-exact — advice failure costs time, never verdict.
+fn run_script_checks_advised(
+    jobs: &[(&Transaction, Vec<TxOut>, Option<Vec<u8>>)],
+    flags: crate::script::ScriptFlags,
+) -> Result<(), crate::interpreter::ScriptError> {
+    let sink = std::cell::RefCell::new(crate::sigchecker::DeferredSink::default());
+    let stat = std::cell::Cell::new((0u64, 0u64));
+    let mut eval_errored: Vec<u32> = Vec::new();
+    for (i, (tx, outs, advice)) in jobs.iter().enumerate() {
+        let entries: &[u8] = advice.as_deref().unwrap_or(&[]);
+        if crate::sigchecker::check_input_scripts_advised(
+            tx,
+            outs,
+            flags,
+            entries,
+            &sink,
+            i as u32,
+            &stat,
+        )
+        .is_err()
+        {
+            eval_errored.push(i as u32);
+        }
+    }
+    let mut recheck = match crate::sigchecker::resolve_sink(&sink.borrow()) {
+        Ok(()) => Vec::new(),
+        Err(dirty) => dirty,
+    };
+    for tag in eval_errored {
+        if !recheck.contains(&tag) {
+            recheck.push(tag);
+        }
+    }
+    for tag in recheck {
+        let (tx, outs, _) = &jobs[tag as usize];
+        if let Err(err) = check_input_scripts(tx, outs, flags) {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 fn run_script_checks(
-    jobs: &[(&Transaction, Vec<TxOut>)],
+    jobs: &[(&Transaction, Vec<TxOut>, Option<Vec<u8>>)],
     flags: crate::script::ScriptFlags,
 ) -> Result<(), crate::interpreter::ScriptError> {
     let workers = std::thread::available_parallelism()
@@ -2001,7 +2179,7 @@ fn run_script_checks(
         .unwrap_or(1)
         .min(jobs.len());
     if workers <= 1 {
-        for (tx, outs) in jobs {
+        for (tx, outs, _) in jobs {
             check_input_scripts(tx, outs, flags)?;
         }
         return Ok(());
@@ -2013,7 +2191,7 @@ fn run_script_checks(
         let mut handles = Vec::with_capacity(workers);
         for part in jobs.chunks(chunk) {
             handles.push(s.spawn(move || {
-                for (tx, outs) in part {
+                for (tx, outs, _) in part {
                     check_input_scripts(tx, outs, flags)?;
                 }
                 Ok::<_, crate::interpreter::ScriptError>(())
@@ -2244,7 +2422,8 @@ mod tests {
                 block_hash: block.block_hash(),
                 script_checks: true,
                 script_pool: None,
-            };
+            advice: None,
+        };
             connect_block(&block, &mut self.utxo, &ctx)?;
             self.tip = block.block_hash();
             self.tip_header = block.header;
@@ -2286,11 +2465,16 @@ mod tests {
             let pool = ScriptPool::new(4);
             let tx = coinbase(1, SUBSIDY);
             for _ in 0..20_000 {
-                let check = std::sync::Arc::new(BlockCheck::new(1));
-                pool.submit(ScriptJob {
+                let job = std::sync::Arc::new(JobData {
                     tx: tx.clone(),
                     outs: Vec::new(),
                     flags: ScriptFlags::NONE,
+                    idx: 0,
+                    advice: None,
+                });
+                let check = std::sync::Arc::new(BlockCheck::new(vec![job.clone()]));
+                pool.submit(ScriptJob {
+                    job,
                     check: check.clone(),
                 });
                 check.wait().unwrap();
@@ -2799,6 +2983,7 @@ mod tests {
             block_hash: block.block_hash(),
             script_checks: true,
             script_pool: None,
+                advice: None,
         };
         // Re-run connect on a clone to capture the undo (extend already applied
         // it); disconnect must restore `before` exactly.
@@ -2841,6 +3026,7 @@ mod tests {
             block_hash: block.block_hash(),
             script_checks: true,
             script_pool: None,
+                advice: None,
         };
         assert_eq!(
             connect_block(&block, &mut chain.utxo, &ctx).unwrap_err(),
@@ -2950,6 +3136,7 @@ mod tests {
             block_hash: block.block_hash(),
             script_checks: true,
             script_pool: None,
+                advice: None,
         };
         let base = chain.utxo.clone();
         let undo = connect_block(&block, &mut chain.utxo, &ctx).unwrap();
