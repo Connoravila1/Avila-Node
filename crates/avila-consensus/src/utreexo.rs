@@ -745,7 +745,7 @@ mod tests {
                 script_checks: true,
                 script_pool: None,
                 advice: None,
-                advice_collect: false,
+                advice_collect: None,
             };
             let (spends, proof) = bridge.bundle(&block);
             connect_block_proven(&block, &mut acc, &spends, &proof, &ctx).unwrap();
@@ -786,7 +786,7 @@ mod tests {
             script_checks: true,
             script_pool: None,
                 advice: None,
-                advice_collect: false,
+                advice_collect: None,
         };
         let (spends, proof) = bridge.bundle(&block);
         assert_eq!(spends.len(), 2);
@@ -876,7 +876,7 @@ mod tests {
                 script_checks: true,
                 script_pool: None,
                 advice: None,
-                advice_collect: false,
+                advice_collect: None,
             };
             connect_block_proven(&block, &mut acc, &[], &Proof::default(), &ctx).unwrap();
             tip_header = block.header;
@@ -910,7 +910,7 @@ mod tests {
             script_checks: true,
             script_pool: None,
                 advice: None,
-                advice_collect: false,
+                advice_collect: None,
         };
         match connect_block_proven(&block, &mut acc, &[], &Proof::default(), &ctx) {
             Err(ProvenConnectError::MissingSpend(o)) => assert_eq!(o, fake),

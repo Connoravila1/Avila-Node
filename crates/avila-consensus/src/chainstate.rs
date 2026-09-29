@@ -2924,7 +2924,7 @@ impl Chainstate {
                     script_checks: self.script_checks(&hash, &params),
                     script_pool: None,
                     advice: None,
-                    advice_collect: false,
+                    advice_collect: None,
                 };
                 if connect::connect_block(&block, utxo, &cctx).is_err() {
                     return false;
@@ -3083,7 +3083,7 @@ impl Chainstate {
                 script_checks: self.script_checks(&hash, self.tree.params()),
                 script_pool: None,
                 advice: None,
-                advice_collect: false,
+                advice_collect: None,
             };
             let Some(acc) = self.utreexo_acc.as_mut() else {
                 break;
@@ -3291,6 +3291,9 @@ impl Chainstate {
                 .advice_dir
                 .as_ref()
                 .and_then(|d| crate::advice::read_advice_file(d, &hash));
+            let collect_map: std::sync::Arc<
+                std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>,
+            > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
             let ctx = ConnectContext {
                 params: &params,
                 tree: &self.tree,
@@ -3298,10 +3301,27 @@ impl Chainstate {
                 script_checks: self.script_checks(&hash, &params),
                 script_pool: self.script_pool.as_deref(),
                 advice: advice_map.as_ref(),
-                advice_collect: self.advice_collect,
+                advice_collect: self
+                    .advice_collect
+                    .then(|| &collect_map),
             };
             match connect::connect_block_full(block, &mut self.utxo, &ctx) {
                 Ok((undo, check, receipt)) => {
+                    // Sync path (no pool): script checks already ran —
+                    // the collect map is final and writes the sidecar
+                    // now. The pool path defers this to the pending
+                    // drain (workers may still be capturing).
+                    if check.is_none()
+                        && self.advice_collect
+                        && let Some(dir) = &self.advice_dir
+                    {
+                        let map = std::mem::take(
+                            &mut *collect_map.lock().unwrap_or_else(|e| e.into_inner()),
+                        );
+                        if !map.is_empty() {
+                            let _ = crate::advice::write_advice_file(dir, &hash, &map);
+                        }
+                    }
                     if let Some(index) = &mut self.filterindex {
                         index.append(height, block, &undo);
                     }
@@ -3765,7 +3785,7 @@ impl Chainstate {
                 script_checks: checks,
                 script_pool: None,
                 advice: None,
-                advice_collect: false,
+                advice_collect: None,
             };
             match connect::connect_block_full(&block, sim, &ctx) {
                 Ok((undo, check, receipt)) => {
@@ -3989,10 +4009,22 @@ impl Chainstate {
                 let Some((h, check)) = bg.pending.pop_front() else {
                     break;
                 };
-                if let Err(e) = check.wait() {
-                    failed = Some(ConnectError::ScriptVerify(e));
-                    let _ = h;
-                    break;
+                match check.wait() {
+                    Ok(()) if self.advice_collect => {
+                        if let Some(dir) = &self.advice_dir {
+                            let m = check.take_advice_map();
+                            if !m.is_empty() {
+                                let bh = self.chain[h as usize];
+                                let _ = crate::advice::write_advice_file(dir, &bh, &m);
+                            }
+                        }
+                    }
+                    Ok(()) => {}
+                    Err(e) => {
+                        failed = Some(ConnectError::ScriptVerify(e));
+                        let _ = h;
+                        break;
+                    }
                 }
             }
             if failed.is_some() {
@@ -4008,6 +4040,9 @@ impl Chainstate {
                 .advice_dir
                 .as_ref()
                 .and_then(|d| crate::advice::read_advice_file(d, &hash));
+            let collect_map: std::sync::Arc<
+                std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>,
+            > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
             let ctx = ConnectContext {
                 params: &params,
                 tree: &self.tree,
@@ -4015,7 +4050,9 @@ impl Chainstate {
                 script_checks: self.script_checks(&hash, &params),
                 script_pool: pool.as_deref(),
                 advice: advice_map.as_ref(),
-                advice_collect: self.advice_collect,
+                advice_collect: self
+                    .advice_collect
+                    .then(|| &collect_map),
             };
             match connect::connect_block_full(&block, &mut bg.utxo, &ctx) {
                 Ok((_undo, check, receipt)) => {
@@ -4050,7 +4087,15 @@ impl Chainstate {
                 self.background = Some(bg);
                 return Err(ConnectError::ScriptVerify(e));
             }
-            let _ = h;
+            if self.advice_collect
+                && let Some(dir) = &self.advice_dir
+            {
+                let m = check.take_advice_map();
+                if !m.is_empty() {
+                    let bh = self.chain[h as usize];
+                    let _ = crate::advice::write_advice_file(dir, &bh, &m);
+                }
+            }
         }
         // Replay reached the base — recompute the content hash exactly
         // as `activate_snapshot` verified the file's.
@@ -7126,7 +7171,7 @@ mod tests {
                 script_checks: true,
                 script_pool: None,
                 advice: None,
-                advice_collect: false,
+                advice_collect: None,
             };
             crate::utreexo::connect_block_proven(block, &mut acc, &spends, &proof, &ctx)
                 .unwrap_or_else(|e| panic!("proven connect h{}: {e}", i + 1));

@@ -150,6 +150,9 @@ impl Harness {
         self.tree
             .insert(&block.header, u32::MAX / 2)
             .map_err(|_| ConnectError::Internal("header insert"))?;
+        let collect_map: std::sync::Arc<
+            std::sync::Mutex<HashMap<Txid, Vec<u8>>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
         let ctx = ConnectContext {
             params: &self.params,
             tree: &self.tree,
@@ -157,7 +160,7 @@ impl Harness {
             script_checks: true,
             script_pool: Some(&self.pool),
             advice,
-            advice_collect: collect,
+            advice_collect: collect.then(|| &collect_map),
         };
         let (_undo, check, _r) = connect_block_full(block, &mut self.utxo, &ctx)?;
         self.tip = block.block_hash();

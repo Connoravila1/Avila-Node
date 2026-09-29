@@ -1017,10 +1017,14 @@ pub struct ConnectContext<'a> {
     /// batch failure re-verifies per-signature and re-runs the affected
     /// transactions — advice is never trusted.
     pub advice: Option<&'a std::collections::HashMap<Txid, Vec<u8>>>,
-    /// When true, script checking also emits the per-tx advice stream
-    /// (the producer half of the paired-node flow). Capture is a
-    /// byproduct of ordinary verification — it never defers.
-    pub advice_collect: bool,
+    /// When set, script checking also emits the per-tx advice stream
+    /// (the producer half of the paired-node flow) into this map
+    /// (`txid -> entries`). Capture is a byproduct of ordinary
+    /// verification — it never defers. Works on both the pool and the
+    /// synchronous paths; the caller drains the map after the check.
+    pub advice_collect:
+        Option<&'a std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>>>,
+
 }
 
 /// A machine-checkable record of one block's connect — the
@@ -1532,9 +1536,9 @@ struct JobData {
     idx: u32,
     /// This tx's advice stream, if the caller supplied one.
     advice: Option<Vec<u8>>,
-    /// Produce advice while verifying (writes to the check's
-    /// `collect_map` under this tx's txid).
-    collect: bool,
+    /// Produce advice while verifying into this sink (`txid ->
+    /// entries`) — shared with `ConnectContext::advice_collect`.
+    collect: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>>>,
 }
 
 /// A block's outstanding script checks: workers decrement
@@ -1552,10 +1556,11 @@ pub struct BlockCheck {
     eval_errored: std::sync::Mutex<Vec<u32>>,
     /// Retained jobs for the fallback re-run (empty when no advice).
     jobs: Vec<std::sync::Arc<JobData>>,
-    /// Produced advice streams — populated while jobs run when
-    /// `ConnectContext::advice_collect` was set; drained via
-    /// [`Self::take_advice_map`] after `wait`.
-    collect_map: std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>,
+    /// Handle to the caller's per-block collect map — set when
+    /// `ConnectContext::advice_collect` is in play; drained after
+    /// `wait` via [`Self::take_advice_map`].
+    collect_sink:
+        Option<std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>>>,
     /// Deferred/inline check counts for status reporting.
     pub advised_checks: std::sync::atomic::AtomicU64,
     /// Unadvised checks that verified inline.
@@ -1573,7 +1578,7 @@ impl BlockCheck {
             sink: std::sync::Mutex::new(crate::sigchecker::DeferredSink::default()),
             eval_errored: std::sync::Mutex::new(Vec::new()),
             jobs,
-            collect_map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            collect_sink: None,
             advised_checks: std::sync::atomic::AtomicU64::new(0),
             inline_checks: std::sync::atomic::AtomicU64::new(0),
         }
@@ -1591,7 +1596,7 @@ impl BlockCheck {
             sink: std::sync::Mutex::new(crate::sigchecker::DeferredSink::default()),
             eval_errored: std::sync::Mutex::new(Vec::new()),
             jobs: Vec::new(),
-            collect_map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            collect_sink: None,
             advised_checks: std::sync::atomic::AtomicU64::new(0),
             inline_checks: std::sync::atomic::AtomicU64::new(0),
         }
@@ -1617,7 +1622,10 @@ impl BlockCheck {
     /// Drain the produced advice streams — `txid → entries`. Called by
     /// the node layer after `wait` to persist the block's sidecar.
     pub fn take_advice_map(&self) -> std::collections::HashMap<Txid, Vec<u8>> {
-        std::mem::take(&mut *self.collect_map.lock().unwrap_or_else(|e| e.into_inner()))
+        match &self.collect_sink {
+            Some(m) => std::mem::take(&mut *m.lock().unwrap_or_else(|e| e.into_inner())),
+            None => std::collections::HashMap::new(),
+        }
     }
 }
 
@@ -1734,7 +1742,7 @@ impl ScriptPool {
                 unreachable!()
             };
             let (job, bc) = (job.clone(), bc.clone());
-            let result = if job.collect {
+            let result = if let Some(sink_map) = &job.collect {
                 let out = std::cell::RefCell::new(Vec::new());
                 let r = crate::sigchecker::check_input_scripts_capture(
                     &job.tx,
@@ -1742,7 +1750,7 @@ impl ScriptPool {
                     job.flags,
                     &out,
                 );
-                bc.collect_map
+                sink_map
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(job.tx.txid(), out.into_inner());
@@ -1978,7 +1986,10 @@ fn connect_block_inner(
     // parallel after — Core's `scriptcheckqueue` shape. A tx's check
     // only needs its resolved prevouts, so it carries no dependence
     // on the UTXO mutations happening around it.
-    let mut script_jobs: Vec<(&Transaction, Vec<TxOut>, Option<Vec<u8>>)> = Vec::new();
+    // `(tx, spent outs, advice, collect sink)` — the pool path lifts
+    // these into `JobData`; the sync path runs them directly.
+    let mut script_jobs: Vec<(&Transaction, Vec<TxOut>, Option<Vec<u8>>, Option<CollectSink>)> =
+        Vec::new();
     let mut owned_jobs: Vec<std::sync::Arc<JobData>> = Vec::new();
 
     // Receipt accumulation (queue #5): the delta stream commits, per
@@ -2046,10 +2057,10 @@ fn connect_block_inner(
                         flags,
                         idx: 0, // set after the loop — see below
                         advice,
-                        collect: ctx.advice_collect,
+                        collect: ctx.advice_collect.cloned(),
                     }));
                 } else {
-                    script_jobs.push((tx, spent_outs, advice));
+                    script_jobs.push((tx, spent_outs, advice, ctx.advice_collect.cloned()));
                 }
             }
             // Apply (Core's UpdateCoins): spend inputs, then add outputs.
@@ -2128,7 +2139,11 @@ fn connect_block_inner(
                 }
             }
             let has_advice = ctx.advice.is_some();
-            let check = std::sync::Arc::new(BlockCheck::new(jobs.clone()));
+            let check = std::sync::Arc::new({
+                let mut c = BlockCheck::new(jobs.clone());
+                c.collect_sink = ctx.advice_collect.cloned();
+                c
+            });
             if has_advice {
                 // The barrier resolves the sink once every tx job has
                 // pushed its records — count it so `wait` holds until
@@ -2208,14 +2223,32 @@ fn connect_block_inner(
 /// its advice stream; deferred records collect in one sink, resolve
 /// once after all evals, and only the dirty jobs re-run the ordinary
 /// path. Consensus-exact — advice failure costs time, never verdict.
+/// The produce-mode sink: `txid -> entry stream`, one map per block.
+type CollectSink =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>>;
+
 fn run_script_checks_advised(
-    jobs: &[(&Transaction, Vec<TxOut>, Option<Vec<u8>>)],
+    jobs: &[(&Transaction, Vec<TxOut>, Option<Vec<u8>>, Option<CollectSink>)],
     flags: crate::script::ScriptFlags,
 ) -> Result<(), crate::interpreter::ScriptError> {
     let sink = std::cell::RefCell::new(crate::sigchecker::DeferredSink::default());
     let stat = std::cell::Cell::new((0u64, 0u64));
     let mut eval_errored: Vec<u32> = Vec::new();
-    for (i, (tx, outs, advice)) in jobs.iter().enumerate() {
+    for (i, (tx, outs, advice, collect)) in jobs.iter().enumerate() {
+        if let Some(map) = collect {
+            // Produce-and-consume in one pass: capture runs a real
+            // verify, so the tx's own advice is irrelevant here — the
+            // produced stream is for downstream peers.
+            let out = std::cell::RefCell::new(Vec::new());
+            let r = crate::sigchecker::check_input_scripts_capture(tx, outs, flags, &out);
+            map.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(tx.txid(), out.into_inner());
+            if r.is_err() {
+                eval_errored.push(i as u32);
+            }
+            continue;
+        }
         let entries: &[u8] = advice.as_deref().unwrap_or(&[]);
         if crate::sigchecker::check_input_scripts_advised(
             tx,
@@ -2241,7 +2274,7 @@ fn run_script_checks_advised(
         }
     }
     for tag in recheck {
-        let (tx, outs, _) = &jobs[tag as usize];
+        let (tx, outs, _, _) = &jobs[tag as usize];
         if let Err(err) = check_input_scripts(tx, outs, flags) {
             return Err(err);
         }
@@ -2250,16 +2283,33 @@ fn run_script_checks_advised(
 }
 
 fn run_script_checks(
-    jobs: &[(&Transaction, Vec<TxOut>, Option<Vec<u8>>)],
+    jobs: &[(&Transaction, Vec<TxOut>, Option<Vec<u8>>, Option<CollectSink>)],
     flags: crate::script::ScriptFlags,
 ) -> Result<(), crate::interpreter::ScriptError> {
     let workers = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1)
         .min(jobs.len());
+    let run_one = |(tx, outs, _, collect): &(
+        &Transaction,
+        Vec<TxOut>,
+        Option<Vec<u8>>,
+        Option<CollectSink>,
+    )|
+     -> Result<(), crate::interpreter::ScriptError> {
+        if let Some(map) = collect {
+            let out = std::cell::RefCell::new(Vec::new());
+            let r = crate::sigchecker::check_input_scripts_capture(tx, outs, flags, &out);
+            map.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(tx.txid(), out.into_inner());
+            return r;
+        }
+        check_input_scripts(tx, outs, flags)
+    };
     if workers <= 1 {
-        for (tx, outs, _) in jobs {
-            check_input_scripts(tx, outs, flags)?;
+        for job in jobs {
+            run_one(job)?;
         }
         return Ok(());
     }
@@ -2270,8 +2320,8 @@ fn run_script_checks(
         let mut handles = Vec::with_capacity(workers);
         for part in jobs.chunks(chunk) {
             handles.push(s.spawn(move || {
-                for (tx, outs, _) in part {
-                    check_input_scripts(tx, outs, flags)?;
+                for job in part {
+                    run_one(job)?;
                 }
                 Ok::<_, crate::interpreter::ScriptError>(())
             }));
@@ -2502,7 +2552,7 @@ mod tests {
                 script_checks: true,
                 script_pool: None,
             advice: None,
-            advice_collect: false,
+            advice_collect: None,
         };
             connect_block(&block, &mut self.utxo, &ctx)?;
             self.tip = block.block_hash();
@@ -2551,7 +2601,7 @@ mod tests {
                     flags: ScriptFlags::NONE,
                     idx: 0,
                     advice: None,
-                    collect: false,
+                    collect: None,
                 });
                 let check = std::sync::Arc::new(BlockCheck::new(vec![job.clone()]));
                 pool.submit(ScriptJob::Tx {
@@ -2650,6 +2700,9 @@ mod tests {
             &chain.params,
         );
         chain.tree.insert(&block.header, chain.now).unwrap();
+        let collect_map = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        ));
         let ctx = ConnectContext {
             params: &chain.params,
             tree: &chain.tree,
@@ -2657,7 +2710,7 @@ mod tests {
             script_checks: true,
             script_pool: Some(&pool),
             advice: None,
-            advice_collect: true,
+            advice_collect: Some(&collect_map),
         };
         let (_undo, check, _receipt) =
             connect_block_full(&block, &mut chain.utxo, &ctx).unwrap();
@@ -2690,7 +2743,7 @@ mod tests {
             script_checks: true,
             script_pool: Some(&pool2),
             advice: Some(&map),
-            advice_collect: false,
+            advice_collect: None,
         };
         let (undo2, check2, _r) =
             connect_block_full(&block2, &mut chain2.utxo, &ctx2).unwrap();
@@ -2725,7 +2778,7 @@ mod tests {
             script_checks: true,
             script_pool: Some(&pool3),
             advice: Some(&tampered),
-            advice_collect: false,
+            advice_collect: None,
         };
         let (undo3, check3, _r) =
             connect_block_full(&block3, &mut chain3.utxo, &ctx3).unwrap();
@@ -3229,7 +3282,7 @@ mod tests {
             script_checks: true,
             script_pool: None,
                 advice: None,
-                advice_collect: false,
+                advice_collect: None,
         };
         // Re-run connect on a clone to capture the undo (extend already applied
         // it); disconnect must restore `before` exactly.
@@ -3273,7 +3326,7 @@ mod tests {
             script_checks: true,
             script_pool: None,
                 advice: None,
-                advice_collect: false,
+                advice_collect: None,
         };
         assert_eq!(
             connect_block(&block, &mut chain.utxo, &ctx).unwrap_err(),
@@ -3384,7 +3437,7 @@ mod tests {
             script_checks: true,
             script_pool: None,
                 advice: None,
-                advice_collect: false,
+                advice_collect: None,
         };
         let base = chain.utxo.clone();
         let undo = connect_block(&block, &mut chain.utxo, &ctx).unwrap();
