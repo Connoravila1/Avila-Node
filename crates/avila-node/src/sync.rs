@@ -2644,7 +2644,7 @@ fn apply_knob<S: std::io::Read + std::io::Write>(
                 "relay.block.compact_high_bandwidth" => knobs.relay_block.1 = want_bool(value)?,
                 "relay.block.compact_serve" => knobs.relay_block.2 = want_bool(value)?,
                 _ => {
-                    let s = want_enum(value, &["auto", "headers", "inv", "none"])?;
+                    let s = want_enum(value, &["", "auto", "headers", "inv", "none"])?;
                     knobs.relay_block.3 = if s == "auto" { String::new() } else { s };
                 }
             }
@@ -2691,14 +2691,18 @@ fn apply_knob<S: std::io::Read + std::io::Write>(
             value.clone()
         }
         "mining.max_weight" => {
-            let w = want_u64(value)? as usize;
+            let w = if value.is_null() {
+                avila_consensus::block::MAX_BLOCK_WEIGHT
+            } else {
+                want_u64(value)? as usize
+            };
             if w > avila_consensus::block::MAX_BLOCK_WEIGHT {
                 return Err(format!(
                     "max {MAX_BLOCK_WEIGHT} — blocks beyond consensus weight are invalid",
                     MAX_BLOCK_WEIGHT = avila_consensus::block::MAX_BLOCK_WEIGHT
                 ));
             }
-            knobs.mining.0 = Some(w);
+            knobs.mining.0 = (!value.is_null()).then_some(w);
             mgr.mempool().set_block_max_weight(w);
             value.clone()
         }
@@ -2709,8 +2713,12 @@ fn apply_knob<S: std::io::Read + std::io::Write>(
             value.clone()
         }
         "mining.reserved_weight" => {
-            let w = want_u64(value)? as usize;
-            knobs.mining.2 = Some(w);
+            let w = if value.is_null() {
+                avila_mempool::template::DEFAULT_BLOCK_RESERVED_WEIGHT
+            } else {
+                want_u64(value)? as usize
+            };
+            knobs.mining.2 = (!value.is_null()).then_some(w);
             mgr.mempool().set_block_reserved_weight(w);
             value.clone()
         }
@@ -2767,6 +2775,9 @@ mod tests {
         assert_eq!(knobs.relay_block.3, "headers");
         // "auto" normalizes to the empty string = negotiated default.
         apply_knob(&mut mgr, &mut knobs, "relay.block.announce", &json!("auto")).unwrap();
+        assert_eq!(knobs.relay_block.3, "");
+        // The resolved config represents auto as an empty string.
+        apply_knob(&mut mgr, &mut knobs, "relay.block.announce", &json!("")).unwrap();
         assert_eq!(knobs.relay_block.3, "");
     }
 

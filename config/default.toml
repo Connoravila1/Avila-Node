@@ -11,6 +11,8 @@ data_dir = "../data"
 #
 # A sibling file "<name>.runtime.toml" is merged over this one at load —
 # that's where GUI edits land, so this file is never rewritten by the app.
+# The GUI may write `_unset = ["privacy.proxy"]` in that overlay to
+# explicitly disable an optional value supplied by this base file.
 
 [diag]
 event_capacity = 256

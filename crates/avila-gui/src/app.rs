@@ -51,6 +51,8 @@ pub struct App {
     config_dirty: Option<Vec<String>>,
     /// The file-watch's last stat — polling every frame is rude.
     config_checked: std::time::Instant,
+    /// An overlay write failed; shown beside the Settings controls.
+    settings_error: Option<String>,
     /// The toybox's shelf: every game, the hash-fed toys, the confetti.
     toys: toybox::Toys,
     /// The toy a capture posed, so it isn't re-posed every frame.
@@ -143,31 +145,21 @@ impl App {
             }
         }
         let network = node.config().get().network;
-        let mut run = RunSettings::new(network);
-        // The proxy choice persists — privacy stays binding across
-        // restarts instead of silently reverting to direct dials.
-        run.proxy = prefs.proxy.clone();
-        // The config file's storage.prune_mb (Core's -prune in
-        // bitcoin.conf) seeds the settings field — an IBD on a small
-        // disk must be pruned from block one, not after the settings
-        // page opens.
-        if let Some(mb) = node.config().get().storage.prune_mb {
-            run.prune_mib = mb.to_string();
-        }
-        // `net.connect` in the config seeds the same field — running
-        // the GUI against a file should connect to its peers, not the
-        // hardcoded regtest default.
-        let connect = node
-            .config()
-            .get()
-            .net
-            .connect
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        if !connect.is_empty() {
-            run.connect = connect;
+        let mut run = RunSettings::from_config(node.config().get());
+        let mut settings_error = None;
+        // Preserve the old appearance-file proxy when moving to the
+        // canonical overlay. Never silently turn a private run direct.
+        if run.proxy.is_empty() && !prefs.proxy.is_empty() {
+            run.proxy = prefs.proxy.clone();
+            if let Some(file) = &config_file {
+                if let Err(e) = avila_node::config::write_overlay_knob(
+                    file,
+                    "privacy.proxy",
+                    Some(toml::Value::String(run.proxy.clone())),
+                ) {
+                    settings_error = Some(format!("Proxy could not be saved: {e}"));
+                }
+            }
         }
         let applied = prefs.clone();
         let mut session = Session::new(demo);
@@ -249,6 +241,7 @@ impl App {
             ),
             config_dirty: None,
             config_checked: std::time::Instant::now(),
+            settings_error,
             config_file,
         };
         // The compositor may never send a frame callback while the
@@ -275,6 +268,36 @@ impl App {
     }
 
     fn start(&mut self) {
+        if self.settings_error.is_some()
+            && let Some(file) = &self.config_file
+            && let Ok(saved) = avila_node::config::load_config(Some(file))
+        {
+            // The file may have been repaired since a failed edit.
+            let before = RunSettings::from_config(saved.get());
+            if self.run.config_changes(&before).is_empty() {
+                self.settings_error = None;
+            } else {
+                self.persist_run_changes(&before);
+            }
+        }
+        if let Some(e) = &self.settings_error {
+            self.session.log(
+                ActivityKind::Node,
+                format!("Not starting: {e}"),
+                None,
+                self.session.now(),
+            );
+            return;
+        }
+        if let Some(problem) = self.run.problems().first() {
+            self.session.log(
+                ActivityKind::Node,
+                format!("Not starting: {problem}"),
+                None,
+                self.session.now(),
+            );
+            return;
+        }
         // Re-read the file so edits made between runs actually land —
         // the Config page's "restart to apply" banner depends on it.
         if let Some(file) = &self.config_file {
@@ -282,14 +305,16 @@ impl App {
                 Ok(v) => {
                     self.node.replace_config(v);
                     self.config_dirty = None;
+                    self.run.sync_from_config(self.node.config().get());
                 }
-                Err(_) => {
+                Err(e) => {
                     self.session.log(
                         ActivityKind::Node,
-                        "The config file doesn't parse — keeping the loaded configuration.".into(),
+                        format!("Not starting: configuration could not be loaded: {e}"),
                         None,
                         self.session.now(),
                     );
+                    return;
                 }
             }
         }
@@ -300,6 +325,51 @@ impl App {
             &self.run,
             self.node.config().get(),
         );
+    }
+
+    fn persist_run_changes(&mut self, before: &RunSettings) {
+        let Some(file) = &self.config_file else {
+            return;
+        };
+        if self.run.config_changes(before).is_empty() {
+            return;
+        }
+        if !self.run.problems().is_empty() {
+            // Text fields are edited a character at a time. Keep a
+            // partial draft until the whole candidate is valid.
+            self.settings_error = None;
+            return;
+        }
+        let saved = match avila_node::config::load_config(Some(file)) {
+            Ok(saved) => saved,
+            Err(e) => {
+                self.settings_error = Some(format!("Settings could not be loaded: {e}"));
+                return;
+            }
+        };
+        let edits = self.run.config_changes(&RunSettings::from_config(saved.get()));
+        if edits.is_empty() {
+            self.settings_error = None;
+            return;
+        }
+        let edits: Vec<_> = edits
+            .into_iter()
+            .map(|(path, value)| {
+                (
+                    path,
+                    match value {
+                        Some(v) => avila_node::config::OverlayEdit::Set(v),
+                        None => avila_node::config::OverlayEdit::Unset,
+                    },
+                )
+            })
+            .collect();
+        match avila_node::config::write_overlay_edits(file, &edits) {
+            Ok(()) => self.settings_error = None,
+            Err(e) => {
+                self.settings_error = Some(format!("Settings were not saved: {e}"));
+            }
+        }
     }
 
     /// Watch the config file and its runtime overlay; when either
@@ -341,6 +411,9 @@ impl App {
                     .map(|k| k.path.to_string())
                     .collect();
                 self.config_dirty = (!diffs.is_empty()).then_some(diffs);
+                if self.settings_error.is_none() && self.run.problems().is_empty() {
+                    self.run.sync_from_config(v.get());
+                }
             }
             Err(_) => self.config_dirty = Some(vec![]),
         }
@@ -414,6 +487,7 @@ impl App {
                         &mut self.prefs,
                         &self.node,
                         open_advanced,
+                        self.settings_error.as_deref(),
                     ),
                 }
             };
@@ -778,6 +852,7 @@ impl eframe::App for App {
         let phase = self.session.phase();
         let network = self.shown_network();
         let mut action = None;
+        let previous_run = self.run.clone();
 
         if Skin::current() == Skin::Xp {
             let chrome = self.xp_chrome(&ctx, phase);
@@ -956,6 +1031,7 @@ impl eframe::App for App {
         if Skin::current() == Skin::Classic {
             classic::resize_frame(ui);
         }
+        self.persist_run_changes(&previous_run);
         match action {
             Some(Action::Start) => {
                 self.prefs.welcomed = true;

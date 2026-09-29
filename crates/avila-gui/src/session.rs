@@ -88,6 +88,135 @@ impl RunSettings {
         }
     }
 
+    /// The GUI's start-shaped fields must begin with the same resolved
+    /// configuration used by the CLI and the Config page.
+    pub fn from_config(config: &avila_core::NodeConfig) -> Self {
+        let mut run = Self::new(config.network);
+        run.sync_from_config(config);
+        run
+    }
+
+    /// Refresh config-backed controls after loading the main file and
+    /// its runtime overlay. Session-only controls remain untouched.
+    pub fn sync_from_config(&mut self, c: &avila_core::NodeConfig) {
+        self.connect = if c.net.connect.is_empty() && c.network == avila_core::Network::Regtest {
+            "127.0.0.1:18444".into()
+        } else {
+            c.net
+                .connect
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        self.proxy = c.privacy.proxy.map_or_else(String::new, |v| v.to_string());
+        self.prune_mib = c.storage.prune_mb.map_or_else(String::new, |v| v.to_string());
+        self.listen = c.net.listen.is_some();
+        self.listen_port = c.net.listen.map_or_else(
+            || params(c.network).default_port.to_string(),
+            |v| v.port().to_string(),
+        );
+        self.dbcache_mib = c.storage.dbcache_mb.map_or_else(String::new, |v| v.to_string());
+        self.maxmempool_mb = c.mempool.max_mb.to_string();
+        self.txindex = c.indexes.txindex;
+        self.blockfilterindex = c.filters.build;
+        self.peerblockfilters = c.filters.serve;
+        self.electrum = c
+            .services
+            .electrum
+            .listen
+            .map_or_else(String::new, |v| v.to_string());
+    }
+
+    /// Valid settings-page edits are persisted through the same overlay
+    /// as the full Config page. Incomplete text drafts stay in the UI
+    /// until the operator finishes typing them.
+    pub fn config_changes(&self, before: &Self) -> Vec<(&'static str, Option<toml::Value>)> {
+        let mut edits = Vec::new();
+        if self.connect != before.connect {
+            let parsed: Option<Vec<String>> = self
+                .connect
+                .split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| v.parse::<SocketAddr>().ok().map(|a| a.to_string()))
+                .collect();
+            if let Some(addrs) = parsed {
+                edits.push((
+                    "net.connect",
+                    Some(toml::Value::Array(
+                        addrs.into_iter().map(toml::Value::String).collect(),
+                    )),
+                ));
+            }
+        }
+        if self.proxy != before.proxy {
+            if self.proxy.trim().is_empty() {
+                edits.push(("privacy.proxy", None));
+            } else if let Ok(addr) = self.proxy.trim().parse::<SocketAddr>() {
+                edits.push((
+                    "privacy.proxy",
+                    Some(toml::Value::String(addr.to_string())),
+                ));
+            }
+        }
+        if self.prune_mib != before.prune_mib {
+            if self.prune_mib.trim().is_empty() {
+                edits.push(("storage.prune_mb", None));
+            } else if let Ok(n) = self.prune_mib.trim().parse::<u64>()
+                && let Ok(n) = i64::try_from(n)
+            {
+                edits.push(("storage.prune_mb", Some(toml::Value::Integer(n))));
+            }
+        }
+        if self.listen != before.listen || (self.listen && self.listen_port != before.listen_port) {
+            if !self.listen {
+                edits.push(("net.listen", None));
+            } else if let Some(addr) = self.listen_addr() {
+                edits.push((
+                    "net.listen",
+                    Some(toml::Value::String(addr.to_string())),
+                ));
+            }
+        }
+        for (path, now, old) in [
+            ("storage.dbcache_mb", &self.dbcache_mib, &before.dbcache_mib),
+            ("mempool.max_mb", &self.maxmempool_mb, &before.maxmempool_mb),
+        ] {
+            if now != old {
+                if now.trim().is_empty() && path == "storage.dbcache_mb" {
+                    edits.push((path, None));
+                } else if now.trim().is_empty() && path == "mempool.max_mb" {
+                    edits.push((path, Some(toml::Value::Integer(
+                        avila_core::NodeConfig::default().mempool.max_mb as i64,
+                    ))));
+                } else if let Ok(n) = now.trim().parse::<i64>() {
+                    edits.push((path, Some(toml::Value::Integer(n))));
+                }
+            }
+        }
+        for (path, now, old) in [
+            ("indexes.txindex", self.txindex, before.txindex),
+            ("filters.build", self.blockfilterindex, before.blockfilterindex),
+            ("filters.serve", self.peerblockfilters, before.peerblockfilters),
+        ] {
+            if now != old {
+                edits.push((path, Some(toml::Value::Boolean(now))));
+            }
+        }
+        if self.electrum != before.electrum {
+            if self.electrum.trim().is_empty() {
+                edits.push(("services.electrum.listen", None));
+            } else if let Ok(addr) = self.electrum.trim().parse::<SocketAddr>() {
+                edits.push((
+                    "services.electrum.listen",
+                    Some(toml::Value::String(addr.to_string())),
+                ));
+            }
+        }
+        edits
+    }
+
     /// Where to accept inbound peers, when listening.
     fn listen_addr(&self) -> Option<SocketAddr> {
         let port = self.listen_port.trim().parse::<u16>().ok()?;
@@ -127,8 +256,10 @@ impl RunSettings {
         let prune = self.prune_mib.trim();
         if !prune.is_empty() && prune.parse::<u64>().is_err() {
             out.push("The prune target is a whole number of MiB, like 5000.".into());
+        } else if !prune.is_empty() && prune.parse::<u64>().is_ok_and(|v| v < 550 || v > i64::MAX as u64) {
+            out.push("The prune target must be between 550 and 9223372036854775807 MiB.".into());
         }
-        if self.listen && self.listen_port.trim().parse::<u16>().is_err() {
+        if self.listen && !self.listen_port.trim().parse::<u16>().is_ok_and(|v| v > 0) {
             out.push("The listening port is a number from 1 to 65535.".into());
         }
         for (value, what) in [
@@ -136,7 +267,7 @@ impl RunSettings {
             (&self.maxmempool_mb, "The mempool limit"),
         ] {
             let v = value.trim();
-            if !v.is_empty() && v.parse::<usize>().is_err() {
+            if !v.is_empty() && v.parse::<i64>().is_err() {
                 out.push(format!("{what} is a whole number, like 450."));
             }
         }
@@ -440,6 +571,7 @@ impl Session {
         let (control_tx, control_rx) = channel();
         let cfg = SyncConfig {
             connect: settings.connect_addrs(),
+            max_peers: config.peers.max_connections,
             target_height: settings.stop_after.unwrap_or(u32::MAX),
             timeout: Duration::from_secs(10 * 365 * 86_400),
             proxy: settings.proxy.trim().parse().ok(),
@@ -976,8 +1108,34 @@ fn deny_pairs(pairs: &[String]) -> Vec<(String, String)> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gui_start_fields_follow_the_resolved_config() {
+        let mut c = avila_core::NodeConfig::default();
+        c.network = avila_core::Network::Mainnet;
+        c.net.connect = vec!["127.0.0.1:8333".parse().unwrap()];
+        c.net.listen = Some("0.0.0.0:8333".parse().unwrap());
+        c.privacy.proxy = Some("127.0.0.1:9050".parse().unwrap());
+        c.storage.prune_mb = Some(2048);
+        c.storage.dbcache_mb = Some(512);
+        c.mempool.max_mb = 64;
+        c.indexes.txindex = true;
+        c.filters.build = true;
+        c.filters.serve = true;
+        c.services.electrum.listen = Some("127.0.0.1:50001".parse().unwrap());
+        let run = RunSettings::from_config(&c);
+        assert_eq!(run.connect, "127.0.0.1:8333");
+        assert_eq!(run.proxy, "127.0.0.1:9050");
+        assert_eq!(run.prune_mib, "2048");
+        assert_eq!(run.dbcache_mib, "512");
+        assert_eq!(run.maxmempool_mb, "64");
+        assert!(run.listen && run.txindex && run.blockfilterindex && run.peerblockfilters);
+        assert_eq!(run.electrum, "127.0.0.1:50001");
+        assert!(run.config_changes(&run).is_empty());
+    }
 
     #[test]
     fn settings_report_what_the_next_start_would_ignore() {
@@ -992,6 +1150,25 @@ mod tests {
             RunSettings::new(avila_core::Network::Regtest).connect,
             "127.0.0.1:18444"
         );
+    }
+
+    #[test]
+    fn settings_edits_preserve_optional_values_and_default_mempool_limit() {
+        let mut original = RunSettings::new(avila_core::Network::Mainnet);
+        original.listen = false;
+        original.listen_port = "8333".into();
+        original.maxmempool_mb = "64".into();
+        let mut edited = original.clone();
+        edited.listen_port = "18444".into();
+        edited.maxmempool_mb.clear();
+        assert_eq!(
+            edited.config_changes(&original),
+            vec![("mempool.max_mb", Some(toml::Value::Integer(300)))]
+        );
+        edited.prune_mib = "5".into();
+        assert!(!edited.problems().is_empty());
+        edited.prune_mib = "550".into();
+        assert!(edited.problems().is_empty());
     }
 
     #[test]
