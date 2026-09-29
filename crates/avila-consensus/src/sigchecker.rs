@@ -542,7 +542,7 @@ impl<'a> TransactionSignatureChecker<'a> {
     /// signatures, which have not historically been enforced in Bitcoin —
     /// `CPubKey::Verify` normalizes first (`secp256k1_ecdsa_signature_normalize`),
     /// so we do the same (pubkey.cpp:283).
-    fn verify_ecdsa_signature(sig: &[u8], pubkey: &[u8], sighash: &[u8; 32]) -> bool {
+    pub fn verify_ecdsa_signature(sig: &[u8], pubkey: &[u8], sighash: &[u8; 32]) -> bool {
         let pk = pk_cache_get(pubkey).unwrap_or_else(|| {
             let p = secp256k1::PublicKey::from_slice(pubkey);
             if let Ok(k) = p {
@@ -948,3 +948,351 @@ pub fn scripts_verified(wtxid: &crate::hash::Wtxid, flags: crate::script::Script
 pub static VERIFIED_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Cache misses — block txs verified the hard way.
 pub static VERIFIED_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// Deferred ECDSA checking — the advice consumer path
+// ---------------------------------------------------------------------------
+//
+// The batch engine (crate::sigbatch) verifies a block's ECDSA signatures
+// in one multi-scalar multiplication. The deferred checker keeps every
+// cheap gate identical to `check_input_scripts` — DER shape, pubkey
+// parse, sighash — and defers only the group operation, pushing `true`
+// provisionally. The provisional result is sound *only if the whole
+// batch passes*: the resolver re-verifies per-signature on any batch
+// failure and re-runs the affected transactions' scripts the ordinary
+// way. An unadvised record never defers — it verifies inline exactly
+// like the ordinary path.
+
+/// Sentinel advice byte: the producer writes it for checks it observed
+/// but could not advise (invalid sig, uncompressed key, ...) — the
+/// consumer verifies those inline. Kept distinct from every valid
+/// hint byte (0..=3).
+pub const ADVICE_ABSENT: u8 = 0xFF;
+
+/// Records collected while a block's scripts evaluate — `job_of[i]`
+/// is the job index of `records[i]`'s transaction.
+#[derive(Default)]
+pub struct DeferredSink {
+    pub records: Vec<crate::sigbatch::Record>,
+    pub job_of: Vec<u32>,
+}
+
+/// A [`SignatureChecker`] that defers advised ECDSA checks into `sink`
+/// and verifies unadvised ones inline. `advice` is consumed in
+/// evaluation order — one entry per `check_ecdsa_signature` call that
+/// reaches the group operation — matching the producer's capture
+/// order. Any divergence in eval order desyncs the stream; the batch
+/// then fails and the resolver falls back. Provisional pushes are only
+/// trusted once the batch commits.
+pub struct DeferredChecker<'a> {
+    /// The ordinary checker — every non-deferred method delegates.
+    inner: TransactionSignatureChecker<'a>,
+    /// Shared per-transaction advice cursor (eval order across the
+    /// tx's inputs — one stream feeds them all).
+    advice: &'a std::cell::Cell<usize>,
+    /// The per-tx advice entries.
+    entries: &'a [u8],
+    /// Shared sink (per-batch-scope; callers isolate threads).
+    sink: &'a std::cell::RefCell<DeferredSink>,
+    /// Index of this tx's job inside the batch scope.
+    tag: u32,
+    /// Counts for reporting: deferred vs inline checks.
+    pub stat: &'a std::cell::Cell<(u64, u64)>,
+}
+
+impl<'a> DeferredChecker<'a> {
+    /// `entries` is a flat byte stream of 97-byte advice records
+    /// (`r32 ‖ hint byte ‖ key_y ‖ nonce_y`) or a 33-byte sentinel
+    /// (`r32 ‖ 0xFF`) for a check the producer observed but could not
+    /// advise. The `r` prefix binds each hint to a signature — an eval
+    /// that diverges from the producer's run desyncs the ordinal stream,
+    /// and the r-match converts that into "no advice" (inline verify)
+    /// instead of a poisoned record.
+    #[must_use]
+    pub fn new(
+        tx: &'a Transaction,
+        n_in: usize,
+        amount: i64,
+        txdata: &'a PrecomputedTransactionData,
+        entries: &'a [u8],
+        sink: &'a std::cell::RefCell<DeferredSink>,
+        tag: u32,
+        stat: &'a std::cell::Cell<(u64, u64)>,
+        advice: &'a std::cell::Cell<usize>,
+    ) -> Self {
+        Self {
+            inner: TransactionSignatureChecker::new(tx, n_in, amount, txdata),
+            advice,
+            entries,
+            sink,
+            tag,
+            stat,
+        }
+    }
+
+    /// Consume one entry — the producer emits exactly one entry per
+    /// check that survives the cheap gates (nonempty sig+pubkey, amount
+    /// present), so the cursor MUST advance here whether or not the sig
+    /// parses. Returns `(entry_r, advice)` — `advice` None marks a
+    /// sentinel. Entry layout: `r32 ‖ flag` where flag 0xFF heads a
+    /// 33-byte sentinel and any other byte heads a 97-byte record.
+    fn take_entry(&self) -> Option<([u8; 32], Option<crate::sigbatch::Advice>)> {
+        let at = self.advice.get();
+        let head = self.entries.get(at..at + 33)?;
+        let mut r = [0u8; 32];
+        r.copy_from_slice(&head[..32]);
+        if head[32] == ADVICE_ABSENT {
+            self.advice.set(at + 33);
+            return Some((r, None));
+        }
+        let Some(rest) = self.entries.get(at + 33..at + 97) else {
+            self.advice.set(self.entries.len());
+            return None;
+        };
+        let mut key_y = [0u8; 32];
+        key_y.copy_from_slice(&rest[..32]);
+        let mut nonce_y = [0u8; 32];
+        nonce_y.copy_from_slice(&rest[32..64]);
+        self.advice.set(at + 97);
+        Some((
+            r,
+            Some(crate::sigbatch::Advice {
+                byte: head[32],
+                key_y,
+                nonce_y: Some(nonce_y),
+            }),
+        ))
+    }
+
+    /// Parse the DER-lax sig + normalize to low-S — identical to what
+    /// `verify_ecdsa_signature` does before the curve call — and
+    /// compress the pubkey. Returns None when the cheap gates reject
+    /// (the ordinary path returns false in the same cases).
+    fn normalize(sig: &[u8], pubkey: &[u8]) -> Option<([u8; 64], [u8; 33])> {
+        let mut s = secp256k1::ecdsa::Signature::from_der_lax(sig).ok()?;
+        s.normalize_s();
+        let sig64 = s.serialize_compact();
+        let pub33: [u8; 33] = match pubkey.len() {
+            33 => pubkey.try_into().ok()?,
+            65 => {
+                let mut c = [0u8; 33];
+                c[0] = if pubkey[64] & 1 == 1 { 0x03 } else { 0x02 };
+                c[1..].copy_from_slice(&pubkey[1..33]);
+                c
+            }
+            _ => return None,
+        };
+        // Pubkey must parse — ordinary verifies would also reject it.
+        if secp256k1::PublicKey::from_slice(&pub33).is_err() {
+            return None;
+        }
+        Some((sig64, pub33))
+    }
+}
+
+impl SignatureChecker for DeferredChecker<'_> {
+    fn check_ecdsa_signature(
+        &self,
+        sig: &[u8],
+        pubkey: &[u8],
+        script_code: &[u8],
+        sigversion: SigVersion,
+    ) -> bool {
+        if pubkey.is_empty() || sig.is_empty() {
+            return false;
+        }
+        let hash_type = i32::from(sig[sig.len() - 1]);
+        let sig = &sig[..sig.len() - 1];
+        if sigversion == SigVersion::WitnessV0 && self.inner.amount < 0 {
+            return false;
+        }
+        // Consume the entry at the same firing point the producer
+        // emits: every check that survives the cheap gates.
+        let entry = self.take_entry();
+        let Some((sig64, pub33)) = Self::normalize(sig, pubkey) else {
+            return false;
+        };
+        // Pair by content: the entry is claimed only if its embedded
+        // `r` equals this signature's — a desync (eval-order
+        // divergence, corrupt stream) degrades to inline for the rest
+        // of the tx rather than pairing a wrong hint.
+        let advice = entry.and_then(|(entry_r, adv)| {
+            if entry_r[..] == sig64[..32] {
+                adv
+            } else {
+                if std::env::var_os("ADVICE_DESYNC_DEBUG").is_some() {
+                    eprintln!(
+                        "desync tag={} at={} entry_r={} sig_r={} sentinel={}",
+                        self.tag,
+                        self.advice.get(),
+                        entry_r[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        sig64[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        adv.is_none(),
+                    );
+                }
+                self.advice.set(self.entries.len());
+                None
+            }
+        });
+        match advice {
+            Some(advice) => {
+                let sighash = signature_hash(
+                    &Script::new(script_code.to_vec()),
+                    self.inner.tx,
+                    self.inner.n_in,
+                    hash_type,
+                    self.inner.amount,
+                    sigversion,
+                    self.inner.txdata,
+                );
+                let mut s = self.sink.borrow_mut();
+                s.records.push(crate::sigbatch::Record {
+                    z: sighash,
+                    sig: sig64,
+                    pubkey: pub33,
+                    advice,
+                });
+                s.job_of.push(self.tag);
+                drop(s);
+                let (a, i) = self.stat.get();
+                self.stat.set((a + 1, i));
+                true
+            }
+            None => {
+                // No advice — ordinary inline verify, real result.
+                let sighash = signature_hash(
+                    &Script::new(script_code.to_vec()),
+                    self.inner.tx,
+                    self.inner.n_in,
+                    hash_type,
+                    self.inner.amount,
+                    sigversion,
+                    self.inner.txdata,
+                );
+                let r = TransactionSignatureChecker::verify_ecdsa_signature(
+                    sig, pubkey, &sighash,
+                );
+                let (a, i) = self.stat.get();
+                self.stat.set((a, i + 1));
+                r
+            }
+        }
+    }
+
+    fn check_schnorr_signature(
+        &self,
+        sig: &[u8],
+        pubkey: &[u8],
+        sigversion: SigVersion,
+        execdata: &mut ExecutionData,
+    ) -> Result<(), ScriptError> {
+        self.inner
+            .check_schnorr_signature(sig, pubkey, sigversion, execdata)
+    }
+
+    fn check_locktime(&self, locktime: i64) -> bool {
+        self.inner.check_locktime(locktime)
+    }
+
+    fn check_sequence(&self, sequence: i64) -> bool {
+        self.inner.check_sequence(sequence)
+    }
+
+    fn verify_taproot_commitment(
+        &self,
+        control: &[u8],
+        program: &[u8],
+        tapleaf_hash: &[u8; 32],
+    ) -> bool {
+        self.inner
+            .verify_taproot_commitment(control, program, tapleaf_hash)
+    }
+}
+
+/// `check_input_scripts` variant that defers advised ECDSA checks into
+/// `sink`. `entries` is the tx's advice stream — empty means every
+/// check verifies inline (identical to the ordinary path). Provisional
+/// results are only trustworthy after [`resolve_sink`] reports all
+/// records verified; the caller MUST run it before accepting the tx's
+/// script verdicts.
+pub fn check_input_scripts_advised(
+    tx: &Transaction,
+    spent_outputs: &[TxOut],
+    flags: crate::script::ScriptFlags,
+    entries: &[u8],
+    sink: &std::cell::RefCell<DeferredSink>,
+    tag: u32,
+    stat: &std::cell::Cell<(u64, u64)>,
+) -> Result<(), ScriptError> {
+    if tx.is_coinbase() {
+        return Ok(());
+    }
+    debug_assert_eq!(spent_outputs.len(), tx.inputs.len());
+    let txdata = PrecomputedTransactionData::new(tx, Some(spent_outputs.to_vec()), false);
+    let cursor = std::cell::Cell::new(0);
+    for (i, input) in tx.inputs.iter().enumerate() {
+        let checker = DeferredChecker::new(
+            tx,
+            i,
+            spent_outputs[i].value,
+            &txdata,
+            entries,
+            sink,
+            tag,
+            stat,
+            &cursor,
+        );
+        verify_script(
+            &input.script_sig,
+            &spent_outputs[i].script_pubkey,
+            Some(&input.witness),
+            flags,
+            &checker,
+        )?;
+    }
+    Ok(())
+}
+
+/// Resolve a batch scope: verify every deferred record. On batch
+/// failure each record is verified the ordinary way; the set of job
+/// indices whose records failed is returned so the caller re-runs only
+/// those transactions' scripts. Returns `Err(indices)` when advice was
+/// corrupt or sigs were bad, `Ok` — with `dirty` empty — when all is
+/// verified. `batch_ok`/`fallback_used` feed status reporting.
+pub fn resolve_sink(sink: &DeferredSink) -> Result<(), Vec<u32>> {
+    match crate::sigbatch::batch_verify(&sink.records) {
+        crate::sigbatch::Outcome::Valid => Ok(()),
+        crate::sigbatch::Outcome::Fallback => {
+            let mut dirty: Vec<u32> = Vec::new();
+            for (i, r) in sink.records.iter().enumerate() {
+                // Ordinary verification of the exact same (z, r‖s, pub)
+                // — libsecp, per-signature, no advice in sight.
+                let Ok(pk) = secp256k1::PublicKey::from_slice(&r.pubkey) else {
+                    dirty.push(sink.job_of[i]);
+                    continue;
+                };
+                let Ok(sig) = secp256k1::ecdsa::Signature::from_compact(&r.sig) else {
+                    dirty.push(sink.job_of[i]);
+                    continue;
+                };
+                let Ok(msg) = secp256k1::Message::from_digest_slice(&r.z) else {
+                    dirty.push(sink.job_of[i]);
+                    continue;
+                };
+                if secp().verify_ecdsa(&msg, &sig, &pk).is_err() {
+                    dirty.push(sink.job_of[i]);
+                }
+            }
+            dirty.sort_unstable();
+            dirty.dedup();
+            if dirty.is_empty() {
+                // Every sig verifies individually — the batch failure
+                // was corrupt advice, not corrupt signatures. Eval
+                // results were provisional-but-correct; nothing to redo.
+                Ok(())
+            } else {
+                Err(dirty)
+            }
+        }
+    }
+}
