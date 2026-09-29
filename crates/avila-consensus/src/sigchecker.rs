@@ -1295,7 +1295,7 @@ static ADVICE_STATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 static ADVICE_BATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ADVICE_FALLBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Snapshot of the advice-path counters (see [`ADVICE_STATS`]).
+/// Snapshot of the advice-path counters.
 #[must_use]
 pub fn advice_stats() -> (u64, u64, u64) {
     (
@@ -1369,7 +1369,7 @@ pub fn resolve_sink(sink: &DeferredSink) -> Result<(), Vec<u32>> {
 
 /// A [`SignatureChecker`] that runs the ordinary verification and emits
 /// the advice stream — what a synced Avila node produces for peers.
-/// Entry layout matches [`DeferredChecker::take_entry`]: `r32 ‖ flag`,
+/// Entry layout matches `DeferredChecker::take_entry`: `r32 ‖ flag`,
 /// flag 0xFF = 33-byte sentinel, else 97-byte advice record.
 pub struct CaptureChecker<'a> {
     /// The ordinary checker — every non-capture method delegates.

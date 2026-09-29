@@ -1,7 +1,7 @@
 //! Advice sidecar files (`AVADV01`) — the file-based form of the
 //! paired-node flow: a node that has already verified a block writes
 //! its per-transaction advice streams to `<blockhash>.adv`; a syncing
-//! peer loads them into [`ConnectContext::advice`].
+//! peer loads them into `ConnectContext::advice`.
 //!
 //! Layout (all integers little-endian):
 //! ```text

@@ -1115,7 +1115,7 @@ impl UtxoSet {
     /// # Errors
     /// `io::Error` on backend transaction failure.
     /// Starts the commit on a worker thread and returns immediately —
-    /// the dirty map becomes the immutable [`FlushLayer`] read source
+    /// the dirty map becomes the immutable `FlushLayer` read source
     /// while `connect` proceeds on a fresh map. Crash safety is
     /// unchanged: the backend tip only advances inside the commit
     /// transaction, so an uncommitted flush replays identically. Call
