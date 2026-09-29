@@ -4373,6 +4373,93 @@ mod tests {
         assert!(Chainstate::new(&params).verify_tip(4, 10));
     }
 
+    /// The produce half at the real boundary: `accept_block` with
+    /// `advice_collect` + `set_advice_dir` must leave a sidecar file
+    /// once the block's script checks drain.
+    #[test]
+    fn advice_collect_writes_sidecar_on_accept() {
+        let params = params();
+        let dir = std::env::temp_dir()
+            .join(format!("avila-adv-{}-{}", std::process::id(), "collect"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_slice(&[0x11; 32]).unwrap();
+        let pk33 = sk.public_key(&secp).serialize();
+        let h160 = crate::hash::hash160(&pk33);
+        let mut p2pkh = vec![0x76, 0xa9, 0x14];
+        p2pkh.extend_from_slice(&h160);
+        p2pkh.extend_from_slice(&[0x88, 0xac]);
+
+        let mut cs = Chainstate::new(&params);
+        cs.enable_speculative_connect();
+        cs.set_advice_dir(Some(dir.clone()), true);
+        let mut parent = genesis_header();
+        let mut spend_out = None;
+        for height in 1..=101u32 {
+            let mut cb = coinbase_tx(height, subsidy(height));
+            if height == 1 {
+                cb.outputs[0].script_pubkey = Script::new(p2pkh.clone());
+            }
+            let block = block_on(&parent, vec![cb.clone()], &params);
+            if height == 1 {
+                spend_out = Some((OutPoint { txid: cb.txid(), vout: 0 }, subsidy(height)));
+            }
+            parent = block.header;
+            cs.accept_block(&block, NOW).unwrap();
+        }
+        cs.drain_scripts().unwrap();
+        let (out, val) = spend_out.unwrap();
+        let mut spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: out,
+                script_sig: Script::new(vec![]),
+                sequence: SEQUENCE_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: val - 1000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let z = crate::sigchecker::signature_hash(
+            &Script::new(p2pkh.clone()),
+            &spend,
+            0,
+            1,
+            0,
+            crate::interpreter::SigVersion::Base,
+            None,
+        );
+        let msg = secp256k1::Message::from_digest_slice(&z).unwrap();
+        let sig = secp.sign_ecdsa(&msg, &sk);
+        let mut der = sig.serialize_der().to_vec();
+        der.push(1);
+        let mut ss = script::push_slice(&der);
+        ss.extend_from_slice(&script::push_slice(&pk33));
+        spend.inputs[0].script_sig = Script::new(ss);
+
+        let block = block_on(
+            &parent,
+            vec![coinbase_tx(102, subsidy(102)), spend],
+            &params,
+        );
+        let bh = block.block_hash();
+        cs.accept_block(&block, NOW).unwrap();
+        cs.drain_scripts().unwrap();
+        let file = dir.join(crate::advice::advice_name(&bh));
+        let data = std::fs::read(&file)
+            .unwrap_or_else(|_| panic!("sidecar missing: {}", file.display()));
+        let (hash, map) = crate::advice::decode_advice_block(&data)
+            .expect("sidecar decodes");
+        assert_eq!(hash, bh);
+        assert_eq!(map.len(), 1, "one non-coinbase tx's stream");
+        let stream = map.values().next().unwrap();
+        assert_eq!(stream.len() % 97, 0, "entries are 97 bytes");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn verify_tip_fails_when_bodies_are_gone() {
         let params = params();

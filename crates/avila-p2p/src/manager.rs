@@ -2633,15 +2633,13 @@ impl<S: Read + Write> PeerManager<S> {
             if let Some(req) = peer.sync.want_blocks_excluding(cs, &unfetched, &reserved) {
                 let _ = peer.session.send(&req);
                 // Advice-capable peers get a sidecar request per
-                // fetched block — the stream beats the block to us and
-                // lands in the advice dir before connect runs.
+                // fetched block — once per hash (want_advice dedupes),
+                // so the stream lands in the advice dir before connect.
                 if cs.advice_dir().is_some()
                     && peer.session.peer().is_some_and(|p| p.advice)
                 {
-                    for hash in &unfetched {
-                        let _ = peer.session.send(&Message::GetAdvice {
-                            block_hash: *hash,
-                        });
+                    for msg in peer.sync.want_advice(&unfetched) {
+                        let _ = peer.session.send(&msg);
                     }
                 }
             }

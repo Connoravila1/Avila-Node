@@ -501,6 +501,22 @@ impl HeaderTree {
                 stack.extend_from_slice(self.children(&h));
             }
         }
+        // Demote the best-header tip if it (or an ancestor of it) just
+        // failed — otherwise `best_chain`/`getheaders` keep serving a
+        // branch whose body can never exist, and every fresh peer that
+        // fetches it stalls on notfound forever (the IBD partner on
+        // equal-work regtest forks hit exactly this).
+        if self.invalid.contains(&self.tip) {
+            let mut best = self.tip;
+            let mut best_work = Work::ZERO;
+            for (h, n) in &self.nodes {
+                if !self.invalid.contains(h) && n.chainwork > best_work {
+                    best = *h;
+                    best_work = n.chainwork;
+                }
+            }
+            self.tip = best;
+        }
     }
 
     /// `true` if `hash` carries the failed flag — either the block whose own validation
@@ -592,7 +608,24 @@ impl HeaderTree {
     /// and its chainwork is at least the current tip's — i.e. it is a maximal
     /// tip. The explicit set preserves "earliest inserted wins" among
     /// equal-work candidates, which a height-sorted reinsert cannot reproduce.
+    ///
+    /// A snapshot written before [`Self::mark_invalid`] learned to demote a
+    /// failed tip can name a header this restore just re-marked — prefer the
+    /// maximal non-failed node then rather than resurrecting the dead branch.
     pub(crate) fn restore_tip(&mut self, hash: BlockHash) -> bool {
+        if self.invalid.contains(&hash) {
+            let mut best_work = Work::ZERO;
+            let mut best = None;
+            for (h, n) in &self.nodes {
+                if !self.invalid.contains(h) && n.chainwork > best_work {
+                    best = Some(*h);
+                    best_work = n.chainwork;
+                }
+            }
+            let Some(best) = best else { return false };
+            self.tip = best;
+            return true;
+        }
         let Some(node) = self.nodes.get(&hash) else {
             return false;
         };

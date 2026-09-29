@@ -120,6 +120,11 @@ pub struct PeerSync {
     in_flight: VecDeque<(BlockHash, Instant)>,
     /// Hashes already requested from any source — dedup guard.
     wanted: HashSet<BlockHash>,
+    /// Hashes whose advice sidecar we've `getadvice`'d from this peer —
+    /// the request rides alongside the block fetch exactly once per
+    /// block per peer, so a stale or unserved answer isn't re-asked
+    /// every tick (a missing sidecar just means ordinary verify).
+    wanted_advice: HashSet<BlockHash>,
     /// When the `getheaders` we currently have outstanding was sent —
     /// `None` once answered (even by an empty page). Core's
     /// `m_last_getheaders_timestamp`.
@@ -188,6 +193,7 @@ impl PeerSync {
         Self {
             in_flight: VecDeque::new(),
             wanted: HashSet::new(),
+            wanted_advice: HashSet::new(),
             headers_in_flight: None,
             headers_applied: 0,
             blocks_received: 0,
@@ -794,6 +800,17 @@ impl PeerSync {
         } else {
             Some(Message::GetData(want))
         }
+    }
+
+    /// Enqueues `getadvice` for each block hash this peer hasn't been
+    /// asked about yet — deduped like [`Self::wanted`] so the fan-out
+    /// asks once per block per peer. Returns the messages to send.
+    pub fn want_advice(&mut self, hashes: &[BlockHash]) -> Vec<Message> {
+        hashes
+            .iter()
+            .filter(|h| self.wanted_advice.insert(**h))
+            .map(|h| Message::GetAdvice { block_hash: *h })
+            .collect()
     }
 
     /// Requests one specific hash bypassing the reservation set —
