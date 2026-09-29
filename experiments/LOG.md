@@ -1833,3 +1833,29 @@ the rerun passed. git diff --check passed.
   (60 s: height, RSS, CPU%, MemAvailable, temp, blk/coinsdb sizes).
 - Comparison baseline (standard path, shared desktop, Sep 25–27):
   genesis→968,779 ≈ 42 h wall (~3.6 h/s late-era).
+
+## 2026-09-29 (overnight) — advice sidecar stack: engine → connect → sidecar
+
+Full local pipeline for hint-assisted sig batching, Bitcoin-only,
+consensus-exact (advice verified, never trusted).
+
+**Corpus A/B (real mainnet sigs, `examples/advice_ab.rs`):**
+- corpus-380 (475 blk, 716,566 sigs): 18.687s → 9.072s = **2.06×**
+- corpus-956 (662 blk, 3,577,335 sigs): 95.462s → 43.912s = **2.17×**
+- Zero batch failures, verdicts identical both runs.
+
+**Connect-level (through `connect_block_full` + ScriptPool,
+`examples/advice_connect_bench.rs`, 56,773 real-signed regtest spends):**
+- ordinary 1.260s / produce 4.73s / **consume 0.509s → 2.48×**
+- Consume only wins when the batch resolves on the pool — a `Barrier`
+  job per check overlaps the next block's evals; resolving in `wait()`
+  serialized it (0.42×!). Small batches (~26 sigs/blk) also lose —
+  MSM setup needs ~1k+ sigs to amortize.
+- Producer overhead ≈3.3–3.75× ordinary (capture re-runs the group
+  ops to lift hints out of a real verify). Fine for a one-time donor.
+
+**IBD note:** the flat-table run OOM'd at 438,390 (peak 24.97 GiB vs
+25 GiB cgroup) — flat's resident footprint (~16.4 GiB steady at 438k,
+spiking on flush) doesn't fit a 30 GiB laptop through dense era.
+Restarted on the standard path + peers.max_connections=24 (plumbing
+bug found: GUI never read the config's peer cap — was locked at 8).
