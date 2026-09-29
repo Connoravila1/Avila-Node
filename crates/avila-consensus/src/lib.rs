@@ -4,6 +4,7 @@
 //! always an explicit input. Every decoder is bounded by its input length.
 
 pub mod address;
+pub mod advice;
 pub mod arith;
 pub mod bip9;
 pub mod block;

@@ -177,6 +177,14 @@ enum Command {
         /// value is the resident cap in MiB — 0 (bare flag) = uncapped.
         #[arg(long, num_args = 0..=1, default_missing_value = "0")]
         flat_utxo_mib: Option<u64>,
+        /// Experimental advice sidecar directory — `<blockhash>.adv`
+        /// files a synced Avila node produced; consumed through the
+        /// deferred sig batch (verified locally, never trusted).
+        #[arg(long)]
+        advice_dir: Option<std::path::PathBuf>,
+        /// Produce advice while verifying into --advice-dir.
+        #[arg(long)]
+        advice_collect: bool,
     },
     /// Sync headers and blocks from live peers (headers-first, full
     /// consensus validation). Bounded by target height and timeout.
@@ -245,6 +253,16 @@ enum Command {
         /// cap in MiB — omit for uncapped, omit flag for off.
         #[arg(long, num_args = 0..=1, default_missing_value = "0")]
         flat_utxo_mib: Option<u64>,
+        /// Experimental advice sidecar directory — `<blockhash>.adv`
+        /// files a synced Avila node produced. Consumed through the
+        /// deferred sig batch; every hint is verified locally, and a
+        /// missing or corrupt file is ordinary verification.
+        #[arg(long)]
+        advice_dir: Option<std::path::PathBuf>,
+        /// Produce advice while verifying and write sidecars into
+        /// --advice-dir — the supplying half of the paired-node flow.
+        #[arg(long)]
+        advice_collect: bool,
     },
     /// Call a JSON-RPC method on a running daemon — the bitcoin-cli
     /// analog. Positional params are parsed as raw JSON values, falling
@@ -761,6 +779,8 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             rpcwhitelist,
             rpcwhitelistdefault,
             flat_utxo_mib,
+            advice_dir,
+            advice_collect,
         } => {
             // A real daemon: unbounded headers-first sync — sync to the
             // tip, then keep serving, relaying, and announcing until
@@ -984,6 +1004,8 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 utreexo: utreexo.unwrap_or(c.sync.utreexo),
                 utreexo_bridge: utreexo_bridge.unwrap_or(c.sync.utreexo_bridge),
                 flat_utxo_bytes: flat_utxo_mib.map(|mib| mib.saturating_mul(1024 * 1024) as usize),
+                advice_dir,
+                advice_collect,
                 status: Some(status),
                 queries: Some(std::sync::Arc::new(std::sync::Mutex::new(query_rx))),
                 waiters: Some(waiters),
@@ -1079,6 +1101,8 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             maxmempool,
             v2transport,
             flat_utxo_mib,
+            advice_dir,
+            advice_collect,
         } => {
             use avila_consensus::params::Network as ConsensusNet;
             let network = config.get().network;
@@ -1128,6 +1152,8 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 utreexo: c.sync.utreexo,
                 utreexo_bridge: c.sync.utreexo_bridge,
                 flat_utxo_bytes: flat_utxo_mib.map(|mib| mib.saturating_mul(1024 * 1024) as usize),
+                advice_dir,
+                advice_collect,
                 status: None,
                 queries: None,
                 waiters: None,

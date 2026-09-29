@@ -177,6 +177,22 @@ fn starting(ui: &mut Ui, s: &Scene, run: &mut RunSettings, node: &Node, open_adv
                     help(ui, s, "empty = uncapped");
                 }
             });
+            ui.horizontal(|ui| {
+                if run.fast_ibd {
+                    field(ui, &mut run.advice_dir, "Advice dir", 220.0);
+                    ui.checkbox(&mut run.advice_collect, "Produce");
+                    help(ui, s, "empty = off");
+                }
+            });
+            if run.fast_ibd {
+                help(
+                    ui,
+                    s,
+                    "Advice consumes <blockhash>.adv files a synced Avila node produced — sig \
+                     hints the batch verifies locally, never trust. 'Produce' writes them here \
+                     so a pairing node can sync faster. Needs a synced partner to be useful.",
+                );
+            }
             help(
                 ui,
                 s,

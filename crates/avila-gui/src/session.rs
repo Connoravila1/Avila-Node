@@ -63,6 +63,13 @@ pub struct RunSettings {
     /// If the committed set outgrows the cap the node politely stays
     /// on the disk path — never a wrong answer, just slower.
     pub flat_mib: String,
+    /// Advice sidecar directory — `<blockhash>.adv` files produced by
+    /// an already-synced Avila node. Empty means off; a bad or absent
+    /// file is ordinary verification, never a trust decision.
+    pub advice_dir: String,
+    /// Emit advice while verifying and write sidecars into
+    /// `advice_dir` — the producing half of the paired-node flow.
+    pub advice_collect: bool,
 }
 
 impl RunSettings {
@@ -90,6 +97,8 @@ impl RunSettings {
             full_verify: false,
             fast_ibd: false,
             flat_mib: String::new(),
+            advice_dir: String::new(),
+            advice_collect: false,
         }
     }
 
@@ -446,6 +455,7 @@ impl Session {
         let (control_tx, control_rx) = channel();
         let cfg = SyncConfig {
             connect: settings.connect_addrs(),
+            max_peers: config.peers.max_connections,
             target_height: settings.stop_after.unwrap_or(u32::MAX),
             timeout: Duration::from_secs(10 * 365 * 86_400),
             proxy: settings.proxy.trim().parse().ok(),
@@ -529,6 +539,11 @@ impl Session {
             flat_utxo_bytes: settings
                 .fast_ibd
                 .then(|| RunSettings::mib(&settings.flat_mib).unwrap_or(0)),
+            advice_dir: {
+                let d = settings.advice_dir.trim();
+                (!d.is_empty()).then(|| std::path::PathBuf::from(d))
+            },
+            advice_collect: settings.advice_collect,
             control: Some(Arc::new(std::sync::Mutex::new(control_rx))),
             ..SyncConfig::default()
         };

@@ -338,6 +338,14 @@ pub struct SyncConfig {
     /// means uncapped. When unset or over-budget the ordinary disk
     /// path runs — verification is identical either way.
     pub flat_utxo_bytes: Option<usize>,
+    /// Advice sidecar directory — `<blockhash>.adv` files produced by a
+    /// synced Avila node (`advice_collect`). Connects load matching
+    /// advice into the deferred sig-batch; missing/garbage files are
+    /// ordinary verification, never an error.
+    pub advice_dir: Option<std::path::PathBuf>,
+    /// Emit advice while verifying and write sidecars into
+    /// `advice_dir` — the producing half of the paired-node flow.
+    pub advice_collect: bool,
     /// When set, publish each tick's progress into this snapshot so a
     /// query surface (RPC, GUI) can read it without blocking sync.
     pub status: Option<crate::rpc::SharedStatus>,
@@ -489,6 +497,8 @@ impl Default for SyncConfig {
             utreexo: false,
             utreexo_bridge: false,
             flat_utxo_bytes: None,
+            advice_dir: None,
+            advice_collect: false,
             status: None,
             queries: None,
             waiters: None,
@@ -875,6 +885,14 @@ pub fn run(
                 cap
             );
         }
+    }
+    if let Some(dir) = &cfg.advice_dir {
+        cs.set_advice_dir(Some(dir.clone()), cfg.advice_collect);
+        eprintln!(
+            "advice: dir={} collect={}",
+            dir.display(),
+            cfg.advice_collect
+        );
     }
     if cfg.txindex {
         cs.enable_txindex(cfg.data_dir.as_deref())

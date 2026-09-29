@@ -928,6 +928,14 @@ pub fn mark_scripts_verified(wtxid: crate::hash::Wtxid, flags: crate::script::Sc
     c.map.insert(wtxid, flags.bits());
 }
 
+/// Drop every verified-script entry — benches need it between phases;
+/// production calls it nowhere (the cache is intentionally sticky).
+pub fn clear_verified_scripts() {
+    let mut c = VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
+    c.map.clear();
+    c.order.clear();
+}
+
 /// True when the tx's scripts were verified under a flag-set that
 /// contains `flags` (block_flags ⊆ verified_flags → skip is sound).
 pub fn scripts_verified(wtxid: &crate::hash::Wtxid, flags: crate::script::ScriptFlags) -> bool {
@@ -1316,4 +1324,160 @@ pub fn resolve_sink(sink: &DeferredSink) -> Result<(), Vec<u32>> {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Capture checking — the advice producer path
+// ---------------------------------------------------------------------------
+
+/// A [`SignatureChecker`] that runs the ordinary verification and emits
+/// the advice stream — what a synced Avila node produces for peers.
+/// Entry layout matches [`DeferredChecker::take_entry`]: `r32 ‖ flag`,
+/// flag 0xFF = 33-byte sentinel, else 97-byte advice record.
+pub struct CaptureChecker<'a> {
+    /// The ordinary checker — every non-capture method delegates.
+    inner: TransactionSignatureChecker<'a>,
+    /// Per-tx output stream (entry bytes appended in eval order).
+    out: &'a std::cell::RefCell<Vec<u8>>,
+}
+
+impl<'a> CaptureChecker<'a> {
+    #[must_use]
+    pub fn new(
+        tx: &'a Transaction,
+        n_in: usize,
+        amount: i64,
+        txdata: &'a PrecomputedTransactionData,
+        out: &'a std::cell::RefCell<Vec<u8>>,
+    ) -> Self {
+        Self {
+            inner: TransactionSignatureChecker::new(tx, n_in, amount, txdata),
+            out,
+        }
+    }
+}
+
+impl SignatureChecker for CaptureChecker<'_> {
+    fn check_ecdsa_signature(
+        &self,
+        sig: &[u8],
+        pubkey: &[u8],
+        script_code: &[u8],
+        sigversion: SigVersion,
+    ) -> bool {
+        if pubkey.is_empty() || sig.is_empty() {
+            return false;
+        }
+        let hash_type = i32::from(sig[sig.len() - 1]);
+        let sig = &sig[..sig.len() - 1];
+        if sigversion == SigVersion::WitnessV0 && self.inner.amount < 0 {
+            return false;
+        }
+        let sighash = signature_hash(
+            &Script::new(script_code.to_vec()),
+            self.inner.tx,
+            self.inner.n_in,
+            hash_type,
+            self.inner.amount,
+            sigversion,
+            self.inner.txdata,
+        );
+        let ok = TransactionSignatureChecker::verify_ecdsa_signature(sig, pubkey, &sighash);
+        let mut out = self.out.borrow_mut();
+        // Sentinel `r` comes from the same lax parse the consumer runs;
+        // zeros only when even lax-DER can't recover r.
+        let sentinel = |out: &mut Vec<u8>| {
+            let r = secp256k1::ecdsa::Signature::from_der_lax(sig)
+                .ok()
+                .map(|s| s.serialize_compact()[..32].to_vec())
+                .unwrap_or_else(|| vec![0u8; 32]);
+            out.extend_from_slice(&r);
+            out.push(ADVICE_ABSENT);
+        };
+        if !ok {
+            sentinel(&mut out);
+            return false;
+        }
+        let Some((sig64, pub33)) = (|| {
+            let mut s = secp256k1::ecdsa::Signature::from_der_lax(sig).ok()?;
+            s.normalize_s();
+            let pub33: [u8; 33] = match pubkey.len() {
+                33 => pubkey.try_into().ok()?,
+                65 => {
+                    let mut c = [0u8; 33];
+                    c[0] = if pubkey[64] & 1 == 1 { 0x03 } else { 0x02 };
+                    c[1..].copy_from_slice(&pubkey[1..33]);
+                    c
+                }
+                _ => return None,
+            };
+            Some((s.serialize_compact(), pub33))
+        })() else {
+            sentinel(&mut out);
+            return true; // verified ordinarily; just unadvisable
+        };
+        match crate::sigbatch::produce_advice(&sighash, &sig64, &pub33) {
+            Some(a) => {
+                out.extend_from_slice(&sig64[..32]); // r
+                out.push(a.byte);
+                out.extend_from_slice(&a.key_y);
+                out.extend_from_slice(&a.nonce_y.unwrap_or([0u8; 32]));
+            }
+            None => sentinel(&mut out),
+        }
+        true
+    }
+
+    fn check_schnorr_signature(
+        &self,
+        sig: &[u8],
+        pubkey: &[u8],
+        sigversion: SigVersion,
+        execdata: &mut ExecutionData,
+    ) -> Result<(), ScriptError> {
+        self.inner
+            .check_schnorr_signature(sig, pubkey, sigversion, execdata)
+    }
+    fn check_locktime(&self, locktime: i64) -> bool {
+        self.inner.check_locktime(locktime)
+    }
+    fn check_sequence(&self, sequence: i64) -> bool {
+        self.inner.check_sequence(sequence)
+    }
+    fn verify_taproot_commitment(
+        &self,
+        control: &[u8],
+        program: &[u8],
+        tapleaf_hash: &[u8; 32],
+    ) -> bool {
+        self.inner
+            .verify_taproot_commitment(control, program, tapleaf_hash)
+    }
+}
+
+/// `check_input_scripts` that also emits the tx's advice stream — the
+/// producer half of the paired-node flow. Verification is always the
+/// ordinary path; capture is a byproduct, never an optimization.
+pub fn check_input_scripts_capture(
+    tx: &Transaction,
+    spent_outputs: &[TxOut],
+    flags: crate::script::ScriptFlags,
+    out: &std::cell::RefCell<Vec<u8>>,
+) -> Result<(), ScriptError> {
+    if tx.is_coinbase() {
+        return Ok(());
+    }
+    debug_assert_eq!(spent_outputs.len(), tx.inputs.len());
+    let txdata = PrecomputedTransactionData::new(tx, Some(spent_outputs.to_vec()), false);
+    for (i, input) in tx.inputs.iter().enumerate() {
+        let checker = CaptureChecker::new(tx, i, spent_outputs[i].value, &txdata, out);
+        verify_script(
+            &input.script_sig,
+            &spent_outputs[i].script_pubkey,
+            Some(&input.witness),
+            flags,
+            &checker,
+        )?;
+    }
+    Ok(())
 }

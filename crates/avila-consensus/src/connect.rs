@@ -1017,6 +1017,10 @@ pub struct ConnectContext<'a> {
     /// batch failure re-verifies per-signature and re-runs the affected
     /// transactions — advice is never trusted.
     pub advice: Option<&'a std::collections::HashMap<Txid, Vec<u8>>>,
+    /// When true, script checking also emits the per-tx advice stream
+    /// (the producer half of the paired-node flow). Capture is a
+    /// byproduct of ordinary verification — it never defers.
+    pub advice_collect: bool,
 }
 
 /// A machine-checkable record of one block's connect — the
@@ -1528,6 +1532,9 @@ struct JobData {
     idx: u32,
     /// This tx's advice stream, if the caller supplied one.
     advice: Option<Vec<u8>>,
+    /// Produce advice while verifying (writes to the check's
+    /// `collect_map` under this tx's txid).
+    collect: bool,
 }
 
 /// A block's outstanding script checks: workers decrement
@@ -1545,6 +1552,10 @@ pub struct BlockCheck {
     eval_errored: std::sync::Mutex<Vec<u32>>,
     /// Retained jobs for the fallback re-run (empty when no advice).
     jobs: Vec<std::sync::Arc<JobData>>,
+    /// Produced advice streams — populated while jobs run when
+    /// `ConnectContext::advice_collect` was set; drained via
+    /// [`Self::take_advice_map`] after `wait`.
+    collect_map: std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>,
     /// Deferred/inline check counts for status reporting.
     pub advised_checks: std::sync::atomic::AtomicU64,
     /// Unadvised checks that verified inline.
@@ -1562,6 +1573,7 @@ impl BlockCheck {
             sink: std::sync::Mutex::new(crate::sigchecker::DeferredSink::default()),
             eval_errored: std::sync::Mutex::new(Vec::new()),
             jobs,
+            collect_map: std::sync::Mutex::new(std::collections::HashMap::new()),
             advised_checks: std::sync::atomic::AtomicU64::new(0),
             inline_checks: std::sync::atomic::AtomicU64::new(0),
         }
@@ -1579,6 +1591,7 @@ impl BlockCheck {
             sink: std::sync::Mutex::new(crate::sigchecker::DeferredSink::default()),
             eval_errored: std::sync::Mutex::new(Vec::new()),
             jobs: Vec::new(),
+            collect_map: std::sync::Mutex::new(std::collections::HashMap::new()),
             advised_checks: std::sync::atomic::AtomicU64::new(0),
             inline_checks: std::sync::atomic::AtomicU64::new(0),
         }
@@ -1594,47 +1607,33 @@ impl BlockCheck {
             guard = self.done.wait(guard).unwrap_or_else(|e| e.into_inner());
         }
         drop(guard);
-        // Batch resolution — provisional pushes stand only if the
-        // aggregate verifies. Fallback re-verifies each record and
-        // re-runs the dirty txs (plus any whose deferred eval errored).
-        let sink = self.sink.lock().unwrap_or_else(|e| e.into_inner());
-        if !sink.records.is_empty() {
-            let mut recheck = match crate::sigchecker::resolve_sink(&sink) {
-                Ok(()) => Vec::new(),
-                Err(dirty) => dirty,
-            };
-            drop(sink);
-            let errored: Vec<u32> =
-                std::mem::take(&mut *self.eval_errored.lock().unwrap_or_else(|e| e.into_inner()));
-            for tag in errored {
-                if !recheck.contains(&tag) {
-                    recheck.push(tag);
-                }
-            }
-            for tag in recheck {
-                let job = &self.jobs[tag as usize];
-                if let Err(err) =
-                    crate::sigchecker::check_input_scripts(&job.tx, &job.outs, job.flags)
-                {
-                    return Err(err);
-                }
-            }
-        }
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match guard.error {
             Some(err) => Err(err),
             None => Ok(()),
         }
     }
+
+    /// Drain the produced advice streams — `txid → entries`. Called by
+    /// the node layer after `wait` to persist the block's sidecar.
+    pub fn take_advice_map(&self) -> std::collections::HashMap<Txid, Vec<u8>> {
+        std::mem::take(&mut *self.collect_map.lock().unwrap_or_else(|e| e.into_inner()))
+    }
 }
 
 
 
-/// One queued script verification — owned so the worker never borrows
-/// block memory (the block may be disconnected before the job runs).
-struct ScriptJob {
-    job: std::sync::Arc<JobData>,
-    check: std::sync::Arc<BlockCheck>,
+/// One queued unit of script-check work — owned so the worker never
+/// borrows block memory (the block may be disconnected before the job
+/// runs). `Barrier` resolves the block's deferred sig batch on a pool
+/// worker so it overlaps the NEXT block's evals instead of stalling
+/// `wait` on the caller's thread.
+enum ScriptJob {
+    Tx {
+        job: std::sync::Arc<JobData>,
+        check: std::sync::Arc<BlockCheck>,
+    },
+    Barrier(std::sync::Arc<BlockCheck>),
 }
 
 /// A persistent script-check pool — Core's `scriptcheckqueue` with the
@@ -1674,37 +1673,108 @@ impl ScriptPool {
                     q = self.avail.wait(q).unwrap_or_else(|e| e.into_inner());
                 }
             };
-            let result = if job.job.advice.is_some() {
+            if let ScriptJob::Barrier(bc) = job {
+                // FIFO dequeue isn't completion: earlier tx jobs may
+                // still be mid-eval on other workers. Wait until the
+                // only outstanding unit is this barrier, then resolve.
+                {
+                    let mut st = bc.state.lock().unwrap_or_else(|e| e.into_inner());
+                    while st.remaining != 1 {
+                        st = bc.done.wait(st).unwrap_or_else(|e| e.into_inner());
+                    }
+                }
+                // Batch resolution on the worker: verify the aggregate,
+                // re-run dirty/errored jobs, set the check's error.
+                let sink = bc.sink.lock().unwrap_or_else(|e| e.into_inner());
+                let mut recheck = if sink.records.is_empty() {
+                    Vec::new()
+                } else {
+                    match crate::sigchecker::resolve_sink(&sink) {
+                        Ok(()) => Vec::new(),
+                        Err(dirty) => dirty,
+                    }
+                };
+                drop(sink);
+                let errored: Vec<u32> = std::mem::take(
+                    &mut *bc.eval_errored.lock().unwrap_or_else(|e| e.into_inner()),
+                );
+                for tag in errored {
+                    if !recheck.contains(&tag) {
+                        recheck.push(tag);
+                    }
+                }
+                let mut barrier_err = None;
+                for tag in recheck {
+                    let jd = &bc.jobs[tag as usize];
+                    if let Err(err) =
+                        crate::sigchecker::check_input_scripts(&jd.tx, &jd.outs, jd.flags)
+                    {
+                        barrier_err = Some(err);
+                        break;
+                    }
+                }
+                if let Some(err) = barrier_err {
+                    let mut state = bc.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if state.error.is_none() {
+                        state.error = Some(err);
+                    }
+                }
+                {
+                    let mut state = bc.state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.remaining -= 1;
+                    let zero = state.remaining == 0;
+                    drop(state);
+                    if zero {
+                        bc.done.notify_all();
+                    }
+                }
+                continue;
+            }
+            let ScriptJob::Tx { job, check: bc } = &job else {
+                unreachable!()
+            };
+            let (job, bc) = (job.clone(), bc.clone());
+            let result = if job.collect {
+                let out = std::cell::RefCell::new(Vec::new());
+                let r = crate::sigchecker::check_input_scripts_capture(
+                    &job.tx,
+                    &job.outs,
+                    job.flags,
+                    &out,
+                );
+                bc.collect_map
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(job.tx.txid(), out.into_inner());
+                r
+            } else if job.advice.is_some() {
                 // Deferred mode: eval errors are provisional — the
                 // pushed sig results aren't proven until the batch
                 // commits, so record the tag for wait()'s re-run list.
                 let stat = std::cell::Cell::new((0u64, 0u64));
                 let r = crate::sigchecker::check_input_scripts_advised(
-                    &job.job.tx,
-                    &job.job.outs,
-                    job.job.flags,
-                    job.job.advice.as_deref().unwrap_or(&[]),
-                    &job.check.sink,
-                    job.job.idx,
+                    &job.tx,
+                    &job.outs,
+                    job.flags,
+                    job.advice.as_deref().unwrap_or(&[]),
+                    &bc.sink,
+                    job.idx,
                     &stat,
                 );
                 let (a, i) = stat.get();
-                job.check
-                    .advised_checks
+                bc.advised_checks
                     .fetch_add(a, std::sync::atomic::Ordering::Relaxed);
-                job.check
-                    .inline_checks
+                bc.inline_checks
                     .fetch_add(i, std::sync::atomic::Ordering::Relaxed);
                 if r.is_err() {
-                    job.check
-                        .eval_errored
+                    bc.eval_errored
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .push(job.job.idx);
+                        .push(job.idx);
                 }
                 Ok(())
             } else {
-                check_input_scripts(&job.job.tx, &job.job.outs, job.job.flags)
+                check_input_scripts(&job.tx, &job.outs, job.flags)
             };
             // The predicate `wait` loops on (`remaining`) and the error
             // slot are updated under the same mutex `wait` holds while
@@ -1713,16 +1783,14 @@ impl ScriptPool {
             // decremented count before blocking, or is already
             // registered on the condvar to receive this notify. Either
             // way the wakeup can't be missed.
-            let mut guard = job.check.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = bc.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(err) = result
                 && guard.error.is_none()
             {
                 guard.error = Some(err);
             }
             guard.remaining -= 1;
-            if guard.remaining == 0 {
-                job.check.done.notify_all();
-            }
+            bc.done.notify_all();
             drop(guard);
         }
     }
@@ -1978,6 +2046,7 @@ fn connect_block_inner(
                         flags,
                         idx: 0, // set after the loop — see below
                         advice,
+                        collect: ctx.advice_collect,
                     }));
                 } else {
                     script_jobs.push((tx, spent_outs, advice));
@@ -2058,12 +2127,22 @@ fn connect_block_inner(
                     d.idx = i as u32;
                 }
             }
+            let has_advice = ctx.advice.is_some();
             let check = std::sync::Arc::new(BlockCheck::new(jobs.clone()));
+            if has_advice {
+                // The barrier resolves the sink once every tx job has
+                // pushed its records — count it so `wait` holds until
+                // the batch is settled.
+                check.state.lock().unwrap_or_else(|e| e.into_inner()).remaining += 1;
+            }
             for job in jobs {
-                pool.submit(ScriptJob {
+                pool.submit(ScriptJob::Tx {
                     job,
                     check: check.clone(),
                 });
+            }
+            if has_advice {
+                pool.submit(ScriptJob::Barrier(check.clone()));
             }
             tick(4, t_script);
             return Ok(Some(check));
@@ -2423,6 +2502,7 @@ mod tests {
                 script_checks: true,
                 script_pool: None,
             advice: None,
+            advice_collect: false,
         };
             connect_block(&block, &mut self.utxo, &ctx)?;
             self.tip = block.block_hash();
@@ -2471,9 +2551,10 @@ mod tests {
                     flags: ScriptFlags::NONE,
                     idx: 0,
                     advice: None,
+                    collect: false,
                 });
                 let check = std::sync::Arc::new(BlockCheck::new(vec![job.clone()]));
-                pool.submit(ScriptJob {
+                pool.submit(ScriptJob::Tx {
                     job,
                     check: check.clone(),
                 });
@@ -2487,6 +2568,170 @@ mod tests {
                 .is_ok(),
             "BlockCheck::wait hung — lost wakeup"
         );
+    }
+
+    // -- advice sidecar: produce → consume → tamper ---------------------------
+
+    /// A P2PKH scriptPubkey for `pk33` — the script the corpus-era blocks
+    /// actually spend against.
+    fn p2pkh_spk(pk33: &[u8; 33]) -> Vec<u8> {
+        let pkh = crate::hash::hash160(pk33);
+        let mut spk = vec![script::OP_DUP, script::OP_HASH160];
+        spk.extend_from_slice(&script::push_slice(&pkh));
+        spk.push(script::OP_EQUALVERIFY);
+        spk.push(script::OP_CHECKSIG);
+        spk
+    }
+
+    /// A signed SIGHASH_ALL spend of `spend_out` (a P2PKH coin) — real
+    /// DER-encoded ECDSA, so `check_ecdsa_signature` fires.
+    fn signed_spend(
+        spend_out: OutPoint,
+        spk: &[u8],
+        value: i64,
+        sk: &secp256k1::SecretKey,
+    ) -> Transaction {
+        let secp = secp256k1::Secp256k1::new();
+        let mut spend = Transaction {
+            version: 1,
+            inputs: vec![txin(spend_out, Vec::new(), SEQUENCE_FINAL)],
+            outputs: vec![txout(value - 1000, ANYONE.to_vec())],
+            lock_time: 0,
+        };
+        let z = crate::sigchecker::signature_hash(
+            &Script::new(spk.to_vec()),
+            &spend,
+            0,
+            1, // SIGHASH_ALL
+            0,
+            crate::interpreter::SigVersion::Base,
+            None,
+        );
+        let msg = secp256k1::Message::from_digest_slice(&z).unwrap();
+        let sig = secp.sign_ecdsa(&msg, sk);
+        let mut der = sig.serialize_der().to_vec();
+        der.push(1);
+        let mut script_sig = script::push_slice(&der);
+        script_sig.extend_from_slice(&script::push_slice(
+            &sk.public_key(&secp).serialize(),
+        ));
+        spend.inputs[0].script_sig = Script::new(script_sig);
+        spend
+    }
+
+    /// The connect-shaped chain: a P2PKH-paying coinbase at h1, matured
+    /// to h101 — the exact scaffold `Chain::extend` builds, but reusable
+    /// for a fresh chain.
+    fn chain_with_p2pkh_coin(pk33: &[u8; 33]) -> (Chain, OutPoint, Vec<u8>, BlockHeader) {
+        let mut chain = Chain::new(Network::Regtest.params());
+        let mut cb = coinbase(1, SUBSIDY);
+        cb.outputs[0].script_pubkey = Script::new(p2pkh_spk(pk33));
+        let b1 = chain.extend(vec![cb]).unwrap();
+        let out = Chain::coinbase_outpoint(&b1);
+        chain.grow_to(101);
+        let tip = chain.tip_header;
+        (chain, out, p2pkh_spk(pk33), tip)
+    }
+
+    #[test]
+    fn advice_produce_consume_and_tamper_at_connect() {
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_slice(&[0x11; 32]).unwrap();
+        let pk33 = sk.public_key(&secp).serialize();
+
+        // Producer node: connect the spend block with advice_collect.
+        let (mut chain, out, spk, tip) = chain_with_p2pkh_coin(&pk33);
+        let spend = signed_spend(out, &spk, SUBSIDY, &sk);
+        let spend_txid = spend.txid();
+        let pool = ScriptPool::new(2);
+        let block = block_on(
+            &tip,
+            vec![coinbase(102, SUBSIDY), spend],
+            &chain.params,
+        );
+        chain.tree.insert(&block.header, chain.now).unwrap();
+        let ctx = ConnectContext {
+            params: &chain.params,
+            tree: &chain.tree,
+            block_hash: block.block_hash(),
+            script_checks: true,
+            script_pool: Some(&pool),
+            advice: None,
+            advice_collect: true,
+        };
+        let (_undo, check, _receipt) =
+            connect_block_full(&block, &mut chain.utxo, &ctx).unwrap();
+        let check = check.expect("pool path returns a check");
+        check.wait().unwrap();
+        let map = check.take_advice_map();
+        let entries = map.get(&spend_txid).expect("spend tx produced advice");
+        assert!(
+            entries.len() >= 97,
+            "advice stream for the spend must carry a full 97B record"
+        );
+
+        // Consumer node: identical chain, connect the same block with
+        // the sidecar — the sig check runs through the batch path.
+        let (mut chain2, out2, spk2, tip2) = chain_with_p2pkh_coin(&pk33);
+        assert_eq!(out2, out);
+        let spend2 = signed_spend(out2, &spk2, SUBSIDY, &sk);
+        let block2 = block_on(
+            &tip2,
+            vec![coinbase(102, SUBSIDY), spend2],
+            &chain2.params,
+        );
+        assert_eq!(block2.block_hash(), block.block_hash());
+        chain2.tree.insert(&block2.header, chain2.now).unwrap();
+        let pool2 = ScriptPool::new(2);
+        let ctx2 = ConnectContext {
+            params: &chain2.params,
+            tree: &chain2.tree,
+            block_hash: block2.block_hash(),
+            script_checks: true,
+            script_pool: Some(&pool2),
+            advice: Some(&map),
+            advice_collect: false,
+        };
+        let (undo2, check2, _r) =
+            connect_block_full(&block2, &mut chain2.utxo, &ctx2).unwrap();
+        check2.unwrap().wait().unwrap();
+        // The spend must actually have applied (not silently skipped).
+        assert!(chain2.utxo.get(&out).is_none(), "spent coin must be gone");
+
+        // Sidecar round-trip: encode → decode → same map.
+        let buf = crate::advice::encode_advice_block(&block.block_hash(), &map);
+        let (h3, map3) = crate::advice::decode_advice_block(&buf).unwrap();
+        assert_eq!(h3, block.block_hash());
+        assert_eq!(map3, map);
+
+        // Tamper evidence: flip a hint byte in the one entry — the
+        // consumer must still connect (batch fallback), never misverify.
+        let mut tampered = map3.clone();
+        let e = tampered.get_mut(&spend_txid).unwrap();
+        e[32] ^= 0x01;
+        let (mut chain3, out3, spk3, tip3) = chain_with_p2pkh_coin(&pk33);
+        let spend3 = signed_spend(out3, &spk3, SUBSIDY, &sk);
+        let block3 = block_on(
+            &tip3,
+            vec![coinbase(102, SUBSIDY), spend3],
+            &chain3.params,
+        );
+        chain3.tree.insert(&block3.header, chain3.now).unwrap();
+        let pool3 = ScriptPool::new(2);
+        let ctx3 = ConnectContext {
+            params: &chain3.params,
+            tree: &chain3.tree,
+            block_hash: block3.block_hash(),
+            script_checks: true,
+            script_pool: Some(&pool3),
+            advice: Some(&tampered),
+            advice_collect: false,
+        };
+        let (undo3, check3, _r) =
+            connect_block_full(&block3, &mut chain3.utxo, &ctx3).unwrap();
+        check3.unwrap().wait().unwrap();
+        assert!(chain3.utxo.get(&out3).is_none());
+        let _ = (undo2, undo3);
     }
 
     // -- subsidy -------------------------------------------------------------
@@ -2984,6 +3229,7 @@ mod tests {
             script_checks: true,
             script_pool: None,
                 advice: None,
+                advice_collect: false,
         };
         // Re-run connect on a clone to capture the undo (extend already applied
         // it); disconnect must restore `before` exactly.
@@ -3027,6 +3273,7 @@ mod tests {
             script_checks: true,
             script_pool: None,
                 advice: None,
+                advice_collect: false,
         };
         assert_eq!(
             connect_block(&block, &mut chain.utxo, &ctx).unwrap_err(),
@@ -3137,6 +3384,7 @@ mod tests {
             script_checks: true,
             script_pool: None,
                 advice: None,
+                advice_collect: false,
         };
         let base = chain.utxo.clone();
         let undo = connect_block(&block, &mut chain.utxo, &ctx).unwrap();

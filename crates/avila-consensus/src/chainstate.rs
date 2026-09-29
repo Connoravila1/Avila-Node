@@ -286,6 +286,15 @@ pub struct Chainstate {
     /// [`Self::enable_speculative_connect`]; when set, block connects
     /// return with verification still in flight.
     script_pool: Option<std::sync::Arc<connect::ScriptPool>>,
+    /// Advice sidecar directory (`<blockhash>.adv` files) — when set,
+    /// connects load matching advice and consume it through the
+    /// deferred sig-batch path; unreadable/missing files degrade to
+    /// ordinary verification.
+    advice_dir: Option<std::path::PathBuf>,
+    /// Emit per-tx advice streams while verifying (produce mode) —
+    /// collected per block into [`connect::BlockCheck::take_advice_map`]
+    /// and written as sidecars when `advice_dir` is set.
+    advice_collect: bool,
     /// Blocks applied to `utxo` whose script checks have not yet
     /// drained — a strictly-increasing tail of the connected chain.
     /// Bounded by the pipeline depth in `accept_block`; emptied by
@@ -1006,6 +1015,8 @@ impl Chainstate {
             snapshot_verified: false,
             disconnected: Vec::new(),
             script_pool: None,
+            advice_dir: None,
+            advice_collect: false,
             pending_scripts: std::collections::VecDeque::new(),
             receipts: std::collections::VecDeque::new(),
             progress: None,
@@ -1097,6 +1108,21 @@ impl Chainstate {
         self.pending_scripts.len()
     }
 
+    /// Point the chainstate at an advice sidecar directory: `advice`
+    /// files (produced by another Avila node's `advice_collect`) are
+    /// consumed through the deferred batch path; when `collect` is
+    /// also true this node re-emits fresh streams as it verifies.
+    pub fn set_advice_dir(&mut self, dir: Option<std::path::PathBuf>, collect: bool) {
+        self.advice_dir = dir;
+        self.advice_collect = collect;
+    }
+
+    /// The sidecar directory configured via [`Self::set_advice_dir`].
+    #[must_use]
+    pub fn advice_dir(&self) -> Option<&std::path::Path> {
+        self.advice_dir.as_deref()
+    }
+
     /// How long the pending tail has gone without a new connect —
     /// the sync loop drains to zero once this exceeds a small grace
     /// window so a quiet tip still becomes authoritative promptly.
@@ -1151,7 +1177,16 @@ impl Chainstate {
             let Some((hash, height, check, receipt)) = self.pending_scripts.pop_front() else {
                 break;
             };
-            if let Err(err) = check.wait() {
+            let waited = check.wait();
+            if waited.is_ok()
+                && let Some(dir) = &self.advice_dir
+            {
+                let map = check.take_advice_map();
+                if !map.is_empty() {
+                    let _ = crate::advice::write_advice_file(dir, &hash, &map);
+                }
+            }
+            if let Err(err) = waited {
                 // The failed block and everything pending above it can
                 // never connect — drop their pending entries, mark the
                 // block invalid, rewind to its parent. Their receipts
@@ -2889,6 +2924,7 @@ impl Chainstate {
                     script_checks: self.script_checks(&hash, &params),
                     script_pool: None,
                     advice: None,
+                    advice_collect: false,
                 };
                 if connect::connect_block(&block, utxo, &cctx).is_err() {
                     return false;
@@ -3047,6 +3083,7 @@ impl Chainstate {
                 script_checks: self.script_checks(&hash, self.tree.params()),
                 script_pool: None,
                 advice: None,
+                advice_collect: false,
             };
             let Some(acc) = self.utreexo_acc.as_mut() else {
                 break;
@@ -3250,13 +3287,18 @@ impl Chainstate {
             index.index_block(hash, block);
         }
         if block.header.prev_block_hash == self.connected {
+            let advice_map = self
+                .advice_dir
+                .as_ref()
+                .and_then(|d| crate::advice::read_advice_file(d, &hash));
             let ctx = ConnectContext {
                 params: &params,
                 tree: &self.tree,
                 block_hash: hash,
                 script_checks: self.script_checks(&hash, &params),
                 script_pool: self.script_pool.as_deref(),
-                advice: None,
+                advice: advice_map.as_ref(),
+                advice_collect: self.advice_collect,
             };
             match connect::connect_block_full(block, &mut self.utxo, &ctx) {
                 Ok((undo, check, receipt)) => {
@@ -3723,6 +3765,7 @@ impl Chainstate {
                 script_checks: checks,
                 script_pool: None,
                 advice: None,
+                advice_collect: false,
             };
             match connect::connect_block_full(&block, sim, &ctx) {
                 Ok((undo, check, receipt)) => {
@@ -3961,13 +4004,18 @@ impl Chainstate {
                 break;
             };
             let hash = block.block_hash();
+            let advice_map = self
+                .advice_dir
+                .as_ref()
+                .and_then(|d| crate::advice::read_advice_file(d, &hash));
             let ctx = ConnectContext {
                 params: &params,
                 tree: &self.tree,
                 block_hash: hash,
                 script_checks: self.script_checks(&hash, &params),
                 script_pool: pool.as_deref(),
-                advice: None,
+                advice: advice_map.as_ref(),
+                advice_collect: self.advice_collect,
             };
             match connect::connect_block_full(&block, &mut bg.utxo, &ctx) {
                 Ok((_undo, check, receipt)) => {
@@ -7078,6 +7126,7 @@ mod tests {
                 script_checks: true,
                 script_pool: None,
                 advice: None,
+                advice_collect: false,
             };
             crate::utreexo::connect_block_proven(block, &mut acc, &spends, &proof, &ctx)
                 .unwrap_or_else(|e| panic!("proven connect h{}: {e}", i + 1));
