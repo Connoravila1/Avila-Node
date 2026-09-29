@@ -80,6 +80,9 @@ pub struct PeerInfo {
     /// Whether the peer sent `sendutxproof` — it wants `utxproof`
     /// bundles appended to served blocks (Avila intra-net).
     pub utxproof: bool,
+    /// Whether the peer sent `sendadvice` — it can serve `advice`
+    /// sig-hint sidecars (Avila intra-net).
+    pub advice: bool,
     /// The peer's BIP152 `sendcmpct`: `(wants_high_bandwidth,
     /// supported_version)`. `version >= 2` means wtxid short-ids.
     /// `None` = ordinary `inv`/`headers` block announcements only.
@@ -218,6 +221,9 @@ pub struct PeerSession<S> {
     /// proof bundles (utreexo shadow mode). Serving stays unconditional
     /// on the bridge side; this flag is the opt-in ask.
     ask_utxproof: bool,
+    /// Whether our handshake advertises `sendadvice` — we want the
+    /// peer's sig-advice sidecars when set.
+    ask_advice: bool,
     /// BIP152 `sendcmpct` we advertise — `Some(hb)` negotiates
     /// version-2 compact relay with high-bandwidth request `hb`.
     ask_cmpct: Option<bool>,
@@ -373,6 +379,7 @@ impl<S: Read + Write> PeerSession<S> {
             cell_bytes: 0,
             recon_salt,
             ask_utxproof: false,
+            ask_advice: false,
             ask_cmpct: None,
         }
     }
@@ -399,6 +406,12 @@ impl<S: Read + Write> PeerSession<S> {
     /// function; this flag asks the peer to send them to *us*.
     pub fn ask_utxproof(&mut self, on: bool) {
         self.ask_utxproof = on;
+    }
+
+    /// Whether this session advertises `sendadvice` in the handshake —
+    /// set when the node wants the peer's sig-advice sidecars.
+    pub fn ask_advice(&mut self, on: bool) {
+        self.ask_advice = on;
     }
 
     /// The salt this session advertised in `sendrecon` — the manager
@@ -691,6 +704,7 @@ impl<S: Read + Write> PeerSession<S> {
                     addrv2: false,
                     recon: None,
                     utxproof: false,
+                    advice: false,
                     cmpct: None,
                 });
                 // ProcessMessage(VERSION)'s reply burst: inbound answers
@@ -719,6 +733,9 @@ impl<S: Read + Write> PeerSession<S> {
                 }
                 if self.ask_utxproof {
                     self.send(&Message::SendUtxProof)?;
+                }
+                if self.ask_advice {
+                    self.send(&Message::SendAdvice)?;
                 }
                 self.send(&Message::Verack)?;
                 self.state = Handshake::AwaitVerack;
@@ -769,6 +786,12 @@ impl<S: Read + Write> PeerSession<S> {
                 }
                 Ok(Some(SessionEvent::Message(msg)))
             }
+            (Handshake::Done, msg @ Message::SendAdvice) => {
+                if let Some(p) = &mut self.peer {
+                    p.advice = true;
+                }
+                Ok(Some(SessionEvent::Message(msg)))
+            }
             (Handshake::Done, msg @ Message::SendHeaders) => Ok(Some(SessionEvent::Message(msg))),
             (_, Message::WtxidRelay) => {
                 if let Some(p) = &mut self.peer {
@@ -797,6 +820,12 @@ impl<S: Read + Write> PeerSession<S> {
             (_, Message::SendUtxProof) => {
                 if let Some(p) = &mut self.peer {
                     p.utxproof = true;
+                }
+                Ok(None)
+            }
+            (_, Message::SendAdvice) => {
+                if let Some(p) = &mut self.peer {
+                    p.advice = true;
                 }
                 Ok(None)
             }
@@ -981,6 +1010,82 @@ mod tests {
         assert!(t.sent_by_msg["version"] > 24);
         assert!(t.connected > 0 && t.last_send > 0 && t.last_recv > 0);
         assert_ne!(t.session_id, 0);
+    }
+
+    #[test]
+    fn advice_capability_negotiates_and_messages_flow() {
+        // Outbound asks for advice in the handshake burst.
+        let (us_end, mut peer_end) = testpipe::pair();
+        let mut us = PeerSession::initiate(
+            us_end,
+            MAGIC,
+            build_version(7, 500, NetAddr::unspecified(), wall_epoch()),
+            BUDGET,
+        )
+        .unwrap();
+        us.ask_advice(true);
+        us.poll().unwrap();
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Version(version(700)));
+        us.poll().unwrap();
+        let burst = testpipe::drain(&mut peer_end, MAGIC);
+        let names: Vec<&str> = burst.iter().map(|m| m.command_name()).collect();
+        assert!(
+            names.contains(&"sendadvice"),
+            "handshake burst should carry sendadvice: {names:?}"
+        );
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Verack);
+        us.poll().unwrap();
+
+        // Their sendadvice marks the peer advice-capable.
+        testpipe::inject(&mut peer_end, MAGIC, &Message::SendAdvice);
+        us.poll().unwrap();
+        assert!(us.peer().is_some_and(|p| p.advice));
+
+        // getadvice/advice payloads traverse the link intact.
+        let hash = avila_consensus::hash::BlockHash::from_bytes([0x5a; 32]);
+        us.send(&Message::GetAdvice { block_hash: hash }).unwrap();
+        us.flush().unwrap();
+        let sent = testpipe::drain(&mut peer_end, MAGIC);
+        assert!(matches!(
+            sent.last(),
+            Some(Message::GetAdvice { block_hash }) if *block_hash == hash
+        ));
+        testpipe::inject(
+            &mut peer_end,
+            MAGIC,
+            &Message::Advice {
+                block_hash: hash,
+                data: b"AVADV01\0demo".to_vec(),
+            },
+        );
+        let events = us.poll().unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::Message(Message::Advice { block_hash, data })
+                if *block_hash == hash && data == b"AVADV01\0demo"
+        )));
+    }
+
+    #[test]
+    fn sendadvice_before_verack_marks_capability() {
+        // Capability bit arriving before verack must still land —
+        // mirrors the `(_, SendUtxProof)` catch-all arm.
+        let (us_end, mut peer_end) = testpipe::pair();
+        let mut us = PeerSession::initiate(
+            us_end,
+            MAGIC,
+            build_version(8, 500, NetAddr::unspecified(), wall_epoch()),
+            BUDGET,
+        )
+        .unwrap();
+        us.poll().unwrap();
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Version(version(700)));
+        us.poll().unwrap();
+        testpipe::inject(&mut peer_end, MAGIC, &Message::SendAdvice);
+        us.poll().unwrap();
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Verack);
+        us.poll().unwrap();
+        assert!(us.peer().is_some_and(|p| p.advice));
     }
 
     #[test]

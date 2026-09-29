@@ -968,6 +968,9 @@ pub fn run(
     mgr.set_clock(crate::time::time);
     mgr.set_v2transport(cfg.v2transport);
     mgr.set_utxproof_consumer(cfg.utreexo);
+    // Advice consumer half: ask advice-capable peers for sidecars so
+    // they land in the dir before their blocks connect.
+    mgr.set_advice_consumer(cfg.advice_dir.is_some());
     // The index we just enabled is what makes BIP157 serving
     // legitimate — advertise NODE_COMPACT_FILTERS only then.
     mgr.set_serve_filters(cfg.blockfilterindex && cfg.peerblockfilters);

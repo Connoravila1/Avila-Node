@@ -255,6 +255,9 @@ pub enum Message {
     /// `sendutxproof` — peer wants `utxproof` bundles appended to
     /// served blocks (Avila intra-net; ignored elsewhere).
     SendUtxProof,
+    /// `sendadvice` — peer can serve `advice` sig-hint sidecars
+    /// (Avila intra-net; ignored elsewhere).
+    SendAdvice,
     /// `feefilter` — minimum feerate the peer accepts, sat/kvB.
     FeeFilter(u64),
     /// `getaddr` — request for known peers.
@@ -347,6 +350,24 @@ pub enum Message {
         /// compact-size count, per-input `(outpoint, coin)` records,
         /// then the rustreexo `Proof` serialization.
         bundle: Vec<u8>,
+    },
+    /// `getadvice` — request a block's sig-advice sidecar
+    /// (Avila intra-net). The payload is just the block hash; the peer
+    /// answers `advice` or `notfound` (inv-free, like `getblocktxn`).
+    GetAdvice {
+        /// The block whose advice is wanted.
+        block_hash: avila_consensus::hash::BlockHash,
+    },
+    /// `advice` — one block's sig-advice sidecar. `data` is the
+    /// `avila_consensus::advice::encode_advice_block` buffer (its
+    /// embedded hash must equal `block_hash`); the consumer verifies
+    /// every hint locally, so a corrupt or foreign stream degrades to
+    /// ordinary verification — never a wrong accept.
+    Advice {
+        /// The block this sidecar belongs to.
+        block_hash: avila_consensus::hash::BlockHash,
+        /// The `AVADV01` sidecar bytes.
+        data: Vec<u8>,
     },
     /// Any other command — Core ignores unknown commands; we preserve the
     /// payload so a session layer can log or drop the peer itself.
@@ -592,6 +613,7 @@ impl Message {
             Self::WtxidRelay => "wtxidrelay",
             Self::SendAddrV2 => "sendaddrv2",
             Self::SendUtxProof => "sendutxproof",
+            Self::SendAdvice => "sendadvice",
             Self::FeeFilter(_) => "feefilter",
             Self::GetAddr => "getaddr",
             Self::Addr(_) => "addr",
@@ -621,6 +643,8 @@ impl Message {
             Self::ReconcilDiff { .. } => "reconcildiff",
             Self::ReqBisec => "reqbisec",
             Self::UtxoProof { .. } => "utxproof",
+            Self::GetAdvice { .. } => "getadvice",
+            Self::Advice { .. } => "advice",
             Self::Unknown { command, .. } => command.as_str(),
         }
     }
@@ -733,6 +757,7 @@ impl Message {
             | Self::WtxidRelay
             | Self::SendAddrV2
             | Self::SendUtxProof
+            | Self::SendAdvice
             | Self::GetAddr
             | Self::Mempool
             | Self::ReqBisec => {}
@@ -783,6 +808,13 @@ impl Message {
                 out.extend_from_slice(block_hash.as_bytes());
                 write_var_bytes(&mut out, bundle);
             }
+            Self::GetAdvice { block_hash } => {
+                out.extend_from_slice(block_hash.as_bytes());
+            }
+            Self::Advice { block_hash, data } => {
+                out.extend_from_slice(block_hash.as_bytes());
+                write_var_bytes(&mut out, data);
+            }
         }
         out
     }
@@ -832,6 +864,7 @@ impl Message {
             "wtxidrelay" => Self::WtxidRelay,
             "sendaddrv2" => Self::SendAddrV2,
             "sendutxproof" => Self::SendUtxProof,
+            "sendadvice" => Self::SendAdvice,
             "getaddr" => Self::GetAddr,
             "mempool" => Self::Mempool,
             "feefilter" => Self::FeeFilter(d.read_u64_le().map_err(|e| payload_err(name, e))?),
@@ -1114,6 +1147,28 @@ impl Message {
                 Self::UtxoProof {
                     block_hash: avila_consensus::hash::BlockHash::from_bytes(hash_bytes),
                     bundle,
+                }
+            }
+            "getadvice" => {
+                let hash_bytes: [u8; 32] = d
+                    .read_bytes(32)
+                    .map_err(|e| payload_err(name, e))?
+                    .try_into()
+                    .map_err(|_| payload_err(name, "hash width"))?;
+                Self::GetAdvice {
+                    block_hash: avila_consensus::hash::BlockHash::from_bytes(hash_bytes),
+                }
+            }
+            "advice" => {
+                let hash_bytes: [u8; 32] = d
+                    .read_bytes(32)
+                    .map_err(|e| payload_err(name, e))?
+                    .try_into()
+                    .map_err(|_| payload_err(name, "hash width"))?;
+                let data = d.read_var_bytes().map_err(|e| payload_err(name, e))?;
+                Self::Advice {
+                    block_hash: avila_consensus::hash::BlockHash::from_bytes(hash_bytes),
+                    data,
                 }
             }
             _ => {
@@ -1505,6 +1560,29 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn advice_messages_round_trip() {
+        let hash = avila_consensus::hash::BlockHash::from_bytes([0xab; 32]);
+        let req = Message::GetAdvice { block_hash: hash };
+        assert_eq!(round_trip(&req), req);
+        let resp = Message::Advice {
+            block_hash: hash,
+            data: b"AVADV01\0payload".to_vec(),
+        };
+        assert_eq!(round_trip(&resp), resp);
+        assert_eq!(round_trip(&Message::SendAdvice), Message::SendAdvice);
+    }
+
+    #[test]
+    fn advice_messages_reject_truncation() {
+        assert!(Message::decode(&cmd("getadvice"), &[0u8; 16]).is_err());
+        assert!(Message::decode(&cmd("advice"), &[0u8; 16]).is_err());
+        // Hash + declared-overlong data → error, not panic.
+        let mut payload = vec![0xabu8; 32];
+        payload.push(0xfc);
+        assert!(Message::decode(&cmd("advice"), &payload).is_err());
     }
 
     #[test]

@@ -669,6 +669,9 @@ pub struct PeerManager<S> {
     /// utreexo spend bundles (shadow connect). See
     /// [`Self::set_utxproof_consumer`].
     ask_utxproof: bool,
+    /// Whether new sessions advertise `sendadvice` — we want their
+    /// sig-advice sidecars when set. See [`Self::set_advice_consumer`].
+    ask_advice: bool,
     /// `relay.block.compact` — negotiate BIP152 `sendcmpct` on new
     /// sessions and accept `cmpctblock` announcements.
     compact_blocks: bool,
@@ -992,6 +995,7 @@ impl<S: Read + Write> PeerManager<S> {
             proxy_failures: 0,
             cell_bytes: 0,
             ask_utxproof: false,
+            ask_advice: false,
             compact_blocks: true,
             compact_hb: true,
             compact_serve: true,
@@ -1314,6 +1318,7 @@ impl<S: Read + Write> PeerManager<S> {
         session.set_clock(self.clock);
         session.set_cell_bytes(self.cell_bytes);
         session.ask_utxproof(self.ask_utxproof);
+        session.ask_advice(self.ask_advice);
         // BIP-152 `announce` bit = "we will send YOU hb cmpctblock
         // announcements" — an offer, not a request. Only advertise it
         // when we actually serve (a peer that can't answer
@@ -1890,6 +1895,14 @@ impl<S: Read + Write> PeerManager<S> {
     /// `-v2transport` which only affects new links).
     pub fn set_utxproof_consumer(&mut self, on: bool) {
         self.ask_utxproof = on;
+    }
+
+    /// Whether sessions advertise `sendadvice` — on when the node runs
+    /// with an advice dir and wants peers' sig-hint sidecars. Serving
+    /// sidecars is unconditional (a peer with files serves any
+    /// `getadvice`; a peer without stays silent).
+    pub fn set_advice_consumer(&mut self, on: bool) {
+        self.ask_advice = on;
     }
 
     /// BIP152 configuration — `compact` negotiates `sendcmpct` and
@@ -2619,6 +2632,18 @@ impl<S: Read + Write> PeerManager<S> {
             };
             if let Some(req) = peer.sync.want_blocks_excluding(cs, &unfetched, &reserved) {
                 let _ = peer.session.send(&req);
+                // Advice-capable peers get a sidecar request per
+                // fetched block — the stream beats the block to us and
+                // lands in the advice dir before connect runs.
+                if cs.advice_dir().is_some()
+                    && peer.session.peer().is_some_and(|p| p.advice)
+                {
+                    for hash in &unfetched {
+                        let _ = peer.session.send(&Message::GetAdvice {
+                            block_hash: *hash,
+                        });
+                    }
+                }
             }
             if !limited_only {
                 next += take;
@@ -2774,6 +2799,7 @@ impl<S: Read + Write> PeerManager<S> {
                     addrv2: false,
                     recon: None,
                     utxproof: false,
+                    advice: false,
                     cmpct: None,
                 });
                 if let Some(their) = info.recon.clone() {
@@ -3421,6 +3447,40 @@ impl<S: Read + Write> PeerManager<S> {
                 // + ordering live in chainstate; a bundle for a block
                 // we never asked about is still harmless state.
                 cs.offer_bundle(block_hash, bundle);
+            }
+            SessionEvent::Message(Message::GetAdvice { block_hash }) => {
+                // Serve this block's sidecar if we have one — silent
+                // when absent (the requester's fetch timeout falls
+                // back to ordinary verification either way).
+                if let Some(dir) = cs.advice_dir() {
+                    if let Some(map) =
+                        avila_consensus::advice::read_advice_file(dir, &block_hash)
+                    {
+                        let data =
+                            avila_consensus::advice::encode_advice_block(&block_hash, &map);
+                        let _ = peer.session.send(&Message::Advice {
+                            block_hash,
+                            data,
+                        });
+                    }
+                }
+            }
+            SessionEvent::Message(Message::Advice { block_hash, data }) => {
+                // Stash a valid sidecar for when the block arrives —
+                // the embedded hash must match the announced one and
+                // the stream must decode (every hint is still verified
+                // at connect time, so a bad stream wastes bytes, never
+                // corrupts state).
+                if let Some(dir) = cs.advice_dir() {
+                    if let Some((hash, map)) =
+                        avila_consensus::advice::decode_advice_block(&data)
+                    {
+                        if hash == block_hash {
+                            let _ =
+                                avila_consensus::advice::write_advice_file(dir, &block_hash, &map);
+                        }
+                    }
+                }
             }
             SessionEvent::Message(Message::NotFound(invs)) => {
                 // The peer can't serve these — release the slots so the
