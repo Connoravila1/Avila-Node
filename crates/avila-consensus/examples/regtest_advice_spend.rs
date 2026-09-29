@@ -1,3 +1,6 @@
+// Rig/test helper — panics on misuse are the intent.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! regtest_advice_spend — helper for the two-node advice rig.
 //!
 //! `addr` — print the regtest P2PKH address for a fixed test key.

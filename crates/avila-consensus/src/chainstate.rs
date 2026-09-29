@@ -3406,7 +3406,7 @@ impl Chainstate {
                 script_checks: self.script_checks(&hash, &params),
                 script_pool: self.script_pool.as_deref(),
                 advice: advice_map.as_ref(),
-                advice_collect: self.advice_collect.then(|| &collect_map),
+                advice_collect: self.advice_collect.then_some(&collect_map),
             };
             match connect::connect_block_full(block, &mut self.utxo, &ctx) {
                 Ok((undo, check, receipt)) => {
@@ -4153,7 +4153,7 @@ impl Chainstate {
                 script_checks: self.script_checks(&hash, &params),
                 script_pool: pool.as_deref(),
                 advice: advice_map.as_ref(),
-                advice_collect: self.advice_collect.then(|| &collect_map),
+                advice_collect: self.advice_collect.then_some(&collect_map),
             };
             match connect::connect_block_full(&block, &mut bg.utxo, &ctx) {
                 Ok((_undo, check, receipt)) => {

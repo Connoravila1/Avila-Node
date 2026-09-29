@@ -1038,6 +1038,7 @@ impl<'a> DeferredChecker<'a> {
     /// and the r-match converts that into "no advice" (inline verify)
     /// instead of a poisoned record.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tx: &'a Transaction,
         n_in: usize,

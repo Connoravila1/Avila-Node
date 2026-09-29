@@ -46,37 +46,6 @@ struct Rec {
     txs: Vec<(Vec<u8>, Vec<Option<Source>>)>,
 }
 
-/// Lax DER→(r,s,hashtype) — same helper shape as corpus_extract.
-fn der_compact_parts(sig: &[u8]) -> Option<([u8; 32], [u8; 32], u8)> {
-    if sig.len() < 9 || sig[0] != 0x30 || sig[2] != 0x02 {
-        return None;
-    }
-    let rlen = sig[3] as usize;
-    if rlen == 0 || rlen > 33 || 5 + rlen >= sig.len() {
-        return None;
-    }
-    let r_off = 4;
-    if sig[r_off + rlen] != 0x02 {
-        return None;
-    }
-    let slen = sig[r_off + rlen + 1] as usize;
-    let s_off = r_off + rlen + 2;
-    if slen == 0 || slen > 33 || s_off + slen > sig.len() {
-        return None;
-    }
-    let pad = |v: &[u8]| {
-        let mut b = [0u8; 32];
-        let k = v.len().min(32);
-        b[32 - k..].copy_from_slice(&v[v.len() - k..]);
-        b
-    };
-    Some((
-        pad(&sig[r_off..r_off + rlen]),
-        pad(&sig[s_off..s_off + slen]),
-        0,
-    ))
-}
-
 fn u32at(b: &[u8], o: &mut usize) -> u32 {
     let v = u32::from_le_bytes(b[*o..*o + 4].try_into().unwrap());
     *o += 4;
@@ -141,7 +110,6 @@ fn parse_corpus(raw: &[u8]) -> Vec<Rec> {
 }
 
 struct Task {
-    height: u32,
     block_slot: usize,
     tx: Transaction,
     outs: Vec<TxOut>,
@@ -313,7 +281,6 @@ fn main() {
                 .map(|o| o.as_ref().unwrap().out.clone())
                 .collect();
             tasks.push(Task {
-                height: b.height,
                 block_slot: bi,
                 tx,
                 outs: owned,
@@ -386,7 +353,7 @@ fn main() {
             let mut o = 0usize;
             while o + 97 <= entries.len() {
                 if entries[o + 32] != ADVICE_ABSENT {
-                    if inject_count % inject_every == 0 {
+                    if inject_count.is_multiple_of(inject_every) {
                         entries[o + 32] ^= 0x01;
                     }
                     inject_count += 1;

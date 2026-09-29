@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
@@ -357,6 +357,11 @@ pub struct CoinsBackend {
     /// Atomic so commits stay `&self` (the backend lives behind `Arc`
     /// inside `UtxoSet`; the sync loop is still the only writer).
     coins_len: AtomicU64,
+    /// Cached `tip_height` — stored *after* `coins_len` on every
+    /// commit so a reader that observes an advanced tip always sees
+    /// the absorbed row count (the meta table would lead by a few
+    /// instructions and tear `UtxoSet::len`).
+    tip: AtomicU32,
     /// Experiment counters — `(commits, coin puts, coin deletes)`
     /// actually executed. Lets benchmarks measure how much churn the
     /// write-back cache absorbs vs what reaches disk.
@@ -462,7 +467,7 @@ impl CoinsBackend {
         // `has_tables` distinguishes a truly fresh database (stamp the
         // requested markers) from a pre-format one (absent → Legacy,
         // and absent engine → Redb: every pre-engine database is).
-        let (coins_len, has_tables, stored_format, stored_engine) = {
+        let (coins_len, stored_tip, has_tables, stored_format, stored_engine) = {
             let r = db
                 .begin_read()
                 .map_err(|e| std::io::Error::other(format!("coinsdb read tx: {e}")))?;
@@ -472,6 +477,11 @@ impl CoinsBackend {
                         .get(K_LEN)
                         .map_err(|e| std::io::Error::other(format!("coinsdb meta: {e}")))?
                         .map(|g| u64::from_le_bytes(g.value().try_into().unwrap_or_default()))
+                        .unwrap_or(0);
+                    let tip = m
+                        .get(K_TIP)
+                        .map_err(|e| std::io::Error::other(format!("coinsdb meta: {e}")))?
+                        .and_then(|g| g.value().try_into().ok().map(u32::from_le_bytes))
                         .unwrap_or(0);
                     let fmt = m
                         .get(K_FORMAT)
@@ -483,9 +493,9 @@ impl CoinsBackend {
                         .map_err(|e| std::io::Error::other(format!("coinsdb meta: {e}")))?
                         .and_then(|g| g.value().first().copied())
                         .and_then(Engine::from_byte);
-                    (len, true, fmt, eng)
+                    (len, tip, true, fmt, eng)
                 }
-                Err(_) => (0, false, None, None), // fresh database — no tables yet
+                Err(_) => (0, 0, false, None, None), // fresh database — no tables yet
             }
         };
         // No markers on an existing database = written before formats/
@@ -584,6 +594,7 @@ impl CoinsBackend {
             hash,
             shadow: None,
             coins_len: AtomicU64::new(coins_len),
+            tip: AtomicU32::new(stored_tip),
             stats: std::sync::Mutex::new((0, 0, 0)),
         })
     }
@@ -622,13 +633,7 @@ impl CoinsBackend {
     /// backend (genesis never connects, so height 0 is the empty set).
     #[must_use]
     pub fn tip_height(&self) -> u32 {
-        self.db
-            .begin_read()
-            .ok()
-            .and_then(|r| r.open_table(META).ok())
-            .and_then(|m| m.get(K_TIP).ok().flatten())
-            .and_then(|g| g.value().try_into().ok().map(u32::from_le_bytes))
-            .unwrap_or(0)
+        self.tip.load(Ordering::Relaxed)
     }
 
     /// The number of persisted coins.
@@ -876,6 +881,9 @@ impl CoinsBackend {
                 (self.coins_len() as i64 + delta).max(0) as u64,
                 Ordering::Relaxed,
             );
+            if let Some(tip) = tip {
+                self.tip.store(tip, Ordering::Relaxed);
+            }
             return Ok(());
         }
         let w = self
@@ -959,6 +967,9 @@ impl CoinsBackend {
             (self.coins_len() as i64 + delta).max(0) as u64,
             Ordering::Relaxed,
         );
+        if let Some(tip) = tip {
+            self.tip.store(tip, Ordering::Relaxed);
+        }
         Ok(())
     }
 

@@ -164,7 +164,7 @@ impl Harness {
             script_checks: true,
             script_pool: Some(&self.pool),
             advice,
-            advice_collect: collect.then(|| &collect_map),
+            advice_collect: collect.then_some(&collect_map),
         };
         let (_undo, check, _r) = connect_block_full(block, &mut self.utxo, &ctx)?;
         self.tip = block.block_hash();

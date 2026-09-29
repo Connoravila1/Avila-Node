@@ -88,7 +88,7 @@ pub fn write_epoch(
         .iter()
         .map(|(op, e)| (crate::utxo_snapshot::outpoint_key(op), e))
         .collect();
-    ordered.sort_by(|a, b| a.0.cmp(&b.0));
+    ordered.sort_by_key(|a| a.0);
 
     // Live coins → .sr; tombstone keys → .del (same ascending order,
     // so one pass writes both).
@@ -168,9 +168,8 @@ impl EpochLayer {
             let mut f = File::open(&paths.del)?;
             let mut buf = Vec::new();
             std::io::Read::read_to_end(&mut f, &mut buf)?;
-            for chunk in buf.chunks_exact(36) {
-                del.push(<[u8; 36]>::try_from(chunk).unwrap_or([0u8; 36]));
-            }
+            let (chunks, _) = buf.as_chunks::<36>();
+            del.extend_from_slice(chunks);
         }
         let undos = load_undos(&paths.und)?;
         let delta = delta.unwrap_or(run.len() as i64 - del.len() as i64);
@@ -217,6 +216,10 @@ impl EpochLayer {
 
     pub fn len(&self) -> u64 {
         self.run.len() + self.del.len() as u64
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

@@ -282,7 +282,10 @@ pub fn batch_verify(records: &[Record]) -> Outcome {
         let Some(nonce) = nonce_point(rec, &r[i]) else {
             return Outcome::Fallback;
         };
-        let a = fresh_coeff(entropy[i * 32..(i + 1) * 32].try_into().unwrap());
+        let Some(ent) = <&[u8; 32]>::try_from(&entropy[i * 32..(i + 1) * 32]).ok() else {
+            return Outcome::Fallback;
+        };
+        let a = fresh_coeff(ent);
         terms.push((nonce, a, true)); // a_i · R_i — 96-bit coefficient
         let v = r[i] * sinv[i]; // v_i = r_i · s_i^-1
         let gi = group_of[i];
@@ -341,6 +344,7 @@ pub fn produce_advice(z: &[u8; 32], sig: &[u8; 64], pubkey: &[u8; 33]) -> Option
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -448,7 +452,7 @@ mod tests {
         let sv = U256::from_be_slice(&sig[32..]);
         let s_hi = n.wrapping_sub(&sv);
         let mut hi = sig;
-        hi[32..].copy_from_slice(&s_hi.to_be_bytes().as_slice()[..]);
+        hi[32..].copy_from_slice(s_hi.to_be_bytes().as_slice());
         let rec = Record {
             z,
             sig: hi,
@@ -463,7 +467,7 @@ mod tests {
         let z = [0x42u8; 32];
         let mut sig = [0u8; 64];
         sig[0] = 1; // r=1, s=0
-        assert!(produce_advice(&z, &sig, &[0x02; 33].into()).is_none());
+        assert!(produce_advice(&z, &sig, &[0x02; 33]).is_none());
     }
 
     #[test]
@@ -478,6 +482,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod bench {
     use super::tests::*;
     use super::*;
@@ -511,6 +516,7 @@ mod bench {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod stagebench {
     use super::tests::*;
     use super::*;
@@ -558,7 +564,7 @@ mod stagebench {
         let gid = |p: &[u8; 33]| *gmap.get(p).unwrap();
         let mut terms: Vec<(ProjectivePoint, Scalar)> = Vec::new();
         for (i, rec) in recs.iter().enumerate() {
-            let a = fresh_coeff(entropy[i * 32..(i + 1) * 32].try_into().unwrap());
+            let a = fresh_coeff(<&[u8; 32]>::try_from(&entropy[i * 32..(i + 1) * 32]).unwrap());
             terms.push((nonces[i].into(), a));
             let v = r[i] * sinv[i];
             accs[gid(&rec.pubkey)] -= a * v;
@@ -597,6 +603,7 @@ mod stagebench {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod msmtest {
     use super::tests::sk;
     use super::*;

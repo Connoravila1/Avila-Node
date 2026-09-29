@@ -338,7 +338,9 @@ impl UtxoSet {
     /// covers the dropped range against the remaining layers).
     pub fn drop_epochs_above(&mut self, tip: u32) {
         while self.runs.last().is_some_and(|l| l.tip > tip) {
-            let l = self.runs.pop().expect("checked");
+            let Some(l) = self.runs.pop() else {
+                break;
+            };
             crate::runs::remove_epoch(
                 l.paths
                     .run
@@ -1182,13 +1184,17 @@ impl UtxoSet {
         let Some(handle) = self.flush_join.take() else {
             return Ok(());
         };
-        let layer = self.flushing.take().expect("join without layer");
+        let Some(layer) = self.flushing.take() else {
+            return Ok(());
+        };
         let result = handle
             .join()
             .unwrap_or_else(|_| Err(std::io::Error::other("flush worker panicked")));
         match result {
             Ok(Some(epoch)) => {
-                let dir = self.runs_dir.clone().expect("epoch write without runs_dir");
+                let Some(dir) = self.runs_dir.clone() else {
+                    return Err(std::io::Error::other("epoch write without runs_dir"));
+                };
                 let l =
                     crate::runs::EpochLayer::open(&dir, epoch.seq, epoch.tip, Some(epoch.delta))?;
                 debug_assert!(
@@ -1370,8 +1376,7 @@ pub struct ConnectContext<'a> {
     /// (`txid -> entries`). Capture is a byproduct of ordinary
     /// verification — it never defers. Works on both the pool and the
     /// synchronous paths; the caller drains the map after the check.
-    pub advice_collect:
-        Option<&'a std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>>>,
+    pub advice_collect: Option<&'a CollectSink>,
 }
 
 /// A machine-checkable record of one block's connect — the
@@ -1885,7 +1890,7 @@ struct JobData {
     advice: Option<Vec<u8>>,
     /// Produce advice while verifying into this sink (`txid ->
     /// entries`) — shared with `ConnectContext::advice_collect`.
-    collect: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>>>,
+    collect: Option<CollectSink>,
 }
 
 /// A block's outstanding script checks: workers decrement
@@ -1906,8 +1911,7 @@ pub struct BlockCheck {
     /// Handle to the caller's per-block collect map — set when
     /// `ConnectContext::advice_collect` is in play; drained after
     /// `wait` via [`Self::take_advice_map`].
-    collect_sink:
-        Option<std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>>>,
+    collect_sink: Option<CollectSink>,
     /// Deferred/inline check counts for status reporting.
     pub advised_checks: std::sync::atomic::AtomicU64,
     /// Unadvised checks that verified inline.
@@ -2329,12 +2333,7 @@ fn connect_block_inner(
     // on the UTXO mutations happening around it.
     // `(tx, spent outs, advice, collect sink)` — the pool path lifts
     // these into `JobData`; the sync path runs them directly.
-    let mut script_jobs: Vec<(
-        &Transaction,
-        Vec<TxOut>,
-        Option<Vec<u8>>,
-        Option<CollectSink>,
-    )> = Vec::new();
+    let mut script_jobs: Vec<QueuedCheck> = Vec::new();
     let mut owned_jobs: Vec<std::sync::Arc<JobData>> = Vec::new();
 
     // Receipt accumulation (queue #5): the delta stream commits, per
@@ -2572,13 +2571,17 @@ fn connect_block_inner(
 /// The produce-mode sink: `txid -> entry stream`, one map per block.
 type CollectSink = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Txid, Vec<u8>>>>;
 
+/// One queued script check: `(tx, resolved prevouts, advice stream,
+/// produce-sink)`.
+type QueuedCheck<'a> = (
+    &'a Transaction,
+    Vec<TxOut>,
+    Option<Vec<u8>>,
+    Option<CollectSink>,
+);
+
 fn run_script_checks_advised(
-    jobs: &[(
-        &Transaction,
-        Vec<TxOut>,
-        Option<Vec<u8>>,
-        Option<CollectSink>,
-    )],
+    jobs: &[QueuedCheck],
     flags: crate::script::ScriptFlags,
 ) -> Result<(), crate::interpreter::ScriptError> {
     let sink = std::cell::RefCell::new(crate::sigchecker::DeferredSink::default());
@@ -2619,20 +2622,13 @@ fn run_script_checks_advised(
     }
     for tag in recheck {
         let (tx, outs, _, _) = &jobs[tag as usize];
-        if let Err(err) = check_input_scripts(tx, outs, flags) {
-            return Err(err);
-        }
+        check_input_scripts(tx, outs, flags)?;
     }
     Ok(())
 }
 
 fn run_script_checks(
-    jobs: &[(
-        &Transaction,
-        Vec<TxOut>,
-        Option<Vec<u8>>,
-        Option<CollectSink>,
-    )],
+    jobs: &[QueuedCheck],
     flags: crate::script::ScriptFlags,
 ) -> Result<(), crate::interpreter::ScriptError> {
     let workers = std::thread::available_parallelism()
