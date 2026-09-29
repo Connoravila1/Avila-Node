@@ -1973,3 +1973,35 @@ redb commit itself is the wall — overlap alone can't win when the
 commit outruns the window. Next levers: shrink what gets
 committed (swiftsync transient + spill-to-disk, or hash engine on
 a fresh datadir), not just hide it.
+
+## Experiment #33 — sorted-run (LSM) flush layers
+
+**Motivation.** #32 proved async commit overlap works but live IBD
+stayed ~1.6 blk/s: the redb commit itself (~60-80s per 1.4M-entry
+epoch against the 33GB btree) outlasts the window it overlaps, so
+joins still block. The right fix is not a faster btree commit — it is
+not doing btree commits at all during IBD.
+
+**Mechanism.** `AVILA_RUNS=1` turns each flush epoch into sequential
+files under `coinsdb/runs/`: `e-<seq>-<tip>.sr` (sorted coins via
+RunBuilder), `.del` (sorted tombstone keys — spends of older-layer
+coins), `.und` (undo records), `.ok` (commit marker written LAST; a
+crash mid-write leaves a markerless epoch that restore drops for
+replay). Attached epochs form an LSM read stack between the flushing
+layer and flat/backend, probed newest→oldest; a del-hit is definitive
+absence. The backend's meta tip stops moving per-epoch — chainstate's
+`committed_coins_tip` watermark covers attached runs; restore reattaches
+`.ok` epochs and `reconcile_backend` drops epochs `state.dat` never
+attested.
+
+**Evidence:** `churn_bench` @2048M — runs flush residual
+**229.4ms/commit** (vs 470 redb-async, 2061 sync), `backend commits 0`
+(the btree is never touched mid-run). Unit test
+`runs_flush_layers_and_reopens` covers layer shadowing, reopen
+reattach, undo sidecars, markerless-epoch discard. 569 tests green.
+`scan_window` tail-clamp fix: reads past EOF on the last sparse window
+previously returned `None` for tail keys.
+
+**Honest caveat:** run files accumulate without compaction (each
+probe walks all layers on a miss); depth is bounded by flush cadence
+(~1M entries/epoch) and bloom/merge layers remain future work.
