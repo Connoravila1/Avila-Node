@@ -112,3 +112,14 @@ is now precise — the working set is larger than the laptop's memory
 envelope, and every storage arrangement spends that envelope
 differently. The next win is a memory-shrinking design (bounded
 flat, filters, swiftsync), not a faster write path.
+
+## Research follow-up — 2026-10-01
+
+The [SwiftSync + Utreexo research note](../docs/IBD_SWIFTSYNC_UTREEXO_RESEARCH_NOTE_2026-10-01.md)
+records a relevant external approach and a correction to our earlier SwiftSync
+interpretation: the current `AVILA_SWIFTSYNC=1` path still retains full coins;
+the aggregate-only description in avenue 4 above is the proposed architecture,
+not an implemented end-to-end mode. Investigate full-validation SwiftSync with
+checked spent-coin data to remove the historical working set. The linked
+Floresta speed claims use assumevalid and do not establish a matched
+full-validation speedup for Avila Node.

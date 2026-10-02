@@ -14,3 +14,10 @@ comparisons from tradeoffs that change checks, trust, privacy or data availabili
 Keep downloadable datasets out of Git, identify them with checksums and retrieval
 instructions, and use small redistributable fixtures where appropriate. Publish
 negative results. Identify the smallest component other projects could adopt.
+
+## IBD research follow-up
+
+See the [SwiftSync + Utreexo research note](../docs/IBD_SWIFTSYNC_UTREEXO_RESEARCH_NOTE_2026-10-01.md)
+for the September 18 Optech proposal, the distinction from our current
+write-elision path, and the proposed full-validation experiment.
+This is a research lead, not a demonstrated Avila Node speedup.
