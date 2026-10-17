@@ -140,3 +140,29 @@ used a 512 MiB cap / 512 MiB reserve and peaked at 54 MiB over 112 seconds.
 A modern-chain watcher for heights 600,000–600,127 was rearmed under a 256
 MiB cap, but has no result because that height range has not been reached.
 IBD remains incomplete.
+
+## Later checkpoint and owned undo flush build
+
+Before installing the owned-undo-flush build, a clean stop persisted height
+200,176 with hash
+`00000000000003c91b94427e9605a6d2c21c688f33e443258c02310827ca2a88`. A
+separate status observation showed 199,887; it is recorded separately and is
+not the persisted checkpoint height. The new CLI and GUI were installed,
+and the service resumed at 06:42Z. Artifact SHA-256 values are CLI
+`adfa4d2cf3eeecd380af1094290c0464018638ba86e328b05845ff9b316c1d68` and GUI
+`261f631d312fb1eb5435be066faab9361a5f5a5ce0839f44e1efc44946063c3e`.
+
+At 2026-10-17T06:42:32.104174Z the installed CLI passed a clean restart,
+resuming at 200,176 with the same saved hash. The subsequent real-peer
+observation was 200,383 with 971,821 headers and six connections. Runtime
+validation continued to report `assume_valid_checkpoint: null` and
+`historical_scripts_required: true`. The attached 760×600 GUI showed height
+200,275; its close exited 0 while node PID 647865 continued to 200,383. The
+GUI check used a 512 MiB cap / 512 MiB reserve and peaked at 53 MiB over 30
+seconds. A heartbeat reported 16,129 entries, capacity 26,880, and 787,265
+accounted key bytes; these counters are not RSS. A collector for heights
+600,000–600,127 is armed under a 256 MiB cap / 256 MiB reserve; the health
+trace is armed under a 128 MiB cap / 128 MiB reserve. Neither has a
+modern-chain sample yet. IBD remains ongoing. The synthetic
+owned-undo comparison and native gate are documented in the
+[owned flush experiment](2026-10-17-owned-undo-flush.md).

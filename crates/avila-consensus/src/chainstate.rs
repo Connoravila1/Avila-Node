@@ -2783,7 +2783,7 @@ impl Chainstate {
             let h = base + 1 + i as u32;
             (h, self.chain[h as usize], u.clone())
         }));
-        self.utxo.flush_to_backend(&pending, tip)?;
+        self.utxo.flush_to_backend_owned(pending, tip)?;
         // `undos` is NOT cleared — the in-flight heights must stay
         // answerable until the join (a reorg mid-flight reads them for
         // disconnect). The join drains the covered prefix.

@@ -2164,3 +2164,34 @@ the validation report had no AssumeValid checkpoint and still required
 historical scripts. Closing the attached GUI exited 0 without stopping that
 node. A watcher for heights 600,000–600,127 is armed, with no result yet;
 IBD remains incomplete.
+
+## Experiment #83 — owned async undo handoff
+
+Added `flush_to_backend_owned(Vec, tip)` and moved Chainstate's pending undo
+vector into the worker, avoiding a deep clone at handoff. The borrowed
+compatibility path joins a prior worker before cloning; Chainstate still keeps
+its original undo tail until join for reorg lookup. A fixed synthetic probe
+verified exact tip, all 64 undo hashes/bodies, and eight seed coins after join
+and reopen for borrowed and owned modes: 65,536 spent coins with 1 KiB scripts
+per coin, totaling 67,108,864 script bytes. The borrowed pending vector is
+dropped immediately after handoff, matching production lifetime.
+
+In separate 1,024 MiB-cap processes, borrowed took 1,793 ms (`VmHWM` 228,828
+KiB; cgroup sample 351 MiB, 3 s) and owned took 1,877 ms (`VmHWM` 159,464 KiB;
+cgroup 283 MiB, 2 s). Cgroup accounting includes file cache; process `VmHWM`
+does not. These single trials had differing cache/clocks and make no speed or
+full-IBD/RSS claim. The full gate passed 1,158 Rust tests (five ignored), 14
+Python tests, Clippy, rustdoc, release CLI/GUI/example builds and smoke checks
+in 333 s at a 2,560 MiB cap / 1,024 MiB reserve (1,663 MiB peak). See the
+[owned undo flush note](2026-10-17-owned-undo-flush.md) for commands, exact
+results, artifact hashes, and the clean mainnet checkpoint context.
+
+After installation, the CLI clean-restart proof at
+2026-10-17T06:42:32.104174Z resumed at height 200,176 with the saved hash.
+The real-peer CLI then observed height 200,383, 971,821 headers, and six
+connections; validation still required historical scripts and had no AssumeValid
+checkpoint. The attached 760×600 GUI showed height 200,275; closing it exited 0
+while node PID 647865 continued to 200,383. Its 512 MiB-cap run peaked at 53
+MiB in 30 s. A first heartbeat's `pk` values (16,129 entries, capacity 26,880,
+787,265 key bytes) are cache accounting, not RSS. A modern-range collector and
+health trace are armed but have no result; full IBD continues.

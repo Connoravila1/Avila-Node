@@ -843,6 +843,52 @@ pub static PK_CACHE_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Pubkey-parse cache misses (successful parses are stored).
 pub static PK_CACHE_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Approximate parsed-pubkey-cache occupancy across worker threads.
+///
+/// Each field is read independently with relaxed ordering. While worker caches
+/// are mutating, the returned values need not describe one simultaneous
+/// instant. `retained_capacity` counts HashMap slots; `live_key_bytes` counts
+/// only the bytes in live key payloads. These are cache payload/capacity
+/// metrics, not an estimate of total heap use or RSS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ParsedPubkeyCacheStats {
+    /// Number of currently cached public keys.
+    pub live_entries: u64,
+    /// Total HashMap slot capacity retained by all live worker caches.
+    pub retained_capacity: u64,
+    /// Sum of key payload lengths for currently cached public keys.
+    pub live_key_bytes: u64,
+}
+
+#[derive(Default)]
+struct ParsedPubkeyCacheMetrics {
+    live_entries: std::sync::atomic::AtomicU64,
+    retained_capacity: std::sync::atomic::AtomicU64,
+    live_key_bytes: std::sync::atomic::AtomicU64,
+}
+
+static PK_CACHE_METRICS: ParsedPubkeyCacheMetrics = ParsedPubkeyCacheMetrics {
+    live_entries: std::sync::atomic::AtomicU64::new(0),
+    retained_capacity: std::sync::atomic::AtomicU64::new(0),
+    live_key_bytes: std::sync::atomic::AtomicU64::new(0),
+};
+
+/// Returns an O(1), lock-free snapshot of parsed-pubkey-cache occupancy.
+///
+/// The three relaxed loads are independent, so concurrent cache updates can
+/// make the fields momentarily inconsistent. Capacity is measured in map
+/// slots, and key bytes exclude allocator and hash-table overhead.
+#[must_use]
+pub fn parsed_pubkey_cache_stats() -> ParsedPubkeyCacheStats {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    ParsedPubkeyCacheStats {
+        live_entries: PK_CACHE_METRICS.live_entries.load(Relaxed),
+        retained_capacity: PK_CACHE_METRICS.retained_capacity.load(Relaxed),
+        live_key_bytes: PK_CACHE_METRICS.live_key_bytes.load(Relaxed),
+    }
+}
+
 /// Per-worker parsed-pubkey cache — `secp256k1_ec_pubkey_parse` costs
 /// ~11 µs (X decompress + sqrt) and P2PKH repeats the same 33-byte key
 /// across many inputs. Entries are byte-identical to re-parsing; failed
@@ -851,14 +897,78 @@ pub static PK_CACHE_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 const PK_CACHE_CAP: usize = 1 << 18;
 
 thread_local! {
-    static PK_CACHE: std::cell::RefCell<
-        std::collections::HashMap<Box<[u8]>, secp256k1::PublicKey>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static PK_CACHE: std::cell::RefCell<ParsedPubkeyCache<'static>> =
+        std::cell::RefCell::new(ParsedPubkeyCache::new(&PK_CACHE_METRICS));
+}
+
+struct ParsedPubkeyCache<'a> {
+    map: std::collections::HashMap<Box<[u8]>, secp256k1::PublicKey>,
+    live_key_bytes: u64,
+    metrics: &'a ParsedPubkeyCacheMetrics,
+}
+
+impl<'a> ParsedPubkeyCache<'a> {
+    fn new(metrics: &'a ParsedPubkeyCacheMetrics) -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            live_key_bytes: 0,
+            metrics,
+        }
+    }
+
+    fn clear(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let entries = self.map.len() as u64;
+        let key_bytes = self.live_key_bytes;
+        self.map.clear();
+        self.live_key_bytes = 0;
+        self.metrics.live_entries.fetch_sub(entries, Relaxed);
+        self.metrics.live_key_bytes.fetch_sub(key_bytes, Relaxed);
+    }
+
+    fn insert(&mut self, pubkey: &[u8], pk: secp256k1::PublicKey) {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let old_capacity = self.map.capacity();
+        let replaced = self.map.insert(pubkey.into(), pk).is_some();
+        let capacity_delta = self.map.capacity().saturating_sub(old_capacity) as u64;
+        if replaced {
+            self.metrics
+                .retained_capacity
+                .fetch_add(capacity_delta, Relaxed);
+            return;
+        }
+
+        let key_bytes = pubkey.len() as u64;
+        self.live_key_bytes = self.live_key_bytes.saturating_add(key_bytes);
+        self.metrics.live_entries.fetch_add(1, Relaxed);
+        self.metrics.live_key_bytes.fetch_add(key_bytes, Relaxed);
+        self.metrics
+            .retained_capacity
+            .fetch_add(capacity_delta, Relaxed);
+    }
+}
+
+impl Drop for ParsedPubkeyCache<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        self.metrics
+            .live_entries
+            .fetch_sub(self.map.len() as u64, Relaxed);
+        self.metrics
+            .retained_capacity
+            .fetch_sub(self.map.capacity() as u64, Relaxed);
+        self.metrics
+            .live_key_bytes
+            .fetch_sub(self.live_key_bytes, Relaxed);
+    }
 }
 
 fn pk_cache_get(pubkey: &[u8]) -> Option<Result<secp256k1::PublicKey, secp256k1::Error>> {
     PK_CACHE.with(|c| {
-        let hit = c.borrow().get(pubkey).copied();
+        let hit = c.borrow().map.get(pubkey).copied();
         if hit.is_some() {
             PK_CACHE_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else {
@@ -870,11 +980,11 @@ fn pk_cache_get(pubkey: &[u8]) -> Option<Result<secp256k1::PublicKey, secp256k1:
 
 fn pk_cache_put(pubkey: &[u8], pk: secp256k1::PublicKey) {
     PK_CACHE.with(|c| {
-        let mut m = c.borrow_mut();
-        if m.len() >= PK_CACHE_CAP {
-            m.clear();
+        let mut cache = c.borrow_mut();
+        if cache.map.len() >= PK_CACHE_CAP {
+            cache.clear();
         }
-        m.insert(pubkey.into(), pk);
+        cache.insert(pubkey, pk);
     });
 }
 

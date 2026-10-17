@@ -1128,6 +1128,31 @@ impl UtxoSet {
         new_undos: &[(u32, crate::hash::BlockHash, BlockUndo)],
         tip: u32,
     ) -> std::io::Result<()> {
+        if self.backend.is_none() {
+            return Ok(());
+        }
+        // Preserve the borrowed path's old ordering: release the prior
+        // worker and its undo vector before cloning the next batch.
+        self.join_flush()?;
+        self.flush_to_backend_owned(new_undos.to_vec(), tip)
+    }
+
+    /// Flushes pending writes with ownership of the undo records, avoiding an
+    /// additional deep copy before the asynchronous commit worker takes them.
+    /// The borrowed [`Self::flush_to_backend`] remains available to callers
+    /// that need to retain their input slice.
+    ///
+    /// Coins, undo records, and `tip` remain part of the same atomic backend
+    /// commit (or the same sorted-run epoch). The in-flight coin snapshot stays
+    /// readable until [`Self::join_flush`] observes the worker result.
+    ///
+    /// # Errors
+    /// `io::Error` on backend transaction failure.
+    pub fn flush_to_backend_owned(
+        &mut self,
+        undos: Vec<(u32, crate::hash::BlockHash, BlockUndo)>,
+        tip: u32,
+    ) -> std::io::Result<()> {
         let Some(be) = self.backend.clone() else {
             return Ok(());
         };
@@ -1156,7 +1181,6 @@ impl UtxoSet {
             bytes: bytes_taken,
             tip,
         });
-        let undos: Vec<(u32, crate::hash::BlockHash, BlockUndo)> = new_undos.to_vec();
         if let Some(dir) = self.runs_dir.clone() {
             // LSM path: the worker writes the epoch as sorted-run
             // files (sequential IO) instead of a B-tree commit. The
@@ -4108,8 +4132,17 @@ mod tests {
         assert_eq!(set.len(), 2);
 
         // Epoch 1 → worker. `map` is now empty; A and B live in the
-        // flushing snapshot.
-        set.flush_to_backend(&[], 1).unwrap();
+        // flushing snapshot. The owned API transfers its undo vector to
+        // the worker; it must land with the matching tip in the same commit.
+        let undo_hash = BlockHash::from_bytes([0xD4; 32]);
+        let persisted_undo = BlockUndo {
+            txs: vec![TxUndo {
+                spent: vec![mk_coin(50, 0)],
+                overwritten: Vec::new(),
+            }],
+        };
+        set.flush_to_backend_owned(vec![(1, undo_hash, persisted_undo.clone())], 1)
+            .unwrap();
         assert_eq!(set.map_stats().0, 0);
         assert_eq!(set.len(), 2, "len must count the flushing layer");
 
@@ -4138,6 +4171,7 @@ mod tests {
         assert_eq!(be.get(&b_op).map(|c| c.out.value), Some(200));
         assert_eq!(be.get(&c_op).map(|c| c.out.value), Some(300));
         assert_eq!(be.tip_height(), 2);
+        assert_eq!(be.undo_entry(1), Some((undo_hash, persisted_undo)));
         assert_eq!(set.len(), 2);
         assert!(set.flushing.is_none() && set.flush_join.is_none());
         let _ = std::fs::remove_dir_all(&dir);

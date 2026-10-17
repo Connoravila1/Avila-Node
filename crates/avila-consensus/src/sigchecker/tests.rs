@@ -10,6 +10,125 @@ use crate::transaction::{OutPoint, TxIn, Witness};
 
 use bitcoin::hashes::Hash as _;
 
+static TEST_PK_CACHE_METRICS: ParsedPubkeyCacheMetrics = ParsedPubkeyCacheMetrics {
+    live_entries: std::sync::atomic::AtomicU64::new(0),
+    retained_capacity: std::sync::atomic::AtomicU64::new(0),
+    live_key_bytes: std::sync::atomic::AtomicU64::new(0),
+};
+
+thread_local! {
+    static TEST_THREAD_PK_CACHE: std::cell::RefCell<ParsedPubkeyCache<'static>> =
+        std::cell::RefCell::new(ParsedPubkeyCache::new(&TEST_PK_CACHE_METRICS));
+}
+
+#[test]
+fn parsed_pubkey_cache_metrics_track_insert_replace_clear_and_drop() {
+    let metrics = ParsedPubkeyCacheMetrics::default();
+    let secret = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+    let public = secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &secret);
+    let key = public.serialize();
+    let mut cache = ParsedPubkeyCache::new(&metrics);
+
+    cache.insert(&key, public);
+    let first_capacity = cache.map.capacity() as u64;
+    assert_eq!(
+        metrics
+            .live_entries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        metrics
+            .retained_capacity
+            .load(std::sync::atomic::Ordering::Relaxed),
+        first_capacity
+    );
+    assert_eq!(
+        metrics
+            .live_key_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        key.len() as u64
+    );
+
+    // Replacing a parsed value for an existing key preserves the original
+    // cache occupancy accounting.
+    cache.insert(&key, public);
+    assert_eq!(
+        metrics
+            .live_entries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        metrics
+            .live_key_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        key.len() as u64
+    );
+
+    cache.clear();
+    assert_eq!(
+        metrics
+            .live_entries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        metrics
+            .live_key_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        metrics
+            .retained_capacity
+            .load(std::sync::atomic::Ordering::Relaxed),
+        first_capacity
+    );
+    drop(cache);
+    assert_eq!(
+        metrics
+            .retained_capacity
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+#[test]
+fn parsed_pubkey_cache_metrics_subtract_thread_local_cache_on_exit() {
+    let handle = std::thread::spawn(|| {
+        let secret = secp256k1::SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let public = secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &secret);
+        TEST_THREAD_PK_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.insert(&public.serialize(), public);
+            assert_eq!(cache.map.len(), 1);
+            assert!(cache.map.capacity() > 0);
+            assert!(cache.live_key_bytes > 0);
+        });
+    });
+    handle.join().unwrap();
+
+    assert_eq!(
+        TEST_PK_CACHE_METRICS
+            .live_entries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        TEST_PK_CACHE_METRICS
+            .retained_capacity
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        TEST_PK_CACHE_METRICS
+            .live_key_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
 fn txid(b: u8) -> Txid {
     Txid::from_bytes([b; 32])
 }
