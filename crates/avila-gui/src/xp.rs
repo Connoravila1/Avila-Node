@@ -1952,6 +1952,7 @@ fn blurb(page: Page) -> &'static str {
         Page::Overview => "Your node at a glance",
         Page::Chain => "Blocks and what was proven",
         Page::Peers => "Who you're connected to",
+        Page::Network => "Network traffic",
         Page::Activity => "What just happened",
         Page::Config => "Every knob the node runs by",
         Page::Toybox => "The game and the skins",

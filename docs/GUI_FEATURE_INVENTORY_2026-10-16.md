@@ -2,13 +2,33 @@
 
 This is a source-based functional inventory of the current Avila GUI, compared with the stable Bitcoin Core GUI release **31.1**. The upstream comparison is pinned to the [`v31.1` release tag](https://github.com/bitcoin/bitcoin/tree/v31.1/src/qt); the official [31.1 release page](https://bitcoincore.org/en/releases/31.1/) and [release index](https://bitcoincore.org/en/releases/) identify that release. Source links below use the immutable tag, not `master`.
 
+**Baseline and follow-up:** the gap inventory below was first captured against Avila source revision [`f59b690`](https://github.com/Connoravila1/Avila-Node/commit/f59b690), before the current block-inspector and operator-shell work. The “Implementation follow-up” records current-branch source additions so baseline absence statements are not mistaken for current status. Native build/test results and live screenshots remain pending; the statements here are source-level only.
+
 ## Evidence limits
 
 This document inspects routes, actions, node models, and backend RPC dispatch. It does not assess rendered layout, visual hierarchy, keyboard usability, screen-reader behavior, or accessibility. No native GUI screenshots were available during this inventory; source cannot substitute for a screenshot-based product audit. The GUI has `--demo` and several appearance/toy modes, but those are excluded from claims about live node capabilities. See [app route dispatch](../crates/avila-gui/src/app.rs#L355) and the explicit demo/live distinction in [model.rs](../crates/avila-gui/src/model.rs#L1).
 
 “Absent from GUI” below means no route/action or data flow was found in the live page dispatch and its source, not merely that a particular menu label was missing. “Backend ready” means the node source exposes relevant data or commands; it does not mean there is already a stable GUI-facing contract for that workflow.
 
-## What the live GUI already exposes
+## Implementation follow-up — current branch source
+
+The original table is a baseline ledger from `f59b690`; current source has since added the following live GUI paths. These are implementation facts, not claims that a native build, runtime behavior, or rendered layout has been verified.
+
+| Added path | Current source behavior | Evidence |
+|---|---|---|
+| Block inspector | Chain recent-block rows open an inspector. It searches by height or hash and follows adjacent block hashes. Header fields and measured body size, weight, transaction count and summaries are shown; body state distinguishes available, header-only, pruned and unavailable. Transactions are fetched in 100-item pages and retained up to 2,000 summaries. The weight bar is explicitly partial until all displayed transactions are loaded; it composes loaded transaction weights, distinguishing coinbase. | [chain.rs](../crates/avila-gui/src/pages/chain.rs#L320), [block_inspector.rs](../crates/avila-gui/src/pages/block_inspector.rs#L16), [block_detail.rs](../crates/avila-gui/src/pages/block_detail.rs#L73), [block_detail.rs](../crates/avila-gui/src/pages/block_detail.rs#L113) |
+| Network traffic history | A dedicated page shows node-wide cumulative bytes and derives rates from bounded session samples; discontinuities and counter resets are omitted. | [network_traffic.rs](../crates/avila-gui/src/pages/network_traffic.rs#L19), [session.rs](../crates/avila-gui/src/session.rs#L930) |
+| Operator actions | The standard shell has an Operator menu for opening config/data/log folders, copying bounded address-free node diagnostics, and navigating to common pages. It does not provide a raw RPC console. | [operator.rs](../crates/avila-gui/src/operator.rs#L18), [app.rs](../crates/avila-gui/src/app.rs#L994) |
+| Full historical script verification | GUI startup accepts `--full-verify`; Settings also has a run option that disables the assume-valid checkpoint. The normal default remains unchanged. | [main.rs](../crates/avila-gui/src/main.rs#L138), [app.rs](../crates/avila-gui/src/app.rs#L185), [settings.rs](../crates/avila-gui/src/pages/settings.rs#L292), [session.rs](../crates/avila-gui/src/session.rs#L458) |
+| Data-directory ownership and config-seeded limits | The sync worker holds the data-directory `.lock` for the run. Configured prune, dbcache and mempool limits seed the GUI run settings rather than being silently replaced by GUI defaults. | [session.rs](../crates/avila-gui/src/session.rs#L575), [session.rs](../crates/avila-gui/src/session.rs#L959), [app.rs](../crates/avila-gui/src/app.rs#L158), [app.rs](../crates/avila-gui/src/app.rs#L166) |
+
+Native build/tests and screenshot capture are pending. No visual or accessibility conclusions are drawn from this source update.
+
+### Remaining gaps after these additions
+
+Full transaction inputs/outputs and prevout-based fee computation are not shown in the block inspector; it has no fee visualization. There is still no RPC/debug console, explicit reorg timeline or branch graph, or wallet workflow (send/receive, address book, backup, encryption, passphrase management, coin control or PSBT). These remain distinct from the now-present block summary/composition and network traffic paths.
+
+## What the live GUI already exposed at baseline f59b690
 
 The standard navigation has Overview, Chain, Peers, Activity, Config, and Settings. Toybox is conditional. The page dispatch confirms these are the live views and distinguishes the optional toy page ([rail.rs](../crates/avila-gui/src/rail.rs#L13), [app.rs](../crates/avila-gui/src/app.rs#L375)).
 
@@ -24,7 +44,7 @@ The standard navigation has Overview, Chain, Peers, Activity, Config, and Settin
 
 The classic skin adds a minimal `File`, `Options`, `Help`, and `Node` menu, start/stop and copy-tip actions, and the original Send Coins/Address Book bitmap buttons. The buttons are intentionally inert and disclose that Avila does not hold or send coins; the “Generate Coins” item is disabled. This is historical chrome, not a wallet or menu parity implementation ([classic.rs](../crates/avila-gui/src/classic.rs#L268), [classic.rs](../crates/avila-gui/src/classic.rs#L309)).
 
-## Gaps and readiness
+## Baseline gaps and readiness at f59b690
 
 Priority is based on operator value for a validating node: first make current state inspectable and explainable, then add workflows that require a wallet or broader backend. “Core parity” describes a function present in Bitcoin Core 31.1’s GUI, not a requirement that Avila become a wallet.
 
@@ -50,7 +70,7 @@ Avila’s normal shell exposes **pages**, not a comparable menu bar: navigation 
 
 ## Block visualization: recommended scope
 
-The highest-value addition is an **inspectable block view**, not an ornamental chain graphic. Avila already has a useful chain-level visualization: the ribbon conveys chain coverage and validation status, while the overview shows a fee staircase for the prospective next block. Neither answers “what is in this block?”
+The highest-value addition in the baseline inventory is an **inspectable block view**, not an ornamental chain graphic. The current branch now has a first block inspector (see the implementation follow-up); Avila also has a chain-level ribbon for chain coverage and validation status, while the overview shows a fee staircase for the prospective next block. Neither chart replaces transaction-level block inspection.
 
 Recommended sequence:
 

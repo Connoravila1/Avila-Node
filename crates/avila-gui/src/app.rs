@@ -40,6 +40,7 @@ pub struct App {
     ribbon_view: View,
     /// The Config page's live-edit state — drafts, pending, overrides.
     config_page: pages::config::ConfigPage,
+    block_inspector: pages::block_inspector::State,
     /// The TOML this node was loaded from — the Config page offers it
     /// up for the knobs that only a restart can apply.
     config_file: Option<std::path::PathBuf>,
@@ -84,12 +85,19 @@ pub struct App {
     close: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Per-launch overrides supplied by the command line.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StartOptions {
+    pub fast_ibd: bool,
+    pub full_verify: bool,
+}
+
 impl App {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         node: Node,
         demo: bool,
-        fast_ibd: bool,
+        start_options: StartOptions,
         theme_override: Option<ThemeChoice>,
         close: std::sync::Arc<std::sync::atomic::AtomicBool>,
         // The TOML the node was loaded from — restart knobs open it.
@@ -155,6 +163,10 @@ impl App {
         if let Some(mb) = node.config().get().storage.prune_mb {
             run.prune_mib = mb.to_string();
         }
+        if let Some(mib) = node.config().get().storage.dbcache_mb {
+            run.dbcache_mib = mib.to_string();
+        }
+        run.maxmempool_mb = node.config().get().mempool.max_mb.to_string();
         // `net.connect` in the config seeds the same field — running
         // the GUI against a file should connect to its peers, not the
         // hardcoded regtest default.
@@ -170,10 +182,13 @@ impl App {
         if !connect.is_empty() {
             run.connect = connect;
         }
-        // `--fast-ibd` overrides the welcome/settings default for this
-        // launch — the running node's choice, not a persisted pref.
-        if fast_ibd {
+        // Command-line verification/performance overrides apply to this
+        // launch and do not change the saved GUI preferences.
+        if start_options.fast_ibd {
             run.fast_ibd = true;
+        }
+        if start_options.full_verify {
+            run.full_verify = true;
         }
         let applied = prefs.clone();
         let mut session = Session::new(demo);
@@ -231,6 +246,7 @@ impl App {
             peer_sort: PeerSort::default(),
             ribbon_view: View::default(),
             config_page: pages::config::ConfigPage::default(),
+            block_inspector: pages::block_inspector::State::default(),
             toys: toybox::Toys::default(),
             toy_posed: 0,
             applied,
@@ -281,6 +297,7 @@ impl App {
     }
 
     fn start(&mut self) {
+        self.block_inspector = pages::block_inspector::State::default();
         // Re-read the file so edits made between runs actually land —
         // the Config page's "restart to apply" banner depends on it.
         if let Some(file) = &self.config_file {
@@ -369,6 +386,13 @@ impl App {
                 network,
                 swirl: self.swirl.as_ref(),
             };
+            let menu_action = crate::operator::show(
+                ui,
+                &scene,
+                self.config_file.as_deref(),
+                &self.node.config().network_data_dir(),
+            );
+            ui.add_space(8.0);
             action = if !self.prefs.welcomed && !self.session.demo && self.tour.is_none() {
                 pages::welcome::show(ui, &scene, &mut self.run)
             } else {
@@ -384,6 +408,7 @@ impl App {
                         &mut self.prefs.scale,
                         &mut self.ribbon_view,
                         &mut self.prefs.rhythm_clock,
+                        &mut self.block_inspector,
                     ),
                     Page::Peers => pages::peers::show(
                         ui,
@@ -399,6 +424,7 @@ impl App {
                         &mut self.filter,
                         self.prefs.hide_addresses,
                     ),
+                    Page::Network => pages::network_traffic::show(ui, &scene),
                     Page::Config => pages::config::show(
                         ui,
                         &scene,
@@ -423,6 +449,7 @@ impl App {
                     ),
                 }
             };
+            action = menu_action.or(action);
         });
         // The first-run slideshow rides on top of whatever the page
         // just drew — the app stays live behind the dim.
@@ -727,6 +754,14 @@ impl eframe::App for App {
         let mut pose_scroll = None;
         let mut open_advanced = false;
         if let Some(pose) = self.capture.as_mut().and_then(|c| c.drive(&ctx)) {
+            #[cfg(feature = "devtools")]
+            if pose.first {
+                if pose.block_fixture {
+                    self.block_inspector.set_offline_genesis_fixture();
+                } else {
+                    self.block_inspector.clear_fixture();
+                }
+            }
             pose_scroll = Some(pose.scroll);
             open_advanced = pose.advanced;
             self.prefs.hide_addresses = pose.hide;
@@ -963,6 +998,57 @@ impl eframe::App for App {
             classic::resize_frame(ui);
         }
         match action {
+            Some(Action::OpenOperatorPath(destination)) => {
+                use crate::operator::OperatorPath;
+                let path = match destination {
+                    OperatorPath::Config => self
+                        .config_file
+                        .as_ref()
+                        .and_then(|path| path.parent())
+                        .map(std::path::Path::to_path_buf),
+                    OperatorPath::Data | OperatorPath::Logs => {
+                        Some(self.node.config().network_data_dir())
+                    }
+                };
+                if let Some(path) = path {
+                    if path.is_dir() {
+                        #[cfg(target_os = "windows")]
+                        let program = "explorer";
+                        #[cfg(target_os = "macos")]
+                        let program = "open";
+                        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                        let program = "xdg-open";
+                        match std::process::Command::new(program)
+                            .arg(&path)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                        {
+                            Ok(mut child) => {
+                                std::thread::spawn(move || {
+                                    let _ = child.wait();
+                                });
+                            }
+                            Err(_) => {
+                                self.session.log(
+                                    ActivityKind::Node,
+                                    "Could not launch the desktop folder opener.".into(),
+                                    None,
+                                    self.session.now(),
+                                );
+                            }
+                        }
+                    } else {
+                        self.session.log(
+                            ActivityKind::Node,
+                            "That folder has not been created yet.".into(),
+                            None,
+                            self.session.now(),
+                        );
+                    }
+                }
+            }
             Some(Action::Start) => {
                 self.prefs.welcomed = true;
                 self.start();

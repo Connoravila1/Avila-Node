@@ -212,6 +212,8 @@ impl Demo {
                 .map(|h| (h, block_hash(h)))
                 .collect(),
             peers,
+            network_bytes_sent: 0,
+            network_bytes_recv: 0,
             mempool_txs: mempool as usize,
             orphans: 2 + (e as usize / 37) % 5,
             fee_rate_sat_kvb: Some((6_100.0 + 1_700.0 * (e / 310.0).sin()) as i64),

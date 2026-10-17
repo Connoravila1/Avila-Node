@@ -11,6 +11,7 @@ pub mod config;
 pub mod electrum;
 pub mod events;
 pub mod hooks;
+pub mod inspect;
 mod next_block;
 pub mod rpc;
 pub mod signerproc;

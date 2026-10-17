@@ -844,6 +844,8 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     disconnects: 0,
                     recent: Vec::new(),
                     peer_details: Vec::new(),
+                    network_bytes_sent: 0,
+                    network_bytes_recv: 0,
                     mempool: (0, 0, None),
                     elapsed_secs: 0,
                     validation: avila_consensus::chainstate::ValidationReport {

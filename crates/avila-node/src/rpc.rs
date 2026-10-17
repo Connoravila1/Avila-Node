@@ -14881,6 +14881,8 @@ mod tests {
             disconnects: 1,
             recent: vec![(120, avila_consensus::hash::BlockHash::from_bytes([7u8; 32]))],
             peer_details: Vec::new(),
+            network_bytes_sent: 0,
+            network_bytes_recv: 0,
             mempool: (5, 1, Some(2_000)),
             elapsed_secs: 42,
             validation: default_report(),

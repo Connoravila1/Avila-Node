@@ -2,8 +2,11 @@
 //! [`Action`] for the app to carry out once the frame is drawn.
 
 pub mod activity;
+pub mod block_detail;
+pub mod block_inspector;
 pub mod chain;
 pub mod config;
+pub mod network_traffic;
 pub mod overview;
 pub mod peers;
 pub mod settings;
@@ -28,6 +31,7 @@ pub struct Scene<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
+    OpenOperatorPath(crate::operator::OperatorPath),
     Start,
     Stop,
     /// Stop, then start again once the worker is out — the file is

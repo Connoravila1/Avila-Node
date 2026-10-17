@@ -7,8 +7,9 @@ use crate::demo::Demo;
 use crate::model::{NodeView, PeerView, thousands};
 use avila_node::sync::{SyncConfig, SyncProgress, SyncReport};
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -218,6 +219,8 @@ impl Phase {
 #[derive(Clone, Copy, Debug)]
 pub struct Sample {
     pub t: f64,
+    /// Changes when a node run starts; cumulative traffic counters reset then.
+    pub run_id: u64,
     pub connected: u32,
     /// Best header height — the headers phase's own progress counter.
     pub headers: u32,
@@ -227,6 +230,9 @@ pub struct Sample {
     pub replayed: u32,
     pub peers: usize,
     pub mempool: usize,
+    /// Cumulative node-wide traffic, including peers that have disconnected.
+    pub network_bytes_sent: u64,
+    pub network_bytes_recv: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -305,6 +311,8 @@ pub struct Session {
     /// The catch-up line being extended: `(first height, entry serial)`.
     catchup: Option<(u32, u64)>,
     serial: u64,
+    /// Counter epoch for traffic samples across node restarts.
+    run_id: u64,
 }
 
 impl Session {
@@ -329,6 +337,7 @@ impl Session {
             known_peers: HashMap::new(),
             catchup: None,
             serial: 0,
+            run_id: 0,
         }
     }
 
@@ -423,6 +432,7 @@ impl Session {
             return;
         }
         self.running = true;
+        self.run_id = self.run_id.saturating_add(1);
         self.stopping = false;
         self.ended = None;
         self.view = None;
@@ -523,12 +533,7 @@ impl Session {
             risks: avila_node::config::risk_review(config),
             listen: settings.listen_addr(),
             dbcache: RunSettings::mib(&settings.dbcache_mib),
-            maxmempool_bytes: settings
-                .maxmempool_mb
-                .trim()
-                .parse::<usize>()
-                .ok()
-                .map(|mb| mb.saturating_mul(1_000_000)),
+            maxmempool_bytes: RunSettings::mib(&settings.maxmempool_mb),
             txindex: settings.txindex,
             blockfilterindex: settings.blockfilterindex,
             peerblockfilters: settings.peerblockfilters,
@@ -556,6 +561,7 @@ impl Session {
         };
         self.control = Some(control_tx);
         let (tx, rx) = channel();
+        let worker_data_dir = cfg.data_dir.clone();
         std::thread::spawn(move || {
             let mut last: Option<Instant> = None;
             // The progress callback must be 'static + Send (sync::run
@@ -566,15 +572,20 @@ impl Session {
             // without it the session reads "running" forever with a
             // dead pipeline underneath.
             let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _lock_file = worker_data_dir
+                    .as_deref()
+                    .map(acquire_datadir_lock)
+                    .transpose()?;
                 avila_node::sync::run(&params, &cfg, move |p| {
                     if last.is_none_or(|l| l.elapsed() >= REPORT_EVERY) {
                         last = Some(Instant::now());
                         let _ = txp.send(Msg::Progress(Box::new(p.clone())));
                     }
                 })
+                .map_err(|error| error.to_string())
             }));
             let report = match report {
-                Ok(r) => r.map_err(|e| e.to_string()),
+                Ok(r) => r,
                 Err(_) => Err("sync worker panicked".to_string()),
             };
             let _ = tx.send(Msg::Done(report));
@@ -700,12 +711,15 @@ impl Session {
         if self.history.back().is_none_or(|s| t - s.t >= 1.0) {
             self.history.push_back(Sample {
                 t,
+                run_id: self.run_id,
                 connected: view.connected,
                 headers: view.headers,
                 headers_buffered: view.headers_buffered,
                 replayed: view.trust.snapshot.as_ref().map_or(0, |s| s.replayed),
                 peers: view.established().count(),
                 mempool: view.mempool_txs,
+                network_bytes_sent: view.network_bytes_sent,
+                network_bytes_recv: view.network_bytes_recv,
             });
             while self.history.len() > HISTORY {
                 self.history.pop_front();
@@ -942,6 +956,33 @@ impl Session {
     }
 }
 
+/// Takes the same advisory `<datadir>/.lock` as the CLI before the GUI
+/// worker can open chainstate. The returned handle must stay alive for
+/// the entire sync run.
+fn acquire_datadir_lock(dir: &Path) -> Result<File, String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("Cannot create data directory {}: {error}", dir.display()))?;
+    let lock_path = dir.join(".lock");
+    let lock = File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| {
+            format!(
+                "Cannot open data-directory lock {}: {error}",
+                lock_path.display()
+            )
+        })?;
+    lock.try_lock().map_err(|_| {
+        format!(
+            "Cannot obtain a lock on data directory {}. Avila-Node is probably already running.",
+            dir.display()
+        )
+    })?;
+    Ok(lock)
+}
+
 /// Consensus parameters for `network`.
 #[must_use]
 pub fn params(network: avila_core::Network) -> avila_consensus::params::Params {
@@ -1009,6 +1050,7 @@ fn deny_pairs(pairs: &[String]) -> Vec<(String, String)> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1035,6 +1077,34 @@ mod tests {
             "Satoshi 28.1.0 · Extra 20250305"
         );
         assert_eq!(agent_name("//"), "unknown software");
+    }
+
+    #[test]
+    fn persistent_datadir_lock_refuses_a_second_owner_and_releases() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock follows Unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "avila-gui-datadir-lock-{}-{unique}",
+            std::process::id()
+        ));
+
+        let first = acquire_datadir_lock(&dir).expect("first owner acquires lock");
+        assert!(dir.join(".lock").is_file());
+        let rejected = acquire_datadir_lock(&dir).expect_err("second owner must be refused");
+        assert!(rejected.contains("already running"));
+
+        drop(first);
+        let after_release = acquire_datadir_lock(&dir).expect("lock is available after drop");
+        drop(after_release);
+        std::fs::remove_dir_all(dir).expect("remove temporary datadir");
+    }
+
+    #[test]
+    fn megabyte_settings_use_the_cli_binary_mib_conversion() {
+        assert_eq!(RunSettings::mib("256"), Some(256 * 1024 * 1024));
+        assert_eq!(RunSettings::mib("invalid"), None);
     }
 
     #[test]

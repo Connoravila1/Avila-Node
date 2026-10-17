@@ -16,6 +16,7 @@ pub enum Page {
     Overview,
     Chain,
     Peers,
+    Network,
     Activity,
     /// The knob table — every config path, the live ones editable.
     Config,
@@ -26,10 +27,11 @@ pub enum Page {
 
 impl Page {
     /// The node's own pages; the toybox joins them only when it's on.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Overview,
         Self::Chain,
         Self::Peers,
+        Self::Network,
         Self::Activity,
         Self::Config,
         Self::Settings,
@@ -41,6 +43,7 @@ impl Page {
             Self::Overview => "Overview",
             Self::Chain => "Chain",
             Self::Peers => "Peers",
+            Self::Network => "Network",
             Self::Activity => "Activity",
             Self::Config => "Config",
             Self::Toybox => "Toybox",
@@ -178,6 +181,13 @@ pub fn icon(p: &Painter, page: Page, c: Pos2, fg: Color32, bg: Color32) {
                 p.circle_filled(c + o, 2.4, fg);
             }
             p.circle_filled(c, 3.6, fg);
+        }
+        // A short traffic trace.
+        Page::Network => {
+            for (dx, dy) in [(-7.0, 4.0), (0.0, -3.0), (7.0, -7.0)] {
+                p.line_segment([c + vec2(dx, 8.0), c + vec2(dx, dy)], s);
+            }
+            p.line_segment([c + vec2(-10.0, 8.5), c + vec2(10.0, 8.5)], s);
         }
         // A running log.
         Page::Activity => {
