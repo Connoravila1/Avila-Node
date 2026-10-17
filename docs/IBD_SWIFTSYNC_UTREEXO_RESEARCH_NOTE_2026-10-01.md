@@ -172,9 +172,18 @@ and the side index supplies historical input coins to the shadow audit while
 canonical Chainstate remains the acceptance path. It checks exact final UTXO
 equality and provisional roots against a `MemForest` oracle. This early fixture
 does not cover modern witness/taproot-era blocks, establish membership or
-spentness proofs, or implement stateless full-validation sync. Native validation
-is pending; these source assertions are not results or performance evidence.
-See the [experiment record](../experiments/2026-10-16-swift-checkpoint-shadow.md)
+spentness proofs, or implement stateless full-validation sync. Local full
+workspace tests passed (1,124 passed, zero failed, five ignored; 1,942 MiB peak
+under a 2,560 MiB cap), and all-target Clippy passed. All three bounded fixture
+modes then passed locally: positive audit, expected tamper mismatch, and
+prevout-backed audit/root/UTXO comparisons. The prevout run checked height 500
+with 513 rows and 55,858 encoded bytes. Remote `researchhead7209` CI passed
+workspace tests and reproducibility, then exposed a fixture-only redb lifetime
+bug when the example reopened the database before dropping its first handle.
+That example now closes the handle before reopening; local rerun passes, while
+remote CI rerun remains outstanding. No IBD has been started, production path
+is unchanged, and no speedup is claimed. See the
+[experiment record](../experiments/2026-10-16-swift-checkpoint-shadow.md)
 and [LOG 79](../experiments/LOG.md#experiment-79--swift-checkpoint-shadow-prototype)
 for scope, guarded commands, evidence status, and remaining integration
 requirements.

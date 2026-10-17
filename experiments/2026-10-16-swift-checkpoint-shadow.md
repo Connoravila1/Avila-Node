@@ -1,7 +1,8 @@
 # Experiment #79 — Swift checkpoint shadow prototype
 
-**Status:** two bounded implementation examples added; native validation is pending. No
-benchmark, live sync, or production integration is claimed.
+**Status:** bounded shadow modules/examples added; local full workspace tests,
+all-target Clippy, and all three bounded fixture modes passed. No benchmark,
+live sync, or production integration is claimed.
 
 ## Question
 
@@ -45,15 +46,34 @@ audit receipt.
 
 ## Current evidence and validation state
 
-The source contains assertions for both oracle replays reaching height 500,
-the positive audit match, the tamper mismatch, and equality with the explicit
-`MemForest` oracle. These are assertions in code, not completed run results.
-Formatting and source review are complete. Native compilation, the unit tests,
-and either example mode remain unverified; the guarded native helper stopped
-before compilation because dependencies were not cached.
+The local full workspace test suite passed with 1,124 passed, zero failed, and
+five ignored tests. This included 595 consensus tests and 144 node tests. It
+completed in 457 seconds with 1,942 MiB peak under the 2,560 MiB guard.
+Workspace Clippy passed for all targets with `-D warnings`.
 
-When dependencies are available, run each command separately through the
-repository's memory guard (do not run them concurrently):
+All three native fixture modes passed: the positive checkpoint shadow matched,
+the `--tamper-input` mode detected the expected audit mismatch, and the
+prevout-backed shadow reported audit `match`, checked height 500, 513 stored
+prevouts and 55,858 encoded bytes, final UTXO equality with full Chainstate,
+and provisional stump roots equal to the explicit `MemForest` oracle. The
+three fixture modes completed in 28 seconds with 593 MiB peak. Modern
+witness/taproot coverage remains false.
+
+The remote `researchhead7209` run passed workspace tests and reproducibility,
+but its offline `swift_prevouts_shadow` step initially failed because the
+example tried to reopen redb while the original store held the exclusive lock.
+This was a fixture resource-lifetime failure, not a consensus validation
+failure. The example now saves bounded metadata and drops the original store
+before reopening; the corrected native fixture run passes. A remote CI rerun is
+still outstanding.
+
+No IBD was started. These modules remain experimental shadow tools: they are
+not wired into production chain acceptance or IBD, do not replace conventional
+UTXO membership checks, and establish no speedup. The fixture remains limited
+to heights 0–500 and lacks modern witness/taproot coverage.
+
+The following guarded commands reproduce targeted unit checks and fixture modes
+serially; the full workspace test and Clippy results above were also run:
 
 ```sh
 tools/guard_run.sh --max 2560 --reserve 1024 -- cargo test --release --locked -p avila-consensus swift_audit::tests
@@ -96,8 +116,8 @@ paths. The 0–500 early-history fixture does not exercise modern
 witness/taproot-era blocks. This is a storage/replay probe, not a membership
 proof, IBD integration, or speed measurement.
 
-Native compilation, tests, and both examples remain pending guarded validation;
-no results are claimed. Next work is to validate these bounded probes, then
-measure the index against identical full-validation rules and account for helper
-and storage costs. This fixture result, once verified, is not a reason to enable
-an implicit-deletion path for mainnet.
+The local unit suite, Clippy, and bounded fixture examples passed; the remote
+CI workflow should be rerun to confirm the repaired example in that environment.
+Next work is to measure the index against identical full-validation rules and
+account for helper and storage costs. These fixture results are not a reason to
+enable an implicit-deletion path for mainnet.

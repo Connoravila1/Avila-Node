@@ -218,16 +218,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(invalid("provisional stump differs from explicit MemForest oracle").into());
     }
 
+    // Save bounded metadata and release the redb handle before reopening: redb
+    // keeps an exclusive process-local lock while the live store owns the DB.
+    let expected_prevout_entries = prevouts.len();
+    let expected_prevout_encoded_bytes = prevouts.encoded_bytes();
+    drop(prevouts);
+
     let reopened = SwiftPrevoutStore::open(&db_path, checkpoint, limits)
         .map_err(|e| invalid(format!("prevout reopen failed: {e:?}")))?;
-    if reopened.len() != prevouts.len() || reopened.encoded_bytes() != prevouts.encoded_bytes() {
-        return Err(invalid("reopened prevout metadata differs from live store").into());
+    if reopened.checkpoint() != checkpoint
+        || reopened.len() != expected_prevout_entries
+        || reopened.encoded_bytes() != expected_prevout_encoded_bytes
+    {
+        return Err(
+            invalid("reopened prevout metadata differs from saved pre-close metadata").into(),
+        );
     }
     let checked_height = full.checked_height();
     let prevout_entries = reopened.len();
     let prevout_encoded_bytes = reopened.encoded_bytes();
     drop(reopened);
-    drop(prevouts);
     drop(temp);
 
     println!(
