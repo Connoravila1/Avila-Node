@@ -47,5 +47,6 @@ pub mod swift_prevouts;
 pub mod swift_stump;
 pub mod swiftsync;
 pub mod transaction;
+pub mod undo_amounts;
 pub mod utreexo;
 pub mod utxo_snapshot;

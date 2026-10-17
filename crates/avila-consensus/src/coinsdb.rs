@@ -1,7 +1,7 @@
 //! The disk-backed coins store — Core's `CCoinsViewDB` analogue backed
 //! by `redb` instead of LevelDB.
 //!
-//! Three tables, all written in a single atomic commit:
+//! Four tables, all written in a single atomic commit:
 //!
 //! * `coins`: outpoint (36B) → coin record — the full UTXO set for
 //!   entries that have left the in-memory write-back cache.
@@ -9,8 +9,10 @@
 //!   of Core's `rev*.dat` files; disconnects read it, and it is what
 //!   makes a crash between a coins commit and the `state.dat` rename
 //!   recoverable (the backend rewinds to the last flushed tip).
-//! * `meta`: `tip_height`, `coins_len` — self-describing consistency
-//!   markers committed in the same transaction as the coins.
+//! * `undo_amount_admission`: fixed-width hash+encoded-size tags for
+//!   display-only amount inspection; old undo rows are never backfilled.
+//! * `meta`: `tip_height`, `coins_len`, and the display-only sticky maximum
+//!   undo length — consistency markers committed with their updates.
 //!
 //! Consistency model: a commit is atomic, so `tip_height` never
 //! describes more than the coin state on disk. `state.dat` is written
@@ -26,7 +28,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::connect::{BlockUndo, Coin};
 use crate::encode::Decoder;
@@ -38,11 +40,24 @@ const COINS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("coins");
 /// lets crash-recovery find the body to disconnect without the chain
 /// vec (which only reaches the last snapshot tip).
 const UNDO: TableDefinition<u32, &[u8]> = TableDefinition::new("undo");
+/// height → block hash (32B) || encoded undo length (u64 LE). This
+/// display-only admission row is committed atomically with `UNDO`. Together
+/// with table-count coverage and the sticky maximum in `META`, inspection
+/// refuses old, incomplete, or oversized histories before reading any undo
+/// value. This is a record/parser/output bound, not a physical page/RSS bound:
+/// intact redb pages may exceed it through power-of-two rounding and
+/// co-resident values. Old databases are never backfilled.
+const UNDO_AMOUNT_ADMISSION: TableDefinition<u32, &[u8; 40]> =
+    TableDefinition::new("undo_amount_admission");
 /// ASCII key → value: `tip_height` (u32 LE), `coins_len` (u64 LE).
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 const K_TIP: &str = "tip_height";
 const K_LEN: &str = "coins_len";
+/// Sticky maximum encoded undo length written by this version. Backend
+/// amount inspection refuses every persisted record if any retained or
+/// previously written undo exceeded its admission cap.
+const K_UNDO_AMOUNT_MAX: &str = "undo_amount_max";
 /// The record-encoding marker — absent means [`CoinFormat::Legacy`].
 const K_FORMAT: &str = "format";
 /// The coins-table engine marker — absent means [`Engine::Redb`].
@@ -233,6 +248,13 @@ pub(crate) fn encode_undo(
         }
     }
     v
+}
+
+fn undo_amount_admission(hash: &crate::hash::BlockHash, encoded_len: usize) -> [u8; 40] {
+    let mut admission = [0; 40];
+    admission[..32].copy_from_slice(hash.as_bytes());
+    admission[32..].copy_from_slice(&u64::try_from(encoded_len).unwrap_or(u64::MAX).to_le_bytes());
+    admission
 }
 
 /// `(block hash, undo)` — `None` on malformed records. Legacy coins
@@ -723,6 +745,82 @@ impl CoinsBackend {
         decode_undo(g.value(), self.format)
     }
 
+    /// Scan one admitted undo record for bounded input amounts without
+    /// allocating or decoding its coins/scripts. The record-size limit does
+    /// not hard-bound redb page allocation: intact pages may exceed it through
+    /// power-of-two rounding and co-resident values, so the global writer
+    /// admission checks run before `UNDO.get` and the node memory cap remains
+    /// in force.
+    pub(crate) fn inspect_undo_amounts(
+        &self,
+        request: &crate::undo_amounts::UndoAmountsRequest,
+    ) -> crate::undo_amounts::UndoAmountsResult {
+        use crate::undo_amounts::{
+            MAX_UNDO_AMOUNT_RECORD_BYTES, UndoAmountsResult, scan_encoded_undo,
+        };
+
+        let Ok(read) = self.db.begin_read() else {
+            return UndoAmountsResult::Unavailable;
+        };
+        let Ok(admission) = read.open_table(UNDO_AMOUNT_ADMISSION) else {
+            return UndoAmountsResult::Unavailable;
+        };
+        let Ok(admission_count) = admission.len() else {
+            return UndoAmountsResult::Unavailable;
+        };
+        let Ok(meta) = read.open_table(META) else {
+            return UndoAmountsResult::Unavailable;
+        };
+        let Ok(Some(max_value)) = meta.get(K_UNDO_AMOUNT_MAX) else {
+            return UndoAmountsResult::Unavailable;
+        };
+        let max_value = max_value.value();
+        if max_value.len() != 8 {
+            return UndoAmountsResult::Unavailable;
+        }
+        let mut max_bytes = [0; 8];
+        max_bytes.copy_from_slice(max_value);
+        if u64::from_le_bytes(max_bytes) > MAX_UNDO_AMOUNT_RECORD_BYTES as u64 {
+            return UndoAmountsResult::TooLarge;
+        }
+        let Ok(undo) = read.open_table(UNDO) else {
+            return UndoAmountsResult::Unavailable;
+        };
+        let Ok(undo_count) = undo.len() else {
+            return UndoAmountsResult::Unavailable;
+        };
+        // redb may put adjacent values in the same variable-order leaf. We
+        // only trust row-level admission when every live undo row was
+        // written atomically with its admission row by this writer.
+        if undo_count != admission_count {
+            return UndoAmountsResult::Unavailable;
+        }
+        let Ok(Some(admitted)) = admission.get(request.height) else {
+            return UndoAmountsResult::Unavailable;
+        };
+        let admitted = admitted.value();
+        if admitted.len() != 40 {
+            return UndoAmountsResult::Malformed;
+        }
+        if admitted[..32] != request.block_hash.as_bytes()[..] {
+            return UndoAmountsResult::HashMismatch;
+        }
+        let mut encoded_len_bytes = [0; 8];
+        encoded_len_bytes.copy_from_slice(&admitted[32..40]);
+        let encoded_len = u64::from_le_bytes(encoded_len_bytes);
+        if encoded_len > MAX_UNDO_AMOUNT_RECORD_BYTES as u64 {
+            return UndoAmountsResult::TooLarge;
+        }
+        let Ok(Some(record)) = undo.get(request.height) else {
+            return UndoAmountsResult::Unavailable;
+        };
+        let bytes = record.value();
+        if bytes.len() as u64 != encoded_len {
+            return UndoAmountsResult::Malformed;
+        }
+        scan_encoded_undo(bytes, self.format, request)
+    }
+
     /// Highest height holding an undo record — the authoritative
     /// "backend has state through here" probe. Unlike `tip_height()`
     /// (a meta key a torn write can zero), undo entries are written in
@@ -838,9 +936,26 @@ impl CoinsBackend {
                 let mut undo = w
                     .open_table(UNDO)
                     .map_err(|e| std::io::Error::other(format!("coinsdb undo: {e}")))?;
+                let mut admission = if !new_undos.is_empty() || tip.is_some() {
+                    Some(w.open_table(UNDO_AMOUNT_ADMISSION).map_err(|e| {
+                        std::io::Error::other(format!("coinsdb undo admission: {e}"))
+                    })?)
+                } else {
+                    None
+                };
+                let mut max_new_undo_len = 0u64;
                 for (hgt, hash, u) in new_undos {
-                    undo.insert(*hgt, encode_undo(hash, u, self.format).as_slice())
+                    let encoded = encode_undo(hash, u, self.format);
+                    max_new_undo_len =
+                        max_new_undo_len.max(u64::try_from(encoded.len()).unwrap_or(u64::MAX));
+                    undo.insert(*hgt, encoded.as_slice())
                         .map_err(|e| std::io::Error::other(format!("coinsdb undo put: {e}")))?;
+                    let admission_bytes = undo_amount_admission(hash, encoded.len());
+                    if let Some(admission) = admission.as_mut() {
+                        admission.insert(*hgt, &admission_bytes).map_err(|e| {
+                            std::io::Error::other(format!("coinsdb undo admission put: {e}"))
+                        })?;
+                    }
                 }
                 // A rewind commit that stamps the tip down must drop
                 // the undo rows it consumed — otherwise they describe a
@@ -862,6 +977,11 @@ impl CoinsBackend {
                     for hgt in stale {
                         undo.remove(hgt)
                             .map_err(|e| std::io::Error::other(format!("coinsdb undo del: {e}")))?;
+                        if let Some(admission) = admission.as_mut() {
+                            admission.remove(hgt).map_err(|e| {
+                                std::io::Error::other(format!("coinsdb undo admission del: {e}"))
+                            })?;
+                        }
                     }
                 }
                 let new_len = (self.coins_len() as i64 + delta).max(0) as u64;
@@ -870,6 +990,27 @@ impl CoinsBackend {
                     .map_err(|e| std::io::Error::other(format!("coinsdb meta: {e}")))?;
                 meta.insert(K_LEN, new_len.to_le_bytes().as_slice())
                     .map_err(|e| std::io::Error::other(format!("coinsdb meta len: {e}")))?;
+                if !new_undos.is_empty() {
+                    let previous_max = match meta.get(K_UNDO_AMOUNT_MAX) {
+                        Ok(Some(value)) => {
+                            let bytes = value.value();
+                            if bytes.len() == 8 {
+                                let mut raw = [0; 8];
+                                raw.copy_from_slice(bytes);
+                                u64::from_le_bytes(raw)
+                            } else {
+                                u64::MAX
+                            }
+                        }
+                        Ok(None) => 0,
+                        Err(_) => u64::MAX,
+                    };
+                    let sticky_max = previous_max.max(max_new_undo_len);
+                    meta.insert(K_UNDO_AMOUNT_MAX, sticky_max.to_le_bytes().as_slice())
+                        .map_err(|e| {
+                            std::io::Error::other(format!("coinsdb undo amount max: {e}"))
+                        })?;
+                }
                 if let Some(tip) = tip {
                     meta.insert(K_TIP, tip.to_le_bytes().as_slice())
                         .map_err(|e| std::io::Error::other(format!("coinsdb meta tip: {e}")))?;
@@ -925,9 +1066,27 @@ impl CoinsBackend {
             let mut undo = w
                 .open_table(UNDO)
                 .map_err(|e| std::io::Error::other(format!("coinsdb undo: {e}")))?;
+            let mut admission =
+                if !new_undos.is_empty() || tip.is_some() {
+                    Some(w.open_table(UNDO_AMOUNT_ADMISSION).map_err(|e| {
+                        std::io::Error::other(format!("coinsdb undo admission: {e}"))
+                    })?)
+                } else {
+                    None
+                };
+            let mut max_new_undo_len = 0u64;
             for (h, hash, u) in new_undos {
-                undo.insert(*h, encode_undo(hash, u, self.format).as_slice())
+                let encoded = encode_undo(hash, u, self.format);
+                max_new_undo_len =
+                    max_new_undo_len.max(u64::try_from(encoded.len()).unwrap_or(u64::MAX));
+                undo.insert(*h, encoded.as_slice())
                     .map_err(|e| std::io::Error::other(format!("coinsdb undo put: {e}")))?;
+                let admission_bytes = undo_amount_admission(hash, encoded.len());
+                if let Some(admission) = admission.as_mut() {
+                    admission.insert(*h, &admission_bytes).map_err(|e| {
+                        std::io::Error::other(format!("coinsdb undo admission put: {e}"))
+                    })?;
+                }
             }
             // Same consumed-undo cleanup as the hash-engine arm: a
             // tip-stamping commit must not leave rows describing
@@ -948,6 +1107,11 @@ impl CoinsBackend {
                 for hgt in stale {
                     undo.remove(hgt)
                         .map_err(|e| std::io::Error::other(format!("coinsdb undo del: {e}")))?;
+                    if let Some(admission) = admission.as_mut() {
+                        admission.remove(hgt).map_err(|e| {
+                            std::io::Error::other(format!("coinsdb undo admission del: {e}"))
+                        })?;
+                    }
                 }
             }
             let new_len = (self.coins_len() as i64 + delta).max(0) as u64;
@@ -956,6 +1120,25 @@ impl CoinsBackend {
                 .map_err(|e| std::io::Error::other(format!("coinsdb meta: {e}")))?;
             meta.insert(K_LEN, new_len.to_le_bytes().as_slice())
                 .map_err(|e| std::io::Error::other(format!("coinsdb meta len: {e}")))?;
+            if !new_undos.is_empty() {
+                let previous_max = match meta.get(K_UNDO_AMOUNT_MAX) {
+                    Ok(Some(value)) => {
+                        let bytes = value.value();
+                        if bytes.len() == 8 {
+                            let mut raw = [0; 8];
+                            raw.copy_from_slice(bytes);
+                            u64::from_le_bytes(raw)
+                        } else {
+                            u64::MAX
+                        }
+                    }
+                    Ok(None) => 0,
+                    Err(_) => u64::MAX,
+                };
+                let sticky_max = previous_max.max(max_new_undo_len);
+                meta.insert(K_UNDO_AMOUNT_MAX, sticky_max.to_le_bytes().as_slice())
+                    .map_err(|e| std::io::Error::other(format!("coinsdb undo amount max: {e}")))?;
+            }
             if let Some(tip) = tip {
                 meta.insert(K_TIP, tip.to_le_bytes().as_slice())
                     .map_err(|e| std::io::Error::other(format!("coinsdb meta tip: {e}")))?;
@@ -1224,6 +1407,237 @@ mod tests {
         assert_eq!(u.txs.len(), 2);
         assert_eq!(u.txs[1].spent[0].out.value, 50_000);
         assert_eq!(u.txs[1].overwritten[0].1.out.value, 1);
+    }
+
+    #[test]
+    fn undo_amounts_backend_scans_legacy_and_compact_records() {
+        for format in [CoinFormat::Legacy, CoinFormat::Compact] {
+            let dir = test_dir(match format {
+                CoinFormat::Legacy => "undo-amounts-legacy",
+                CoinFormat::Compact => "undo-amounts-compact",
+            });
+            let be = CoinsBackend::open_with_format(&dir, format).unwrap();
+            be.commit(&HashMap::new(), &[(7, hash(9), undo(3))], 7)
+                .unwrap();
+            let request = crate::undo_amounts::UndoAmountsRequest {
+                height: 7,
+                block_hash: hash(9),
+                tx_index: 1,
+                block_tx_count: 2,
+                input_count: 1,
+                input_offset: 0,
+                input_limit: 1,
+            };
+            assert_eq!(
+                be.inspect_undo_amounts(&request),
+                crate::undo_amounts::UndoAmountsResult::Available(
+                    crate::undo_amounts::UndoAmounts {
+                        input_total_sats: 50_000,
+                        input_values: vec![50_000],
+                    }
+                )
+            );
+            assert_eq!(
+                be.inspect_undo_amounts(&crate::undo_amounts::UndoAmountsRequest {
+                    block_hash: hash(10),
+                    ..request
+                }),
+                crate::undo_amounts::UndoAmountsResult::HashMismatch
+            );
+            assert_eq!(
+                be.inspect_undo_amounts(&crate::undo_amounts::UndoAmountsRequest {
+                    height: 8,
+                    ..request
+                }),
+                crate::undo_amounts::UndoAmountsResult::Unavailable
+            );
+            drop(be);
+
+            // New admission rows survive reopen with the undo record.
+            let be = CoinsBackend::open_with_format(&dir, format).unwrap();
+            assert_eq!(
+                be.inspect_undo_amounts(&request),
+                crate::undo_amounts::UndoAmountsResult::Available(
+                    crate::undo_amounts::UndoAmounts {
+                        input_total_sats: 50_000,
+                        input_values: vec![50_000],
+                    }
+                )
+            );
+            let oversized_by_one =
+                undo_amount_admission(&hash(9), encode_undo(&hash(9), &undo(3), format).len() + 1);
+            let write = be.db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(UNDO_AMOUNT_ADMISSION).unwrap();
+                table.insert(7, &oversized_by_one).unwrap();
+            }
+            write.commit().unwrap();
+            assert_eq!(
+                be.inspect_undo_amounts(&request),
+                crate::undo_amounts::UndoAmountsResult::Malformed
+            );
+            drop(be);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn undo_amount_admission_is_required_and_checked_before_undo_read() {
+        use crate::undo_amounts::{
+            MAX_UNDO_AMOUNT_RECORD_BYTES, UndoAmountsRequest, UndoAmountsResult,
+        };
+
+        let dir = test_dir("undo-amount-admission");
+        let be = CoinsBackend::open(&dir).unwrap();
+        let request = UndoAmountsRequest {
+            height: 7,
+            block_hash: hash(9),
+            tx_index: 1,
+            block_tx_count: 2,
+            input_count: 1,
+            input_offset: 0,
+            input_limit: 1,
+        };
+
+        // Simulate a pre-admission database row: existing undo remains
+        // available to consensus callers but persisted amount inspection
+        // refuses the backend without scanning or backfilling it.
+        let write = be.db.begin_write().unwrap();
+        {
+            let mut undo_table = write.open_table(UNDO).unwrap();
+            undo_table
+                .insert(
+                    7,
+                    encode_undo(&hash(9), &undo(3), CoinFormat::Legacy).as_slice(),
+                )
+                .unwrap();
+        }
+        write.commit().unwrap();
+        assert_eq!(
+            be.inspect_undo_amounts(&request),
+            UndoAmountsResult::Unavailable
+        );
+
+        drop(be);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // A fresh complete table with an unadmitted neighboring undo is
+        // globally unknown. No request may fetch the small target row.
+        let dir = test_dir("undo-amount-unadmitted-neighbor");
+        let be = CoinsBackend::open(&dir).unwrap();
+        be.commit(
+            &HashMap::new(),
+            &[(7, hash(7), undo(3)), (8, hash(8), undo(3))],
+            8,
+        )
+        .unwrap();
+        let write = be.db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(UNDO_AMOUNT_ADMISSION).unwrap();
+            table.remove(8).unwrap();
+        }
+        write.commit().unwrap();
+        assert_eq!(
+            be.inspect_undo_amounts(&UndoAmountsRequest {
+                block_hash: hash(7),
+                ..request
+            }),
+            UndoAmountsResult::Unavailable
+        );
+        drop(be);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // A complete table with any known oversized neighbor is rejected
+        // globally before the small requested UNDO value is fetched. The
+        // synthetic short value keeps the test allocation-bounded; the
+        // fixed admission and sticky maximum model the writer metadata.
+        let dir = test_dir("undo-amount-global-oversize");
+        let be = CoinsBackend::open(&dir).unwrap();
+        be.commit(
+            &HashMap::new(),
+            &[(7, hash(7), undo(3)), (8, hash(8), undo(3))],
+            8,
+        )
+        .unwrap();
+        let oversized = undo_amount_admission(&hash(8), MAX_UNDO_AMOUNT_RECORD_BYTES + 1);
+        let write = be.db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(UNDO_AMOUNT_ADMISSION).unwrap();
+            table.insert(8, &oversized).unwrap();
+        }
+        {
+            let mut meta = write.open_table(META).unwrap();
+            meta.insert(
+                K_UNDO_AMOUNT_MAX,
+                (MAX_UNDO_AMOUNT_RECORD_BYTES as u64 + 1)
+                    .to_le_bytes()
+                    .as_slice(),
+            )
+            .unwrap();
+        }
+        write.commit().unwrap();
+        assert_eq!(
+            be.inspect_undo_amounts(&UndoAmountsRequest {
+                block_hash: hash(7),
+                ..request
+            }),
+            UndoAmountsResult::TooLarge
+        );
+        be.commit(&HashMap::new(), &[], 7).unwrap();
+        assert_eq!(
+            be.inspect_undo_amounts(&UndoAmountsRequest {
+                block_hash: hash(7),
+                ..request
+            }),
+            UndoAmountsResult::TooLarge,
+            "the largest-record admission remains sticky after rewind"
+        );
+        drop(be);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn undo_amount_admission_is_rewound_atomically() {
+        use crate::undo_amounts::{UndoAmountsRequest, UndoAmountsResult};
+
+        let dir = test_dir("undo-amount-admission-rewind");
+        let be = CoinsBackend::open(&dir).unwrap();
+        be.commit(
+            &HashMap::new(),
+            &[(7, hash(7), undo(3)), (8, hash(8), undo(3))],
+            8,
+        )
+        .unwrap();
+        be.commit(&HashMap::new(), &[], 7).unwrap();
+        drop(be);
+
+        let be = CoinsBackend::open(&dir).unwrap();
+        let request = UndoAmountsRequest {
+            height: 8,
+            block_hash: hash(8),
+            tx_index: 1,
+            block_tx_count: 2,
+            input_count: 1,
+            input_offset: 0,
+            input_limit: 1,
+        };
+        assert_eq!(
+            be.inspect_undo_amounts(&request),
+            UndoAmountsResult::Unavailable
+        );
+        assert_eq!(
+            be.inspect_undo_amounts(&UndoAmountsRequest {
+                height: 7,
+                block_hash: hash(7),
+                ..request
+            }),
+            UndoAmountsResult::Available(crate::undo_amounts::UndoAmounts {
+                input_total_sats: 50_000,
+                input_values: vec![50_000],
+            })
+        );
+        drop(be);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -73,9 +73,28 @@ fetched 100 at a time, and labels partial map coverage while more are available.
 Selected transaction detail requests are pinned to block hash, txid, and index;
 input and output pages are each capped at 100. The view shows outpoint, sequence,
 script/witness prefixes, output values and standard addresses when available.
-Prevout values and fees remain explicitly unknown because this detail path does
-not look up previous outputs; script hex is shown as a bounded prefix when
-truncated.
+Current source also recovers non-coinbase input values and fees from a matching
+active-chain block undo record when that record is available and passes the
+bounded reader. The transaction total fee is input total minus all output values;
+the displayed sat/vB rate uses the measured transaction weight converted to
+virtual bytes. Known amounts carry a `block_undo` source label. Coinbase has no
+prevout amount or fee. Missing, non-active-chain, hash-mismatched, oversized,
+malformed, or arithmetically inconsistent undo remains explicitly unknown. This
+path does not query the current UTXO set, a txindex, or peers, and does not change
+consensus checks or validation-status claims. Script hex remains a bounded prefix
+when truncated.
+
+Existing databases are not backfilled. The persisted lookup path stays disabled
+while admission metadata fails to cover any retained undo record, or the sticky
+record maximum exceeds 8 MiB; adding admitted new rows alone does not repair
+incomplete historical coverage. Recent in-memory tail/run undo remains eligible.
+Once persisted-table coverage is complete and the global maximum is within 8 MiB,
+the selected row is still checked against its recorded size and block hash before
+scanning at most 8 MiB. This is an encoded parser/input bound, not a physical or
+RSS guarantee: ordinary redb page access may exceed the record limit. Native
+checks on this laptop exercised the in-memory retained-undo path; persisted
+lookups against an existing database without complete current-writer admission
+remain unavailable.
 
 The **Network traffic** page shows cumulative bytes sent and received by the
 current node worker, including peers that disconnected, and rates derived from
@@ -99,12 +118,15 @@ the transaction table continues below the initial viewport. The larger capture
 shows the single coinbase weight-composition segment. These captures do not verify
 live-node responses or transaction paging.
 
-The current GUI source passed its native GUI gate: 85 tests, formatting,
-all-target/devtools Clippy with warnings denied, and release build under a 2.5 GiB
-memory cap (1 GiB reserve; 1,025 MiB peak, 50 s). Its source fingerprint
-SHA-256 is `497f4d3bf71a6ac7d00b5a4168357a3f502a8171a74ec465b87baeac3f2d1a3c`;
-the installed GUI binary SHA-256 is
-`7cb089a848309ba1c2aaa76323f9004252e590a621de5f2f67779472eaf02488`. Earlier live captures used mainnet block 83018
+The undo-inspector source passed a guarded workspace gate: 1,172 Rust tests
+(including 86 GUI tests; five ignored), 17 Python tests, formatting, all-target
+Clippy and rustdoc with warnings denied, paired release CLI/GUI builds, and
+smoke checks. The 2,560 MiB cap / 1,024 MiB reserve run peaked at 2,031 MiB in
+319 s. Source fingerprint SHA-256:
+`b8d1e8aad825943419f4e7fc25bb46e01387dd91c0d3169c8ef97a0c41458f2c`; installed
+CLI SHA-256 `9fa0079142f80ea292fc4bbd6bff213755ecf7dd31491e2ca991645a480b7d0d`;
+installed GUI SHA-256 `b0ee9470af909e3622fdd0df7395f13aa3f54dfd62ed5f3c563a0a3d5a4aae0c`.
+Earlier live captures used mainnet block 83018
 (`00000000002bba570c3fbc62f77f54685b7011bfa202a086d4005131cc0ceed6`), which
 contains 225 transactions. The inspector loaded summaries in 100 → 200 → 225
 steps, updated its loaded-coverage labels, and removed the load-more button at the
@@ -133,6 +155,25 @@ verifies this row-focus sequence only; screen-reader behavior, a transaction
 with more than 100 outputs, missing-cookie recovery, and cross-platform behavior
 remain unverified. A 440-input transaction was paged natively (details below).
 This is not a full visual or accessibility audit.
+
+Native checks then used active mainnet block 257285, transaction 1
+(`e0236df7f02f5611faa1de318c3e462477a0aa6e8939b7ab0ae30d94dd4085ea`). At
+1440×900 and 760×600, both at 100% scale, the inspector showed input value
+7.22282802 BTC, total fee 0 BTC, rate 0.00 sat/vB at 258 vB, the block-undo
+source caption, and the per-input amount. An earlier query of block 255048
+initially returned amounts over RPC, but the GUI later showed them unknown after
+the undo moved from in-memory tail to a persisted backend whose historical
+admission coverage was incomplete; the database was not backfilled. The first
+GUI detail request visibly timed out with OS error 11. Selecting the row again
+recovered the detail; this
+does not establish automatic retry behavior. The native sample had a zero fee;
+nonzero-fee rendering is not yet established by a native fixture. GUI close
+exited 0 and left the same daemon PID active while height advanced 256,261 →
+258,591. The GUI's 512 MiB cap / 512 MiB reserve run peaked at 108 MiB in 196 s.
+See the [undo-inspector experiment note](../experiments/2026-10-17-undo-inspector-amounts.md)
+for proof details. These checks do not claim full IBD completion, nonzero-fee
+rendering, screen-reader behavior, cross-platform behavior, or more than 100
+outputs.
 
 Launch with `--full-verify` to disable the assume-valid checkpoint for that run
 and verify historical scripts during initial sync, matching the CLI's

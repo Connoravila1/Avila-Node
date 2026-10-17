@@ -1,7 +1,7 @@
 //! Data-driven block summary and transaction composition for the inspector.
 
 use avila_node::inspect::{
-    AmountUnknownReason, BlockSummary, BlockTxDetail, BlockTxSummary, BodyState,
+    AmountSource, AmountUnknownReason, BlockSummary, BlockTxDetail, BlockTxSummary, BodyState,
 };
 use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, Stroke, Ui, vec2};
 
@@ -558,7 +558,18 @@ fn transaction_detail(ui: &mut Ui, view: &mut InspectorView<'_>) -> Option<Inter
                 format_sats,
             ),
         );
+        if let Some(fee) = detail.fee_sats
+            && let Some(rate) = format_fee_rate(fee, summary.weight)
+        {
+            wrapped_fact(ui, "Rate", rate);
+        }
     });
+    if detail.amount_source == Some(AmountSource::BlockUndo) {
+        ui.label(
+            RichText::new("Input amounts and fee recovered from matching active-chain block undo.")
+                .weak(),
+        );
+    }
 
     let mut action = None;
     ui.columns(2, |columns| {
@@ -763,8 +774,31 @@ fn amount_unknown(reason: Option<AmountUnknownReason>) -> &'static str {
     match reason {
         Some(AmountUnknownReason::CoinbaseHasNoPrevoutAmount) => "coinbase has no prevout amount",
         Some(AmountUnknownReason::PreviousOutputsNotLookedUp) => "previous outputs not looked up",
+        Some(AmountUnknownReason::UndoUnavailable) => "matching block undo unavailable",
+        Some(AmountUnknownReason::NotActiveChain) => "block is not on the active chain",
+        Some(AmountUnknownReason::UndoHashMismatch) => "undo block hash did not match",
+        Some(AmountUnknownReason::UndoTooLarge) => "undo exceeds the inspection size limit",
+        Some(AmountUnknownReason::UndoMalformed) => "undo data is malformed",
+        Some(AmountUnknownReason::InconsistentTransactionAmounts) => {
+            "transaction amounts are inconsistent"
+        }
         None => "not provided by node",
     }
+}
+
+fn format_fee_rate(fee_sats: i64, weight: u64) -> Option<String> {
+    if fee_sats < 0 || weight == 0 {
+        return None;
+    }
+    let vsize = weight.saturating_add(3) / 4;
+    if vsize == 0 {
+        return None;
+    }
+    let hundredths =
+        (i128::from(fee_sats) * 100 + i128::from(vsize) / 2).checked_div(i128::from(vsize))?;
+    let whole = hundredths / 100;
+    let fraction = hundredths % 100;
+    Some(format!("{whole}.{fraction:02} sat/vB · {vsize} vB"))
 }
 
 fn treemap_rects(bounds: egui::Rect, transactions: &[BlockTxSummary]) -> Vec<egui::Rect> {
@@ -878,7 +912,7 @@ fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::treemap_rects;
+    use super::{format_fee_rate, treemap_rects};
     use avila_node::inspect::BlockTxSummary;
     use eframe::egui::{pos2, vec2};
 
@@ -923,5 +957,16 @@ mod tests {
         let total_area = bounds.width() * bounds.height();
         let dominant = rects[2].width() * rects[2].height() / total_area;
         assert!((dominant - 100.0 / 102.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn fee_rate_uses_rounded_virtual_size_and_is_unknown_without_weight() {
+        assert_eq!(
+            format_fee_rate(10_000, 400).as_deref(),
+            Some("100.00 sat/vB · 100 vB")
+        );
+        assert_eq!(format_fee_rate(1, 5).as_deref(), Some("0.50 sat/vB · 2 vB"));
+        assert_eq!(format_fee_rate(1, 0), None);
+        assert_eq!(format_fee_rate(-1, 400), None);
     }
 }

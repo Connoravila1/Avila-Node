@@ -2655,6 +2655,62 @@ impl Chainstate {
         self.undos.get((height - base - 1) as usize).cloned()
     }
 
+    /// Return bounded historical input amounts from the undo for a matching
+    /// active-chain block. This reads only the selected undo record; it does
+    /// not consult the current UTXO set or fetch a block body or peer data.
+    #[must_use]
+    pub fn inspect_undo_amounts(
+        &self,
+        request: crate::undo_amounts::UndoAmountsRequest,
+    ) -> crate::undo_amounts::UndoAmountsResult {
+        use crate::undo_amounts::{UndoAmountsResult, from_borrowed_undo, validate_request};
+
+        if let Err(result) = validate_request(&request) {
+            return result;
+        }
+        let Some(active_hash) = self.chain.get(request.height as usize) else {
+            return UndoAmountsResult::NotActiveChain;
+        };
+        if *active_hash != request.block_hash {
+            return UndoAmountsResult::NotActiveChain;
+        }
+        if request.height == 0
+            || self
+                .snapshot_base
+                .is_some_and(|base| request.height <= base)
+        {
+            return UndoAmountsResult::Unavailable;
+        }
+
+        let base = self.undo_base();
+        if request.height <= base {
+            if let Some((stored_hash, undo)) = self.utxo.epoch_undo_entry_ref(request.height) {
+                if stored_hash != request.block_hash {
+                    return UndoAmountsResult::HashMismatch;
+                }
+                return from_borrowed_undo(&request, undo);
+            }
+            return self
+                .coins_backend
+                .as_deref()
+                .map_or(UndoAmountsResult::Unavailable, |backend| {
+                    backend.inspect_undo_amounts(&request)
+                });
+        }
+        let Some(index) = request
+            .height
+            .checked_sub(base)
+            .and_then(|height| height.checked_sub(1))
+        else {
+            return UndoAmountsResult::Unavailable;
+        };
+        self.undos
+            .get(index as usize)
+            .map_or(UndoAmountsResult::Unavailable, |undo| {
+                from_borrowed_undo(&request, undo)
+            })
+    }
+
     /// Attaches the disk coins backend — Core's `CCoinsViewDB` under
     /// the cache. Call before load/replay so every connect streams
     /// through the write-back cache.
@@ -6652,6 +6708,88 @@ mod tests {
         let mut expected = utxo11;
         expected.sort_by_key(|(o, _)| (o.txid, o.vout));
         assert_eq!(resumed, expected, "replayed coins != pre-crash coins");
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn undo_amounts_match_tail_backend_and_run_layers() {
+        let params = params();
+        let dir = store_dir("undo-amounts-layers");
+        let blocks = spend_chain(102, &params);
+        let selected_block = &blocks[101];
+        let selected_hash = selected_block.block_hash();
+        let request = crate::undo_amounts::UndoAmountsRequest {
+            height: 102,
+            block_hash: selected_hash,
+            tx_index: 1,
+            block_tx_count: 2,
+            input_count: 1,
+            input_offset: 0,
+            input_limit: 1,
+        };
+        let expected =
+            crate::undo_amounts::UndoAmountsResult::Available(crate::undo_amounts::UndoAmounts {
+                input_total_sats: subsidy(1),
+                input_values: vec![subsidy(1)],
+            });
+
+        let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        for block in &blocks {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        assert_eq!(cs.inspect_undo_amounts(request), expected);
+
+        let mut wrong_hash = request;
+        wrong_hash.block_hash = BlockHash::from_bytes([0x77; 32]);
+        assert_eq!(
+            cs.inspect_undo_amounts(wrong_hash),
+            crate::undo_amounts::UndoAmountsResult::NotActiveChain
+        );
+        let mut above_tip = request;
+        above_tip.height = 103;
+        assert_eq!(
+            cs.inspect_undo_amounts(above_tip),
+            crate::undo_amounts::UndoAmountsResult::NotActiveChain
+        );
+        let mut genesis = request;
+        genesis.height = 0;
+        genesis.block_hash = cs.chain()[0];
+        genesis.tx_index = 0;
+        genesis.block_tx_count = 1;
+        genesis.input_count = 0;
+        assert_eq!(
+            cs.inspect_undo_amounts(genesis),
+            crate::undo_amounts::UndoAmountsResult::Unavailable
+        );
+
+        cs.flush().unwrap();
+        assert_eq!(cs.inspect_undo_amounts(request), expected);
+
+        let persisted_undo = cs.undo(request.height).unwrap();
+        cs.utxo.enable_runs(&dir).unwrap();
+        let wrong_stored_hash = BlockHash::from_bytes([0x44; 32]);
+        cs.utxo
+            .flush_to_backend_owned(
+                vec![(request.height, wrong_stored_hash, persisted_undo.clone())],
+                request.height,
+            )
+            .unwrap();
+        cs.utxo.join_flush().unwrap();
+        assert_eq!(
+            cs.inspect_undo_amounts(request),
+            crate::undo_amounts::UndoAmountsResult::HashMismatch
+        );
+
+        cs.utxo
+            .flush_to_backend_owned(
+                vec![(request.height, selected_hash, persisted_undo)],
+                request.height,
+            )
+            .unwrap();
+        cs.utxo.join_flush().unwrap();
+        assert_eq!(cs.inspect_undo_amounts(request), expected);
+
         drop(cs);
         std::fs::remove_dir_all(&dir).unwrap();
     }

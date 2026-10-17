@@ -5,7 +5,9 @@
 //! that a later request will observe the same chain after a reorganization.
 
 use avila_consensus::chainstate::Chainstate;
+use avila_consensus::check::MAX_MONEY;
 use avila_consensus::hash::{BlockHash, Txid};
+use avila_consensus::undo_amounts::{UndoAmountsRequest, UndoAmountsResult};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_TRANSACTION_PAGE: u16 = 250;
@@ -89,6 +91,18 @@ pub struct BlockIdentity {
 pub enum AmountUnknownReason {
     CoinbaseHasNoPrevoutAmount,
     PreviousOutputsNotLookedUp,
+    UndoUnavailable,
+    NotActiveChain,
+    UndoHashMismatch,
+    UndoTooLarge,
+    UndoMalformed,
+    InconsistentTransactionAmounts,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AmountSource {
+    BlockUndo,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,6 +149,8 @@ pub struct BlockTxDetail {
     pub input_amount_unknown_reason: Option<AmountUnknownReason>,
     pub fee_sats: Option<i64>,
     pub fee_unknown_reason: Option<AmountUnknownReason>,
+    #[serde(default)]
+    pub amount_source: Option<AmountSource>,
     pub inputs: Vec<TxInputDetail>,
     pub next_input_offset: Option<u32>,
     pub outputs: Vec<TxOutputDetail>,
@@ -264,9 +280,9 @@ pub(crate) fn inspect(
     }
 }
 
-/// Read bounded, script-only details for a transaction selected from an
-/// already inspected block. Prevout values are intentionally not resolved:
-/// this path never consults the current UTXO set or a txindex.
+/// Read bounded details for a transaction selected from an already inspected
+/// block. Prevout amounts are sourced only from hash-pinned block undo; this
+/// path never consults the current UTXO set, a txindex, or peers.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn inspect_transaction(
     cs: &Chainstate,
@@ -323,17 +339,96 @@ pub(crate) fn inspect_transaction(
     }
 
     let coinbase = tx.is_coinbase();
-    let unknown_reason = Some(if coinbase {
-        AmountUnknownReason::CoinbaseHasNoPrevoutAmount
+    let (input_amount_sats, fee_sats, page_input_values, amount_unknown_reason) = if coinbase {
+        (
+            None,
+            None,
+            None,
+            Some(AmountUnknownReason::CoinbaseHasNoPrevoutAmount),
+        )
     } else {
-        AmountUnknownReason::PreviousOutputsNotLookedUp
-    });
+        let input_limit = input_limit.clamp(1, MAX_TX_DETAIL_PAGE);
+        let input_count = tx.inputs.len().min(u32::MAX as usize) as u32;
+        let page_inputs = page_slice(&tx.inputs, input_offset, input_limit);
+        let result = cs.inspect_undo_amounts(UndoAmountsRequest {
+            height: node.height,
+            block_hash,
+            tx_index,
+            block_tx_count: body.transactions.len().min(u32::MAX as usize) as u32,
+            input_count,
+            input_offset: input_offset.min(input_count),
+            input_limit,
+        });
+        match result {
+            UndoAmountsResult::Available(amounts) => {
+                let output_total = tx.outputs.iter().try_fold(0i64, |sum, output| {
+                    if !(0..=MAX_MONEY).contains(&output.value) {
+                        return None;
+                    }
+                    sum.checked_add(output.value)
+                        .filter(|total| *total <= MAX_MONEY)
+                });
+                let page_total = amounts.input_values.iter().try_fold(0i64, |sum, value| {
+                    if !(0..=MAX_MONEY).contains(value) {
+                        return None;
+                    }
+                    sum.checked_add(*value).filter(|total| *total <= MAX_MONEY)
+                });
+                let valid_values = amounts.input_values.len() == page_inputs.len()
+                    && page_total.is_some_and(|page_sum| page_sum <= amounts.input_total_sats);
+                let valid_input_total = (0..=MAX_MONEY).contains(&amounts.input_total_sats);
+                let fee = output_total.and_then(|outputs| {
+                    amounts
+                        .input_total_sats
+                        .checked_sub(outputs)
+                        .filter(|fee| (0..=MAX_MONEY).contains(fee))
+                });
+                if valid_values && valid_input_total && fee.is_some() {
+                    (
+                        Some(amounts.input_total_sats),
+                        fee,
+                        Some(amounts.input_values),
+                        None,
+                    )
+                } else {
+                    (
+                        None,
+                        None,
+                        None,
+                        Some(AmountUnknownReason::InconsistentTransactionAmounts),
+                    )
+                }
+            }
+            UndoAmountsResult::Unavailable => {
+                (None, None, None, Some(AmountUnknownReason::UndoUnavailable))
+            }
+            UndoAmountsResult::NotActiveChain => {
+                (None, None, None, Some(AmountUnknownReason::NotActiveChain))
+            }
+            UndoAmountsResult::HashMismatch => (
+                None,
+                None,
+                None,
+                Some(AmountUnknownReason::UndoHashMismatch),
+            ),
+            UndoAmountsResult::TooLarge => {
+                (None, None, None, Some(AmountUnknownReason::UndoTooLarge))
+            }
+            UndoAmountsResult::Malformed => {
+                (None, None, None, Some(AmountUnknownReason::UndoMalformed))
+            }
+        }
+    };
+    let amounts_available = amount_unknown_reason.is_none();
     let inputs = page_slice(&tx.inputs, input_offset, input_limit)
         .iter()
         .enumerate()
         .map(|(page_index, input)| {
             let index = input_offset.saturating_add(page_index as u32);
             let prevout = input.previous_output;
+            let value_sats = page_input_values
+                .as_ref()
+                .and_then(|values| values.get(page_index).copied());
             let witness_items = input
                 .witness
                 .items()
@@ -346,8 +441,11 @@ pub(crate) fn inspect_transaction(
                 prev_txid: (!prevout.is_null()).then(|| prevout.txid.to_string()),
                 prev_vout: (!prevout.is_null()).then_some(prevout.vout),
                 sequence: input.sequence,
-                value_sats: None,
-                value_unknown_reason: unknown_reason,
+                value_sats,
+                value_unknown_reason: value_sats
+                    .is_none()
+                    .then_some(amount_unknown_reason)
+                    .flatten(),
                 script_sig: script_summary(input.script_sig.as_bytes()),
                 witness_item_count: input.witness.len().min(u32::MAX as usize) as u32,
                 witness_items_truncated: input.witness.len() > MAX_WITNESS_ITEMS_SHOWN,
@@ -381,10 +479,11 @@ pub(crate) fn inspect_transaction(
             coinbase,
             input_count: tx.inputs.len().min(u32::MAX as usize) as u32,
             output_count: tx.outputs.len().min(u32::MAX as usize) as u32,
-            input_amount_sats: None,
-            input_amount_unknown_reason: unknown_reason,
-            fee_sats: None,
-            fee_unknown_reason: unknown_reason,
+            input_amount_sats,
+            input_amount_unknown_reason: amount_unknown_reason,
+            fee_sats,
+            fee_unknown_reason: amount_unknown_reason,
+            amount_source: amounts_available.then_some(AmountSource::BlockUndo),
             inputs,
             next_input_offset: (input_end < tx.inputs.len() as u32).then_some(input_end),
             outputs,
@@ -572,6 +671,41 @@ mod tests {
             }],
             lock_time: 0,
         }
+    }
+
+    fn mature_spend_blocks(params: &avila_consensus::params::Params) -> (Vec<Block>, Transaction) {
+        let mut blocks = Vec::with_capacity(101);
+        let mut parent = params.genesis_header;
+        for height in 1..=100 {
+            let block = block_on(&parent, vec![coinbase(height, params, 1)], params);
+            parent = block.header;
+            blocks.push(block);
+        }
+        let first_coinbase = &blocks[0].transactions[0];
+        let spend = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: first_coinbase.txid(),
+                    vout: 0,
+                },
+                script_sig: Script::new(vec![script::OP_1]),
+                sequence: SEQUENCE_FINAL,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: avila_consensus::connect::block_subsidy(1, params) - 1_000,
+                script_pubkey: Script::new(vec![script::OP_1]),
+            }],
+            lock_time: 0,
+        };
+        let block = block_on(
+            &parent,
+            vec![coinbase(101, params, 1), spend.clone()],
+            params,
+        );
+        blocks.push(block);
+        (blocks, spend)
     }
 
     #[test]
@@ -788,7 +922,7 @@ mod tests {
         assert_eq!(detail.inputs[0].value_sats, None);
         assert_eq!(
             detail.inputs[0].value_unknown_reason,
-            Some(AmountUnknownReason::PreviousOutputsNotLookedUp)
+            Some(AmountUnknownReason::NotActiveChain)
         );
         assert_eq!(detail.inputs[0].script_sig.byte_len, 40);
         assert_eq!(detail.inputs[0].script_sig.hex_prefix.len(), 64);
@@ -807,8 +941,9 @@ mod tests {
         assert_eq!(detail.fee_sats, None);
         assert_eq!(
             detail.fee_unknown_reason,
-            Some(AmountUnknownReason::PreviousOutputsNotLookedUp)
+            Some(AmountUnknownReason::NotActiveChain)
         );
+        assert_eq!(detail.amount_source, None);
         assert_eq!(detail.next_input_offset, Some(2));
         assert_eq!(detail.next_output_offset, Some(2));
 
@@ -831,5 +966,89 @@ mod tests {
             inspect_transaction(&cs, block_hash, Txid::ZERO, 1, 0, 1, 0, 1),
             BlockTxDetailResult::NotFound
         ));
+    }
+
+    #[test]
+    fn undo_amounts_are_pinned_and_paginated_for_active_transactions() {
+        let params = regtest_params();
+        let (blocks, spend) = mature_spend_blocks(&params);
+        let txid = spend.txid();
+        let mut cs = Chainstate::new(&params);
+        for block in &blocks {
+            cs.accept_block(block, NOW)
+                .expect("mature spend-chain block should connect");
+        }
+        let block_hash = blocks.last().expect("height 101 exists").block_hash();
+
+        let BlockTxDetailResult::Found { detail } =
+            inspect_transaction(&cs, block_hash, txid, 1, 0, 1, 0, 1)
+        else {
+            panic!("active transaction detail should be available");
+        };
+        assert!(detail.block.active_chain);
+        assert_eq!(
+            detail.input_amount_sats,
+            Some(avila_consensus::connect::block_subsidy(1, &params))
+        );
+        assert_eq!(detail.fee_sats, Some(1_000));
+        assert_eq!(detail.amount_source, Some(AmountSource::BlockUndo));
+        assert_eq!(detail.inputs.len(), 1);
+        assert_eq!(detail.inputs[0].value_sats, detail.input_amount_sats);
+        assert_eq!(detail.inputs[0].value_unknown_reason, None);
+        let mut legacy_json = serde_json::to_value(&detail).expect("detail serializes");
+        legacy_json
+            .as_object_mut()
+            .expect("detail is an object")
+            .remove("amount_source");
+        let legacy_detail: BlockTxDetail =
+            serde_json::from_value(legacy_json).expect("missing optional source is compatible");
+        assert_eq!(legacy_detail.amount_source, None);
+
+        // The result remains pinned to the exact txid/index and reports
+        // per-page values without depending on a current UTXO lookup.
+        let BlockTxDetailResult::Found { detail: empty_page } =
+            inspect_transaction(&cs, block_hash, txid, 1, 1, u16::MAX, 0, 1)
+        else {
+            panic!("out-of-range input page should still return transaction detail");
+        };
+        assert_eq!(empty_page.inputs.len(), 0);
+        assert_eq!(empty_page.input_amount_sats, detail.input_amount_sats);
+        assert_eq!(empty_page.fee_sats, detail.fee_sats);
+        let BlockTxDetailResult::Found {
+            detail: past_end_page,
+        } = inspect_transaction(&cs, block_hash, txid, 1, u32::MAX, u16::MAX, 0, 1)
+        else {
+            panic!("input offset past the end should return bounded detail");
+        };
+        assert_eq!(past_end_page.inputs.len(), 0);
+        assert_eq!(past_end_page.input_amount_sats, detail.input_amount_sats);
+        assert_eq!(past_end_page.fee_sats, detail.fee_sats);
+
+        // Flush the same chain through the coins backend so inspection also
+        // exercises the stored, hash-tagged undo path.
+        let dir = std::env::temp_dir().join(format!(
+            "avila-inspect-undo-{}-{}",
+            std::process::id(),
+            block_hash
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut disk = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20)
+            .expect("temporary block/coins stores open");
+        for block in &blocks {
+            disk.accept_block(block, NOW)
+                .expect("same mature spend-chain block should connect on disk");
+        }
+        disk.flush().expect("block bodies and undo data flush");
+        let BlockTxDetailResult::Found {
+            detail: stored_detail,
+        } = inspect_transaction(&disk, block_hash, txid, 1, 0, 1, 0, 1)
+        else {
+            panic!("stored active transaction details should be available");
+        };
+        assert_eq!(stored_detail.input_amount_sats, detail.input_amount_sats);
+        assert_eq!(stored_detail.fee_sats, detail.fee_sats);
+        assert_eq!(stored_detail.amount_source, Some(AmountSource::BlockUndo));
+        drop(disk);
+        std::fs::remove_dir_all(dir).expect("temporary inspection stores are removable");
     }
 }

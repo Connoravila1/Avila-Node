@@ -802,6 +802,7 @@ mod tests {
             input_amount_unknown_reason: Some(AmountUnknownReason::PreviousOutputsNotLookedUp),
             fee_sats: None,
             fee_unknown_reason: Some(AmountUnknownReason::PreviousOutputsNotLookedUp),
+            amount_source: None,
             inputs: (input_offset..input_end)
                 .map(|index| TxInputDetail {
                     index,
@@ -991,6 +992,7 @@ mod tests {
                     ),
                     fee_sats: None,
                     fee_unknown_reason: Some(AmountUnknownReason::CoinbaseHasNoPrevoutAmount),
+                    amount_source: None,
                     inputs: Vec::new(),
                     next_input_offset: None,
                     outputs: Vec::new(),

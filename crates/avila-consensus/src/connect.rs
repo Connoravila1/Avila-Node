@@ -1244,6 +1244,19 @@ impl UtxoSet {
         self.runs.iter().rev().find_map(|l| l.undo(height).cloned())
     }
 
+    /// Borrow a run-sidecar undo without cloning it for bounded read-only
+    /// inspection. Preserve its stored hash as part of the authoritative
+    /// record identity. Newest attached epochs take precedence.
+    pub(crate) fn epoch_undo_entry_ref(&self, height: u32) -> Option<(BlockHash, &BlockUndo)> {
+        self.runs.iter().rev().find_map(|layer| {
+            layer
+                .undos
+                .iter()
+                .find(|(stored_height, _, _)| *stored_height == height)
+                .map(|(_, hash, undo)| (*hash, undo))
+        })
+    }
+
     /// Attached run epochs' net live-coin delta — `len()`'s share of
     /// the run layers (they are already-durable committed state).
     fn runs_delta(&self) -> i64 {
