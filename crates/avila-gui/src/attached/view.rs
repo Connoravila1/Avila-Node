@@ -305,6 +305,9 @@ impl AttachedApp {
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
                 )
                 .ui(ui, |ui| {
+                    // Reserve a narrow gutter for the menu scrollbar so it
+                    // cannot cover the privacy option or its label.
+                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                     let menu_height = (ui.ctx().content_rect().height() * 0.65).clamp(180.0, 380.0);
                     ScrollArea::vertical()
                         .id_salt("attached_view_menu_options")

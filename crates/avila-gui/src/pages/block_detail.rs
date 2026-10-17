@@ -5,6 +5,8 @@ use avila_node::inspect::{
 };
 use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, Stroke, Ui, vec2};
 
+const COMPACT_TRANSACTION_TABLE_WIDTH: f32 = 640.0;
+
 pub struct InspectorView<'a> {
     pub(super) block: &'a BlockSummary,
     pub(super) transactions: &'a [BlockTxSummary],
@@ -131,10 +133,15 @@ pub fn show(ui: &mut Ui, view: &mut InspectorView<'_>) -> Option<Interaction> {
         }
     }
     if let Some(next) = view.block.next_hash.as_deref() {
-        ui.horizontal(|ui| {
+        if ui.available_width() < COMPACT_TRANSACTION_TABLE_WIDTH {
             ui.label(RichText::new("Next block").weak());
-            ui.label(RichText::new(next).monospace());
-        });
+            wrapped_hash_label(ui, next, 12.0);
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Next block").weak());
+                wrapped_hash_label(ui, next, 12.0);
+            });
+        }
     }
     None
 }
@@ -323,6 +330,7 @@ fn transaction_table(
     selected_tx_index: Option<u32>,
     allow_selection: bool,
 ) -> Option<Interaction> {
+    let compact = ui.available_width() < COMPACT_TRANSACTION_TABLE_WIDTH;
     ui.add_space(12.0);
     ui.label(RichText::new("Transactions").strong());
     egui::ScrollArea::vertical()
@@ -335,67 +343,113 @@ fn transaction_table(
             // scrolls vertically; without this minimum its nested area can
             // collapse to a single visible row.
             ui.set_min_height(120.0);
-            egui::ScrollArea::horizontal()
-                .id_salt("block_transaction_columns")
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    let mut selected = None;
-                    egui::Grid::new("block_transactions")
-                        .striped(true)
-                        .num_columns(7)
-                        .spacing([12.0, 5.0])
-                        .show(ui, |ui| {
-                            for header in [
-                                "Index",
-                                "Txid",
-                                "Kind",
-                                "Inputs",
-                                "Outputs",
-                                "Output value",
-                                "Weight",
-                            ] {
-                                ui.label(RichText::new(header).strong().weak());
-                            }
-                            ui.end_row();
-                            for tx in transactions {
-                                if ui
-                                    .add_enabled_ui(allow_selection, |ui| {
-                                        ui.selectable_label(
-                                            selected_tx_index == Some(tx.index),
-                                            tx.index.to_string(),
-                                        )
-                                    })
-                                    .inner
-                                    .clicked()
-                                {
-                                    selected = Some(Interaction::SelectTransaction(tx.index));
-                                }
-                                // Keep the table compact at narrow window sizes;
-                                // clicking the label or its context menu still
-                                // copies the complete txid.
-                                if crate::widgets::hash_label(ui, &tx.txid, 13.0, Some(14))
-                                    .clicked()
-                                    && allow_selection
-                                {
-                                    selected = Some(Interaction::SelectTransaction(tx.index));
-                                }
-                                ui.label(if tx.coinbase {
+            let mut selected = None;
+            if compact {
+                for tx in transactions {
+                    ui.horizontal_wrapped(|ui| {
+                        let index = ui
+                            .add_enabled_ui(allow_selection, |ui| {
+                                ui.selectable_label(
+                                    selected_tx_index == Some(tx.index),
+                                    tx.index.to_string(),
+                                )
+                            })
+                            .inner;
+                        if index.clicked() {
+                            index.request_focus();
+                            selected = Some(Interaction::SelectTransaction(tx.index));
+                        }
+                        // The visible text is shortened, while the widget retains
+                        // its full-hash copy action and tx selection behavior.
+                        let txid = crate::widgets::hash_label(ui, &tx.txid, 13.0, Some(14));
+                        if txid.clicked() && allow_selection {
+                            txid.request_focus();
+                            selected = Some(Interaction::SelectTransaction(tx.index));
+                        }
+                    });
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!(
+                                "{} · Inputs {} · Outputs {} · Output value {} · Weight {} WU",
+                                if tx.coinbase {
                                     "coinbase"
                                 } else if tx.has_witness {
                                     "witness"
                                 } else {
                                     "standard"
-                                });
-                                ui.label(tx.inputs.to_string());
-                                ui.label(tx.outputs.to_string());
-                                ui.label(format_sats(tx.output_sats));
-                                ui.label(format!("{} WU", tx.weight));
+                                },
+                                tx.inputs,
+                                tx.outputs,
+                                format_sats(tx.output_sats),
+                                tx.weight
+                            ))
+                            .weak(),
+                        )
+                        .wrap(),
+                    );
+                    ui.separator();
+                }
+            } else {
+                egui::ScrollArea::horizontal()
+                    .id_salt("block_transaction_columns")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        egui::Grid::new("block_transactions")
+                            .striped(true)
+                            .num_columns(7)
+                            .spacing([12.0, 5.0])
+                            .show(ui, |ui| {
+                                for header in [
+                                    "Index",
+                                    "Txid",
+                                    "Kind",
+                                    "Inputs",
+                                    "Outputs",
+                                    "Output value",
+                                    "Weight",
+                                ] {
+                                    ui.label(RichText::new(header).strong().weak());
+                                }
                                 ui.end_row();
-                            }
-                        });
-                    selected
-                })
-                .inner
+                                for tx in transactions {
+                                    let index = ui
+                                        .add_enabled_ui(allow_selection, |ui| {
+                                            ui.selectable_label(
+                                                selected_tx_index == Some(tx.index),
+                                                tx.index.to_string(),
+                                            )
+                                        })
+                                        .inner;
+                                    if index.clicked() {
+                                        index.request_focus();
+                                        selected = Some(Interaction::SelectTransaction(tx.index));
+                                    }
+                                    // Keep the table compact at narrow window sizes;
+                                    // clicking the label or its context menu still
+                                    // copies the complete txid.
+                                    let txid =
+                                        crate::widgets::hash_label(ui, &tx.txid, 13.0, Some(14));
+                                    if txid.clicked() && allow_selection {
+                                        txid.request_focus();
+                                        selected = Some(Interaction::SelectTransaction(tx.index));
+                                    }
+                                    ui.label(if tx.coinbase {
+                                        "coinbase"
+                                    } else if tx.has_witness {
+                                        "witness"
+                                    } else {
+                                        "standard"
+                                    });
+                                    ui.label(tx.inputs.to_string());
+                                    ui.label(tx.outputs.to_string());
+                                    ui.label(format_sats(tx.output_sats));
+                                    ui.label(format!("{} WU", tx.weight));
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            }
+            selected
         })
         .inner
 }

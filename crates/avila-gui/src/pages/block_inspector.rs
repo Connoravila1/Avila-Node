@@ -41,6 +41,7 @@ pub struct State {
     tx_detail_timed_out: bool,
     tx_detail_generation: u64,
     pending_detail_generation: Option<u64>,
+    pending_detail_offsets: Option<(u32, u32)>,
     detail_input_offset: u32,
     detail_output_offset: u32,
     detail_message: Option<String>,
@@ -307,6 +308,7 @@ impl State {
         self.tx_detail_pending_since = None;
         self.tx_detail_timed_out = false;
         self.pending_detail_generation = None;
+        self.pending_detail_offsets = None;
         self.detail_input_offset = 0;
         self.detail_output_offset = 0;
         self.detail_message = None;
@@ -360,18 +362,28 @@ impl State {
         }
         self.tx_detail_generation = self.tx_detail_generation.wrapping_add(1);
         let generation = self.tx_detail_generation;
-        let selection_changed = self.selected_tx_index != Some(tx_index);
+        let detail_identity_changed = self.tx_detail.as_ref().is_some_and(|detail| {
+            detail.block.hash != block_hash_text
+                || detail.tx_index != tx_index
+                || detail.txid != txid_text
+        });
+        let selection_changed = self.selected_tx_index != Some(tx_index) || detail_identity_changed;
         self.selected_tx_index = Some(tx_index);
-        self.tx_detail = None;
+        if selection_changed {
+            // A different tx has a different page identity; discard the old
+            // detail and reset its displayed offsets together.
+            self.tx_detail = None;
+            self.detail_input_offset = 0;
+            self.detail_output_offset = 0;
+        }
         self.tx_detail_pending = None;
         self.tx_detail_pending_since = None;
         self.tx_detail_timed_out = false;
         self.pending_detail_generation = None;
+        self.pending_detail_offsets = None;
         if selection_changed {
             self.detail_scroll_requested = true;
         }
-        self.detail_input_offset = input_offset;
-        self.detail_output_offset = output_offset;
         self.detail_message = Some("Loading transaction details…".into());
         let Some(sender) = sender else {
             self.detail_message = Some(if self.is_fixture() {
@@ -404,6 +416,7 @@ impl State {
                 self.tx_detail_pending = Some(receive);
                 self.tx_detail_pending_since = Some(Instant::now());
                 self.pending_detail_generation = Some(generation);
+                self.pending_detail_offsets = Some((input_offset, output_offset));
             }
             Err(_) => {
                 self.detail_message =
@@ -439,6 +452,7 @@ impl State {
             return;
         };
         let response_generation = self.pending_detail_generation;
+        let requested_offsets = self.pending_detail_offsets.take();
         self.tx_detail_pending = None;
         self.tx_detail_pending_since = None;
         self.tx_detail_timed_out = false;
@@ -458,10 +472,15 @@ impl State {
                     && expected_tx.is_some_and(|tx| {
                         detail.tx_index == tx.index && detail.txid == tx.txid
                     })
-                    && self.detail_page_matches(&detail) =>
+                    && requested_offsets.is_some_and(|(input, output)| {
+                        Self::detail_page_matches(&detail, input, output)
+                    }) =>
             {
-                self.detail_input_offset = self.detail_input_offset.min(detail.input_count);
-                self.detail_output_offset = self.detail_output_offset.min(detail.output_count);
+                let Some((input_offset, output_offset)) = requested_offsets else {
+                    return;
+                };
+                self.detail_input_offset = input_offset.min(detail.input_count);
+                self.detail_output_offset = output_offset.min(detail.output_count);
                 self.tx_detail = Some(detail);
                 self.detail_message = None;
             }
@@ -486,31 +505,27 @@ impl State {
         }
     }
 
-    fn detail_page_matches(&self, detail: &BlockTxDetail) -> bool {
+    fn detail_page_matches(detail: &BlockTxDetail, input_offset: u32, output_offset: u32) -> bool {
         let expected_input_len = detail
             .input_count
-            .saturating_sub(self.detail_input_offset)
+            .saturating_sub(input_offset)
             .min(u32::from(DETAIL_PAGE_SIZE)) as usize;
         let expected_output_len = detail
             .output_count
-            .saturating_sub(self.detail_output_offset)
+            .saturating_sub(output_offset)
             .min(u32::from(DETAIL_PAGE_SIZE)) as usize;
-        let expected_input_end = self
-            .detail_input_offset
-            .checked_add(expected_input_len as u32);
-        let expected_output_end = self
-            .detail_output_offset
-            .checked_add(expected_output_len as u32);
+        let expected_input_end = input_offset.checked_add(expected_input_len as u32);
+        let expected_output_end = output_offset.checked_add(expected_output_len as u32);
         detail.block.body_state == avila_node::inspect::BodyState::Available
             && detail.inputs.len() <= usize::from(DETAIL_PAGE_SIZE)
             && detail.outputs.len() <= usize::from(DETAIL_PAGE_SIZE)
             && detail.inputs.len() == expected_input_len
             && detail.outputs.len() == expected_output_len
             && detail.inputs.iter().enumerate().all(|(position, input)| {
-                self.detail_input_offset.checked_add(position as u32) == Some(input.index)
+                input_offset.checked_add(position as u32) == Some(input.index)
             })
             && detail.outputs.iter().enumerate().all(|(position, output)| {
-                self.detail_output_offset.checked_add(position as u32) == Some(output.index)
+                output_offset.checked_add(position as u32) == Some(output.index)
             })
             && expected_input_end.is_some_and(|end| {
                 detail.next_input_offset == (end < detail.input_count).then_some(end)
@@ -755,6 +770,73 @@ mod tests {
         }
     }
 
+    fn transaction_detail(input_offset: u32, output_offset: u32) -> BlockTxDetail {
+        let input_count = 101u32;
+        let output_count = 1u32;
+        let input_len = input_count
+            .saturating_sub(input_offset)
+            .min(u32::from(super::DETAIL_PAGE_SIZE));
+        let output_len = output_count
+            .saturating_sub(output_offset)
+            .min(u32::from(super::DETAIL_PAGE_SIZE));
+        let input_end = input_offset + input_len;
+        let output_end = output_offset + output_len;
+        BlockTxDetail {
+            block: BlockIdentity {
+                hash: BlockHash::ZERO.to_string(),
+                height: 7,
+                active_chain: true,
+                fully_checked: true,
+                snapshot_assumed: false,
+                body_state: BodyState::Available,
+            },
+            tx_index: 0,
+            txid: BlockHash::ZERO.to_string(),
+            wtxid: BlockHash::ZERO.to_string(),
+            version: 1,
+            lock_time: 0,
+            coinbase: false,
+            input_count,
+            output_count,
+            input_amount_sats: None,
+            input_amount_unknown_reason: Some(AmountUnknownReason::PreviousOutputsNotLookedUp),
+            fee_sats: None,
+            fee_unknown_reason: Some(AmountUnknownReason::PreviousOutputsNotLookedUp),
+            inputs: (input_offset..input_end)
+                .map(|index| TxInputDetail {
+                    index,
+                    prev_txid: None,
+                    prev_vout: None,
+                    sequence: 0,
+                    value_sats: None,
+                    value_unknown_reason: Some(AmountUnknownReason::PreviousOutputsNotLookedUp),
+                    script_sig: TxScriptSummary {
+                        byte_len: 0,
+                        hex_prefix: String::new(),
+                        truncated: false,
+                    },
+                    witness_item_count: 0,
+                    witness_items: Vec::new(),
+                    witness_items_truncated: false,
+                })
+                .collect(),
+            next_input_offset: (input_end < input_count).then_some(input_end),
+            outputs: (output_offset..output_end)
+                .map(|index| TxOutputDetail {
+                    index,
+                    value_sats: 0,
+                    address: None,
+                    script_pubkey: TxScriptSummary {
+                        byte_len: 0,
+                        hex_prefix: String::new(),
+                        truncated: false,
+                    },
+                })
+                .collect(),
+            next_output_offset: (output_end < output_count).then_some(output_end),
+        }
+    }
+
     #[test]
     fn lookup_input_accepts_heights_and_rejects_partial_hashes() {
         assert!(matches!(
@@ -878,6 +960,7 @@ mod tests {
             selected_tx_index: Some(0),
             tx_detail_generation: 4,
             pending_detail_generation: Some(3),
+            pending_detail_offsets: Some((100, 0)),
             detail_message: Some("Loading transaction details…".into()),
             ..State::default()
         };
@@ -923,6 +1006,7 @@ mod tests {
         assert!(state.tx_detail.is_none());
         assert_eq!(state.selected_tx_index, Some(0));
         assert!(state.detail_message.is_some());
+        assert!(state.pending_detail_offsets.is_none());
     }
 
     #[test]
@@ -945,6 +1029,7 @@ mod tests {
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
         assert_eq!(state.selected_tx_index, Some(0));
         assert!(state.tx_detail_pending.is_some());
+        assert_eq!(state.pending_detail_offsets, Some((0, 0)));
     }
 
     #[test]
@@ -979,68 +1064,160 @@ mod tests {
 
     #[test]
     fn transaction_detail_pages_require_contiguous_indexes_and_correct_next_offsets() {
-        let state = State {
-            detail_input_offset: 100,
+        let mut detail = transaction_detail(100, 0);
+        assert!(State::detail_page_matches(&detail, 100, 0));
+
+        detail.inputs[0].index = 99;
+        assert!(!State::detail_page_matches(&detail, 100, 0));
+        detail.inputs[0].index = 100;
+        detail.next_input_offset = Some(101);
+        assert!(!State::detail_page_matches(&detail, 100, 0));
+    }
+
+    #[test]
+    fn same_index_with_different_detail_pin_discards_old_page() {
+        for changed_txid in [false, true] {
+            let (sender, receiver) = channel();
+            let mut old_detail = transaction_detail(100, 0);
+            if changed_txid {
+                old_detail.txid = BlockHash::from_bytes([1; 32]).to_string();
+            } else {
+                old_detail.block.hash = BlockHash::from_bytes([1; 32]).to_string();
+            }
+            let mut state = State {
+                block: Some(summary(1)),
+                transactions: vec![transaction(0)],
+                selected_tx_index: Some(0),
+                tx_detail: Some(old_detail),
+                detail_input_offset: 100,
+                detail_output_offset: 0,
+                ..State::default()
+            };
+
+            state.request_transaction_detail(Some(&sender), 0, 0, 0, true);
+            let ControlMsg::InspectBlockTx {
+                input_offset,
+                output_offset,
+                ..
+            } = receiver.try_recv().expect("new detail request sent")
+            else {
+                panic!("state sends transaction detail requests");
+            };
+            assert_eq!((input_offset, output_offset), (0, 0));
+            assert_eq!(state.selected_tx_index, Some(0));
+            assert!(state.tx_detail.is_none());
+            assert_eq!(
+                (state.detail_input_offset, state.detail_output_offset),
+                (0, 0)
+            );
+            assert!(state.detail_scroll_requested);
+            assert_eq!(state.pending_detail_offsets, Some((0, 0)));
+        }
+    }
+
+    #[test]
+    fn selected_transaction_keeps_displayed_page_until_requested_page_is_accepted() {
+        let (sender, receiver) = channel();
+        let old_detail = transaction_detail(0, 0);
+        let mut state = State {
+            block: Some(summary(1)),
+            transactions: vec![transaction(0)],
+            selected_tx_index: Some(0),
+            tx_detail: Some(old_detail.clone()),
+            detail_input_offset: 0,
             detail_output_offset: 0,
             ..State::default()
         };
-        let mut detail = BlockTxDetail {
-            block: BlockIdentity {
-                hash: BlockHash::ZERO.to_string(),
-                height: 7,
-                active_chain: true,
-                fully_checked: true,
-                snapshot_assumed: false,
-                body_state: BodyState::Available,
-            },
-            tx_index: 0,
-            txid: BlockHash::ZERO.to_string(),
-            wtxid: BlockHash::ZERO.to_string(),
-            version: 1,
-            lock_time: 0,
-            coinbase: false,
-            input_count: 101,
-            output_count: 1,
-            input_amount_sats: None,
-            input_amount_unknown_reason: Some(AmountUnknownReason::PreviousOutputsNotLookedUp),
-            fee_sats: None,
-            fee_unknown_reason: Some(AmountUnknownReason::PreviousOutputsNotLookedUp),
-            inputs: vec![TxInputDetail {
-                index: 100,
-                prev_txid: None,
-                prev_vout: None,
-                sequence: 0,
-                value_sats: None,
-                value_unknown_reason: Some(AmountUnknownReason::PreviousOutputsNotLookedUp),
-                script_sig: TxScriptSummary {
-                    byte_len: 0,
-                    hex_prefix: String::new(),
-                    truncated: false,
-                },
-                witness_item_count: 0,
-                witness_items: Vec::new(),
-                witness_items_truncated: false,
-            }],
-            next_input_offset: None,
-            outputs: vec![TxOutputDetail {
-                index: 0,
-                value_sats: 0,
-                address: None,
-                script_pubkey: TxScriptSummary {
-                    byte_len: 0,
-                    hex_prefix: String::new(),
-                    truncated: false,
-                },
-            }],
-            next_output_offset: None,
-        };
-        assert!(state.detail_page_matches(&detail));
 
-        detail.inputs[0].index = 99;
-        assert!(!state.detail_page_matches(&detail));
-        detail.inputs[0].index = 100;
-        detail.next_input_offset = Some(101);
-        assert!(!state.detail_page_matches(&detail));
+        state.request_transaction_detail(Some(&sender), 0, 100, 0, true);
+        let ControlMsg::InspectBlockTx {
+            input_offset,
+            output_offset,
+            reply,
+            ..
+        } = receiver.try_recv().expect("page request sent")
+        else {
+            panic!("state sends transaction detail requests");
+        };
+        assert_eq!((input_offset, output_offset), (100, 0));
+        assert_eq!(
+            serde_json::to_value(state.tx_detail.as_ref()).unwrap(),
+            serde_json::to_value(&old_detail).unwrap()
+        );
+        assert_eq!(
+            (state.detail_input_offset, state.detail_output_offset),
+            (0, 0)
+        );
+        assert_eq!(state.pending_detail_offsets, Some((100, 0)));
+
+        reply
+            .send(BlockTxDetailResult::Found {
+                detail: transaction_detail(100, 0),
+            })
+            .expect("detail receiver remains live");
+        state.poll_transaction_detail();
+
+        assert_eq!(
+            serde_json::to_value(state.tx_detail.as_ref()).unwrap(),
+            serde_json::to_value(transaction_detail(100, 0)).unwrap()
+        );
+        assert_eq!(
+            (state.detail_input_offset, state.detail_output_offset),
+            (100, 0)
+        );
+        assert!(state.pending_detail_offsets.is_none());
+        assert!(state.detail_message.is_none());
+    }
+
+    #[test]
+    fn rejected_detail_pin_or_page_retains_last_detail_and_offsets() {
+        for wrong_page in [true, false] {
+            let (sender, receiver) = channel();
+            let old_detail = transaction_detail(0, 0);
+            let mut state = State {
+                block: Some(summary(1)),
+                transactions: vec![transaction(0)],
+                selected_tx_index: Some(0),
+                tx_detail: Some(old_detail.clone()),
+                detail_input_offset: 0,
+                detail_output_offset: 0,
+                ..State::default()
+            };
+            state.request_transaction_detail(Some(&sender), 0, 100, 0, true);
+            let ControlMsg::InspectBlockTx { reply, .. } =
+                receiver.try_recv().expect("page request sent")
+            else {
+                panic!("state sends transaction detail requests");
+            };
+            let mut bad_detail = if wrong_page {
+                transaction_detail(0, 0)
+            } else {
+                transaction_detail(100, 0)
+            };
+            if !wrong_page {
+                bad_detail.block.hash = BlockHash::from_bytes([1; 32]).to_string();
+            }
+            reply
+                .send(BlockTxDetailResult::Found { detail: bad_detail })
+                .expect("detail receiver remains live");
+            state.poll_transaction_detail();
+
+            assert_eq!(
+                serde_json::to_value(state.tx_detail.as_ref()).unwrap(),
+                serde_json::to_value(&old_detail).unwrap()
+            );
+            assert_eq!(
+                (state.detail_input_offset, state.detail_output_offset),
+                (0, 0)
+            );
+            assert!(state.pending_detail_offsets.is_none());
+            assert!(
+                state
+                    .detail_message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("did not match"))
+            );
+        }
     }
 
     #[cfg(feature = "devtools")]

@@ -4,8 +4,42 @@ Running record of every experiment tried — adopted, rejected, blocked,
 or inconclusive. One line per attempt; details live in the dated docs.
 A "failed" or "inconclusive" row is a result, not a gap — write it down.
 
+## Experiment #84 — attached block inspector viewport and selection follow-up
+
+The attached block inspector now switches to wrapped, labeled transaction rows
+below 640 logical points, retaining index selection, full-txid copy, kind, input
+and output counts, output value, and measured transaction weight; wider layouts
+keep the seven-column table. The next-block hash stacks below its label at narrow
+widths. A clicked index or txid requests keyboard focus, and the attached View
+popup uses a local solid scrollbar so the bar reserves space beside the privacy
+label while the popup remains open for scrolling.
+
+State tests cover transaction-detail single-flight behavior (including retaining
+the flight after timeout), contiguous page indexes and offsets, discarding stale
+detail pins, preserving displayed pages until a requested page is accepted, and
+retaining old detail on rejected responses. The GUI-only gate passed 85 tests,
+formatting, all-target/devtools Clippy with warnings denied, and release build;
+source fingerprint SHA-256 `497f4d3bf71a6ac7d00b5a4168357a3f502a8171a74ec465b87baeac3f2d1a3c`.
+Native checks against the live attached node at 760×600 (100%/130%) and
+1440×900 (100%/200%) showed the compact rows retain all fields and weight, the
+wide table remains visible, the full next-block hash wraps at 130%, and the View
+popup scrollbar does not cover its privacy label or close the menu while
+scrolling. Direct keyboard dispatch verified click index 0 → Tab to txid 0 → Tab
+to index 1 → Space selects transaction 1 and opens matching details. This is a
+specific native keyboard path, not screen-reader or cross-platform qualification.
+Installed GUI binary SHA-256: `7cb089a848309ba1c2aaa76323f9004252e590a621de5f2f67779472eaf02488`.
+On block 200000, transaction 384 had 440 inputs and 2 outputs. Native navigation
+showed input pages 1–100, 101–200, 201–300, 301–400, and 401–440, returned
+through the previous pages, and removed Next on the last page. Its RPC answered quickly;
+slow native network behavior is not established by this run. Closing GUI with
+Node → Close monitor exited 0 while the same daemon PID advanced 214,599 → 219,741
+(five peers, 971,827 headers); IBD remains incomplete. >100-output paging,
+screen-reader, missing-cookie, and cross-platform checks remain open. See
+[GUI docs](../docs/GUI.md) for viewport and accessibility limits.
+
 | # | Date | Experiment | Hypothesis | Verdict | Key numbers | Doc |
 |---|------|-----------|------------|---------|-------------|-----|
+| 84 | 10-17 | Attached block inspector responsive layout, focus and detail paging | Can a narrow/wide transaction view preserve measured fields, keyboard selection, and bounded large-input navigation? | **GUI gate and scoped native checks passed; accessibility limits remain** | 85 GUI tests; GUI all-target/devtools Clippy and release build passed (2,560 MiB cap, 1,025 MiB peak). Source SHA-256 `497f4d3b…`; installed GUI SHA-256 `7cb089a8…`. Native: 760×600 at 100%/130%, 1440×900 at 100%/200%; direct click→Tab→Tab→Space selected row 1. Block 200,000 tx 384: five input pages for 440 inputs, previous/next navigation; 512 MiB native GUI cap, 80 MiB peak. GUI close left daemon PID 760476 running, height 214,599→219,741. >100-output, delayed RPC, screen-reader, cross-platform remain open. | [GUI](../docs/GUI.md) |
 | 80 | 10-17 | First managed mainnet full-validation IBD observation | Can the 8 GiB laptop sustain ordinary disk-backed validation with AssumeValid disabled, and resume after a clean restart? | **partial; live sync and restart continuity confirmed, IBD ongoing** | Started ~04:02 UTC with `--assumevalid=0`, no SwiftSync modules; first observation: 1,228 connected blocks / 38,782 headers (status cache showed 1,063). Clean stop at height 718, hash `000000000992f083d79cdd428b664ce97105c57fdc63049371bfa98c28dbbc79`; restart resumed at 889 with hash match. Two clean restart proofs have now passed. Later status advanced from 27,784 / 971,809 to 45,000 connected / 971,810 headers at 04:44:27 UTC; IBD remained true, AssumeValid checkpoint null and `historical_scripts_required=true`; CLI SHA-256 `4560d816cdce06f8406034ad669ff7f21a6bcab766acf8946aec58f2d05beff8`. 8 GiB i5-9300H, SSD, prune 8192, dbcache 256, redb 256, mempool 64, 6 peers/16 inflight, 3072 MiB cgroup cap, swap 0. Stopped ~04:10 for GUI build, then sync continued. Still incomplete IBD, no modern-chain coverage or speed claim. | [first-mainnet-ibd](2026-10-17-first-mainnet-ibd.md) |
 | 81 | 10-17 | BIP324 max-garbage handshake-tail test reliability | Does the oversized-length bound test always finish the random-garbage handshake before testing packet length? | **targeted regression and full native validation passed** | Test-only flake: one 4096-byte read could stop before the terminator when up to 4095 bytes of garbage preceded the tail. Test now uses deterministic MAX_GARBAGE_LEN initiator garbage, consumes/asserts the complete stream and version packet, then probes the oversized length. Six targeted BIP324 tests passed. Full workspace pipeline #5 passed: 1,138 passed, 5 ignored, 0 failed; Clippy, rustdoc with warnings denied, and release CLI/GUI builds passed; 1,297 MiB peak under 2,560 MiB cap, 223 s. | [BIP324 test](../crates/avila-p2p/src/bip324.rs) |
 | 79 | 10-16 | Swift checkpoint shadow prototype | Can ordered implicit deletions match explicit Utreexo roots over a fully validated bounded fixture, and can a keyed coin multiset audit detect a changed input copy? | **bounded tests/examples passed; experimental only** | Local workspace: 1,124 passed, 0 failed, 5 ignored (595 consensus, 144 node), 457 s, 1,942 MiB peak under 2,560 MiB guard; all-target Clippy passed. All three fixture modes passed (28 s, 593 MiB); prevout run: height 500, audit match, 513 rows/55,858 encoded bytes, final UTXO and stump roots match their full-validation oracles. Remote `researchhead7209` tests/reproducibility passed; its example exposed redb reopen-under-live-handle bug, now fixed and locally rerun; remote rerun pending. No IBD, production integration, or speed claim. | [swift-checkpoint-shadow](2026-10-16-swift-checkpoint-shadow.md) |

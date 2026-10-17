@@ -99,10 +99,12 @@ the transaction table continues below the initial viewport. The larger capture
 shows the single coinbase weight-composition segment. These captures do not verify
 live-node responses or transaction paging.
 
-Final native validation passed GUI formatting, Clippy, 82 GUI tests, and a
-release build under the 2.5 GiB memory cap (1 GiB reserve; 811 MiB peak, 55 s).
-The full workspace passed 1,152 tests (5 ignored), plus 14 Python tests. Live
-captures used mainnet block 83018
+The current GUI source passed its native GUI gate: 85 tests, formatting,
+all-target/devtools Clippy with warnings denied, and release build under a 2.5 GiB
+memory cap (1 GiB reserve; 1,025 MiB peak, 50 s). Its source fingerprint
+SHA-256 is `497f4d3bf71a6ac7d00b5a4168357a3f502a8171a74ec465b87baeac3f2d1a3c`;
+the installed GUI binary SHA-256 is
+`7cb089a848309ba1c2aaa76323f9004252e590a621de5f2f67779472eaf02488`. Earlier live captures used mainnet block 83018
 (`00000000002bba570c3fbc62f77f54685b7011bfa202a086d4005131cc0ceed6`), which
 contains 225 transactions. The inspector loaded summaries in 100 → 200 → 225
 steps, updated its loaded-coverage labels, and removed the load-more button at the
@@ -113,23 +115,24 @@ selectable address. The block was marked as a lookup snapshot. At 760×600 and
 1440×900 with 100% scale, the partial-map caption, transaction table, map, and
 detail panes were readable.
 
-The attached View scale was exercised at 130% and 200%, then restored to 100%
-through the scrolled menu. The View scrollbar remained usable without closing the
-menu and exposed 175%, 200%, and privacy options at 200% on 1440×900. The
-Help/About version was correct. Black-to-Dark reset, peer-address masking on six
-rows, and Node → Close monitor were checked. Closing the monitor left the daemon
-active while its height advanced from 162,749 to 162,836. This is a changing sync
-sample, not evidence of completion.
+The preceding installed GUI's View scale was exercised at 130% and 200%, then
+restored to 100%; its floating scrollbar exposed lower choices but overlapped the
+privacy label. Black-to-Dark reset, peer-address masking on six rows, Help/About,
+and Node → Close monitor were checked. Closing the monitor left the daemon active
+while its height advanced from 162,749 to 162,836. This is a changing sync sample,
+not evidence of completion.
 
-At 130% on 760×600, long block hashes, transaction details, outpoints, addresses,
-and scripts wrap; the transaction-table Weight column and adjacent Next block hash
-still clip. At 100% on 760×600, fact labels and values remain readable. At 200% on
-1440×900, the View menu can be scrolled to and used for every scale and privacy
-choice; while hovered, its floating scrollbar overlaps the end of the privacy
-label. Keyboard selection of a transaction-table row and screen-reader behavior
-were not verified. A transaction with more than 100 inputs or outputs was not
-tested, and missing-cookie recovery remains unverified. These observations are
-not a full visual or accessibility audit.
+Final native checks show compact, wrapped transaction rows with all fields
+including measured weight and the full next-block hash at 130% on 760×600. The
+seven-column table remains fully visible at 100% on 760×600 and 200% on 1440×900.
+At 1440×900 and 200%, the solid View-menu scrollbar exposes scale and privacy
+controls, stays open while scrolled, and closes after selecting a choice. With
+direct keyboard dispatch at 1440×900/100%, clicking index 0 then pressing Tab,
+Tab, Space focused and selected index 1 and opened its matching details. This
+verifies this row-focus sequence only; screen-reader behavior, a transaction
+with more than 100 outputs, missing-cookie recovery, and cross-platform behavior
+remain unverified. A 440-input transaction was paged natively (details below).
+This is not a full visual or accessibility audit.
 
 Launch with `--full-verify` to disable the assume-valid checkpoint for that run
 and verify historical scripts during initial sync, matching the CLI's
@@ -209,13 +212,28 @@ masking was checked. Help/About showed the package version. Node → Close monit
 closed only the GUI; the daemon remained active and its height advanced from
 162,749 to 162,836.
 
-At 130% on 760×600, the transaction-table Weight column and adjacent Next block
-hash still clip, although long inspector/detail fields wrap. At 200% on 1440×900,
-scrolling the View menu exposes 175%, 200%, and privacy; its floating scrollbar
-overlaps the end of the privacy label while hovered. Keyboard selection of a
-transaction-table row, a transaction with more than 100 inputs or outputs,
-missing-cookie recovery, and screen-reader behavior remain unverified. Do not use
-fixture or demo data for live attached-node checks.
+A later native check used actual mainnet block 200000
+(`000000000000034a7dedef4a161fa058a2d67a173a90155f3a2fe6fc132e0ebf`). Map
+selection opened transaction 384
+(`bcb887acb2c01b6c5c8b92c22a368135d207f07a26eff170fe730b1cd40d2547`), with
+440 inputs and 2 outputs. Input pages 1–100, 101–200, 201–300, 301–400, and
+401–440 were displayed; Previous returned through 101–200 and 1–100, and forward
+navigation reached the final page with no Next control. The detail heading stayed visible.
+This confirms >100-input paging and backward navigation for that transaction.
+The RPC responded quickly; controller retention, timeout and single-flight states
+were tested, but delayed native RPC was not exercised. The GUI
+closed with exit 0 through Node → Close monitor; the same daemon PID continued
+from height 214,599 to 219,741 with five peers and 971,827 headers. Full IBD
+remains in progress; this is not a completion claim.
+
+Native checks show wrapped transaction rows with weight and the full stacked
+next-block hash at 130%/760×600. At 200%/1440×900, the View menu's solid scrollbar
+exposes scale and privacy controls without overlap and keeps the menu open while
+scrolling. At 1440×900/100%, direct keyboard dispatch verified click index 0 →
+Tab to txid 0 → Tab to index 1 → Space selects transaction 1 and opens matching
+details. A transaction with more than 100 outputs, missing-cookie recovery,
+screen-reader behavior, and cross-platform behavior remain unverified.
+Do not use fixture or demo data for live attached-node checks.
 
 Keep native screenshots and provenance notes in a review-artifact directory
 outside the repository. Do not include private peer addresses in shared artifacts.
