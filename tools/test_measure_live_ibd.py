@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.measure_live_ibd import (
     MAX_WINDOW,
@@ -16,6 +17,7 @@ from tools.measure_live_ibd import (
     build_parser,
     collect_window,
     percentiles,
+    run,
     validate_observation,
     validate_rpc_addr,
     validate_receipt_window,
@@ -24,14 +26,14 @@ from tools.measure_live_ibd import (
 )
 
 
-def fake_state(height: int, *, mono: float = 10.0) -> NodeState:
+def fake_state(height: int, *, mono: float = 10.0, uptime: int = 600) -> NodeState:
     return NodeState(
         connected_height=height,
         header_height=height,
         bestblockhash="a" * 64,
         chain="main",
         ibd=True,
-        uptime=600,
+        uptime=uptime,
         policy_checkpoint=None,
         historical_scripts_required=True,
         observed_at="2026-10-17T12:00:00.000Z",
@@ -240,6 +242,136 @@ class WindowAndTimingTests(unittest.TestCase):
         self.assertIsNone(missing)
         self.assertTrue(late)
         self.assertFalse(refreshed)
+
+    def test_run_retries_busy_continuity_hash_and_keeps_latest_baseline(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.hash_calls: list[int] = []
+                self.busy_once = True
+
+            def call(self, method: str, *params: object) -> object:
+                if method == "getblockhash":
+                    height = int(params[0])
+                    self.hash_calls.append(height)
+                    if height == 8 and self.busy_once:
+                        self.busy_once = False
+                        raise RpcCallError("temporary busy response")
+                    return f"{height:064x}" if height >= 10 else "a" * 64
+                if method == "getblockreceipts":
+                    return [receipt(10), receipt(11)]
+                raise AssertionError(f"unexpected RPC method {method}")
+
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            cli = directory / "fake-avila-cli"
+            config = directory / "node.toml"
+            output = directory / "result.json"
+            cli.write_text("test executable", encoding="utf-8")
+            cli.chmod(0o755)
+            config.write_text("test config", encoding="utf-8")
+            args = build_parser().parse_args(
+                [
+                    "--cli", str(cli), "--config", str(config), "--output", str(output),
+                    "--start-height", "10", "--count", "2", "--wait-seconds", "30",
+                    "--poll-seconds", "0.25", "--rpc-timeout", "1",
+                ]
+            )
+            client = FakeClient()
+            observations = iter(
+                [
+                    fake_state(8, mono=10),
+                    fake_state(9, mono=11),  # discarded: continuity RPC is transiently busy
+                    fake_state(9, mono=12),  # successful retry becomes the pre-window baseline
+                    fake_state(11, mono=13),
+                    fake_state(11, mono=14),
+                    fake_state(11, mono=15),
+                ]
+            )
+            with (
+                patch("tools.measure_live_ibd.AvilaCli", return_value=client),
+                patch("tools.measure_live_ibd.read_state", side_effect=lambda _client: next(observations)),
+                patch("tools.measure_live_ibd.time.sleep"),
+            ):
+                result = run(args)
+
+            self.assertEqual(result["observations"]["first_status"]["connected_height"], 8)
+            self.assertEqual(result["external_sample"]["observed_connected_height_start"], 9)
+            self.assertTrue(result["external_sample"]["interval_encloses_target_window"])
+            self.assertEqual(client.hash_calls.count(8), 2)
+
+    def test_run_does_not_retry_wrong_continuity_hash(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.hash_calls = 0
+
+            def call(self, method: str, *params: object) -> object:
+                if method == "getblockhash":
+                    self.hash_calls += 1
+                    return "b" * 64
+                raise AssertionError(f"unexpected RPC method {method}")
+
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            cli = directory / "fake-avila-cli"
+            config = directory / "node.toml"
+            cli.write_text("test executable", encoding="utf-8")
+            cli.chmod(0o755)
+            config.write_text("test config", encoding="utf-8")
+            args = build_parser().parse_args(
+                [
+                    "--cli", str(cli), "--config", str(config), "--output", str(directory / "result.json"),
+                    "--start-height", "10", "--count", "2", "--wait-seconds", "30",
+                    "--poll-seconds", "0.25", "--rpc-timeout", "1",
+                ]
+            )
+            client = FakeClient()
+            observations = iter([fake_state(8, mono=10), fake_state(9, mono=11)])
+            with (
+                patch("tools.measure_live_ibd.AvilaCli", return_value=client),
+                patch("tools.measure_live_ibd.read_state", side_effect=lambda _client: next(observations)),
+                patch("tools.measure_live_ibd.time.sleep"),
+                self.assertRaisesRegex(MeasurementError, "active chain changed below"),
+            ):
+                run(args)
+            self.assertEqual(client.hash_calls, 1)
+
+    def test_run_detects_restart_before_retrying_continuity_hash(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.hash_calls = 0
+
+            def call(self, method: str, *params: object) -> object:
+                if method == "getblockhash":
+                    self.hash_calls += 1
+                    raise RpcCallError("temporary busy response")
+                raise AssertionError(f"unexpected RPC method {method}")
+
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            cli = directory / "fake-avila-cli"
+            config = directory / "node.toml"
+            cli.write_text("test executable", encoding="utf-8")
+            cli.chmod(0o755)
+            config.write_text("test config", encoding="utf-8")
+            args = build_parser().parse_args(
+                [
+                    "--cli", str(cli), "--config", str(config), "--output", str(directory / "result.json"),
+                    "--start-height", "10", "--count", "2", "--wait-seconds", "30",
+                    "--poll-seconds", "0.25", "--rpc-timeout", "1",
+                ]
+            )
+            client = FakeClient()
+            observations = iter(
+                [fake_state(8, mono=10, uptime=600), fake_state(9, mono=11, uptime=599)]
+            )
+            with (
+                patch("tools.measure_live_ibd.AvilaCli", return_value=client),
+                patch("tools.measure_live_ibd.read_state", side_effect=lambda _client: next(observations)),
+                patch("tools.measure_live_ibd.time.sleep"),
+                self.assertRaisesRegex(MeasurementError, "uptime decreased"),
+            ):
+                run(args)
+            self.assertEqual(client.hash_calls, 0)
 
     def test_serial_timing_percentiles(self) -> None:
         self.assertEqual(percentiles([10, 20, 30, 40]), {"median": 25.0, "p95": 40, "min": 10, "max": 40})

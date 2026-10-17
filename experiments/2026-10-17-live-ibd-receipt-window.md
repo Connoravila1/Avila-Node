@@ -121,3 +121,31 @@ transport and the baseline-selection sequence. After the updated CLI was
 deployed, a separate 600,000–600,127 watcher was armed with the node PID pinned.
 The node is still far from that window and full IBD remains incomplete; no
 artifact or result exists yet.
+
+## Continuity retry follow-up — 2026-10-17
+
+The separate modern-chain collector attempt terminated at 07:36:18 UTC after
+373 seconds with exit 1 when its prior-tip continuity `getblockhash` call
+failed transiently. The sampler retries transient `RpcCallError` failures for
+both status reads and the pre-window continuity check, preserving the last
+successful observation until a complete observation succeeds. Height rollback,
+same-height hash changes, uptime decreases, active-hash mismatches, and policy
+or identity failures remain fail-closed; the cheap height/hash/uptime checks
+run before the retryable continuity call. Final receipt collection and its
+rechecks are not retried.
+
+All 17 sampler unit tests passed under a 256 MiB guard cap / 256 MiB reserve.
+They include transient continuity-hash recovery through a valid receipt
+window, wrong-hash rejection, and a restart/uptime rollback that fails before
+calling the busy hash RPC. The short test process peak was missed by the guard
+sampler, so no memory figure is claimed. The sampler source SHA-256 was
+`cd3a8f6449dda57ce1476b6d41bb3d21a9a87ee1c4b5c2e958e71ec6d5b22a81`; the test
+source SHA-256 was
+`c51044781a7d32228525e67288a298994c2ccb71a4c18ea35a41ea0444a636bc`.
+No Rust build or node behavior changed. The 600,000–600,127 result remains
+pending. Attempt 2 was armed at 07:41:29.770 UTC as
+`avila-ibd-receipts-600000-p838059-a2.service` (collector PID 903060), against
+the same node PID 838059 and helper SHA-256 above. It uses a 256 MiB cap and
+256 MiB reserve, 15-second RPC timeout, and 1-second poll interval. Its output
+is separate from the terminal first attempt; no modern-window result exists
+yet.

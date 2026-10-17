@@ -669,6 +669,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             verify_process_identity(pid_identity)
         try:
             state = read_state(client)
+            # These checks need only the new observation and must run before
+            # a retryable RPC, so a transient hash failure cannot mask a
+            # restart or reorg already evident in the status fields.
+            if last_height is not None and state.connected_height < last_height:
+                raise MeasurementError("checked connected height decreased during sample; possible reorg/restart")
+            if last_height is not None and state.connected_height == last_height and state.bestblockhash != last_tip_hash:
+                raise MeasurementError("checked tip hash changed without height progress; possible reorg")
+            if last_uptime is not None and state.uptime < last_uptime:
+                raise MeasurementError("node uptime decreased during sample; node restarted")
+            # Keep the observation and its continuity check together. A
+            # transient CLI/RPC failure must not discard the last successful
+            # baseline or terminate a long pre-window wait. MeasurementError
+            # (including a real active-chain mismatch) remains fail-closed.
+            if last_height is not None and state.connected_height > last_height:
+                prior_active_hash = require_hash(
+                    client.call("getblockhash", last_height), f"getblockhash({last_height})"
+                )
+                if prior_active_hash != last_tip_hash:
+                    raise MeasurementError("active chain changed below the observed checked tip")
         except RpcCallError:
             if time.monotonic() >= deadline:
                 raise
@@ -676,18 +695,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             continue
         if first_observation is None:
             first_observation = state
-        if last_height is not None and state.connected_height < last_height:
-            raise MeasurementError("checked connected height decreased during sample; possible reorg/restart")
-        if last_height is not None and state.connected_height == last_height and state.bestblockhash != last_tip_hash:
-            raise MeasurementError("checked tip hash changed without height progress; possible reorg")
-        if last_height is not None and state.connected_height > last_height:
-            prior_active_hash = require_hash(
-                client.call("getblockhash", last_height), f"getblockhash({last_height})"
-            )
-            if prior_active_hash != last_tip_hash:
-                raise MeasurementError("active chain changed below the observed checked tip")
-        if last_uptime is not None and state.uptime < last_uptime:
-            raise MeasurementError("node uptime decreased during sample; node restarted")
         last_height = state.connected_height
         last_tip_hash = state.bestblockhash
         last_uptime = state.uptime
