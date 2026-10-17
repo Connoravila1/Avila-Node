@@ -4,6 +4,55 @@ Running record of every experiment tried — adopted, rejected, blocked,
 or inconclusive. One line per attempt; details live in the dated docs.
 A "failed" or "inconclusive" row is a result, not a gap — write it down.
 
+## Experiment #94 — checked-frontier RPC confirmations
+
+A mainnet RPC observation reported height 300,000 with 671,840 confirmations,
+matching best-header height 971,839 rather than the contemporaneous checked
+height 301,625. The current implementation reports public confirmation depth
+from the checked active-chain prefix and gates selected state-sensitive
+wallet/UTXO and transaction-admission queries on pending script checks. It
+publishes any completed valid prefix before returning a later validation
+failure, without running the requested query. Attempt 1 passed consensus
+(628 tests, four ignored) and Python (17), then failed RPC-test compilation on
+three missing input borrows. Attempt 2 compiled and passed 71 RPC tests but had
+two fixture failures (witness commitment and later wallet funding). Attempt 3
+passed 628 consensus tests (four ignored), 73 RPC tests, and 17 Python tests;
+Clippy caught two `expect_used` warnings in new tests, which were fixed without
+lint suppression. Attempt 4 passed the full gate at source fingerprint
+`bc147fa2637e476f6f6bf1481e8184dc1b4bb768d005cf0504cef3eb1ba076d4`: 1,194
+release tests (five ignored), 628 debug consensus tests (four ignored), 73
+debug RPC tests, 17 Python tests, formatting, all-target workspace Clippy and
+rustdoc with GUI/devtools and warnings denied, paired release CLI/GUI builds,
+and CLI/config/inspect/GUI-help smoke checks. Build cap/reserve was 2,560/1,024
+MiB (2,308 MiB peak, 349 s); install cap/reserve was 256/256 MiB (122 MiB peak,
+3 s). Installed CLI SHA-256 is
+`c9cad90e2d6c3ab80c2b936fc65e4a0b77ef81fa950baf318bef9abf0e9d46ac`; GUI SHA-256
+is `5a1416908fcedb5676b0d9bcd062c6d8c16de3727ace0c366227d94e865bad4e`. Native
+runtime verification then passed for the installed CLI: a fresh process
+automatically resumed the height-309,143 checkpoint with its hash matching,
+strict historical-script validation, and unchanged config. Three RPCs for
+height 300,000 (`getblockheader`, `getblock` verbosity 1, and explicit-block
+`getrawtransaction`) each reported 9,169 confirmations at checked height
+309,168, with best headers at 971,843. One selected future header at height
+310,168 reported -1 and no next-block hash; it was inactive, not fully checked,
+and had no available body. The bounded 15-call runtime proof took one second;
+its sampled peak missed the run, so it makes no memory claim. A fresh native
+attach-GUI smoke at 1440×900 showed height 309,302, headers 971,843,
+`full_validation`, historical scripts required, and no snapshot. Block 300,000
+loaded with its expected hash, active/fully-checked state, 237 transactions,
+515,240 WU, and first 100 map rows. Closing the monitor exited 0 with no
+remaining windows while daemon PID 1597809 (start ticks 3,848,734) continued to
+309,603. The capture helper's extra post-close wait assertion failed because
+the window had already closed; independent GUI process-exit, zero-window, and
+daemon-identity checks confirmed successful close behavior. This 512 MiB
+cap/reserve run peaked at 107 MiB in 55 s. It does not requalify compact layouts,
+transaction paging, fee detail, or earlier wallet-focused GUI captures from a
+different binary. Full IBD and the 600,000–600,127 modern-range observation
+remain pending. No consensus checks are weakened or skipped. See the
+[checked-frontier confirmation note](2026-10-17-checked-confirmations.md) for
+scope, exact checkpoint and runtime details, failures, and upstream Core v31.1
+references.
+
 ## Experiment #84 — attached block inspector viewport and selection follow-up
 
 The attached block inspector now switches to wrapped, labeled transaction rows

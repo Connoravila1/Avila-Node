@@ -105,17 +105,39 @@ impl ChainQuery {
         mgr: &mut PeerManager<TcpStream>,
         rescans: &mut std::collections::VecDeque<DeferredQuery>,
     ) {
-        match (self.run)(cs, mgr) {
-            QueryReply::Now(result) => {
-                let _ = self.reply.send(result);
-            }
-            QueryReply::Defer(deferred) => rescans.push_back(DeferredQuery {
-                reply: self.reply,
-                ..deferred
-            }),
-            QueryReply::Spawned(job) => {
-                let reply = self.reply;
-                std::thread::spawn(move || job(reply));
+        let _ = self.answer_with_progress(cs, mgr, rescans);
+    }
+
+    /// Executes this query and returns a checked tip whose progress event
+    /// must be emitted by the sync loop, if the query itself drained and
+    /// published a validated block batch.
+    pub(crate) fn answer_with_progress(
+        self,
+        cs: &mut Chainstate,
+        mgr: &mut PeerManager<TcpStream>,
+        rescans: &mut std::collections::VecDeque<DeferredQuery>,
+    ) -> Option<u32> {
+        let Self { run, reply, .. } = self;
+        let mut outcome = run(cs, mgr);
+        let mut tip_advanced = None;
+        loop {
+            match outcome {
+                QueryReply::WithTipAdvanced { height, reply } => {
+                    tip_advanced = Some(tip_advanced.map_or(height, |old: u32| old.max(height)));
+                    outcome = *reply;
+                }
+                QueryReply::Now(result) => {
+                    let _ = reply.send(result);
+                    return tip_advanced;
+                }
+                QueryReply::Defer(deferred) => {
+                    rescans.push_back(DeferredQuery { reply, ..deferred });
+                    return tip_advanced;
+                }
+                QueryReply::Spawned(job) => {
+                    std::thread::spawn(move || job(reply));
+                    return tip_advanced;
+                }
             }
         }
     }
@@ -126,6 +148,14 @@ impl ChainQuery {
 pub enum QueryReply {
     /// Send the result immediately.
     Now(Result<Value, (i64, String)>),
+    /// Preserve the ordinary reply while asking the sync loop to publish
+    /// one coalesced progress event for the highest checked block.
+    WithTipAdvanced {
+        /// Highest validated height published before this query ran.
+        height: u32,
+        /// The unchanged underlying reply disposition.
+        reply: Box<QueryReply>,
+    },
     /// The query found `pending` heights without bodies — fetch them
     /// and finish when they arrive (or the deadline passes).
     Defer(DeferredQuery),
@@ -1069,17 +1099,13 @@ fn fund_spend(
         .iter()
         .map(|o| 9 + o.script_pubkey.as_bytes().len() as i64)
         .sum();
-    // Maturity gate (Core's IsImmatureCoinBase): coinbases are
-    // spendable only past 100 confirmations — the wallet must not
-    // pick what consensus rejects as premature.
-    let tip_h = cs.tree().tip().height;
+    // Coinbase maturity is evaluated at the candidate next block:
+    // depth 100 at checked tip H is spendable in H+1, matching the
+    // consensus spend-height rule without counting best-header work.
     let mature = |c: &crate::watch::WatchedCoin| -> bool {
         !c.coinbase
-            || cs
-                .tree()
-                .get(&c.block)
-                .map(|n| tip_h.saturating_sub(n.height) + 1 >= 100)
-                .unwrap_or(false)
+            || checked_active_confirmations(cs, &c.block, c.height)
+                .is_some_and(|confirmations| confirmations >= 100)
     };
     let mut chosen: Vec<(OutPoint, i64)> = Vec::new();
     // Core's AvailableCoins: a coin spent by ANY mempool transaction —
@@ -1381,6 +1407,69 @@ fn chain_query(
     + 'static,
 ) -> (Value, Option<(i64, String)>) {
     chain_query_deferred(method, queries, move |cs, mgr| QueryReply::Now(f(cs, mgr)))
+}
+
+/// State-sensitive wallet/UTXO queries must not read the speculative
+/// UTXO changes made by blocks whose deferred script checks are still
+/// pending. Resolve that bounded suffix first, then apply the validated
+/// block feed to the mempool before the query reads either state. This
+/// path announces the resulting tip. The sync loop remains the sole
+/// producer of progress events; a query-triggered drain does not enqueue
+/// its own `tip_advanced` event.
+fn checked_chain_query_deferred(
+    method: &str,
+    queries: Option<&QuerySender>,
+    f: impl FnOnce(&mut Chainstate, &mut PeerManager<TcpStream>) -> QueryReply + Send + 'static,
+) -> (Value, Option<(i64, String)>) {
+    chain_query_deferred(method, queries, move |cs, mgr| {
+        let drain_error = (cs.pending_scripts_len() > 0)
+            .then(|| cs.drain_scripts().err())
+            .flatten();
+        // A checked query can itself cross the deferred-validation
+        // boundary. Publish every validated block to the mempool before
+        // reading either UTXOs or mempool state, so a transaction confirmed
+        // and spent by this suffix cannot be returned as a stale mempool
+        // output. The sync loop still owns progress events; this path only
+        // applies the validated-block feed and announces the resulting tip.
+        let checked = cs.take_checked();
+        let mut checked_tip = None;
+        if !checked.is_empty() {
+            for (height, hash) in checked {
+                checked_tip = Some(checked_tip.map_or(height, |old: u32| old.max(height)));
+                if let Some(body) = cs.body(&hash) {
+                    mgr.mempool().on_block_connected(&body, height);
+                }
+            }
+            mgr.announce_tip(cs);
+        }
+        // A failed later block can follow a valid prefix during the same
+        // drain. Publish that prefix, but never execute the query closure
+        // after any pending validation failure.
+        let reply = match drain_error {
+            Some(error) => QueryReply::Now(Err((
+                RPC_VERIFY_ERROR,
+                format!("pending block validation failed: {error}"),
+            ))),
+            None => f(cs, mgr),
+        };
+        match checked_tip {
+            Some(height) => QueryReply::WithTipAdvanced {
+                height,
+                reply: Box::new(reply),
+            },
+            None => reply,
+        }
+    })
+}
+
+fn checked_chain_query(
+    method: &str,
+    queries: Option<&QuerySender>,
+    f: impl FnOnce(&mut Chainstate, &mut PeerManager<TcpStream>) -> Result<Value, (i64, String)>
+    + Send
+    + 'static,
+) -> (Value, Option<(i64, String)>) {
+    checked_chain_query_deferred(method, queries, move |cs, mgr| QueryReply::Now(f(cs, mgr)))
 }
 
 /// The cap on parked `waitforblock*` predicates — a flood of wait calls
@@ -1869,7 +1958,7 @@ fn listunspent_entry(
     w: &crate::watch::WatchWallet,
     op: OutPoint,
     coin: &crate::watch::WatchedCoin,
-    confs: u32,
+    confs: i64,
     address: Option<String>,
 ) -> Value {
     let desc = w
@@ -4038,9 +4127,23 @@ fn service_names(services: u64) -> Vec<String> {
     names
 }
 
-/// Whether `hash` sits on the active (connected, fully validated) chain.
+/// Whether `hash` sits on the structurally active connected chain.
 fn on_active_chain(cs: &Chainstate, hash: &BlockHash, height: u32) -> bool {
     cs.chain().get(height as usize) == Some(hash)
+}
+
+/// Confirmations are reported only inside the highest fully checked
+/// active-chain prefix. `chain()` can include a suffix whose script
+/// checks are still pending, while the header tree may be much farther
+/// ahead; neither suffix is a public confirmation frontier.
+fn checked_active_confirmations(cs: &Chainstate, hash: &BlockHash, height: u32) -> Option<i64> {
+    let checked_height = cs.checked_height();
+    (height <= checked_height && on_active_chain(cs, hash, height))
+        .then(|| i64::from(checked_height) - i64::from(height) + 1)
+}
+
+fn confirmations_or_minus_one(confirmations: Option<i64>) -> i64 {
+    confirmations.unwrap_or(-1)
 }
 
 // Core's getdeploymentinfo — rpc/deploymentinfo.cpp.
@@ -4139,16 +4242,14 @@ fn deploymentinfo_json(cs: &Chainstate, node: &HeaderNode) -> Value {
 /// The Core-shaped header object shared by `getblockheader`/`getblock`.
 fn header_json(cs: &Chainstate, node: &HeaderNode) -> Value {
     let hash = node.hash();
-    let tip_height = cs.tree().tip().height;
-    let active = on_active_chain(cs, &hash, node.height);
+    let checked_height = cs.checked_height();
+    let confirmations = checked_active_confirmations(cs, &hash, node.height);
     let mut out = json!({
         "hash": hash.to_string(),
-        // Core: -1 for blocks not on the active chain.
-        "confirmations": if active {
-            i64::from(tip_height - node.height) + 1
-        } else {
-            -1
-        },
+        // A connected block may still be pending script checks. Keep
+        // its structural chain membership separate from confirmed RPC
+        // depth, just as header-only blocks have no confirmations.
+        "confirmations": confirmations_or_minus_one(confirmations),
         "height": node.height,
         "version": node.header.version,
         "versionHex": format!("{:08x}", node.header.version as u32),
@@ -4167,9 +4268,10 @@ fn header_json(cs: &Chainstate, node: &HeaderNode) -> Value {
     if !node.header.prev_block_hash.is_zero() {
         out["previousblockhash"] = json!(node.header.prev_block_hash.to_string());
     }
-    // `nextblockhash` exists only for non-tip blocks on the active chain.
-    if active
-        && node.height < tip_height
+    // `nextblockhash` is exposed only when the successor itself is in
+    // the checked active prefix.
+    if confirmations.is_some()
+        && node.height < checked_height
         && let Some(next) = cs.chain().get(node.height as usize + 1)
     {
         out["nextblockhash"] = json!(next.to_string());
@@ -7118,7 +7220,7 @@ pub(crate) fn dispatch(
             let include_mempool = param(params, 2, "include_mempool")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            chain_query(method, queries, move |cs, mgr| {
+            checked_chain_query(method, queries, move |cs, mgr| {
                 let outpoint = OutPoint {
                     txid,
                     vout: vout as u32,
@@ -7130,10 +7232,18 @@ pub(crate) fn dispatch(
                 }
                 match cs.utxo().get(&outpoint) {
                     Some(coin) => {
-                        let tip = cs.chain().len() as u32 - 1;
+                        let block = cs.chain().get(coin.height as usize).copied();
+                        let confirmations = block
+                            .and_then(|hash| checked_active_confirmations(cs, &hash, coin.height));
+                        let checked_height = cs.checked_height();
+                        let bestblock = cs
+                            .chain()
+                            .get(checked_height as usize)
+                            .copied()
+                            .unwrap_or_else(|| cs.tip_hash());
                         Ok(json!({
-                            "bestblock": cs.tip_hash().to_string(),
-                            "confirmations": tip - coin.height + 1,
+                            "bestblock": bestblock.to_string(),
+                            "confirmations": confirmations_or_minus_one(confirmations),
                             "value": value_from_amount(coin.out.value),
                             "scriptPubKey": script_pubkey_json(
                                 &coin.out.script_pubkey,
@@ -7151,7 +7261,11 @@ pub(crate) fn dispatch(
                         .filter(|_| include_mempool)
                     {
                         Some(out) => Ok(json!({
-                            "bestblock": cs.tip_hash().to_string(),
+                            "bestblock": cs.chain()
+                                .get(cs.checked_height() as usize)
+                                .copied()
+                                .unwrap_or_else(|| cs.tip_hash())
+                                .to_string(),
                             "confirmations": 0,
                             "value": value_from_amount(out.value),
                             "scriptPubKey": script_pubkey_json(
@@ -7721,7 +7835,9 @@ pub(crate) fn dispatch(
                         "Block not found in chain".to_string(),
                     ));
                 };
-                if cs.chain().get(bnode.height as usize) != Some(&block_hash) {
+                if cs.chain().get(bnode.height as usize) != Some(&block_hash)
+                    || checked_active_confirmations(cs, &block_hash, bnode.height).is_none()
+                {
                     return Err((
                         RPC_INVALID_ADDRESS_OR_KEY,
                         "Block not found in chain".to_string(),
@@ -7749,10 +7865,11 @@ pub(crate) fn dispatch(
                             .collect::<Vec<_>>()
                     ));
                 }
-                let tip_h = cs.chain().len() as u32 - 1;
                 Ok(json!({
                     "blockheight": bnode.height,
-                    "confirmations": tip_h - bnode.height + 1,
+                    "confirmations": confirmations_or_minus_one(
+                        checked_active_confirmations(cs, &block_hash, bnode.height),
+                    ),
                     "blockhash": block_hash.to_string(),
                     "tx": matches
                         .iter()
@@ -7842,7 +7959,7 @@ pub(crate) fn dispatch(
                             .into(),
                     ));
                 }
-                let mut via_index = false;
+                let explicit_block_hash = block_hash.is_some();
                 let found = if let Some(bh) = block_hash {
                     cs.body(&bh).and_then(|block| {
                         block
@@ -7862,7 +7979,6 @@ pub(crate) fn dispatch(
                     // can't distinguish pooled from absent.
                     Some((tx.clone(), None))
                 } else {
-                    via_index = true;
                     cs.find_transaction(&txid).and_then(|bh| {
                         cs.body(&bh).and_then(|block| {
                             block
@@ -7894,20 +8010,23 @@ pub(crate) fn dispatch(
                     && let Some(node) = cs.tree().get(&bh)
                 {
                     out["blockhash"] = json!(bh.to_string());
-                    out["blocktime"] = json!(node.header.time);
-                    out["time"] = json!(node.header.time);
-                    // `in_active_chain` is emitted on the index
-                    // path only (Core's convention — a named
-                    // block is by definition where the caller
-                    // looked); confirmations count only for
-                    // active-chain blocks.
-                    let active = !via_index || cs.on_active_chain(&bh);
-                    if via_index {
-                        out["in_active_chain"] = json!(active);
+                    let confirmations = checked_active_confirmations(cs, &bh, node.height);
+                    // Core adds this field only when the caller named
+                    // the block hash. Txindex results are identified
+                    // by their blockhash without an extra claim.
+                    if explicit_block_hash {
+                        out["in_active_chain"] = json!(confirmations.is_some());
                     }
-                    if active {
-                        let tip = cs.tree().tip().height;
-                        out["confirmations"] = json!(i64::from(tip - node.height) + 1);
+                    if let Some(confirmations) = confirmations {
+                        out["confirmations"] = json!(confirmations);
+                        out["blocktime"] = json!(node.header.time);
+                        out["time"] = json!(node.header.time);
+                    } else {
+                        // Core reports zero confirmations for a
+                        // side-branch tx. A structurally connected
+                        // block beyond the checked frontier is also
+                        // not yet active for public transaction depth.
+                        out["confirmations"] = json!(0);
                     }
                 }
                 Ok(out)
@@ -8568,7 +8687,7 @@ pub(crate) fn dispatch(
                     )),
                 );
             }
-            chain_query(method, queries, move |cs, mgr| {
+            checked_chain_query(method, queries, move |cs, mgr| {
                 let mut out = Vec::with_capacity(raws.len());
                 for raw in raws {
                     let Ok(bytes) = hex::decode(&raw) else {
@@ -8672,7 +8791,7 @@ pub(crate) fn dispatch(
             // "TX decode failed. Make sure the tx has at least one
             // input." (decoderawtransaction keeps the bare wording).
             let bytes = hex::decode(raw).unwrap_or_default();
-            chain_query(method, queries, move |cs, mgr| {
+            checked_chain_query(method, queries, move |cs, mgr| {
                 let tx = match Transaction::decode(&bytes) {
                     Ok(tx) => tx,
                     Err(_) => {
@@ -8844,7 +8963,7 @@ pub(crate) fn dispatch(
                     );
                 }
             }
-            chain_query(method, queries, move |cs, mgr| {
+            checked_chain_query(method, queries, move |cs, mgr| {
                 // CheckPackage's remaining package-wide rules, reached
                 // only after the topology throw above and only for
                 // multi-tx packages: intra-package input conflicts,
@@ -11847,7 +11966,7 @@ pub(crate) fn dispatch(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let wallet = wallet.cloned();
-            chain_query_deferred(method, queries, move |cs, mgr| {
+            checked_chain_query_deferred(method, queries, move |cs, mgr| {
                 let Some(wallet) = wallet else {
                     return QueryReply::Now(Err((
                         RPC_MISC_ERROR,
@@ -12038,7 +12157,7 @@ pub(crate) fn dispatch(
             let outputs_arg = param(params, 0, "outputs").cloned();
             let locktime_arg = param(params, 1, "locktime").and_then(Value::as_i64);
             let wallet = wallet.cloned();
-            chain_query_deferred(method, queries, move |cs, mgr| {
+            checked_chain_query_deferred(method, queries, move |cs, mgr| {
                 let Some(wallet) = wallet else {
                     return QueryReply::Now(Err((
                         RPC_MISC_ERROR,
@@ -12812,7 +12931,7 @@ pub(crate) fn dispatch(
             let include_unsafe = arr.get(3).and_then(Value::as_bool).unwrap_or(true);
             let query_options = arr.get(4).cloned().unwrap_or(Value::Null);
             let wallet = wallet.cloned();
-            chain_query(method, queries, move |cs, mgr| {
+            checked_chain_query(method, queries, move |cs, mgr| {
                 let Some(wallet) = wallet else {
                     return Err((
                         RPC_MISC_ERROR,
@@ -12855,23 +12974,18 @@ pub(crate) fn dispatch(
                         }
                     }
                 }
-                let tip_h = cs.tree().tip().height;
-                // Audit SP-F6: immature coinbases are not spendable
-                // (consensus rejects them) and by default not listed —
-                // the same IsImmatureCoinBase rule fund_spend uses.
+                // Immature coinbases are not spendable (consensus
+                // rejects them) and by default not listed. Maturity is
+                // evaluated against checked tip depth at the next block.
                 let immature = |c: &crate::watch::WatchedCoin| -> bool {
                     c.coinbase
-                        && cs
-                            .tree()
-                            .get(&c.block)
-                            .map(|n| tip_h.saturating_sub(n.height) + 1 < 100)
-                            .unwrap_or(true)
+                        && checked_active_confirmations(cs, &c.block, c.height)
+                            .is_none_or(|confirmations| confirmations < 100)
                 };
                 let mut w = wallet
                     .lock()
                     .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
                 w.advance(cs);
-                let tip = w.chain.len() as u32;
                 let mempool_txs: Vec<Transaction> = mgr
                     .mempool()
                     .txids()
@@ -12891,11 +13005,13 @@ pub(crate) fn dispatch(
                 // early-exit budget, not a "the wallet must hold at
                 // least this much" precondition the RPC enforces.
                 'unspent: for (op, coin) in w.unspent() {
-                    // `tip` here is the chain *count* — confs of a
-                    // height-h coin = tip_height - h + 1 = count - h.
-                    let confs = tip.saturating_sub(coin.height);
-                    if (confs as i64) < minconf
-                        || (confs as i64) > maxconf
+                    let confs = confirmations_or_minus_one(checked_active_confirmations(
+                        cs,
+                        &coin.block,
+                        coin.height,
+                    ));
+                    if confs < minconf
+                        || confs > maxconf
                         || mempool_spends.contains(&(op.txid, op.vout))
                         || coin.value < min_amt
                         || coin.value > max_amt
@@ -13054,7 +13170,7 @@ pub(crate) fn dispatch(
         // the `watchonly` member is ever populated.
         "getbalances" => {
             let wallet = wallet.cloned();
-            chain_query(method, queries, move |cs, mgr| {
+            checked_chain_query(method, queries, move |cs, mgr| {
                 let Some(wallet) = wallet else {
                     return Err((
                         RPC_MISC_ERROR,
@@ -13065,7 +13181,6 @@ pub(crate) fn dispatch(
                     .lock()
                     .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
                 w.advance(cs);
-                let tip = w.chain.len() as u32;
                 let mempool_txs: Vec<Transaction> = mgr
                     .mempool()
                     .txids()
@@ -13083,10 +13198,15 @@ pub(crate) fn dispatch(
                     if mempool_spends.contains(&(op.txid, op.vout)) {
                         continue;
                     }
-                    // `tip` here is the chain *count* — confs of a
-                    // height-h coin = tip_height - h + 1 = count - h.
-                    let confs = tip.saturating_sub(coin.height);
-                    if coin.coinbase && confs < 100 {
+                    let confirmations = checked_active_confirmations(cs, &coin.block, coin.height);
+                    if confirmations.is_none() {
+                        // Wallet scans can see the connected suffix
+                        // while its deferred script checks are pending.
+                        // Do not include those outputs in confirmed
+                        // balances before the public checked frontier.
+                        continue;
+                    }
+                    if coin.coinbase && confirmations.is_some_and(|confs| confs < 100) {
                         immature += coin.value;
                     } else {
                         trusted += coin.value;
@@ -13176,7 +13296,7 @@ pub(crate) fn dispatch(
             let count = arr.first().and_then(Value::as_i64).unwrap_or(10);
             let skip = arr.get(1).and_then(Value::as_i64).unwrap_or(0);
             let wallet = wallet.cloned();
-            chain_query(method, queries, move |cs, _mgr| {
+            checked_chain_query(method, queries, move |cs, _mgr| {
                 let Some(wallet) = wallet else {
                     return Err((
                         RPC_MISC_ERROR,
@@ -13187,9 +13307,13 @@ pub(crate) fn dispatch(
                     .lock()
                     .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
                 w.advance(cs);
-                let tip = w.chain.len() as u32;
                 let mut rows: Vec<Value> = Vec::new();
                 for ((txid, vout), coin) in &w.coins {
+                    let confirmations = confirmations_or_minus_one(checked_active_confirmations(
+                        cs,
+                        &coin.block,
+                        coin.height,
+                    ));
                     rows.push(json!({
                         "category": "receive",
                         "txid": txid.to_string(),
@@ -13197,9 +13321,12 @@ pub(crate) fn dispatch(
                         "amount": value_from_amount(coin.value),
                         "blockhash": coin.block.to_string(),
                         "blockheight": coin.height,
-                        "confirmations": tip.saturating_sub(coin.height),
+                        "confirmations": confirmations,
                     }));
                     if let (Some(sh), Some(sp)) = (coin.spent_height, coin.spent_by) {
+                        let spent_hash = w.chain.get(sh as usize).copied();
+                        let spent_confirmations =
+                            spent_hash.and_then(|hash| checked_active_confirmations(cs, &hash, sh));
                         rows.push(json!({
                             "category": "send",
                             "txid": sp.to_string(),
@@ -13207,7 +13334,7 @@ pub(crate) fn dispatch(
                             "amount": value_from_amount(-coin.value),
                             "blockheight": sh,
                             "blockhash": w.chain.get(sh as usize).map(|h| h.to_string()),
-                            "confirmations": tip.saturating_sub(sh),
+                            "confirmations": confirmations_or_minus_one(spent_confirmations),
                         }));
                     }
                 }
@@ -13228,7 +13355,7 @@ pub(crate) fn dispatch(
             let minconf = arr.first().and_then(Value::as_i64).unwrap_or(1);
             let include_empty = arr.get(1).and_then(Value::as_bool).unwrap_or(false);
             let wallet = wallet.cloned();
-            chain_query(method, queries, move |cs, _| {
+            checked_chain_query(method, queries, move |cs, _| {
                 let Some(wallet) = wallet else {
                     return Err((
                         RPC_MISC_ERROR,
@@ -13240,25 +13367,26 @@ pub(crate) fn dispatch(
                     .lock()
                     .map_err(|_| (RPC_MISC_ERROR, "wallet lock poisoned".to_string()))?;
                 w.advance(cs);
-                let tip = w.chain.len() as u32;
                 struct Recv {
                     amount: i64,
-                    confs: u32,
+                    confs: i64,
                     label: String,
                     txids: Vec<Txid>,
                 }
                 let mut by_addr: BTreeMap<String, Recv> = BTreeMap::new();
                 let mut no_addr = Recv {
                     amount: 0,
-                    confs: 0,
+                    confs: -1,
                     label: String::new(),
                     txids: Vec::new(),
                 };
                 for ((txid, _), coin) in &w.coins {
-                    // `tip` here is the chain *count* — confs of a
-                    // height-h coin = tip_height - h + 1 = count - h.
-                    let confs = tip.saturating_sub(coin.height);
-                    if (confs as i64) < minconf {
+                    let confs = confirmations_or_minus_one(checked_active_confirmations(
+                        cs,
+                        &coin.block,
+                        coin.height,
+                    ));
+                    if confs < minconf {
                         continue;
                     }
                     let script = Script::new(coin.script.clone());
@@ -13410,7 +13538,7 @@ pub(crate) fn dispatch(
                     }
                     let scanobjects = arr[1].clone();
                     let scan = Arc::clone(scan);
-                    chain_query(method, queries, move |cs, _mgr| {
+                    checked_chain_query(method, queries, move |cs, _mgr| {
                         let params = cs.tree().params();
                         // EvalDescriptorStringOrObject per scan object:
                         // expand every position, collect the script set
@@ -13435,7 +13563,7 @@ pub(crate) fn dispatch(
                         // count every entry, match exact output
                         // scripts, poll abort every 8192, progress every
                         // 256 from the outpoint's first two hash bytes.
-                        let tip_height = cs.chain().len().saturating_sub(1) as u32;
+                        let tip_height = cs.checked_height();
                         let tip_hash = cs
                             .chain()
                             .last()
@@ -13497,8 +13625,11 @@ pub(crate) fn dispatch(
                                 "coinbase": coin.coinbase,
                                 "height": coin.height,
                                 "blockhash": blockhash,
-                                "confirmations":
-                                    tip_height.saturating_sub(coin.height) + 1,
+                                "confirmations": cs
+                                    .chain()
+                                    .get(coin.height as usize)
+                                    .and_then(|hash| checked_active_confirmations(cs, hash, coin.height))
+                                    .unwrap_or(-1),
                             }));
                         }
                         Ok(json!({
@@ -15545,6 +15676,28 @@ mod tests {
     }
 
     #[test]
+    fn chain_query_progress_wrapper_preserves_result_and_coalesces_height() {
+        let (mut query, reply) = ChainQuery::new(|_, _| Ok(json!({"result": "unchanged"})));
+        query.run = Box::new(|_, _| QueryReply::WithTipAdvanced {
+            height: 4,
+            reply: Box::new(QueryReply::WithTipAdvanced {
+                height: 9,
+                reply: Box::new(QueryReply::Now(Ok(json!({"result": "unchanged"})))),
+            }),
+        });
+        let mut cs = Chainstate::new(&Network::Regtest.params());
+        let mut mgr = PeerManager::<TcpStream>::new(8);
+        let mut rescans = std::collections::VecDeque::new();
+
+        assert_eq!(
+            query.answer_with_progress(&mut cs, &mut mgr, &mut rescans),
+            Some(9)
+        );
+        assert_eq!(reply.recv().unwrap(), Ok(json!({"result": "unchanged"})));
+        assert!(rescans.is_empty());
+    }
+
+    #[test]
     fn cookie_auth_and_base64_roundtrip() {
         // RFC 4648 vectors.
         assert_eq!(base64_encode(b""), "");
@@ -15741,8 +15894,11 @@ mod tests {
     /// `sync::run`'s `catch_unwind` isolation so a panicking query
     /// can't stop this thread from answering the next one.
     fn query_server(cs: Chainstate) -> QuerySender {
+        query_server_with_manager(cs, PeerManager::new(8))
+    }
+
+    fn query_server_with_manager(cs: Chainstate, mut mgr: PeerManager<TcpStream>) -> QuerySender {
         let (tx, rx) = mpsc::channel::<ChainQuery>();
-        let mut mgr: PeerManager<TcpStream> = PeerManager::new(8);
         let mut cs = cs;
         let mut rescans = std::collections::VecDeque::new();
         thread::spawn(move || {
@@ -17489,6 +17645,475 @@ mod tests {
         assert_eq!(e.unwrap().0, RPC_DESERIALIZATION_ERROR);
     }
 
+    /// Confirmations and `nextblockhash` stop at `getblockchaininfo`'s
+    /// checked frontier even after a valid child header has arrived.
+    #[test]
+    fn rpc_confirmation_frontier_excludes_header_only_successor() {
+        let params = Network::Regtest.params();
+        let queries = query_server(Chainstate::new(&params));
+        let snap = snap();
+        let genesis = params.genesis_header.hash();
+        let mut header = BlockHeader {
+            version: 0x2000_0000,
+            prev_block_hash: genesis,
+            merkle_root: avila_consensus::hash::MerkleRoot::from_bytes([0x5a; 32]),
+            time: crate::time::time() as u32,
+            bits: params.genesis_header.bits,
+            nonce: 0,
+        };
+        while avila_consensus::pow::check_proof_of_work(&header.hash(), header.bits, &params)
+            .is_err()
+        {
+            header.nonce = header.nonce.wrapping_add(1);
+        }
+        let header_hash = header.hash();
+        let (r, e) = dispatch(
+            "getblockchaininfo",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["blocks"], 0);
+        assert_eq!(r["headers"], 0);
+
+        let (r, e) = dispatch(
+            "submitheader",
+            &json!([hex::encode(&header.encode())]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r, Value::Null);
+
+        let (r, e) = dispatch(
+            "getblockchaininfo",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["blocks"], 0);
+        assert_eq!(r["headers"], 1);
+        assert_eq!(r["bestblockhash"], genesis.to_string());
+
+        let (r, e) = dispatch(
+            "getblockheader",
+            &json!([header_hash.to_string()]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["confirmations"], -1);
+        assert!(r.get("nextblockhash").is_none());
+
+        let (r, e) = dispatch(
+            "getblockheader",
+            &json!([genesis.to_string()]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(r["confirmations"], 1);
+        assert!(r.get("nextblockhash").is_none());
+    }
+
+    /// A checked UTXO query drains a connected speculative suffix before
+    /// reading it, while ordinary header inspection continues to expose the
+    /// checked (not speculative) confirmation frontier.
+    #[test]
+    fn checked_utxo_query_drains_pending_scripts_before_reading_state() {
+        let params = Network::Regtest.params();
+        let mut cs = Chainstate::new(&params);
+        cs.enable_speculative_connect();
+        let template = avila_mempool::Mempool::new()
+            .build_template(
+                &cs,
+                Script::new(vec![avila_consensus::script::OP_1]),
+                crate::time::time() as u32,
+            )
+            .unwrap();
+        let mut mined = template.block;
+        let coinbase_txid = mined.transactions[0].txid();
+        while avila_consensus::pow::check_proof_of_work(
+            &mined.block_hash(),
+            mined.header.bits,
+            &params,
+        )
+        .is_err()
+        {
+            mined.header.nonce = mined.header.nonce.wrapping_add(1);
+        }
+        let block_hash = mined.block_hash();
+        assert!(cs.accept_block(&mined, crate::time::time() as u32).is_ok());
+        assert!(cs.pending_scripts_len() > 0);
+        assert_eq!(cs.checked_height(), 0);
+
+        let queries = query_server(cs);
+        let snap = snap();
+        let (header, error) = dispatch(
+            "getblockheader",
+            &json!([block_hash.to_string()]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(header["confirmations"], -1);
+
+        let (classic_proof, error) = dispatch(
+            "gettxoutproof",
+            &json!([[coinbase_txid.to_string()], block_hash.to_string()]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(error.is_none(), "{error:?}");
+        let (classic_result, error) = dispatch(
+            "verifytxoutproof",
+            &json!([classic_proof]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(classic_result.is_null());
+        assert_eq!(error.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
+
+        let (witness_proof, error) = dispatch(
+            "gettxoutproof",
+            &json!([[coinbase_txid.to_string()], block_hash.to_string(), {"prove_witness": true}]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(error.is_none(), "{error:?}");
+        let (witness_result, error) = dispatch(
+            "verifytxoutproof",
+            &json!([witness_proof["proof"], {"verify_witness": true}]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(witness_result.is_null());
+        assert_eq!(error.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
+
+        let (coin, error) = dispatch(
+            "gettxout",
+            &json!([coinbase_txid.to_string(), 0]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(error.is_none(), "{error:?}");
+        assert!(!coin.is_null());
+        assert_eq!(coin["bestblock"], block_hash.to_string());
+        assert_eq!(coin["confirmations"], 1);
+
+        let (verified_classic, error) = dispatch(
+            "verifytxoutproof",
+            &json!([classic_proof]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(verified_classic, json!([coinbase_txid.to_string()]));
+        let (verified_witness, error) = dispatch(
+            "verifytxoutproof",
+            &json!([witness_proof["proof"], {"verify_witness": true}]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(verified_witness["blockhash"], block_hash.to_string());
+
+        let (info, error) = dispatch(
+            "getblockchaininfo",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(info["blocks"], 1);
+    }
+
+    /// When one pending block confirms and spends a mempool output, then
+    /// a later pending block fails, publish the valid prefix and suppress
+    /// the query rather than exposing the stale mempool output.
+    #[test]
+    fn checked_utxo_query_removes_confirmed_spent_mempool_output() {
+        fn refresh_template_commitments(block: &mut avila_consensus::block::Block) {
+            if let Some(index) = block.witness_commitment_output() {
+                let commitment = block.expected_witness_commitment().unwrap_or_else(|| {
+                    panic!("template coinbase has a valid witness reserved value")
+                });
+                let mut script = block.transactions[0].outputs[index]
+                    .script_pubkey
+                    .as_bytes()
+                    .to_vec();
+                script[6..38].copy_from_slice(&commitment);
+                block.transactions[0].outputs[index].script_pubkey = Script::new(script);
+            }
+            let (root, _) = block.merkle_root();
+            block.header.merkle_root = root;
+        }
+
+        let params = Network::Regtest.params();
+        let mut cs = Chainstate::new(&params);
+        let empty_pool = avila_mempool::Mempool::new();
+        let miner_script = Script::new(vec![avila_consensus::script::OP_1]);
+        let start_time = crate::time::time() as u32;
+        let mut mature_coinbase = None;
+
+        // Build a small ordinary regtest chain so a coinbase input is
+        // mature under consensus and acceptable to the mempool.
+        for height in 1..=101u32 {
+            let mut block = empty_pool
+                .build_template(&cs, miner_script.clone(), start_time.saturating_add(height))
+                .unwrap()
+                .block;
+            if height == 1 {
+                mature_coinbase = Some(block.transactions[0].txid());
+            }
+            while avila_consensus::pow::check_proof_of_work(
+                &block.block_hash(),
+                block.header.bits,
+                &params,
+            )
+            .is_err()
+            {
+                block.header.nonce = block.header.nonce.wrapping_add(1);
+            }
+            cs.accept_block(&block, start_time.saturating_add(height))
+                .unwrap();
+        }
+
+        let mature_coinbase = mature_coinbase.unwrap();
+        let mature_outpoint = OutPoint {
+            txid: mature_coinbase,
+            vout: 0,
+        };
+        let mature_value = cs.utxo().get(&mature_outpoint).unwrap().out.value;
+        let tx_a = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: mature_outpoint,
+                script_sig: Script::default(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: mature_value - 10_000,
+                script_pubkey: miner_script.clone(),
+            }],
+            lock_time: 0,
+        };
+        let tx_a_id = tx_a.txid();
+        let tx_a_output = OutPoint {
+            txid: tx_a_id,
+            vout: 0,
+        };
+        let tx_b = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: tx_a_output,
+                script_sig: Script::default(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: mature_value - 20_000,
+                // The next block's spend will fail after this valid prefix.
+                script_pubkey: Script::new(vec![avila_consensus::script::OP_CHECKSIG]),
+            }],
+            lock_time: 0,
+        };
+        let tx_b_id = tx_b.txid();
+
+        let now = start_time.saturating_add(102);
+        let mut mgr = PeerManager::<TcpStream>::new(8);
+        // OP_1 is consensus-valid but not a standard mempool output, so
+        // this isolated regtest fixture opts out of standardness only.
+        mgr.mempool().set_require_standard(false);
+        mgr.mempool()
+            .accept_tx(tx_a, &cs, now)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "mature anyone-can-spend transaction should enter regtest mempool: {error:?}"
+                )
+            });
+        let mut block = mgr
+            .mempool()
+            .build_template(&cs, miner_script.clone(), now)
+            .unwrap()
+            .block;
+        block.transactions.push(tx_b);
+        refresh_template_commitments(&mut block);
+        cs.enable_speculative_connect();
+        while avila_consensus::pow::check_proof_of_work(
+            &block.block_hash(),
+            block.header.bits,
+            &params,
+        )
+        .is_err()
+        {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        cs.accept_block(&block, now)
+            .unwrap_or_else(|error| panic!("valid prefix block was rejected: {error:?}"));
+        assert!(cs.pending_scripts_len() > 0);
+        assert!(mgr.mempool_ref().entry(&tx_a_id).is_some());
+
+        let tx_c = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: tx_b_id,
+                    vout: 0,
+                },
+                script_sig: Script::default(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![TxOut {
+                value: mature_value - 30_000,
+                script_pubkey: miner_script.clone(),
+            }],
+            lock_time: 0,
+        };
+        let mut bad_successor = empty_pool
+            .build_template(&cs, miner_script.clone(), now.saturating_add(1))
+            .unwrap()
+            .block;
+        bad_successor.transactions.push(tx_c);
+        refresh_template_commitments(&mut bad_successor);
+        while avila_consensus::pow::check_proof_of_work(
+            &bad_successor.block_hash(),
+            bad_successor.header.bits,
+            &params,
+        )
+        .is_err()
+        {
+            bad_successor.header.nonce = bad_successor.header.nonce.wrapping_add(1);
+        }
+        cs.accept_block(&bad_successor, now.saturating_add(1))
+            .unwrap_or_else(|error| {
+                panic!("speculative invalid successor failed early: {error:?}")
+            });
+        assert!(cs.pending_scripts_len() >= 2);
+
+        let queries = query_server_with_manager(cs, mgr);
+        let (result, error) = dispatch(
+            "gettxout",
+            &json!([tx_a_id.to_string(), 0, true]),
+            &snap(),
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(result.is_null());
+        assert_eq!(error.unwrap().0, RPC_VERIFY_ERROR);
+
+        // Check the mempool directly before any later checked query could
+        // trigger another drain and mask a missing publication here.
+        let (entry, error) = dispatch(
+            "getmempoolentry",
+            &json!([tx_a_id.to_string()]),
+            &snap(),
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(entry.is_null());
+        assert_eq!(error.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
+
+        // The first block passed even though its successor failed. The
+        // completed prefix still removes A before a later query consults
+        // the mempool fallback.
+        let (result, error) = dispatch(
+            "gettxout",
+            &json!([tx_a_id.to_string(), 0, true]),
+            &snap(),
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(error.is_none(), "{error:?}");
+        assert!(result.is_null());
+    }
+
     /// `generatetoaddress` mines real blocks to a decoded address and
     /// `generateblock` covers the tx-resolution error paths. Both
     /// grow the chain — the query server's state advances.
@@ -17751,6 +18376,9 @@ mod tests {
         );
         assert!(e.is_none(), "{e:?}");
         assert_eq!(r["txid"], txid);
+        assert_eq!(r["confirmations"], 1);
+        assert_eq!(r["in_active_chain"], true);
+        assert_eq!(r["blocktime"], r["time"]);
 
         let (hex_neg, e) = dispatch(
             "getrawtransaction",
@@ -17776,6 +18404,146 @@ mod tests {
             false,
         );
         assert_eq!(hex_neg, hex_zero);
+    }
+
+    /// Named-block raw-transaction metadata follows the checked active
+    /// branch after a reorg: detached transactions have zero
+    /// confirmations and no active-chain time fields.
+    #[test]
+    fn rawtransaction_named_detached_block_has_zero_confirmations() {
+        let params = Network::Regtest.params();
+        let queries = query_server(Chainstate::new(&params));
+        let snap = snap();
+        let addr = "bcrt1q9mc2hc2f6x2lsxh7xnuu3fdjj628hvjatzgxcr";
+        let (active, e) = dispatch(
+            "generatetoaddress",
+            &json!([1, addr]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(e.is_none(), "{e:?}");
+        let active_hash = active[0].as_str().unwrap().to_string();
+        let (active_block, e) = dispatch(
+            "getblock",
+            &json!([active_hash, 1]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(e.is_none(), "{e:?}");
+        let detached_txid = active_block["tx"][0].as_str().unwrap().to_string();
+
+        // Build a two-block sibling branch in an isolated regtest
+        // chainstate, then submit it to force an ordinary reorg.
+        let mut side = Chainstate::new(&params);
+        let pool = avila_mempool::Mempool::new();
+        let now = crate::time::time() as u32;
+        let script = Script::new(vec![avila_consensus::script::OP_1]);
+        let mut side_one = pool
+            .build_template(&side, script.clone(), now)
+            .unwrap()
+            .block;
+        while avila_consensus::pow::check_proof_of_work(
+            &side_one.block_hash(),
+            side_one.header.bits,
+            &params,
+        )
+        .is_err()
+        {
+            side_one.header.nonce = side_one.header.nonce.wrapping_add(1);
+        }
+        side.accept_block(&side_one, now).unwrap();
+        let mut side_two = pool
+            .build_template(&side, script, now.saturating_add(1))
+            .unwrap()
+            .block;
+        while avila_consensus::pow::check_proof_of_work(
+            &side_two.block_hash(),
+            side_two.header.bits,
+            &params,
+        )
+        .is_err()
+        {
+            side_two.header.nonce = side_two.header.nonce.wrapping_add(1);
+        }
+        side.accept_block(&side_two, now.saturating_add(1)).unwrap();
+        let side_two_hash = side_two.block_hash().to_string();
+        let side_two_txid = side_two.transactions[0].txid().to_string();
+
+        for block in [side_one, side_two] {
+            let (result, e) = dispatch(
+                "submitblock",
+                &json!([hex::encode(&block.encode())]),
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+                None,
+                false,
+            );
+            assert!(e.is_none(), "{e:?}");
+            assert!(
+                result.is_null() || result == json!("inconclusive"),
+                "{result}"
+            );
+        }
+        let (chain, e) = dispatch(
+            "getblockchaininfo",
+            &json!([]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(chain["blocks"], 2);
+        assert_eq!(chain["bestblockhash"], side_two_hash);
+
+        let (detached, e) = dispatch(
+            "getrawtransaction",
+            &json!([detached_txid, 1, active_hash]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(detached["in_active_chain"], false);
+        assert_eq!(detached["confirmations"], 0);
+        assert!(detached.get("time").is_none());
+        assert!(detached.get("blocktime").is_none());
+
+        let (active, e) = dispatch(
+            "getrawtransaction",
+            &json!([side_two_txid, 1, side_two_hash]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(active["in_active_chain"], true);
+        assert_eq!(active["confirmations"], 1);
+        assert_eq!(active["blocktime"], active["time"]);
     }
 
     /// `listunspent`'s `minimumSumAmount`: Core's `AvailableCoins`
@@ -17909,17 +18677,73 @@ mod tests {
         assert_eq!(mnemonic.split_whitespace().count(), 24);
         assert_eq!(r["entropy_commitment"].as_str().unwrap().len(), 64);
 
-        // Address → 101 blocks mature a coinbase (regtest COINBASE_MATURITY=100).
+        // Height 99 leaves the height-1 coinbase at 99 confirmations.
         let (r, e) = call("getnewaddress", &Value::Null);
         assert!(e.is_none(), "{e:?}");
         let addr = r.as_str().unwrap().to_string();
-        let (_, e) = call("generatetoaddress", &json!([101, addr]));
+        let (_, e) = call("generatetoaddress", &json!([99, addr]));
+        assert!(e.is_none(), "{e:?}");
+
+        let (unmature, e) = call("listunspent", &json!([1, 9_999_999]));
+        assert!(e.is_none(), "{e:?}");
+        assert!(unmature.as_array().unwrap().is_empty(), "{unmature}");
+        let (including_immature, e) = call(
+            "listunspent",
+            &json!([1, 9_999_999, [], true, {"include_immature_coinbase": true}]),
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert!(!including_immature.as_array().unwrap().is_empty());
+
+        // A best-header successor must not turn a 99-confirmation
+        // coinbase into a spendable/listed coin before its block connects.
+        let (tip_hash, e) = call("getblockhash", &json!([99]));
+        assert!(e.is_none(), "{e:?}");
+        let (tip_header, e) = call("getblockheader", &json!([tip_hash]));
+        assert!(e.is_none(), "{e:?}");
+        let successor_time = tip_header["time"].as_u64().unwrap() as u32 + 1;
+        let mut header = BlockHeader {
+            version: 0x2000_0000,
+            prev_block_hash: tip_hash.as_str().unwrap().parse().unwrap(),
+            merkle_root: avila_consensus::hash::MerkleRoot::from_bytes([0x5a; 32]),
+            time: successor_time.max(crate::time::time() as u32),
+            bits: params.genesis_header.bits,
+            nonce: 0,
+        };
+        while avila_consensus::pow::check_proof_of_work(&header.hash(), header.bits, &params)
+            .is_err()
+        {
+            header.nonce = header.nonce.wrapping_add(1);
+        }
+        let fake_hash = header.hash();
+        let (_, e) = call("submitheader", &json!([hex::encode(&header.encode())]));
+        assert!(e.is_none(), "{e:?}");
+        let (info, e) = call("getblockchaininfo", &json!([]));
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(info["blocks"], 99);
+        assert_eq!(info["headers"], 100);
+        let (still_immature, e) = call("listunspent", &json!([1, 9_999_999]));
+        assert!(e.is_none(), "{e:?}");
+        assert!(
+            still_immature.as_array().unwrap().is_empty(),
+            "{still_immature}"
+        );
+        let (_, e) = call("invalidateblock", &json!([fake_hash.to_string()]));
+        assert!(e.is_none(), "{e:?}");
+
+        // At checked height 100 the oldest coinbase has 100
+        // confirmations and is spendable in the next block.
+        let (_, e) = call("generatetoaddress", &json!([1, addr]));
         assert!(e.is_none(), "{e:?}");
 
         // Funded: the spendable coinbase is ours.
         let (r, e) = call("listunspent", &json!([1, 9_999_999]));
         assert!(e.is_none(), "{e:?}");
         assert!(!r.as_array().unwrap().is_empty(), "{r}");
+
+        // Keep a second mature coinbase available for the later funded-PSBT
+        // path after the send below consumes the first one.
+        let (_, e) = call("generatetoaddress", &json!([1, addr]));
+        assert!(e.is_none(), "{e:?}");
 
         // Spend to ourselves — into the mempool via admit_and_relay.
         let (r, _e) = call("getnewaddress", &Value::Null);

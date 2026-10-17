@@ -2450,15 +2450,19 @@ pub fn run(
                         // but that's strictly better than the crash
                         // this replaces.
                         let method = q.method().unwrap_or("<unknown>").to_string();
-                        if let Err(payload) =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                q.answer(&mut cs, &mut mgr, &mut rescans)
-                            }))
-                        {
-                            eprintln!(
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            q.answer_with_progress(&mut cs, &mut mgr, &mut rescans)
+                        })) {
+                            Ok(Some(height)) => emit(
+                                &mut stream,
+                                "tip_advanced",
+                                serde_json::json!({"height": height}),
+                            ),
+                            Ok(None) => {}
+                            Err(payload) => eprintln!(
                                 "chain query panicked (method={method}): {}",
                                 panic_message(&payload)
-                            );
+                            ),
                         }
                     }
                     Err(_) => break,
