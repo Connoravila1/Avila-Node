@@ -455,6 +455,13 @@ pub struct SyncConfig {
 /// tick, journaled as `config_changed`/`config_rejected`.
 #[derive(Debug)]
 pub enum ControlMsg {
+    /// Read-only desktop request; bounded pages and nonblocking replies.
+    InspectBlock {
+        lookup: crate::inspect::BlockLookup,
+        tx_offset: u32,
+        tx_limit: u16,
+        reply: std::sync::mpsc::SyncSender<crate::inspect::BlockLookupResult>,
+    },
     /// `config describe` path + the new value as JSON.
     Set {
         path: String,
@@ -588,6 +595,9 @@ pub struct SyncProgress {
     pub recent: Vec<(u32, avila_consensus::hash::BlockHash)>,
     /// Per-peer views — what each peer claims vs. what it has served.
     pub peer_details: Vec<avila_p2p::manager::PeerSnapshot>,
+    /// Session wire totals, including peers that have disconnected.
+    pub network_bytes_sent: u64,
+    pub network_bytes_recv: u64,
     /// Pooled transactions, parked orphans, and the fee estimate for
     /// ~6-block confirmation in sat/kvB (`None` = insufficient data).
     pub mempool: (usize, usize, Option<i64>),
@@ -649,6 +659,8 @@ impl SyncProgress {
             utreexo_height: None,
             recent: Vec::new(),
             peer_details: Vec::new(),
+            network_bytes_sent: 0,
+            network_bytes_recv: 0,
             mempool: (0, 0, None),
             elapsed_secs: 0,
             validation: avila_consensus::chainstate::ValidationReport {
@@ -1905,8 +1917,21 @@ pub fn run(
         if let Some(control) = &cfg.control
             && let Ok(rx) = control.lock()
         {
-            while let Ok(msg) = rx.try_recv() {
-                let ControlMsg::Set { path, value } = msg;
+            for _ in 0..8 {
+                let Ok(msg) = rx.try_recv() else { break };
+                let (path, value) = match msg {
+                    ControlMsg::Set { path, value } => (path, value),
+                    ControlMsg::InspectBlock {
+                        lookup,
+                        tx_offset,
+                        tx_limit,
+                        reply,
+                    } => {
+                        let _ = reply
+                            .try_send(crate::inspect::inspect(&cs, lookup, tx_offset, tx_limit));
+                        continue;
+                    }
+                };
                 match apply_knob(&mut mgr, &mut knobs, &path, &value) {
                     Ok(applied) => emit(
                         &mut stream,
@@ -2339,6 +2364,8 @@ pub fn run(
             disconnects,
             recent,
             peer_details: mgr.peer_snapshots(),
+            network_bytes_sent: mgr.net_totals().0,
+            network_bytes_recv: mgr.net_totals().1,
             mempool: (
                 mgr.mempool().len(),
                 mgr.mempool().orphan_count(),

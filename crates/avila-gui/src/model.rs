@@ -24,6 +24,9 @@ pub struct NodeView {
     /// The last few connected blocks `(height, display hash)`, newest last.
     pub recent: Vec<(u32, String)>,
     pub peers: Vec<PeerView>,
+    /// Cumulative traffic for this node worker, including closed peers.
+    pub network_bytes_sent: u64,
+    pub network_bytes_recv: u64,
     pub mempool_txs: usize,
     pub orphans: usize,
     /// Fee rate for ~6-block confirmation, sat/kvB.
@@ -200,6 +203,8 @@ impl From<&SyncProgress> for NodeView {
                     services: s.services.unwrap_or(0),
                 })
                 .collect(),
+            network_bytes_sent: p.network_bytes_sent,
+            network_bytes_recv: p.network_bytes_recv,
             mempool_txs: p.mempool.0,
             orphans: p.mempool.1,
             fee_rate_sat_kvb: p.mempool.2,

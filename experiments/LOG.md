@@ -6,6 +6,7 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 
 | # | Date | Experiment | Hypothesis | Verdict | Key numbers | Doc |
 |---|------|-----------|------------|---------|-------------|-----|
+| 79 | 10-16 | Swift checkpoint shadow prototype | Can ordered implicit deletions match explicit Utreexo roots over a fully validated bounded fixture, and can a keyed coin multiset audit detect a changed input copy? | **bounded tests/examples passed; experimental only** | Local workspace: 1,124 passed, 0 failed, 5 ignored (595 consensus, 144 node), 457 s, 1,942 MiB peak under 2,560 MiB guard; all-target Clippy passed. All three fixture modes passed (28 s, 593 MiB); prevout run: height 500, audit match, 513 rows/55,858 encoded bytes, final UTXO and stump roots match their full-validation oracles. Remote `researchhead7209` tests/reproducibility passed; its example exposed redb reopen-under-live-handle bug, now fixed and locally rerun; remote rerun pending. No IBD, production integration, or speed claim. | [swift-checkpoint-shadow](2026-10-16-swift-checkpoint-shadow.md) |
 | 78 | 09-26 | Corpus-wide occurrence join (Gate 4 pt 1, repaired ×2) | Shared join + headers in corpus + one invalidity decision + supplied-state loading | **all repaired; real contiguous LINKED segment verified clean** | REVIEW_78_FOLLOWUP repairs: AVCORP03 retains 80B headers → hash+parent linkage verified (300/300 on segment, 419/419 window), check_block per block (PoW self-consistency, merkle, context-free — closes the negative-output hole), MTP in-window where ≥11 ancestors. Single `known_invalid` → both modes exit 1, no export; script failures carry block height → failing block excluded from prefix. Component flags replace `complete`. `--boundary` loads dumptxoutset via new `snapverify::for_each_coin`; Missing becomes invalidity under complete state. Exec regressions 74 checks (8 invalidity cases × both modes + boundary semantics + prefix-boundary). Segment 341808–342108: linked, 412,825 inputs verified, 0 violations everywhere; unresolved = "absent from source records". v2→v3 identical exports reconciled (consumed-boundary coins only; +28,566 inputs verified — key-set equality ≠ validation equality). Fresh 579-test log. PUSHED 695f73c+cd3cb45 (CI green both) — REVIEW_78_PUSH repairs follow: for_each_coin returns hash_serialized_3 commitment; donor pins base-hash/base-height/txoutset-hash + wrong-network/non-adjacent/dup-outpoint/height-bound rejections; --run-manifest embeds compile-time build_rev (stale binary can't claim newer checkout) + streamed file hashes + argv JSON + exit_code; base-hash pin decode fixed (was an underflow panic); exec suite 84 checks incl. pin matrix + manifest fields. Still data-blocked on authoritative starting UTXO — dumptxoutset handoff documented. | [window-join](2026-09-26-ibd-window-join.md) |
 | 77 | 09-26 | Exact state closure — occurrence-record engine vs `connect_block` (Gate 3) | Occurrence-aware batch state evaluation reproduces the real connect pipeline exactly, not just key-set | **25/25 byte-exact, verdict- AND expectation-equal** | Repaired per REVIEW_77: checked header-tree growth on both paths (frozen-MTP defect fixed), declared expected outcome+tip per case, per-block-boundary digests, rejection-preserves-state, isolated predicates (time-type BIP68, MTP locktime, fee-claim ±1, missing input, BIP30 dup-creation on synthetic bip34-off params — caught a real coinbase-skip hole). Canonical exports preserved. Scope: bounded regtest OP_TRUE chains; sigops/scripts/mainnet history excluded per audit. | [state-closure](2026-09-26-ibd-state-closure.md) |
 | 76 | 09-26 | Resolver repair + executed calibration (#41/#72 gates) | File-identity, coinbase sources, per-item preimage model, executed counters | **repairs verified; matched calibration done** | V2 corpus: 599,840 resolved (89.29%), 0 txid mismatches, 0 immature; executed 517,819 (77.08%). Executed: 526,534 ECDSA attempts → 526,528 backend calls (6 parse early-returns); sighash 1.4% of 1-worker check-stage. MATCHED-subset calibration: identical selection digest both sides; structural DER items over the identical executed set 524,092 vs 526,534 helper attempts = 0.9954. 0 non-DER-shaped attempts; +2,442 excess over structural DER items is consistent with repeated signature checks, including multisig retries (classifier checks outer shape, not opcode/strict DER). Replay rejects immature corpora (exit≠0), 0-worker fails. Census: 83/83 segwit merkle verified post-fix. | [corpus-replay](2026-09-26-ibd-corpus-replay.md) |
@@ -15,7 +16,7 @@ A "failed" or "inconclusive" row is a result, not a gap — write it down.
 | 72 | 09-26 | IBD workload census (structural) | Era-resolved structural counts can replace assumed corpus parameters | **structural counts valid; hash figures were coarse estimates (regenerated in #76)** | Windows over real corpora: pre-segwit 229–408k + taproot 956.5k + genesis fixture. Per-block: 303–1,147 tx / 731–3,971 sig-items pre-segwit; 4,765 tx / 7,667 sig-items at 956k (schnorr ~8%). DER-attempt estimate matches executed within 0.46% on the matched executed subset (#76). Legacy sighash dominates hash plane — v1 amplification figure (~35–75×) retired; corrected ~3.75× lower (still dominant). | [workload-census](2026-09-26-ibd-workload-census.md) |
 | 71 | 09-26 | IBD arithmetic census and hardware limits | Instruction accounting can replace unsupported universal IBD-floor estimates | **measured narrow scope; full-IBD floor unestablished** | 512 canonical mainnet ECDSA attempts: all verdicts matched, 985 field multiplies + 973 squares + one scalar inversion/attempt, no variable field inversion; compressed parse adds 14 multiplies + 255 squares. Shared-host timing ~100–135 microseconds/attempt; native compiler gain inconclusive. Static field kernels retain costly SHRD candidates. Further experiments assigned to SWE-2 | [hardware-floor](2026-09-26-ibd-hardware-floor.md) |
 | 1 | 09-14 | RPC compat matrix vs Core 29.4 | RPC surface can be made byte-compatible | **adopted** | 75 calls exact-match | [rpc-compat-matrix](2026-09-14-rpc-compat-matrix.md) |
-| 2 | ~09-20 | Header acceptance baseline | Header-chain parity is provable offline | **adopted** | `check_headers_core.py` 0 mismatches | [header-acceptance](2026-09-header-acceptance-baseline.md) |
+| 2 | ~09-20 | Header acceptance baseline | Header-chain parity is provable offline | **adopted; readiness harness corrected and verified** | Original baseline: 0 mismatches. Core v31.1 recheck initially returned `Loading banlist…` for all 2,047 signet submissions because readiness ignored JSON-RPC errors. After polling for successful `getblockchaininfo`, signet rerun passed 2,047/0; combined suites 10,404/0. | [header-acceptance](2026-09-header-acceptance-baseline.md) |
 | 3 | 09-22 | coinsdb snapshot ingest | redb can absorb AssumeUTXO-scale writes | **adopted w/ caveat** | 20M sorted OK; random ingest collapses ~40M | [snapshot-ingest](2026-09-22-coinsdb-snapshot-ingest.md) |
 | 4 | 09-23 | Compact coin codec (Core `Coin` format) | Core's codec halves record size at scale | **adopted** | 2.0→1.0 GiB at 5M; +12–25% bulk | [coinsdb-layout](2026-09-23-coinsdb-layout.md) |
 | 5 | 09-23 | Sorted-key commits | Sorting dirty map removes B-tree churn | **adopted** | +20–25% bulk commits | same doc |
@@ -2029,3 +2030,51 @@ flush memory accounting; getadvice dedupe + request-at-header-accept.
 bounded flat mirror, per-run bloom filters, run compaction,
 swiftsync transient mode, utreexo. Full analysis:
 [2026-09-29-ibd-wall-analysis.md](2026-09-29-ibd-wall-analysis.md)
+
+## Experiment #79 — Swift checkpoint shadow prototype
+
+Source-only implementation of `swift_audit`, `swift_stump`, and the new
+checkpoint-bound `swift_prevouts` redb store, with the
+`swift_checkpoint_shadow` and `swift_prevouts_shadow` examples. Both examples
+are bounded to the committed mainnet fixture at heights 0–500 (501 blocks, 114,278 bytes,
+`ef9cb1e45eaaafa55d23016d7dfce3e8f64f56609573e18b9a8940b8b1ac3d73`). The
+example is written to do two ordinary replays with `assume_valid=None`, use the
+first replay's final UTXO set as a local spentness-classification oracle, and
+compare the provisional roots with a `MemForest` add-all/explicit-delete
+oracle. `--tamper-input` changes only an audit-owned coin copy after block
+acceptance and expects a multiset mismatch.
+
+The follow-on prevout example also performs ordinary full validation with
+`assume_valid=None`; a bounded temporary redb index supplies previous-block input
+coins to the shadow audit, while an ordered in-memory overlay handles only
+earlier outputs within the current block. It compares each indexed coin against
+canonical Chainstate, checks final UTXO equality against the first full replay,
+and compares provisional stump roots with an explicit-deletion `MemForest`.
+The store's checksums detect accidental corruption only and do not authenticate
+records or prove membership/spentness. This early fixture does not cover modern
+witness/taproot-era blocks.
+
+Local full workspace tests passed: 1,124 passed, zero failed, and five ignored,
+including 595 consensus and 144 node tests. Runtime was 457 seconds with
+1,942 MiB peak under the 2,560 MiB guard. All-target workspace Clippy passed.
+All three bounded native fixture modes passed in 28 seconds with 593 MiB peak:
+the positive audit matched, the tamper mode detected its expected mismatch, and
+the prevout run reached checked height 500 with 513 entries/55,858 encoded
+bytes, matching full-validation UTXO and explicit-forest stump oracles.
+
+Remote `researchhead7209` CI passed workspace tests and reproducibility, but its
+offline `swift_prevouts_shadow` example initially failed because it reopened
+redb before dropping the original store handle. This fixture resource-lifetime
+failure was not a consensus failure. The example now drops the first handle
+before reopen and checks saved checkpoint/entry/byte metadata; corrected native
+fixture execution passed, with remote CI rerun outstanding.
+
+No performance or end-to-end IBD claim is made, and IBD has not been started.
+Scope is limited to this early 2009-era fixture; no external helper
+parser/authentication, whole-chain migration, durable UTXO state, reorganization
+handling, or production stateless full-validation path exists. The accumulator
+uses Avila's existing leaf scheme, not BIP Utreexo interoperability. Measure the
+bounded store against the same full-validation rules before considering any
+mainnet path. See
+[the experiment note](2026-10-16-swift-checkpoint-shadow.md) for guarded
+commands and detailed limits.

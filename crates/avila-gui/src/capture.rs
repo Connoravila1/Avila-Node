@@ -64,6 +64,9 @@ pub struct Pose {
     pub pointer: &'static [Step],
     /// Identity is posed once for pointer-driven navigation captures.
     pub first: bool,
+    /// Render a fixed mainnet-genesis data fixture in the block inspector.
+    /// It carries no live-node or validation claim.
+    pub block_fixture: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -126,6 +129,7 @@ impl Capture {
             desk: Desk::Window,
             pointer: &[],
             first: true,
+            block_fixture: false,
         };
         let mut shots = Vec::new();
         for theme in [Theme::Light, Theme::Dark] {
@@ -646,6 +650,21 @@ impl Capture {
             size: [705.0, 484.0],
             name: "-classic-return-modern",
         });
+        for (size, name) in [
+            (FULL, "-block-detail-genesis-fixture-full"),
+            (SMALL, "-block-detail-genesis-fixture-small"),
+        ] {
+            shots.push(Shot {
+                theme: Theme::Light,
+                pose: Pose {
+                    scroll: 1_120.0,
+                    block_fixture: true,
+                    ..pose(Page::Chain)
+                },
+                size,
+                name,
+            });
+        }
         // `AVILA_GUI_CAPTURE_ONLY=xp` takes just the shots so named.
         if let Ok(only) = std::env::var("AVILA_GUI_CAPTURE_ONLY") {
             shots.retain(|shot| file_name(shot).contains(&only));
@@ -744,6 +763,11 @@ impl Capture {
             let receipt = serde_json::json!({
                 "screenshot": name,
                 "pixels": image.size,
+                "data_fixture": if shot.pose.block_fixture {
+                    Some("offline mainnet genesis fixture; not live node data")
+                } else {
+                    None
+                },
                 "actual": self.observation,
             });
             if let Err(e) = std::fs::write(

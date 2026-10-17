@@ -56,6 +56,51 @@ as each relevant workflow is built. Plotting and docking libraries are separate
 ecosystem dependencies; evaluate compatibility and interaction benefit before
 adding them. Enabling every Cargo feature is not a product requirement.
 
+## Current node views and limits
+
+On **Chain**, choose **Inspect** beside a recent block, or enter a height or full
+block hash in **Block inspector**. Previous/next follow the returned block-hash
+links. The detail shows header fields and measured body size, weight, transaction
+count and transaction summaries. A header-only, pruned or otherwise unavailable
+body is identified explicitly. The weight composition and transaction table start
+with 100 transactions per request and can be paged; the GUI retains at most 2,000
+transaction summaries for the selected block. Composition is labeled as partial
+while more transactions remain. Fee and feerate fields are not part of this
+inspector's data contract.
+
+The **Network traffic** page shows cumulative bytes sent and received by the
+current node worker, including peers that disconnected, and rates derived from
+successive samples. The session retains at most 900 samples (about 15 minutes at
+one sample per second); the chart shows at most 120 valid rate intervals. Pairs
+across a run restart, counter reset, nonpositive time interval or gap over 2.5
+seconds are omitted. Demo mode is simulated and does not report live network
+traffic; block inspection requires a live node session.
+
+The GUI starts and controls its own node worker. It cannot attach to a separate
+headless Avila Node process in the current architecture; inspection requests use
+an in-process channel to the worker started by this GUI.
+
+Native captures reviewed on 2026-10-17 show the Chain page with the offline
+mainnet-genesis fixture at 1120×760 and 760×600. The fixture is explicitly marked
+as offline, not live node data. Both captures show the inspector and measured
+genesis header/body facts; the compact view keeps the long hashes on-screen, while
+the transaction table continues below the initial viewport. The larger capture
+shows the single coinbase weight-composition segment. These captures do not verify
+live-node responses, transaction paging, keyboard navigation, zoom behavior, or
+screen-reader/accessibility behavior. The native GUI build, workspace tests,
+Clippy, and Bitcoin Core diff checks passed for this implementation.
+
+Launch with `--full-verify` to disable the assume-valid checkpoint for that run
+and verify historical scripts during initial sync, matching the CLI's
+`assumevalid=0` behavior. This can make initial sync substantially slower. The
+default is unchanged, and the flag does not alter saved GUI preferences.
+
+For a native devtools capture of the measured offline genesis fixture, run
+`AVILA_GUI_CAPTURE=/tmp/avila-gui-capture AVILA_GUI_CAPTURE_ONLY=block-detail-genesis-fixture cargo run -p avila-gui --features devtools -- --demo`.
+The harness writes full-size and compact screenshots with JSON provenance sidecars.
+This capture is a deterministic fixture view, not evidence from a live node. A
+separate attach-mode operator view is planned; it is not part of the current GUI.
+
 ## Acceptance requirements
 
 - The same node commands and status semantics must serve the CLI and GUI.

@@ -1,7 +1,7 @@
 //! The chain in detail: coverage to scale, what the validation report
 //! says, the snapshot and its replay, and the newest blocks.
 
-use super::{Action, Scene, start_offer};
+use super::{Action, Scene, block_inspector::State as BlockInspector, start_offer};
 use crate::model::{NodeView, btc, month_year, percent, span, thousands};
 use crate::ribbon::{self, Coverage, Options, Ruler, Scale, View};
 use crate::session;
@@ -16,7 +16,10 @@ pub fn show(
     scale: &mut Scale,
     view: &mut View,
     clock: &mut bool,
+    inspector: &mut BlockInspector,
 ) -> Option<Action> {
+    let node_sender = s.session.control_sender();
+    inspector.update_liveness(node_sender.is_some());
     let Some(v) = &s.session.view else {
         widgets::empty(
             ui,
@@ -94,7 +97,9 @@ pub fn show(
     ui.add_space(28.0);
     rhythm(ui, s, v, clock);
     ui.add_space(28.0);
-    recent(ui, s, v);
+    inspector.ui(ui, node_sender.as_ref(), v.connected, v.headers);
+    ui.add_space(28.0);
+    recent(ui, s, v, inspector, node_sender.as_ref());
     None
 }
 
@@ -319,7 +324,13 @@ fn snapshot(ui: &mut Ui, s: &Scene, v: &NodeView) {
     ui.label(RichText::new(explain).size(13.5).color(s.pal.muted));
 }
 
-fn recent(ui: &mut Ui, s: &Scene, v: &NodeView) {
+fn recent(
+    ui: &mut Ui,
+    s: &Scene,
+    v: &NodeView,
+    inspector: &mut BlockInspector,
+    sender: Option<&std::sync::mpsc::Sender<avila_node::sync::ControlMsg>>,
+) {
     widgets::section(
         ui,
         "Recent blocks",
@@ -327,10 +338,10 @@ fn recent(ui: &mut Ui, s: &Scene, v: &NodeView) {
     );
     let keep = (ui.available_width() < 760.0).then_some(20);
     egui::Grid::new("recent")
-        .num_columns(3)
+        .num_columns(4)
         .spacing([28.0, 10.0])
         .show(ui, |ui| {
-            for title in ["Height", "Hash", "Seen"] {
+            for title in ["Height", "Hash", "Details", "Seen"] {
                 ui.label(
                     RichText::new(title)
                         .font(font(theme::MEDIUM, 12.0))
@@ -345,6 +356,15 @@ fn recent(ui: &mut Ui, s: &Scene, v: &NodeView) {
                         .color(s.pal.text),
                 );
                 widgets::hash_label(ui, hash, 12.5, keep);
+                if ui.small_button("Inspect").clicked()
+                    && let Ok(block_hash) = hash.parse::<avila_consensus::hash::BlockHash>()
+                {
+                    inspector.request(
+                        sender,
+                        avila_node::inspect::BlockLookup::Hash(block_hash),
+                        0,
+                    );
+                }
                 let seen = match s.session.seen_ago(*h) {
                     Some(ago) if ago < 5.0 => "just now".to_owned(),
                     Some(ago) => format!("{} ago", span(ago as u64)),

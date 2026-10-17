@@ -63,6 +63,7 @@ mod capture {
         pub desk: Desk,
         pub pointer: &'static [Step],
         pub first: bool,
+        pub block_fixture: bool,
     }
     pub struct Capture;
     impl Capture {
@@ -93,6 +94,7 @@ mod fingerprint;
 mod gallery;
 mod julia;
 mod model;
+mod operator;
 mod oracle;
 mod pages;
 mod phosphor;
@@ -133,6 +135,10 @@ struct Args {
     /// ~17 GiB RAM at mainnet tip and a less-tested code path.
     #[arg(long)]
     fast_ibd: bool,
+    /// Verify historical scripts instead of using the assume-valid checkpoint.
+    /// This can make initial sync substantially slower; the default is unchanged.
+    #[arg(long)]
+    full_verify: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -171,6 +177,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..Default::default()
     };
     let (demo, theme) = (args.demo, args.theme);
+    let start_options = app::StartOptions {
+        fast_ibd: args.fast_ibd,
+        full_verify: args.full_verify,
+    };
     let close_flag = close;
     eframe::run_native(
         "Avila Node",
@@ -180,7 +190,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 cc,
                 node,
                 demo,
-                args.fast_ibd,
+                start_options,
                 theme,
                 close_flag,
                 config_file,
