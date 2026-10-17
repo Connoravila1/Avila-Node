@@ -40,6 +40,10 @@ const CFCHECKPT_INTERVAL: u32 = 1_000;
 /// may owe us at once.
 pub const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 
+/// Maximum queued block announcements per peer. One protocol-limit `inv`
+/// message can fill this backlog; repeated batches cannot grow it forever.
+pub const MAX_PENDING_BLOCKS_PER_PEER: usize = 50_000;
+
 /// Per-`getdata` serve budget: payload bytes (approximate wire size)
 /// emitted for a single request before the rest is announced
 /// `notfound`. Sized so a normal block fetch (≤16 blocks in flight)
@@ -688,11 +692,21 @@ impl PeerSync {
             if is_block && cs.have_body(&hash) {
                 continue;
             }
+            // A repeated announcement for an already-queued block must not
+            // bypass FIFO by requesting it directly when a slot opens.
+            if is_block && self.pending_set.contains(&hash) {
+                continue;
+            }
             // Beyond the request budget this tick: remember the block —
-            // without a backlog the rest of a 100-inv announcement is
-            // silently dropped and the chain stalls behind the tip.
+            // until one max-sized announcement backlog is retained. Excess
+            // entries are scheduling hints only; headers-first fetching
+            // remains independent of this per-peer INV queue.
             if want.len() >= free {
-                if is_block && self.pending_set.insert(hash) && !self.wanted.contains(&hash) {
+                if is_block
+                    && !self.wanted.contains(&hash)
+                    && self.pending_blocks.len() < MAX_PENDING_BLOCKS_PER_PEER
+                    && self.pending_set.insert(hash)
+                {
                     self.pending_blocks.push_back(hash);
                 }
                 continue;
@@ -1598,6 +1612,61 @@ mod tests {
         assert_eq!(want.len(), 1);
         assert_eq!(want[0].hash, BlockHash::from_bytes([16; 32]));
         assert_eq!(sync.pending_blocks.len(), 3);
+    }
+
+    #[test]
+    fn pending_block_inv_queue_is_capped_deduped_and_fifo() {
+        let mut sync = PeerSync::new();
+        let cs = regtest();
+        let hash_at = |n: u32| {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&n.to_le_bytes());
+            BlockHash::from_bytes(bytes)
+        };
+
+        // Fill the in-flight window, then send duplicate outstanding hashes
+        // followed by more than one maximum INV backlog of distinct hints.
+        let requested: Vec<InvVector> = (0..16)
+            .map(|n| InvVector {
+                inv_type: InvType::WitnessBlock,
+                hash: hash_at(n),
+            })
+            .collect();
+        sync.on_inv(&cs, None, &requested, usize::MAX)
+            .expect("first batch fills the request window");
+
+        let mut burst: Vec<InvVector> = requested.clone();
+        burst.extend(
+            (16..MAX_PENDING_BLOCKS_PER_PEER as u32 + 316).map(|n| InvVector {
+                inv_type: InvType::WitnessBlock,
+                hash: hash_at(n),
+            }),
+        );
+        assert!(sync.on_inv(&cs, None, &burst, 0).is_none());
+        assert_eq!(sync.pending_blocks.len(), MAX_PENDING_BLOCKS_PER_PEER);
+        assert_eq!(sync.pending_set.len(), sync.pending_blocks.len());
+        assert!(
+            sync.pending_blocks
+                .iter()
+                .all(|hash| sync.pending_set.contains(hash) && !sync.wanted.contains(hash))
+        );
+
+        let expected_first: Vec<_> = (16..32).map(hash_at).collect();
+        sync.in_flight.clear();
+        let Some(Message::GetData(requested)) = sync.drain_pending(&cs, usize::MAX) else {
+            panic!("freed slots should drain the pending announcement queue");
+        };
+        assert_eq!(
+            requested.iter().map(|inv| inv.hash).collect::<Vec<_>>(),
+            expected_first
+        );
+        assert_eq!(sync.pending_blocks.len(), MAX_PENDING_BLOCKS_PER_PEER - 16);
+        assert_eq!(sync.pending_set.len(), sync.pending_blocks.len());
+        assert!(
+            expected_first
+                .iter()
+                .all(|hash| sync.wanted.contains(hash) && !sync.pending_set.contains(hash))
+        );
     }
 
     #[test]

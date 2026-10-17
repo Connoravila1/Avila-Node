@@ -299,67 +299,80 @@ impl AttachedApp {
                     ui.close();
                 }
             });
-            ui.menu_button("View", |ui| {
-                ui.label(RichText::new("Theme").weak());
-                let mut appearance_changed = false;
-                if ui
-                    .selectable_label(
-                        self.prefs.theme == ThemeChoice::Light && !self.black_theme,
-                        "Light",
-                    )
-                    .clicked()
-                {
-                    self.black_theme = false;
-                    self.prefs.theme = ThemeChoice::Light;
-                    appearance_changed = true;
-                }
-                if ui
-                    .selectable_label(
-                        self.prefs.theme == ThemeChoice::Dark && !self.black_theme,
-                        "Dark",
-                    )
-                    .clicked()
-                {
-                    self.black_theme = false;
-                    self.prefs.theme = ThemeChoice::Dark;
-                    appearance_changed = true;
-                }
-                if ui
-                    .selectable_label(self.prefs.theme == ThemeChoice::System, "System")
-                    .clicked()
-                {
-                    self.black_theme = false;
-                    self.prefs.theme = ThemeChoice::System;
-                    appearance_changed = true;
-                }
-                if ui.selectable_label(self.black_theme, "Black").clicked() {
-                    self.black_theme = true;
-                    self.prefs.theme = ThemeChoice::Dark;
-                    appearance_changed = true;
-                }
-                ui.separator();
-                ui.label(RichText::new("Interface scale").weak());
-                for (scale, label) in ATTACHED_SCALES {
-                    if ui
-                        .selectable_value(&mut self.ui_scale, scale, label)
-                        .clicked()
-                    {
-                        ui.ctx().set_zoom_factor(scale);
-                    }
-                }
-                ui.separator();
-                ui.checkbox(&mut self.prefs.hide_addresses, "Hide peer addresses");
-                if appearance_changed {
-                    theme::install_style(ui.ctx());
-                    let mut appearance = self.prefs.clone();
-                    appearance.toybox = false;
-                    appearance.apply(ui.ctx());
-                    ui.ctx().set_zoom_factor(self.ui_scale);
-                    if self.black_theme {
-                        apply_black_visuals(ui.ctx());
-                    }
-                }
-            });
+            egui::containers::menu::MenuButton::new("View")
+                .config(
+                    egui::containers::menu::MenuConfig::new()
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                )
+                .ui(ui, |ui| {
+                    let menu_height = (ui.ctx().content_rect().height() * 0.65).clamp(180.0, 380.0);
+                    ScrollArea::vertical()
+                        .id_salt("attached_view_menu_options")
+                        .max_height(menu_height)
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Theme").weak());
+                            let mut appearance_changed = false;
+                            if ui
+                                .selectable_label(
+                                    self.prefs.theme == ThemeChoice::Light && !self.black_theme,
+                                    "Light",
+                                )
+                                .clicked()
+                            {
+                                self.black_theme = false;
+                                self.prefs.theme = ThemeChoice::Light;
+                                appearance_changed = true;
+                            }
+                            if ui
+                                .selectable_label(
+                                    self.prefs.theme == ThemeChoice::Dark && !self.black_theme,
+                                    "Dark",
+                                )
+                                .clicked()
+                            {
+                                self.black_theme = false;
+                                self.prefs.theme = ThemeChoice::Dark;
+                                appearance_changed = true;
+                            }
+                            if ui
+                                .selectable_label(self.prefs.theme == ThemeChoice::System, "System")
+                                .clicked()
+                            {
+                                self.black_theme = false;
+                                self.prefs.theme = ThemeChoice::System;
+                                appearance_changed = true;
+                            }
+                            if ui.selectable_label(self.black_theme, "Black").clicked() {
+                                self.black_theme = true;
+                                self.prefs.theme = ThemeChoice::Dark;
+                                appearance_changed = true;
+                            }
+                            ui.separator();
+                            ui.label(RichText::new("Interface scale").weak());
+                            for (scale, label) in ATTACHED_SCALES {
+                                if ui
+                                    .selectable_value(&mut self.ui_scale, scale, label)
+                                    .clicked()
+                                {
+                                    ui.ctx().set_zoom_factor(scale);
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            ui.checkbox(&mut self.prefs.hide_addresses, "Hide peer addresses");
+                            if appearance_changed {
+                                theme::install_style(ui.ctx());
+                                let mut appearance = self.prefs.clone();
+                                appearance.toybox = false;
+                                appearance.apply(ui.ctx());
+                                ui.ctx().set_zoom_factor(self.ui_scale);
+                                if self.black_theme {
+                                    apply_black_visuals(ui.ctx());
+                                }
+                                ui.close();
+                            }
+                        });
+                });
             ui.menu_button("Help", |ui| {
                 if ui.button("About Avila Node").clicked() {
                     self.about_open = true;

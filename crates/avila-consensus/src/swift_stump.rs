@@ -363,6 +363,11 @@ mod tests {
     use crate::hash::sha256d;
     use rustreexo::mem_forest::MemForest;
     use rustreexo::node_hash::{AccumulatorHash, BitcoinNodeHash};
+    use rustreexo_v07::node_hash::{
+        AccumulatorHash as AccumulatorHashV07, BitcoinNodeHash as BitcoinNodeHashV07,
+    };
+    use rustreexo_v07::proof::Proof as ProofV07;
+    use rustreexo_v07::stump::Stump as StumpV07;
     use std::mem::size_of;
 
     fn checkpoint(last_height: u32) -> SwiftCheckpoint {
@@ -384,7 +389,11 @@ mod tests {
     }
 
     fn leaf(index: usize) -> BitcoinNodeHash {
-        BitcoinNodeHash::from(sha256d(&(index as u64).to_le_bytes()))
+        BitcoinNodeHash::from(leaf_bytes(index))
+    }
+
+    fn leaf_bytes(index: usize) -> [u8; 32] {
+        sha256d(&(index as u64).to_le_bytes())
     }
 
     fn audited(checkpoint: SwiftCheckpoint) -> ExternalAuditPassed {
@@ -441,6 +450,59 @@ mod tests {
                 let (leaves, roots) = expected_explicit_forest(&outputs);
                 assert_eq!(stump.leaves, leaves, "count={count}");
                 assert_eq!(stump.roots, roots, "count={count}");
+            }
+        }
+    }
+
+    #[test]
+    fn final_implicit_additions_match_rustreexo_v07_and_explicit_memforest() {
+        // This is a final-checkpoint differential only. Upstream documents
+        // intermediate stumps as provisional while these empty-hash additions
+        // stand in for outputs later spent before the checkpoint.
+        let batch_sizes = [1, 3, 5, 8, 13];
+        for count in 0..=40 {
+            let cases = [
+                (0..count).map(|i| Some(leaf(i))).collect::<Vec<_>>(),
+                (0..count)
+                    .map(|i| (i % 3 != 1).then(|| leaf(i)))
+                    .collect::<Vec<_>>(),
+                (0..count).map(|_| None).collect::<Vec<_>>(),
+            ];
+
+            for outputs in cases {
+                let (expected_leaves, expected_roots) = expected_explicit_forest(&outputs);
+                for batch_size in batch_sizes {
+                    let current = build(&outputs, batch_size);
+                    let mut upstream = StumpV07::<BitcoinNodeHashV07>::new();
+
+                    for (batch_index, batch) in outputs.chunks(batch_size).enumerate() {
+                        let start = batch_size * batch_index;
+                        let additions = batch
+                            .iter()
+                            .enumerate()
+                            .map(|(offset, output)| match output {
+                                Some(_) => BitcoinNodeHashV07::from(leaf_bytes(start + offset)),
+                                None => BitcoinNodeHashV07::empty(),
+                            })
+                            .collect::<Vec<_>>();
+                        upstream = upstream
+                            .modify(&additions, &[], &ProofV07::default())
+                            .unwrap();
+                    }
+
+                    let upstream_roots = upstream.roots;
+                    let upstream_roots: Vec<_> =
+                        upstream_roots.iter().map(ToString::to_string).collect();
+                    let expected_root_strings: Vec<_> =
+                        expected_roots.iter().map(ToString::to_string).collect();
+                    let current_root_strings: Vec<_> =
+                        current.roots.iter().map(ToString::to_string).collect();
+
+                    assert_eq!(upstream.leaves, expected_leaves, "count={count}");
+                    assert_eq!(upstream_roots, expected_root_strings, "count={count}");
+                    assert_eq!(current.leaves, upstream.leaves, "count={count}");
+                    assert_eq!(current_root_strings, upstream_roots, "count={count}");
+                }
             }
         }
     }

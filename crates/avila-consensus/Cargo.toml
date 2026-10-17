@@ -29,6 +29,7 @@ rustreexo = "0.6.0"
 # Differential references only. Neither crate is used by the validation path.
 bitcoin.workspace = true
 proptest.workspace = true
+rustreexo_v07 = { package = "rustreexo", version = "=0.7.0" }
 
 [lints]
 workspace = true

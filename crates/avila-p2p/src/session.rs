@@ -38,6 +38,11 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Bytes read per socket call inside `poll`.
 const READ_CHUNK: usize = 8 * 1024;
+/// Maximum socket bytes consumed by one `poll` call, shared by v1 and v2.
+/// A single completed partial frame can add up to `MAX_MESSAGE_PAYLOAD` of
+/// decoded payload to this batch, so this bounds newly-read bytes rather than
+/// imposing a strict cap on total transient decoded-event memory.
+const MAX_POLL_READ_BYTES: usize = 1 << 20;
 
 /// The services we advertise on every connection. `NODE_P2P_V2` is
 /// deliberately absent — BIP324 isn't implemented yet, and advertising it
@@ -620,9 +625,10 @@ impl<S: Read + Write> PeerSession<S> {
         Ok(())
     }
 
-    /// Flushes the send queue, then reads whatever is available and
-    /// processes every complete frame. Nonblocking sockets return
-    /// `Ok(vec![])` on `WouldBlock`.
+    /// Flushes the send queue, then reads up to `MAX_POLL_READ_BYTES`
+    /// from the socket, processing every complete frame already buffered.
+    /// Partial frame bytes remain in the v1 decoder or v2 channel for the
+    /// next poll. Nonblocking sockets return `Ok(vec![])` on `WouldBlock`.
     ///
     /// # Errors
     /// Any [`SessionError`] — all are terminal for the peer.
@@ -630,10 +636,16 @@ impl<S: Read + Write> PeerSession<S> {
         self.flush()?;
         let mut scratch = [0u8; READ_CHUNK];
         let mut events = Vec::new();
+        let mut bytes_read = 0usize;
         loop {
-            match self.stream.read(&mut scratch) {
+            if bytes_read >= MAX_POLL_READ_BYTES {
+                break;
+            }
+            let read_len = scratch.len().min(MAX_POLL_READ_BYTES - bytes_read);
+            match self.stream.read(&mut scratch[..read_len]) {
                 Ok(0) => return Err(SessionError::Eof),
                 Ok(n) => {
+                    bytes_read += n;
                     self.telemetry.bytes_recv += n as u64;
                     match &mut self.v2 {
                         Some(channel) => {
@@ -886,6 +898,21 @@ mod tests {
     const BUDGET: usize = 1 << 20;
 
     use crate::testpipe;
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client.set_nodelay(true).unwrap();
+        server.set_nodelay(true).unwrap();
+        (client, server)
+    }
+
+    fn wire_message(message: &Message) -> Vec<u8> {
+        let command = Command::new(message.command_name()).unwrap();
+        encode_frame(MAGIC, command, &message.encode())
+    }
 
     fn version(start_height: i32) -> Version {
         Version {
@@ -1376,5 +1403,143 @@ mod tests {
         s1.flush().unwrap();
         let v1_n = v1_peer.read(&mut sink).expect("v1 write");
         assert!(v1_n > 0 && v1_n < CELL, "v1 should stay unpadded");
+    }
+
+    #[test]
+    fn v1_tcp_poll_budget_preserves_fragmented_and_queued_frames() {
+        const PINGS: u64 = 35_000;
+        let (stream, mut peer) = tcp_pair();
+        stream.set_nonblocking(true).unwrap();
+        let mut session = PeerSession::initiate(stream, MAGIC, version(1), 4 << 20).unwrap();
+
+        let mut wire = wire_message(&Message::Version(version(2)));
+        for nonce in 0..PINGS {
+            wire.extend(wire_message(&Message::Pong(nonce)));
+        }
+        let expected_bytes = wire.len();
+        let (part_tx, part_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            peer.write_all(&wire[..7]).unwrap();
+            part_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            peer.write_all(&wire[7..19]).unwrap();
+            peer.write_all(&wire[19..]).unwrap();
+            done_tx.send(()).unwrap();
+            // Keep the socket open until the reader has consumed all frames.
+            continue_rx.recv().unwrap();
+        });
+
+        part_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(session.poll().unwrap().is_empty());
+        assert_eq!(session.telemetry().bytes_recv, 7);
+        continue_tx.send(()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut pongs = Vec::new();
+        let mut poll_count = 0;
+        while pongs.len() < PINGS as usize {
+            assert!(Instant::now() < deadline, "timed out receiving v1 frames");
+            let before = session.telemetry().bytes_recv;
+            let events = session.poll().unwrap();
+            let consumed = session.telemetry().bytes_recv - before;
+            assert!(consumed <= MAX_POLL_READ_BYTES as u64);
+            poll_count += 1;
+            for event in events {
+                if let SessionEvent::Message(Message::Pong(nonce)) = event {
+                    pongs.push(nonce);
+                }
+            }
+            if consumed == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        continue_tx.send(()).unwrap();
+        writer.join().unwrap();
+
+        assert!(poll_count > 1, "fixture did not cross the poll byte budget");
+        assert_eq!(pongs, (0..PINGS).collect::<Vec<_>>());
+        assert_eq!(session.telemetry().bytes_recv as usize, expected_bytes);
+    }
+
+    #[test]
+    fn v2_tcp_poll_budget_preserves_packet_order_across_polls() {
+        const INV_ENTRIES: u32 = 18_000;
+        let (mut initiator, mut responder) = tcp_pair();
+        let pending = bip324::start_handshake(&mut initiator).unwrap();
+        let channel_b = bip324::respond_handshake(&mut responder, MAGIC).unwrap();
+        let bip324::Handshake::V2(cipher_a, garbage_a) =
+            bip324::finish_handshake(&mut initiator, pending, MAGIC).unwrap()
+        else {
+            panic!("loopback responder unexpectedly fell back to v1");
+        };
+        let mut channel_a = bip324::V2Channel::new(cipher_a, garbage_a);
+        let tail = channel_a.handshake_tail();
+        initiator.write_all(&tail).unwrap();
+        initiator.set_nonblocking(true).unwrap();
+        responder.set_nonblocking(true).unwrap();
+
+        let mut us =
+            PeerSession::initiate_v2_channel(initiator, MAGIC, version(2), 4 << 20, channel_a)
+                .unwrap();
+        let mut them =
+            PeerSession::accept_v2_channel(responder, MAGIC, version(1), 4 << 20, channel_b);
+        let handshake_deadline = Instant::now() + Duration::from_secs(5);
+        while !us.established() || !them.established() {
+            assert!(
+                Instant::now() < handshake_deadline,
+                "v2 TCP handshake timed out"
+            );
+            let _ = us.poll().unwrap();
+            let _ = them.poll().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(us.established() && them.established());
+
+        let hash_at = |n: u32| {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&n.to_le_bytes());
+            BlockHash::from_bytes(bytes)
+        };
+        for base in [0, INV_ENTRIES] {
+            let invs = (base..base + INV_ENTRIES)
+                .map(|n| crate::message::InvVector {
+                    inv_type: crate::message::InvType::WitnessBlock,
+                    hash: hash_at(n),
+                })
+                .collect();
+            them.send(&Message::Inv(invs)).unwrap();
+        }
+        let mut received_ranges = Vec::new();
+        let mut poll_count = 0;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while received_ranges.len() < 2 {
+            assert!(Instant::now() < deadline, "timed out receiving v2 packets");
+            them.flush().unwrap();
+            let before = us.telemetry().bytes_recv;
+            let events = us.poll().unwrap();
+            let consumed = us.telemetry().bytes_recv - before;
+            assert!(consumed <= MAX_POLL_READ_BYTES as u64);
+            poll_count += 1;
+            for event in events {
+                if let SessionEvent::Message(Message::Inv(invs)) = event {
+                    assert_eq!(invs.len(), INV_ENTRIES as usize);
+                    received_ranges.push((invs[0].hash, invs[INV_ENTRIES as usize - 1].hash));
+                }
+            }
+            if consumed == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(poll_count > 1, "fixture did not cross the poll byte budget");
+        assert_eq!(
+            received_ranges,
+            vec![
+                (hash_at(0), hash_at(INV_ENTRIES - 1)),
+                (hash_at(INV_ENTRIES), hash_at(INV_ENTRIES * 2 - 1)),
+            ]
+        );
     }
 }

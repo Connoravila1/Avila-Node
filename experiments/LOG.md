@@ -2103,3 +2103,31 @@ for timing, resource, and uncertainty details. The sampler's 14 Python tests
 passed; a separate 600,000–600,127 watcher is armed with a pinned node PID but
 has no result yet because the node remains far from that height and IBD is
 incomplete.
+
+## Experiment #81 — bounded peer ingress and accumulator shadow differential
+
+Bounded P2P ingress now limits each session poll to 1 MiB of newly read socket
+bytes across v1/v2 and caps each peer's pending block-INV hints at 50,000.
+Loopback regressions cover fragmented and multi-frame v1/v2 order, poll-budget
+continuation, and pending-queue dedupe/cap/FIFO behavior. The socket-byte limit
+does not cap decoded heap use: an earlier partial frame can complete in a poll
+and decoding can amplify its wire size. Full validation passed 1,152 Rust tests
+(five ignored), 14 Python tests, and Clippy under the 2,560 MiB cap / 1,024 MiB
+reserve (1,680 MiB peak, 239 s). After a doc-link-only rustdoc correction,
+docs/build/smokes passed in 91 s with 1,090 MiB peak.
+
+The same gate included 615 final-state-only differential cases against
+test-only rustreexo v0.7.0, Avila's root-carry builder, and the v0.6 explicit
+deletion oracle; they do not assert intermediate roots or establish proof
+authentication or production interoperability. See the
+[rustreexo v0.7 shadow note](2026-10-17-rustreexo-07-shadow.md) for the exact
+pin, archive digest, and test coverage. The preceding stage-3 CI run 39006754615 passed; these follow-up
+native results are separate from remote CI.
+
+The deployed CLI (`fd20c6eb...`) passed a real-peer check with four connections
+and a clean restart from 155,785 to 155,788; sync later reached 156,067. The
+validation report still required historical scripts with no AssumeValid
+checkpoint, and full IBD remains incomplete. No speedup, completed-IBD, or
+modern-chain coverage claim is made. See the
+[bounded peer-ingress note](2026-10-17-bounded-peer-ingress.md) for limits,
+caveats, and regression details.

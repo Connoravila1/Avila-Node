@@ -148,8 +148,45 @@ pub enum Interaction {
 
 fn fact(ui: &mut Ui, name: &str, value: &str) {
     ui.label(RichText::new(name).weak());
-    ui.label(RichText::new(value).monospace());
+    if matches!(name, "Hash" | "Previous block" | "Merkle root") {
+        wrapped_hash_label(ui, value, 12.0);
+    } else {
+        ui.add(
+            egui::Label::new(RichText::new(value).monospace())
+                .selectable(true)
+                .wrap(),
+        );
+    }
     ui.end_row();
+}
+
+fn wrapped_hash_label(ui: &mut Ui, hash: &str, size: f32) {
+    let response = ui.add(
+        egui::Label::new(RichText::new(hash).monospace().size(size))
+            .selectable(true)
+            .wrap()
+            .sense(Sense::click()),
+    );
+    if response.clicked() {
+        ui.ctx().copy_text(hash.to_owned());
+    }
+    response
+        .on_hover_cursor(egui::CursorIcon::Copy)
+        .on_hover_text("Copy the full hash")
+        .context_menu(|ui| {
+            if ui.button("Copy hash").clicked() {
+                ui.ctx().copy_text(hash.to_owned());
+                ui.close();
+            }
+        });
+}
+
+fn wrapped_fact(ui: &mut Ui, name: &str, value: String) {
+    ui.add(
+        egui::Label::new(RichText::new(format!("{name}: {value}")))
+            .selectable(true)
+            .wrap(),
+    );
 }
 
 fn composition(
@@ -372,9 +409,9 @@ fn transaction_detail(ui: &mut Ui, view: &mut InspectorView<'_>) -> Option<Inter
     if std::mem::take(&mut *view.detail_scroll_requested) {
         heading.scroll_to_me(Some(egui::Align::Center));
     }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Txid").weak());
-        crate::widgets::hash_label(ui, &summary.txid, 12.5, None);
+        wrapped_hash_label(ui, &summary.txid, 12.5);
         if view.detail_loading {
             ui.add(egui::Spinner::new());
         }
@@ -434,9 +471,9 @@ fn transaction_detail(ui: &mut Ui, view: &mut InspectorView<'_>) -> Option<Inter
         })
         .weak(),
     );
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Witness txid").weak());
-        crate::widgets::hash_label(ui, &detail.wtxid, 12.0, Some(20));
+        wrapped_hash_label(ui, &detail.wtxid, 12.0);
         ui.label(
             RichText::new(format!(
                 "Version {} · lock time {}",
@@ -446,23 +483,27 @@ fn transaction_detail(ui: &mut Ui, view: &mut InspectorView<'_>) -> Option<Inter
         );
     });
     ui.horizontal_wrapped(|ui| {
-        ui.label(format!(
-            "Input amount: {}",
+        wrapped_fact(
+            ui,
+            "Input amount",
             detail.input_amount_sats.map_or_else(
-                || format!(
-                    "unknown ({})",
-                    amount_unknown(detail.input_amount_unknown_reason)
-                ),
+                || {
+                    format!(
+                        "unknown ({})",
+                        amount_unknown(detail.input_amount_unknown_reason)
+                    )
+                },
                 format_sats,
-            )
-        ));
-        ui.label(format!(
-            "Fee: {}",
+            ),
+        );
+        wrapped_fact(
+            ui,
+            "Fee",
             detail.fee_sats.map_or_else(
                 || format!("unknown ({})", amount_unknown(detail.fee_unknown_reason)),
                 format_sats,
-            )
-        ));
+            ),
+        );
     });
 
     let mut action = None;
@@ -508,25 +549,32 @@ fn transaction_detail(ui: &mut Ui, view: &mut InspectorView<'_>) -> Option<Inter
                         if let (Some(txid), Some(vout)) =
                             (input.prev_txid.as_deref(), input.prev_vout)
                         {
-                            ui.horizontal(|ui| {
-                                ui.label("Previous output");
-                                crate::widgets::hash_label(ui, txid, 11.5, Some(16));
-                                ui.label(format!(":{vout}"));
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new("Previous output").weak());
+                                ui.horizontal_wrapped(|ui| {
+                                    wrapped_hash_label(ui, txid, 11.5);
+                                    ui.label(format!(":{vout}"));
+                                });
                             });
                         } else {
-                            ui.label("Coinbase null outpoint");
+                            ui.add(egui::Label::new("Coinbase null outpoint").wrap());
                         }
-                        ui.label(format!(
-                            "Value: {} · sequence: 0x{:08x}",
+                        wrapped_fact(
+                            ui,
+                            "Value",
                             input.value_sats.map_or_else(
-                                || format!(
-                                    "unknown ({})",
-                                    amount_unknown(input.value_unknown_reason)
-                                ),
-                                format_sats
+                                || {
+                                    format!(
+                                        "unknown ({})",
+                                        amount_unknown(input.value_unknown_reason)
+                                    )
+                                },
+                                format_sats,
                             ),
-                            input.sequence
-                        ));
+                        );
+                        ui.add(
+                            egui::Label::new(format!("Sequence: 0x{:08x}", input.sequence)).wrap(),
+                        );
                         script_summary(ui, "scriptSig", &input.script_sig);
                         if input.witness_item_count > 0 {
                             ui.label(
@@ -591,13 +639,16 @@ fn transaction_detail(ui: &mut Ui, view: &mut InspectorView<'_>) -> Option<Inter
                 }
                 for output in &detail.outputs {
                     ui.group(|ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "Output {} · {}",
-                                output.index,
-                                format_sats(output.value_sats)
-                            ))
-                            .strong(),
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "Output {} · {}",
+                                    output.index,
+                                    format_sats(output.value_sats)
+                                ))
+                                .strong(),
+                            )
+                            .wrap(),
                         );
                         if let Some(address) = output.address.as_deref() {
                             ui.label(RichText::new("Address").weak());
@@ -607,7 +658,12 @@ fn transaction_detail(ui: &mut Ui, view: &mut InspectorView<'_>) -> Option<Inter
                                     .wrap(),
                             );
                         } else {
-                            ui.label(RichText::new("Address: no standard address").weak());
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new("Address: no standard address").weak(),
+                                )
+                                .wrap(),
+                            );
                         }
                         script_summary(ui, "scriptPubKey", &output.script_pubkey);
                     });
@@ -623,22 +679,29 @@ fn script_summary(ui: &mut Ui, label: &str, script: &avila_node::inspect::TxScri
     } else {
         script.hex_prefix.clone()
     };
-    ui.label(
-        RichText::new(format!(
-            "{label} · {} bytes{}",
-            script.byte_len,
-            if script.truncated {
-                " · hex prefix only"
-            } else {
-                ""
-            }
-        ))
-        .weak(),
+    ui.add(
+        egui::Label::new(
+            RichText::new(format!(
+                "{label} · {} bytes{}",
+                script.byte_len,
+                if script.truncated {
+                    " · hex prefix only"
+                } else {
+                    ""
+                }
+            ))
+            .weak(),
+        )
+        .wrap(),
     );
     if shown.is_empty() {
         ui.label(RichText::new("(empty script)").monospace().weak());
     } else {
-        ui.add(egui::Label::new(RichText::new(shown).monospace().size(11.0)).selectable(true));
+        ui.add(
+            egui::Label::new(RichText::new(shown).monospace().size(11.0))
+                .selectable(true)
+                .wrap(),
+        );
     }
 }
 

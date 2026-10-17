@@ -100,8 +100,9 @@ shows the single coinbase weight-composition segment. These captures do not veri
 live-node responses or transaction paging.
 
 Final native validation passed GUI formatting, Clippy, 82 GUI tests, and a
-release build under the 2.5 GiB memory cap. The full workspace passed 1,148 tests
-(5 ignored), plus 14 Python tests. Live captures used mainnet block 83018
+release build under the 2.5 GiB memory cap (1 GiB reserve; 811 MiB peak, 55 s).
+The full workspace passed 1,152 tests (5 ignored), plus 14 Python tests. Live
+captures used mainnet block 83018
 (`00000000002bba570c3fbc62f77f54685b7011bfa202a086d4005131cc0ceed6`), which
 contains 225 transactions. The inspector loaded summaries in 100 → 200 → 225
 steps, updated its loaded-coverage labels, and removed the load-more button at the
@@ -112,19 +113,23 @@ selectable address. The block was marked as a lookup snapshot. At 760×600 and
 1440×900 with 100% scale, the partial-map caption, transaction table, map, and
 detail panes were readable.
 
-The attached View scale was exercised at 130% and 200%, then restored to 100%; the
+The attached View scale was exercised at 130% and 200%, then restored to 100%
+through the scrolled menu. The View scrollbar remained usable without closing the
+menu and exposed 175%, 200%, and privacy options at 200% on 1440×900. The
 Help/About version was correct. Black-to-Dark reset, peer-address masking on six
 rows, and Node → Close monitor were checked. Closing the monitor left the daemon
-active while its height advanced from 141,214 to 141,244. This is a changing sync
+active while its height advanced from 162,749 to 162,836. This is a changing sync
 sample, not evidence of completion.
 
-Remaining native limits: at 130% on 760×600, long fields clip; at 200% on
-1440×900, the lower View-menu entries (175%, 200%, and privacy) fall below the
-window, so the full high-zoom menu is not accessible. Keyboard selection of a
-transaction-table row and screen-reader behavior were not verified. A transaction
-with more than 100 inputs or outputs was not tested, and missing-cookie recovery
-remains unverified. These observations are not a full visual or accessibility
-audit.
+At 130% on 760×600, long block hashes, transaction details, outpoints, addresses,
+and scripts wrap; the transaction-table Weight column and adjacent Next block hash
+still clip. At 100% on 760×600, fact labels and values remain readable. At 200% on
+1440×900, the View menu can be scrolled to and used for every scale and privacy
+choice; while hovered, its floating scrollbar overlaps the end of the privacy
+label. Keyboard selection of a transaction-table row and screen-reader behavior
+were not verified. A transaction with more than 100 inputs or outputs was not
+tested, and missing-cookie recovery remains unverified. These observations are
+not a full visual or accessibility audit.
 
 Launch with `--full-verify` to disable the assume-valid checkpoint for that run
 and verify historical scripts during initial sync, matching the CLI's
@@ -202,10 +207,12 @@ returned actual chain info and rejected a method outside its allowlist. Traffic
 counters/rates and the graph rendered; six peer rows were visible and peer-address
 masking was checked. Help/About showed the package version. Node → Close monitor
 closed only the GUI; the daemon remained active and its height advanced from
-141,214 to 141,244.
+162,749 to 162,836.
 
-At 130% on 760×600, long fields clip. At 200% on 1440×900, the lower View-menu
-entries (175%, 200%, and privacy) fall below the window. Keyboard selection of a
+At 130% on 760×600, the transaction-table Weight column and adjacent Next block
+hash still clip, although long inspector/detail fields wrap. At 200% on 1440×900,
+scrolling the View menu exposes 175%, 200%, and privacy; its floating scrollbar
+overlaps the end of the privacy label while hovered. Keyboard selection of a
 transaction-table row, a transaction with more than 100 inputs or outputs,
 missing-cookie recovery, and screen-reader behavior remain unverified. Do not use
 fixture or demo data for live attached-node checks.
