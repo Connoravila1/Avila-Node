@@ -82,7 +82,11 @@ impl BlockStore {
         Self::open_with_limit(dir, magic, MAX_FILE_SIZE)
     }
 
-    fn open_with_limit(dir: &Path, magic: [u8; 4], max_file_size: u64) -> io::Result<Self> {
+    pub(crate) fn open_with_limit(
+        dir: &Path,
+        magic: [u8; 4],
+        max_file_size: u64,
+    ) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let mut files: Vec<(u32, PathBuf)> = fs::read_dir(dir)?
             .filter_map(|entry| {
@@ -217,7 +221,9 @@ impl BlockStore {
     /// frame; the next `open` truncates it.
     pub fn append(&mut self, block: &Block) -> io::Result<BlockPos> {
         let hash = block.block_hash();
-        if let Some(pos) = self.index.get(&hash) {
+        if let Some(pos) = self.index.get(&hash)
+            && !self.is_pruned(*pos)
+        {
             return Ok(*pos);
         }
         let payload = block.encode();
@@ -293,6 +299,37 @@ impl BlockStore {
             deleted += 1;
         }
         Ok(deleted)
+    }
+
+    /// Whether the `blk*.dat` byte total exceeds `limit`.
+    ///
+    /// Flushes the tail handle before reading file lengths so its current
+    /// length is reflected in metadata. This does not fsync the files; it is
+    /// a sizing precheck, and callers that remove bodies must first establish
+    /// their own durability boundary.
+    pub fn exceeds_bytes(&mut self, limit: u64) -> io::Result<bool> {
+        self.tail.flush()?;
+        let mut total = 0u64;
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let filename = entry.file_name();
+            let Some(name) = filename.to_str() else {
+                continue;
+            };
+            let valid_block_file = name
+                .strip_prefix(FILE_PREFIX)
+                .and_then(|name| name.strip_suffix(FILE_SUFFIX))
+                .and_then(|digits| digits.parse::<u32>().ok())
+                .is_some();
+            if !valid_block_file {
+                continue;
+            }
+            total = total.saturating_add(entry.metadata()?.len());
+            if total > limit {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Flushes buffered writes to the OS. Durability beyond this (fsync) is
@@ -1031,6 +1068,19 @@ mod tests {
         let store = BlockStore::open_with_limit(&dir, MAGIC, limit).unwrap();
         assert!(store.position(&blocks[8].block_hash()).is_some());
         assert_eq!(store.len(), 9 - deleted as usize * 3);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn byte_precheck_includes_append_tail() {
+        let dir = test_dir("prune-precheck-append-tail");
+        let mut store = BlockStore::open_with_limit(&dir, MAGIC, u64::MAX).unwrap();
+        store.append(&test_block(0)).unwrap();
+        let appended_length = fs::metadata(file_path(&dir, 0)).unwrap().len();
+        assert!(appended_length > 0);
+        assert!(store.exceeds_bytes(appended_length - 1).unwrap());
+        assert!(!store.exceeds_bytes(appended_length).unwrap());
+        drop(store);
         fs::remove_dir_all(&dir).unwrap();
     }
 

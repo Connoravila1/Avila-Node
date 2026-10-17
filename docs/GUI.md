@@ -65,7 +65,9 @@ On **Chain**, choose **Inspect** beside a recent block, or enter a height or ful
 block hash in **Block inspector**. Previous/next follow the returned block-hash
 links. The detail shows header fields and measured body size, weight, transaction
 count and transaction summaries. A header-only, pruned or otherwise unavailable
-body is identified explicitly. The transaction map sizes each rectangle by its
+body is identified explicitly. For the measured prune gate and pruned-body
+recovery limits, see the [prune/checkpoint boundary note](../experiments/2026-10-17-prune-checkpoint-boundary.md).
+The transaction map sizes each rectangle by its
 share of loaded transaction weight; the block header/framing is excluded and
 shade is a logarithmic cue. It covers only summaries currently loaded. A cell or keyboard-selectable transaction-table
 row selects that transaction. The inspector retains at most 2,000 summaries,
@@ -118,14 +120,15 @@ the transaction table continues below the initial viewport. The larger capture
 shows the single coinbase weight-composition segment. These captures do not verify
 live-node responses or transaction paging.
 
-The undo-inspector source passed a guarded workspace gate: 1,172 Rust tests
+At the undo-inspector proof, the source passed a guarded workspace gate: 1,172 Rust tests
 (including 86 GUI tests; five ignored), 17 Python tests, formatting, all-target
 Clippy and rustdoc with warnings denied, paired release CLI/GUI builds, and
 smoke checks. The 2,560 MiB cap / 1,024 MiB reserve run peaked at 2,031 MiB in
-319 s. Source fingerprint SHA-256:
-`b8d1e8aad825943419f4e7fc25bb46e01387dd91c0d3169c8ef97a0c41458f2c`; installed
-CLI SHA-256 `9fa0079142f80ea292fc4bbd6bff213755ecf7dd31491e2ca991645a480b7d0d`;
-installed GUI SHA-256 `b0ee9470af909e3622fdd0df7395f13aa3f54dfd62ed5f3c563a0a3d5a4aae0c`.
+319 s. Source fingerprint SHA-256 at that proof:
+`b8d1e8aad825943419f4e7fc25bb46e01387dd91c0d3169c8ef97a0c41458f2c`. The CLI
+and GUI binaries installed for that proof had SHA-256
+`9fa0079142f80ea292fc4bbd6bff213755ecf7dd31491e2ca991645a480b7d0d` and
+`b0ee9470af909e3622fdd0df7395f13aa3f54dfd62ed5f3c563a0a3d5a4aae0c`, respectively.
 Earlier live captures used mainnet block 83018
 (`00000000002bba570c3fbc62f77f54685b7011bfa202a086d4005131cc0ceed6`), which
 contains 225 transactions. The inspector loaded summaries in 100 → 200 → 225

@@ -2504,14 +2504,12 @@ impl Chainstate {
     }
 
     /// Deletes the oldest `blk*.dat` files while their total exceeds
-    /// `keep` bytes — Core's `-prune` analog, with a floor at the last
-    /// persisted state tip: bodies between `state_tip_persisted` and
-    /// the backend tip are what a crash-recovery rewind disconnects
-    /// through, so the file holding that height and everything newer
-    /// must survive. A reorg reaching a pruned body fails loudly at
-    /// disconnect rather than silently skipping (Core halts with a
-    /// fatal error past the prune depth); a resubmitted pruned block
-    /// re-validates and re-stores.
+    /// `keep` bytes — Core's `-prune` analog. Before deleting any body,
+    /// checkpoints the current active chain and coins backend so crash
+    /// recovery does not need bodies from an older saved tip. Only files
+    /// below the append tail are eligible for deletion. A reorg reaching
+    /// a pruned body fails loudly at disconnect rather than silently
+    /// skipping; a resubmitted pruned block re-validates and re-stores.
     ///
     /// # Errors
     ///
@@ -2520,23 +2518,23 @@ impl Chainstate {
         let Some(store) = &mut self.store else {
             return Ok(0);
         };
-        // File floor: bodies above `state_tip_persisted` may still be
-        // needed to unwind a crash-ahead backend — and a straggler can
-        // sit in an old file (out-of-order download), so the floor is
-        // the earliest file holding ANY such body, not the file the tip
-        // itself happens to live in. One index scan per prune tick.
-        let floor = store
-            .positions()
-            .into_iter()
-            .filter(|(hash, _)| {
-                self.tree
-                    .get(hash)
-                    .is_some_and(|n| n.height > self.state_tip_persisted)
-            })
-            .map(|(_, pos)| pos.file)
-            .min()
-            .unwrap_or(u32::MAX);
-        store.prune_to_bytes(keep_bytes, floor)
+        // Avoid a full state checkpoint every pruning tick while the
+        // store is already within budget. The precheck flushes the tail
+        // handle before counting all block-file bytes, including the tail.
+        if !store.exceeds_bytes(keep_bytes)? {
+            return Ok(0);
+        }
+        // A body may be retained for a parked side branch or a header far
+        // ahead of the active tip, and can sit in an early file forever.
+        // Before deleting any block file, commit the current active state
+        // and join all coins work. If this fails, no file has been deleted;
+        // after success crash recovery resumes at this exact active tip and
+        // no longer needs an undo/body rewind window. Normal prune semantics
+        // may still require a pruned side-branch body to be downloaded again.
+        self.flush()?;
+        self.store
+            .as_mut()
+            .map_or(Ok(0), |store| store.prune_to_bytes(keep_bytes, u32::MAX))
     }
 
     /// The block index (Core's `mapBlockIndex` + best-tip bookkeeping).
@@ -5607,6 +5605,227 @@ mod tests {
         v
     }
 
+    fn use_tiny_block_files(cs: &mut Chainstate, params: &Params, dir: &std::path::Path) {
+        drop(cs.store.take());
+        cs.store = Some(
+            BlockStore::open_with_limit(dir, params.message_start, 1)
+                .expect("open test block store with one frame per file"),
+        );
+    }
+
+    fn read_blk_files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name().into_string().unwrap();
+                (name.starts_with("blk") && name.ends_with(".dat"))
+                    .then(|| (name.clone(), std::fs::read(dir.join(name)).unwrap()))
+            })
+            .collect();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    #[test]
+    fn pruning_checkpoints_then_removes_parked_body_in_old_file() {
+        let params = params();
+        let dir = store_dir("prune-checkpoint-parked-old-file");
+        let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        use_tiny_block_files(&mut cs, &params, &dir);
+
+        // Put the body for a high-height side branch in file 0 before the
+        // active chain arrives. Its headers are known, but its ancestors have
+        // no bodies, so it remains parked while still being retained on disk.
+        let mut side = Vec::new();
+        let mut parent = params.genesis_header;
+        for height in 1..=8u32 {
+            let block = block_on(
+                &parent,
+                vec![tagged_coinbase(height, subsidy(height), script::OP_EQUAL)],
+                &params,
+            );
+            cs.accept_header(&block.header, NOW).unwrap();
+            parent = block.header;
+            side.push(block);
+        }
+        assert_eq!(
+            cs.accept_block(side.last().unwrap(), NOW),
+            Ok(Acceptance::Parked { height: 8 })
+        );
+        let side_hash = side[7].block_hash();
+        let side_pos = cs.store.as_ref().unwrap().position(&side_hash).unwrap();
+        assert_eq!(side_pos.file, 0);
+
+        let active = probe_chain(4, &[], &params);
+        for block in &active {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        assert_eq!(cs.chain().len() as u32 - 1, 4);
+        assert_eq!(cs.state_tip_persisted, 0);
+        let tail_pos = cs
+            .store
+            .as_ref()
+            .unwrap()
+            .position(&active[3].block_hash())
+            .unwrap();
+        assert!(tail_pos.file > side_pos.file);
+        cs.store.as_mut().unwrap().flush().unwrap();
+        let keep = std::fs::metadata(dir.join(format!("blk{:05}.dat", tail_pos.file)))
+            .unwrap()
+            .len();
+
+        let deleted = cs.prune(keep).unwrap();
+        assert!(deleted > 0);
+        assert_eq!(cs.state_tip_persisted, 4);
+        assert_eq!(cs.coins_backend.as_ref().unwrap().tip_height(), 4);
+        assert!(cs.store.as_ref().unwrap().is_pruned(side_pos));
+        assert!(
+            read_blk_files(&dir)
+                .iter()
+                .map(|(_, contents)| contents.len() as u64)
+                .sum::<u64>()
+                <= keep
+        );
+        // The parked body is still above the newly checkpointed tip. Merely
+        // checkpointing while retaining the old all-bodies floor would leave
+        // file 0 pinned; pruning must exclude side-branch bodies from the
+        // crash-recovery floor after the checkpoint succeeds.
+        assert_eq!(cs.tree().get(&side_hash).unwrap().height, 8);
+        let saved = store::read_state(&dir, params.message_start)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.height, 4);
+        assert_eq!(saved.tip, active[3].block_hash());
+
+        // The same process must be able to restore a pruned body. Its old
+        // in-memory index entry points at a deleted file, so append must
+        // replace that position with the newly downloaded body.
+        assert!(!cs.have_body(&side_hash));
+        assert_eq!(
+            cs.accept_block(side.last().unwrap(), NOW),
+            Ok(Acceptance::Parked { height: 8 })
+        );
+        assert!(cs.have_body(&side_hash));
+        assert_eq!(cs.body(&side_hash), Some(side[7].clone()));
+        let refetched_pos = cs.store.as_ref().unwrap().position(&side_hash).unwrap();
+        assert!(!cs.store.as_ref().unwrap().is_pruned(refetched_pos));
+        assert_eq!(
+            cs.store
+                .as_mut()
+                .unwrap()
+                .append(side.last().unwrap())
+                .unwrap(),
+            refetched_pos,
+            "re-appending a retained body remains idempotent"
+        );
+
+        let expected_utxo = sorted_utxo(&cs);
+        drop(cs);
+        let resumed = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        assert_eq!(resumed.tip_hash(), active[3].block_hash());
+        assert_eq!(sorted_utxo(&resumed), expected_utxo);
+        assert!(resumed.have_body(&side_hash));
+        assert_eq!(resumed.body(&side_hash), Some(side[7].clone()));
+        drop(resumed);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pruned_parked_body_can_be_refetched_after_restart() {
+        let params = params();
+        let dir = store_dir("prune-refetch-after-restart");
+        let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        use_tiny_block_files(&mut cs, &params, &dir);
+
+        let mut side = Vec::new();
+        let mut parent = params.genesis_header;
+        for height in 1..=8u32 {
+            let block = block_on(
+                &parent,
+                vec![tagged_coinbase(height, subsidy(height), script::OP_EQUAL)],
+                &params,
+            );
+            cs.accept_header(&block.header, NOW).unwrap();
+            parent = block.header;
+            side.push(block);
+        }
+        assert_eq!(
+            cs.accept_block(side.last().unwrap(), NOW),
+            Ok(Acceptance::Parked { height: 8 })
+        );
+        let side_hash = side[7].block_hash();
+        let side_pos = cs.store.as_ref().unwrap().position(&side_hash).unwrap();
+        assert_eq!(side_pos.file, 0);
+
+        let active = probe_chain(4, &[], &params);
+        for block in &active {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        let tail_pos = cs
+            .store
+            .as_ref()
+            .unwrap()
+            .position(&active[3].block_hash())
+            .unwrap();
+        cs.store.as_mut().unwrap().flush().unwrap();
+        let keep = std::fs::metadata(dir.join(format!("blk{:05}.dat", tail_pos.file)))
+            .unwrap()
+            .len();
+        assert!(cs.prune(keep).unwrap() > 0);
+        assert_eq!(cs.state_tip_persisted, 4);
+        assert!(cs.store.as_ref().unwrap().is_pruned(side_pos));
+        drop(cs);
+
+        let mut resumed = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        assert_eq!(resumed.tip_hash(), active[3].block_hash());
+        assert!(!resumed.have_body(&side_hash));
+        assert_eq!(
+            resumed.accept_block(side.last().unwrap(), NOW),
+            Ok(Acceptance::Parked { height: 8 })
+        );
+        assert!(resumed.have_body(&side_hash));
+        assert_eq!(resumed.body(&side_hash), Some(side[7].clone()));
+        drop(resumed);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_prune_checkpoint_leaves_block_files_untouched() {
+        let params = params();
+        let dir = store_dir("prune-checkpoint-failure");
+        let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        use_tiny_block_files(&mut cs, &params, &dir);
+        let blocks = probe_chain(4, &[], &params);
+        for block in &blocks {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        cs.store.as_mut().unwrap().flush().unwrap();
+        let before = read_blk_files(&dir);
+        std::fs::create_dir(dir.join("state.dat")).unwrap();
+
+        assert!(cs.prune(0).is_err());
+        assert_eq!(cs.state_tip_persisted, 0);
+        assert_eq!(read_blk_files(&dir), before);
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn under_budget_prune_does_not_write_a_checkpoint() {
+        let params = params();
+        let dir = store_dir("prune-under-budget");
+        let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        use_tiny_block_files(&mut cs, &params, &dir);
+        let block = probe_chain(1, &[], &params).remove(0);
+        cs.accept_block(&block, NOW).unwrap();
+        assert_eq!(cs.prune(u64::MAX).unwrap(), 0);
+        assert_eq!(cs.state_tip_persisted, 0);
+        assert!(!dir.join("state.dat").exists());
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn with_store_persists_and_resumes() {
         let params = params();
@@ -6780,6 +6999,12 @@ mod tests {
             cs.inspect_undo_amounts(request),
             crate::undo_amounts::UndoAmountsResult::HashMismatch
         );
+
+        // Run tips are strictly increasing. Remove the deliberately
+        // mismatched display layer before testing backend fallback and
+        // reattaching the authoritative undo at this same tip.
+        cs.utxo.drop_epochs_above(request.height - 1);
+        assert_eq!(cs.inspect_undo_amounts(request), expected);
 
         cs.utxo
             .flush_to_backend_owned(

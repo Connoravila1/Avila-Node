@@ -85,8 +85,32 @@ release builds, and CLI smokes at 2,031 MiB peak / 2,560 MiB cap. GUI checks at
 positive-fee sample, modern-chain coverage, completed IBD, speedup, or
 accessibility qualification is claimed. See the [undo amount note](2026-10-17-undo-inspector-amounts.md).
 
+## Experiment #88 — checkpoint boundary for byte-budget pruning
+
+The pruner now checkpoints active state before deleting over-budget block
+files, so parked future bodies in old files cannot pin the retention floor.
+Under-budget calls skip the checkpoint. The guarded native gate passed 616
+debug consensus tests and 1,177 release workspace tests (five ignored), plus
+17 Python tests, Clippy, rustdoc, release builds, and CLI smokes. On mainnet,
+the store fell from 11,800,471,692 bytes to 8,628,801,147 bytes against an
+8,589,934,592-byte target; the 38,866,555-byte excess was within the root
+proof's 128 MiB observation tolerance, not a configured or guaranteed bound.
+There is no hard 8 GiB + 128 MiB limit between 60-second prune passes, and
+high throughput can append more than one whole file between passes. A clean
+restart resumed height 264,970 and later verified
+that height 265,336 descended from its saved hash, under full-script policy.
+Block 2,000's old body reported unavailable after pruning. Fixture tests cover
+same-process and restart-before-refetch, but no live future-body refetch was
+forced. IBD remains incomplete; no power-loss body durability, deep-reorg,
+speedup, or modern-chain claim. In a same-PID follow-up at height 265,866, the
+store advanced to 64 files (25–88), totaling 8,578,585,794 bytes—below the
+8,589,934,592-byte target—showing pruning continued during IBD. A separate
+760×600 GUI attach/close smoke showed full-script policy; closing exited 0 and
+left the daemon running. No new fee or accessibility claim. See the [prune note](2026-10-17-prune-checkpoint-boundary.md).
+
 | # | Date | Experiment | Hypothesis | Verdict | Key numbers | Doc |
 |---|------|-----------|------------|---------|-------------|-----|
+| 88 | 10-17 | Checkpoint boundary for byte-budget pruning | Can checkpoint-before-delete avoid parked-body floor pinning while preserving crash recovery? | **native prune/restart and live periodic-prune proofs passed; limits remain** | Before: 88 files (0–87), 11,800,471,692 bytes. First after: 65 files (24–88), 8,628,801,147 bytes vs target (+38,866,555; within proof's 128 MiB observation tolerance, not a limit). No hard 8 GiB + 128 MiB bound between 60-second passes; high throughput can append more than one whole file. Same PID later reached 265,866 with 64 files (25–88), 8,578,585,794 bytes, below target. Auto restart at 264,970; saved hash matched at 265,336. Full-script policy, `pruned: true`; block 2,000 body unavailable. GUI attach/close smoke at 760×600 left daemon running. No live future-refetch, power-loss, deep-reorg, speed, IBD-completion, or accessibility claim. | [prune checkpoint](2026-10-17-prune-checkpoint-boundary.md) |
 | 87 | 10-17 | Historical input amounts from retained undo | Can inspection show bounded, source-labeled amounts without current-UTXO lookup or changing validation? | **native sampled proof passed; coverage remains limited** | RPC block 255,048 tx 1 and GUI block 257,285 tx 1 showed `block_undo` values and zero fees; wrong txid rejected; unavailable undo stayed unknown; empty `u32::MAX` page retained aggregate fee. Workspace gate: 1,172 Rust (5 ignored), 17 Python; Clippy/rustdoc/release/smokes passed, 2,031 MiB peak under 2,560 MiB cap. No positive-fee native sample, modern coverage, IBD completion, speed, or accessibility claim. | [undo amounts](2026-10-17-undo-inspector-amounts.md) |
 | 84 | 10-17 | Attached block inspector responsive layout, focus and detail paging | Can a narrow/wide transaction view preserve measured fields, keyboard selection, and bounded large-input navigation? | **GUI gate and scoped native checks passed; accessibility limits remain** | 85 GUI tests; GUI all-target/devtools Clippy and release build passed (2,560 MiB cap, 1,025 MiB peak). Source SHA-256 `497f4d3b…`; installed GUI SHA-256 `7cb089a8…`. Native: 760×600 at 100%/130%, 1440×900 at 100%/200%; direct click→Tab→Tab→Space selected row 1. Block 200,000 tx 384: five input pages for 440 inputs, previous/next navigation; 512 MiB native GUI cap, 80 MiB peak. GUI close left daemon PID 760476 running, height 214,599→219,741. >100-output, delayed RPC, screen-reader, cross-platform remain open. | [GUI](../docs/GUI.md) |
 | 85 | 10-17 | Managed IBD OOM and allocator arena-limit hypothesis | Does limiting glibc malloc arenas to two alter memory behavior under the same full-validation workload and cap? | **baseline OOM, finite survival, and one clean restart continuity proof observed** | CLI process 760476 OOM-killed 07:23:53 UTC; exit 137 after 831 s, 3,072 MiB cap, swap 0. Process 838059 used same CLI/config/checks/cap with `MALLOC_ARENA_MAX=2`; observation from 07:31:53 to 07:48:53 advanced 10,036 checked blocks over 1,108.649 s; sampled OOM counters 0. Sampled max cgroup current 3,221,221,376 bytes (within 4 KiB of cap), anon 2,239,561,728 bytes, RSS 2,191,588 KiB; `memory.events.max` reached 103,613. CLI clean exit 0 preceded the 07:50:05.520 capture of height 235,517, hash `00000000000000e9d96b9ca5ca7e865070f55414049732fe5a5919c37099e050` (95,646,575 bytes; framed SHA256d verified; file SHA-256 `99da068833c6a00a91ad7db2e29d30b10e29182a20216d7331cccd0183ac0262`). At 07:51:22.934, PID 943399 resumed at checked 235,847 with saved-height hash matching; arena2, same CLI/config/full-script policy, 3,072 MiB cap, swap0 verified. One restart proof, not lifetime/full-IBD or causal allocator evidence. | [allocator arena trial](2026-10-17-allocator-arena-limit.md) |
