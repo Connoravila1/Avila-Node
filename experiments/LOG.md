@@ -108,8 +108,45 @@ store advanced to 64 files (25–88), totaling 8,578,585,794 bytes—below the
 760×600 GUI attach/close smoke showed full-script policy; closing exited 0 and
 left the daemon running. No new fee or accessibility claim. See the [prune note](2026-10-17-prune-checkpoint-boundary.md).
 
+## Experiment #89 — read-only coins database storage measurement
+
+A standalone read-only redb 4.3.0 utility measured a closed database at saved
+height 269,677. The 3,944,288,256-byte file contained 7,439,043 coins with
+463,874,790 logical stored bytes, 269,677 undo rows with 1,651,199,431 stored
+bytes, and 14,826 undo-admission rows with 652,344 stored bytes. A 32 MiB
+configured cache read took 19 seconds under a 512 MiB cap / 512 MiB reserve;
+the guard sampled 511 MiB peak including file cache. File identity, length,
+and mtime were unchanged; no full-file hash, record decode, cleanup, or
+compaction was performed. `stored_bytes` is not file size or physical
+fragmentation. The helper source is isolated and not shipped. A subsequent
+restart checked 273,569 with the saved ancestor hash and full-script policy
+intact. No undo-GC implementation, storage projection, or IBD-completion
+claim. See the [measurement note](2026-10-17-undo-storage-measurement.md).
+
+## Experiment #90 — fail-stop periodic prune errors
+
+Periodic sync now propagates pruning/checkpoint errors instead of logging and
+continuing after the asynchronous dirty-coins handoff may have failed. This is
+fail-stop error propagation only; it does not repair or resume the failed
+worker, change consensus validation, or establish a fixed prune overshoot
+bound. The native gate passed 616 debug consensus tests (four ignored), 1,177
+release workspace tests (five ignored), and 17 Python tests; Clippy, rustdoc,
+release builds, and CLI/GUI smokes passed. Guard peak was 2,098 MiB under a
+2,560 MiB cap / 1,024 MiB reserve. The CLI (`d3a0ce8b…`) and GUI
+(`c1fe7ac9…`) were installed at 09:10:43.958662 UTC. Supervisor restart
+verification at 09:11:45.611120 and manual proof at 09:11:53.168564 both
+resumed new PID 1,263,449 at saved height 273,718 with the checkpoint hash
+matching under full-script policy, arena2, 3,072 MiB cap, and swap disabled.
+At 09:12:07.058162 UTC, the same PID was freshly observed syncing at height
+273,803 with no AssumeValid checkpoint and historical scripts required. No
+hash query was made at 273,803, and no failure was injected live. IBD remains
+incomplete. See the
+[prune error-stop note](2026-10-17-prune-error-stop.md).
+
 | # | Date | Experiment | Hypothesis | Verdict | Key numbers | Doc |
 |---|------|-----------|------------|---------|-------------|-----|
+| 90 | 10-17 | Fail-stop periodic prune errors | Should sync stop if a prune/checkpoint fails after async dirty-coin handoff? | **native gate, install, saved-hash restart, and same-process advance passed; limits remain** | Periodic prune errors now return `SyncError::Store`; no live failure injection. Gate: 616 debug (4 ignored), 1,177 release (5 ignored), 17 Python; Clippy/rustdoc/release/smokes passed, 2,098 MiB peak / 2,560 MiB cap. CLI `d3a0ce8b…`, GUI `c1fe7ac9…`; installed 09:10:43.958662 UTC. New PID 1,263,449 restarted at 273,718 and matched saved hash at 09:11:53.168564 UTC; full-script policy, 3,072 MiB cap, swap0, arena2. Same PID observed at 273,803 at 09:12:07.058162; no hash query at that height. Full IBD incomplete. | [prune error-stop](2026-10-17-prune-error-stop.md) |
+| 89 | 10-17 | Read-only coinsdb storage measurement | Can closed redb table statistics quantify retained undo without record decoding or mutation? | **bounded read-only sample passed; cleanup design remains open** | File 3,944,288,256 bytes; undo 269,677 rows / 1,651,199,431 stored bytes; admission 14,826 rows. 19 s, 512 MiB cap/reserve, 511 MiB sampled including file cache. Unchanged inode/size/mtime; no full hash, decode, compaction, or undo GC. Restart matched saved ancestor at 273,569. | [storage measurement](2026-10-17-undo-storage-measurement.md) |
 | 88 | 10-17 | Checkpoint boundary for byte-budget pruning | Can checkpoint-before-delete avoid parked-body floor pinning while preserving crash recovery? | **native prune/restart and live periodic-prune proofs passed; limits remain** | Before: 88 files (0–87), 11,800,471,692 bytes. First after: 65 files (24–88), 8,628,801,147 bytes vs target (+38,866,555; within proof's 128 MiB observation tolerance, not a limit). No hard 8 GiB + 128 MiB bound between 60-second passes; high throughput can append more than one whole file. Same PID later reached 265,866 with 64 files (25–88), 8,578,585,794 bytes, below target. Auto restart at 264,970; saved hash matched at 265,336. Full-script policy, `pruned: true`; block 2,000 body unavailable. GUI attach/close smoke at 760×600 left daemon running. No live future-refetch, power-loss, deep-reorg, speed, IBD-completion, or accessibility claim. | [prune checkpoint](2026-10-17-prune-checkpoint-boundary.md) |
 | 87 | 10-17 | Historical input amounts from retained undo | Can inspection show bounded, source-labeled amounts without current-UTXO lookup or changing validation? | **native sampled proof passed; coverage remains limited** | RPC block 255,048 tx 1 and GUI block 257,285 tx 1 showed `block_undo` values and zero fees; wrong txid rejected; unavailable undo stayed unknown; empty `u32::MAX` page retained aggregate fee. Workspace gate: 1,172 Rust (5 ignored), 17 Python; Clippy/rustdoc/release/smokes passed, 2,031 MiB peak under 2,560 MiB cap. No positive-fee native sample, modern coverage, IBD completion, speed, or accessibility claim. | [undo amounts](2026-10-17-undo-inspector-amounts.md) |
 | 84 | 10-17 | Attached block inspector responsive layout, focus and detail paging | Can a narrow/wide transaction view preserve measured fields, keyboard selection, and bounded large-input navigation? | **GUI gate and scoped native checks passed; accessibility limits remain** | 85 GUI tests; GUI all-target/devtools Clippy and release build passed (2,560 MiB cap, 1,025 MiB peak). Source SHA-256 `497f4d3b…`; installed GUI SHA-256 `7cb089a8…`. Native: 760×600 at 100%/130%, 1440×900 at 100%/200%; direct click→Tab→Tab→Space selected row 1. Block 200,000 tx 384: five input pages for 440 inputs, previous/next navigation; 512 MiB native GUI cap, 80 MiB peak. GUI close left daemon PID 760476 running, height 214,599→219,741. >100-output, delayed RPC, screen-reader, cross-platform remain open. | [GUI](../docs/GUI.md) |

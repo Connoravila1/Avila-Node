@@ -2534,14 +2534,12 @@ pub fn run(
         // Pruned mode must hold its budget DURING sync, not only at
         // exit — IBD accumulates blk files at network speed and a
         // shutdown-only prune needs the full archival disk anyway.
-        // Whole-file deletion at 128 MiB granularity: a minute
-        // cadence keeps the store within keep+one file.
+        // Whole-file deletion has file-granularity overshoot; the excess
+        // depends on incoming throughput between checks and file sizes.
         if cfg.prune_bytes.is_some() && last_prune.elapsed() >= Duration::from_secs(60) {
             last_prune = std::time::Instant::now();
-            if let Some(keep) = cfg.prune_bytes
-                && let Err(e) = cs.prune(keep)
-            {
-                eprintln!("prune failed: {e}");
+            if let Some(keep) = cfg.prune_bytes {
+                cs.prune(keep).map_err(SyncError::Store)?;
             }
         }
         if let Ok(mut p) = progress.lock() {
