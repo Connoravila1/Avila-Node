@@ -122,6 +122,17 @@ deployed, a separate 600,000–600,127 watcher was armed with the node PID pinne
 The node is still far from that window and full IBD remains incomplete; no
 artifact or result exists yet.
 
+The revised sampler was also exercised on a separate 16-block native probe at
+heights 233,609–233,624. The sample was accepted with full-validation policy
+(`assume_valid_checkpoint: null`, historical scripts required), and all receipt
+hashes were checked against the active chain during collection and rechecked
+afterward. It recorded 5,246 transactions, 11,420 spent coins, 16,111 created
+coins, 5,230 script-check jobs (for non-coinbase transactions), and 64,520
+sigops. The first status observation
+was already above the target start, so external timing was unavailable; this
+probe is not a speed result. Its artifact is `ibd-receipts-retry-native-233609.json`.
+The separate 600,000–600,127 collection remains pending.
+
 ## Continuity retry follow-up — 2026-10-17
 
 The separate modern-chain collector attempt terminated at 07:36:18 UTC after
@@ -147,5 +158,6 @@ pending. Attempt 2 was armed at 07:41:29.770 UTC as
 `avila-ibd-receipts-600000-p838059-a2.service` (collector PID 903060), against
 the same node PID 838059 and helper SHA-256 above. It uses a 256 MiB cap and
 256 MiB reserve, 15-second RPC timeout, and 1-second poll interval. Its output
-is separate from the terminal first attempt; no modern-window result exists
-yet.
+is separate from the terminal first attempt. After the clean arena-2 restart,
+the modern-window collector and health watcher were rearmed against new node
+PID 943399. The 600,000–600,127 target receipt has not yet arrived.
