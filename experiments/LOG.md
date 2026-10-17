@@ -2131,3 +2131,36 @@ checkpoint, and full IBD remains incomplete. No speedup, completed-IBD, or
 modern-chain coverage claim is made. See the
 [bounded peer-ingress note](2026-10-17-bounded-peer-ingress.md) for limits,
 caveats, and regression details.
+
+## Experiment #82 — streaming state.dat checkpoint writer
+
+The streaming 64 KiB serializer and previous buffered encoder produced
+byte-for-byte identical v4 `state.dat` files, each matching the cleanly
+captured source checkpoint SHA-256. The checkpoint was captured after a clean
+stop at connected height 188,928 (hash
+`00000000000005400d9a675d37db5b2140887238fd1335db17cdb2159a1d6814`), with
+971,817 headers; it was 92,105,283 bytes. Separate guarded 1,024 MiB-cap
+processes reported whole-process `VmHWM` of 273,520 KiB (about 267.11 MiB) for
+the buffered reference and 182,796 KiB (about 178.51 MiB) for streaming. They
+took 1,540 ms and 1,547 ms respectively. Each process includes the same read
+and decode work; this was one trial with differing cache state and clocks, so
+there is no speed claim, and the result does not prove all node RSS is fixed.
+`VmHWM` is the process resident-set high-water mark; it does not measure
+nonresident virtual allocations or cgroup file cache.
+
+The full validation pipeline passed: 1,156 Rust tests (five ignored), 14
+Python tests, workspace all-target Clippy with GUI/devtools features, rustdoc
+with warnings denied, and release CLI/GUI/example builds. The compiler ran
+under a 2,560 MiB cap / 1,024 MiB reserve; the pipeline peak was 1,807 MiB.
+CLI config/inspect and GUI help smoke checks passed. See the
+[streaming writer note](2026-10-17-state-writer-streaming.md) for exact
+commands, hashes, format guarantees, and the directory-fsync durability
+limitation. No consensus validation behavior changed.
+
+The installed CLI passed a clean shutdown/restart at
+2026-10-17T06:25:04.548465Z, resuming at height 188,928 with the captured
+checkpoint hash. The same node PID later reached 190,895 with six connections;
+the validation report had no AssumeValid checkpoint and still required
+historical scripts. Closing the attached GUI exited 0 without stopping that
+node. A watcher for heights 600,000–600,127 is armed, with no result yet;
+IBD remains incomplete.

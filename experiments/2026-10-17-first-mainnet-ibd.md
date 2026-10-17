@@ -104,3 +104,39 @@ A temporary sleep inhibitor was attached to the managed service for the
 long-running observation and follows the service lifecycle; it is not a
 permanent host setting. The full-script IBD measurement remains in progress,
 with no throughput or SwiftSync/Utreexo speed claim.
+
+## Clean checkpoint capture and writer comparison
+
+A later clean stop captured the v4 `state.dat` checkpoint at connected height
+188,928, hash
+`00000000000005400d9a675d37db5b2140887238fd1335db17cdb2159a1d6814`, with
+971,817 headers. The file was 92,105,283 bytes and SHA-256
+`be0de17b70d78f5ea68d5990656d1d11f23ac1cc591392c28c7db0e3e7c94159`. An
+offline bounded comparison wrote the checkpoint through both the prior
+buffered v4 encoder and the new 64 KiB streaming serializer. Both outputs were
+byte-for-byte identical to the source and each other, with matching hashes.
+
+Separate guarded 1,024 MiB-cap processes reported whole-process `VmHWM` of
+273,520 KiB (about 267.11 MiB) for buffered reference and 182,796 KiB (about
+178.51 MiB) for streaming; elapsed times were 1,540 ms and 1,547 ms. Both
+include identical read/decode work. This was a single trial with different
+cache state and clocks, so it supports no speed conclusion and does not prove
+all node RSS is fixed. The decoded state and caller snapshot still occupy
+memory. `VmHWM` is the process resident-set high-water mark; it does not
+measure nonresident virtual allocations or cgroup file cache. The writer
+comparison validates format-preserving checkpoint output,
+not IBD completion or a change to consensus validation. See the
+[streaming writer experiment](2026-10-17-state-writer-streaming.md) for native
+gate results, exact command bounds, and durability caveats.
+
+The installed CLI then passed a clean shutdown/restart proof at
+2026-10-17T06:25:04.548465Z: it resumed at height 188,928 with the same
+captured block hash. The same node process (PID 560505) later advanced to
+190,895 with six connections. Its validation report had no AssumeValid
+checkpoint and still required historical scripts. The attached GUI at
+760×600 displayed live heights 189,659 and 190,819. Closing its node window
+exited 0 while the same node PID continued syncing to 190,895. That GUI check
+used a 512 MiB cap / 512 MiB reserve and peaked at 54 MiB over 112 seconds.
+A modern-chain watcher for heights 600,000–600,127 was rearmed under a 256
+MiB cap, but has no result because that height range has not been reached.
+IBD remains incomplete.

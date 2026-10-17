@@ -13,13 +13,15 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::block::{Block, MAX_BLOCK_SERIALIZED_SIZE};
 use crate::connect::{BlockUndo, Coin, TxUndo};
-use crate::encode::{Decoder, write_compact_size, write_var_bytes};
-use crate::hash::{BlockHash, Txid, sha256d};
+use crate::encode::Decoder;
+#[cfg(test)]
+use crate::encode::{write_compact_size, write_var_bytes};
+use crate::hash::{BlockHash, Sha256d, Txid, sha256d};
 use crate::transaction::{OutPoint, Script, TxOut};
 
 /// Core's `MAX_BLOCKFILE_SIZE` — `BLK_FILE_CHUNK` rotations keep each file
@@ -450,6 +452,7 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
+#[cfg(test)]
 fn put_coin(out: &mut Vec<u8>, coin: &Coin) {
     out.extend_from_slice(&coin.out.value.to_le_bytes());
     write_var_bytes(out, coin.out.script_pubkey.as_bytes());
@@ -480,6 +483,7 @@ fn get_coin(d: &mut Decoder) -> io::Result<Coin> {
     })
 }
 
+#[cfg(test)]
 fn put_outpoint(out: &mut Vec<u8>, op: &OutPoint) {
     out.extend_from_slice(op.txid.as_bytes());
     out.extend_from_slice(&op.vout.to_le_bytes());
@@ -498,6 +502,7 @@ fn get_outpoint(d: &mut Decoder) -> io::Result<OutPoint> {
     })
 }
 
+#[cfg(test)]
 fn put_undo(out: &mut Vec<u8>, undo: &BlockUndo) {
     write_compact_size(out, undo.txs.len() as u64);
     for tx in &undo.txs {
@@ -548,57 +553,22 @@ fn get_undo(d: &mut Decoder) -> io::Result<BlockUndo> {
 ///
 /// `io::Error` on any write/sync/rename failure.
 pub fn write_state(dir: &Path, magic: [u8; 4], data: &StateData) -> io::Result<()> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(data.tip.as_bytes());
-    payload.extend_from_slice(&data.height.to_le_bytes());
-    write_compact_size(&mut payload, data.headers.len() as u64);
-    for header in &data.headers {
-        payload.extend_from_slice(&header.encode());
-    }
-    payload.extend_from_slice(data.best_header.as_bytes());
-    write_compact_size(&mut payload, data.chain.len() as u64);
-    for hash in &data.chain {
-        payload.extend_from_slice(hash.as_bytes());
-    }
-    write_compact_size(&mut payload, data.undos.len() as u64);
-    for undo in &data.undos {
-        let mut buf = Vec::new();
-        put_undo(&mut buf, undo);
-        write_var_bytes(&mut payload, &buf);
-    }
-    write_compact_size(&mut payload, data.utxo.len() as u64);
-    for (op, coin) in &data.utxo {
-        put_outpoint(&mut payload, op);
-        put_coin(&mut payload, coin);
-    }
-    write_compact_size(&mut payload, data.failed.len() as u64);
-    for hash in &data.failed {
-        payload.extend_from_slice(hash.as_bytes());
-    }
-    write_compact_size(&mut payload, data.tx_meta.len() as u64);
-    for (hash, n_tx, n_chain_tx) in &data.tx_meta {
-        payload.extend_from_slice(hash.as_bytes());
-        payload.extend_from_slice(&n_tx.to_le_bytes());
-        payload.extend_from_slice(&n_chain_tx.to_le_bytes());
-    }
-    payload.extend_from_slice(&data.snapshot_base.to_le_bytes());
-    // The flags byte is a bitmask: bit0 = externalized (v4's original
-    // meaning), bit1 = snapshot verified. Old v4 writers only ever
-    // emitted 0/1, so values 2/3 read cleanly on upgrade.
-    let flags = u8::from(data.externalized) | (u8::from(data.snapshot_verified) << 1);
-    payload.push(flags);
-
-    let mut file_bytes = Vec::with_capacity(payload.len() + 44);
-    file_bytes.extend_from_slice(&magic);
-    file_bytes.extend_from_slice(&STATE_VERSION.to_le_bytes());
-    file_bytes.extend_from_slice(&sha256d(&payload));
-    file_bytes.extend_from_slice(&payload);
-
     let tmp = dir.join(STATE_TMP);
     {
-        let mut f = File::create(&tmp)?;
-        f.write_all(&file_bytes)?;
-        f.sync_all()?;
+        let file = File::create(&tmp)?;
+        let mut out = BufWriter::with_capacity(64 * 1024, file);
+        out.write_all(&magic)?;
+        out.write_all(&STATE_VERSION.to_le_bytes())?;
+        out.write_all(&[0; 32])?;
+
+        let checksum = write_state_payload(&mut out, data)?;
+        out.flush()?;
+        // The buffered payload is now fully written. Patch the reserved
+        // checksum slot without retaining another copy of the state.
+        out.seek(SeekFrom::Start(8))?;
+        out.write_all(&checksum)?;
+        out.flush()?;
+        out.get_ref().sync_all()?;
     }
     fs::rename(&tmp, dir.join(STATE_FILE))?;
     // The rename itself needs a directory fsync to be durable — without
@@ -606,6 +576,144 @@ pub fn write_state(dir: &Path, magic: [u8; 4], data: &StateData) -> io::Result<(
     // old state.dat (or at nothing) even though the new file's bytes
     // already hit disk (hashstore.rs's renames do the same).
     File::open(dir)?.sync_all()
+}
+
+/// Streams the byte-for-byte v4 state payload and returns its sha256d.
+fn write_state_payload<W: Write>(out: &mut W, data: &StateData) -> io::Result<[u8; 32]> {
+    let mut out = ChecksumWriter {
+        inner: out,
+        hasher: Sha256d::new(),
+    };
+    out.write_all(data.tip.as_bytes())?;
+    out.write_all(&data.height.to_le_bytes())?;
+    write_compact_size_to(&mut out, data.headers.len() as u64)?;
+    for header in &data.headers {
+        out.write_all(&header.encode())?;
+    }
+    out.write_all(data.best_header.as_bytes())?;
+    write_compact_size_to(&mut out, data.chain.len() as u64)?;
+    for hash in &data.chain {
+        out.write_all(hash.as_bytes())?;
+    }
+    write_compact_size_to(&mut out, data.undos.len() as u64)?;
+    for undo in &data.undos {
+        let undo_len = count_undo_bytes(undo)?;
+        write_compact_size_to(&mut out, undo_len)?;
+        write_undo_to(&mut out, undo)?;
+    }
+    write_compact_size_to(&mut out, data.utxo.len() as u64)?;
+    for (op, coin) in &data.utxo {
+        write_outpoint_to(&mut out, op)?;
+        write_coin_to(&mut out, coin)?;
+    }
+    write_compact_size_to(&mut out, data.failed.len() as u64)?;
+    for hash in &data.failed {
+        out.write_all(hash.as_bytes())?;
+    }
+    write_compact_size_to(&mut out, data.tx_meta.len() as u64)?;
+    for (hash, n_tx, n_chain_tx) in &data.tx_meta {
+        out.write_all(hash.as_bytes())?;
+        out.write_all(&n_tx.to_le_bytes())?;
+        out.write_all(&n_chain_tx.to_le_bytes())?;
+    }
+    out.write_all(&data.snapshot_base.to_le_bytes())?;
+    // bit0 = externalized; bit1 = snapshot verified. Preserve the v4 flags.
+    let flags = u8::from(data.externalized) | (u8::from(data.snapshot_verified) << 1);
+    out.write_all(&[flags])?;
+    out.flush()?;
+    Ok(out.hasher.finalize())
+}
+
+struct ChecksumWriter<'a, W> {
+    inner: &'a mut W,
+    hasher: Sha256d,
+}
+
+impl<W: Write> Write for ChecksumWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct CountingWriter {
+    count: u64,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.count = self
+            .count
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "encoded undo too large"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn count_undo_bytes(undo: &BlockUndo) -> io::Result<u64> {
+    let mut counter = CountingWriter { count: 0 };
+    write_undo_to(&mut counter, undo)?;
+    Ok(counter.count)
+}
+
+fn write_compact_size_to<W: Write>(out: &mut W, value: u64) -> io::Result<()> {
+    match value {
+        0..=252 => out.write_all(&[value as u8]),
+        253..=65_535 => {
+            out.write_all(&[253])?;
+            out.write_all(&(value as u16).to_le_bytes())
+        }
+        65_536..=4_294_967_295 => {
+            out.write_all(&[254])?;
+            out.write_all(&(value as u32).to_le_bytes())
+        }
+        _ => {
+            out.write_all(&[255])?;
+            out.write_all(&value.to_le_bytes())
+        }
+    }
+}
+
+fn write_var_bytes_to<W: Write>(out: &mut W, bytes: &[u8]) -> io::Result<()> {
+    write_compact_size_to(out, bytes.len() as u64)?;
+    out.write_all(bytes)
+}
+
+fn write_coin_to<W: Write>(out: &mut W, coin: &Coin) -> io::Result<()> {
+    out.write_all(&coin.out.value.to_le_bytes())?;
+    write_var_bytes_to(out, coin.out.script_pubkey.as_bytes())?;
+    out.write_all(&coin.height.to_le_bytes())?;
+    out.write_all(&[u8::from(coin.coinbase)])
+}
+
+fn write_outpoint_to<W: Write>(out: &mut W, op: &OutPoint) -> io::Result<()> {
+    out.write_all(op.txid.as_bytes())?;
+    out.write_all(&op.vout.to_le_bytes())
+}
+
+fn write_undo_to<W: Write>(out: &mut W, undo: &BlockUndo) -> io::Result<()> {
+    write_compact_size_to(out, undo.txs.len() as u64)?;
+    for tx in &undo.txs {
+        write_compact_size_to(out, tx.spent.len() as u64)?;
+        for coin in &tx.spent {
+            write_coin_to(out, coin)?;
+        }
+        write_compact_size_to(out, tx.overwritten.len() as u64)?;
+        for (op, coin) in &tx.overwritten {
+            write_outpoint_to(out, op)?;
+            write_coin_to(out, coin)?;
+        }
+    }
+    Ok(())
 }
 
 /// Reads `dir/state.dat`, verifying magic, version and checksum.
@@ -1024,6 +1132,226 @@ mod tests {
             externalized: false,
             snapshot_verified: false,
         }
+    }
+
+    /// The previous v4 encoder, retained only as a byte-level test oracle.
+    fn buffered_state_bytes_reference(data: &StateData) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(data.tip.as_bytes());
+        payload.extend_from_slice(&data.height.to_le_bytes());
+        write_compact_size(&mut payload, data.headers.len() as u64);
+        for header in &data.headers {
+            payload.extend_from_slice(&header.encode());
+        }
+        payload.extend_from_slice(data.best_header.as_bytes());
+        write_compact_size(&mut payload, data.chain.len() as u64);
+        for hash in &data.chain {
+            payload.extend_from_slice(hash.as_bytes());
+        }
+        write_compact_size(&mut payload, data.undos.len() as u64);
+        for undo in &data.undos {
+            let mut bytes = Vec::new();
+            put_undo(&mut bytes, undo);
+            write_var_bytes(&mut payload, &bytes);
+        }
+        write_compact_size(&mut payload, data.utxo.len() as u64);
+        for (op, coin) in &data.utxo {
+            put_outpoint(&mut payload, op);
+            put_coin(&mut payload, coin);
+        }
+        write_compact_size(&mut payload, data.failed.len() as u64);
+        for hash in &data.failed {
+            payload.extend_from_slice(hash.as_bytes());
+        }
+        write_compact_size(&mut payload, data.tx_meta.len() as u64);
+        for (hash, n_tx, n_chain_tx) in &data.tx_meta {
+            payload.extend_from_slice(hash.as_bytes());
+            payload.extend_from_slice(&n_tx.to_le_bytes());
+            payload.extend_from_slice(&n_chain_tx.to_le_bytes());
+        }
+        payload.extend_from_slice(&data.snapshot_base.to_le_bytes());
+        let flags = u8::from(data.externalized) | (u8::from(data.snapshot_verified) << 1);
+        payload.push(flags);
+
+        let mut framed = Vec::with_capacity(payload.len() + 40);
+        framed.extend_from_slice(&MAGIC);
+        framed.extend_from_slice(&STATE_VERSION.to_le_bytes());
+        framed.extend_from_slice(&sha256d(&payload));
+        framed.extend_from_slice(&payload);
+        framed
+    }
+
+    #[derive(Default)]
+    struct TestWriter {
+        bytes: Vec<u8>,
+        max_write: usize,
+        fail_after: Option<usize>,
+        write_zero_after: Option<usize>,
+        fail_flush: bool,
+    }
+
+    impl Write for TestWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self
+                .write_zero_after
+                .is_some_and(|limit| self.bytes.len() >= limit)
+            {
+                return Ok(0);
+            }
+            if let Some(limit) = self.fail_after {
+                if self.bytes.len() >= limit {
+                    return Err(io::Error::other("injected write failure"));
+                }
+                let remaining = limit - self.bytes.len();
+                let count = bytes.len().min(remaining).min(self.max_write.max(1));
+                self.bytes.extend_from_slice(&bytes[..count]);
+                return Ok(count);
+            }
+            let count = bytes.len().min(self.max_write.max(1));
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::Error::other("injected flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_state_matches_previous_v4_bytes_for_contents_and_flags() {
+        let dir = test_dir("state-stream-equivalence");
+        fs::create_dir_all(&dir).unwrap();
+        for (externalized, snapshot_verified) in
+            [(false, false), (true, false), (true, true), (false, true)]
+        {
+            let mut state = test_state();
+            state.externalized = externalized;
+            state.snapshot_verified = snapshot_verified;
+            let expected = buffered_state_bytes_reference(&state);
+            write_state(&dir, MAGIC, &state).unwrap();
+            assert_eq!(fs::read(dir.join(STATE_FILE)).unwrap(), expected);
+            assert_eq!(read_state(&dir, MAGIC).unwrap(), Some(state));
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn streaming_encoder_preserves_compactsize_and_script_length_boundaries() {
+        for value in [
+            0,
+            252,
+            253,
+            254,
+            65_535,
+            65_536,
+            u64::from(u32::MAX),
+            u64::from(u32::MAX) + 1,
+            u64::MAX,
+        ] {
+            let mut old = Vec::new();
+            write_compact_size(&mut old, value);
+            let mut streamed = Vec::new();
+            write_compact_size_to(&mut streamed, value).unwrap();
+            assert_eq!(streamed, old, "value={value}");
+        }
+
+        for script_len in [252, 253, 65_535, 65_536] {
+            let mut state = test_state();
+            state.utxo[0].1.out.script_pubkey = Script::new(vec![0x51; script_len]);
+            state.undos[0].txs[0].spent[0].out.script_pubkey = Script::new(vec![0x52; script_len]);
+            assert_stream_matches_reference(&state);
+        }
+
+        for failed_count in [252, 253, 65_535, 65_536] {
+            let mut state = test_state();
+            state
+                .failed
+                .resize(failed_count, BlockHash::from_bytes([0xa5; 32]));
+            assert_stream_matches_reference(&state);
+        }
+    }
+
+    fn assert_stream_matches_reference(state: &StateData) {
+        let expected = buffered_state_bytes_reference(state);
+        let mut streamed = TestWriter {
+            max_write: 11,
+            ..TestWriter::default()
+        };
+        let checksum = write_state_payload(&mut streamed, state).unwrap();
+        assert_eq!(&expected[..4], &MAGIC);
+        assert_eq!(&expected[4..8], &STATE_VERSION.to_le_bytes());
+        assert_eq!(&expected[8..40], &checksum);
+        assert_eq!(&streamed.bytes[..], &expected[40..]);
+    }
+
+    #[test]
+    fn payload_writer_handles_short_writes_and_propagates_write_errors() {
+        let state = test_state();
+        let expected = buffered_state_bytes_reference(&state);
+        let mut short = TestWriter {
+            max_write: 7,
+            ..TestWriter::default()
+        };
+        let checksum = write_state_payload(&mut short, &state).unwrap();
+        assert_eq!(&short.bytes[..], &expected[40..]);
+        assert_eq!(&checksum, &expected[8..40]);
+
+        let mut failing = TestWriter {
+            max_write: 9,
+            fail_after: Some(100),
+            ..TestWriter::default()
+        };
+        assert_eq!(
+            write_state_payload(&mut failing, &state)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Other
+        );
+
+        let mut write_zero = TestWriter {
+            max_write: 17,
+            write_zero_after: Some(100),
+            ..TestWriter::default()
+        };
+        assert_eq!(
+            write_state_payload(&mut write_zero, &state)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WriteZero
+        );
+
+        let mut flush_failure = TestWriter {
+            fail_flush: true,
+            ..TestWriter::default()
+        };
+        assert_eq!(
+            write_state_payload(&mut flush_failure, &state)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn failed_temp_open_preserves_the_previous_state_file() {
+        let dir = test_dir("state-failed-write-preserves-old");
+        fs::create_dir_all(&dir).unwrap();
+        let old = test_state();
+        write_state(&dir, MAGIC, &old).unwrap();
+        let old_bytes = fs::read(dir.join(STATE_FILE)).unwrap();
+        fs::create_dir(dir.join(STATE_TMP)).unwrap();
+
+        let mut replacement = old.clone();
+        replacement.snapshot_verified = true;
+        assert!(write_state(&dir, MAGIC, &replacement).is_err());
+        assert_eq!(fs::read(dir.join(STATE_FILE)).unwrap(), old_bytes);
+        fs::remove_dir(dir.join(STATE_TMP)).unwrap();
+        assert_eq!(read_state(&dir, MAGIC).unwrap(), Some(old));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn expect_invalid(result: io::Result<Option<StateData>>) {
