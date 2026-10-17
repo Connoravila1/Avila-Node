@@ -24,7 +24,7 @@ use avila_consensus::swift_stump::{
 use avila_consensus::transaction::OutPoint;
 use avila_consensus::utreexo::leaf_for;
 use rustreexo::mem_forest::MemForest;
-use rustreexo::node_hash::{AccumulatorHash, BitcoinNodeHash};
+use rustreexo::node_hash::BitcoinNodeHash;
 
 const FIXTURE: &str = "mainnet-blocks-000000-000500.dat";
 const FIXTURE_BYTES: usize = 114_278;

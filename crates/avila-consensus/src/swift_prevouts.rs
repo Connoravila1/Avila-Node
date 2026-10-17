@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use sha2::{Digest, Sha256};
 
 use crate::coinsdb::CoinFormat;
@@ -323,7 +323,7 @@ impl SwiftPrevoutStore {
             let key = crate::utxo_snapshot::outpoint_key(outpoint);
             let value = encode_record(&key, coin, self.limits)?;
             if let Some((prior_coin, _)) = encoded.get(&key) {
-                if prior_coin != coin {
+                if *prior_coin != coin {
                     return Err(SwiftPrevoutError::DuplicateCoinMismatch);
                 }
             } else {
@@ -806,42 +806,48 @@ mod tests {
     fn entry_batch_and_script_bounds_are_enforced_atomically() {
         let temp = TestDir::new();
         let mut lim = limits();
-        lim.max_entries = 1;
+        lim.max_entries = 2;
         lim.max_batch_entries = 2;
         let a = item(4, 100, &[0x51]);
         let b = item(5, 200, &[0x51]);
+        let c = item(8, 300, &[0x51]);
         let mut store = SwiftPrevoutStore::create(&temp.db_path(), checkpoint(), lim).unwrap();
+        store.insert_batch(std::slice::from_ref(&a)).unwrap();
         assert!(matches!(
-            store.insert_batch(&[a.clone(), b.clone()]),
+            store.insert_batch(&[b.clone(), c.clone()]),
             Err(SwiftPrevoutError::EntryLimitExceeded)
         ));
-        assert_eq!(store.len(), 0);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(&a.0).unwrap(), Some(a.1.clone()));
+        assert_eq!(store.get(&b.0).unwrap(), None);
+        assert_eq!(store.get(&c.0).unwrap(), None);
         assert!(matches!(
-            store.insert_batch(&[a.clone(), b.clone(), b.clone()]),
+            store.insert_batch(&[b.clone(), c.clone(), c.clone()]),
             Err(SwiftPrevoutError::BatchTooLarge)
         ));
         let mut oversized_script = Vec::new();
         oversized_script.resize(lim.max_script_bytes + 1, 0x51);
         assert!(matches!(
             store.insert_batch(&[(
-                b.0,
+                c.0,
                 Coin {
                     out: TxOut {
-                        value: b.1.out.value,
+                        value: c.1.out.value,
                         script_pubkey: Script::new(oversized_script),
                     },
-                    ..b.1.clone()
+                    ..c.1.clone()
                 }
             )]),
             Err(SwiftPrevoutError::InvalidCoin)
         ));
-        let mut out_of_range = b.1.clone();
+        let mut out_of_range = c.1.clone();
         out_of_range.out.value = crate::check::MAX_MONEY + 1;
         assert!(matches!(
-            store.insert_batch(&[(b.0, out_of_range)]),
+            store.insert_batch(&[(c.0, out_of_range)]),
             Err(SwiftPrevoutError::InvalidCoin)
         ));
-        assert_eq!(store.len(), 0);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(&a.0).unwrap(), Some(a.1));
     }
 
     #[test]
@@ -874,6 +880,7 @@ mod tests {
             Err(SwiftPrevoutError::EncodedBytesLimitExceeded)
         ));
         assert_eq!(store.len(), 0);
+        drop(store);
         let wrong_limits = SwiftPrevoutLimits {
             max_total_encoded_bytes: 2,
             ..lim
