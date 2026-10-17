@@ -42,6 +42,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Unit and integration tests
         run: cargo test --workspace --locked
+      - name: Offline Swift checkpoint shadow experiments
+        run: |
+          cargo run --locked -p avila-consensus --example swift_checkpoint_shadow
+          cargo run --locked -p avila-consensus --example swift_checkpoint_shadow -- --tamper-input
+          cargo run --locked -p avila-consensus --example swift_prevouts_shadow
       - name: Documentation
         env:
           RUSTDOCFLAGS: -D warnings
