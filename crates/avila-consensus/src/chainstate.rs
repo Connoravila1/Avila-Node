@@ -263,6 +263,10 @@ pub struct Chainstate {
     /// below it are assume-valid: their `undos` slots are empty
     /// placeholders and no reorg may fork below it.
     snapshot_base: Option<u32>,
+    /// Coinsdb's persisted undo-collection boundary and active-chain anchor.
+    /// Forks below this parent height are parked because their undo prefix
+    /// may have been collected.
+    undo_floor: Option<(u32, BlockHash)>,
     /// Core's ibd chainstate while a snapshot is active — replays the
     /// stored bodies of heights `1..=snapshot_base` into an independent
     /// UTXO set; on reaching the base, its recomputed content hash must
@@ -372,6 +376,22 @@ pub struct Chainstate {
     /// stays populated through the flight so `undo()` keeps answering;
     /// the covered prefix drains when the join lands.
     inflight_flush: Option<(u32, usize)>,
+}
+
+fn validate_snapshot_undo_floor(
+    state_height: u32,
+    state_chain: &[BlockHash],
+    floor: Option<(u32, BlockHash)>,
+) -> std::io::Result<()> {
+    if let Some((height, anchor)) = floor
+        && (state_height < height || state_chain.get(height as usize) != Some(&anchor))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "state.dat is older than or mismatches the persisted undo floor",
+        ));
+    }
+    Ok(())
 }
 
 /// The background validation replay beneath an active snapshot — a
@@ -1023,6 +1043,7 @@ impl Chainstate {
             filterindex: None,
             precious: None,
             snapshot_base: None,
+            undo_floor: None,
             background: None,
             snapshot_verified: false,
             disconnected: Vec::new(),
@@ -1201,6 +1222,11 @@ impl Chainstate {
                 }
             }
             if let Err(err) = waited {
+                if let Err(preflight) = self.preflight_rewind(height.saturating_sub(1)) {
+                    self.pending_scripts
+                        .push_front((hash, height, check, receipt));
+                    return Err(preflight);
+                }
                 // The failed block and everything pending above it can
                 // never connect — drop their pending entries, mark the
                 // block invalid, rewind to its parent. Their receipts
@@ -1878,38 +1904,67 @@ impl Chainstate {
     /// then replay any stored bodies it doesn't cover.
     fn resume(self, dir: &Path, now: u32) -> std::io::Result<Self> {
         let mut cs = self;
+        let persisted_floor = cs
+            .coins_backend
+            .as_ref()
+            .map(|backend| backend.undo_floor())
+            .transpose()?
+            .flatten();
+        cs.undo_floor = persisted_floor;
         // A snapshot that fails to load or restore falls back to full replay —
         // the blk files are the record of what arrived; state.dat only ever
-        // re-derives it faster.
-        let mut pending = match store::read_state(dir, cs.tree.params().message_start) {
-            Ok(Some(state)) => match cs.restore(state, now) {
-                Ok(pending) => pending,
-                Err(err) => {
-                    // Restore failed — rebuild a clean in-memory
-                    // chainstate; the backend keeps its data (a fresh
-                    // UtxoSet over it replays from blk files anyway).
-                    eprintln!("restore: state.dat rejected ({err}) — rebuilding from blk files");
-                    let store = cs.store.take();
-                    let backend = cs.coins_backend.take();
-                    // Runs files may cover heights the backend attests
-                    // differently — drop them before re-attaching.
-                    if cs.utxo.runs_enabled() {
-                        let _ = crate::runs::purge(&dir.join("runs"));
-                    }
-                    cs = Self::new(cs.tree.params());
-                    cs.store = store;
-                    cs.coins_backend = backend;
-                    if let Some(be) = &cs.coins_backend {
-                        cs.committed_coins_tip = be.tip_height();
-                        cs.utxo.attach_shared(be.clone());
-                        if std::env::var("AVILA_RUNS").as_deref() == Ok("1") {
-                            cs.utxo.enable_runs(dir)?;
+        // re-derives it faster. Once an undo prefix has been collected, that
+        // fallback can no longer reconstruct a consistent historical UTXO
+        // view and must fail closed.
+        let state_read = store::read_state(dir, cs.tree.params().message_start);
+        let mut pending = match state_read {
+            Ok(Some(state)) => {
+                validate_snapshot_undo_floor(state.height, &state.chain, persisted_floor)?;
+                match cs.restore(state, now) {
+                    Ok(pending) => pending,
+                    Err(err) => {
+                        if persisted_floor.is_some() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "state.dat restore failed with an undo floor present: {err}"
+                                ),
+                            ));
                         }
+                        // Restore failed — rebuild a clean in-memory
+                        // chainstate; the backend keeps its data (a fresh
+                        // UtxoSet over it replays from blk files anyway).
+                        eprintln!(
+                            "restore: state.dat rejected ({err}) — rebuilding from blk files"
+                        );
+                        let store = cs.store.take();
+                        let backend = cs.coins_backend.take();
+                        // Runs files may cover heights the backend attests
+                        // differently — drop them before re-attaching.
+                        if cs.utxo.runs_enabled() {
+                            let _ = crate::runs::purge(&dir.join("runs"));
+                        }
+                        cs = Self::new(cs.tree.params());
+                        cs.store = store;
+                        cs.coins_backend = backend;
+                        if let Some(be) = &cs.coins_backend {
+                            cs.committed_coins_tip = be.tip_height();
+                            cs.utxo.attach_shared(be.clone());
+                            if std::env::var("AVILA_RUNS").as_deref() == Ok("1") {
+                                cs.utxo.enable_runs(dir)?;
+                            }
+                        }
+                        cs.stored_positions(&HashSet::new())
                     }
-                    cs.stored_positions(&HashSet::new())
                 }
-            },
-            _ => cs.stored_positions(&HashSet::new()),
+            }
+            Ok(None) | Err(_) if persisted_floor.is_some() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "state.dat is missing or unreadable while coinsdb has an undo floor",
+                ));
+            }
+            Ok(None) | Err(_) => cs.stored_positions(&HashSet::new()),
         };
         // Torn/absent state.dat skips `restore` — and with it the
         // backend reconcile. The backend may sit thousands of heights
@@ -1935,6 +1990,14 @@ impl Chainstate {
                 match cs.reconcile_backend(tip) {
                     Ok(()) => eprintln!("restore: backend rewound"),
                     Err(err) => {
+                        if persisted_floor.is_some() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "backend rewind failed while an undo floor is present: {err}"
+                                ),
+                            ));
+                        }
                         // Rewind can't cross pruned/missing bodies or a
                         // gap in the undo table — and attaching the
                         // mismatched backend anyway is how one run
@@ -2521,7 +2584,26 @@ impl Chainstate {
         // Avoid a full state checkpoint every pruning tick while the
         // store is already within budget. The precheck flushes the tail
         // handle before counting all block-file bytes, including the tail.
-        if !store.exceeds_bytes(keep_bytes)? {
+        let over_budget = store.exceeds_bytes(keep_bytes)?;
+        let gc_allowed = self.snapshot_base.is_none()
+            && !self.utxo.runs_enabled()
+            && !self.utxo.flat_enabled()
+            && std::env::var("AVILA_RUNS").as_deref() != Ok("1")
+            && self.coins_backend.as_ref().is_some_and(|backend| {
+                backend.engine() == crate::coinsdb::Engine::Redb && !backend.has_shadow()
+            });
+        let candidate = gc_allowed.then(|| self.undo_gc_candidate()).flatten();
+        let gc_pending = if let (Some((floor, _)), Some(backend)) =
+            (self.undo_floor, self.coins_backend.as_ref())
+        {
+            backend.has_undo_at_or_below(floor)?
+        } else {
+            false
+        };
+        let gc_needed = candidate
+            .is_some_and(|(height, _)| self.undo_floor.is_none_or(|(old, _)| height > old))
+            || gc_pending;
+        if !over_budget && !gc_needed {
             return Ok(0);
         }
         // A body may be retained for a parked side branch or a header far
@@ -2532,9 +2614,66 @@ impl Chainstate {
         // no longer needs an undo/body rewind window. Normal prune semantics
         // may still require a pruned side-branch body to be downloaded again.
         self.flush()?;
-        self.store
+        let deleted = self
+            .store
             .as_mut()
-            .map_or(Ok(0), |store| store.prune_to_bytes(keep_bytes, u32::MAX))
+            .map_or(Ok(0), |store| store.prune_to_bytes(keep_bytes, u32::MAX))?;
+        if gc_allowed && (deleted > 0 || gc_needed) {
+            let candidate = self.undo_gc_candidate();
+            let target = match (self.undo_floor, candidate) {
+                (Some(old), Some(new)) if old.0 >= new.0 => Some(old),
+                (_, Some(new)) => Some(new),
+                (Some(old), None) => Some(old),
+                (None, None) => None,
+            };
+            if let (Some((height, hash)), Some(backend)) = (target, self.coins_backend.as_ref()) {
+                let needs_collection = self.undo_floor.is_none_or(|(old, _)| height > old)
+                    || backend.has_undo_at_or_below(height)?;
+                if needs_collection {
+                    backend.advance_undo_floor_and_collect(height, hash)?;
+                    self.undo_floor = Some((height, hash));
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// A conservative undo rollback boundary implied by the first active
+    /// body still present on disk and the minimum 288-block reorg window.
+    /// This is only used after a durable checkpoint and successful body prune.
+    fn undo_gc_candidate(&self) -> Option<(u32, BlockHash)> {
+        if self.snapshot_base.is_some() {
+            return None;
+        }
+        let store = self.store.as_ref()?;
+        store.pruned_through()?;
+        let tip = self.chain.len().checked_sub(1)? as u32;
+        let depth_limit = tip.checked_sub(288)?;
+        let first_retained = self
+            .chain
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(height, hash)| {
+                store
+                    .position(hash)
+                    .filter(|position| !store.is_pruned(*position))
+                    .map(|_| height as u32)
+            })?;
+        let pending_script_floor = self
+            .pending_scripts
+            .iter()
+            .map(|(_, height, _, _)| height.saturating_sub(1))
+            .min()
+            .unwrap_or(u32::MAX);
+        let floor = first_retained
+            .saturating_sub(1)
+            .min(depth_limit)
+            .min(pending_script_floor);
+        if floor == 0 {
+            return None;
+        }
+        Some((floor, self.chain.get(floor as usize).copied()?))
     }
 
     /// The block index (Core's `mapBlockIndex` + best-tip bookkeeping).
@@ -2854,6 +2993,37 @@ impl Chainstate {
         let Some(be) = self.coins_backend.clone() else {
             return Ok(());
         };
+        if self.undo_floor.is_some_and(|(floor, _)| state_tip < floor) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "state.dat tip {state_tip} is below persisted undo floor {}",
+                    self.undo_floor.map_or(0, |(floor, _)| floor)
+                ),
+            ));
+        }
+        // The floor anchor proves the saved chain only through the retained
+        // rollback boundary. Above it, the persisted undo row binds the
+        // backend's committed branch at the snapshot tip. This also matters
+        // when both tips have the same height: a crash during a reorg can
+        // leave state.dat on one branch and coinsdb on another while both
+        // still share the floor anchor.
+        if self.undo_floor.is_some_and(|(floor, _)| state_tip > floor) {
+            let expected = self.chain.get(state_tip as usize).copied().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("state.dat chain has no hash at floor-protected tip {state_tip}"),
+                )
+            })?;
+            if be.undo_block_hash(state_tip) != Some(expected) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "coinsdb undo at state.dat tip {state_tip} is missing or names a different active branch"
+                    ),
+                ));
+            }
+        }
         // The real applied height is `max(meta tip, last undo key)`:
         // both land in the same commit, but a torn write-state flush can
         // leave meta tip at 0 (or behind) while the undo table still
@@ -3664,6 +3834,12 @@ impl Chainstate {
         if self.snapshot_base.is_some_and(|b| fork_height < b) {
             return Ok(None);
         }
+        if self
+            .undo_floor
+            .is_some_and(|(floor, _)| fork_height < floor)
+        {
+            return Ok(None);
+        }
 
         // A candidate whose branch lacks a stored body can never activate
         // (Core: `!HaveTxsDownloaded` keeps it out of `setBlockIndexCandidates`)
@@ -4030,6 +4206,9 @@ impl Chainstate {
             return Ok(Some(0));
         }
         let height = node.height;
+        if self.chain.get(height as usize) == Some(hash) {
+            self.preflight_rewind(height - 1)?;
+        }
         self.tree.mark_invalid_subtree(hash);
         let rewind_start = self.disconnected.len();
         if self.chain.get(height as usize) == Some(hash) {
@@ -4065,6 +4244,11 @@ impl Chainstate {
     /// indexes; the coin delta and new tip then commit in one transaction via
     /// `flush_coins`.
     fn rewind_connected(&mut self, target: u32) -> Result<(), ConnectError> {
+        if self.undo_floor.is_some_and(|(floor, _)| target < floor) {
+            return Err(ConnectError::Internal(
+                "rewind is below collected undo floor",
+            ));
+        }
         // A pending block being disconnected leaves the queue — its
         // check result is moot (the block unwinds regardless) and
         // draining it later would publish a checked-feed entry for a
@@ -4101,6 +4285,32 @@ impl Chainstate {
         }
         self.flush_coins()
             .map_err(|_| ConnectError::Internal("coinsdb flush failed"))?;
+        Ok(())
+    }
+
+    /// Checks rollback bounds and the complete body/undo availability before
+    /// an in-place rewind can mutate pending-script queues, indexes, or coins.
+    /// It holds only one decoded undo at a time.
+    fn preflight_rewind(&self, target: u32) -> Result<(), ConnectError> {
+        if self.undo_floor.is_some_and(|(floor, _)| target < floor) {
+            return Err(ConnectError::Internal(
+                "rewind is below collected undo floor",
+            ));
+        }
+        let tip = self.chain.len().saturating_sub(1) as u32;
+        for height in (target.saturating_add(1)..=tip).rev() {
+            let Some(hash) = self.chain.get(height as usize) else {
+                return Err(ConnectError::Internal(
+                    "rewind height is outside active chain",
+                ));
+            };
+            if self.body(hash).is_none() {
+                return Err(ConnectError::Internal("missing connected block body"));
+            }
+            if self.undo(height).is_none() {
+                return Err(ConnectError::Internal("missing connected undo"));
+            }
+        }
         Ok(())
     }
 
@@ -4406,6 +4616,10 @@ mod tests {
 
     const REGTEST_BITS: u32 = 0x207f_ffff;
     const NOW: u32 = 1_800_000_000;
+
+    fn hash(seed: u8) -> BlockHash {
+        BlockHash::from_bytes([seed; 32])
+    }
 
     fn params() -> Params {
         Network::Regtest.params()
@@ -5625,6 +5839,350 @@ mod tests {
             .collect();
         files.sort_by(|left, right| left.0.cmp(&right.0));
         files
+    }
+
+    #[test]
+    fn undo_floor_snapshot_requires_matching_height_and_anchor() {
+        let chain = vec![hash(0), hash(1), hash(2)];
+        assert!(validate_snapshot_undo_floor(1, &chain, Some((1, hash(1)))).is_ok());
+        assert!(validate_snapshot_undo_floor(2, &chain, Some((1, hash(1)))).is_ok());
+        assert!(validate_snapshot_undo_floor(0, &chain, Some((1, hash(1)))).is_err());
+        assert!(validate_snapshot_undo_floor(2, &chain, Some((1, hash(9)))).is_err());
+        assert!(validate_snapshot_undo_floor(0, &chain, None).is_ok());
+    }
+
+    #[test]
+    fn resume_refuses_missing_or_corrupt_snapshot_with_undo_floor() {
+        let params = params();
+        for corrupt in [false, true] {
+            let dir = store_dir(if corrupt {
+                "undo-floor-corrupt-state"
+            } else {
+                "undo-floor-missing-state"
+            });
+            let cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+            let backend = cs.coins_backend.as_ref().unwrap();
+            backend
+                .commit(
+                    &HashMap::new(),
+                    &[(1, hash(1), crate::connect::BlockUndo { txs: vec![] })],
+                    1,
+                )
+                .unwrap();
+            backend
+                .advance_undo_floor_and_collect(1, params.genesis_header.hash())
+                .unwrap();
+            drop(cs);
+            if corrupt {
+                std::fs::write(dir.join("state.dat"), b"not a snapshot").unwrap();
+            }
+
+            let err = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20)
+                .err()
+                .expect("a persisted undo floor must reject a missing or corrupt snapshot");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn resume_accepts_snapshot_at_or_above_undo_floor_anchor() {
+        let params = params();
+        let dir = store_dir("undo-floor-valid-state");
+        {
+            let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+            let first = block_on(
+                &params.genesis_header,
+                vec![coinbase_tx(1, subsidy(1))],
+                &params,
+            );
+            let second = block_on(&first.header, vec![coinbase_tx(2, subsidy(2))], &params);
+            cs.accept_block(&first, NOW).unwrap();
+            cs.accept_block(&second, NOW).unwrap();
+            cs.flush().unwrap();
+            cs.coins_backend
+                .as_ref()
+                .unwrap()
+                .advance_undo_floor_and_collect(1, first.block_hash())
+                .unwrap();
+        }
+
+        let resumed = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        assert_eq!(resumed.undo_floor, Some((1, resumed.chain[1])));
+        assert_eq!(resumed.chain.len(), 3);
+        drop(resumed);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resume_rejects_same_height_backend_branch_divergence_above_floor() {
+        let params = params();
+        let dir = store_dir("undo-floor-same-height-branch-divergence");
+        let first_hash;
+        let alternate_hash;
+        {
+            let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+            let first = block_on(
+                &params.genesis_header,
+                vec![coinbase_tx(1, subsidy(1))],
+                &params,
+            );
+            let saved_second = block_on(&first.header, vec![coinbase_tx(2, subsidy(2))], &params);
+            let alternate_second =
+                block_on(&first.header, vec![coinbase_tx(22, subsidy(2))], &params);
+            cs.accept_block(&first, NOW).unwrap();
+            cs.accept_block(&saved_second, NOW).unwrap();
+            cs.flush().unwrap();
+            first_hash = first.block_hash();
+            alternate_hash = alternate_second.block_hash();
+            cs.coins_backend
+                .as_ref()
+                .unwrap()
+                .advance_undo_floor_and_collect(1, first_hash)
+                .unwrap();
+
+            // Model a crash window where coinsdb committed an alternate
+            // height-2 branch but state.dat still records the saved branch.
+            // Both histories retain the same floor anchor at height 1.
+            cs.coins_backend
+                .as_ref()
+                .unwrap()
+                .commit(
+                    &HashMap::new(),
+                    &[(2, alternate_hash, crate::connect::BlockUndo { txs: vec![] })],
+                    2,
+                )
+                .unwrap();
+        }
+
+        let err = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20)
+            .err()
+            .expect("equal-height branch divergence above the floor must fail closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let backend = crate::coinsdb::CoinsBackend::open(&dir).unwrap();
+        assert_eq!(backend.tip_height(), 2);
+        assert_eq!(backend.undo_floor().unwrap(), Some((1, first_hash)));
+        assert_eq!(backend.undo_block_hash(2), Some(alternate_hash));
+        drop(backend);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_backend_reconcile_with_floor_preserves_coinsdb() {
+        let params = params();
+        let dir = store_dir("undo-floor-reconcile-failure");
+        let first_hash;
+        {
+            let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+            let first = block_on(
+                &params.genesis_header,
+                vec![coinbase_tx(1, subsidy(1))],
+                &params,
+            );
+            let second = block_on(&first.header, vec![coinbase_tx(2, subsidy(2))], &params);
+            cs.accept_block(&first, NOW).unwrap();
+            cs.accept_block(&second, NOW).unwrap();
+            cs.flush().unwrap();
+            first_hash = first.block_hash();
+            let backend = cs.coins_backend.as_ref().unwrap();
+            backend
+                .advance_undo_floor_and_collect(1, first_hash)
+                .unwrap();
+            // A crash-ahead row whose block body is absent forces the restore
+            // reconciliation error path without changing the saved snapshot.
+            backend
+                .commit(
+                    &HashMap::new(),
+                    &[(
+                        3,
+                        BlockHash::from_bytes([99; 32]),
+                        crate::connect::BlockUndo { txs: vec![] },
+                    )],
+                    3,
+                )
+                .unwrap();
+        }
+
+        assert!(Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).is_err());
+        let backend = crate::coinsdb::CoinsBackend::open(&dir).unwrap();
+        assert_eq!(backend.tip_height(), 3);
+        assert!(backend.undo_entry(3).is_some());
+        assert_eq!(backend.undo_floor().unwrap(), Some((1, first_hash)));
+        drop(backend);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn undo_floor_candidate_uses_lowest_retained_active_height() {
+        let params = params();
+        let dir = store_dir("undo-floor-retained-order");
+        let blocks = probe_chain(600, &[], &params);
+        let mut cs = Chainstate::new(&params);
+        cs.chain = std::iter::once(params.genesis_header.hash())
+            .chain(blocks.iter().map(Block::block_hash))
+            .collect();
+        let mut store = BlockStore::open_with_limit(&dir, params.message_start, 1).unwrap();
+        // File order is intentionally different from chain-height order:
+        // height 400 is in the file that pruning removes, while lower h250
+        // survives in the tail file.
+        store.append(&blocks[399]).unwrap();
+        store.append(&blocks[249]).unwrap();
+        store.flush().unwrap();
+        assert_eq!(store.prune_to_bytes(0, u32::MAX).unwrap(), 1);
+        cs.store = Some(store);
+
+        assert_eq!(
+            cs.undo_gc_candidate(),
+            Some((249, cs.chain[249])),
+            "the retained h250 body bounds the floor despite out-of-order files"
+        );
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let dir = store_dir("undo-floor-depth-cap");
+        let mut cs = Chainstate::new(&params);
+        cs.chain = std::iter::once(params.genesis_header.hash())
+            .chain(blocks.iter().map(Block::block_hash))
+            .collect();
+        let mut store = BlockStore::open_with_limit(&dir, params.message_start, 1).unwrap();
+        store.append(&blocks[399]).unwrap();
+        store.append(&blocks[400]).unwrap();
+        store.flush().unwrap();
+        cs.store = Some(store);
+        assert_eq!(cs.undo_gc_candidate(), None, "no prune marker, no GC floor");
+        let store = cs.store.as_mut().unwrap();
+        assert_eq!(store.prune_to_bytes(0, u32::MAX).unwrap(), 1);
+        assert_eq!(
+            cs.undo_gc_candidate(),
+            Some((312, cs.chain[312])),
+            "the rollback floor keeps at least 288 active heights above it"
+        );
+        drop(cs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn prune_collects_one_undo_batch_then_catches_up_under_budget() {
+        let params = params();
+        let dir = store_dir("undo-floor-prune-batches");
+        let blocks = probe_chain(600, &[], &params);
+        let mut cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        use_tiny_block_files(&mut cs, &params, &dir);
+        for block in &blocks {
+            cs.accept_block(block, NOW).unwrap();
+        }
+        cs.flush().unwrap();
+        let tail = cs
+            .store
+            .as_ref()
+            .unwrap()
+            .position(&blocks[599].block_hash())
+            .unwrap();
+        let keep = std::fs::metadata(dir.join(format!("blk{:05}.dat", tail.file)))
+            .unwrap()
+            .len();
+
+        assert!(cs.prune(keep).unwrap() > 0);
+        let floor = 600 - 288;
+        assert_eq!(cs.undo_floor, Some((floor, cs.chain[floor as usize])));
+        let backend = cs.coins_backend.as_ref().unwrap().clone();
+        assert!(backend.undo_at(256).is_none());
+        assert!(backend.undo_at(257).is_some());
+        assert!(backend.has_undo_at_or_below(floor).unwrap());
+
+        // No block bytes exceed the budget now, but a persisted floor with a
+        // remaining prefix is checkpointed and drained one bounded batch.
+        assert_eq!(cs.prune(keep).unwrap(), 0);
+        assert!(!backend.has_undo_at_or_below(floor).unwrap());
+        assert!(backend.undo_at(floor).is_none());
+        drop(cs);
+        drop(backend);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn invalidate_below_undo_floor_does_not_mark_or_disconnect() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        let block = block_on(
+            &params.genesis_header,
+            vec![coinbase_tx(1, subsidy(1))],
+            &params,
+        );
+        cs.accept_block(&block, NOW).unwrap();
+        let hash = block.block_hash();
+        cs.undo_floor = Some((1, hash));
+        let before_tip = cs.connected;
+
+        assert!(cs.invalidate_block(&hash).is_err());
+        assert_eq!(cs.connected, before_tip);
+        assert_eq!(cs.chain.len(), 2);
+        assert!(!cs.tree.is_failed(&hash));
+    }
+
+    #[test]
+    fn invalidate_with_missing_lower_body_does_not_partially_mark_or_rewind() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        let first = block_on(
+            &params.genesis_header,
+            vec![coinbase_tx(1, subsidy(1))],
+            &params,
+        );
+        let second = block_on(&first.header, vec![coinbase_tx(2, subsidy(2))], &params);
+        cs.accept_block(&first, NOW).unwrap();
+        cs.accept_block(&second, NOW).unwrap();
+        let first_hash = first.block_hash();
+        let second_hash = second.block_hash();
+        cs.blocks.remove(&first_hash);
+        let before_tip = cs.connected;
+        let before_chain = cs.chain.clone();
+
+        assert!(cs.invalidate_block(&first_hash).is_err());
+        assert_eq!(cs.connected, before_tip);
+        assert_eq!(cs.chain, before_chain);
+        assert!(!cs.tree.is_failed(&first_hash));
+        assert!(!cs.tree.is_failed(&second_hash));
+    }
+
+    #[test]
+    fn heavier_branch_below_undo_floor_is_parked() {
+        let params = params();
+        let mut cs = Chainstate::new(&params);
+        let active1 = block_on(
+            &params.genesis_header,
+            vec![coinbase_tx(1, subsidy(1))],
+            &params,
+        );
+        let active2 = block_on(&active1.header, vec![coinbase_tx(2, subsidy(2))], &params);
+        cs.accept_block(&active1, NOW).unwrap();
+        cs.accept_block(&active2, NOW).unwrap();
+        let active_tip = cs.connected;
+        cs.undo_floor = Some((1, active1.block_hash()));
+
+        let side1 = block_on(
+            &params.genesis_header,
+            vec![tagged_coinbase(1, subsidy(1), script::OP_EQUAL)],
+            &params,
+        );
+        let side2 = block_on(
+            &side1.header,
+            vec![tagged_coinbase(2, subsidy(2), script::OP_EQUAL)],
+            &params,
+        );
+        let side3 = block_on(
+            &side2.header,
+            vec![tagged_coinbase(3, subsidy(3), script::OP_EQUAL)],
+            &params,
+        );
+        cs.accept_block(&side1, NOW).unwrap();
+        cs.accept_block(&side2, NOW).unwrap();
+        assert_eq!(
+            cs.accept_block(&side3, NOW),
+            Ok(Acceptance::Parked { height: 3 })
+        );
+        assert_eq!(cs.connected, active_tip);
+        assert!(!cs.tree.is_failed(&side3.block_hash()));
     }
 
     #[test]
@@ -6907,6 +7465,12 @@ mod tests {
             cs.accept_block(block, NOW).unwrap();
         }
         cs.flush().unwrap();
+        let floor_hash = blocks[0].block_hash();
+        cs.coins_backend
+            .as_ref()
+            .unwrap()
+            .advance_undo_floor_and_collect(1, floor_hash)
+            .unwrap();
 
         // Connect 3 more and commit coins WITHOUT writing state.dat —
         // the backend-ahead crash window.
@@ -6921,6 +7485,7 @@ mod tests {
         // rewinds to 8, then the post-snapshot bodies (still in the blk
         // files) replay forward, converging both to tip 11.
         let cs = Chainstate::with_store_coinsdb(&dir, &params, NOW, 1 << 20).unwrap();
+        assert_eq!(cs.undo_floor, Some((1, floor_hash)));
         assert_eq!(cs.tip_hash(), blocks[10].block_hash());
         let mut resumed = cs.utxo().iter();
         resumed.sort_by_key(|(o, _)| (o.txid, o.vout));

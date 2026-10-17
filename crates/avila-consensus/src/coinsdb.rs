@@ -58,10 +58,53 @@ const K_LEN: &str = "coins_len";
 /// amount inspection refuses every persisted record if any retained or
 /// previously written undo exceeded its admission cap.
 const K_UNDO_AMOUNT_MAX: &str = "undo_amount_max";
+/// Minimum permitted reorg fork-parent height after undo-prefix collection:
+/// `height (u32 LE) || active-chain hash at height (32 bytes)`.
+const K_UNDO_FLOOR: &str = "undo_floor";
 /// The record-encoding marker — absent means [`CoinFormat::Legacy`].
 const K_FORMAT: &str = "format";
 /// The coins-table engine marker — absent means [`Engine::Redb`].
 const K_ENGINE: &str = "engine";
+
+fn decode_undo_floor(bytes: &[u8]) -> std::io::Result<(u32, crate::hash::BlockHash)> {
+    if bytes.len() != 36 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "coinsdb undo floor metadata has invalid length",
+        ));
+    }
+    let height = u32::from_le_bytes(bytes[..4].try_into().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid undo floor height")
+    })?);
+    if height == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "coinsdb undo floor height must be positive",
+        ));
+    }
+    let mut hash = [0; 32];
+    hash.copy_from_slice(&bytes[4..]);
+    Ok((height, crate::hash::BlockHash::from_bytes(hash)))
+}
+
+fn ensure_tip_respects_floor(
+    floor: Option<&[u8]>,
+    proposed_tip: Option<u32>,
+) -> std::io::Result<()> {
+    let Some(bytes) = floor else {
+        return Ok(());
+    };
+    let (floor, _) = decode_undo_floor(bytes)?;
+    if let Some(tip) = proposed_tip
+        && tip < floor
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("coinsdb commit tip {tip} is below undo floor {floor}"),
+        ));
+    }
+    Ok(())
+}
 
 /// The coin-record encoding a `coinsdb.redb` carries, stamped into
 /// `meta` at creation and read back on open. A database keeps its
@@ -745,6 +788,26 @@ impl CoinsBackend {
         decode_undo(g.value(), self.format)
     }
 
+    /// Reads only the block-hash prefix of a persisted undo row. Startup
+    /// reconciliation uses this to bind a floor-protected snapshot to the
+    /// backend's active branch without decoding the full undo payload.
+    #[must_use]
+    pub fn undo_block_hash(&self, height: u32) -> Option<crate::hash::BlockHash> {
+        let read = self.db.begin_read().ok()?;
+        let undo = read.open_table(UNDO).ok()?;
+        let record = undo.get(height).ok()??;
+        let bytes = record.value();
+        let prefix: [u8; 32] = bytes.get(..32)?.try_into().ok()?;
+        Some(crate::hash::BlockHash::from_bytes(prefix))
+    }
+
+    /// Whether this backend participates in dual-engine shadow validation.
+    /// Undo collection is intentionally disabled for that experimental mode.
+    #[must_use]
+    pub fn has_shadow(&self) -> bool {
+        self.shadow.is_some()
+    }
+
     /// Scan one admitted undo record for bounded input amounts without
     /// allocating or decoding its coins/scripts. The record-size limit does
     /// not hard-bound redb page allocation: intact pages may exceed it through
@@ -834,6 +897,169 @@ impl CoinsBackend {
             .and_then(|r| r.open_table(UNDO).ok())
             .and_then(|t| t.last().ok().flatten().map(|(k, _)| k.value()))
             .unwrap_or(0)
+    }
+
+    /// Reads the persisted undo rollback floor and its active-chain anchor.
+    /// Absence means an older database with no undo collection. Malformed
+    /// metadata is a startup error; callers must not silently reset it.
+    pub fn undo_floor(&self) -> std::io::Result<Option<(u32, crate::hash::BlockHash)>> {
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| std::io::Error::other(format!("coinsdb undo floor read: {e}")))?;
+        let meta = read
+            .open_table(META)
+            .map_err(|e| std::io::Error::other(format!("coinsdb undo floor meta: {e}")))?;
+        let Some(value) = meta
+            .get(K_UNDO_FLOOR)
+            .map_err(|e| std::io::Error::other(format!("coinsdb undo floor get: {e}")))?
+        else {
+            return Ok(None);
+        };
+        decode_undo_floor(value.value()).map(Some)
+    }
+
+    /// Persists a monotone rollback floor and removes at most 256 undo rows
+    /// at or below it in one atomic redb transaction. Matching admission rows
+    /// are removed when present; this deliberately does not repair incomplete
+    /// legacy admission coverage. Returns the number of undo rows removed.
+    ///
+    /// The caller must checkpoint/prune first and only use this on ordinary
+    /// redb mode. The floor anchor is committed with each deletion batch so a
+    /// crash cannot leave deleted undo rows without their recovery boundary.
+    pub fn advance_undo_floor_and_collect(
+        &self,
+        height: u32,
+        hash: crate::hash::BlockHash,
+    ) -> std::io::Result<u32> {
+        if self.engine != Engine::Redb {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "undo collection floor is supported only by redb coins storage",
+            ));
+        }
+        const DELETE_BATCH: usize = 256;
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|e| std::io::Error::other(format!("coinsdb undo floor begin: {e}")))?;
+        let mut meta = write
+            .open_table(META)
+            .map_err(|e| std::io::Error::other(format!("coinsdb undo floor meta: {e}")))?;
+        let existing = match meta
+            .get(K_UNDO_FLOOR)
+            .map_err(|e| std::io::Error::other(format!("coinsdb undo floor get: {e}")))?
+        {
+            Some(value) => decode_undo_floor(value.value())?,
+            None => (0, crate::hash::BlockHash::ZERO),
+        };
+        let committed_tip = meta
+            .get(K_TIP)
+            .map_err(|e| std::io::Error::other(format!("coinsdb tip get: {e}")))?
+            .map(|value| {
+                let bytes = value.value();
+                if bytes.len() != 4 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "coinsdb tip metadata has invalid length",
+                    ));
+                }
+                let mut raw = [0; 4];
+                raw.copy_from_slice(bytes);
+                Ok(u32::from_le_bytes(raw))
+            })
+            .transpose()?
+            .unwrap_or(0);
+        if height > committed_tip {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "undo collection floor exceeds the committed coins tip",
+            ));
+        }
+        if height < existing.0 || (height == existing.0 && existing.0 > 0 && hash != existing.1) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "coinsdb undo floor cannot move backward or change its anchor",
+            ));
+        }
+        let (floor, anchor) = if height > existing.0 {
+            (height, hash)
+        } else {
+            existing
+        };
+        if floor == 0 {
+            drop(meta);
+            write
+                .commit()
+                .map_err(|e| std::io::Error::other(format!("coinsdb undo floor commit: {e}")))?;
+            return Ok(0);
+        }
+        let mut floor_value = [0; 36];
+        floor_value[..4].copy_from_slice(&floor.to_le_bytes());
+        floor_value[4..].copy_from_slice(anchor.as_bytes());
+        meta.insert(K_UNDO_FLOOR, floor_value.as_slice())
+            .map_err(|e| std::io::Error::other(format!("coinsdb undo floor put: {e}")))?;
+        drop(meta);
+
+        let mut undo = write
+            .open_table(UNDO)
+            .map_err(|e| std::io::Error::other(format!("coinsdb undo table: {e}")))?;
+        let mut heights = Vec::with_capacity(DELETE_BATCH);
+        {
+            let rows = undo
+                .range(..=floor)
+                .map_err(|e| std::io::Error::other(format!("coinsdb undo prefix: {e}")))?;
+            for row in rows.take(DELETE_BATCH) {
+                let row =
+                    row.map_err(|e| std::io::Error::other(format!("coinsdb undo prefix: {e}")))?;
+                heights.push(row.0.value());
+            }
+        }
+        let mut admission = write
+            .open_table(UNDO_AMOUNT_ADMISSION)
+            .map_err(|e| std::io::Error::other(format!("coinsdb undo admission: {e}")))?;
+        for old_height in &heights {
+            let removed = undo
+                .remove(*old_height)
+                .map_err(|e| std::io::Error::other(format!("coinsdb undo delete: {e}")))?;
+            if removed.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "coinsdb undo prefix changed during collection transaction",
+                ));
+            }
+            drop(removed);
+            drop(admission.remove(*old_height).map_err(|e| {
+                std::io::Error::other(format!("coinsdb undo admission delete: {e}"))
+            })?);
+        }
+        drop(admission);
+        drop(undo);
+        write
+            .commit()
+            .map_err(|e| std::io::Error::other(format!("coinsdb undo collection commit: {e}")))?;
+        Ok(heights.len() as u32)
+    }
+
+    /// Whether another bounded undo-prefix collection batch is needed.
+    pub fn has_undo_at_or_below(&self, floor: u32) -> std::io::Result<bool> {
+        if self.engine != Engine::Redb {
+            return Ok(false);
+        }
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| std::io::Error::other(format!("coinsdb undo prefix probe: {e}")))?;
+        let undo = read
+            .open_table(UNDO)
+            .map_err(|e| std::io::Error::other(format!("coinsdb undo table: {e}")))?;
+        let mut rows = undo
+            .range(..=floor)
+            .map_err(|e| std::io::Error::other(format!("coinsdb undo prefix probe: {e}")))?;
+        rows.next()
+            .transpose()
+            .map(|row| row.is_some())
+            .map_err(|e| std::io::Error::other(format!("coinsdb undo prefix probe: {e}")))
     }
 
     /// Atomically commits a cache delta: `dirty` entries (`Some` =
@@ -926,6 +1152,14 @@ impl CoinsBackend {
         // then the bookkeeping tx — torn state always replays as
         // "commit the same delta again", which is idempotent.
         if let Some(h) = &self.hash {
+            if let (Some(tip), Some((floor, _))) = (tip, self.undo_floor()?)
+                && tip < floor
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("coinsdb commit tip {tip} is below undo floor {floor}"),
+                ));
+            }
             let delta = h.commit_coins(dirty, tip)?;
             h.sync()?;
             let w = self
@@ -988,6 +1222,11 @@ impl CoinsBackend {
                 let mut meta = w
                     .open_table(META)
                     .map_err(|e| std::io::Error::other(format!("coinsdb meta: {e}")))?;
+                let floor = meta
+                    .get(K_UNDO_FLOOR)
+                    .map_err(|e| std::io::Error::other(format!("coinsdb undo floor get: {e}")))?;
+                ensure_tip_respects_floor(floor.as_ref().map(|value| value.value()), tip)?;
+                drop(floor);
                 meta.insert(K_LEN, new_len.to_le_bytes().as_slice())
                     .map_err(|e| std::io::Error::other(format!("coinsdb meta len: {e}")))?;
                 if !new_undos.is_empty() {
@@ -1118,6 +1357,11 @@ impl CoinsBackend {
             let mut meta = w
                 .open_table(META)
                 .map_err(|e| std::io::Error::other(format!("coinsdb meta: {e}")))?;
+            let floor = meta
+                .get(K_UNDO_FLOOR)
+                .map_err(|e| std::io::Error::other(format!("coinsdb undo floor get: {e}")))?;
+            ensure_tip_respects_floor(floor.as_ref().map(|value| value.value()), tip)?;
+            drop(floor);
             meta.insert(K_LEN, new_len.to_le_bytes().as_slice())
                 .map_err(|e| std::io::Error::other(format!("coinsdb meta len: {e}")))?;
             if !new_undos.is_empty() {
@@ -1592,6 +1836,89 @@ mod tests {
             UndoAmountsResult::TooLarge,
             "the largest-record admission remains sticky after rewind"
         );
+        drop(be);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn undo_floor_collects_bounded_prefix_without_repairing_legacy_admissions() {
+        let dir = test_dir("undo-floor-prefix");
+        let be = CoinsBackend::open(&dir).unwrap();
+        let undos: Vec<_> = (1..=300)
+            .map(|height| (height, hash(height as u8), undo(height as u8)))
+            .collect();
+        be.commit(&HashMap::new(), &undos, 300).unwrap();
+
+        // Simulate an old/incomplete admission row above the collection
+        // boundary. Prefix GC must not manufacture trust for that history.
+        let write = be.db.begin_write().unwrap();
+        {
+            let mut admission = write.open_table(UNDO_AMOUNT_ADMISSION).unwrap();
+            drop(admission.remove(300).unwrap());
+        }
+        write.commit().unwrap();
+
+        // Fixture hashes use u8 tags rather than height-sized values.
+        let anchor = hash(43); // fixture row h299
+        assert_eq!(be.advance_undo_floor_and_collect(299, anchor).unwrap(), 256);
+        assert_eq!(be.undo_floor().unwrap(), Some((299, anchor)));
+        assert!(be.advance_undo_floor_and_collect(298, hash(42)).is_err());
+        assert!(be.advance_undo_floor_and_collect(299, hash(1)).is_err());
+        assert!(be.undo_at(256).is_none());
+        assert!(be.undo_at(257).is_some());
+        assert!(be.has_undo_at_or_below(299).unwrap());
+
+        assert_eq!(be.advance_undo_floor_and_collect(299, anchor).unwrap(), 43);
+        assert!(!be.has_undo_at_or_below(299).unwrap());
+        assert!(be.undo_at(299).is_none());
+        assert!(be.undo_at(300).is_some());
+        let read = be.db.begin_read().unwrap();
+        let undo = read.open_table(UNDO).unwrap();
+        let admission = read.open_table(UNDO_AMOUNT_ADMISSION).unwrap();
+        assert_eq!(undo.len().unwrap(), 1);
+        assert_eq!(admission.len().unwrap(), 0);
+        assert_eq!(
+            be.inspect_undo_amounts(&crate::undo_amounts::UndoAmountsRequest {
+                height: 300,
+                block_hash: hash(44),
+                tx_index: 1,
+                block_tx_count: 2,
+                input_count: 1,
+                input_offset: 0,
+                input_limit: 1,
+            }),
+            crate::undo_amounts::UndoAmountsResult::Unavailable
+        );
+        assert!(be.advance_undo_floor_and_collect(301, hash(45)).is_err());
+        assert!(be.commit(&HashMap::new(), &[], 298).is_err());
+        assert_eq!(be.tip_height(), 300, "a below-floor commit must roll back");
+        assert_eq!(
+            be.max_undo_height(),
+            300,
+            "a rejected rewind must preserve rows the transaction tried to delete"
+        );
+        drop(admission);
+        drop(undo);
+        drop(read);
+        drop(be);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn malformed_undo_floor_is_not_treated_as_legacy_absence() {
+        let dir = test_dir("undo-floor-malformed");
+        let be = CoinsBackend::open(&dir).unwrap();
+        let write = be.db.begin_write().unwrap();
+        {
+            let mut meta = write.open_table(META).unwrap();
+            meta.insert(K_UNDO_FLOOR, &[1, 2, 3][..]).unwrap();
+        }
+        write.commit().unwrap();
+        assert_eq!(
+            be.undo_floor().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(be.advance_undo_floor_and_collect(1, hash(1)).is_err());
         drop(be);
         std::fs::remove_dir_all(&dir).unwrap();
     }

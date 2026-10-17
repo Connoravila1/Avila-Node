@@ -143,9 +143,70 @@ hash query was made at 273,803, and no failure was injected live. IBD remains
 incomplete. See the
 [prune error-stop note](2026-10-17-prune-error-stop.md).
 
+## Experiment #91 — bounded persisted undo retention
+
+Can ordinary redb undo growth be reduced incrementally without crossing the
+active checkpoint or weakening recovery checks? The implementation advances
+a hash-bound undo floor only after a successful current-tip checkpoint and
+block prune, then removes at most 256 UNDO/admission keys per prune call.
+When a floor is present, restore fails closed if the snapshot does not match
+the floor's active-branch anchor; the legacy no-floor restore path is unchanged.
+Invalidation rejects below-floor targets before changing flags, then preflights
+required bodies/undos before rewind; no all-error-atomicity claim is made.
+Source guards restrict GC to ordinary redb; no qualification of runs, flat,
+AssumeUTXO, or the redb shadow mode is claimed. The 256-key batch is not a byte, redb
+page, or RSS bound; logical deletion does not shrink/compact the database.
+The code adds 12 focused tests and updates the floor-present crash-ahead test.
+Three initial native-gate attempts stopped at compile errors: an undefined
+test hash helper; borrowed metadata-table handling and an invalid floor-zero
+fixture; and overflowing `u8` fixture tags. A fourth attempt correctly caught
+a fixture that had not actually pruned its marker. These were fixed before any
+binary was installed. Gate attempt five passed: 628 debug consensus tests (four
+ignored), 1,189 release workspace tests (five ignored, including 86 GUI tests),
+and 17 Python tests; formatting, all-target/devtools Clippy, rustdoc, release
+builds, and smokes passed. The guard used a 2,560 MiB cap / 1,024 MiB reserve,
+peaking at 2,090 MiB over 345 seconds. Source fingerprint
+`2007ef695d70273d2aa9723e7d82871065a386b9c00a739a00e708888b1ce96c`, build
+revision `fc95eda` plus reviewed working-tree changes. CLI SHA-256
+`430a0e63557926efea9b7aabdaa705ceb25e8f088c872cd3378f5e03fdc9f1ce` and GUI
+SHA-256 `2d36a706dfbb69fcf1e7975d76b4d91e510bbdb646464fdfff3d3b5b4d42af9c`
+installed at 09:34:47.865285 UTC. Automatic restart verification passed at 09:35:44.787733 UTC. Manual continuity
+proof at 09:36:06.236955 UTC checked height 278,621 on new PID 1,318,056 and
+matched saved height 278,536; full-validation policy, exact CLI, 3,072 MiB cap,
+swap0, and arena2 were verified. Same PID was freshly observed at checked
+282,769 / blockchain 282,761 at 09:44:29.321384 UTC; no hash query at that later
+height. After a later clean CLI exit 0, a v4 checkpoint at 283,070 was captured and
+passed framed-checksum verification (99,261,719 bytes; SHA-256
+`20d2802be9160b9b38a80810b6d368fbd8bcebd10cc8c3eb9e301952c9127b0a`). The
+25-second closed-DB read-only sample (512 MiB cap/reserve, 511 MiB sampled incl.
+file cache) found the same 6,442,684,416-byte DB length and inode/mtime during
+read. Undo floor 225,832 with raw anchor recorded; key range 2,817–283,070,
+280,254 rows. Compared with the earlier height 278,536/278,536-row sample,
+tip advanced 4,534 but row count only 1,718, consistent with 2,816 old prefix
+rows collected (11 batches); logical undo bytes grew by 103,169,799. Admission
+rows rose by the full 4,534-height delta, so this sample observed no legacy
+admission-row collection. No physical shrink. The local stop wrapper initially
+reported failure despite CLI exit0; process absence and inactive service were
+verified before the RO read. This was operator-helper behavior, not a Rust
+change, and the repaired stop verifier awaits another stop. Post-measurement
+manual RPC proof passed at 09:50:11.929745 UTC on PID 1,358,692: saved height
+283,070 and persisted floor 225,832 both matched their RPC hashes; checked height
+283,195 under the exact CLI and full-validation policy. The supervisor
+restart-check field still referred to the earlier start, so this is not a
+second automatic restart-check result. Pre-change read-only stats at height 278,536 saw a 6,442,684,416-byte
+DB, 278,536 undo rows / 1,878,483,659 logical bytes, 8,123,178 coin rows /
+507,014,413 logical bytes, and 23,685 admission rows; floor absent, undo range
+1–278,536. A 22-second read-only pass under 512 MiB cap/reserve sampled 511 MiB
+including file cache; inode/size/mtime matched, no full-file hash or record
+iteration. The table entry count increased after prefix collection and the
+logical undo bytes grew; no whole-table size reduction, RSS reduction, physical
+file shrink, deep-reorg, or speed result is claimed. See the [bounded undo-retention note](2026-10-17-bounded-undo-retention.md).
+
 | # | Date | Experiment | Hypothesis | Verdict | Key numbers | Doc |
 |---|------|-----------|------------|---------|-------------|-----|
 | 90 | 10-17 | Fail-stop periodic prune errors | Should sync stop if a prune/checkpoint fails after async dirty-coin handoff? | **native gate, install, saved-hash restart, and same-process advance passed; limits remain** | Periodic prune errors now return `SyncError::Store`; no live failure injection. Gate: 616 debug (4 ignored), 1,177 release (5 ignored), 17 Python; Clippy/rustdoc/release/smokes passed, 2,098 MiB peak / 2,560 MiB cap. CLI `d3a0ce8b…`, GUI `c1fe7ac9…`; installed 09:10:43.958662 UTC. New PID 1,263,449 restarted at 273,718 and matched saved hash at 09:11:53.168564 UTC; full-script policy, 3,072 MiB cap, swap0, arena2. Same PID observed at 273,803 at 09:12:07.058162; no hash query at that height. Full IBD incomplete. | [prune error-stop](2026-10-17-prune-error-stop.md) |
+| 91 | 10-17 | Bounded persisted undo retention | Can ordinary redb undo rows be reclaimed in bounded batches after a hash-bound current checkpoint? | **gate/install, bounded prefix collection, and saved-checkpoint/floor-anchor restart proof passed; limits remain** | 628 debug consensus (4 ignored), 1,189 release workspace (5 ignored; includes GUI 86), 17 Python; fmt/Clippy/rustdoc/release/smokes passed. 2,090 MiB peak / 2,560 MiB cap, 1,024 MiB reserve. Source fp `2007ef69…`, build `fc95eda`+reviewed changes; CLI `430a0e63…`, GUI `2d36a706…`, installed 09:34:47.865285 UTC. At most 256 UNDO/admission keys per call, ordinary redb only. Auto/manual restart checked saved height 278,536 on PID 1,318,056 at 09:36:06.236955 UTC; same PID later observed at 282,769 / blockchain 282,761 without a hash query. After clean exit, captured v4 height 283,070 and measured persisted floor 225,832; first UNDO key advanced 1→2,817. With height +4,534 and rows +1,718, the observed prefix removal is consistent with 2,816 rows (11×256); logical undo bytes grew by 103,169,799 and file size remained 6,442,684,416 B. 25 s read-only at 512 MiB cap/reserve, sampled 511 MiB incl. file cache. Post-measurement manual RPC proof on new PID 1,358,692 matched saved height 283,070 and persisted floor 225,832/hash anchor; checked height 283,195 under full-validation policy and the same cap. Supervisor restart-check still referred to the earlier restart; local stop verifier not yet requalified. No second automatic-check claim. Pre-change DB: 6,442,684,416 bytes; 278,536 undo rows / 1,878,483,659 logical bytes; floor absent. 22 s read-only, 512 MiB cap/reserve, 511 MiB sampled including file cache. No physical shrink, RSS, reorg/body-availability, or speed claim. | [bounded undo retention](2026-10-17-bounded-undo-retention.md) |
+| 92 | 10-17 | Native transaction output paging | Does attached block detail navigate beyond the first 100 outputs? | **1440×900 pass; compact page 2 remains unverified** | Block 275,318 (1,339 tx), index 291 / txid `42af068a…` (1 input/111 outputs): 1–100 → 101–111 → 1–100 at 1440×900/100%, Next absent on final page. At 760×600/100%, only first page confirmed. First detail request showed OS error 11; explicit reselection recovered; fee unknown due incomplete retained-undo admission. GUI SHA-256 `2d36a706…`, source fp `2007ef69…`; same daemon PID 1,318,056 remained active at checked 282,769 after GUI close. Candidate finder: 4 bounded RPC pages; separate from GUI latency. | [native output paging](2026-10-17-native-output-paging.md) |
 | 89 | 10-17 | Read-only coinsdb storage measurement | Can closed redb table statistics quantify retained undo without record decoding or mutation? | **bounded read-only sample passed; cleanup design remains open** | File 3,944,288,256 bytes; undo 269,677 rows / 1,651,199,431 stored bytes; admission 14,826 rows. 19 s, 512 MiB cap/reserve, 511 MiB sampled including file cache. Unchanged inode/size/mtime; no full hash, decode, compaction, or undo GC. Restart matched saved ancestor at 273,569. | [storage measurement](2026-10-17-undo-storage-measurement.md) |
 | 88 | 10-17 | Checkpoint boundary for byte-budget pruning | Can checkpoint-before-delete avoid parked-body floor pinning while preserving crash recovery? | **native prune/restart and live periodic-prune proofs passed; limits remain** | Before: 88 files (0–87), 11,800,471,692 bytes. First after: 65 files (24–88), 8,628,801,147 bytes vs target (+38,866,555; within proof's 128 MiB observation tolerance, not a limit). No hard 8 GiB + 128 MiB bound between 60-second passes; high throughput can append more than one whole file. Same PID later reached 265,866 with 64 files (25–88), 8,578,585,794 bytes, below target. Auto restart at 264,970; saved hash matched at 265,336. Full-script policy, `pruned: true`; block 2,000 body unavailable. GUI attach/close smoke at 760×600 left daemon running. No live future-refetch, power-loss, deep-reorg, speed, IBD-completion, or accessibility claim. | [prune checkpoint](2026-10-17-prune-checkpoint-boundary.md) |
 | 87 | 10-17 | Historical input amounts from retained undo | Can inspection show bounded, source-labeled amounts without current-UTXO lookup or changing validation? | **native sampled proof passed; coverage remains limited** | RPC block 255,048 tx 1 and GUI block 257,285 tx 1 showed `block_undo` values and zero fees; wrong txid rejected; unavailable undo stayed unknown; empty `u32::MAX` page retained aggregate fee. Workspace gate: 1,172 Rust (5 ignored), 17 Python; Clippy/rustdoc/release/smokes passed, 2,031 MiB peak under 2,560 MiB cap. No positive-fee native sample, modern coverage, IBD completion, speed, or accessibility claim. | [undo amounts](2026-10-17-undo-inspector-amounts.md) |

@@ -154,9 +154,10 @@ At 1440×900 and 200%, the solid View-menu scrollbar exposes scale and privacy
 controls, stays open while scrolled, and closes after selecting a choice. With
 direct keyboard dispatch at 1440×900/100%, clicking index 0 then pressing Tab,
 Tab, Space focused and selected index 1 and opened its matching details. This
-verifies this row-focus sequence only; screen-reader behavior, a transaction
-with more than 100 outputs, missing-cookie recovery, and cross-platform behavior
-remain unverified. A 440-input transaction was paged natively (details below).
+verifies this row-focus sequence only; screen-reader behavior, 760×600 page 2
+for a transaction with more than 100 outputs, missing-cookie recovery, and
+cross-platform behavior remain unverified. A 440-input transaction was
+paged natively (details below); a later >100-output check is recorded below.
 This is not a full visual or accessibility audit.
 
 Native checks then used active mainnet block 257285, transaction 1
@@ -175,8 +176,9 @@ exited 0 and left the same daemon PID active while height advanced 256,261 →
 258,591. The GUI's 512 MiB cap / 512 MiB reserve run peaked at 108 MiB in 196 s.
 See the [undo-inspector experiment note](../experiments/2026-10-17-undo-inspector-amounts.md)
 for proof details. These checks do not claim full IBD completion, nonzero-fee
-rendering, screen-reader behavior, cross-platform behavior, or more than 100
-outputs.
+rendering, screen-reader behavior, or cross-platform behavior. This 257285
+sample does not establish >100-output paging; that was checked separately as
+described below.
 
 Launch with `--full-verify` to disable the assume-valid checkpoint for that run
 and verify historical scripts during initial sync, matching the CLI's
@@ -270,13 +272,29 @@ closed with exit 0 through Node → Close monitor; the same daemon PID continued
 from height 214,599 to 219,741 with five peers and 971,827 headers. Full IBD
 remains in progress; this is not a completion claim.
 
+A later native check used block 275318
+(`00000000000000028f7229a62048c5401bc1f9e939ff144c15abdf38c0c31091`), which
+contains 1,339 transactions. At 1440×900/100%, transaction index 291, txid
+`42af068a6fede69b672226affacb35083a6f4c226e17d0798f8f8436db272cf4`, showed
+one input and 111 outputs. The view advanced from outputs 1–100 to 101–111,
+removed Next on the last page, and Previous returned to outputs 1–100. At
+760×600/100%, page 1 was visible but page 2 was not confirmed. The first detail
+request returned OS error 11; explicit reselection recovered the 111 outputs.
+Fee stayed unknown because retained undo admission coverage was incomplete; no
+automatic retry or known-fee result is claimed. See the
+[native output-paging note](../experiments/2026-10-17-native-output-paging.md).
+The GUI closed with exit 0 and zero windows while daemon PID 1,318,056 remained
+active at checked height 282,769 (09:44:29.321384 UTC). This does not imply IBD
+completion.
+
 Native checks show wrapped transaction rows with weight and the full stacked
 next-block hash at 130%/760×600. At 200%/1440×900, the View menu's solid scrollbar
 exposes scale and privacy controls without overlap and keeps the menu open while
 scrolling. At 1440×900/100%, direct keyboard dispatch verified click index 0 →
 Tab to txid 0 → Tab to index 1 → Space selects transaction 1 and opens matching
-details. A transaction with more than 100 outputs, missing-cookie recovery,
-screen-reader behavior, and cross-platform behavior remain unverified.
+details. Missing-cookie recovery, screen-reader behavior, and cross-platform
+behavior remain unverified. The 1440×900/100% output-page flow is verified;
+760×600 page 2 and other scale combinations remain unverified.
 Do not use fixture or demo data for live attached-node checks.
 
 Keep native screenshots and provenance notes in a review-artifact directory
