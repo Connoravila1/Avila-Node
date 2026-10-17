@@ -901,17 +901,32 @@ mod tests {
         assert_eq!(MAX_CONTENTS_LEN, 1 + 12 + 4_000_000);
 
         let (mut a, mut b) = crate::testpipe::pair();
-        let pending = start_handshake(&mut a).unwrap();
+        // Fix initiator garbage at its maximum so this test always proves
+        // that the receive buffer can consume the complete handshake tail.
+        let garbage = vec![0x42; MAX_GARBAGE_LEN];
+        let (key, ellswift) = keypair([0x31; 32]).unwrap();
+        a.write_all(&ellswift.to_array()).unwrap();
+        a.write_all(&garbage).unwrap();
+        let pending = PendingHandshake {
+            key,
+            ellswift,
+            garbage,
+        };
         let mut ch_b = respond_handshake(&mut b, MAGIC).unwrap();
         let Handshake::V2(cipher_a, garbage_a) = finish_handshake(&mut a, pending, MAGIC).unwrap()
         else {
             panic!("v1 fallback on a v2 peer");
         };
         let mut ch_a = V2Channel::new(cipher_a, garbage_a);
-        a.write_all(&ch_a.handshake_tail()).unwrap();
-        let mut buf = [0u8; 4096];
+        let tail = ch_a.handshake_tail();
+        a.write_all(&tail).unwrap();
+        // The receive stream contains the maximum initial garbage plus
+        // terminator/version packet. Drain all of it before testing length.
+        let mut buf = [0u8; 8192];
         let n = b.read(&mut buf).unwrap();
+        assert_eq!(n, MAX_GARBAGE_LEN + tail.len());
         ch_b.feed(&buf[..n]).unwrap();
+        assert!(ch_b.saw_version);
 
         // One byte past the correct bound — still comfortably under the
         // old (too loose) 4 MiB one, so this pins the tighter value.
@@ -940,11 +955,17 @@ mod tests {
         else {
             panic!("v1 fallback on a v2 peer");
         };
+        let garbage_len = garbage_a.len();
         let mut ch_a = V2Channel::new(cipher_a, garbage_a);
-        a.write_all(&ch_a.handshake_tail()).unwrap();
-        let mut buf = [0u8; 4096];
+        let tail = ch_a.handshake_tail();
+        a.write_all(&tail).unwrap();
+        // The receive stream contains the previously sent garbage plus the
+        // terminator/version packet; read the entire bounded sequence.
+        let mut buf = [0u8; 8192];
         let n = b.read(&mut buf).unwrap();
+        assert_eq!(n, garbage_len + tail.len());
         ch_b.feed(&buf[..n]).unwrap();
+        assert!(ch_b.saw_version);
 
         // message, decoy, message, decoy — as the session's injection
         // emits them.
