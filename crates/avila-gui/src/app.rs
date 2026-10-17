@@ -762,7 +762,7 @@ impl eframe::App for App {
                     self.block_inspector.clear_fixture();
                 }
             }
-            pose_scroll = Some(pose.scroll);
+            pose_scroll = (!pose.block_fixture).then_some(pose.scroll);
             open_advanced = pose.advanced;
             self.prefs.hide_addresses = pose.hide;
             self.prefs.rhythm_clock = pose.clock;

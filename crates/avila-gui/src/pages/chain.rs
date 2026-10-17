@@ -97,9 +97,9 @@ pub fn show(
     ui.add_space(28.0);
     rhythm(ui, s, v, clock);
     ui.add_space(28.0);
-    recent(ui, s, v, inspector, node_sender.as_ref());
-    ui.add_space(20.0);
     inspector.ui(ui, node_sender.as_ref(), v.connected, v.headers);
+    ui.add_space(28.0);
+    recent(ui, s, v, inspector, node_sender.as_ref());
     None
 }
 

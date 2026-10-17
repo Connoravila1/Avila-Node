@@ -175,20 +175,29 @@ class Daemon:
         )
         cookie_path = os.path.join(self.datadir, cfg["cookie_dir"], ".cookie")
         deadline = time.time() + 60
+        last_rpc_error = None
         while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"bitcoind exited early for {suite}")
             if os.path.exists(cookie_path):
                 self.cookie = open(cookie_path).read().strip()
                 try:
-                    self.rpc("getblockchaininfo")
-                    break
-                except (urllib.error.URLError, ConnectionError, json.JSONDecodeError):
-                    time.sleep(0.25)
-            else:
-                time.sleep(0.25)
-                if self.proc.poll() is not None:
-                    raise RuntimeError(f"bitcoind exited early for {suite}")
+                    response = self.rpc("getblockchaininfo")
+                    if response.get("error") is None and isinstance(
+                        response.get("result"), dict
+                    ):
+                        break
+                    error = response.get("error")
+                    if isinstance(error, dict):
+                        last_rpc_error = f"RPC {error.get('code')}: {error.get('message')}"
+                    else:
+                        last_rpc_error = "unexpected getblockchaininfo response"
+                except (urllib.error.URLError, ConnectionError, json.JSONDecodeError) as err:
+                    last_rpc_error = str(err)
+            time.sleep(0.25)
         else:
-            raise RuntimeError(f"bitcoind for {suite} did not become ready")
+            detail = f"; last RPC response: {last_rpc_error}" if last_rpc_error else ""
+            raise RuntimeError(f"bitcoind for {suite} did not become ready{detail}")
 
     def rpc(self, method, *params):
         return self.rpc_batch([(method, list(params))])[0]

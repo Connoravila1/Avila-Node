@@ -23,6 +23,7 @@ pub struct State {
     lookup: Option<BlockLookup>,
     pending: Option<Receiver<BlockLookupResult>>,
     pending_since: Option<Instant>,
+    scroll_requested: bool,
     was_live: bool,
     #[cfg(feature = "devtools")]
     fixture: bool,
@@ -118,6 +119,7 @@ impl State {
         self.next_offset = None;
         self.message = None;
         self.draft = "0".into();
+        self.scroll_requested = true;
         self.fixture = true;
     }
 
@@ -171,6 +173,7 @@ impl State {
             return;
         }
         if tx_offset == 0 {
+            self.scroll_requested = true;
             self.lookup = Some(lookup);
             self.block = None;
             self.transactions.clear();
@@ -281,7 +284,10 @@ impl State {
         self.update_liveness(sender.is_some());
         self.poll();
         ui.separator();
-        ui.heading("Block inspector");
+        let heading = ui.heading("Block inspector");
+        if std::mem::take(&mut self.scroll_requested) {
+            heading.scroll_to_me(Some(egui::Align::TOP));
+        }
         if self.is_fixture() {
             ui.colored_label(
                 egui::Color32::from_rgb(198, 146, 72),

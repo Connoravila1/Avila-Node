@@ -63,6 +63,24 @@ re-anchoring it as an orphan while `HeaderTree` pre-seeds it; a reporting
 artifact, not a verdict difference). All seven named invalid cases produced
 identical reject reasons on both sides.
 
+
+### 2026-10-16 harness-readiness incident
+
+A later Core v31.1 recheck artifact (`target/reference-runs/headers-1792209288.json`)
+reported 2,047 signet disagreements, all with Core's identical `Loading banlist…`
+response versus Avila's `accepted`; the first was fixture header `signet-1` at
+index 1. The other suites remained clean: mainnet 4,031/0, testnet4 4,031/0,
+and regtest 295/0. This was not a signet consensus-rule mismatch:
+`Daemon.__init__` considered any parsed `getblockchaininfo` JSON response ready,
+including a warmup RPC error. The harness now waits for an error-free
+`getblockchaininfo` object result, checks early daemon exit, and reports the last
+RPC error if readiness times out. The corrected signet-only rerun passed all
+2,047 comparisons with zero mismatches (`target/reference-runs/headers-1792209432.json`);
+across all four suites the corrected run compared 10,404 headers with zero
+mismatches. The one-second signet run was too short for the resource sampler to
+capture peak memory. The initial warmup artifact's entries are not consensus
+verdicts.
+
 ## Results
 
 Artifact: `target/scorecard/headers-1789357657.json` (gitignored; raw per-rep
