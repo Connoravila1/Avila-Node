@@ -95,10 +95,11 @@ The native GUI showed block 257,285 transaction 1
 (`e0236df7f02f5611faa1de318c3e462477a0aa6e8939b7ab0ae30d94dd4085ea`): one
 input at 7.22282802 BTC, two outputs, zero fee, 258 vB, 0.00 sat/vB, the
 `block_undo` source caption, and the per-input value at both 1440×900 and
-760×600 at 100%. An initial request timed out with OS error 11; explicit
-reselection later showed unknown amounts after the in-memory undo moved to the
-persisted backend, whose historical admission coverage was incomplete. The UI
-displayed that unavailable state; this is not evidence of automatic retry.
+760×600 at 100%. Separately, an earlier query of block 255,048 returned amounts
+over RPC, but a later GUI detail response showed them unknown. This is consistent
+with incomplete persisted admission coverage, but the exact undo tier and timing
+were not proven. The UI displayed that unavailable state; this is not evidence
+of automatic retry.
 Closing the GUI monitor exited 0 without stopping the same
 daemon PID, which advanced from height 256,261 to 258,591. The GUI proof ran
 under a 512 MiB cap and 512 MiB reserve, peaked at 108 MiB, and took 196 seconds.
@@ -107,7 +108,8 @@ The saved restart proof, RPC proof, and GUI proof are recorded in the local
 evidence files `undo-amounts-restart-proof.json`,
 `undo-amounts-native-rpc-proof.json`, and `undo-amounts-native-ui-proof.json`;
 the GUI transaction came from the recorded fixture. No native positive-fee
-transaction was demonstrated (nonzero fee is covered by tests). IBD remains
+transaction was demonstrated in this earlier proof (a later native positive-fee
+sample is recorded separately). IBD remains
 incomplete, and the armed 600,000–600,127 receipt-window collection has no
 result yet. These checks establish bounded display behavior on the sampled
 transactions, not modern-chain coverage, speedup, full IBD completion, or

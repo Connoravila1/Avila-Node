@@ -77,8 +77,9 @@ The block inspector now reports input amounts and fee only when they are
 available from active-chain, hash-pinned undo; missing undo remains explicitly
 unknown. Native RPC and GUI checks showed sampled zero-fee transactions,
 rejected a wrong txid, preserved aggregates on an empty `u32::MAX` page, and
-showed unknown amounts after in-memory undo moved to the persisted backend,
-where historical admission coverage was incomplete. The guarded workspace
+showed unknown amounts on a later GUI detail request. This is consistent with
+incomplete persisted admission coverage; the exact undo tier and timing were
+not proven. The guarded workspace
 gate passed 1,172 Rust tests (five ignored), 17 Python tests, Clippy, rustdoc,
 release builds, and CLI smokes at 2,031 MiB peak / 2,560 MiB cap. GUI checks at
 1440×900 and 760×600 passed; GUI close left the daemon running. No native
@@ -202,8 +203,30 @@ iteration. The table entry count increased after prefix collection and the
 logical undo bytes grew; no whole-table size reduction, RSS reduction, physical
 file shrink, deep-reorg, or speed result is claimed. See the [bounded undo-retention note](2026-10-17-bounded-undo-retention.md).
 
+## Experiment #93 — compact output paging and positive-fee rendering
+
+This native follow-up closes two UI-only qualification gaps using the unchanged
+attached GUI binary. At 760×600/100%, real block 275318 transaction 291 (1 input,
+111 outputs) paged 1–100 → 101–111 → 1–100; Next disappeared on the last page,
+and output 100 showed 0.01 BTC. Retries and outer-page repositioning were needed;
+automatic retry was not established. At both 760×600 and 1440×900/100%, block
+293782 transaction 2 displayed input total 613.289 BTC, outputs 613.2889 BTC,
+10,000 sat positive fee and 44.44 sat/vB at 225 vB / 900 WU. The source label
+was `block_undo`; the RPC does not distinguish memory-tail from backend storage.
+Earlier candidate detail responses displayed unknown after RPC fees were known;
+this is consistent with incomplete persisted admission coverage, but exact tier
+and timing were not proven. The fourth bounded candidate-finder invocation used
+seven RPCs, completing in two seconds under 128 MiB cap/reserve with 12 MiB peak;
+each invocation was bounded to 12 calls, 2 MiB responses, and 15 s per request.
+The 512 MiB GUI guard peaked at 85 MiB over 431 s. GUI exited 0 with no windows;
+the same CLI PID was subsequently observed at 294,471 checked / 971,839 headers,
+historical scripts required. IBD remains incomplete. No source or binary change,
+automatic retry, delayed-RPC, screen-reader, cross-platform, or storage-tier
+claim. See the [compact paging and positive-fee note](2026-10-17-compact-paging-positive-fee.md).
+
 | # | Date | Experiment | Hypothesis | Verdict | Key numbers | Doc |
 |---|------|-----------|------------|---------|-------------|-----|
+| 93 | 10-17 | Compact output paging and positive-fee rendering | Does the attached inspector page >100 outputs at 760×600 and render a real positive fee? | **scoped native checks passed; tier and broader accessibility remain unqualified** | Block 275,318 tx index 291/1 input/111 outputs: 1–100→101–111→1–100 at 760×600/100%, 500 summaries loaded; Next absent on last page, output 100=0.01 BTC. Block 293,782 tx index 2: 613.289 BTC inputs, 613.2889 BTC outputs, 10,000 sat fee, 44.44 sat/vB at 225 vB/900 WU, rendered at 760×600 and 1440×900/100%. GUI SHA-256 unchanged `2d36a706…`, source fp `2007ef69…`; 512 MiB guard, 85 MiB peak/431 s; close exit0 left node active. Finder's successful 4th invocation: 7 calls/2 s, 12 MiB peak under 128 MiB cap/reserve. Checked height 294,471 / 971,839 headers, historical scripts required; IBD incomplete. | [compact paging + positive fee](2026-10-17-compact-paging-positive-fee.md) |
 | 90 | 10-17 | Fail-stop periodic prune errors | Should sync stop if a prune/checkpoint fails after async dirty-coin handoff? | **native gate, install, saved-hash restart, and same-process advance passed; limits remain** | Periodic prune errors now return `SyncError::Store`; no live failure injection. Gate: 616 debug (4 ignored), 1,177 release (5 ignored), 17 Python; Clippy/rustdoc/release/smokes passed, 2,098 MiB peak / 2,560 MiB cap. CLI `d3a0ce8b…`, GUI `c1fe7ac9…`; installed 09:10:43.958662 UTC. New PID 1,263,449 restarted at 273,718 and matched saved hash at 09:11:53.168564 UTC; full-script policy, 3,072 MiB cap, swap0, arena2. Same PID observed at 273,803 at 09:12:07.058162; no hash query at that height. Full IBD incomplete. | [prune error-stop](2026-10-17-prune-error-stop.md) |
 | 91 | 10-17 | Bounded persisted undo retention | Can ordinary redb undo rows be reclaimed in bounded batches after a hash-bound current checkpoint? | **gate/install, bounded prefix collection, and saved-checkpoint/floor-anchor restart proof passed; limits remain** | 628 debug consensus (4 ignored), 1,189 release workspace (5 ignored; includes GUI 86), 17 Python; fmt/Clippy/rustdoc/release/smokes passed. 2,090 MiB peak / 2,560 MiB cap, 1,024 MiB reserve. Source fp `2007ef69…`, build `fc95eda`+reviewed changes; CLI `430a0e63…`, GUI `2d36a706…`, installed 09:34:47.865285 UTC. At most 256 UNDO/admission keys per call, ordinary redb only. Auto/manual restart checked saved height 278,536 on PID 1,318,056 at 09:36:06.236955 UTC; same PID later observed at 282,769 / blockchain 282,761 without a hash query. After clean exit, captured v4 height 283,070 and measured persisted floor 225,832; first UNDO key advanced 1→2,817. With height +4,534 and rows +1,718, the observed prefix removal is consistent with 2,816 rows (11×256); logical undo bytes grew by 103,169,799 and file size remained 6,442,684,416 B. 25 s read-only at 512 MiB cap/reserve, sampled 511 MiB incl. file cache. Post-measurement manual RPC proof on new PID 1,358,692 matched saved height 283,070 and persisted floor 225,832/hash anchor; checked height 283,195 under full-validation policy and the same cap. Supervisor restart-check still referred to the earlier restart; local stop verifier not yet requalified. No second automatic-check claim. Pre-change DB: 6,442,684,416 bytes; 278,536 undo rows / 1,878,483,659 logical bytes; floor absent. 22 s read-only, 512 MiB cap/reserve, 511 MiB sampled including file cache. No physical shrink, RSS, reorg/body-availability, or speed claim. | [bounded undo retention](2026-10-17-bounded-undo-retention.md) |
 | 92 | 10-17 | Native transaction output paging | Does attached block detail navigate beyond the first 100 outputs? | **1440×900 pass; compact page 2 remains unverified** | Block 275,318 (1,339 tx), index 291 / txid `42af068a…` (1 input/111 outputs): 1–100 → 101–111 → 1–100 at 1440×900/100%, Next absent on final page. At 760×600/100%, only first page confirmed. First detail request showed OS error 11; explicit reselection recovered; fee unknown due incomplete retained-undo admission. GUI SHA-256 `2d36a706…`, source fp `2007ef69…`; same daemon PID 1,318,056 remained active at checked 282,769 after GUI close. Candidate finder: 4 bounded RPC pages; separate from GUI latency. | [native output paging](2026-10-17-native-output-paging.md) |

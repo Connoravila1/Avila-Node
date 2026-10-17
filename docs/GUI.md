@@ -154,10 +154,11 @@ At 1440×900 and 200%, the solid View-menu scrollbar exposes scale and privacy
 controls, stays open while scrolled, and closes after selecting a choice. With
 direct keyboard dispatch at 1440×900/100%, clicking index 0 then pressing Tab,
 Tab, Space focused and selected index 1 and opened its matching details. This
-verifies this row-focus sequence only; screen-reader behavior, 760×600 page 2
-for a transaction with more than 100 outputs, missing-cookie recovery, and
-cross-platform behavior remain unverified. A 440-input transaction was
-paged natively (details below); a later >100-output check is recorded below.
+verifies this row-focus sequence only. At that check, screen-reader behavior,
+760×600 page 2 for a transaction with more than 100 outputs, missing-cookie
+recovery, and cross-platform behavior were unverified. A 440-input
+transaction was paged natively (details below); later >100-output and positive-fee
+checks are recorded below.
 This is not a full visual or accessibility audit.
 
 Native checks then used active mainnet block 257285, transaction 1
@@ -165,18 +166,19 @@ Native checks then used active mainnet block 257285, transaction 1
 1440×900 and 760×600, both at 100% scale, the inspector showed input value
 7.22282802 BTC, total fee 0 BTC, rate 0.00 sat/vB at 258 vB, the block-undo
 source caption, and the per-input amount. An earlier query of block 255048
-initially returned amounts over RPC, but the GUI later showed them unknown after
-the undo moved from in-memory tail to a persisted backend whose historical
-admission coverage was incomplete; the database was not backfilled. The first
+initially returned amounts over RPC, but a later GUI detail response showed
+them unknown. This is consistent with incomplete persisted admission coverage;
+the exact undo tier and timing were not proven, and the database was not
+backfilled. The first
 GUI detail request visibly timed out with OS error 11. Selecting the row again
-recovered the detail; this
-does not establish automatic retry behavior. The native sample had a zero fee;
-nonzero-fee rendering is not yet established by a native fixture. GUI close
+recovered the detail; this does not establish automatic retry behavior. This
+native sample had a zero fee; a later, separate native check established
+positive-fee rendering. GUI close
 exited 0 and left the same daemon PID active while height advanced 256,261 →
 258,591. The GUI's 512 MiB cap / 512 MiB reserve run peaked at 108 MiB in 196 s.
 See the [undo-inspector experiment note](../experiments/2026-10-17-undo-inspector-amounts.md)
-for proof details. These checks do not claim full IBD completion, nonzero-fee
-rendering, screen-reader behavior, or cross-platform behavior. This 257285
+for proof details. These checks do not claim full IBD completion, screen-reader
+behavior, or cross-platform behavior. This 257285
 sample does not establish >100-output paging; that was checked separately as
 described below.
 
@@ -272,20 +274,42 @@ closed with exit 0 through Node → Close monitor; the same daemon PID continued
 from height 214,599 to 219,741 with five peers and 971,827 headers. Full IBD
 remains in progress; this is not a completion claim.
 
-A later native check used block 275318
+The earlier #92 native check used block 275318
 (`00000000000000028f7229a62048c5401bc1f9e939ff144c15abdf38c0c31091`), which
 contains 1,339 transactions. At 1440×900/100%, transaction index 291, txid
 `42af068a6fede69b672226affacb35083a6f4c226e17d0798f8f8436db272cf4`, showed
 one input and 111 outputs. The view advanced from outputs 1–100 to 101–111,
 removed Next on the last page, and Previous returned to outputs 1–100. At
-760×600/100%, page 1 was visible but page 2 was not confirmed. The first detail
+760×600/100%, page 1 was visible but page 2 was not confirmed in that attempt. The first detail
 request returned OS error 11; explicit reselection recovered the 111 outputs.
 Fee stayed unknown because retained undo admission coverage was incomplete; no
-automatic retry or known-fee result is claimed. See the
+automatic retry or known-fee result was established in that attempt. See the
 [native output-paging note](../experiments/2026-10-17-native-output-paging.md).
 The GUI closed with exit 0 and zero windows while daemon PID 1,318,056 remained
 active at checked height 282,769 (09:44:29.321384 UTC). This does not imply IBD
-completion.
+completion. The later #93 check below supersedes the small-viewport limitation
+for this transaction; this earlier proof and its binary hash are unchanged.
+
+Follow-up native checks at 760×600/100% completed block 275318 output paging:
+outputs 1–100 → 101–111 → 1–100, with Next absent on the last page and output
+index 100 shown as 0.01000000 BTC. This required request retries and repositioning
+the outer page; it does not establish automatic retry. A separate positive-fee
+sample used active mainnet block 293782, transaction index 2
+(`03fb74fc931fbcf8f0bf194cd5c97328f3459ef60b266f8305443e29711f1276`): one
+input, two outputs, 613.289 BTC input total, 613.2889 BTC output total, 10,000
+sats (0.0001 BTC) fee, and 44.44 sat/vB at 225 vB (900 WU). The block-undo
+source was shown at both 760×600 and 1440×900/100%; resizing reused the same
+detail snapshot. The RPC labels the source as block undo but does not identify
+whether a value came from the in-memory tail or persisted backend, so no storage-
+tier claim is made. Earlier candidates returned unknown in the GUI after their
+RPC fee result; this is consistent with incomplete persisted admission coverage,
+but the exact storage tier and timing were not proven. The bounded finder made
+four invocations with at most 12 requests per invocation, 2 MiB per response, and 15 seconds per
+request; its successful invocation used seven calls in two seconds. The GUI run
+used a 512 MiB cap/reserve, peaked at 85 MiB over 431 seconds, and closed with
+exit 0 and zero GUI windows. The same CLI PID 1,358,692 was observed at checked height
+294,471 / 971,839 headers with historical scripts required; IBD remains
+incomplete. See the [compact paging and positive-fee note](../experiments/2026-10-17-compact-paging-positive-fee.md).
 
 Native checks show wrapped transaction rows with weight and the full stacked
 next-block hash at 130%/760×600. At 200%/1440×900, the View menu's solid scrollbar
@@ -293,8 +317,9 @@ exposes scale and privacy controls without overlap and keeps the menu open while
 scrolling. At 1440×900/100%, direct keyboard dispatch verified click index 0 →
 Tab to txid 0 → Tab to index 1 → Space selects transaction 1 and opens matching
 details. Missing-cookie recovery, screen-reader behavior, and cross-platform
-behavior remain unverified. The 1440×900/100% output-page flow is verified;
-760×600 page 2 and other scale combinations remain unverified.
+behavior remain unverified. Output paging is verified for the selected 111-output
+transaction at 760×600 and 1440×900, both at 100%; other scale combinations,
+automatic retry, and delayed native RPC remain unverified.
 Do not use fixture or demo data for live attached-node checks.
 
 Keep native screenshots and provenance notes in a review-artifact directory
