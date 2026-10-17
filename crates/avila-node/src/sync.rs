@@ -462,6 +462,18 @@ pub enum ControlMsg {
         tx_limit: u16,
         reply: std::sync::mpsc::SyncSender<crate::inspect::BlockLookupResult>,
     },
+    /// Read-only detail for one transaction, pinned to its block hash. Each
+    /// side has an independently bounded page and a nonblocking reply.
+    InspectBlockTx {
+        block_hash: avila_consensus::hash::BlockHash,
+        txid: avila_consensus::hash::Txid,
+        tx_index: u32,
+        input_offset: u32,
+        input_limit: u16,
+        output_offset: u32,
+        output_limit: u16,
+        reply: std::sync::mpsc::SyncSender<crate::inspect::BlockTxDetailResult>,
+    },
     /// `config describe` path + the new value as JSON.
     Set {
         path: String,
@@ -1929,6 +1941,28 @@ pub fn run(
                     } => {
                         let _ = reply
                             .try_send(crate::inspect::inspect(&cs, lookup, tx_offset, tx_limit));
+                        continue;
+                    }
+                    ControlMsg::InspectBlockTx {
+                        block_hash,
+                        txid,
+                        tx_index,
+                        input_offset,
+                        input_limit,
+                        output_offset,
+                        output_limit,
+                        reply,
+                    } => {
+                        let _ = reply.try_send(crate::inspect::inspect_transaction(
+                            &cs,
+                            block_hash,
+                            txid,
+                            tx_index,
+                            input_offset,
+                            input_limit,
+                            output_offset,
+                            output_limit,
+                        ));
                         continue;
                     }
                 };

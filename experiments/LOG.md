@@ -2080,3 +2080,26 @@ bounded store against the same full-validation rules before considering any
 mainnet path. See
 [the experiment note](2026-10-16-swift-checkpoint-shadow.md) for guarded
 commands and detailed limits.
+
+## Experiment #80 — bounded block inspection and live GUI follow-up
+
+The stage-3 transaction-inspection RPC and interactive block map were
+validated alongside the attached-GUI flow. The full native gate passed with
+1,148 tests passed, five ignored, and zero failures; its 2,560 MiB cap / 1,024
+MiB reserve run peaked at 1,292 MiB and took 218 seconds. The separate GUI
+paint follow-up passed 82 tests (GUI-only gate: 753 MiB peak, 54 seconds).
+These results cover the tested endpoints and layouts, not unverified paging,
+zoom, or screen-reader behavior recorded in the GUI inventory.
+
+The bounded early-chain receipt sampler completed its 128-block window at
+heights 116,138–116,265. It recorded 1,103 transactions, 1,920 spent inputs,
+2,192 created outputs, and 975 `script_checks`; the enclosing sampled status
+interval was 116,123–116,277 (154 actual blocks, with 14 prefix and 12 suffix
+blocks), so it does not measure the exact 128-block duration. This is an
+early-chain observation only, with no speedup, modern-chain, or end-to-end IBD
+claim. See the
+[live IBD receipt-window protocol and result](2026-10-17-live-ibd-receipt-window.md)
+for timing, resource, and uncertainty details. The sampler's 14 Python tests
+passed; a separate 600,000–600,127 watcher is armed with a pinned node PID but
+has no result yet because the node remains far from that height and IBD is
+incomplete.

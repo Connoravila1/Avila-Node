@@ -2843,6 +2843,20 @@ fn param<'a>(params: &'a Value, index: usize, name: &str) -> Option<&'a Value> {
     params.get(index).or_else(|| params.get(name))
 }
 
+fn parse_detail_page_limit(params: &Value, index: usize, name: &str) -> Result<u16, (i64, String)> {
+    match param(params, index, name) {
+        None | Some(Value::Null) => Ok(crate::inspect::MAX_TX_DETAIL_PAGE),
+        Some(Value::Number(number)) => match number.as_u64() {
+            Some(value @ 1..=100) => Ok(value as u16),
+            _ => Err((
+                RPC_INVALID_PARAMETER,
+                format!("{name} must be an integer between 1 and 100"),
+            )),
+        },
+        Some(value) => Err((RPC_TYPE_ERROR, field_type_message(value, "number"))),
+    }
+}
+
 /// `logging`'s mutable category state — Core's `g_logger` category
 /// set. The toggles are advisory: our log sites don't yet gate on
 /// categories, but the RPC contract (include/exclude ordering, the
@@ -3700,6 +3714,7 @@ const DECODESCRIPT_HELP: &str = "decodescript \"hexstring\"\n\nDecode a hex-enco
 const GETBLOCKHASH_HELP: &str = "getblockhash height\n\nReturns hash of block in best-block-chain at height provided.\n\nArguments:\n1. height    (numeric, required) The height index\n\nResult:\n\"hex\"    (string) The block hash\n\nExamples:\n> bitcoin-cli getblockhash 1000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockhash\", \"params\": [1000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const GETBLOCKHEADER_HELP: &str = "getblockheader \"blockhash\" ( verbose )\n\nIf verbose is false, returns a string that is serialized, hex-encoded data for blockheader 'hash'.\nIf verbose is true, returns an Object with information about blockheader <hash>.\n\nArguments:\n1. blockhash    (string, required) The block hash\n2. verbose      (boolean, optional, default=true) true for a json object, false for the hex-encoded data\n\nResult (for verbose = true):\n{                                 (json object)\n  \"hash\" : \"hex\",                 (string) the block hash (same as provided)\n  \"confirmations\" : n,            (numeric) The number of confirmations, or -1 if the block is not on the main chain\n  \"height\" : n,                   (numeric) The block height or index\n  \"version\" : n,                  (numeric) The block version\n  \"versionHex\" : \"hex\",           (string) The block version formatted in hexadecimal\n  \"merkleroot\" : \"hex\",           (string) The merkle root\n  \"time\" : xxx,                   (numeric) The block time expressed in UNIX epoch time\n  \"mediantime\" : xxx,             (numeric) The median block time expressed in UNIX epoch time\n  \"nonce\" : n,                    (numeric) The nonce\n  \"bits\" : \"hex\",                 (string) nBits: compact representation of the block difficulty target\n  \"target\" : \"hex\",               (string) The difficulty target\n  \"difficulty\" : n,               (numeric) The difficulty\n  \"chainwork\" : \"hex\",            (string) Expected number of hashes required to produce the current chain\n  \"nTx\" : n,                      (numeric) The number of transactions in the block\n  \"previousblockhash\" : \"hex\",    (string, optional) The hash of the previous block (if available)\n  \"nextblockhash\" : \"hex\"         (string, optional) The hash of the next block (if available)\n}\n\nResult (for verbose=false):\n\"hex\"    (string) A string that is serialized, hex-encoded data for block 'hash'\n\nExamples:\n> bitcoin-cli getblockheader \"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockheader\", \"params\": [\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const GETBLOCKINSPECT_HELP: &str = "getblockinspect height_or_hash ( tx_offset tx_limit )\n\nReturn a bounded, read-only block summary and one transaction page from locally indexed chainstate. A numeric first argument selects a height; a 64-character hexadecimal string selects a block hash. Missing/pruned bodies are reported in body_state and are not fetched from peers.\n\nArguments:\n1. height_or_hash (numeric or string, required) Block height or 64-character block hash\n2. tx_offset      (numeric, optional, default=0) First transaction index\n3. tx_limit       (numeric, optional, default=100, maximum=250) Transactions to return\n\nResult: a tagged object with status `found`, `not_found`, or `error`; `found` includes block metadata, transactions, and next_offset.\n";
+const GETBLOCKTXINSPECT_HELP: &str = "getblocktxinspect \"block_hash\" \"txid\" tx_index ( input_offset input_limit output_offset output_limit )\n\nReturn bounded read-only details for one transaction in an already indexed local block body. The transaction is pinned by block hash, txid, and index. Prevout values and fees are not looked up; they remain unknown. Scripts are returned as short hexadecimal prefixes. Missing, pruned, header-only, or unavailable bodies are reported without fetching from peers.\n\nArguments:\n1. block_hash   (string, required) 64-character block hash\n2. txid         (string, required) 64-character transaction id\n3. tx_index     (numeric, required) Transaction index in that block\n4. input_offset (numeric, optional, default=0) First input index\n5. input_limit  (numeric, optional, default=100, maximum=100) Inputs to return\n6. output_offset (numeric, optional, default=0) First output index\n7. output_limit (numeric, optional, default=100, maximum=100) Outputs to return\n\nResult: tagged `not_found`, `body_unavailable`, `found`, or `error`; found details include block validation identity and independent next offsets for input and output pages.\n";
 const GETBLOCK_HELP: &str = "getblock \"blockhash\" ( verbosity )\n\nIf verbosity is 0, returns a string that is serialized, hex-encoded data for block 'hash'.\nIf verbosity is 1, returns an Object with information about block <hash>.\nIf verbosity is 2, returns an Object with information about block <hash> and information about each transaction.\nIf verbosity is 3, returns an Object with information about block <hash> and information about each transaction, including prevout information for inputs (only for unpruned blocks in the current best chain).\n\nArguments:\n1. blockhash    (string, required) The block hash\n2. verbosity    (numeric, optional, default=1) 0 for hex-encoded data, 1 for a JSON object, 2 for JSON object with transaction data, and 3 for JSON object with transaction data including prevout information for inputs\n\nResult (for verbosity = 0):\n\"hex\"    (string) A string that is serialized, hex-encoded data for block 'hash'\n\nResult (for verbosity = 1):\n{                                 (json object)\n  \"hash\" : \"hex\",                 (string) the block hash (same as provided)\n  \"confirmations\" : n,            (numeric) The number of confirmations, or -1 if the block is not on the main chain\n  \"size\" : n,                     (numeric) The block size\n  \"strippedsize\" : n,             (numeric) The block size excluding witness data\n  \"weight\" : n,                   (numeric) The block weight as defined in BIP 141\n  \"height\" : n,                   (numeric) The block height or index\n  \"version\" : n,                  (numeric) The block version\n  \"versionHex\" : \"hex\",           (string) The block version formatted in hexadecimal\n  \"merkleroot\" : \"hex\",           (string) The merkle root\n  \"tx\" : [                        (json array) The transaction ids\n    \"hex\",                        (string) The transaction id\n    ...\n  ],\n  \"time\" : xxx,                   (numeric) The block time expressed in UNIX epoch time\n  \"mediantime\" : xxx,             (numeric) The median block time expressed in UNIX epoch time\n  \"nonce\" : n,                    (numeric) The nonce\n  \"bits\" : \"hex\",                 (string) nBits: compact representation of the block difficulty target\n  \"target\" : \"hex\",               (string) The difficulty target\n  \"difficulty\" : n,               (numeric) The difficulty\n  \"chainwork\" : \"hex\",            (string) Expected number of hashes required to produce the chain up to this block (in hex)\n  \"nTx\" : n,                      (numeric) The number of transactions in the block\n  \"previousblockhash\" : \"hex\",    (string, optional) The hash of the previous block (if available)\n  \"nextblockhash\" : \"hex\"         (string, optional) The hash of the next block (if available)\n}\n\nResult (for verbosity = 2):\n{                   (json object)\n  ...,              Same output as verbosity = 1\n  \"tx\" : [          (json array)\n    {               (json object)\n      ...,          The transactions in the format of the getrawtransaction RPC. Different from verbosity = 1 \"tx\" result\n      \"fee\" : n     (numeric) The transaction fee in BTC, omitted if block undo data is not available\n    },\n    ...\n  ]\n}\n\nResult (for verbosity = 3):\n{                                        (json object)\n  ...,                                   Same output as verbosity = 2\n  \"tx\" : [                               (json array)\n    {                                    (json object)\n      \"vin\" : [                          (json array)\n        {                                (json object)\n          ...,                           The same output as verbosity = 2\n          \"prevout\" : {                  (json object) (Only if undo information is available)\n            \"generated\" : true|false,    (boolean) Coinbase or not\n            \"height\" : n,                (numeric) The height of the prevout\n            \"value\" : n,                 (numeric) The value in BTC\n            \"scriptPubKey\" : {           (json object)\n              \"asm\" : \"str\",             (string) Disassembly of the output script\n              \"desc\" : \"str\",            (string) Inferred descriptor for the output\n              \"hex\" : \"hex\",             (string) The raw output script bytes, hex-encoded\n              \"address\" : \"str\",         (string, optional) The Bitcoin address (only if a well-defined address exists)\n              \"type\" : \"str\"             (string) The type (one of: nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n            }\n          }\n        },\n        ...\n      ]\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli getblock \"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblock\", \"params\": [\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const GETBLOCKSTATS_HELP: &str = "getblockstats hash_or_height ( stats )\n\nCompute per block statistics for a given window. All amounts are in satoshis.\nIt won't work for some heights with pruning.\n\nArguments:\n1. hash_or_height    (string or numeric, required) The block hash or height of the target block\n2. stats             (json array, optional, default=all values) Values to plot (see result below)\n     [\n       \"height\",     (string) Selected statistic\n       \"time\",       (string) Selected statistic\n       ...\n     ]\n\nResult:\n{                                (json object)\n  \"avgfee\" : n,                  (numeric, optional) Average fee in the block\n  \"avgfeerate\" : n,              (numeric, optional) Average feerate (in satoshis per virtual byte)\n  \"avgtxsize\" : n,               (numeric, optional) Average transaction size\n  \"blockhash\" : \"hex\",           (string, optional) The block hash (to check for potential reorgs)\n  \"feerate_percentiles\" : [      (json array, optional) Feerates at the 10th, 25th, 50th, 75th, and 90th percentile weight unit (in satoshis per virtual byte)\n    n,                           (numeric) The 10th percentile feerate\n    n,                           (numeric) The 25th percentile feerate\n    n,                           (numeric) The 50th percentile feerate\n    n,                           (numeric) The 75th percentile feerate\n    n                            (numeric) The 90th percentile feerate\n  ],\n  \"height\" : n,                  (numeric, optional) The height of the block\n  \"ins\" : n,                     (numeric, optional) The number of inputs (excluding coinbase)\n  \"maxfee\" : n,                  (numeric, optional) Maximum fee in the block\n  \"maxfeerate\" : n,              (numeric, optional) Maximum feerate (in satoshis per virtual byte)\n  \"maxtxsize\" : n,               (numeric, optional) Maximum transaction size\n  \"medianfee\" : n,               (numeric, optional) Truncated median fee in the block\n  \"mediantime\" : n,              (numeric, optional) The block median time past\n  \"mediantxsize\" : n,            (numeric, optional) Truncated median transaction size\n  \"minfee\" : n,                  (numeric, optional) Minimum fee in the block\n  \"minfeerate\" : n,              (numeric, optional) Minimum feerate (in satoshis per virtual byte)\n  \"mintxsize\" : n,               (numeric, optional) Minimum transaction size\n  \"outs\" : n,                    (numeric, optional) The number of outputs\n  \"subsidy\" : n,                 (numeric, optional) The block subsidy\n  \"swtotal_size\" : n,            (numeric, optional) Total size of all segwit transactions\n  \"swtotal_weight\" : n,          (numeric, optional) Total weight of all segwit transactions\n  \"swtxs\" : n,                   (numeric, optional) The number of segwit transactions\n  \"time\" : n,                    (numeric, optional) The block time\n  \"total_out\" : n,               (numeric, optional) Total amount in all outputs (excluding coinbase and thus reward [ie subsidy + totalfee])\n  \"total_size\" : n,              (numeric, optional) Total size of all non-coinbase transactions\n  \"total_weight\" : n,            (numeric, optional) Total weight of all non-coinbase transactions\n  \"totalfee\" : n,                (numeric, optional) The fee total\n  \"txs\" : n,                     (numeric, optional) The number of transactions (including coinbase)\n  \"utxo_increase\" : n,           (numeric, optional) The increase/decrease in the number of unspent outputs (not discounting op_return and similar)\n  \"utxo_size_inc\" : n,           (numeric, optional) The increase/decrease in size for the utxo index (not discounting op_return and similar)\n  \"utxo_increase_actual\" : n,    (numeric, optional) The increase/decrease in the number of unspent outputs, not counting unspendables\n  \"utxo_size_inc_actual\" : n     (numeric, optional) The increase/decrease in size for the utxo index, not counting unspendables\n}\n\nExamples:\n> bitcoin-cli getblockstats '\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"' '[\"minfeerate\",\"avgfeerate\"]'\n> bitcoin-cli getblockstats 1000 '[\"minfeerate\",\"avgfeerate\"]'\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockstats\", \"params\": [\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\", [\"minfeerate\",\"avgfeerate\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockstats\", \"params\": [1000, [\"minfeerate\",\"avgfeerate\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const IMPORTDESCRIPTORS_HELP: &str = "importdescriptors requests\n\nImport descriptors. This will trigger a rescan of the blockchain based on the earliest timestamp of all descriptors being imported. Requires a new wallet backup.\nWhen importing descriptors with multipath key expressions, if the multipath specifier contains exactly two elements, the descriptor produced from the second elements will be imported as an internal descriptor.\n\nNote: This call can take over an hour to complete if using an early timestamp; during that time, other rpc calls\nmay report that the imported keys, addresses or scripts exist but related transactions are still missing.\nThe rescan is significantly faster if block filters are available (using startup option \"-blockfilterindex=1\").\n\nArguments:\n1. requests                                 (json array, required) Data to be imported\n     [\n       {                                    (json object)\n         \"desc\": \"str\",                     (string, required) Descriptor to import.\n         \"active\": bool,                    (boolean, optional, default=false) Set this descriptor to be the active descriptor for the corresponding output type/externality\n         \"range\": n or [n,n],               (numeric or array, optional) If a ranged descriptor is used, this specifies the end or the range (in the form [begin,end]) to import\n         \"next_index\": n,                   (numeric, optional) If a ranged descriptor is set to active, this specifies the next index to generate addresses from\n         \"timestamp\": timestamp | \"now\",    (integer / string, required) Time from which to start rescanning the blockchain for this descriptor, in UNIX epoch time\n                                            Use the string \"now\" to substitute the current synced blockchain time.\n                                            \"now\" can be specified to bypass scanning, for outputs which are known to never have been used, and\n                                            0 can be specified to scan the entire blockchain. Blocks up to 2 hours before the earliest timestamp\n                                            of all descriptors being imported will be scanned as well as the mempool.\n         \"internal\": bool,                  (boolean, optional, default=false) Whether matching outputs should be treated as not incoming payments (e.g. change)\n         \"label\": \"str\",                    (string, optional, default=\"\") Label to assign to the address, only allowed with internal=false. Disabled for ranged descriptors\n       },\n       ...\n     ]\n\nResult:\n[                              (json array) Response is an array with the same size as the input that has the execution result\n  {                            (json object)\n    \"success\" : true|false,    (boolean)\n    \"warnings\" : [             (json array, optional)\n      \"str\",                   (string)\n      ...\n    ],\n    \"error\" : {                (json object, optional)\n      ...                      JSONRPC error\n    }\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli importdescriptors '[{ \"desc\": \"<my descriptor>\", \"timestamp\":1455191478, \"internal\": true }, { \"desc\": \"<my descriptor 2>\", \"label\": \"example 2\", \"timestamp\": 1455191480 }]'\n> bitcoin-cli importdescriptors '[{ \"desc\": \"<my descriptor>\", \"timestamp\":1455191478, \"active\": true, \"range\": [0,100], \"label\": \"<my bech32 wallet>\" }]'";
@@ -5108,6 +5123,19 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
             ("tx_limit", Some("number"), false),
         ],
         GETBLOCKINSPECT_HELP,
+    ),
+    (
+        "getblocktxinspect",
+        &[
+            ("block_hash", Some("string"), true),
+            ("txid", Some("string"), true),
+            ("tx_index", Some("number"), true),
+            ("input_offset", Some("number"), false),
+            ("input_limit", Some("number"), false),
+            ("output_offset", Some("number"), false),
+            ("output_limit", Some("number"), false),
+        ],
+        GETBLOCKTXINSPECT_HELP,
     ),
     (
         "getblockhash",
@@ -6740,6 +6768,117 @@ pub(crate) fn dispatch(
                     (
                         RPC_INTERNAL_ERROR,
                         format!("failed to encode block inspection result: {error}"),
+                    )
+                })
+            })
+        }
+        "getblocktxinspect" => {
+            if params.as_array().is_some_and(|values| values.len() > 7) {
+                return (
+                    Value::Null,
+                    Some((RPC_INVALID_PARAMETER, "too many parameters".into())),
+                );
+            }
+            let Some(block_hash_value) = param(params, 0, "block_hash") else {
+                return missing_params("block_hash");
+            };
+            let Some(block_hash_text) = block_hash_value.as_str() else {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_TYPE_ERROR,
+                        field_type_message(block_hash_value, "string"),
+                    )),
+                );
+            };
+            if block_hash_text.len() != 64 {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_INVALID_PARAMETER,
+                        "block_hash must be exactly 64 hexadecimal characters".into(),
+                    )),
+                );
+            }
+            let block_hash = match parse_hash_arg::<BlockHash>(block_hash_value, "block_hash") {
+                Ok(hash) => hash,
+                Err(error) => return (Value::Null, Some(error)),
+            };
+
+            let Some(txid_value) = param(params, 1, "txid") else {
+                return missing_params("txid");
+            };
+            let Some(txid_text) = txid_value.as_str() else {
+                return (
+                    Value::Null,
+                    Some((RPC_TYPE_ERROR, field_type_message(txid_value, "string"))),
+                );
+            };
+            if txid_text.len() != 64 {
+                return (
+                    Value::Null,
+                    Some((
+                        RPC_INVALID_PARAMETER,
+                        "txid must be exactly 64 hexadecimal characters".into(),
+                    )),
+                );
+            }
+            let txid = match parse_hash_arg::<Txid>(txid_value, "txid") {
+                Ok(txid) => txid,
+                Err(error) => return (Value::Null, Some(error)),
+            };
+
+            let parse_u32 =
+                |index: usize, name: &str, default: Option<u32>| match param(params, index, name) {
+                    None | Some(Value::Null) => default
+                        .ok_or_else(|| (RPC_INVALID_PARAMETER, format!("{name} is required"))),
+                    Some(Value::Number(number)) => number
+                        .as_u64()
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| {
+                            (
+                                RPC_INVALID_PARAMETER,
+                                format!("{name} must be an integer between 0 and 4294967295"),
+                            )
+                        }),
+                    Some(value) => Err((RPC_TYPE_ERROR, field_type_message(value, "number"))),
+                };
+            let tx_index = match parse_u32(2, "tx_index", None) {
+                Ok(value) => value,
+                Err(error) => return (Value::Null, Some(error)),
+            };
+            let input_offset = match parse_u32(3, "input_offset", Some(0)) {
+                Ok(value) => value,
+                Err(error) => return (Value::Null, Some(error)),
+            };
+            let input_limit = match parse_detail_page_limit(params, 4, "input_limit") {
+                Ok(value) => value,
+                Err(error) => return (Value::Null, Some(error)),
+            };
+            let output_offset = match parse_u32(5, "output_offset", Some(0)) {
+                Ok(value) => value,
+                Err(error) => return (Value::Null, Some(error)),
+            };
+            let output_limit = match parse_detail_page_limit(params, 6, "output_limit") {
+                Ok(value) => value,
+                Err(error) => return (Value::Null, Some(error)),
+            };
+
+            chain_query(method, queries, move |cs, _| {
+                let result = crate::inspect::inspect_transaction(
+                    cs,
+                    block_hash,
+                    txid,
+                    tx_index,
+                    input_offset,
+                    input_limit,
+                    output_offset,
+                    output_limit,
+                );
+                serde_json::to_value(result).map_err(|error| {
+                    (
+                        RPC_INTERNAL_ERROR,
+                        format!("failed to encode block transaction details: {error}"),
                     )
                 })
             })
@@ -15233,6 +15372,67 @@ mod tests {
             false,
         );
         assert_eq!(error.unwrap().0, RPC_METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn getblocktxinspect_checks_pins_and_bounds_both_pages() {
+        let cs = Chainstate::new(&Network::Regtest.params());
+        let block_hash = cs.tree().tip().hash();
+        let txid = cs.body(&block_hash).unwrap().transactions[0].txid();
+        let queries = query_server(cs);
+        let snap = snap();
+        let d = |params: Value| {
+            dispatch(
+                "getblocktxinspect",
+                &params,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+
+        let (result, error) = d(json!([
+            block_hash.to_string(),
+            txid.to_string(),
+            0,
+            0,
+            100,
+            0,
+            100
+        ]));
+        assert!(error.is_none());
+        assert_eq!(result["status"], "found");
+        assert_eq!(
+            result["data"]["detail"]["block"]["hash"],
+            block_hash.to_string()
+        );
+        assert_eq!(result["data"]["detail"]["txid"], txid.to_string());
+        assert_eq!(result["data"]["detail"]["coinbase"], true);
+        assert_eq!(result["data"]["detail"]["fee_sats"], Value::Null);
+        assert_eq!(
+            result["data"]["detail"]["fee_unknown_reason"],
+            "coinbase_has_no_prevout_amount"
+        );
+
+        for params in [
+            json!(["short", txid.to_string(), 0]),
+            json!([block_hash.to_string(), "not-a-txid", 0]),
+            json!([block_hash.to_string(), txid.to_string(), -1]),
+            json!([block_hash.to_string(), txid.to_string(), 0, 0, 101]),
+            json!([block_hash.to_string(), txid.to_string(), 0, 0, 1, 0, 0]),
+            json!([block_hash.to_string(), txid.to_string(), 0.5]),
+        ] {
+            let (_, error) = d(params);
+            assert!(error.is_some(), "expected parameter error");
+        }
+
+        let (mismatch, error) = d(json!([block_hash.to_string(), Txid::ZERO.to_string(), 0]));
+        assert!(error.is_none());
+        assert_eq!(mismatch["status"], "not_found");
     }
 
     #[test]

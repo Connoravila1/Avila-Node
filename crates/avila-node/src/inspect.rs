@@ -5,10 +5,13 @@
 //! that a later request will observe the same chain after a reorganization.
 
 use avila_consensus::chainstate::Chainstate;
-use avila_consensus::hash::BlockHash;
+use avila_consensus::hash::{BlockHash, Txid};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_TRANSACTION_PAGE: u16 = 250;
+pub const MAX_TX_DETAIL_PAGE: u16 = 100;
+const MAX_SCRIPT_PREFIX_BYTES: usize = 32;
+const MAX_WITNESS_ITEMS_SHOWN: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockLookup {
@@ -68,6 +71,82 @@ pub enum BlockLookupResult {
         transactions: Vec<BlockTxSummary>,
         next_offset: Option<u32>,
     },
+    Error(String),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlockIdentity {
+    pub hash: String,
+    pub height: u32,
+    pub active_chain: bool,
+    pub fully_checked: bool,
+    pub snapshot_assumed: bool,
+    pub body_state: BodyState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AmountUnknownReason {
+    CoinbaseHasNoPrevoutAmount,
+    PreviousOutputsNotLookedUp,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TxScriptSummary {
+    pub byte_len: u32,
+    pub hex_prefix: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TxInputDetail {
+    pub index: u32,
+    pub prev_txid: Option<String>,
+    pub prev_vout: Option<u32>,
+    pub sequence: u32,
+    pub value_sats: Option<i64>,
+    pub value_unknown_reason: Option<AmountUnknownReason>,
+    pub script_sig: TxScriptSummary,
+    pub witness_item_count: u32,
+    pub witness_items: Vec<TxScriptSummary>,
+    pub witness_items_truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TxOutputDetail {
+    pub index: u32,
+    pub value_sats: i64,
+    pub address: Option<String>,
+    pub script_pubkey: TxScriptSummary,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlockTxDetail {
+    pub block: BlockIdentity,
+    pub tx_index: u32,
+    pub txid: String,
+    pub wtxid: String,
+    pub version: u32,
+    pub lock_time: u32,
+    pub coinbase: bool,
+    pub input_count: u32,
+    pub output_count: u32,
+    pub input_amount_sats: Option<i64>,
+    pub input_amount_unknown_reason: Option<AmountUnknownReason>,
+    pub fee_sats: Option<i64>,
+    pub fee_unknown_reason: Option<AmountUnknownReason>,
+    pub inputs: Vec<TxInputDetail>,
+    pub next_input_offset: Option<u32>,
+    pub outputs: Vec<TxOutputDetail>,
+    pub next_output_offset: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", content = "data", rename_all = "snake_case")]
+pub enum BlockTxDetailResult {
+    NotFound,
+    BodyUnavailable { block: BlockIdentity },
+    Found { detail: BlockTxDetail },
     Error(String),
 }
 
@@ -182,6 +261,150 @@ pub(crate) fn inspect(
         block: summary,
         transactions,
         next_offset: (end < body.transactions.len()).then_some(end as u32),
+    }
+}
+
+/// Read bounded, script-only details for a transaction selected from an
+/// already inspected block. Prevout values are intentionally not resolved:
+/// this path never consults the current UTXO set or a txindex.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn inspect_transaction(
+    cs: &Chainstate,
+    block_hash: BlockHash,
+    txid: Txid,
+    tx_index: u32,
+    input_offset: u32,
+    input_limit: u16,
+    output_offset: u32,
+    output_limit: u16,
+) -> BlockTxDetailResult {
+    let Some(node) = cs.tree().get(&block_hash) else {
+        return BlockTxDetailResult::NotFound;
+    };
+    let active_chain = cs.chain().get(node.height as usize) == Some(&block_hash);
+    let coverage = cs.validation_report();
+    let snapshot_assumed = coverage.snapshot.as_ref().is_some_and(|snapshot| {
+        !snapshot.verified
+            && node.height <= snapshot.base_height
+            && node.height > snapshot.replayed_height
+    });
+    let fully_checked = active_chain
+        && node.height <= cs.checked_height()
+        && !snapshot_assumed
+        && cs.tree().params().assume_valid.is_none();
+    let mut identity = BlockIdentity {
+        hash: block_hash.to_string(),
+        height: node.height,
+        active_chain,
+        fully_checked,
+        snapshot_assumed,
+        body_state: BodyState::Unavailable,
+    };
+    let Some(body) = cs.body(&block_hash) else {
+        identity.body_state = if cs
+            .store()
+            .and_then(|store| store.position(&block_hash).map(|pos| store.is_pruned(pos)))
+            == Some(true)
+        {
+            BodyState::Pruned
+        } else if node.n_tx == 0 && node.n_chain_tx == 0 {
+            BodyState::HeaderOnly
+        } else {
+            BodyState::Unavailable
+        };
+        return BlockTxDetailResult::BodyUnavailable { block: identity };
+    };
+    identity.body_state = BodyState::Available;
+    let Some(tx) = body.transactions.get(tx_index as usize) else {
+        return BlockTxDetailResult::NotFound;
+    };
+    if tx.txid() != txid {
+        return BlockTxDetailResult::NotFound;
+    }
+
+    let coinbase = tx.is_coinbase();
+    let unknown_reason = Some(if coinbase {
+        AmountUnknownReason::CoinbaseHasNoPrevoutAmount
+    } else {
+        AmountUnknownReason::PreviousOutputsNotLookedUp
+    });
+    let inputs = page_slice(&tx.inputs, input_offset, input_limit)
+        .iter()
+        .enumerate()
+        .map(|(page_index, input)| {
+            let index = input_offset.saturating_add(page_index as u32);
+            let prevout = input.previous_output;
+            let witness_items = input
+                .witness
+                .items()
+                .iter()
+                .take(MAX_WITNESS_ITEMS_SHOWN)
+                .map(|item| script_summary(item))
+                .collect::<Vec<_>>();
+            TxInputDetail {
+                index,
+                prev_txid: (!prevout.is_null()).then(|| prevout.txid.to_string()),
+                prev_vout: (!prevout.is_null()).then_some(prevout.vout),
+                sequence: input.sequence,
+                value_sats: None,
+                value_unknown_reason: unknown_reason,
+                script_sig: script_summary(input.script_sig.as_bytes()),
+                witness_item_count: input.witness.len().min(u32::MAX as usize) as u32,
+                witness_items_truncated: input.witness.len() > MAX_WITNESS_ITEMS_SHOWN,
+                witness_items,
+            }
+        })
+        .collect::<Vec<_>>();
+    let outputs = page_slice(&tx.outputs, output_offset, output_limit)
+        .iter()
+        .enumerate()
+        .map(|(page_index, output)| TxOutputDetail {
+            index: output_offset.saturating_add(page_index as u32),
+            value_sats: output.value,
+            address: avila_consensus::address::script_address(
+                &output.script_pubkey,
+                cs.tree().params(),
+            ),
+            script_pubkey: script_summary(output.script_pubkey.as_bytes()),
+        })
+        .collect::<Vec<_>>();
+    let input_end = input_offset.saturating_add(inputs.len().min(u32::MAX as usize) as u32);
+    let output_end = output_offset.saturating_add(outputs.len().min(u32::MAX as usize) as u32);
+    BlockTxDetailResult::Found {
+        detail: BlockTxDetail {
+            block: identity,
+            tx_index,
+            txid: tx.txid().to_string(),
+            wtxid: tx.wtxid().to_string(),
+            version: tx.version,
+            lock_time: tx.lock_time,
+            coinbase,
+            input_count: tx.inputs.len().min(u32::MAX as usize) as u32,
+            output_count: tx.outputs.len().min(u32::MAX as usize) as u32,
+            input_amount_sats: None,
+            input_amount_unknown_reason: unknown_reason,
+            fee_sats: None,
+            fee_unknown_reason: unknown_reason,
+            inputs,
+            next_input_offset: (input_end < tx.inputs.len() as u32).then_some(input_end),
+            outputs,
+            next_output_offset: (output_end < tx.outputs.len() as u32).then_some(output_end),
+        },
+    }
+}
+
+fn page_slice<T>(items: &[T], offset: u32, limit: u16) -> &[T] {
+    let start = (offset as usize).min(items.len());
+    let count = usize::from(limit.clamp(1, MAX_TX_DETAIL_PAGE));
+    &items[start..start.saturating_add(count).min(items.len())]
+}
+
+fn script_summary(bytes: &[u8]) -> TxScriptSummary {
+    let prefix_len = bytes.len().min(MAX_SCRIPT_PREFIX_BYTES);
+    TxScriptSummary {
+        byte_len: bytes.len().min(u32::MAX as usize) as u32,
+        hex_prefix: avila_consensus::hex::encode(&bytes[..prefix_len]),
+        truncated: bytes.len() > prefix_len,
     }
 }
 
@@ -398,6 +621,15 @@ mod tests {
             panic!("genesis must be inspectable")
         };
         assert!(!block.fully_checked);
+        let hash = cs.tree().tip().hash();
+        let txid = cs.body(&hash).unwrap().transactions[0].txid();
+        let BlockTxDetailResult::Found { detail } =
+            inspect_transaction(&cs, hash, txid, 0, 0, 1, 0, 1)
+        else {
+            panic!("genesis transaction detail must be inspectable")
+        };
+        assert!(!detail.block.fully_checked);
+        assert!(!detail.block.snapshot_assumed);
     }
 
     #[test]
@@ -428,6 +660,17 @@ mod tests {
         assert!(matches!(
             inspect(&cs, BlockLookup::Hash(header.hash()), 0, 100),
             BlockLookupResult::Found { .. }
+        ));
+        assert!(matches!(
+            inspect_transaction(&cs, header.hash(), Txid::ZERO, 0, 0, 1, 0, 1),
+            BlockTxDetailResult::BodyUnavailable {
+                block: BlockIdentity {
+                    body_state: BodyState::HeaderOnly,
+                    active_chain: false,
+                    fully_checked: false,
+                    ..
+                }
+            }
         ));
     }
 
@@ -469,5 +712,124 @@ mod tests {
         assert_eq!(second.first().map(|tx| tx.index), Some(250));
         assert_eq!(second.last().map(|tx| tx.index), Some(260));
         assert_eq!(next_offset, None);
+    }
+
+    #[test]
+    fn transaction_details_pin_identity_bound_script_and_page_both_sides() {
+        let params = regtest_params();
+        let mut cs = Chainstate::new(&params);
+        let tx = Transaction {
+            version: 2,
+            inputs: (0..3)
+                .map(|index| TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid::from_bytes([index as u8 + 1; 32]),
+                        vout: index as u32,
+                    },
+                    script_sig: Script::new(vec![index as u8; 40]),
+                    sequence: 0xffff_fffe - index as u32,
+                    witness: Witness::new((0..10).map(|n| vec![n; 40]).collect()),
+                })
+                .collect(),
+            outputs: (0..3)
+                .map(|index| TxOut {
+                    value: 100 + index,
+                    script_pubkey: Script::new(vec![script::OP_1; 40]),
+                })
+                .collect(),
+            // A zero locktime is final even with the nonfinal sequences below.
+            lock_time: 0,
+        };
+        let txid = tx.txid();
+        let mut coinbase = coinbase(1, &params, 1);
+        coinbase.inputs[0].witness = Witness::new(vec![vec![0x42; 32]]);
+        let provisional = block_on(&params.genesis_header, vec![coinbase, tx.clone()], &params);
+        let commitment = provisional
+            .expected_witness_commitment()
+            .expect("well-formed coinbase reserved value produces a commitment");
+        let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        commitment_script.extend_from_slice(&commitment);
+        let mut transactions = provisional.transactions;
+        transactions[0].outputs.push(TxOut {
+            value: 0,
+            script_pubkey: Script::new(commitment_script),
+        });
+        // Recompute the merkle root and proof of work after changing coinbase.
+        let block = block_on(&params.genesis_header, transactions, &params);
+        let block_hash = block.block_hash();
+        // A deliberately unresolved prevout leaves the stored body available
+        // while making it unsuitable as an active-chain validation result.
+        // Keep the failure precise so a fixture-rule error cannot masquerade
+        // as the intended body-retention path.
+        assert_eq!(
+            cs.accept_block(&block, NOW),
+            Err(avila_consensus::chainstate::BlockRejection::Connect(
+                avila_consensus::connect::ConnectError::InputsMissingOrSpent
+            ))
+        );
+
+        let BlockTxDetailResult::Found { detail } =
+            inspect_transaction(&cs, block_hash, txid, 1, 1, 1, 1, 1)
+        else {
+            panic!("stored transaction details should be inspectable");
+        };
+        assert_eq!(detail.block.hash, block_hash.to_string());
+        assert!(!detail.block.active_chain);
+        assert_eq!(detail.tx_index, 1);
+        assert_eq!(detail.txid, txid.to_string());
+        assert_eq!(detail.wtxid, tx.wtxid().to_string());
+        assert_eq!(detail.version, 2);
+        assert_eq!(detail.lock_time, 0);
+        assert_eq!(detail.input_count, 3);
+        assert_eq!(detail.output_count, 3);
+        assert_eq!(detail.inputs[0].index, 1);
+        assert_eq!(detail.inputs[0].prev_vout, Some(1));
+        assert_eq!(detail.inputs[0].sequence, 0xffff_fffd);
+        assert_eq!(detail.inputs[0].value_sats, None);
+        assert_eq!(
+            detail.inputs[0].value_unknown_reason,
+            Some(AmountUnknownReason::PreviousOutputsNotLookedUp)
+        );
+        assert_eq!(detail.inputs[0].script_sig.byte_len, 40);
+        assert_eq!(detail.inputs[0].script_sig.hex_prefix.len(), 64);
+        assert!(detail.inputs[0].script_sig.truncated);
+        assert_eq!(detail.inputs[0].witness_item_count, 10);
+        assert_eq!(
+            detail.inputs[0].witness_items.len(),
+            MAX_WITNESS_ITEMS_SHOWN
+        );
+        assert!(detail.inputs[0].witness_items_truncated);
+        assert_eq!(detail.outputs[0].index, 1);
+        assert_eq!(detail.outputs[0].value_sats, 101);
+        assert_eq!(detail.outputs[0].script_pubkey.byte_len, 40);
+        assert!(detail.outputs[0].script_pubkey.truncated);
+        assert_eq!(detail.input_amount_sats, None);
+        assert_eq!(detail.fee_sats, None);
+        assert_eq!(
+            detail.fee_unknown_reason,
+            Some(AmountUnknownReason::PreviousOutputsNotLookedUp)
+        );
+        assert_eq!(detail.next_input_offset, Some(2));
+        assert_eq!(detail.next_output_offset, Some(2));
+
+        // The node-side bound remains effective even for a trusted internal
+        // request that bypasses RPC validation.
+        let BlockTxDetailResult::Found { detail } =
+            inspect_transaction(&cs, block_hash, txid, 1, 0, u16::MAX, 0, u16::MAX)
+        else {
+            panic!("stored transaction details should remain inspectable");
+        };
+        assert_eq!(detail.inputs.len(), 3);
+        assert_eq!(detail.outputs.len(), 3);
+        assert_eq!(detail.next_input_offset, None);
+        assert_eq!(detail.next_output_offset, None);
+        assert!(matches!(
+            inspect_transaction(&cs, block_hash, txid, 0, 0, 1, 0, 1),
+            BlockTxDetailResult::NotFound
+        ));
+        assert!(matches!(
+            inspect_transaction(&cs, block_hash, Txid::ZERO, 1, 0, 1, 0, 1),
+            BlockTxDetailResult::NotFound
+        ));
     }
 }

@@ -5,8 +5,11 @@
 //! thread.
 
 use super::block_detail;
-use avila_consensus::hash::BlockHash;
-use avila_node::inspect::{BlockLookup, BlockLookupResult, BlockSummary, BlockTxSummary};
+use avila_consensus::hash::{BlockHash, Txid};
+use avila_node::inspect::{
+    BlockLookup, BlockLookupResult, BlockSummary, BlockTxDetail, BlockTxDetailResult,
+    BlockTxSummary,
+};
 use avila_node::sync::ControlMsg;
 use eframe::egui::{self, Align, Layout, RichText, TextEdit, Ui};
 use std::str::FromStr;
@@ -14,6 +17,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 const PAGE_SIZE: u16 = 100;
+const DETAIL_PAGE_SIZE: u16 = 100;
 const MAX_DISPLAYED_TXS: usize = 2_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -30,6 +34,17 @@ pub struct State {
     block: Option<BlockSummary>,
     transactions: Vec<BlockTxSummary>,
     next_offset: Option<u32>,
+    selected_tx_index: Option<u32>,
+    tx_detail: Option<BlockTxDetail>,
+    tx_detail_pending: Option<Receiver<BlockTxDetailResult>>,
+    tx_detail_pending_since: Option<Instant>,
+    tx_detail_timed_out: bool,
+    tx_detail_generation: u64,
+    pending_detail_generation: Option<u64>,
+    detail_input_offset: u32,
+    detail_output_offset: u32,
+    detail_message: Option<String>,
+    detail_scroll_requested: bool,
     message: Option<String>,
 }
 
@@ -44,6 +59,8 @@ impl State {
             self.block = None;
             self.transactions.clear();
             self.next_offset = None;
+            self.selected_tx_index = None;
+            self.clear_transaction_detail();
             self.message = Some("The node stopped; inspect again after it starts.".into());
             #[cfg(feature = "devtools")]
             {
@@ -117,6 +134,8 @@ impl State {
         self.block = Some(summary);
         self.transactions = transactions;
         self.next_offset = None;
+        self.selected_tx_index = None;
+        self.clear_transaction_detail();
         self.message = None;
         self.draft = "0".into();
         self.scroll_requested = true;
@@ -138,6 +157,8 @@ impl State {
         self.transactions.clear();
         self.lookup = None;
         self.next_offset = None;
+        self.selected_tx_index = None;
+        self.clear_transaction_detail();
         self.message = None;
     }
 
@@ -178,6 +199,8 @@ impl State {
             self.block = None;
             self.transactions.clear();
             self.next_offset = None;
+            self.selected_tx_index = None;
+            self.clear_transaction_detail();
             self.message = Some("Looking up block…".into());
         } else {
             if self.transactions.len() >= MAX_DISPLAYED_TXS {
@@ -240,6 +263,8 @@ impl State {
                 self.block = None;
                 self.transactions.clear();
                 self.next_offset = None;
+                self.selected_tx_index = None;
+                self.clear_transaction_detail();
                 self.message = Some("No stored block matched that height or hash.".into());
             }
             BlockLookupResult::Error(error) => self.message = Some(error),
@@ -254,6 +279,8 @@ impl State {
                     .is_some_and(|current| current.hash == block.hash);
                 if !same_block {
                     self.transactions.clear();
+                    self.selected_tx_index = None;
+                    self.clear_transaction_detail();
                 }
                 self.block = Some(block);
                 for transaction in transactions {
@@ -273,6 +300,226 @@ impl State {
         }
     }
 
+    fn clear_transaction_detail(&mut self) {
+        self.tx_detail_generation = self.tx_detail_generation.wrapping_add(1);
+        self.tx_detail = None;
+        self.tx_detail_pending = None;
+        self.tx_detail_pending_since = None;
+        self.tx_detail_timed_out = false;
+        self.pending_detail_generation = None;
+        self.detail_input_offset = 0;
+        self.detail_output_offset = 0;
+        self.detail_message = None;
+        self.detail_scroll_requested = false;
+    }
+
+    fn request_transaction_detail(
+        &mut self,
+        sender: Option<&std::sync::mpsc::Sender<ControlMsg>>,
+        tx_index: u32,
+        input_offset: u32,
+        output_offset: u32,
+        force: bool,
+    ) {
+        // Control messages share the node's unbounded command channel. Keep
+        // this inspector single-flight so rapid clicks cannot queue work
+        // faster than the storage worker can answer it.
+        if self.tx_detail_pending.is_some() {
+            return;
+        }
+        let Some(block_hash_text) = self.block.as_ref().map(|block| block.hash.clone()) else {
+            return;
+        };
+        let Some(txid_text) = self
+            .transactions
+            .iter()
+            .find(|transaction| transaction.index == tx_index)
+            .map(|transaction| transaction.txid.clone())
+        else {
+            self.detail_message = Some("That transaction is not in the loaded block page.".into());
+            return;
+        };
+        if !force
+            && self.selected_tx_index == Some(tx_index)
+            && self.tx_detail.as_ref().is_some_and(|detail| {
+                detail.block.hash == block_hash_text
+                    && detail.tx_index == tx_index
+                    && detail.txid == txid_text
+            })
+        {
+            return;
+        }
+        if self.is_fixture() {
+            self.clear_transaction_detail();
+            self.selected_tx_index = Some(tx_index);
+            self.detail_scroll_requested = true;
+            self.detail_message = Some(
+                "This offline fixture includes transaction summaries only; live input/output detail requires a running node.".into(),
+            );
+            return;
+        }
+        self.tx_detail_generation = self.tx_detail_generation.wrapping_add(1);
+        let generation = self.tx_detail_generation;
+        let selection_changed = self.selected_tx_index != Some(tx_index);
+        self.selected_tx_index = Some(tx_index);
+        self.tx_detail = None;
+        self.tx_detail_pending = None;
+        self.tx_detail_pending_since = None;
+        self.tx_detail_timed_out = false;
+        self.pending_detail_generation = None;
+        if selection_changed {
+            self.detail_scroll_requested = true;
+        }
+        self.detail_input_offset = input_offset;
+        self.detail_output_offset = output_offset;
+        self.detail_message = Some("Loading transaction details…".into());
+        let Some(sender) = sender else {
+            self.detail_message = Some(if self.is_fixture() {
+                "This offline fixture includes transaction summaries only; live input/output detail requires a running node.".into()
+            } else {
+                "Transaction detail is available while a live node is running.".into()
+            });
+            return;
+        };
+        let Ok(block_hash) = BlockHash::from_str(&block_hash_text) else {
+            self.detail_message = Some("The selected block hash is invalid.".into());
+            return;
+        };
+        let Ok(txid) = Txid::from_str(&txid_text) else {
+            self.detail_message = Some("The selected transaction ID is invalid.".into());
+            return;
+        };
+        let (reply, receive) = std::sync::mpsc::sync_channel(1);
+        match sender.send(ControlMsg::InspectBlockTx {
+            block_hash,
+            txid,
+            tx_index,
+            input_offset,
+            input_limit: DETAIL_PAGE_SIZE,
+            output_offset,
+            output_limit: DETAIL_PAGE_SIZE,
+            reply,
+        }) {
+            Ok(()) => {
+                self.tx_detail_pending = Some(receive);
+                self.tx_detail_pending_since = Some(Instant::now());
+                self.pending_detail_generation = Some(generation);
+            }
+            Err(_) => {
+                self.detail_message =
+                    Some("The node stopped before it could inspect this transaction.".into());
+            }
+        }
+    }
+
+    fn poll_transaction_detail(&mut self) {
+        let Some(receiver) = &self.tx_detail_pending else {
+            return;
+        };
+        let response = match receiver.try_recv() {
+            Ok(response) => Some(response),
+            Err(TryRecvError::Empty)
+                if !self.tx_detail_timed_out
+                    && self
+                        .tx_detail_pending_since
+                        .is_some_and(|started| started.elapsed() >= REQUEST_TIMEOUT) =>
+            {
+                self.tx_detail_timed_out = true;
+                self.detail_message = Some(
+                    "Transaction detail exceeded 30 seconds. The outstanding lookup remains single-flight until it returns or the node stops.".into(),
+                );
+                return;
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(BlockTxDetailResult::Error(
+                "The node ended the transaction detail request without a result.".into(),
+            )),
+        };
+        let Some(response) = response else {
+            return;
+        };
+        let response_generation = self.pending_detail_generation;
+        self.tx_detail_pending = None;
+        self.tx_detail_pending_since = None;
+        self.tx_detail_timed_out = false;
+        self.pending_detail_generation = None;
+        if response_generation != Some(self.tx_detail_generation) {
+            return;
+        }
+        let expected_block_hash = self.block.as_ref().map(|block| block.hash.as_str());
+        let expected_tx = self.selected_tx_index.and_then(|index| {
+            self.transactions
+                .iter()
+                .find(|transaction| transaction.index == index)
+        });
+        match response {
+            BlockTxDetailResult::Found { detail }
+                if Some(detail.block.hash.as_str()) == expected_block_hash
+                    && expected_tx.is_some_and(|tx| {
+                        detail.tx_index == tx.index && detail.txid == tx.txid
+                    })
+                    && self.detail_page_matches(&detail) =>
+            {
+                self.detail_input_offset = self.detail_input_offset.min(detail.input_count);
+                self.detail_output_offset = self.detail_output_offset.min(detail.output_count);
+                self.tx_detail = Some(detail);
+                self.detail_message = None;
+            }
+            BlockTxDetailResult::BodyUnavailable { block }
+                if Some(block.hash.as_str()) == expected_block_hash =>
+            {
+                self.detail_message = Some(format!(
+                    "Transaction body unavailable for this block ({})",
+                    body_state_label(block.body_state)
+                ));
+            }
+            BlockTxDetailResult::Found { .. } | BlockTxDetailResult::BodyUnavailable { .. } => {
+                self.detail_message = Some(
+                    "The transaction response did not match the selected block and transaction; retry the inspection.".into(),
+                );
+            }
+            BlockTxDetailResult::NotFound => {
+                self.detail_message =
+                    Some("The selected transaction was not found at this block position.".into());
+            }
+            BlockTxDetailResult::Error(error) => self.detail_message = Some(error),
+        }
+    }
+
+    fn detail_page_matches(&self, detail: &BlockTxDetail) -> bool {
+        let expected_input_len = detail
+            .input_count
+            .saturating_sub(self.detail_input_offset)
+            .min(u32::from(DETAIL_PAGE_SIZE)) as usize;
+        let expected_output_len = detail
+            .output_count
+            .saturating_sub(self.detail_output_offset)
+            .min(u32::from(DETAIL_PAGE_SIZE)) as usize;
+        let expected_input_end = self
+            .detail_input_offset
+            .checked_add(expected_input_len as u32);
+        let expected_output_end = self
+            .detail_output_offset
+            .checked_add(expected_output_len as u32);
+        detail.block.body_state == avila_node::inspect::BodyState::Available
+            && detail.inputs.len() <= usize::from(DETAIL_PAGE_SIZE)
+            && detail.outputs.len() <= usize::from(DETAIL_PAGE_SIZE)
+            && detail.inputs.len() == expected_input_len
+            && detail.outputs.len() == expected_output_len
+            && detail.inputs.iter().enumerate().all(|(position, input)| {
+                self.detail_input_offset.checked_add(position as u32) == Some(input.index)
+            })
+            && detail.outputs.iter().enumerate().all(|(position, output)| {
+                self.detail_output_offset.checked_add(position as u32) == Some(output.index)
+            })
+            && expected_input_end.is_some_and(|end| {
+                detail.next_input_offset == (end < detail.input_count).then_some(end)
+            })
+            && expected_output_end.is_some_and(|end| {
+                detail.next_output_offset == (end < detail.output_count).then_some(end)
+            })
+    }
+
     /// Draw search, navigation and the selected block details.
     pub fn ui(
         &mut self,
@@ -283,6 +530,7 @@ impl State {
     ) {
         self.update_liveness(sender.is_some());
         self.poll();
+        self.poll_transaction_detail();
         ui.separator();
         let heading = ui.heading("Block inspector");
         if std::mem::take(&mut self.scroll_requested) {
@@ -365,25 +613,69 @@ impl State {
         if let Some(message) = &self.message {
             ui.label(RichText::new(message).weak());
         }
-        if let Some(block) = &self.block {
-            block_detail::show(
-                ui,
+        let offline_fixture = self.is_fixture();
+        let interaction = if let Some(block) = &self.block {
+            let mut view = block_detail::InspectorView {
                 block,
-                &self.transactions,
-                self.next_offset,
-                self.pending.is_some(),
-                self.is_fixture(),
-            );
+                transactions: &self.transactions,
+                next_offset: self.next_offset,
+                loading: self.pending.is_some(),
+                offline_fixture,
+                selected_tx_index: self.selected_tx_index,
+                detail: self.tx_detail.as_ref(),
+                detail_status: self.detail_message.as_deref(),
+                detail_loading: self.tx_detail_pending.is_some(),
+                input_offset: self.detail_input_offset,
+                output_offset: self.detail_output_offset,
+                detail_scroll_requested: &mut self.detail_scroll_requested,
+            };
+            block_detail::show(ui, &mut view)
+        } else {
+            None
+        };
+        if let Some(interaction) = interaction {
+            match interaction {
+                block_detail::Interaction::SelectTransaction(index) => {
+                    self.request_transaction_detail(sender, index, 0, 0, false);
+                }
+                block_detail::Interaction::InputPage(offset) => {
+                    if let Some(index) = self.selected_tx_index {
+                        self.request_transaction_detail(
+                            sender,
+                            index,
+                            offset,
+                            self.detail_output_offset,
+                            true,
+                        );
+                    }
+                }
+                block_detail::Interaction::OutputPage(offset) => {
+                    if let Some(index) = self.selected_tx_index {
+                        self.request_transaction_detail(
+                            sender,
+                            index,
+                            self.detail_input_offset,
+                            offset,
+                            true,
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(block) = &self.block {
             if self.transactions.len() >= MAX_DISPLAYED_TXS && self.next_offset.is_some() {
-                ui.label(RichText::new(format!(
-                    "Showing the first {MAX_DISPLAYED_TXS} of {} transactions; more are available.",
-                    block.tx_count.unwrap_or(MAX_DISPLAYED_TXS as u32)
-                )).weak());
+                ui.label(
+                    RichText::new(format!(
+                        "Showing the first {MAX_DISPLAYED_TXS} of {} transactions; more are available.",
+                        block.tx_count.unwrap_or(MAX_DISPLAYED_TXS as u32)
+                    ))
+                    .weak(),
+                );
             } else if let Some(offset) = self.next_offset
                 && ui
                     .add_enabled(
                         self.pending.is_none(),
-                        egui::Button::new("Load next 100 transactions"),
+                        egui::Button::new("Load more transactions"),
                     )
                     .clicked()
                 && let Some(lookup) = self.lookup
@@ -405,13 +697,24 @@ fn parse_lookup(value: &str) -> Option<BlockLookup> {
     BlockHash::from_str(value).ok().map(BlockLookup::Hash)
 }
 
+fn body_state_label(state: avila_node::inspect::BodyState) -> &'static str {
+    match state {
+        avila_node::inspect::BodyState::Available => "available",
+        avila_node::inspect::BodyState::HeaderOnly => "header-only",
+        avila_node::inspect::BodyState::Pruned => "pruned",
+        avila_node::inspect::BodyState::Unavailable => "unavailable",
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{MAX_DISPLAYED_TXS, PAGE_SIZE, REQUEST_TIMEOUT, State, parse_lookup};
     use avila_consensus::hash::BlockHash;
     use avila_node::inspect::{
-        BlockLookup, BlockLookupResult, BlockSummary, BlockTxSummary, BodyState,
+        AmountUnknownReason, BlockIdentity, BlockLookup, BlockLookupResult, BlockSummary,
+        BlockTxDetail, BlockTxDetailResult, BlockTxSummary, BodyState, TxInputDetail,
+        TxOutputDetail, TxScriptSummary,
     };
     use avila_node::sync::ControlMsg;
     use std::sync::mpsc::{TryRecvError, channel};
@@ -565,6 +868,179 @@ mod tests {
         assert!(state.block.is_none());
         assert!(state.transactions.is_empty());
         assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn stale_transaction_detail_generation_is_discarded() {
+        let mut state = State {
+            block: Some(summary(1)),
+            transactions: vec![transaction(0)],
+            selected_tx_index: Some(0),
+            tx_detail_generation: 4,
+            pending_detail_generation: Some(3),
+            detail_message: Some("Loading transaction details…".into()),
+            ..State::default()
+        };
+
+        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        reply
+            .send(BlockTxDetailResult::Found {
+                detail: BlockTxDetail {
+                    block: BlockIdentity {
+                        hash: BlockHash::ZERO.to_string(),
+                        height: 7,
+                        active_chain: true,
+                        fully_checked: true,
+                        snapshot_assumed: false,
+                        body_state: BodyState::Available,
+                    },
+                    tx_index: 0,
+                    txid: BlockHash::ZERO.to_string(),
+                    wtxid: BlockHash::ZERO.to_string(),
+                    version: 1,
+                    lock_time: 0,
+                    coinbase: true,
+                    input_count: 1,
+                    output_count: 1,
+                    input_amount_sats: None,
+                    input_amount_unknown_reason: Some(
+                        AmountUnknownReason::CoinbaseHasNoPrevoutAmount,
+                    ),
+                    fee_sats: None,
+                    fee_unknown_reason: Some(AmountUnknownReason::CoinbaseHasNoPrevoutAmount),
+                    inputs: Vec::new(),
+                    next_input_offset: None,
+                    outputs: Vec::new(),
+                    next_output_offset: None,
+                },
+            })
+            .expect("detail receiver is live");
+        state.tx_detail_pending = Some(receiver);
+        state.pending_detail_generation = Some(3);
+
+        state.poll_transaction_detail();
+
+        assert!(state.tx_detail.is_none());
+        assert_eq!(state.selected_tx_index, Some(0));
+        assert!(state.detail_message.is_some());
+    }
+
+    #[test]
+    fn transaction_detail_requests_are_single_flight() {
+        let (sender, receiver) = channel();
+        let mut state = State {
+            block: Some(summary(2)),
+            transactions: vec![transaction(0), transaction(1)],
+            ..State::default()
+        };
+
+        state.request_transaction_detail(Some(&sender), 0, 0, 0, false);
+        state.request_transaction_detail(Some(&sender), 1, 0, 0, false);
+
+        let ControlMsg::InspectBlockTx { tx_index, .. } = receiver.try_recv().expect("one request")
+        else {
+            panic!("state sends transaction detail requests");
+        };
+        assert_eq!(tx_index, 0);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(state.selected_tx_index, Some(0));
+        assert!(state.tx_detail_pending.is_some());
+    }
+
+    #[test]
+    fn timed_out_transaction_request_stays_single_flight_until_worker_returns() {
+        let (sender, receiver) = channel();
+        let mut state = State {
+            block: Some(summary(2)),
+            transactions: vec![transaction(0), transaction(1)],
+            ..State::default()
+        };
+        state.request_transaction_detail(Some(&sender), 0, 0, 0, false);
+        let ControlMsg::InspectBlockTx { reply, .. } = receiver.try_recv().expect("request sent")
+        else {
+            panic!("state sends transaction detail requests");
+        };
+
+        state.tx_detail_pending_since = Some(Instant::now() - REQUEST_TIMEOUT);
+        state.poll_transaction_detail();
+        assert!(state.tx_detail_pending.is_some());
+        assert!(state.tx_detail_timed_out);
+        assert!(
+            state
+                .detail_message
+                .as_deref()
+                .is_some_and(|message| message.contains("remains single-flight"))
+        );
+
+        state.request_transaction_detail(Some(&sender), 1, 0, 0, false);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        drop(reply);
+    }
+
+    #[test]
+    fn transaction_detail_pages_require_contiguous_indexes_and_correct_next_offsets() {
+        let state = State {
+            detail_input_offset: 100,
+            detail_output_offset: 0,
+            ..State::default()
+        };
+        let mut detail = BlockTxDetail {
+            block: BlockIdentity {
+                hash: BlockHash::ZERO.to_string(),
+                height: 7,
+                active_chain: true,
+                fully_checked: true,
+                snapshot_assumed: false,
+                body_state: BodyState::Available,
+            },
+            tx_index: 0,
+            txid: BlockHash::ZERO.to_string(),
+            wtxid: BlockHash::ZERO.to_string(),
+            version: 1,
+            lock_time: 0,
+            coinbase: false,
+            input_count: 101,
+            output_count: 1,
+            input_amount_sats: None,
+            input_amount_unknown_reason: Some(AmountUnknownReason::PreviousOutputsNotLookedUp),
+            fee_sats: None,
+            fee_unknown_reason: Some(AmountUnknownReason::PreviousOutputsNotLookedUp),
+            inputs: vec![TxInputDetail {
+                index: 100,
+                prev_txid: None,
+                prev_vout: None,
+                sequence: 0,
+                value_sats: None,
+                value_unknown_reason: Some(AmountUnknownReason::PreviousOutputsNotLookedUp),
+                script_sig: TxScriptSummary {
+                    byte_len: 0,
+                    hex_prefix: String::new(),
+                    truncated: false,
+                },
+                witness_item_count: 0,
+                witness_items: Vec::new(),
+                witness_items_truncated: false,
+            }],
+            next_input_offset: None,
+            outputs: vec![TxOutputDetail {
+                index: 0,
+                value_sats: 0,
+                address: None,
+                script_pubkey: TxScriptSummary {
+                    byte_len: 0,
+                    hex_prefix: String::new(),
+                    truncated: false,
+                },
+            }],
+            next_output_offset: None,
+        };
+        assert!(state.detail_page_matches(&detail));
+
+        detail.inputs[0].index = 99;
+        assert!(!state.detail_page_matches(&detail));
+        detail.inputs[0].index = 100;
+        detail.next_input_offset = Some(101);
+        assert!(!state.detail_page_matches(&detail));
     }
 
     #[cfg(feature = "devtools")]

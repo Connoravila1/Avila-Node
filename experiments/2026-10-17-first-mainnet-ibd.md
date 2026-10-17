@@ -88,3 +88,19 @@ MiB peak, 55 s); a follow-up constant-txid change also passed Clippy and
 release build (718 MiB peak, 29 s). The user service is enabled for login and
 the desktop launcher was tested. These checks do not cover 100-item GUI paging,
 zoom behavior, or screen-reader behavior; those remain unverified.
+
+## Later managed IBD status and restart check
+
+At a later observation, the managed node was still performing ordinary
+full-script validation; IBD is incomplete. Its validation policy continued to
+report `assume_valid_checkpoint: null` and
+`historical_scripts_required: true`. The CLI binary used for this check had
+SHA-256 prefix `84aa111...`. A clean restart resumed from the saved state at
+height 118,211 and advanced to 118,230; this is a continuity/restart check,
+not evidence of completion or modern-chain coverage. The managed startup-stop
+wrapper exited 0 on clean shutdown and left no orphan node process.
+
+A temporary sleep inhibitor was attached to the managed service for the
+long-running observation and follows the service lifecycle; it is not a
+permanent host setting. The full-script IBD measurement remains in progress,
+with no throughput or SwiftSync/Utreexo speed claim.

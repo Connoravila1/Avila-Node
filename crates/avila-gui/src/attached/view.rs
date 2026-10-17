@@ -26,6 +26,18 @@ const MAX_TRAFFIC_SAMPLES: usize = 120;
 const MAX_CONSOLE_INPUT: usize = 8 * 1024;
 const MAX_CONSOLE_OUTPUT: usize = 64 * 1024;
 const CONSOLE_TIMEOUT: Duration = Duration::from_secs(30);
+const ATTACHED_SCALE_KEY: &str = "attached.ui_scale.v1";
+const ATTACHED_BLACK_KEY: &str = "attached.black_theme.v1";
+const ATTACHED_SCALES: [(f32, &str); 8] = [
+    (0.75, "75%"),
+    (0.9, "90%"),
+    (1.0, "100%"),
+    (1.15, "115%"),
+    (1.3, "130%"),
+    (1.5, "150%"),
+    (1.75, "175%"),
+    (2.0, "200%"),
+];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Page {
@@ -89,6 +101,9 @@ pub struct AttachedApp {
     swirl: Option<eframe::egui::TextureHandle>,
     prefs: Prefs,
     config_file: Option<PathBuf>,
+    ui_scale: f32,
+    black_theme: bool,
+    about_open: bool,
 }
 
 impl AttachedApp {
@@ -118,9 +133,25 @@ impl AttachedApp {
         if let Some(theme) = theme_override {
             prefs.theme = theme;
         }
+        let ui_scale = cc
+            .storage
+            .and_then(|storage| eframe::get_value::<f32>(storage, ATTACHED_SCALE_KEY))
+            .filter(|scale| ATTACHED_SCALES.iter().any(|(value, _)| *value == *scale))
+            .unwrap_or(prefs.size);
+        let black_theme = if theme_override.is_some() {
+            false
+        } else {
+            cc.storage
+                .and_then(|storage| eframe::get_value::<bool>(storage, ATTACHED_BLACK_KEY))
+                .unwrap_or(false)
+        };
         let mut appearance = prefs.clone();
         appearance.toybox = false;
         appearance.apply(&cc.egui_ctx);
+        cc.egui_ctx.set_zoom_factor(ui_scale);
+        if black_theme {
+            apply_black_visuals(&cc.egui_ctx);
+        }
         let network = node.config().get().network.to_string();
         let data_dir = node.config().network_data_dir();
         let worker = Worker::start(addr, data_dir, cc.egui_ctx.clone());
@@ -143,6 +174,9 @@ impl AttachedApp {
             swirl: brand::swirl_texture(&cc.egui_ctx),
             prefs,
             config_file,
+            ui_scale,
+            black_theme,
+            about_open: false,
         }
     }
 
@@ -214,7 +248,7 @@ impl AttachedApp {
     }
 
     fn show_header(&mut self, ui: &mut Ui, pal: Palette) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if let Some(swirl) = &self.swirl {
                 ui.add(
                     egui::Image::new(swirl)
@@ -224,43 +258,117 @@ impl AttachedApp {
             }
             ui.vertical(|ui| {
                 ui.heading("Avila Node");
-                ui.label(
-                    RichText::new(format!("Attached · {} · {}", self.network, self.rpc_addr))
-                        .size(12.0)
-                        .color(pal.muted),
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("Attached · {} · {}", self.network, self.rpc_addr))
+                            .size(12.0)
+                            .color(pal.muted),
+                    )
+                    .wrap(),
                 );
             });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.menu_button("Node", |ui| {
-                    if ui.button("Copy attached-node diagnostics").clicked() {
-                        ui.ctx().copy_text(self.diagnostics());
-                        ui.close();
+            ui.add_space(8.0);
+            ui.menu_button("Node", |ui| {
+                if ui.button("Copy attached-node diagnostics").clicked() {
+                    ui.ctx().copy_text(self.diagnostics());
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        self.config_file.is_some(),
+                        egui::Button::new("Open config folder"),
+                    )
+                    .clicked()
+                {
+                    if let Some(path) = self
+                        .config_file
+                        .as_deref()
+                        .and_then(std::path::Path::parent)
+                    {
+                        open_folder(path);
                     }
+                    ui.close();
+                }
+                if ui.button("Open data folder").clicked() {
+                    open_folder(&self.data_dir);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Close monitor").clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    ui.close();
+                }
+            });
+            ui.menu_button("View", |ui| {
+                ui.label(RichText::new("Theme").weak());
+                let mut appearance_changed = false;
+                if ui
+                    .selectable_label(
+                        self.prefs.theme == ThemeChoice::Light && !self.black_theme,
+                        "Light",
+                    )
+                    .clicked()
+                {
+                    self.black_theme = false;
+                    self.prefs.theme = ThemeChoice::Light;
+                    appearance_changed = true;
+                }
+                if ui
+                    .selectable_label(
+                        self.prefs.theme == ThemeChoice::Dark && !self.black_theme,
+                        "Dark",
+                    )
+                    .clicked()
+                {
+                    self.black_theme = false;
+                    self.prefs.theme = ThemeChoice::Dark;
+                    appearance_changed = true;
+                }
+                if ui
+                    .selectable_label(self.prefs.theme == ThemeChoice::System, "System")
+                    .clicked()
+                {
+                    self.black_theme = false;
+                    self.prefs.theme = ThemeChoice::System;
+                    appearance_changed = true;
+                }
+                if ui.selectable_label(self.black_theme, "Black").clicked() {
+                    self.black_theme = true;
+                    self.prefs.theme = ThemeChoice::Dark;
+                    appearance_changed = true;
+                }
+                ui.separator();
+                ui.label(RichText::new("Interface scale").weak());
+                for (scale, label) in ATTACHED_SCALES {
                     if ui
-                        .add_enabled(
-                            self.config_file.is_some(),
-                            egui::Button::new("Open config folder"),
-                        )
+                        .selectable_value(&mut self.ui_scale, scale, label)
                         .clicked()
                     {
-                        if let Some(path) = self
-                            .config_file
-                            .as_deref()
-                            .and_then(std::path::Path::parent)
-                        {
-                            open_folder(path);
-                        }
-                        ui.close();
+                        ui.ctx().set_zoom_factor(scale);
                     }
-                    if ui.button("Open data folder").clicked() {
-                        open_folder(&self.data_dir);
-                        ui.close();
+                }
+                ui.separator();
+                ui.checkbox(&mut self.prefs.hide_addresses, "Hide peer addresses");
+                if appearance_changed {
+                    theme::install_style(ui.ctx());
+                    let mut appearance = self.prefs.clone();
+                    appearance.toybox = false;
+                    appearance.apply(ui.ctx());
+                    ui.ctx().set_zoom_factor(self.ui_scale);
+                    if self.black_theme {
+                        apply_black_visuals(ui.ctx());
                     }
-                });
-                ui.add_space(8.0);
-                let (label, color) = self.connection_label(pal);
-                ui.colored_label(color, label);
+                }
             });
+            ui.menu_button("Help", |ui| {
+                if ui.button("About Avila Node").clicked() {
+                    self.about_open = true;
+                    ui.close();
+                }
+            });
+            ui.add_space(8.0);
+            let (label, color) = self.connection_label(pal);
+            ui.add(egui::Label::new(RichText::new(label).color(color)).wrap());
         });
         ui.add_space(7.0);
         ui.horizontal_wrapped(|ui| {
@@ -677,7 +785,14 @@ impl AttachedApp {
             ui.add_space(10.0);
             match result {
                 Ok(value) => {
-                    let mut text = serde_json::to_string_pretty(value)
+                    let display_value = if self.prefs.hide_addresses {
+                        let mut redacted = value.clone();
+                        redact_peer_addresses(&mut redacted);
+                        redacted
+                    } else {
+                        value.clone()
+                    };
+                    let mut text = serde_json::to_string_pretty(&display_value)
                         .unwrap_or_else(|_| "Response could not be formatted as JSON.".into());
                     truncate_utf8(&mut text, MAX_CONSOLE_OUTPUT);
                     ui.label(RichText::new("Response").strong());
@@ -753,7 +868,11 @@ impl eframe::App for AttachedApp {
         // own repaint notification to wake the window immediately on updates.
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(Duration::from_secs(1));
-        let pal = Palette::of(&ctx);
+        let pal = if self.black_theme {
+            black_palette(Palette::of(&ctx))
+        } else {
+            Palette::of(&ctx)
+        };
         egui::Panel::top("attached_top")
             .frame(
                 Frame::new()
@@ -768,6 +887,17 @@ impl eframe::App for AttachedApp {
                     .inner_margin(egui::Margin::same(18)),
             )
             .show(ui, |ui| self.page(ui, pal));
+        if self.about_open {
+            egui::Window::new("About Avila Node")
+                .open(&mut self.about_open)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.heading(format!("Avila Node {}", env!("CARGO_PKG_VERSION")));
+                    ui.label("Attached read-only monitor");
+                    ui.label(format!("Network: {}", self.network));
+                    ui.label("Closing this monitor leaves the daemon running.");
+                });
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -777,6 +907,56 @@ impl eframe::App for AttachedApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.prefs.save(storage);
+        eframe::set_value(storage, ATTACHED_SCALE_KEY, &self.ui_scale);
+        eframe::set_value(storage, ATTACHED_BLACK_KEY, &self.black_theme);
+    }
+}
+
+fn apply_black_visuals(ctx: &egui::Context) {
+    ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.visuals.dark_mode = true;
+        style.visuals.panel_fill = Color32::BLACK;
+        style.visuals.window_fill = Color32::BLACK;
+        style.visuals.extreme_bg_color = Color32::from_gray(4);
+        style.visuals.faint_bg_color = Color32::from_gray(18);
+        style.visuals.code_bg_color = Color32::from_gray(12);
+        style.visuals.widgets.inactive.bg_fill = Color32::from_gray(22);
+        style.visuals.widgets.hovered.bg_fill = Color32::from_gray(38);
+        style.visuals.widgets.active.bg_fill = Color32::from_gray(52);
+        style.visuals.widgets.open.bg_fill = Color32::from_gray(30);
+    });
+}
+
+fn black_palette(mut palette: Palette) -> Palette {
+    palette.canvas = Color32::BLACK;
+    palette.raised = Color32::from_gray(10);
+    palette.well = Color32::from_gray(5);
+    palette.hairline = Color32::from_gray(42);
+    palette.text = Color32::from_gray(238);
+    palette.muted = Color32::from_gray(160);
+    palette.faint = Color32::from_gray(100);
+    palette.primary = Color32::from_gray(238);
+    palette.on_primary = Color32::BLACK;
+    palette
+}
+
+fn redact_peer_addresses(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object.iter_mut() {
+                if matches!(key.as_str(), "addr" | "addrlocal" | "addrbind") {
+                    *child = Value::String("Hidden".into());
+                } else {
+                    redact_peer_addresses(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_peer_addresses(item);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -989,7 +1169,9 @@ fn draw_traffic(ui: &mut Ui, samples: &VecDeque<TrafficSample>, pal: Palette) {
 
 #[cfg(test)]
 mod tests {
-    use super::historical_script_policy;
+    use super::{apply_black_visuals, historical_script_policy, redact_peer_addresses};
+    use crate::theme::{self, Palette};
+    use eframe::egui::{self, Color32};
     use serde_json::json;
 
     #[test]
@@ -1026,5 +1208,36 @@ mod tests {
             historical_script_policy(&json!({"coverage":{"state":"full_validation"}})),
             "Unknown (daemon did not report validation policy)"
         );
+    }
+
+    #[test]
+    fn hide_peer_addresses_redacts_nested_rpc_peer_fields() {
+        let mut peers = json!([
+            { "addr": "198.51.100.4:8333", "addrlocal": "192.0.2.1:8333", "subver": "/node/" },
+            { "addr": "[2001:db8::1]:8333", "addrbind": "0.0.0.0:8333" }
+        ]);
+
+        redact_peer_addresses(&mut peers);
+
+        assert_eq!(peers[0]["addr"], "Hidden");
+        assert_eq!(peers[0]["addrlocal"], "Hidden");
+        assert_eq!(peers[0]["subver"], "/node/");
+        assert_eq!(peers[1]["addr"], "Hidden");
+        assert_eq!(peers[1]["addrbind"], "Hidden");
+    }
+
+    #[test]
+    fn standard_style_install_resets_black_theme_visuals() {
+        let ctx = egui::Context::default();
+        theme::install_style(&ctx);
+        apply_black_visuals(&ctx);
+        let dark = ctx.style_of(egui::Theme::Dark);
+        assert_eq!(dark.visuals.panel_fill, Color32::BLACK);
+        assert_eq!(dark.visuals.window_fill, Color32::BLACK);
+
+        theme::install_style(&ctx);
+        let dark = ctx.style_of(egui::Theme::Dark);
+        assert_eq!(dark.visuals.panel_fill, Palette::DARK.canvas);
+        assert_eq!(dark.visuals.window_fill, Palette::DARK.raised);
     }
 }

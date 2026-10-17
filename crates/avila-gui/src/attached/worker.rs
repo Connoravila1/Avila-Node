@@ -5,7 +5,9 @@
 //! endpoint. RPC credentials are read from the local cookie file for each
 //! request and are never included in status, console, or error messages.
 
-use avila_node::inspect::{BlockLookupResult, MAX_TRANSACTION_PAGE};
+use avila_node::inspect::{
+    BlockLookupResult, BlockTxDetailResult, MAX_TRANSACTION_PAGE, MAX_TX_DETAIL_PAGE,
+};
 use avila_node::sync::ControlMsg;
 use eframe::egui::Context;
 use serde_json::{Value, json};
@@ -33,6 +35,7 @@ const READ_ONLY_METHODS: &[&str] = &[
     "getblockheader",
     "getblockhash",
     "getblockinspect",
+    "getblocktxinspect",
     "getblockstats",
 ];
 
@@ -259,6 +262,39 @@ fn inspect_loop(
                 let _ = reply.try_send(result);
                 ctx.request_repaint();
             }
+            Ok(ControlMsg::InspectBlockTx {
+                block_hash,
+                txid,
+                tx_index,
+                input_offset,
+                input_limit,
+                output_offset,
+                output_limit,
+                reply,
+            }) => {
+                let result = rpc_result(
+                    addr,
+                    data_dir,
+                    "getblocktxinspect",
+                    vec![
+                        json!(block_hash.to_string()),
+                        json!(txid.to_string()),
+                        json!(tx_index),
+                        json!(input_offset),
+                        json!(input_limit.clamp(1, MAX_TX_DETAIL_PAGE)),
+                        json!(output_offset),
+                        json!(output_limit.clamp(1, MAX_TX_DETAIL_PAGE)),
+                    ],
+                )
+                .and_then(|value| {
+                    serde_json::from_value::<BlockTxDetailResult>(value).map_err(|_| {
+                        "The daemon returned an invalid transaction-inspection response.".to_owned()
+                    })
+                })
+                .unwrap_or_else(BlockTxDetailResult::Error);
+                let _ = reply.try_send(result);
+                ctx.request_repaint();
+            }
             Ok(ControlMsg::Set { .. }) => {
                 // Attach mode has no local sync loop; reject live knob writes.
                 // It deliberately does not translate them to RPC setters.
@@ -472,6 +508,7 @@ mod tests {
                         "getpeerinfo" => json!([]),
                         "getnetworkinfo" => json!({ "networkactive": true }),
                         "getblockinspect" => json!({ "status": "not_found" }),
+                        "getblocktxinspect" => json!({ "status": "not_found" }),
                         _ => break,
                     };
                     let response = json!({
@@ -526,6 +563,7 @@ mod tests {
     fn read_only_allowlist_excludes_control_and_wallet_methods() {
         assert!(READ_ONLY_METHODS.contains(&"getblockchaininfo"));
         assert!(READ_ONLY_METHODS.contains(&"getblockinspect"));
+        assert!(READ_ONLY_METHODS.contains(&"getblocktxinspect"));
         assert!(!READ_ONLY_METHODS.contains(&"stop"));
         assert!(!READ_ONLY_METHODS.contains(&"setban"));
         assert!(!READ_ONLY_METHODS.contains(&"sendtoaddress"));
@@ -622,6 +660,25 @@ mod tests {
             BlockLookupResult::NotFound
         ));
 
+        let (reply, response) = mpsc::sync_channel(1);
+        worker
+            .control
+            .send(ControlMsg::InspectBlockTx {
+                block_hash: avila_consensus::hash::BlockHash::from_bytes([3; 32]),
+                txid: avila_consensus::hash::Txid::from_bytes([4; 32]),
+                tx_index: 7,
+                input_offset: 10,
+                input_limit: u16::MAX,
+                output_offset: 11,
+                output_limit: u16::MAX,
+                reply,
+            })
+            .unwrap();
+        assert!(matches!(
+            response.recv_timeout(Duration::from_secs(3)).unwrap(),
+            BlockTxDetailResult::NotFound
+        ));
+
         drop(worker);
         server.join().unwrap();
         let methods = methods.lock().unwrap();
@@ -632,6 +689,7 @@ mod tests {
             "getpeerinfo",
             "getnetworkinfo",
             "getblockinspect",
+            "getblocktxinspect",
         ] {
             assert!(methods.iter().any(|method| method == required));
         }

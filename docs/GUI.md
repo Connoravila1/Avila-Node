@@ -17,13 +17,16 @@ their explanation. Configuration inspection offers explicit copy actions.
 
 The event retention indicator measures the actual diagnostic buffer's occupancy.
 It does not represent chain synchronization. No peer graph or block chart is fed
-invented measurements. **View → Appearance** provides Light, Dark and Black themes
-and 75–200% interface scaling. Black uses `#000000` for panel and window backgrounds;
-controls retain visible boundaries and interaction states. Theme and scale persist
-locally in a versioned appearance record. `--theme light|dark|black` selects a startup
-theme. Generic egui memory, search terms, node data and window state are not saved.
+invented measurements. In GUI-owned mode, **Settings → Appearance** offers Light,
+Dark, Match the system, and 90–130% scale choices. The startup flag accepts
+`--theme light|dark|system`; Black is not a CLI value or a GUI-owned theme. In attach
+mode, **View** offers Black and 75–200% scale choices. Its Black palette sets panel
+and window backgrounds to `#000000`. Native checks exercised 130% and 200% scale
+and restored 100%; see the viewport limits below. Appearance settings persist
+locally. Generic egui memory, search terms, node data and window state are not
+saved.
 
-The default is Dark at 100% scale. On Linux, appearance is stored in
+The GUI-owned default is Light at 100% scale. On Linux, appearance is stored in
 `$XDG_DATA_HOME/avilanode/app.ron`, or `~/.local/share/avilanode/app.ron` when that
 environment variable is unset. eframe chooses the application-data directory on
 other platforms. Changes are saved on normal close and periodic autosave; a forced
@@ -62,11 +65,17 @@ On **Chain**, choose **Inspect** beside a recent block, or enter a height or ful
 block hash in **Block inspector**. Previous/next follow the returned block-hash
 links. The detail shows header fields and measured body size, weight, transaction
 count and transaction summaries. A header-only, pruned or otherwise unavailable
-body is identified explicitly. The weight composition and transaction table start
-with 100 transactions per request and can be paged; the GUI retains at most 2,000
-transaction summaries for the selected block. Composition is labeled as partial
-while more transactions remain. Fee and feerate fields are not part of this
-inspector's data contract.
+body is identified explicitly. The transaction map sizes each rectangle by its
+share of loaded transaction weight; the block header/framing is excluded and
+shade is a logarithmic cue. It covers only summaries currently loaded. A cell or keyboard-selectable transaction-table
+row selects that transaction. The inspector retains at most 2,000 summaries,
+fetched 100 at a time, and labels partial map coverage while more are available.
+Selected transaction detail requests are pinned to block hash, txid, and index;
+input and output pages are each capped at 100. The view shows outpoint, sequence,
+script/witness prefixes, output values and standard addresses when available.
+Prevout values and fees remain explicitly unknown because this detail path does
+not look up previous outputs; script hex is shown as a bounded prefix when
+truncated.
 
 The **Network traffic** page shows cumulative bytes sent and received by the
 current node worker, including peers that disconnected, and rates derived from
@@ -90,31 +99,32 @@ the transaction table continues below the initial viewport. The larger capture
 shows the single coinbase weight-composition segment. These captures do not verify
 live-node responses or transaction paging.
 
-The guarded native workspace pipeline passed after attach mode was integrated:
-build, rustdoc, Clippy, and 1,138 tests passed (5 ignored). The CLI and GUI were
-deployed, and a clean restart advanced validation from height 1,555 to 1,610 with
-block-hash consistency checks passing. Native attach captures from a running node
-show the Overview and block 170 at 760×600 and 1440×900. Keyboard navigation
-reached Blocks and height search selected 170. The inspector showed
-active-chain/fully-checked status and measured header/body facts. Final lower-page
-captures show both transaction rows and all seven table columns at both sizes.
-Displayed txids are compacted to fit; clicking the coinbase txid copied and
-matched the complete txid. The Node menu and theme-tinted brand mark are visible
-in the light theme.
+Final native validation passed GUI formatting, Clippy, 82 GUI tests, and a
+release build under the 2.5 GiB memory cap. The full workspace passed 1,148 tests
+(5 ignored), plus 14 Python tests. Live captures used mainnet block 83018
+(`00000000002bba570c3fbc62f77f54685b7011bfa202a086d4005131cc0ceed6`), which
+contains 225 transactions. The inspector loaded summaries in 100 → 200 → 225
+steps, updated its loaded-coverage labels, and removed the load-more button at the
+end. Selecting map cell 84 opened the matching transaction detail; selecting
+table row 1 showed the real one-input/two-output transaction, full txid, and
+explicitly unknown fee. The 200 px input/output panes showed the facts and
+selectable address. The block was marked as a lookup snapshot. At 760×600 and
+1440×900 with 100% scale, the partial-map caption, transaction table, map, and
+detail panes were readable.
 
-Further native attach checks showed an actual `getblockchaininfo` result at
-connected height 37,129, rejection of an RPC method outside the console allowlist,
-traffic counters/rates and plot, and six peer rows. Peer addresses were kept out
-of repository documentation and shareable captures. Closing the GUI exited
-cleanly while the same daemon remained active and advanced from height 40,815 to
-40,835. These changing heights reflect an active sync sample, not catch-up or
-completion. GUI tests (74), Clippy, and GUI build passed after the table layout and
-compact-txid changes; the guarded workspace pipeline also passed build, rustdoc,
-Clippy, and 1,138 tests (5 ignored).
+The attached View scale was exercised at 130% and 200%, then restored to 100%; the
+Help/About version was correct. Black-to-Dark reset, peer-address masking on six
+rows, and Node → Close monitor were checked. Closing the monitor left the daemon
+active while its height advanced from 141,214 to 141,244. This is a changing sync
+sample, not evidence of completion.
 
-Transaction paging beyond the first 100 entries, zoom behavior, missing-cookie
-recovery, and screen-reader behavior remain unverified. These observations are
-not a full visual or accessibility audit.
+Remaining native limits: at 130% on 760×600, long fields clip; at 200% on
+1440×900, the lower View-menu entries (175%, 200%, and privacy) fall below the
+window, so the full high-zoom menu is not accessible. Keyboard selection of a
+transaction-table row and screen-reader behavior were not verified. A transaction
+with more than 100 inputs or outputs was not tested, and missing-cookie recovery
+remains unverified. These observations are not a full visual or accessibility
+audit.
 
 Launch with `--full-verify` to disable the assume-valid checkpoint for that run
 and verify historical scripts during initial sync, matching the CLI's
@@ -160,6 +170,14 @@ console. The console allows only these read-only methods: `help`,
 responses to 64 KiB, and one console request can be pending at a time. Node
 configuration and wallet/mutating RPC methods are not exposed by this console.
 
+At the tested default 100% scale, the attached header keeps Node, View, and Help
+reachable at 760×600 and 1440×900. Higher zoom still has layout limits described
+below. View offers Light, Dark, System, and Black
+themes; 75–200% interface scale; and peer-address masking in the peer table and
+RPC JSON (`addr`, `addrlocal`, and `addrbind` fields). These attached appearance
+choices persist locally. Node → Close monitor closes only this GUI window, while
+Help → About shows the running package version.
+
 Validation policy comes from `getvalidationreport.validation_policy`:
 `historical_scripts_required: true` is shown as requiring all historical scripts;
 `false` is shown with the `assume_valid_checkpoint` only when that value is a
@@ -173,19 +191,23 @@ work-based validation measure, or catch-up guarantee.
 
 ### Attached-block checks completed and pending
 
-Completed native checks used the actual attached node and block 170, not demo or
-fixture data. At 760×600 and 1440×900, both transaction rows and all seven columns
-were readable. The displayed txid is abbreviated; a native clipboard comparison
-confirmed clicking it copied the complete coinbase txid. Keyboard navigation
-reached Blocks, height search selected 170, and the Node menu remained visible in
-light theme. The attached console returned actual chain info and rejected a method
-outside its allowlist. Traffic counters/rates and the graph rendered; six peer
-rows were visible. Closing the GUI left the daemon running, and its connected
-height advanced from 40,815 to 40,835.
+Completed native checks used the actual attached node and block 83018, not demo or
+fixture data. The inspector loaded 225 transaction summaries in three pages and
+stopped offering more when all were loaded. A map cell selected its matching
+transaction; the table selected a real one-input/two-output transaction and showed
+its full txid, unknown fee, input/output facts and selectable address. At 760×600
+and 1440×900 with 100% scale, the map caption, table, and detail panes fit and
+remained readable. Lookup-snapshot status was visible. The attached console
+returned actual chain info and rejected a method outside its allowlist. Traffic
+counters/rates and the graph rendered; six peer rows were visible and peer-address
+masking was checked. Help/About showed the package version. Node → Close monitor
+closed only the GUI; the daemon remained active and its height advanced from
+141,214 to 141,244.
 
-Still to check: choose a body-available block with at least 100 transactions,
-load the next page, and verify the partial-composition label and table update.
-Also verify missing-cookie recovery, zoom, and screen-reader behavior. Do not use
+At 130% on 760×600, long fields clip. At 200% on 1440×900, the lower View-menu
+entries (175%, 200%, and privacy) fall below the window. Keyboard selection of a
+transaction-table row, a transaction with more than 100 inputs or outputs,
+missing-cookie recovery, and screen-reader behavior remain unverified. Do not use
 fixture or demo data for live attached-node checks.
 
 Keep native screenshots and provenance notes in a review-artifact directory
