@@ -183,41 +183,56 @@ fn transaction_table(ui: &mut Ui, transactions: &[BlockTxSummary]) {
     ui.add_space(12.0);
     ui.label(RichText::new("Transactions").strong());
     egui::ScrollArea::vertical()
+        .id_salt("block_transaction_rows")
         .max_height(300.0)
+        .min_scrolled_height(120.0)
         .show(ui, |ui| {
-            egui::Grid::new("block_transactions")
-                .striped(true)
-                .num_columns(7)
-                .spacing([12.0, 5.0])
+            // Give the nested vertical area a useful viewport even when the
+            // current block has only a few rows. The enclosing page also
+            // scrolls vertically; without this minimum its nested area can
+            // collapse to a single visible row.
+            ui.set_min_height(120.0);
+            egui::ScrollArea::horizontal()
+                .id_salt("block_transaction_columns")
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for header in [
-                        "Index",
-                        "Txid",
-                        "Kind",
-                        "Inputs",
-                        "Outputs",
-                        "Output value",
-                        "Weight",
-                    ] {
-                        ui.label(RichText::new(header).strong().weak());
-                    }
-                    ui.end_row();
-                    for tx in transactions {
-                        ui.label(tx.index.to_string());
-                        ui.label(RichText::new(&tx.txid).monospace());
-                        ui.label(if tx.coinbase {
-                            "coinbase"
-                        } else if tx.has_witness {
-                            "witness"
-                        } else {
-                            "standard"
+                    egui::Grid::new("block_transactions")
+                        .striped(true)
+                        .num_columns(7)
+                        .spacing([12.0, 5.0])
+                        .show(ui, |ui| {
+                            for header in [
+                                "Index",
+                                "Txid",
+                                "Kind",
+                                "Inputs",
+                                "Outputs",
+                                "Output value",
+                                "Weight",
+                            ] {
+                                ui.label(RichText::new(header).strong().weak());
+                            }
+                            ui.end_row();
+                            for tx in transactions {
+                                ui.label(tx.index.to_string());
+                                // Keep the table compact at narrow window sizes;
+                                // clicking the label or its context menu still
+                                // copies the complete txid.
+                                crate::widgets::hash_label(ui, &tx.txid, 13.0, Some(14));
+                                ui.label(if tx.coinbase {
+                                    "coinbase"
+                                } else if tx.has_witness {
+                                    "witness"
+                                } else {
+                                    "standard"
+                                });
+                                ui.label(tx.inputs.to_string());
+                                ui.label(tx.outputs.to_string());
+                                ui.label(format_sats(tx.output_sats));
+                                ui.label(format!("{} WU", tx.weight));
+                                ui.end_row();
+                            }
                         });
-                        ui.label(tx.inputs.to_string());
-                        ui.label(tx.outputs.to_string());
-                        ui.label(format_sats(tx.output_sats));
-                        ui.label(format!("{} WU", tx.weight));
-                        ui.end_row();
-                    }
                 });
         });
 }

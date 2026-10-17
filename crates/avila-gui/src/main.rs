@@ -1,4 +1,5 @@
 mod app;
+mod attached;
 mod avalanche;
 #[cfg(feature = "devtools")]
 mod bench;
@@ -110,6 +111,7 @@ mod widgets;
 mod xp;
 
 use std::error::Error;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use avila_node::Node;
@@ -139,10 +141,29 @@ struct Args {
     /// This can make initial sync substantially slower; the default is unchanged.
     #[arg(long)]
     full_verify: bool,
+    /// Observe an already-running local daemon instead of starting a node.
+    /// The daemon must expose cookie-authenticated loopback RPC.
+    #[arg(long)]
+    attach: bool,
+    /// Loopback RPC endpoint for --attach; defaults to services.rpc.bind,
+    /// then 127.0.0.1:18443. Needed when the daemon was started with --rpc.
+    #[arg(long, value_name = "IP:PORT", requires = "attach")]
+    rpc_addr: Option<SocketAddr>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    if args.attach && args.demo {
+        return Err("--attach cannot be combined with --demo".into());
+    }
+    if args.attach && (args.fast_ibd || args.full_verify) {
+        return Err(
+            "--fast-ibd and --full-verify only configure a GUI-owned node; they cannot change an attached daemon".into(),
+        );
+    }
+    if !args.attach && args.rpc_addr.is_some() {
+        return Err("--rpc-addr requires --attach".into());
+    }
     // SIGINT/SIGTERM ask the window to close — eframe then runs the
     // app's on_exit, which stops the sync worker and lets its exit
     // flush write state.dat. A bare kill would otherwise discard
@@ -160,8 +181,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         .clone()
         .and_then(|p| p.canonicalize().ok().or(Some(p)));
     let node = Node::new(load_config(args.config.as_deref())?)?;
+    let rpc_addr = args
+        .rpc_addr
+        .or(node.config().get().services.rpc.bind)
+        .unwrap_or("127.0.0.1:18443".parse()?);
+    if args.attach && !rpc_addr.ip().is_loopback() {
+        return Err("--attach accepts loopback RPC addresses only".into());
+    }
     let icon = eframe::icon_data::from_png_bytes(brand::LOGO_PNG)?;
-    let title = if args.demo {
+    let title = if args.attach {
+        "Avila Node — attached"
+    } else if args.demo {
         "Avila Node — simulated"
     } else {
         "Avila Node"
@@ -176,7 +206,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .with_min_inner_size([760.0, 480.0]),
         ..Default::default()
     };
-    let (demo, theme) = (args.demo, args.theme);
+    let (attach, demo, theme) = (args.attach, args.demo, args.theme);
     let start_options = app::StartOptions {
         fast_ibd: args.fast_ibd,
         full_verify: args.full_verify,
@@ -186,15 +216,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         "Avila Node",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(app::App::new(
-                cc,
-                node,
-                demo,
-                start_options,
-                theme,
-                close_flag,
-                config_file,
-            )))
+            let app: Box<dyn eframe::App> = if attach {
+                Box::new(attached::AttachedApp::new(
+                    cc,
+                    node,
+                    config_file,
+                    rpc_addr,
+                    theme,
+                    close_flag,
+                ))
+            } else {
+                Box::new(app::App::new(
+                    cc,
+                    node,
+                    demo,
+                    start_options,
+                    theme,
+                    close_flag,
+                    config_file,
+                ))
+            };
+            Ok(app)
         }),
     )?;
     Ok(())

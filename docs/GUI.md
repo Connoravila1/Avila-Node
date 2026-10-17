@@ -76,9 +76,11 @@ across a run restart, counter reset, nonpositive time interval or gap over 2.5
 seconds are omitted. Demo mode is simulated and does not report live network
 traffic; block inspection requires a live node session.
 
-The GUI starts and controls its own node worker. It cannot attach to a separate
-headless Avila Node process in the current architecture; inspection requests use
-an in-process channel to the worker started by this GUI.
+In its default mode, the GUI starts and controls its own node worker. Attach mode
+instead observes an already-running node through its loopback RPC endpoint; it
+does not start a second node or chainstate. The attached block inspector and
+status views use background RPC workers. RPC operations use three-second
+connect, read, and write inactivity timeouts; this is not a total-call deadline.
 
 Native captures reviewed on 2026-10-17 show the Chain page with the offline
 mainnet-genesis fixture at 1120×760 and 760×600. The fixture is explicitly marked
@@ -86,9 +88,33 @@ as offline, not live node data. Both captures show the inspector and measured
 genesis header/body facts; the compact view keeps the long hashes on-screen, while
 the transaction table continues below the initial viewport. The larger capture
 shows the single coinbase weight-composition segment. These captures do not verify
-live-node responses, transaction paging, keyboard navigation, zoom behavior, or
-screen-reader/accessibility behavior. The native GUI build, workspace tests,
-Clippy, and Bitcoin Core diff checks passed for this implementation.
+live-node responses or transaction paging.
+
+The guarded native workspace pipeline passed after attach mode was integrated:
+build, rustdoc, Clippy, and 1,138 tests passed (5 ignored). The CLI and GUI were
+deployed, and a clean restart advanced validation from height 1,555 to 1,610 with
+block-hash consistency checks passing. Native attach captures from a running node
+show the Overview and block 170 at 760×600 and 1440×900. Keyboard navigation
+reached Blocks and height search selected 170. The inspector showed
+active-chain/fully-checked status and measured header/body facts. Final lower-page
+captures show both transaction rows and all seven table columns at both sizes.
+Displayed txids are compacted to fit; clicking the coinbase txid copied and
+matched the complete txid. The Node menu and theme-tinted brand mark are visible
+in the light theme.
+
+Further native attach checks showed an actual `getblockchaininfo` result at
+connected height 37,129, rejection of an RPC method outside the console allowlist,
+traffic counters/rates and plot, and six peer rows. Peer addresses were kept out
+of repository documentation and shareable captures. Closing the GUI exited
+cleanly while the same daemon remained active and advanced from height 40,815 to
+40,835. These changing heights reflect an active sync sample, not catch-up or
+completion. GUI tests (74), Clippy, and GUI build passed after the table layout and
+compact-txid changes; the guarded workspace pipeline also passed build, rustdoc,
+Clippy, and 1,138 tests (5 ignored).
+
+Transaction paging beyond the first 100 entries, zoom behavior, missing-cookie
+recovery, and screen-reader behavior remain unverified. These observations are
+not a full visual or accessibility audit.
 
 Launch with `--full-verify` to disable the assume-valid checkpoint for that run
 and verify historical scripts during initial sync, matching the CLI's
@@ -98,8 +124,72 @@ default is unchanged, and the flag does not alter saved GUI preferences.
 For a native devtools capture of the measured offline genesis fixture, run
 `AVILA_GUI_CAPTURE=/tmp/avila-gui-capture AVILA_GUI_CAPTURE_ONLY=block-detail-genesis-fixture cargo run -p avila-gui --features devtools -- --demo`.
 The harness writes full-size and compact screenshots with JSON provenance sidecars.
-This capture is a deterministic fixture view, not evidence from a live node. A
-separate attach-mode operator view is planned; it is not part of the current GUI.
+This capture is a deterministic fixture view, not evidence from a live node.
+
+## Attaching to an existing node
+
+Start a daemon with cookie-authenticated RPC enabled on a loopback address, then
+launch the GUI with the same network configuration so it can find that daemon's
+data directory and local RPC cookie:
+
+```sh
+avila-gui --attach --config /path/to/avila.toml
+```
+
+If the daemon's RPC address differs from `services.rpc.bind` in that config, pass
+it explicitly:
+
+```sh
+avila-gui --attach --config /path/to/avila.toml --rpc-addr 127.0.0.1:18443
+```
+
+Only loopback RPC addresses are accepted. The attach worker reads the cookie from
+the configured network data directory for each request; if the cookie is not
+available yet, the view reports RPC unavailable and retries. It never places the
+cookie in status, console output, or errors. Closing the GUI stops its attach
+workers and leaves the daemon running. Attach mode cannot start or stop the node,
+apply settings, change pruning or memory limits, or alter verification policy.
+`--fast-ibd` and `--full-verify` are rejected with `--attach`; they only configure
+a GUI-owned node. `--demo` is also incompatible with attach mode.
+
+The attached window has five pages: Overview, Blocks, Peers, Traffic, and RPC
+console. The console allows only these read-only methods: `help`,
+`getblockchaininfo`, `getvalidationreport`, `getnetworkinfo`, `getnettotals`,
+`getpeerinfo`, `getmempoolinfo`, `getchaintips`, `getblockheader`,
+`getblockhash`, `getblockinspect`, and `getblockstats`. Input is limited to 8 KiB,
+responses to 64 KiB, and one console request can be pending at a time. Node
+configuration and wallet/mutating RPC methods are not exposed by this console.
+
+Validation policy comes from `getvalidationreport.validation_policy`:
+`historical_scripts_required: true` is shown as requiring all historical scripts;
+`false` is shown with the `assume_valid_checkpoint` only when that value is a
+valid hash. Missing or malformed policy metadata is displayed as unknown. A
+server without the required validation-report RPC cannot provide a fresh required
+status sample, so the attached view reports the RPC error/stale state instead of
+inferring strict validation from an older coverage label. The Overview labels
+`initialblockdownload` as the daemon estimate, warns when connected or header
+height is zero, and says that a 100% connected/header height ratio is not an ETA,
+work-based validation measure, or catch-up guarantee.
+
+### Attached-block checks completed and pending
+
+Completed native checks used the actual attached node and block 170, not demo or
+fixture data. At 760×600 and 1440×900, both transaction rows and all seven columns
+were readable. The displayed txid is abbreviated; a native clipboard comparison
+confirmed clicking it copied the complete coinbase txid. Keyboard navigation
+reached Blocks, height search selected 170, and the Node menu remained visible in
+light theme. The attached console returned actual chain info and rejected a method
+outside its allowlist. Traffic counters/rates and the graph rendered; six peer
+rows were visible. Closing the GUI left the daemon running, and its connected
+height advanced from 40,815 to 40,835.
+
+Still to check: choose a body-available block with at least 100 transactions,
+load the next page, and verify the partial-composition label and table update.
+Also verify missing-cookie recovery, zoom, and screen-reader behavior. Do not use
+fixture or demo data for live attached-node checks.
+
+Keep native screenshots and provenance notes in a review-artifact directory
+outside the repository. Do not include private peer addresses in shared artifacts.
 
 ## Acceptance requirements
 

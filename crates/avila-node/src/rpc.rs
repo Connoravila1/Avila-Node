@@ -34,7 +34,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use avila_consensus::address::{script_address, validate_address};
-use avila_consensus::arith::difficulty_from_compact;
+use avila_consensus::arith::{Work, difficulty_from_compact};
 use avila_consensus::chain::HeaderNode;
 use avila_consensus::chainstate::Chainstate;
 use avila_consensus::check::RuleError;
@@ -492,9 +492,24 @@ const MAX_RESPONSE: u64 = 32 * 1024 * 1024;
 /// # Errors
 /// A `String` describing the transport, HTTP, or JSON failure.
 pub fn call(addr: SocketAddr, auth: Option<&str>, request: &Value) -> Result<Value, String> {
-    let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    call_with_timeout(addr, auth, request, Duration::from_secs(15))
+}
+
+/// The same JSON-RPC transport as [`call`], with explicit connection,
+/// read, and write socket timeouts. This is not a whole-call deadline.
+/// The auth value is written only to the request header and is never
+/// included in errors or logs.
+pub fn call_with_timeout(
+    addr: SocketAddr,
+    auth: Option<&str>,
+    request: &Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let mut stream =
+        TcpStream::connect_timeout(&addr, timeout).map_err(|e| format!("connect {addr}: {e}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(15)))
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
         .map_err(|e| e.to_string())?;
     let body = request.to_string();
     let mut head = format!(
@@ -3679,11 +3694,12 @@ const GETRPCINFO_HELP: &str = "getrpcinfo\n\nReturns details of the RPC server.\
 const GETBLOCKCOUNT_HELP: &str = "getblockcount\n\nReturns the height of the most-work fully-validated chain.\nThe genesis block has height 0.\n\nResult:\nn    (numeric) The current block count\n\nExamples:\n> bitcoin-cli getblockcount \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockcount\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const GETBESTBLOCKHASH_HELP: &str = "getbestblockhash\n\nReturns the hash of the best (tip) block in the most-work fully-validated chain.\n\nResult:\n\"hex\"    (string) the block hash, hex-encoded\n\nExamples:\n> bitcoin-cli getbestblockhash \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getbestblockhash\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const GETDIFFICULTY_HELP: &str = "getdifficulty\n\nReturns the proof-of-work difficulty as a multiple of the minimum difficulty.\n\nResult:\nn    (numeric) the proof-of-work difficulty as a multiple of the minimum difficulty.\n\nExamples:\n> bitcoin-cli getdifficulty \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getdifficulty\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
-const GETBLOCKCHAININFO_HELP: &str = "getblockchaininfo\n\nReturns an object containing various state info regarding blockchain processing.\n\nResult:\n{                                         (json object)\n  \"chain\" : \"str\",                        (string) current network name (main, test, testnet4, signet, regtest)\n  \"blocks\" : n,                           (numeric) the height of the most-work fully-validated chain. The genesis block has height 0\n  \"headers\" : n,                          (numeric) the current number of headers we have validated\n  \"bestblockhash\" : \"str\",                (string) the hash of the currently best block\n  \"bits\" : \"hex\",                         (string) nBits: compact representation of the block difficulty target\n  \"target\" : \"hex\",                       (string) The difficulty target\n  \"difficulty\" : n,                       (numeric) the current difficulty\n  \"time\" : xxx,                           (numeric) The block time expressed in UNIX epoch time\n  \"mediantime\" : xxx,                     (numeric) The median block time expressed in UNIX epoch time\n  \"verificationprogress\" : n,             (numeric) estimate of verification progress [0..1]\n  \"initialblockdownload\" : true|false,    (boolean) (debug information) estimate of whether this node is in Initial Block Download mode\n  \"chainwork\" : \"hex\",                    (string) total amount of work in active chain, in hexadecimal\n  \"size_on_disk\" : n,                     (numeric) the estimated size of the block and undo files on disk\n  \"pruned\" : true|false,                  (boolean) if the blocks are subject to pruning\n  \"pruneheight\" : n,                      (numeric, optional) height of the last block pruned, plus one (only present if pruning is enabled)\n  \"automatic_pruning\" : true|false,       (boolean, optional) whether automatic pruning is enabled (only present if pruning is enabled)\n  \"prune_target_size\" : n,                (numeric, optional) the target size used by pruning (only present if automatic pruning is enabled)\n  \"signet_challenge\" : \"hex\",             (string, optional) the block challenge (aka. block script), in hexadecimal (only present if the current network is a signet)\n  \"warnings\" : [                          (json array) any network and blockchain warnings (run with `-deprecatedrpc=warnings` to return the latest warning as a single string)\n    \"str\",                                (string) warning\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli getblockchaininfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockchaininfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETBLOCKCHAININFO_HELP: &str = "getblockchaininfo\n\nReturns an object containing various state info regarding blockchain processing.\n\nResult:\n{                                         (json object)\n  \"chain\" : \"str\",                        (string) current network name (main, test, testnet4, signet, regtest)\n  \"blocks\" : n,                           (numeric) the height of the most-work fully-validated chain. The genesis block has height 0\n  \"headers\" : n,                          (numeric) the current number of headers we have validated\n  \"bestblockhash\" : \"str\",                (string) the hash of the currently best block\n  \"bits\" : \"hex\",                         (string) nBits: compact representation of the block difficulty target\n  \"target\" : \"hex\",                       (string) The difficulty target\n  \"difficulty\" : n,                       (numeric) the current difficulty\n  \"time\" : xxx,                           (numeric) The block time expressed in UNIX epoch time\n  \"mediantime\" : xxx,                     (numeric) The median block time expressed in UNIX epoch time\n  \"verificationprogress\" : n,             (numeric) rough connected-height / header-height estimate [0..1], not a work-weighted validation estimate\n  \"initialblockdownload\" : true|false,    (boolean) conservative status based on minimum chainwork, a recent checked tip, and header lag\n  \"chainwork\" : \"hex\",                    (string) total amount of work in active chain, in hexadecimal\n  \"size_on_disk\" : n,                     (numeric) the estimated size of the block and undo files on disk\n  \"pruned\" : true|false,                  (boolean) if the blocks are subject to pruning\n  \"pruneheight\" : n,                      (numeric, optional) height of the last block pruned, plus one (only present if pruning is enabled)\n  \"automatic_pruning\" : true|false,       (boolean, optional) whether automatic pruning is enabled (only present if pruning is enabled)\n  \"prune_target_size\" : n,                (numeric, optional) the target size used by pruning (only present if automatic pruning is enabled)\n  \"signet_challenge\" : \"hex\",             (string, optional) the block challenge (aka. block script), in hexadecimal (only present if the current network is a signet)\n  \"warnings\" : [                          (json array) any network and blockchain warnings (run with `-deprecatedrpc=warnings` to return the latest warning as a single string)\n    \"str\",                                (string) warning\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli getblockchaininfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockchaininfo\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const VALIDATEADDRESS_HELP: &str = "validateaddress \"address\"\n\nReturn information about the given bitcoin address.\n\nArguments:\n1. address    (string, required) The bitcoin address to validate\n\nResult:\n{                               (json object)\n  \"isvalid\" : true|false,       (boolean) If the address is valid or not\n  \"address\" : \"str\",            (string, optional) The bitcoin address validated\n  \"scriptPubKey\" : \"hex\",       (string, optional) The hex-encoded output script generated by the address\n  \"isscript\" : true|false,      (boolean, optional) If the key is a script\n  \"iswitness\" : true|false,     (boolean, optional) If the address is a witness address\n  \"witness_version\" : n,        (numeric, optional) The version number of the witness program\n  \"witness_program\" : \"hex\",    (string, optional) The hex value of the witness program\n  \"error\" : \"str\",              (string, optional) Error message, if any\n  \"error_locations\" : [         (json array, optional) Indices of likely error locations in address, if known (e.g. Bech32 errors)\n    n,                          (numeric) index of a potential error\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli validateaddress \"bc1q09vm5lfy0j5reeulh4x5752q25uqqvz34hufdl\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"validateaddress\", \"params\": [\"bc1q09vm5lfy0j5reeulh4x5752q25uqqvz34hufdl\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const DECODESCRIPT_HELP: &str = "decodescript \"hexstring\"\n\nDecode a hex-encoded script.\n\nArguments:\n1. hexstring    (string, required) the hex-encoded script\n\nResult:\n{                             (json object)\n  \"asm\" : \"str\",              (string) Disassembly of the script\n  \"desc\" : \"str\",             (string) Inferred descriptor for the script\n  \"type\" : \"str\",             (string) The output type (e.g. nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n  \"address\" : \"str\",          (string, optional) The Bitcoin address (only if a well-defined address exists)\n  \"p2sh\" : \"str\",             (string, optional) address of P2SH script wrapping this redeem script (not returned for types that should not be wrapped)\n  \"segwit\" : {                (json object, optional) Result of a witness output script wrapping this redeem script (not returned for types that should not be wrapped)\n    \"asm\" : \"str\",            (string) Disassembly of the output script\n    \"hex\" : \"hex\",            (string) The raw output script bytes, hex-encoded\n    \"type\" : \"str\",           (string) The type of the output script (e.g. witness_v0_keyhash or witness_v0_scripthash)\n    \"address\" : \"str\",        (string, optional) The Bitcoin address (only if a well-defined address exists)\n    \"desc\" : \"str\",           (string) Inferred descriptor for the script\n    \"p2sh-segwit\" : \"str\"     (string) address of the P2SH script wrapping this witness redeem script\n  }\n}\n\nExamples:\n> bitcoin-cli decodescript \"hexstring\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"decodescript\", \"params\": [\"hexstring\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const GETBLOCKHASH_HELP: &str = "getblockhash height\n\nReturns hash of block in best-block-chain at height provided.\n\nArguments:\n1. height    (numeric, required) The height index\n\nResult:\n\"hex\"    (string) The block hash\n\nExamples:\n> bitcoin-cli getblockhash 1000\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockhash\", \"params\": [1000]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const GETBLOCKHEADER_HELP: &str = "getblockheader \"blockhash\" ( verbose )\n\nIf verbose is false, returns a string that is serialized, hex-encoded data for blockheader 'hash'.\nIf verbose is true, returns an Object with information about blockheader <hash>.\n\nArguments:\n1. blockhash    (string, required) The block hash\n2. verbose      (boolean, optional, default=true) true for a json object, false for the hex-encoded data\n\nResult (for verbose = true):\n{                                 (json object)\n  \"hash\" : \"hex\",                 (string) the block hash (same as provided)\n  \"confirmations\" : n,            (numeric) The number of confirmations, or -1 if the block is not on the main chain\n  \"height\" : n,                   (numeric) The block height or index\n  \"version\" : n,                  (numeric) The block version\n  \"versionHex\" : \"hex\",           (string) The block version formatted in hexadecimal\n  \"merkleroot\" : \"hex\",           (string) The merkle root\n  \"time\" : xxx,                   (numeric) The block time expressed in UNIX epoch time\n  \"mediantime\" : xxx,             (numeric) The median block time expressed in UNIX epoch time\n  \"nonce\" : n,                    (numeric) The nonce\n  \"bits\" : \"hex\",                 (string) nBits: compact representation of the block difficulty target\n  \"target\" : \"hex\",               (string) The difficulty target\n  \"difficulty\" : n,               (numeric) The difficulty\n  \"chainwork\" : \"hex\",            (string) Expected number of hashes required to produce the current chain\n  \"nTx\" : n,                      (numeric) The number of transactions in the block\n  \"previousblockhash\" : \"hex\",    (string, optional) The hash of the previous block (if available)\n  \"nextblockhash\" : \"hex\"         (string, optional) The hash of the next block (if available)\n}\n\nResult (for verbose=false):\n\"hex\"    (string) A string that is serialized, hex-encoded data for block 'hash'\n\nExamples:\n> bitcoin-cli getblockheader \"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockheader\", \"params\": [\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+const GETBLOCKINSPECT_HELP: &str = "getblockinspect height_or_hash ( tx_offset tx_limit )\n\nReturn a bounded, read-only block summary and one transaction page from locally indexed chainstate. A numeric first argument selects a height; a 64-character hexadecimal string selects a block hash. Missing/pruned bodies are reported in body_state and are not fetched from peers.\n\nArguments:\n1. height_or_hash (numeric or string, required) Block height or 64-character block hash\n2. tx_offset      (numeric, optional, default=0) First transaction index\n3. tx_limit       (numeric, optional, default=100, maximum=250) Transactions to return\n\nResult: a tagged object with status `found`, `not_found`, or `error`; `found` includes block metadata, transactions, and next_offset.\n";
 const GETBLOCK_HELP: &str = "getblock \"blockhash\" ( verbosity )\n\nIf verbosity is 0, returns a string that is serialized, hex-encoded data for block 'hash'.\nIf verbosity is 1, returns an Object with information about block <hash>.\nIf verbosity is 2, returns an Object with information about block <hash> and information about each transaction.\nIf verbosity is 3, returns an Object with information about block <hash> and information about each transaction, including prevout information for inputs (only for unpruned blocks in the current best chain).\n\nArguments:\n1. blockhash    (string, required) The block hash\n2. verbosity    (numeric, optional, default=1) 0 for hex-encoded data, 1 for a JSON object, 2 for JSON object with transaction data, and 3 for JSON object with transaction data including prevout information for inputs\n\nResult (for verbosity = 0):\n\"hex\"    (string) A string that is serialized, hex-encoded data for block 'hash'\n\nResult (for verbosity = 1):\n{                                 (json object)\n  \"hash\" : \"hex\",                 (string) the block hash (same as provided)\n  \"confirmations\" : n,            (numeric) The number of confirmations, or -1 if the block is not on the main chain\n  \"size\" : n,                     (numeric) The block size\n  \"strippedsize\" : n,             (numeric) The block size excluding witness data\n  \"weight\" : n,                   (numeric) The block weight as defined in BIP 141\n  \"height\" : n,                   (numeric) The block height or index\n  \"version\" : n,                  (numeric) The block version\n  \"versionHex\" : \"hex\",           (string) The block version formatted in hexadecimal\n  \"merkleroot\" : \"hex\",           (string) The merkle root\n  \"tx\" : [                        (json array) The transaction ids\n    \"hex\",                        (string) The transaction id\n    ...\n  ],\n  \"time\" : xxx,                   (numeric) The block time expressed in UNIX epoch time\n  \"mediantime\" : xxx,             (numeric) The median block time expressed in UNIX epoch time\n  \"nonce\" : n,                    (numeric) The nonce\n  \"bits\" : \"hex\",                 (string) nBits: compact representation of the block difficulty target\n  \"target\" : \"hex\",               (string) The difficulty target\n  \"difficulty\" : n,               (numeric) The difficulty\n  \"chainwork\" : \"hex\",            (string) Expected number of hashes required to produce the chain up to this block (in hex)\n  \"nTx\" : n,                      (numeric) The number of transactions in the block\n  \"previousblockhash\" : \"hex\",    (string, optional) The hash of the previous block (if available)\n  \"nextblockhash\" : \"hex\"         (string, optional) The hash of the next block (if available)\n}\n\nResult (for verbosity = 2):\n{                   (json object)\n  ...,              Same output as verbosity = 1\n  \"tx\" : [          (json array)\n    {               (json object)\n      ...,          The transactions in the format of the getrawtransaction RPC. Different from verbosity = 1 \"tx\" result\n      \"fee\" : n     (numeric) The transaction fee in BTC, omitted if block undo data is not available\n    },\n    ...\n  ]\n}\n\nResult (for verbosity = 3):\n{                                        (json object)\n  ...,                                   Same output as verbosity = 2\n  \"tx\" : [                               (json array)\n    {                                    (json object)\n      \"vin\" : [                          (json array)\n        {                                (json object)\n          ...,                           The same output as verbosity = 2\n          \"prevout\" : {                  (json object) (Only if undo information is available)\n            \"generated\" : true|false,    (boolean) Coinbase or not\n            \"height\" : n,                (numeric) The height of the prevout\n            \"value\" : n,                 (numeric) The value in BTC\n            \"scriptPubKey\" : {           (json object)\n              \"asm\" : \"str\",             (string) Disassembly of the output script\n              \"desc\" : \"str\",            (string) Inferred descriptor for the output\n              \"hex\" : \"hex\",             (string) The raw output script bytes, hex-encoded\n              \"address\" : \"str\",         (string, optional) The Bitcoin address (only if a well-defined address exists)\n              \"type\" : \"str\"             (string) The type (one of: nonstandard, anchor, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_scripthash, witness_v0_keyhash, witness_v1_taproot, witness_unknown)\n            }\n          }\n        },\n        ...\n      ]\n    },\n    ...\n  ]\n}\n\nExamples:\n> bitcoin-cli getblock \"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblock\", \"params\": [\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const GETBLOCKSTATS_HELP: &str = "getblockstats hash_or_height ( stats )\n\nCompute per block statistics for a given window. All amounts are in satoshis.\nIt won't work for some heights with pruning.\n\nArguments:\n1. hash_or_height    (string or numeric, required) The block hash or height of the target block\n2. stats             (json array, optional, default=all values) Values to plot (see result below)\n     [\n       \"height\",     (string) Selected statistic\n       \"time\",       (string) Selected statistic\n       ...\n     ]\n\nResult:\n{                                (json object)\n  \"avgfee\" : n,                  (numeric, optional) Average fee in the block\n  \"avgfeerate\" : n,              (numeric, optional) Average feerate (in satoshis per virtual byte)\n  \"avgtxsize\" : n,               (numeric, optional) Average transaction size\n  \"blockhash\" : \"hex\",           (string, optional) The block hash (to check for potential reorgs)\n  \"feerate_percentiles\" : [      (json array, optional) Feerates at the 10th, 25th, 50th, 75th, and 90th percentile weight unit (in satoshis per virtual byte)\n    n,                           (numeric) The 10th percentile feerate\n    n,                           (numeric) The 25th percentile feerate\n    n,                           (numeric) The 50th percentile feerate\n    n,                           (numeric) The 75th percentile feerate\n    n                            (numeric) The 90th percentile feerate\n  ],\n  \"height\" : n,                  (numeric, optional) The height of the block\n  \"ins\" : n,                     (numeric, optional) The number of inputs (excluding coinbase)\n  \"maxfee\" : n,                  (numeric, optional) Maximum fee in the block\n  \"maxfeerate\" : n,              (numeric, optional) Maximum feerate (in satoshis per virtual byte)\n  \"maxtxsize\" : n,               (numeric, optional) Maximum transaction size\n  \"medianfee\" : n,               (numeric, optional) Truncated median fee in the block\n  \"mediantime\" : n,              (numeric, optional) The block median time past\n  \"mediantxsize\" : n,            (numeric, optional) Truncated median transaction size\n  \"minfee\" : n,                  (numeric, optional) Minimum fee in the block\n  \"minfeerate\" : n,              (numeric, optional) Minimum feerate (in satoshis per virtual byte)\n  \"mintxsize\" : n,               (numeric, optional) Minimum transaction size\n  \"outs\" : n,                    (numeric, optional) The number of outputs\n  \"subsidy\" : n,                 (numeric, optional) The block subsidy\n  \"swtotal_size\" : n,            (numeric, optional) Total size of all segwit transactions\n  \"swtotal_weight\" : n,          (numeric, optional) Total weight of all segwit transactions\n  \"swtxs\" : n,                   (numeric, optional) The number of segwit transactions\n  \"time\" : n,                    (numeric, optional) The block time\n  \"total_out\" : n,               (numeric, optional) Total amount in all outputs (excluding coinbase and thus reward [ie subsidy + totalfee])\n  \"total_size\" : n,              (numeric, optional) Total size of all non-coinbase transactions\n  \"total_weight\" : n,            (numeric, optional) Total weight of all non-coinbase transactions\n  \"totalfee\" : n,                (numeric, optional) The fee total\n  \"txs\" : n,                     (numeric, optional) The number of transactions (including coinbase)\n  \"utxo_increase\" : n,           (numeric, optional) The increase/decrease in the number of unspent outputs (not discounting op_return and similar)\n  \"utxo_size_inc\" : n,           (numeric, optional) The increase/decrease in size for the utxo index (not discounting op_return and similar)\n  \"utxo_increase_actual\" : n,    (numeric, optional) The increase/decrease in the number of unspent outputs, not counting unspendables\n  \"utxo_size_inc_actual\" : n     (numeric, optional) The increase/decrease in size for the utxo index, not counting unspendables\n}\n\nExamples:\n> bitcoin-cli getblockstats '\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"' '[\"minfeerate\",\"avgfeerate\"]'\n> bitcoin-cli getblockstats 1000 '[\"minfeerate\",\"avgfeerate\"]'\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockstats\", \"params\": [\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\", [\"minfeerate\",\"avgfeerate\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockstats\", \"params\": [1000, [\"minfeerate\",\"avgfeerate\"]]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
 const IMPORTDESCRIPTORS_HELP: &str = "importdescriptors requests\n\nImport descriptors. This will trigger a rescan of the blockchain based on the earliest timestamp of all descriptors being imported. Requires a new wallet backup.\nWhen importing descriptors with multipath key expressions, if the multipath specifier contains exactly two elements, the descriptor produced from the second elements will be imported as an internal descriptor.\n\nNote: This call can take over an hour to complete if using an early timestamp; during that time, other rpc calls\nmay report that the imported keys, addresses or scripts exist but related transactions are still missing.\nThe rescan is significantly faster if block filters are available (using startup option \"-blockfilterindex=1\").\n\nArguments:\n1. requests                                 (json array, required) Data to be imported\n     [\n       {                                    (json object)\n         \"desc\": \"str\",                     (string, required) Descriptor to import.\n         \"active\": bool,                    (boolean, optional, default=false) Set this descriptor to be the active descriptor for the corresponding output type/externality\n         \"range\": n or [n,n],               (numeric or array, optional) If a ranged descriptor is used, this specifies the end or the range (in the form [begin,end]) to import\n         \"next_index\": n,                   (numeric, optional) If a ranged descriptor is set to active, this specifies the next index to generate addresses from\n         \"timestamp\": timestamp | \"now\",    (integer / string, required) Time from which to start rescanning the blockchain for this descriptor, in UNIX epoch time\n                                            Use the string \"now\" to substitute the current synced blockchain time.\n                                            \"now\" can be specified to bypass scanning, for outputs which are known to never have been used, and\n                                            0 can be specified to scan the entire blockchain. Blocks up to 2 hours before the earliest timestamp\n                                            of all descriptors being imported will be scanned as well as the mempool.\n         \"internal\": bool,                  (boolean, optional, default=false) Whether matching outputs should be treated as not incoming payments (e.g. change)\n         \"label\": \"str\",                    (string, optional, default=\"\") Label to assign to the address, only allowed with internal=false. Disabled for ranged descriptors\n       },\n       ...\n     ]\n\nResult:\n[                              (json array) Response is an array with the same size as the input that has the execution result\n  {                            (json object)\n    \"success\" : true|false,    (boolean)\n    \"warnings\" : [             (json array, optional)\n      \"str\",                   (string)\n      ...\n    ],\n    \"error\" : {                (json object, optional)\n      ...                      JSONRPC error\n    }\n  },\n  ...\n]\n\nExamples:\n> bitcoin-cli importdescriptors '[{ \"desc\": \"<my descriptor>\", \"timestamp\":1455191478, \"internal\": true }, { \"desc\": \"<my descriptor 2>\", \"label\": \"example 2\", \"timestamp\": 1455191480 }]'\n> bitcoin-cli importdescriptors '[{ \"desc\": \"<my descriptor>\", \"timestamp\":1455191478, \"active\": true, \"range\": [0,100], \"label\": \"<my bech32 wallet>\" }]'";
@@ -3854,9 +3870,72 @@ fn network_hashps(cs: &Chainstate, lookup: i64, height: i64) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Explain snapshot replay progress under AssumeValid without implying that
+/// replay completion establishes full historical script validation.
+fn snapshot_assume_valid_plain(
+    base_height: u32,
+    replayed_height: u32,
+    replay_complete: bool,
+    policy_note: &str,
+) -> String {
+    let replay = if replay_complete {
+        format!(
+            "Snapshot base {base_height} background replay is complete through height {replayed_height} under the configured validation policy."
+        )
+    } else if replayed_height < base_height {
+        format!(
+            "Snapshot base {base_height} background replay has reached height {replayed_height}; heights {}..={base_height} remain pending under the configured validation policy.",
+            replayed_height.saturating_add(1),
+        )
+    } else {
+        format!(
+            "Snapshot base {base_height} background replay reached the base height; final snapshot verification remains pending under the configured validation policy."
+        )
+    };
+    format!(
+        "{replay} {policy_note} Replay completion alone does not establish that every historical script was checked."
+    )
+}
+
 /// Core's `GetDifficulty` (pow.cpp), matching bitcoind's printed value.
 fn difficulty(bits: u32) -> f64 {
     difficulty_from_compact(avila_consensus::arith::CompactTarget(bits))
+}
+
+const IBD_TIP_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// Approximate progress by connected height. Heights are not work-weighted,
+/// so this is a rough UI estimate rather than a validation-progress claim.
+fn verification_progress(connected_height: u32, best_header_height: u32) -> f64 {
+    if best_header_height == 0 {
+        return 0.0;
+    }
+    (f64::from(connected_height) / f64::from(best_header_height)).clamp(0.0, 1.0)
+}
+
+/// Conservative observation-only IBD heuristic. It never changes consensus
+/// acceptance: the checked tip must have enough work, be recent, and not lag
+/// the best-known header by either height or accumulated work.
+fn initial_block_download(
+    checked_work: Work,
+    header_work: Work,
+    minimum_chain_work: Work,
+    checked_height: u32,
+    header_height: u32,
+    checked_tip_time: u32,
+    now: u64,
+) -> bool {
+    let enough_work = checked_work >= minimum_chain_work;
+    let tip_age = now.saturating_sub(u64::from(checked_tip_time));
+    let recent_tip = tip_age <= IBD_TIP_MAX_AGE_SECS;
+    let header_lag = header_height > checked_height || header_work > checked_work;
+    !(enough_work && recent_tip && !header_lag)
+}
+
+fn unix_time_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 /// The `Value` Core's UniValue emits for a double: `std::setprecision(16)`
@@ -5022,6 +5101,15 @@ static METHOD_ARGS: &[(&str, &[ArgSpec], &str)] = &[
         GETBLOCKFROMPEER_HELP,
     ),
     (
+        "getblockinspect",
+        &[
+            ("height_or_hash", None, true),
+            ("tx_offset", Some("number"), false),
+            ("tx_limit", Some("number"), false),
+        ],
+        GETBLOCKINSPECT_HELP,
+    ),
+    (
         "getblockhash",
         &[("height", Some("number"), true)],
         GETBLOCKHASH_HELP,
@@ -5933,12 +6021,19 @@ pub(crate) fn dispatch(
                     .tree()
                     .median_time_past(&tip)
                     .unwrap_or(node.header.time),
-                "verificationprogress": core_num(if best_header.height > 0 {
-                    connected as f64 / best_header.height as f64
-                } else {
-                    1.0
-                }),
-                "initialblockdownload": best_header.height > connected,
+                // This is explicitly only a height-ratio estimate, not a
+                // precise measure of validated work. In particular, an
+                // empty header tree must not appear 100% complete.
+                "verificationprogress": core_num(verification_progress(connected, best_header.height)),
+                "initialblockdownload": initial_block_download(
+                    node.chainwork,
+                    best_header.chainwork,
+                    cs.tree().params().minimum_chain_work,
+                    connected,
+                    best_header.height,
+                    node.header.time,
+                    unix_time_now(),
+                ),
                 "chainwork": node.chainwork.0.to_hex(),
                 "size_on_disk": size_on_disk,
                 "pruned": cs.store().and_then(|s| s.pruned_through()).is_some(),
@@ -5968,11 +6063,7 @@ pub(crate) fn dispatch(
                     "bits": format!("{:08x}", node.header.bits.0),
                     "target": node.header.bits.expand().value.to_hex(),
                     "difficulty": core_num(difficulty(node.header.bits.0)),
-                    "verificationprogress": core_num(if best_header.height > 0 {
-                        height as f64 / best_header.height as f64
-                    } else {
-                        1.0
-                    }),
+                    "verificationprogress": core_num(verification_progress(height, best_header.height)),
                     // No bounded coins caches — our UTXO set is the
                     // state itself, held without a byte budget.
                     "coins_db_cache_bytes": 0,
@@ -6147,6 +6238,8 @@ pub(crate) fn dispatch(
         }
         "getvalidationreport" => chain_query(method, queries, |cs, _| {
             let r = cs.validation_report();
+            let assume_valid = cs.tree().params().assume_valid;
+            let historical_scripts_required = assume_valid.is_none();
             let snapshot = r.snapshot.clone().map(|s| {
                 json!({
                     "base_height": s.base_height,
@@ -6161,7 +6254,7 @@ pub(crate) fn dispatch(
             // Astra's acceptance criterion: the operator must be able
             // to distinguish fully-verified / pending / snapshot-assumed
             // history at a glance — one `coverage` block, plain words.
-            let coverage = match &r.snapshot {
+            let mut coverage = match &r.snapshot {
                 None => json!({
                     "state": "full_validation",
                     "verified_ranges": [[0, r.connected_height]],
@@ -6188,10 +6281,58 @@ pub(crate) fn dispatch(
                     "plain": format!("snapshot at {} commitment-verified; heights {}..={} not yet historically replayed", s.base_height, s.replayed_height + 1, s.base_height),
                 }),
             };
+            if let Some(checkpoint) = assume_valid {
+                let checkpoint_hash = checkpoint.to_string();
+                let policy_note = format!(
+                    "Configured assumevalid checkpoint {checkpoint_hash}: where blocks are processed, structural and contextual checks are still applied, while historical script checks may be exempted below that checkpoint. This report does not infer actual skipped heights or counts."
+                );
+                if r.snapshot.is_none() {
+                    coverage["state"] = json!("assume_valid_configured");
+                    coverage["verified_ranges"] = Value::Null;
+                    coverage["structural_check_ranges"] = json!([[0, r.connected_height]]);
+                    coverage["plain"] = json!(format!(
+                        "Connected blocks were checked with the configured rules. {policy_note}"
+                    ));
+                } else if let Some(snapshot) = &r.snapshot {
+                    coverage["state"] = json!(if snapshot.verified {
+                        "snapshot_replay_complete_assume_valid_configured"
+                    } else {
+                        "snapshot_replaying_assume_valid_configured"
+                    });
+                    coverage["verified_ranges"] = Value::Null;
+                    let mut structural_ranges = Vec::with_capacity(2);
+                    if snapshot.replayed_height > 0 {
+                        structural_ranges.push(json!([1, snapshot.replayed_height]));
+                    }
+                    if snapshot.base_height < r.connected_height {
+                        structural_ranges
+                            .push(json!([snapshot.base_height + 1, r.connected_height]));
+                    }
+                    coverage["structural_check_ranges"] = json!(structural_ranges);
+                    coverage["plain"] = json!(snapshot_assume_valid_plain(
+                        snapshot.base_height,
+                        snapshot.replayed_height,
+                        snapshot.verified,
+                        &policy_note,
+                    ));
+                    coverage["policy_note"] = json!(policy_note);
+                }
+                coverage["script_validation"] = json!({
+                    "historical_scripts_required": false,
+                    "assume_valid_checkpoint": checkpoint_hash,
+                    "exemptions_possible": true,
+                    "actual_skipped_ranges": null,
+                });
+            }
             Ok(json!({
                 "connected_height": r.connected_height,
                 "header_height": r.header_height,
                 "verified_fraction": r.verified_fraction,
+                "verified_fraction_semantics": "share of connected heights reported by chainstate as locally verified or snapshot-replayed; not a per-transaction or per-script validation percentage. AssumeValid script exemptions are reported separately.",
+                "validation_policy": {
+                    "assume_valid_checkpoint": assume_valid.map(|hash| hash.to_string()),
+                    "historical_scripts_required": historical_scripts_required,
+                },
                 "coverage": coverage,
                 "snapshot": snapshot,
             }))
@@ -6489,6 +6630,118 @@ pub(crate) fn dispatch(
             chain_query(method, queries, move |cs, _| {
                 let params_ref = cs.tree().params();
                 Ok(psbt_json(&psbt, params_ref))
+            })
+        }
+        "getblockinspect" => {
+            let lookup_value = match param(params, 0, "height_or_hash") {
+                Some(value) => value,
+                None => return missing_params("height_or_hash"),
+            };
+            let lookup = match lookup_value {
+                Value::Number(number) => {
+                    let Some(height) = number.as_u64() else {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_INVALID_PARAMETER,
+                                "Block height must be a non-negative integer".into(),
+                            )),
+                        );
+                    };
+                    let Ok(height) = u32::try_from(height) else {
+                        return (
+                            Value::Null,
+                            Some((RPC_INVALID_PARAMETER, "Block height out of range".into())),
+                        );
+                    };
+                    crate::inspect::BlockLookup::Height(height)
+                }
+                Value::String(hash) => {
+                    // Reject overlong strings before parsing so this read
+                    // path never performs work proportional to caller input.
+                    if hash.len() != 64 {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_INVALID_PARAMETER,
+                                format!(
+                                    "blockhash must be exactly 64 hexadecimal characters (got {})",
+                                    hash.len()
+                                ),
+                            )),
+                        );
+                    }
+                    let parsed = match parse_hash_arg::<BlockHash>(lookup_value, "blockhash") {
+                        Ok(hash) => hash,
+                        Err(error) => return (Value::Null, Some(error)),
+                    };
+                    crate::inspect::BlockLookup::Hash(parsed)
+                }
+                value => {
+                    return (
+                        Value::Null,
+                        Some((
+                            RPC_TYPE_ERROR,
+                            format!(
+                                "height_or_hash must be a number or string (got {})",
+                                json_type_name(value)
+                            ),
+                        )),
+                    );
+                }
+            };
+            let tx_offset = match param(params, 1, "tx_offset") {
+                None | Some(Value::Null) => 0,
+                Some(Value::Number(number)) => {
+                    match number.as_u64().and_then(|value| u32::try_from(value).ok()) {
+                        Some(value) => value,
+                        None => {
+                            return (
+                                Value::Null,
+                                Some((
+                                    RPC_INVALID_PARAMETER,
+                                    "tx_offset must be an integer between 0 and 4294967295".into(),
+                                )),
+                            );
+                        }
+                    }
+                }
+                Some(value) => {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, field_type_message(value, "number"))),
+                    );
+                }
+            };
+            let tx_limit = match param(params, 2, "tx_limit") {
+                None | Some(Value::Null) => 100,
+                Some(Value::Number(number)) => match number.as_u64() {
+                    Some(value @ 1..=250) => value as u16,
+                    _ => {
+                        return (
+                            Value::Null,
+                            Some((
+                                RPC_INVALID_PARAMETER,
+                                "tx_limit must be between 1 and 250".into(),
+                            )),
+                        );
+                    }
+                },
+                Some(value) => {
+                    return (
+                        Value::Null,
+                        Some((RPC_TYPE_ERROR, field_type_message(value, "number"))),
+                    );
+                }
+            };
+            chain_query(method, queries, move |cs, _| {
+                let result = crate::inspect::inspect(cs, lookup, tx_offset, tx_limit);
+                serde_json::to_value(result).map_err(|error| {
+                    (
+                        RPC_INTERNAL_ERROR,
+                        format!("failed to encode block inspection result: {error}"),
+                    )
+                })
             })
         }
         "getblockhash" => {
@@ -14921,6 +15174,160 @@ mod tests {
     }
 
     #[test]
+    fn getblockinspect_is_read_only_bounded_and_serializable() {
+        let queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let snap = snap();
+        let d = |params: Value| {
+            dispatch(
+                "getblockinspect",
+                &params,
+                &snap,
+                Some(&queries),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+
+        // The chainstate starts with a locally indexed genesis header/body.
+        let (found, error) = d(json!([0, 0, 1]));
+        assert!(error.is_none());
+        assert_eq!(found["status"], "found");
+        assert_eq!(found["data"]["block"]["height"], 0);
+        assert_eq!(found["data"]["block"]["body_state"], "available");
+        assert_eq!(found["data"]["transactions"][0]["index"], 0);
+
+        // Offset paging is stable and an offset past the end returns an
+        // empty page, while the summary remains present.
+        let (past_end, error) = d(json!([0, 1, 1]));
+        assert!(error.is_none());
+        assert_eq!(past_end["status"], "found");
+        assert_eq!(past_end["data"]["transactions"], json!([]));
+        assert!(past_end["data"]["next_offset"].is_null());
+
+        // Invalid shapes/ranges are JSON-RPC parameter errors; the method
+        // never falls back to materializing an unbounded getblock object.
+        for params in [
+            json!([]),
+            json!([true]),
+            json!([0, 0, 251]),
+            json!([0, -1, 1]),
+        ] {
+            let (_, error) = d(params);
+            assert!(error.is_some(), "expected parameter error");
+        }
+        let (_, error) = d(json!(["0".repeat(65)]));
+        assert_eq!(error.unwrap().0, RPC_INVALID_PARAMETER);
+
+        let (_, error) = dispatch(
+            "getblockinspect_typo",
+            &json!([0]),
+            &snap,
+            Some(&queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(error.unwrap().0, RPC_METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn getvalidationreport_distinguishes_assumevalid_script_policy() {
+        let snap = snap();
+        let strict_queries = query_server(Chainstate::new(&Network::Regtest.params()));
+        let (strict, error) = dispatch(
+            "getvalidationreport",
+            &json!([]),
+            &snap,
+            Some(&strict_queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(error.is_none());
+        assert!(
+            strict["validation_policy"]["historical_scripts_required"]
+                .as_bool()
+                .unwrap()
+        );
+        assert!(strict["validation_policy"]["assume_valid_checkpoint"].is_null());
+        assert_eq!(strict["coverage"]["state"], "full_validation");
+        assert_eq!(strict["coverage"]["verified_ranges"], json!([[0, 0]]));
+
+        let checkpoint = BlockHash::from_bytes([0xa5; 32]);
+        let mut params = Network::Regtest.params();
+        params.assume_valid = Some(checkpoint);
+        let assumed_queries = query_server(Chainstate::new(&params));
+        let (assumed, error) = dispatch(
+            "getvalidationreport",
+            &json!([]),
+            &snap,
+            Some(&assumed_queries),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(error.is_none());
+        assert!(
+            !assumed["validation_policy"]["historical_scripts_required"]
+                .as_bool()
+                .unwrap()
+        );
+        assert_eq!(
+            assumed["validation_policy"]["assume_valid_checkpoint"],
+            json!(checkpoint.to_string())
+        );
+        assert_eq!(assumed["coverage"]["state"], "assume_valid_configured");
+        assert!(assumed["coverage"]["verified_ranges"].is_null());
+        assert!(
+            assumed["verified_fraction_semantics"]
+                .as_str()
+                .unwrap()
+                .contains("not a per-transaction or per-script validation percentage")
+        );
+        assert_eq!(
+            assumed["coverage"]["structural_check_ranges"],
+            json!([[0, 0]])
+        );
+        assert!(
+            assumed["coverage"]["script_validation"]["exemptions_possible"]
+                .as_bool()
+                .unwrap()
+        );
+        assert!(assumed["coverage"]["script_validation"]["actual_skipped_ranges"].is_null());
+        assert!(
+            assumed["coverage"]["plain"]
+                .as_str()
+                .unwrap()
+                .contains("may be exempted")
+        );
+    }
+
+    #[test]
+    fn assume_valid_snapshot_text_describes_replay_without_claiming_full_validation() {
+        let policy =
+            "Configured assumevalid checkpoint abc: historical script checks may be exempted.";
+        let complete = snapshot_assume_valid_plain(500, 500, true, policy);
+        assert!(complete.contains("background replay is complete"));
+        assert!(complete.contains("Configured assumevalid checkpoint"));
+        assert!(complete.contains("does not establish that every historical script was checked"));
+        assert!(!complete.contains("equivalent to full validation"));
+
+        let pending = snapshot_assume_valid_plain(500, 300, false, policy);
+        assert!(pending.contains("heights 301..=500 remain pending"));
+        assert!(pending.contains("under the configured validation policy"));
+        assert!(!pending.contains("equivalent to full validation"));
+    }
+
+    #[test]
     fn chain_methods_need_the_query_channel() {
         let snap = snap();
         let (_, e) = dispatch(
@@ -15386,6 +15793,80 @@ mod tests {
             false,
         );
         assert_eq!(e.unwrap().0, RPC_INVALID_ADDRESS_OR_KEY);
+    }
+
+    #[test]
+    fn getblockchaininfo_ibd_heuristic_is_conservative() {
+        let now = 1_800_000_000u32;
+        let minimum = Network::Mainnet.params().minimum_chain_work;
+
+        // Mainnet genesis is never reported as caught up: its actual
+        // chainwork is below the configured minimum.
+        let genesis_state = Chainstate::new(&Network::Mainnet.params());
+        let genesis = genesis_state.tree().tip();
+        assert!(genesis.chainwork < minimum);
+        assert!(initial_block_download(
+            genesis.chainwork,
+            genesis.chainwork,
+            minimum,
+            genesis.height,
+            genesis.height,
+            genesis.header.time,
+            u64::from(now),
+        ));
+        // Also pin the generic low-work condition with a recent, zero-work
+        // candidate so staleness cannot be the reason for the result.
+        assert!(initial_block_download(
+            Work::ZERO,
+            Work::ZERO,
+            minimum,
+            0,
+            0,
+            now,
+            u64::from(now),
+        ));
+
+        // Enough work is insufficient when the checked tip is stale.
+        assert!(initial_block_download(
+            minimum,
+            minimum,
+            minimum,
+            500,
+            500,
+            now - 86_401,
+            u64::from(now),
+        ));
+
+        // A recent checked tip with enough work and no known header lag is
+        // the only caught-up case in this conservative heuristic.
+        assert!(!initial_block_download(
+            minimum,
+            minimum,
+            minimum,
+            500,
+            500,
+            now,
+            u64::from(now),
+        ));
+
+        // Header lag keeps IBD true even if checked work is already above
+        // the minimum threshold.
+        assert!(initial_block_download(
+            minimum,
+            minimum,
+            minimum,
+            500,
+            501,
+            now,
+            u64::from(now),
+        ));
+    }
+
+    #[test]
+    fn verification_progress_does_not_call_genesis_complete() {
+        assert_eq!(verification_progress(0, 0), 0.0);
+        assert_eq!(verification_progress(5, 10), 0.5);
+        assert_eq!(verification_progress(12, 10), 1.0);
     }
 
     #[test]

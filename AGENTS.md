@@ -11,13 +11,16 @@
 - Test protocol features on real connections, not only fixtures.
 - Repo conventions: `cargo test --release -p <crate>`; docs in
   `docs/`, experiments in `experiments/`.
-- **Resource limits (mandatory).** This is a 30 GiB laptop sharing a
-  desktop. Any job that can grow unboundedly — corpus builders,
-  snapshot loaders/verifiers, window joins with `--boundary`, node
-  dumptxoutset runs, large file scans — MUST run under
-  `tools/guard_run.sh`, which enforces a kernel-level cgroup
-  `MemoryMax` (instant OOM-kill at the cap; no polling gap) and refuses
-  to start without `MemAvailable >= cap + reserve`. Polling watchdogs
-  are NOT sufficient (GB/s allocators beat any interval). Suggested
-  caps: corpus build 8192, window_join w/ boundary 12288,
-  snapshot_verify 2048. Never run two heavy jobs concurrently.
+- **Resource limits (mandatory).** This is an 8 GiB i5-9300H laptop
+  sharing a desktop. Any job that can grow unboundedly — corpus
+  builders, snapshot loaders/verifiers, window joins with `--boundary`,
+  node dumptxoutset runs, large file scans, and heavyweight builds — MUST
+  run under `tools/guard_run.sh`, which enforces a kernel-level cgroup
+  `MemoryMax` and refuses to start without `MemAvailable >= cap +
+  reserve`. Polling watchdogs are NOT sufficient (GB/s allocators beat
+  any interval). The wrapper's 8192 MiB cap + 4096 MiB reserve defaults
+  exceed this machine's physical-memory budget: never rely on them.
+  Pass explicit `--max` and `--reserve` values chosen from current
+  `MemAvailable` and a deliberate desktop reserve, then record the cap.
+  The managed IBD service uses a 3072 MiB memory cap with swap disabled.
+  Never run two heavy jobs concurrently.

@@ -6,6 +6,7 @@
 
 use avila_consensus::chainstate::Chainstate;
 use avila_consensus::hash::BlockHash;
+use serde::{Deserialize, Serialize};
 
 pub const MAX_TRANSACTION_PAGE: u16 = 250;
 
@@ -15,7 +16,8 @@ pub enum BlockLookup {
     Hash(BlockHash),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BodyState {
     Available,
     HeaderOnly,
@@ -23,7 +25,7 @@ pub enum BodyState {
     Unavailable,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockSummary {
     pub hash: String,
     pub height: u32,
@@ -44,7 +46,7 @@ pub struct BlockSummary {
     pub weight: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockTxSummary {
     pub index: u32,
     pub txid: String,
@@ -57,7 +59,8 @@ pub struct BlockTxSummary {
     pub has_witness: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", content = "data", rename_all = "snake_case")]
 pub enum BlockLookupResult {
     NotFound,
     Found {
@@ -194,6 +197,81 @@ mod tests {
     use avila_consensus::pow;
     use avila_consensus::script;
     use avila_consensus::transaction::{OutPoint, Script, Transaction, TxIn, TxOut, Witness};
+
+    #[test]
+    fn lookup_result_serde_contract_round_trips_all_variants() {
+        let block = BlockSummary {
+            hash: "block-hash".into(),
+            height: 9,
+            previous_hash: "previous-hash".into(),
+            next_hash: Some("next-hash".into()),
+            version: 4,
+            bits: 0x207f_ffff,
+            time: 1_800_000_000,
+            nonce: 42,
+            merkle_root: "merkle-root".into(),
+            active_chain: true,
+            fully_checked: false,
+            snapshot_assumed: true,
+            body_state: BodyState::HeaderOnly,
+            tx_count: Some(3),
+            size: None,
+            weight: Some(3_000),
+        };
+        let transaction = BlockTxSummary {
+            index: 2,
+            txid: "transaction-id".into(),
+            coinbase: false,
+            inputs: 1,
+            outputs: 2,
+            output_sats: 123,
+            size: 200,
+            weight: 500,
+            has_witness: true,
+        };
+        let cases = [
+            BlockLookupResult::NotFound,
+            BlockLookupResult::Found {
+                block,
+                transactions: vec![transaction],
+                next_offset: Some(3),
+            },
+            BlockLookupResult::Error("bounded inspection error".into()),
+        ];
+
+        for case in cases {
+            let value = serde_json::to_value(&case).unwrap();
+            let round_trip: BlockLookupResult = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(round_trip).unwrap(), value);
+        }
+        let found = serde_json::to_value(BlockLookupResult::Found {
+            block: BlockSummary {
+                hash: "block-hash".into(),
+                height: 9,
+                previous_hash: "previous-hash".into(),
+                next_hash: None,
+                version: 4,
+                bits: 0x207f_ffff,
+                time: 1_800_000_000,
+                nonce: 42,
+                merkle_root: "merkle-root".into(),
+                active_chain: true,
+                fully_checked: false,
+                snapshot_assumed: false,
+                body_state: BodyState::Available,
+                tx_count: Some(1),
+                size: Some(100),
+                weight: Some(400),
+            },
+            transactions: Vec::new(),
+            next_offset: None,
+        })
+        .unwrap();
+        assert_eq!(found["status"], "found");
+        assert_eq!(found["data"]["block"]["body_state"], "available");
+        assert!(found["data"].get("next_offset").is_some());
+        assert_eq!(serde_json::to_value(BodyState::Pruned).unwrap(), "pruned");
+    }
 
     const REGTEST_BITS: u32 = 0x207f_ffff;
     const NOW: u32 = 1_800_000_000;
