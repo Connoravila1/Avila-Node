@@ -2,9 +2,10 @@
 
 Recorded: 2026-10-20. This is an implementation and architecture note for the
 bounded SwiftSync/Utreexo work in the `ibd/swift-20261020` worktree. The source
-now includes an explicitly opted-in full-check path, node TCP fixtures, and
-promotion into an ordinary datadir. Final serialized compile, test, and CLI
-qualification is still in progress. No whole-IBD performance result is claimed.
+includes an explicitly opted-in full-check path, node TCP fixtures, and
+promotion into an ordinary datadir. Scoped release suites, workspace Clippy and
+rustdoc, and the release CLI smoke passed on the recorded source tree. No
+whole-IBD performance result is claimed.
 
 ## Implemented in this worktree
 
@@ -235,4 +236,10 @@ bytes each) while preserving the four-job window for smaller bodies. Its new
 boundary test confirms maximum-size bodies are admitted and the decoded cap
 remains enforced. The recent-window A/B pair predates this cap and is not a
 measurement of it. Local checks do not replace the pending remote full-workspace
-CI run or a mainnet-scale helper-backed IBD qualification.
+CI run or a mainnet-scale helper-backed IBD qualification. The release CLI
+built from source commit `6713f6926bc88b7e92adb0745b606ab74f964a72` (tree
+`5b8f3a7a1a0cdf3dc6ca3c67806dd3e9482bc75c`) has SHA256
+`5a724b16e585ac95d69fea07c7ee318b80539e68c8e30cb5ce3948f5e9106d4d`; the
+private candidate and build receipt are under
+`~/.local/state/avila-review/ibd-swift-final-6713f69/`. The artifact was not
+installed and no live datadir was touched.

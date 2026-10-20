@@ -2497,3 +2497,32 @@ acceptance medians were 15.5 ms baseline and 12.0 ms with two prevout workers
 and clean cache. The fixture is too small for an IBD speed claim. The exact
 measurements, validation settings, and limitations are in the [crypto note](2026-10-20-exact-crypto.md)
 and [coins pipeline note](2026-10-20-coins-pipeline.md).
+
+## 2026-10-20 — opt-in full-check Swift IBD source qualification
+
+Qualified the isolated Swift source candidate `6713f6926bc88b7e92adb0745b606ab74f964a72`
+(tree `5b8f3a7a1a0cdf3dc6ca3c67806dd3e9482bc75c`) with workspace all-targets
+Clippy (`-D warnings`), workspace rustdoc (`-D warnings`), and scoped release
+tests: consensus library 665 passed / 4 ignored, consensus fault-injection and
+property tests 28 passed, P2P library 208 passed, and node library 159 passed.
+The node library includes a real local TCP fixture covering a qualified
+BIP455-provider audit/promotion, ordinary fallback without a provider, and a
+dishonest helper that cannot publish the target. CLI and node all-target checks
+passed; the release CLI's version, config-validation, and inspect commands also
+passed. Candidate CLI SHA256 is
+`5a724b16e585ac95d69fea07c7ee318b80539e68c8e30cb5ce3948f5e9106d4d`.
+
+This is an opt-in implementation source gate, not a whole-workspace test-suite
+result or a mainnet-scale Swift IBD demonstration. BIP455/BIP456 are drafts and
+no public deployed helper/provider was available; the TCP fixture generated
+claims from its own regtest blocks. Ordinary sync remains the default and the
+artifact was not installed or used against the live datadir. The 128-block
+recent-window A/B pair independently matched the 14,248,193-coin checkpoint,
+but activation was 6.8% slower in the candidate and total time was 2.8% lower
+in one pair, with no repeatable or whole-IBD speed claim. That measurement used
+the prior 64 MiB disk-prefetch decode reservation; the updated 512 MiB bounded
+reservation admits two maximum-size blocks and remains unmeasured. See the
+[full-check Swift boundary note](2026-10-20-fullcheck-swift.md) and the
+[recent-window replay note](2026-10-20-recent-window-replay.md) for detailed
+gaps, receipts, and limitations. Remote full-workspace CI is expected after
+publication.
