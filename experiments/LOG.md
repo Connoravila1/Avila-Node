@@ -2526,3 +2526,29 @@ reservation admits two maximum-size blocks and remains unmeasured. See the
 [recent-window replay note](2026-10-20-recent-window-replay.md) for detailed
 gaps, receipts, and limitations. Remote full-workspace CI is expected after
 publication.
+
+## 2026-10-20 — published Swift source, CI, and ordinary IBD restart
+
+Follow-up to the earlier point-in-time status above: published main
+`cca4b33243b35f6fa5c4639d62e675f438d46b2a` (source tree
+`5b8f3a7a1a0cdf3dc6ca3c67806dd3e9482bc75c`) passed GitHub Actions run
+[39469309764](https://github.com/Connoravila1/Avila-Node/actions/runs/39469309764).
+The Linux workspace job passed formatting, Clippy, tests, docs, CLI smoke, and
+`window_join` regressions; the reproducible release build job passed both
+independent builds and hash comparison. The installed CLI was built from
+source commit `6713f6926bc88b7e92adb0745b606ab74f964a72` with SHA256
+`5a724b16e585ac95d69fea07c7ee318b80539e68c8e30cb5ce3948f5e9106d4d`; the
+prior CLI/receipt remain preserved and the GUI binary was not rebuilt.
+
+The managed ordinary node resumed checkpoint height 325,897 with hash
+`00000000000000000d92abf9d5e74567f446ae2d4889fd3eb9dba994ffa5973c` and
+passed the automatic restart check. At 2026-10-20 17:57:43 UTC it had advanced
+to 326,137 under full-validation coverage from genesis, with no AssumeValid
+checkpoint and historical scripts required. The Swift helper path remains
+off. The current-PID passive health trace is active and the 14-day sampler for
+heights 600,000–600,127 is armed with result pending. The initial cgroup sample
+was 3,934,830,592 current bytes / 3,997,360,128 peak bytes under a
+4,294,967,296-byte limit, with zero OOM or limit events. These observations do
+not establish a whole-IBD performance gain. Details and qualification receipts
+are in the [Swift boundary note](2026-10-20-fullcheck-swift.md) and private
+validation directory.

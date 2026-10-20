@@ -230,16 +230,45 @@ The serialized local gates passed for the final Swift-source candidate:
 - Release tests: consensus library 665 passed / 4 ignored; consensus fault-injection and property integration tests 28 passed; P2P library 208 passed; node library 159 passed. The node suite includes one real local TCP Swift test with qualified-provider promotion, no-provider ordinary fallback, and dishonest-helper no-promotion cases.
 - `cargo check -p avila-cli --all-targets` and `cargo check -p avila-node --all-targets` passed before the final lint-only cleanup; the final workspace Clippy check compiled all workspace targets including GUI.
 
-The block-body disk prefetcher now reserves 512 MiB decoded space at its 64x
+The block-body disk prefetcher reserves 512 MiB decoded space at its 64x
 amplification bound, admitting two maximum-size serialized blocks (4,000,000
-bytes each) while preserving the four-job window for smaller bodies. Its new
+bytes each) while preserving the four-job window for smaller bodies. Its
 boundary test confirms maximum-size bodies are admitted and the decoded cap
 remains enforced. The recent-window A/B pair predates this cap and is not a
-measurement of it. Local checks do not replace the pending remote full-workspace
-CI run or a mainnet-scale helper-backed IBD qualification. The release CLI
-built from source commit `6713f6926bc88b7e92adb0745b606ab74f964a72` (tree
-`5b8f3a7a1a0cdf3dc6ca3c67806dd3e9482bc75c`) has SHA256
-`5a724b16e585ac95d69fea07c7ee318b80539e68c8e30cb5ce3948f5e9106d4d`; the
-private candidate and build receipt are under
-`~/.local/state/avila-review/ibd-swift-final-6713f69/`. The artifact was not
-installed and no live datadir was touched.
+measurement of it.
+
+## Post-qualification runtime status (2026-10-20)
+
+This section supersedes the pending-CI and not-installed statements recorded
+above at the earlier review point. GitHub Actions run
+[39469309764](https://github.com/Connoravila1/Avila-Node/actions/runs/39469309764)
+passed for published main commit `cca4b33243b35f6fa5c4639d62e675f438d46b2a`,
+tree `5b8f3a7a1a0cdf3dc6ca3c67806dd3e9482bc75c`. The Linux workspace job
+passed formatting, all-target Clippy, unit/integration tests, documentation,
+CLI smoke, and `window_join` regressions; the reproducible release build job
+passed two independent builds and hash comparison. The exact API response and
+source-identity receipt are retained in the private qualification directory.
+
+The qualified release CLI from source commit
+`6713f6926bc88b7e92adb0745b606ab74f964a72` (same source tree as published
+main) has SHA256
+`5a724b16e585ac95d69fea07c7ee318b80539e68c8e30cb5ce3948f5e9106d4d`. It was
+installed on 2026-10-20 after the gates passed; the previous CLI and its
+receipt were preserved at
+`~/.local/opt/avila-node/previous/qualified-cli-20261020T175518Z/`. The GUI
+binary was left untouched and retains only its earlier, separate provenance.
+
+The managed node restarted cleanly at the saved mainnet checkpoint, height
+325,897, hash
+`00000000000000000d92abf9d5e74567f446ae2d4889fd3eb9dba994ffa5973c`; the
+restart receipt matched the installed CLI hash. At 2026-10-20 17:57:43 UTC,
+the live status reported height 326,137, six peers, `assume_valid_checkpoint`
+null, and historical scripts required, with full-validation coverage from
+height 0 through 326,137. Ordinary IBD is active. The separate Swift helper
+path remains experimental and opt-in; it is not enabled for this node. The
+health trace and 14-day sampler are armed for the current process; the sampler
+result is pending. The first health sample recorded 3,934,830,592 current
+cgroup bytes and 3,997,360,128 peak bytes under the 4,294,967,296-byte limit,
+with zero memory-max, OOM, and OOM-kill events. These are point-in-time runtime
+observations, not a performance claim. Mainnet-scale helper-backed Swift IBD
+and whole-IBD speedup remain unqualified.
