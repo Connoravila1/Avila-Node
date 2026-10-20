@@ -2474,3 +2474,26 @@ while node PID 647865 continued to 200,383. Its 512 MiB-cap run peaked at 53
 MiB in 30 s. A first heartbeat's `pk` values (16,129 entries, capacity 26,880,
 787,265 key bytes) are cache accounting, not RSS. A modern-range collector and
 health trace are armed but have no result; full IBD continues.
+
+## 2026-10-20 — full-validation crypto and coins first-batch gate
+
+Qualified the published source tree `b880d639` (main commit `a346862`) with
+the exact release workspace test: 1,201 passed, 5 ignored, 0 failed across
+consensus (638), P2P (193), node (158), and the other workspace crates. The
+guarded run exited 0 in 544 s at a 3,072 MiB cap / 768 MiB reserve, with a
+3,071 MiB peak. Workspace Clippy with `-D warnings`, formatting, workspace
+rustdoc, consensus Clippy, and CLI `--version` also passed. The private,
+qualified release CLI copy is recorded with its binary hash in the review
+receipt; no installed binary or service was changed.
+
+The guarded three-run crypto microbench median was 31,455 ns/op for the
+cached secp256k1 0.29 ECDSA baseline and 31,049 ns/op for the production 0.33
+path. For eight fixed 64-byte Merkle messages, scalar SHA256d took 6,710 ns
+versus 932 ns through the runtime-checked Core AVX2 wrapper. These are isolated
+microbenchmarks, not whole-node speedups. On the 0..500 mainnet fixture,
+alternating three-run full-validation A/B trials all reopened at height 500
+with the same 503-coin set and `hash_serialized_3` commitment; the under-20 ms
+acceptance medians were 15.5 ms baseline and 12.0 ms with two prevout workers
+and clean cache. The fixture is too small for an IBD speed claim. The exact
+measurements, validation settings, and limitations are in the [crypto note](2026-10-20-exact-crypto.md)
+and [coins pipeline note](2026-10-20-coins-pipeline.md).
