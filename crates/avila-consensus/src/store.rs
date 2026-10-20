@@ -203,12 +203,12 @@ impl BlockStore {
         if self.is_pruned(pos) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "block body pruned"));
         }
-        let mut file = BufReader::new(File::open(file_path(&self.dir, pos.file))?);
-        file.seek(SeekFrom::Start(pos.offset))?;
-        let mut payload = vec![0u8; pos.len as usize];
-        file.read_exact(&mut payload)?;
-        Block::decode(&payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("block decode: {e}")))
+        read_raw_position(&self.dir, self.magic, pos)
+    }
+
+    /// Immutable read parameters for the bounded asynchronous body reader.
+    pub(crate) fn prefetch_source(&self) -> (PathBuf, [u8; 4]) {
+        (self.dir.clone(), self.magic)
     }
 
     /// Appends `block` as a `magic | len | payload` frame, rotating to a new
@@ -339,6 +339,20 @@ impl BlockStore {
         self.tail.flush()
     }
 
+    /// Flushes and synchronizes all body-store files and the directory entry.
+    pub(crate) fn sync_all(&mut self) -> io::Result<()> {
+        self.tail.flush()?;
+        self.tail.sync_all()?;
+        for file_no in 0..self.tail_no {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(file_path(&self.dir, file_no))?
+                .sync_all()?;
+        }
+        File::open(&self.dir)?.sync_all()
+    }
+
     /// The directory holding this store — where `state.dat` lives too.
     #[must_use]
     pub fn dir(&self) -> &Path {
@@ -354,6 +368,51 @@ impl BlockStore {
 
 fn file_path(dir: &Path, no: u32) -> PathBuf {
     dir.join(format!("{FILE_PREFIX}{no:05}{FILE_SUFFIX}"))
+}
+
+/// Reads one indexed frame without borrowing a `BlockStore`. Prefetch workers
+/// use this with a copied directory/magic pair, so they never share the store's
+/// mutable append tail or index. The expected hash check detects stale indexes
+/// and file replacement before the body reaches consensus code.
+pub(crate) fn read_position(
+    dir: &Path,
+    magic: [u8; 4],
+    pos: BlockPos,
+    expected_hash: BlockHash,
+) -> io::Result<Block> {
+    let block = read_raw_position(dir, magic, pos)?;
+    if block.block_hash() != expected_hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stored block hash does not match indexed hash",
+        ));
+    }
+    Ok(block)
+}
+
+fn read_raw_position(dir: &Path, magic: [u8; 4], pos: BlockPos) -> io::Result<Block> {
+    if pos.offset < FRAME_HEADER || pos.len == 0 || pos.len as usize > MAX_BLOCK_SERIALIZED_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid block position",
+        ));
+    }
+    let mut file = BufReader::new(File::open(file_path(dir, pos.file))?);
+    file.seek(SeekFrom::Start(pos.offset - FRAME_HEADER))?;
+    let mut header = [0u8; FRAME_HEADER as usize];
+    file.read_exact(&mut header)?;
+    let frame_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    if header[..4] != magic || frame_len != pos.len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "block frame header changed since indexing",
+        ));
+    }
+    let mut payload = vec![0u8; pos.len as usize];
+    file.read_exact(&mut payload)?;
+    let block = Block::decode(&payload)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("block decode: {e}")))?;
+    Ok(block)
 }
 
 fn open_tail(dir: &Path, no: u32) -> io::Result<File> {
@@ -439,8 +498,18 @@ const STATE_TMP: &str = "state.dat.tmp";
 // survives restarts; a v1 snapshot is rejected and replay rebuilds.
 // v3 adds `snapshot_base` — the assumeutxo base height (`0` = none) —
 // so a `loadtxoutset` chainstate resumes without demanding stored
-// bodies below the base.
-pub const STATE_VERSION: u32 = 4;
+// bodies below the base. v5 adds a separate boundary for history that
+// was fully validated locally, then body-pruned before checkpoint import.
+pub const STATE_VERSION: u32 = 5;
+const STATE_VERSION_LEGACY_WRITE: u32 = 4;
+
+fn state_version(data: &StateData) -> u32 {
+    if data.fully_validated_pruned_through == 0 {
+        STATE_VERSION_LEGACY_WRITE
+    } else {
+        STATE_VERSION
+    }
+}
 
 /// The complete validation state needed to resume without re-validation.
 #[derive(Clone, PartialEq, Debug)]
@@ -483,6 +552,12 @@ pub struct StateData {
     /// the v4 flag byte's bit 1. Without it a resumed snapshot re-runs
     /// the replay.
     pub snapshot_verified: bool,
+    /// Highest block whose body may be absent because it was fully
+    /// validated by the ordinary checks before a sealed checkpoint was
+    /// imported. This is distinct from `snapshot_base`: it never skips
+    /// consensus validation and only records durable body pruning.
+    /// `0` means no such prefix.
+    pub fully_validated_pruned_through: u32,
 }
 
 fn invalid(msg: impl Into<String>) -> io::Error {
@@ -595,7 +670,7 @@ pub fn write_state(dir: &Path, magic: [u8; 4], data: &StateData) -> io::Result<(
         let file = File::create(&tmp)?;
         let mut out = BufWriter::with_capacity(64 * 1024, file);
         out.write_all(&magic)?;
-        out.write_all(&STATE_VERSION.to_le_bytes())?;
+        out.write_all(&state_version(data).to_le_bytes())?;
         out.write_all(&[0; 32])?;
 
         let checksum = write_state_payload(&mut out, data)?;
@@ -615,7 +690,7 @@ pub fn write_state(dir: &Path, magic: [u8; 4], data: &StateData) -> io::Result<(
     File::open(dir)?.sync_all()
 }
 
-/// Streams the byte-for-byte v4 state payload and returns its sha256d.
+/// Streams the byte-for-byte v5 state payload and returns its sha256d.
 fn write_state_payload<W: Write>(out: &mut W, data: &StateData) -> io::Result<[u8; 32]> {
     let mut out = ChecksumWriter {
         inner: out,
@@ -657,6 +732,9 @@ fn write_state_payload<W: Write>(out: &mut W, data: &StateData) -> io::Result<[u
     // bit0 = externalized; bit1 = snapshot verified. Preserve the v4 flags.
     let flags = u8::from(data.externalized) | (u8::from(data.snapshot_verified) << 1);
     out.write_all(&[flags])?;
+    if data.fully_validated_pruned_through > 0 {
+        out.write_all(&data.fully_validated_pruned_through.to_le_bytes())?;
+    }
     out.flush()?;
     Ok(out.hasher.finalize())
 }
@@ -869,6 +947,12 @@ pub fn read_state(dir: &Path, magic: [u8; 4]) -> io::Result<Option<StateData>> {
     } else {
         (false, false)
     };
+    let fully_validated_pruned_through = if version >= 5 {
+        d.read_u32_le()
+            .map_err(|e| invalid(format!("fully validated prune boundary: {e}")))?
+    } else {
+        0
+    };
     d.finish().map_err(|e| invalid(format!("trailing: {e}")))?;
     // Externalized states keep their coins/undos in coinsdb — the
     // inline counts don't apply there.
@@ -878,6 +962,17 @@ pub fn read_state(dir: &Path, magic: [u8; 4]) -> io::Result<Option<StateData>> {
         || u64::from(height) != chain.len() as u64 - 1
     {
         return Err(invalid("state.dat: chain/undo/tip mismatch"));
+    }
+    if fully_validated_pruned_through > 0
+        && (fully_validated_pruned_through > height
+            || chain.get(fully_validated_pruned_through as usize).is_none()
+            || snapshot_base != 0
+            || snapshot_verified
+            || !externalized)
+    {
+        return Err(invalid(
+            "state.dat: invalid fully validated pruned-history boundary",
+        ));
     }
     Ok(Some(StateData {
         tip,
@@ -892,6 +987,7 @@ pub fn read_state(dir: &Path, magic: [u8; 4]) -> io::Result<Option<StateData>> {
         snapshot_base,
         externalized,
         snapshot_verified,
+        fully_validated_pruned_through,
     }))
 }
 
@@ -1181,10 +1277,11 @@ mod tests {
             snapshot_base: 0,
             externalized: false,
             snapshot_verified: false,
+            fully_validated_pruned_through: 0,
         }
     }
 
-    /// The previous v4 encoder, retained only as a byte-level test oracle.
+    /// The buffered encoder, retained only as a byte-level test oracle.
     fn buffered_state_bytes_reference(data: &StateData) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(data.tip.as_bytes());
@@ -1222,10 +1319,13 @@ mod tests {
         payload.extend_from_slice(&data.snapshot_base.to_le_bytes());
         let flags = u8::from(data.externalized) | (u8::from(data.snapshot_verified) << 1);
         payload.push(flags);
+        if data.fully_validated_pruned_through > 0 {
+            payload.extend_from_slice(&data.fully_validated_pruned_through.to_le_bytes());
+        }
 
         let mut framed = Vec::with_capacity(payload.len() + 40);
         framed.extend_from_slice(&MAGIC);
-        framed.extend_from_slice(&STATE_VERSION.to_le_bytes());
+        framed.extend_from_slice(&state_version(data).to_le_bytes());
         framed.extend_from_slice(&sha256d(&payload));
         framed.extend_from_slice(&payload);
         framed
@@ -1272,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_state_matches_previous_v4_bytes_for_contents_and_flags() {
+    fn streaming_state_matches_buffered_bytes_for_contents_and_flags() {
         let dir = test_dir("state-stream-equivalence");
         fs::create_dir_all(&dir).unwrap();
         for (externalized, snapshot_verified) in
@@ -1333,7 +1433,7 @@ mod tests {
         };
         let checksum = write_state_payload(&mut streamed, state).unwrap();
         assert_eq!(&expected[..4], &MAGIC);
-        assert_eq!(&expected[4..8], &STATE_VERSION.to_le_bytes());
+        assert_eq!(&expected[4..8], &state_version(state).to_le_bytes());
         assert_eq!(&expected[8..40], &checksum);
         assert_eq!(&streamed.bytes[..], &expected[40..]);
     }
@@ -1420,6 +1520,21 @@ mod tests {
         assert_eq!(read_state(&dir, MAGIC).unwrap(), Some(state));
         // The tmp file is consumed by the rename — never left behind.
         assert!(!dir.join(STATE_TMP).exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn state_roundtrip_fully_validated_prune_marker_is_distinct_from_snapshot() {
+        let dir = test_dir("state-fully-validated-pruned");
+        fs::create_dir_all(&dir).unwrap();
+        let mut state = test_state();
+        state.externalized = true;
+        state.fully_validated_pruned_through = state.height;
+        write_state(&dir, MAGIC, &state).unwrap();
+        let loaded = read_state(&dir, MAGIC).unwrap().unwrap();
+        assert_eq!(loaded, state);
+        assert_eq!(loaded.snapshot_base, 0);
+        assert!(!loaded.snapshot_verified);
         fs::remove_dir_all(&dir).unwrap();
     }
 

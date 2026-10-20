@@ -2,10 +2,11 @@
 //! core: a bounded set of [`PeerSession`]s, each with its own
 //! [`PeerSync`], all driven by one [`PeerManager::tick`] call.
 //!
-//! Single-threaded round-robin: `tick` polls every session (nonblocking),
-//! feeds events into the shared [`Chainstate`], sends whatever the sync
-//! layer asks for, evicts stalled/misbehaving peers, and reports
-//! [`NetEvent`]s the caller can log or budget.
+//! One ordered state owner with a bounded block-preparation pool: `tick`
+//! polls every session (nonblocking), routes framed block payloads to two
+//! memory-bounded decode/check workers, feeds completed bodies into the
+//! shared [`Chainstate`], sends sync requests, evicts stalled/misbehaving
+//! peers, and reports [`NetEvent`]s it can log or budget.
 //!
 //! Generic over the stream type so tests run entirely on in-memory pipes —
 //! `PeerManager<End>` needs no sockets, while the concrete
@@ -20,6 +21,7 @@ use avila_consensus::chainstate::Chainstate;
 use avila_consensus::hash::BlockHash;
 
 use crate::addrman::{self, AddrBook};
+use crate::blockprep::{BlockPreparationPool, Completion, PreparationResult, Reservation};
 use crate::message::{AddrV2Entry, Message, NODE_P2P_V2, NetAddr, Version};
 use crate::session::{
     HANDSHAKE_TIMEOUT, PeerInfo, PeerSession, SessionError, SessionEvent, build_version, wall_epoch,
@@ -34,6 +36,10 @@ pub const DEFAULT_MAX_PEERS: usize = 8;
 /// set — independent of peer count, so aggregate download memory stays
 /// predictable (Core bounds this through `BLOCK_DOWNLOAD_WINDOW`).
 pub const MAX_BLOCKS_IN_TRANSIT_TOTAL: usize = 1024;
+
+/// Maximum externally held Swift block bodies awaiting the caller. This is
+/// independent of network reservations, which are released on capture.
+const MAX_SWIFT_PENDING_BLOCKS: usize = 4;
 
 /// Seconds between initiated BIP330 reconciliation rounds per link —
 /// BIP-330 paces ~1/s per link on mainnet-scale pools; we start
@@ -117,6 +123,8 @@ const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1000.0;
 /// reads — one filter request/second sustained, burst 20.
 const CFILTER_RATE_PER_SECOND: f64 = 1.0;
 const CFILTER_TOKEN_BUCKET: f64 = 20.0;
+/// Missing BIP455 responses fall back to ordinary block validation after this delay.
+pub const SWIFT_SPENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Core's `HEADERS_DOWNLOAD_TIMEOUT_BASE` — the fixed floor of the
 /// overall deadline the headers-sync leader has to catch us up, on top
@@ -158,6 +166,29 @@ pub enum DisconnectReason {
     Stalled,
 }
 
+/// Why a BIP455 spent-coin request could not be sent or matched.
+#[derive(Debug, thiserror::Error)]
+pub enum SwiftSpentRequestError {
+    /// The experimental Swift request path is disabled by configuration.
+    #[error("Swift spent-coin acquisition is disabled")]
+    Disabled,
+    /// The peer id is not connected.
+    #[error("unknown peer")]
+    UnknownPeer,
+    /// The peer has not completed the version handshake.
+    #[error("peer is not established")]
+    NotEstablished,
+    /// The peer did not advertise exact BIP455 v1 support via BIP434.
+    #[error("peer does not support blockspentcoinsv1")]
+    Unsupported,
+    /// The request exceeded local in-flight/index bounds.
+    #[error(transparent)]
+    Protocol(#[from] crate::swift_spent::SpentCoinsError),
+    /// The session send queue rejected the request.
+    #[error("could not queue getbspent: {0}")]
+    Send(String),
+}
+
 /// An event the caller should observe.
 #[derive(Clone, Debug)]
 pub enum NetEvent {
@@ -177,6 +208,38 @@ pub enum NetEvent {
     },
     /// Our connected tip advanced — `(new height)`.
     TipAdvanced(u32),
+    /// Untrusted, exactly correlated spent-coin claims for one requested block.
+    /// Consensus validation remains the Swift engine's responsibility.
+    SpentCoins {
+        /// The peer that supplied the claims.
+        peer: u64,
+        /// The bounded response matched to a pending block request.
+        response: crate::swift_spent::SpentCoins,
+    },
+    /// Spent-coin acquisition hit a local resource limit or response timeout;
+    /// callers should fall back to ordinary block validation for this hash.
+    SpentCoinsFallback {
+        /// The peer that supplied the oversized response.
+        peer: u64,
+        /// The block whose spent coins could not be used.
+        block_hash: BlockHash,
+    },
+    /// A block body reserved for an explicit external full-check driver.
+    /// This event does not advance Chainstate's accepted tip.
+    SwiftBlock {
+        /// The peer that supplied the body.
+        peer: u64,
+        /// Bounded block body for the caller's ordered validation queue.
+        block: Box<avila_consensus::block::Block>,
+    },
+    /// The caller stopped accepting provisional bodies because its independent
+    /// external-validation queue reached the fixed bound.
+    SwiftCaptureLimit {
+        /// Peer that supplied the body at the queue limit.
+        peer: u64,
+        /// Dropped body hash; after fallback it may be requested normally.
+        block_hash: BlockHash,
+    },
     /// Eclipse indicators fired — advisory, not proof (queue #12).
     EclipseSuspected(Vec<EclipseSignal>),
     /// A peer dominated dispatch CPU (>50% share, >200ms/s sustained)
@@ -261,6 +324,7 @@ pub enum NetEvent {
 struct PeerEntry<S> {
     session: PeerSession<S>,
     sync: PeerSync,
+    spent_requests: crate::swift_spent::SpentCoinsRequests,
     /// The peer's network address when we know it (outbound dials do).
     remote: Option<NetAddr>,
     /// The peer sent `sendheaders` — announce new tips via `headers`,
@@ -531,6 +595,8 @@ pub struct PeerSnapshot {
     pub recon_their_misses: u64,
     /// BIP152 — the peer's `sendcmpct` negotiated v2 (wtxid shortids).
     pub cmpct_v2: bool,
+    /// Peer advertised exact BIP455 v1 spent-coin service.
+    pub blockspentcoinsv1: bool,
     /// BIP152 — the peer asked for high-bandwidth `cmpctblock`
     /// announcements.
     pub cmpct_hb: bool,
@@ -566,6 +632,9 @@ pub struct PeerManager<S> {
     /// Aggregate bound on block reservations across all peers —
     /// defaults to [`MAX_BLOCKS_IN_TRANSIT_TOTAL`].
     max_in_flight_total: usize,
+    /// Persistent, bounded P2P decode + context-free block-check workers.
+    /// `None` is the explicit synchronous A/B baseline.
+    block_preparer: Option<BlockPreparationPool>,
     /// Height-sorted `(height, hash)` fetch index for the fill pass —
     /// rebuilt only when the header set grows, so each tick scans the
     /// unfetched suffix instead of re-sorting the whole index per peer.
@@ -669,6 +738,20 @@ pub struct PeerManager<S> {
     /// utreexo spend bundles (shadow connect). See
     /// [`Self::set_utxproof_consumer`].
     ask_utxproof: bool,
+    /// Explicit opt-in to request BIP455 data for full-check Swift IBD.
+    swift_spent_enabled: bool,
+    /// Route bodies to an external validator instead of ordinary Chainstate.
+    swift_block_capture: bool,
+    /// Pinned Swift checkpoint used to construct the block-fetch path. This
+    /// only changes requests; it never changes Chainstate's checked tip.
+    swift_capture_target: Option<(u32, BlockHash)>,
+    /// Last body acquired by the external Swift caller. This provisional
+    /// frontier prevents released reservations from requesting the same block
+    /// repeatedly while a bounded spent-coin response is in flight.
+    swift_fetch_frontier: Option<(u32, BlockHash)>,
+    /// Bodies delivered to the external caller but not yet validated by it.
+    /// They keep the manager from immediately re-requesting the same height.
+    swift_pending_blocks: std::collections::HashSet<BlockHash>,
     /// Whether new sessions advertise `sendadvice` — we want their
     /// sig-advice sidecars when set. See [`Self::set_advice_consumer`].
     ask_advice: bool,
@@ -957,6 +1040,16 @@ impl<S: Read + Write> PeerManager<S> {
     /// An empty manager — `max_peers` bounds the set.
     #[must_use]
     pub fn new(max_peers: usize) -> Self {
+        let prepare_blocks = std::env::var("AVILA_P2P_BLOCK_PREPARE")
+            .map(|value| value != "0")
+            .unwrap_or(!cfg!(test));
+        Self::new_with_block_preparation(max_peers, prepare_blocks)
+    }
+
+    /// Creates a manager with optional off-thread block preparation. Tests and
+    /// matched A/B runs can select the synchronous baseline explicitly.
+    #[must_use]
+    pub fn new_with_block_preparation(max_peers: usize, prepare_blocks: bool) -> Self {
         let dial_channel = std::sync::mpsc::channel();
         let inbound_channel = std::sync::mpsc::channel();
         Self {
@@ -966,6 +1059,7 @@ impl<S: Read + Write> PeerManager<S> {
             headers_leader: None,
             headers_sync_deadline: None,
             max_in_flight_total: MAX_BLOCKS_IN_TRANSIT_TOTAL,
+            block_preparer: prepare_blocks.then(BlockPreparationPool::new).flatten(),
             fetch_index: Vec::new(),
             fetch_index_headers: usize::MAX,
             last_frontier: 0,
@@ -995,6 +1089,11 @@ impl<S: Read + Write> PeerManager<S> {
             proxy_failures: 0,
             cell_bytes: 0,
             ask_utxproof: false,
+            swift_spent_enabled: false,
+            swift_block_capture: false,
+            swift_capture_target: None,
+            swift_fetch_frontier: None,
+            swift_pending_blocks: std::collections::HashSet::new(),
             ask_advice: false,
             compact_blocks: true,
             compact_hb: true,
@@ -1188,6 +1287,7 @@ impl<S: Read + Write> PeerManager<S> {
                     recon_misses: peer.recon_misses,
                     recon_their_misses: peer.recon_their_misses,
                     cmpct_v2: peer.cmpct_v2,
+                    blockspentcoinsv1: info.is_some_and(|i| i.blockspentcoinsv1),
                     cmpct_hb: peer.cmpct_hb,
                     cmpct_asked_hb: peer.session.cmpct_asked(),
                     cmpct_recv: peer.cmpct_recv,
@@ -1334,6 +1434,13 @@ impl<S: Read + Write> PeerManager<S> {
         // Inbound accepts register no nonce — Core only ever checks
         // against outbound dials, never the other way around.
         let our_nonce = (!inbound).then(|| session.our_nonce());
+        let spent_requests = crate::swift_spent::SpentCoinsRequests::new(
+            crate::swift_spent::MAX_PENDING_SPENT_REQUESTS,
+            crate::swift_spent::MAX_SPENT_COINS,
+            crate::swift_spent::MAX_SPENT_SCRIPT_BYTES,
+            crate::swift_spent::MAX_PENDING_INPUT_INDEX_BYTES,
+        )
+        .ok()?;
         if let Some(nonce) = our_nonce {
             self.outbound_nonces.insert(nonce);
         }
@@ -1342,6 +1449,7 @@ impl<S: Read + Write> PeerManager<S> {
             PeerEntry {
                 session,
                 sync: PeerSync::new(),
+                spent_requests,
                 remote,
                 wants_headers_announce: false,
                 inbound,
@@ -1406,6 +1514,18 @@ impl<S: Read + Write> PeerManager<S> {
     pub fn tick(&mut self, cs: &mut Chainstate, now: u32) -> Vec<NetEvent> {
         let mut events = Vec::new();
         let mut dead = Vec::new();
+        let swift_block_capture = self.swift_block_capture;
+        let mut prepared_by_peer: HashMap<u64, Vec<Completion>> = HashMap::new();
+        let mut pending_dispatch: HashMap<u64, Vec<SessionEvent>> = HashMap::new();
+        let mut reservation_holds: HashMap<u64, Vec<Reservation>> = HashMap::new();
+        if let Some(pool) = &self.block_preparer {
+            for completion in pool.drain() {
+                prepared_by_peer
+                    .entry(completion.peer_id)
+                    .or_default()
+                    .push(completion);
+            }
+        }
         // Aggregate reservation budget shared by every event this tick —
         // headers-driven and inv-driven fetches draw it down too.
         let mut global_free = self.max_in_flight_total.saturating_sub(self.in_flight());
@@ -1421,8 +1541,22 @@ impl<S: Read + Write> PeerManager<S> {
             tx_serve_verdict,
             block_serve_verdict,
             block_serve_mode,
+            block_preparer,
+            recent_deliveries,
+            swift_pending_blocks,
             ..
         } = self;
+        for (id, peer) in peers.iter_mut() {
+            for block_hash in peer
+                .spent_requests
+                .expire_older_than(SWIFT_SPENT_RESPONSE_TIMEOUT)
+            {
+                events.push(NetEvent::SpentCoinsFallback {
+                    peer: *id,
+                    block_hash,
+                });
+            }
+        }
         // Core's `m_num_preferred_download_peers - state.fPreferredDownload
         // >= 1`: the sync-peer timeout below only ever fires an established
         // peer if there's at least one *other* established peer to hand
@@ -1467,6 +1601,7 @@ impl<S: Read + Write> PeerManager<S> {
                 // must keep draining, and the remote side closes a
                 // connection it can't write to.
                 && *headers_leader != Some(id)
+                && !prepared_by_peer.contains_key(&id)
             {
                 events.push(NetEvent::CpuThrottled {
                     peer: id,
@@ -1478,47 +1613,55 @@ impl<S: Read + Write> PeerManager<S> {
                 dead.push((id, DisconnectReason::Session(e.to_string())));
                 continue;
             }
-            match peer.session.poll() {
-                Ok(peer_events) => {
-                    for event in peer_events {
-                        peer.last_rx = Instant::now();
-                        let t0 = Instant::now();
-                        Self::dispatch(
-                            id,
-                            peer,
-                            event,
-                            cs,
-                            now,
-                            addrbook,
-                            headers_leader,
-                            headers_sync_deadline,
-                            &mut announce_tip,
-                            &mut announce_tx,
-                            mempool,
-                            &mut global_free,
-                            &mut events,
-                            &mut dead,
-                            serve_filters,
-                            outbound_nonces,
-                            &stem_exclude,
-                            &mut self.recent_deliveries,
-                            tx_serve_verdict,
-                            block_serve_verdict,
-                            block_serve_mode.as_str(),
-                            self.compact_blocks,
-                            self.compact_serve,
-                            self.blocks_only,
-                            self.send_feefilter,
-                        );
-                        // Per-peer CPU accounting (PEER_BUDGETS):
-                        // time inside dispatch lands on this peer's
-                        // cumulative + window counters.
-                        let spent = t0.elapsed().as_nanos() as u64;
-                        peer.cpu_ns += spent;
-                        peer.cpu_window_ns += spent;
+            let current_session = peer.session.telemetry().session_id;
+            let mut ready_events = Vec::new();
+            if let Some(completions) = prepared_by_peer.remove(&id) {
+                for completion in completions {
+                    if completion.session_id != current_session {
+                        continue;
+                    }
+                    let Completion {
+                        result,
+                        _reservation,
+                        ..
+                    } = completion;
+                    reservation_holds.entry(id).or_default().push(_reservation);
+                    match result {
+                        PreparationResult::Prepared(prepared) => {
+                            ready_events.push(SessionEvent::PreparedBlock(prepared));
+                        }
+                        PreparationResult::CheckRejected(block) => {
+                            // Preserve the ordinary CheckBlock rejection path
+                            // and its pre-header, non-cached failure behavior.
+                            ready_events.push(SessionEvent::Message(Message::Block(block)));
+                        }
+                        PreparationResult::DecodeRejected(error) => {
+                            dead.push((id, DisconnectReason::Session(error.to_string())));
+                        }
                     }
                 }
+            }
+            match peer.session.poll() {
+                Ok(peer_events) => ready_events.extend(peer_events),
                 Err(e) => dead.push((id, DisconnectReason::Session(e.to_string()))),
+            }
+            for event in ready_events {
+                peer.last_rx = Instant::now();
+                let event = match event {
+                    SessionEvent::RawBlock(payload) => {
+                        if let Some(pool) = block_preparer {
+                            match pool.try_submit(id, current_session, payload, *cs.tree().params())
+                            {
+                                Ok(()) => continue,
+                                Err(payload) => SessionEvent::RawBlock(payload),
+                            }
+                        } else {
+                            SessionEvent::RawBlock(payload)
+                        }
+                    }
+                    event => event,
+                };
+                pending_dispatch.entry(id).or_default().push(event);
             }
             // Periodic liveness ping.
             if peer.session.established() && peer.last_ping.elapsed() > PING_INTERVAL {
@@ -1528,15 +1671,121 @@ impl<S: Read + Write> PeerManager<S> {
                     peer.ping_outstanding = Some((nonce, Instant::now()));
                 }
             }
-            // The current leader's overall catch-up deadline (Core's
-            // sync-peer timeout): armed lazily the first tick a peer is
-            // seen holding leadership (freshly armed, so never
-            // immediately exceeded), then checked every tick after.
-            // This is independent of `headers_timed_out` above — a
-            // leader that keeps answering every single request
-            // promptly, but never actually finishes catching us up
-            // (e.g. cycling through abandoned low-work syncs), would
-            // otherwise never trip that per-request timeout at all.
+        }
+        // Poll every session and enqueue every received raw block before
+        // running any chainstate acceptance. This keeps acquisition polling
+        // ahead of expensive ordered connects within each manager tick.
+        for (&id, peer) in peers.iter_mut() {
+            let _holds = reservation_holds.remove(&id);
+            if let Some(peer_events) = pending_dispatch.remove(&id) {
+                for event in peer_events {
+                    let event = match event {
+                        SessionEvent::RawBlock(payload) => {
+                            match crate::message::decode_block_payload(&payload) {
+                                Ok(block) => SessionEvent::Message(Message::Block(block)),
+                                Err(error) => {
+                                    dead.push((id, DisconnectReason::Session(error.to_string())));
+                                    continue;
+                                }
+                            }
+                        }
+                        event => event,
+                    };
+                    let is_block_body = matches!(
+                        &event,
+                        SessionEvent::Message(Message::Block(_)) | SessionEvent::PreparedBlock(_)
+                    );
+                    let capture_capable = peer
+                        .session
+                        .peer()
+                        .is_some_and(|info| info.blockspentcoinsv1);
+                    if swift_block_capture && is_block_body && !capture_capable {
+                        let block = match &event {
+                            SessionEvent::Message(Message::Block(block)) => Some(block),
+                            SessionEvent::PreparedBlock(prepared) => Some(prepared.block()),
+                            _ => None,
+                        };
+                        if let Some(block) = block {
+                            let _ = peer.sync.on_block_for_external_validation(block);
+                        }
+                        // An unqualified peer cannot disable the Swift
+                        // attempt by sending an unsolicited block body.
+                        continue;
+                    }
+                    let captured = if swift_block_capture {
+                        match &event {
+                            SessionEvent::Message(Message::Block(block)) => Some(block.clone()),
+                            SessionEvent::PreparedBlock(prepared) => Some(prepared.block().clone()),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(block) = captured {
+                        let hash = block.block_hash();
+                        if !swift_pending_blocks.contains(&hash)
+                            && swift_pending_blocks.len() >= MAX_SWIFT_PENDING_BLOCKS
+                        {
+                            let _ = peer.sync.on_block_for_external_validation(&block);
+                            events.push(NetEvent::SwiftCaptureLimit {
+                                peer: id,
+                                block_hash: hash,
+                            });
+                            continue;
+                        }
+                        if swift_pending_blocks.contains(&hash) {
+                            let _ = peer.sync.on_block_for_external_validation(&block);
+                            continue;
+                        }
+                        swift_pending_blocks.insert(hash);
+                        let _ = peer.sync.on_block_for_external_validation(&block);
+                        peer.last_block_time = Some(i64::from(now));
+                        peer.last_useful = Instant::now();
+                        peer.stall_releases = 0;
+                        events.push(NetEvent::SwiftBlock {
+                            peer: id,
+                            block: Box::new(block),
+                        });
+                        recent_deliveries.push_back((hash, id));
+                        if recent_deliveries.len() > 2048 {
+                            recent_deliveries.pop_front();
+                        }
+                        continue;
+                    }
+                    let t0 = Instant::now();
+                    Self::dispatch(
+                        id,
+                        peer,
+                        event,
+                        cs,
+                        now,
+                        addrbook,
+                        headers_leader,
+                        headers_sync_deadline,
+                        &mut announce_tip,
+                        &mut announce_tx,
+                        mempool,
+                        &mut global_free,
+                        &mut events,
+                        &mut dead,
+                        serve_filters,
+                        outbound_nonces,
+                        &stem_exclude,
+                        recent_deliveries,
+                        tx_serve_verdict,
+                        block_serve_verdict,
+                        block_serve_mode.as_str(),
+                        self.compact_blocks,
+                        self.compact_serve,
+                        self.blocks_only,
+                        swift_block_capture,
+                        self.send_feefilter,
+                    );
+                    let spent = t0.elapsed().as_nanos() as u64;
+                    peer.cpu_ns += spent;
+                    peer.cpu_window_ns += spent;
+                }
+            }
             if *headers_leader == Some(id) {
                 let deadline = *headers_sync_deadline
                     .get_or_insert_with(|| headers_download_deadline(cs, now));
@@ -1546,30 +1795,10 @@ impl<S: Read + Write> PeerManager<S> {
                     dead.push((id, DisconnectReason::Stalled));
                 }
             }
-            // Stall eviction: a block download that's gone quiet, or an
-            // outstanding `getheaders` that has gone unanswered past
-            // Core's `HEADERS_RESPONSE_TIME`. The latter matters even
-            // for a peer that's otherwise alive and answering pings —
-            // without it a headers leader that simply stops replying to
-            // `getheaders` would freeze header sync until it
-            // disconnects for some unrelated reason, since only the
-            // leader is allowed to keep paging. Dropping it here clears
-            // `headers_leader` below and `fill_queues` hands leadership
-            // to another established peer on the next tick.
-            // Per-hash staleness first: `stalled()` only watches the
-            // queue front, so a peer that keeps answering other requests
-            // can pin one hash forever — release stragglers back to the
-            // pool so another peer picks them up next fill.
             peer.sync.release_older_than(BLOCK_STALLING_TIMEOUT * 8);
             if peer.sync.headers_timed_out() {
                 dead.push((id, DisconnectReason::Stalled));
             } else if peer.sync.stalled() {
-                // Core's stall recovery: a peer whose block requests
-                // went unanswered isn't instantly dropped — its
-                // reservations are released back to the fetch pool so
-                // answering peers take over, and the peer survives if
-                // it still delivers. Only a peer that stalls release
-                // after release without ever contributing gets dropped.
                 let released = peer.sync.release_in_flight();
                 peer.stall_releases += 1;
                 if released == 0 || peer.stall_releases >= 4 {
@@ -1895,6 +2124,90 @@ impl<S: Read + Write> PeerManager<S> {
     /// `-v2transport` which only affects new links).
     pub fn set_utxproof_consumer(&mut self, on: bool) {
         self.ask_utxproof = on;
+    }
+
+    /// Enables the experimental, fully checked Swift IBD caller to request
+    /// BIP455 spent coins from peers that advertised the exact v1 feature.
+    /// Disabled by default; ordinary block sync remains the fallback.
+    pub fn set_swift_spent_requests(&mut self, on: bool) {
+        self.swift_spent_enabled = on;
+    }
+
+    /// Explicitly route received block bodies to the Swift full-check caller.
+    /// This does not validate or publish blocks; callers must own a bounded
+    /// ordered engine queue and leave this disabled when no qualified BIP455
+    /// provider is available. Compact relay is disabled because compact
+    /// reconstruction currently bypasses this body-capture boundary.
+    pub fn set_swift_block_capture(&mut self, on: bool) {
+        self.swift_block_capture = on;
+        if on {
+            self.compact_blocks = false;
+            self.compact_hb = false;
+            self.compact_serve = false;
+        } else {
+            self.swift_pending_blocks.clear();
+        }
+    }
+
+    /// Releases an acquired body after the external caller has validated it
+    /// or abandoned the experimental attempt.
+    pub fn complete_swift_block(&mut self, hash: BlockHash) {
+        self.swift_pending_blocks.remove(&hash);
+    }
+
+    /// Binds external block fetching to a pinned checkpoint and a separate
+    /// provisional acquisition cursor. `frontier` is advanced only by the
+    /// caller after it has bounded and retained the corresponding body; it is
+    /// not a validated-height or checked-tip signal.
+    pub fn set_swift_fetch_window(
+        &mut self,
+        target: Option<(u32, BlockHash)>,
+        frontier: Option<(u32, BlockHash)>,
+    ) {
+        self.swift_capture_target = target;
+        self.swift_fetch_frontier = frontier;
+        self.fetch_index.clear();
+        self.fetch_index_headers = usize::MAX;
+    }
+
+    /// Requests bounded BIP455 coins for a block from one negotiated peer.
+    /// `expected_input_indices` must be the exact sorted non-coinbase input
+    /// indexes for the request's cutoff. Returned coins remain untrusted.
+    pub fn request_spent_coins(
+        &mut self,
+        peer_id: u64,
+        request: crate::swift_spent::GetSpentCoins,
+        expected_input_indices: &[u32],
+    ) -> Result<(), SwiftSpentRequestError> {
+        if !self.swift_spent_enabled {
+            return Err(SwiftSpentRequestError::Disabled);
+        }
+        let peer = self
+            .peers
+            .get_mut(&peer_id)
+            .ok_or(SwiftSpentRequestError::UnknownPeer)?;
+        if !peer.session.established() {
+            return Err(SwiftSpentRequestError::NotEstablished);
+        }
+        if !peer
+            .session
+            .peer()
+            .is_some_and(|info| info.blockspentcoinsv1)
+        {
+            return Err(SwiftSpentRequestError::Unsupported);
+        }
+        let payload = peer
+            .spent_requests
+            .request(request, expected_input_indices)?;
+        let message = Message::Unknown {
+            command: crate::swift_spent::GET_SPENT_COMMAND.to_string(),
+            payload,
+        };
+        if let Err(error) = peer.session.send(&message) {
+            peer.spent_requests.remove(&request.block_hash);
+            return Err(SwiftSpentRequestError::Send(error.to_string()));
+        }
+        Ok(())
     }
 
     /// Whether sessions advertise `sendadvice` — on when the node runs
@@ -2386,6 +2699,7 @@ impl<S: Read + Write> PeerManager<S> {
     }
 
     fn fill_queues(&mut self, cs: &mut Chainstate, now: u32) {
+        let swift_capture = self.swift_block_capture;
         // Leaderless and connected: the first established peer resumes
         // headers paging from our tip (locator-based, so cheap).
         // Slow-leader handoff: a sync peer whose page request has gone
@@ -2462,10 +2776,22 @@ impl<S: Read + Write> PeerManager<S> {
         // the tail of a download (and on any <2048-header chain): the
         // last partial page never trips 2048, so the frozen index ends
         // below the tip and no block is ever requested.
+        let target_path = self.swift_capture_target;
+        let index_tip = target_path.map_or_else(|| cs.tree().tip_hash(), |(_, hash)| hash);
+        let index_height = target_path.map_or(cs.tree().tip().height, |(height, _)| height);
+        let target_is_best_ancestor = target_path.is_none_or(|(height, hash)| {
+            cs.tree()
+                .get_ancestor(&cs.tree().tip_hash(), height)
+                .is_some_and(|node| node.hash() == hash)
+                && cs
+                    .tree()
+                    .get(&hash)
+                    .is_some_and(|node| node.height == height)
+        });
         let index_short = self
             .fetch_index
             .last()
-            .is_none_or(|(h, _)| *h < cs.tree().tip().height);
+            .is_none_or(|(h, _)| *h < index_height);
         // `index_short` only justifies a rebuild when headers actually
         // grew since the last one — if the index still can't reach the
         // tip (a taller side-branch node outranks it), rebuilding every
@@ -2474,21 +2800,36 @@ impl<S: Read + Write> PeerManager<S> {
             || stale >= 2048
             || (index_short && header_count != self.fetch_index_headers)
         {
-            self.fetch_index = cs
-                .tree()
-                .headers_by_height()
-                .iter()
-                .map(|h| {
-                    let hash = h.hash();
-                    (cs.tree().get(&hash).map(|n| n.height).unwrap_or(0), hash)
-                })
-                .collect();
+            self.fetch_index = if target_path.is_some() && !target_is_best_ancestor {
+                Vec::new()
+            } else if target_path.is_some() {
+                (0..=index_height)
+                    .filter_map(|height| {
+                        cs.tree()
+                            .get_ancestor(&index_tip, height)
+                            .map(|node| (height, node.hash()))
+                    })
+                    .collect()
+            } else {
+                cs.tree()
+                    .headers_by_height()
+                    .iter()
+                    .map(|h| {
+                        let hash = h.hash();
+                        (cs.tree().get(&hash).map(|n| n.height).unwrap_or(0), hash)
+                    })
+                    .collect()
+            };
             self.fetch_index_headers = header_count;
         }
         // One shared scan: unfetched candidates above the connected
         // frontier (connected heights have bodies by definition), each
         // peer taking a slice until the aggregate budget binds.
-        let frontier = cs.chain().len() as u32;
+        let frontier = self
+            .swift_fetch_frontier
+            .map_or(cs.chain().len() as u32, |(height, _)| {
+                height.saturating_add(1)
+            });
         let start = self.fetch_index.partition_point(|(h, _)| *h < frontier);
         if frontier != self.last_frontier {
             self.last_frontier = frontier;
@@ -2569,11 +2910,20 @@ impl<S: Read + Write> PeerManager<S> {
                 }
             }
         }
-        let want_total = self.max_in_flight_total.saturating_sub(reserved.len());
+        let want_total = self
+            .max_in_flight_total
+            .saturating_sub(reserved.len())
+            .min(if swift_capture { 1 } else { usize::MAX });
+        let swift_pending_blocks = &self.swift_pending_blocks;
         let candidates: Vec<(u32, BlockHash)> = self.fetch_index[start..]
             .iter()
             .copied()
-            .filter(|(_, h)| !cs.have_body(h) && !reserved.contains(h))
+            .filter(|(height, h)| {
+                target_path.is_none_or(|(target_height, _)| *height <= target_height)
+                    && !swift_pending_blocks.contains(h)
+                    && !cs.have_body(h)
+                    && !reserved.contains(h)
+            })
             .take(want_total)
             .collect();
         // Rotate the iteration start each fill: stable map order gave the
@@ -2594,6 +2944,19 @@ impl<S: Read + Write> PeerManager<S> {
             let Some(peer) = self.peers.get_mut(&id) else {
                 continue;
             };
+            // Draft Swift block acquisition depends on the same peer being
+            // able to answer the correlated `getbspent` request after the
+            // body arrives. Do not reserve bodies from ordinary peers and
+            // only discover the missing capability after capture.
+            if swift_capture
+                && !peer
+                    .session
+                    .peer()
+                    .is_some_and(|info| info.blockspentcoinsv1)
+            {
+                reserved.extend(peer.sync.reserved_hashes().copied());
+                continue;
+            }
             if !peer.session.established()
                 || peer.sync.stalled()
                 || peer.sync.in_flight() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER
@@ -2654,11 +3017,16 @@ impl<S: Read + Write> PeerManager<S> {
                 .peers
                 .values()
                 .any(|p| p.sync.reserved_hashes().any(|h| *h == frontier_hash));
-            if (aged || !held)
+            if !swift_pending_blocks.contains(&frontier_hash)
+                && (aged || !held)
                 && let Some(peer) = self
                     .peers
                     .values_mut()
-                    .filter(|p| p.session.established())
+                    .filter(|p| {
+                        p.session.established()
+                            && (!swift_capture
+                                || p.session.peer().is_some_and(|info| info.blockspentcoinsv1))
+                    })
                     .min_by_key(|p| p.sync.in_flight())
                 && let Some(req) = peer.sync.want_one(frontier_hash)
             {
@@ -2669,7 +3037,7 @@ impl<S: Read + Write> PeerManager<S> {
         // without this, inv bursts beyond the window are forgotten.
         let mut global_free = self.max_in_flight_total.saturating_sub(self.in_flight());
         for peer in self.peers.values_mut() {
-            if !peer.session.established() {
+            if swift_capture || !peer.session.established() {
                 continue;
             }
             if let Some(req) = peer.sync.drain_pending(cs, global_free) {
@@ -2741,6 +3109,81 @@ impl<S: Read + Write> PeerManager<S> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn dispatch_block(
+        id: u64,
+        peer: &mut PeerEntry<S>,
+        block: &avila_consensus::block::Block,
+        prepared: Option<&avila_consensus::chainstate::PreparedBlock>,
+        cs: &mut Chainstate,
+        now: u32,
+        announce_tip: &mut Option<u64>,
+        mempool: &mut avila_mempool::Mempool,
+        events: &mut Vec<NetEvent>,
+        dead: &mut Vec<(u64, DisconnectReason)>,
+        recent_deliveries: &mut std::collections::VecDeque<(avila_consensus::hash::BlockHash, u64)>,
+    ) {
+        peer.last_block_time = Some(i64::from(now));
+        // A delivery — even a late one poached by reassignment — proves the
+        // peer answers; the stall counter resets.
+        peer.stall_releases = 0;
+        let hash = block.block_hash();
+        // Deferred script failures surface blocks later and must not blame the
+        // peer that merely triggered the drain.
+        recent_deliveries.push_back((hash, id));
+        if recent_deliveries.len() > 2048 {
+            recent_deliveries.pop_front();
+        }
+        let result = if let Some(prepared) = prepared {
+            peer.sync.on_prepared_block(cs, prepared, now)
+        } else {
+            peer.sync.on_block(cs, block, now)
+        };
+        match result {
+            Ok(outcome) => {
+                peer.last_useful = Instant::now();
+                if let Some(avila_consensus::chainstate::Acceptance::Connected { height, .. }) =
+                    outcome.acceptance
+                {
+                    peer.synced_block_height = i64::from(height);
+                }
+                // Verified effects only: a speculative connect returns
+                // `Connected` with script checks still in flight. Mempool,
+                // tip, and relay effects wait for the checked frontier.
+                let checked = cs.take_checked();
+                let mut checked_tip = None;
+                for (height, hash) in &checked {
+                    if let Some(body) = cs.body(hash) {
+                        mempool.on_block_connected(&body, *height);
+                    }
+                    checked_tip = Some(*height);
+                }
+                if let Some(avila_consensus::chainstate::Acceptance::Connected {
+                    reorged, ..
+                }) = outcome.acceptance
+                {
+                    if reorged {
+                        let gone = cs.take_disconnected();
+                        mempool.refill_from_disconnected(&gone, cs, now, true, usize::MAX);
+                    }
+                    if let Some(height) = checked_tip {
+                        events.push(NetEvent::TipAdvanced(height));
+                        *announce_tip = Some(id);
+                    }
+                }
+            }
+            Err(e) => match cs.take_spec_failed() {
+                Some(bad) => {
+                    if let Some((_, who)) = recent_deliveries.iter().find(|(h, _)| *h == bad) {
+                        eprintln!("block {bad} failed deferred script checks — blaming its sender");
+                        dead.push((*who, DisconnectReason::Misbehavior(e.to_string())));
+                    }
+                }
+                None => dead.push((id, DisconnectReason::Misbehavior(e.to_string()))),
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn dispatch(
         id: u64,
         peer: &mut PeerEntry<S>,
@@ -2770,6 +3213,7 @@ impl<S: Read + Write> PeerManager<S> {
         compact_enabled: bool,
         compact_serve: bool,
         blocks_only: bool,
+        swift_block_capture: bool,
         send_feefilter: u64,
     ) {
         match event {
@@ -2783,6 +3227,7 @@ impl<S: Read + Write> PeerManager<S> {
                     start_height: 0,
                     user_agent: String::new(),
                     relay: false,
+                    blockspentcoinsv1: false,
                     wtxid_relay: false,
                     addrv2: false,
                     recon: None,
@@ -2857,7 +3302,10 @@ impl<S: Read + Write> PeerManager<S> {
                                 let _ = peer.session.send(&next);
                             }
                         }
-                        if !outcome.fetchable.is_empty() {
+                        // Swift mode has one authoritative pinned scheduler
+                        // in `fill_queues`; this per-page fast path would
+                        // reserve bodies beyond the configured checkpoint.
+                        if !swift_block_capture && !outcome.fetchable.is_empty() {
                             let offer =
                                 &outcome.fetchable[..outcome.fetchable.len().min(*global_free)];
                             // Sidecar requests ride at header-accept
@@ -2904,16 +3352,22 @@ impl<S: Read + Write> PeerManager<S> {
                 // `net.blocks_only` — block invs still fetch; tx items
                 // are stripped before the scheduler ever sees them.
                 let filtered_vec;
-                let filtered: &[crate::message::InvVector] = if blocks_only {
+                let filtered: &[crate::message::InvVector] = if blocks_only || swift_block_capture {
                     filtered_vec = invs
                         .iter()
                         .filter(|i| {
-                            !matches!(
+                            let is_tx = matches!(
                                 i.inv_type,
                                 crate::message::InvType::Tx
                                     | crate::message::InvType::WitnessTx
                                     | crate::message::InvType::Wtx
-                            )
+                            );
+                            let is_block = matches!(
+                                i.inv_type,
+                                crate::message::InvType::Block
+                                    | crate::message::InvType::WitnessBlock
+                            );
+                            (!blocks_only || !is_tx) && (!swift_block_capture || !is_block)
                         })
                         .cloned()
                         .collect::<Vec<_>>();
@@ -2937,94 +3391,34 @@ impl<S: Read + Write> PeerManager<S> {
                     let _ = peer.session.send(&req);
                 }
             }
-            SessionEvent::Message(Message::Block(block)) => {
-                peer.last_block_time = Some(i64::from(now));
-                // A delivery — even a late one poached by reassignment —
-                // proves the peer answers; the stall counter resets.
-                peer.stall_releases = 0;
-                // Journal who delivered this hash — a deferred script
-                // failure surfaces blocks later and must not blame the
-                // peer that merely triggered the drain.
-                recent_deliveries.push_back((block.block_hash(), id));
-                if recent_deliveries.len() > 2048 {
-                    recent_deliveries.pop_front();
-                }
-                match peer.sync.on_block(cs, &block, now) {
-                    Ok(outcome) => {
-                        peer.last_useful = Instant::now();
-                        if let Some(avila_consensus::chainstate::Acceptance::Connected {
-                            height,
-                            ..
-                        }) = outcome.acceptance
-                        {
-                            peer.synced_block_height = i64::from(height);
-                        }
-                        // Verified effects only: a speculative connect
-                        // returns `Connected` with script checks still
-                        // in flight — the mempool feed, tip event, and
-                        // relay announcement wait for `take_checked`,
-                        // which yields a block only after its checks
-                        // actually passed.
-                        let checked = cs.take_checked();
-                        let mut checked_tip = None;
-                        for (h, hash) in &checked {
-                            if let Some(body) = cs.body(hash) {
-                                mempool.on_block_connected(&body, *h);
-                            }
-                            checked_tip = Some(*h);
-                        }
-                        if let Some(avila_consensus::chainstate::Acceptance::Connected {
-                            reorged,
-                            ..
-                        }) = outcome.acceptance
-                        {
-                            if reorged {
-                                // The disconnected branch's txs are
-                                // unconfirmed again — re-admit them
-                                // fork-adjacent block first (Core's
-                                // DisconnectedBlockTransactions reverse
-                                // drain, parent before child).
-                                let gone = cs.take_disconnected();
-                                mempool.refill_from_disconnected(&gone, cs, now, true, usize::MAX);
-                            }
-                            // The tip event and relay announcement fire
-                            // only when the *checked* frontier moved —
-                            // a purely speculative connect publishes
-                            // nothing.
-                            if let Some(h) = checked_tip {
-                                events.push(NetEvent::TipAdvanced(h));
-                                *announce_tip = Some(id);
-                            }
-                        }
-                        // The tick fill pass re-feeds this peer's queue.
-                    }
-                    Err(e) => {
-                        // A deferred script failure names the guilty
-                        // block — blame its recorded sender, not the
-                        // peer whose delivery happened to surface it.
-                        // When the sender is unknown (journal rotated
-                        // out), punish nobody: the block is marked
-                        // invalid either way.
-                        match cs.take_spec_failed() {
-                            Some(bad) => {
-                                // Deferred failure: blame the bad
-                                // block's recorded sender; if the
-                                // journal rotated it out, punish the
-                                // innocent triggerer not at all — the
-                                // block stays marked invalid either way.
-                                if let Some((_, who)) =
-                                    recent_deliveries.iter().find(|(h, _)| *h == bad)
-                                {
-                                    eprintln!(
-                                        "block {bad} failed deferred script checks — blaming its sender"
-                                    );
-                                    dead.push((*who, DisconnectReason::Misbehavior(e.to_string())));
-                                }
-                            }
-                            None => dead.push((id, DisconnectReason::Misbehavior(e.to_string()))),
-                        }
-                    }
-                }
+            SessionEvent::Message(Message::Block(block)) => Self::dispatch_block(
+                id,
+                peer,
+                &block,
+                None,
+                cs,
+                now,
+                announce_tip,
+                mempool,
+                events,
+                dead,
+                recent_deliveries,
+            ),
+            SessionEvent::PreparedBlock(prepared) => Self::dispatch_block(
+                id,
+                peer,
+                prepared.block(),
+                Some(&prepared),
+                cs,
+                now,
+                announce_tip,
+                mempool,
+                events,
+                dead,
+                recent_deliveries,
+            ),
+            SessionEvent::RawBlock(_) => {
+                unreachable!("raw block frames are handled by PeerManager::tick")
             }
             SessionEvent::Message(Message::SendHeaders) => {
                 peer.wants_headers_announce = true;
@@ -3092,6 +3486,7 @@ impl<S: Read + Write> PeerManager<S> {
                                 compact_enabled,
                                 compact_serve,
                                 blocks_only,
+                                swift_block_capture,
                                 send_feefilter,
                             );
                         }
@@ -3198,6 +3593,7 @@ impl<S: Read + Write> PeerManager<S> {
                                 compact_enabled,
                                 compact_serve,
                                 blocks_only,
+                                swift_block_capture,
                                 send_feefilter,
                             );
                         }
@@ -3747,6 +4143,59 @@ impl<S: Read + Write> PeerManager<S> {
             SessionEvent::Message(Message::FeeFilter(rate)) => {
                 // BIP-133 — the peer's minimum feerate gates its invs.
                 peer.min_fee = rate;
+            }
+            SessionEvent::Message(Message::Unknown { command, payload })
+                if command == crate::swift_spent::SPENT_COMMAND =>
+            {
+                if !peer
+                    .session
+                    .peer()
+                    .is_some_and(|info| info.blockspentcoinsv1)
+                {
+                    dead.push((
+                        id,
+                        DisconnectReason::Misbehavior(
+                            "bspent from peer without blockspentcoinsv1".into(),
+                        ),
+                    ));
+                    return;
+                }
+                match peer.spent_requests.accept(&payload) {
+                    Ok(response) => {
+                        peer.spent_requests.remove(&response.block_hash);
+                        peer.last_useful = Instant::now();
+                        events.push(NetEvent::SpentCoins { peer: id, response });
+                    }
+                    Err(crate::swift_spent::SpentCoinsError::ResourceLimit) => {
+                        if let Ok(hash_bytes) =
+                            <[u8; 32]>::try_from(payload.get(..32).unwrap_or(&[]))
+                        {
+                            let block_hash = BlockHash::from_bytes(hash_bytes);
+                            if peer.spent_requests.remove(&block_hash) {
+                                events.push(NetEvent::SpentCoinsFallback {
+                                    peer: id,
+                                    block_hash,
+                                });
+                            } else {
+                                dead.push((
+                                    id,
+                                    DisconnectReason::Misbehavior(
+                                        "unrequested bspent response".into(),
+                                    ),
+                                ));
+                            }
+                        } else {
+                            dead.push((
+                                id,
+                                DisconnectReason::Misbehavior("truncated bspent response".into()),
+                            ));
+                        }
+                    }
+                    Err(error) => dead.push((
+                        id,
+                        DisconnectReason::Misbehavior(format!("invalid bspent response: {error}")),
+                    )),
+                }
             }
             SessionEvent::Message(_) => {}
         }
@@ -4898,6 +5347,248 @@ mod tests {
         testpipe::inject(peer, MAGIC, &Message::Verack);
         events.extend(mgr.tick(cs, NOW));
         events
+    }
+
+    #[test]
+    fn negotiated_bspent_request_and_response_cross_managed_session() {
+        let (mut mgr, mut peer, id) = managed_peer();
+        let mut cs = testchain::regtest();
+        mgr.set_swift_spent_requests(true);
+
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer, MAGIC);
+        testpipe::inject(&mut peer, MAGIC, &Message::Version(peer_version(0)));
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer, MAGIC);
+        testpipe::inject(
+            &mut peer,
+            MAGIC,
+            &Message::Feature {
+                id: crate::swift_spent::FEATURE_NAME.to_string(),
+                data: crate::swift_spent::FEATURE_DATA_V1.to_vec(),
+            },
+        );
+        testpipe::inject(&mut peer, MAGIC, &Message::Verack);
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, NetEvent::Connected { peer, .. } if *peer == id))
+        );
+        testpipe::drain(&mut peer, MAGIC);
+
+        let block_hash = BlockHash::from_bytes([0x74; 32]);
+        let request = crate::swift_spent::GetSpentCoins {
+            block_hash,
+            cutoff: 0,
+        };
+        mgr.request_spent_coins(id, request, &[0, 2]).unwrap();
+        mgr.tick(&mut cs, NOW);
+        let sent = testpipe::drain(&mut peer, MAGIC);
+        let request_payload = sent
+            .iter()
+            .find_map(|message| match message {
+                Message::Unknown { command, payload }
+                    if command == crate::swift_spent::GET_SPENT_COMMAND =>
+                {
+                    Some(payload.as_slice())
+                }
+                _ => None,
+            })
+            .expect("getbspent request");
+        assert_eq!(
+            crate::swift_spent::decode_request(request_payload).unwrap(),
+            request
+        );
+
+        let response = crate::swift_spent::SpentCoins {
+            block_hash,
+            coins: vec![
+                crate::swift_spent::SpentCoin {
+                    input_index: 0,
+                    coin: avila_consensus::connect::Coin {
+                        out: avila_consensus::transaction::TxOut {
+                            value: 50_000,
+                            script_pubkey: avila_consensus::transaction::Script::new(vec![0x51]),
+                        },
+                        height: 4,
+                        coinbase: false,
+                    },
+                },
+                crate::swift_spent::SpentCoin {
+                    input_index: 2,
+                    coin: avila_consensus::connect::Coin {
+                        out: avila_consensus::transaction::TxOut {
+                            value: 60_000,
+                            script_pubkey: avila_consensus::transaction::Script::new(vec![0x52]),
+                        },
+                        height: 5,
+                        coinbase: true,
+                    },
+                },
+            ],
+        };
+        testpipe::inject(
+            &mut peer,
+            MAGIC,
+            &Message::Unknown {
+                command: crate::swift_spent::SPENT_COMMAND.to_string(),
+                payload: crate::swift_spent::encode_response(&response).unwrap(),
+            },
+        );
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(events.iter().any(|event| matches!(event, NetEvent::SpentCoins { peer, response: got } if *peer == id && got == &response)));
+        assert!(mgr.request_spent_coins(id, request, &[0, 2]).is_ok());
+    }
+
+    #[test]
+    fn negotiated_bspent_request_and_response_cross_real_v1_socket() {
+        use std::io::{Read, Write};
+
+        fn write_message(stream: &mut std::net::TcpStream, message: &Message) {
+            let command = crate::codec::Command::new(message.command_name()).unwrap();
+            stream
+                .write_all(&crate::codec::encode_frame(
+                    MAGIC,
+                    command,
+                    &message.encode(),
+                ))
+                .unwrap();
+        }
+
+        fn read_messages(
+            stream: &mut std::net::TcpStream,
+            decoder: &mut crate::codec::FrameDecoder,
+        ) -> Vec<Message> {
+            let mut buffer = [0; 8192];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => decoder.feed(&buffer[..read]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("read v1 peer socket: {error}"),
+                }
+            }
+            let mut messages = Vec::new();
+            while let Some((command, payload)) = decoder.next_frame().unwrap() {
+                messages.push(Message::decode(&command, &payload).unwrap());
+            }
+            messages
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        // The request is only a few dozen bytes. With Nagle enabled on
+        // both ends, a preceding handshake frame can be delayed behind the
+        // receiver's ACK timer, making a tight `yield_now` polling loop
+        // expire before the frame reaches this socket.
+        client.set_nodelay(true).unwrap();
+        server.set_nodelay(true).unwrap();
+        client.set_nonblocking(true).unwrap();
+        server.set_nonblocking(true).unwrap();
+        let session = PeerSession::initiate(
+            client,
+            MAGIC,
+            build_version(82, 0, NetAddr::unspecified(), i64::from(NOW)),
+            BUDGET,
+        )
+        .unwrap();
+        let mut manager = PeerManager::<std::net::TcpStream>::new(2);
+        manager.set_swift_spent_requests(true);
+        let peer_id = manager.add_outbound(session).unwrap();
+        let mut chainstate = testchain::regtest();
+        let mut decoder = crate::codec::FrameDecoder::new(MAGIC);
+
+        manager.tick(&mut chainstate, NOW);
+        let first = read_messages(&mut server, &mut decoder);
+        assert!(matches!(first.as_slice(), [Message::Version(_)]));
+        write_message(&mut server, &Message::Version(peer_version(0)));
+        write_message(
+            &mut server,
+            &Message::Feature {
+                id: crate::swift_spent::FEATURE_NAME.to_string(),
+                data: crate::swift_spent::FEATURE_DATA_V1.to_vec(),
+            },
+        );
+        write_message(&mut server, &Message::Verack);
+        let events = manager.tick(&mut chainstate, NOW);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, NetEvent::Connected { peer, .. } if *peer == peer_id))
+        );
+        let _ = read_messages(&mut server, &mut decoder);
+
+        let block_hash = BlockHash::from_bytes([0x75; 32]);
+        let request = crate::swift_spent::GetSpentCoins {
+            block_hash,
+            cutoff: 250_000,
+        };
+        manager
+            .request_spent_coins(peer_id, request, &[1, 7])
+            .unwrap();
+        let mut request_payload = None;
+        let request_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < request_deadline {
+            manager.tick(&mut chainstate, NOW);
+            let sent = read_messages(&mut server, &mut decoder);
+            request_payload = sent.into_iter().find_map(|message| match message {
+                Message::Unknown { command, payload }
+                    if command == crate::swift_spent::GET_SPENT_COMMAND =>
+                {
+                    Some(payload)
+                }
+                _ => None,
+            });
+            if request_payload.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let request_payload = request_payload.expect("getbspent frame over TCP");
+        assert_eq!(
+            crate::swift_spent::decode_request(&request_payload).unwrap(),
+            request
+        );
+
+        let response = crate::swift_spent::SpentCoins {
+            block_hash,
+            coins: vec![
+                crate::swift_spent::SpentCoin {
+                    input_index: 1,
+                    coin: avila_consensus::connect::Coin {
+                        out: avila_consensus::transaction::TxOut {
+                            value: 125_000,
+                            script_pubkey: avila_consensus::transaction::Script::new(vec![0x51]),
+                        },
+                        height: 249_999,
+                        coinbase: false,
+                    },
+                },
+                crate::swift_spent::SpentCoin {
+                    input_index: 7,
+                    coin: avila_consensus::connect::Coin {
+                        out: avila_consensus::transaction::TxOut {
+                            value: 175_000,
+                            script_pubkey: avila_consensus::transaction::Script::new(vec![0x52]),
+                        },
+                        height: 249_000,
+                        coinbase: true,
+                    },
+                },
+            ],
+        };
+        write_message(
+            &mut server,
+            &Message::Unknown {
+                command: crate::swift_spent::SPENT_COMMAND.to_string(),
+                payload: crate::swift_spent::encode_response(&response).unwrap(),
+            },
+        );
+        let events = manager.tick(&mut chainstate, NOW);
+        assert!(events.iter().any(|event| matches!(event, NetEvent::SpentCoins { peer, response: got } if *peer == peer_id && got == &response)));
     }
 
     #[test]
@@ -6065,6 +6756,203 @@ mod tests {
         }
         let admitted = mgr.drain_inbounds();
         assert_eq!(admitted.len(), 1, "port 6666 refused by the hook");
+    }
+
+    #[test]
+    fn loopback_tcp_block_uses_bounded_preparation_then_connects() {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ours = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (theirs, _) = listener.accept().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        theirs.set_nonblocking(true).unwrap();
+        let raw_writer = theirs.try_clone().unwrap();
+        let our_session = PeerSession::initiate(
+            ours,
+            MAGIC,
+            build_version(1, 0, NetAddr::unspecified(), i64::from(NOW)),
+            BUDGET,
+        )
+        .unwrap();
+        let mut remote = PeerSession::accept(
+            theirs,
+            MAGIC,
+            build_version(9, 0, NetAddr::unspecified(), i64::from(NOW)),
+            BUDGET,
+        );
+        let mut mgr = PeerManager::<TcpStream>::new_with_block_preparation(8, true);
+        let peer_id = mgr.add_outbound(our_session).expect("outbound TCP session");
+        let mut cs = regtest();
+
+        for _ in 0..8 {
+            let _ = mgr.tick(&mut cs, NOW);
+            remote.poll().unwrap();
+        }
+        assert!(mgr.peer_snapshots().iter().any(|p| p.established));
+
+        let block = testchain::chain_blocks(&cs, 1).remove(0);
+        let expected = block.block_hash();
+        remote.send(&Message::Block(block)).unwrap();
+        for _ in 0..500 {
+            remote.poll().unwrap(); // flushes the actual TCP frame
+            let _ = mgr.tick(&mut cs, NOW);
+            if cs.tip_hash() == expected {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            cs.tip_hash(),
+            expected,
+            "prepared block connects on loopback"
+        );
+
+        let command = crate::codec::Command::new("block").unwrap();
+        let malformed = crate::codec::encode_frame(MAGIC, command, &[0]);
+        (&raw_writer).write_all(&malformed).unwrap();
+        let mut attributed_disconnect = false;
+        for _ in 0..500 {
+            let events = mgr.tick(&mut cs, NOW);
+            attributed_disconnect |= events.iter().any(|event| {
+                matches!(event, NetEvent::Disconnected {
+                    peer,
+                    reason: DisconnectReason::Session(reason),
+                } if *peer == peer_id && reason.contains("block"))
+            });
+            if attributed_disconnect {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            attributed_disconnect,
+            "malformed raw block remains attributed to its TCP peer"
+        );
+    }
+
+    #[test]
+    fn explicit_swift_capture_releases_reservation_without_advancing_chainstate() {
+        let (mut mgr, mut peer, peer_id) = managed_peer();
+        mgr.set_swift_spent_requests(true);
+        mgr.set_swift_block_capture(true);
+        let mut cs = regtest();
+        let block = testchain::chain_blocks(&cs, 1).remove(0);
+        let block_hash = block.block_hash();
+        cs.accept_header(&block.header, NOW).unwrap();
+        // A full-check engine starts after its genesis boundary, so the
+        // acquisition cursor requests h1 rather than the unavailable
+        // regtest genesis body.
+        mgr.set_swift_fetch_window(
+            Some((1, block_hash)),
+            Some((0, cs.tree().params().genesis_header.hash())),
+        );
+        mgr.tick(&mut cs, NOW);
+        assert!(matches!(
+            testpipe::drain(&mut peer, MAGIC).first(),
+            Some(Message::Version(_))
+        ));
+        testpipe::inject(&mut peer, MAGIC, &Message::Version(peer_version(600)));
+        mgr.tick(&mut cs, NOW);
+        testpipe::drain(&mut peer, MAGIC);
+        testpipe::inject(
+            &mut peer,
+            MAGIC,
+            &Message::Feature {
+                id: crate::swift_spent::FEATURE_NAME.to_string(),
+                data: crate::swift_spent::FEATURE_DATA_V1.to_vec(),
+            },
+        );
+        testpipe::inject(&mut peer, MAGIC, &Message::Verack);
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NetEvent::Connected { peer, .. } if *peer == peer_id
+        )));
+        // `fill_queues` reserves the body after dispatch; the next tick
+        // flushes that newly queued getdata frame to the scripted peer.
+        mgr.tick(&mut cs, NOW);
+        let snapshot = &mgr.peer_snapshots()[0];
+        assert!(
+            snapshot.blockspentcoinsv1,
+            "BIP455 must be negotiated before the pinned block request"
+        );
+        let requested = testpipe::drain(&mut peer, MAGIC);
+        assert!(
+            requested.iter().any(|message| matches!(
+                message,
+                Message::GetData(vectors)
+                    if vectors.iter().any(|vector| vector.hash == block_hash)
+            )),
+            "qualified peer must be asked for the pinned block: {requested:?}; in_flight={:?}, header_height={}, connected_height={}",
+            snapshot.in_flight_hashes,
+            snapshot.synced_header_height,
+            snapshot.synced_block_height,
+        );
+        assert!(
+            mgr.peer_snapshots()[0]
+                .in_flight_hashes
+                .contains(&block_hash)
+        );
+        let reservations_before_capture = mgr.peer_snapshots()[0].in_flight_hashes.clone();
+
+        testpipe::inject(&mut peer, MAGIC, &Message::Block(block.clone()));
+        let events = mgr.tick(&mut cs, NOW);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NetEvent::SwiftBlock { peer, block }
+                if *peer == peer_id && block.block_hash() == block_hash
+        )));
+        assert_eq!(cs.tip_hash(), cs.tree().params().genesis_header.hash());
+        // The regtest genesis body is absent, so the normal scheduler may
+        // retain an unrelated genesis reservation. The captured block's
+        // reservation itself must be released.
+        assert!(
+            !mgr.peer_snapshots()[0]
+                .in_flight_hashes
+                .contains(&block_hash),
+            "captured block {block_hash} must no longer be reserved; remaining {:?}",
+            mgr.peer_snapshots()[0].in_flight_hashes
+        );
+        let mut expected_reservations = reservations_before_capture;
+        expected_reservations.retain(|hash| *hash != block_hash);
+        assert_eq!(
+            mgr.peer_snapshots()[0].in_flight_hashes,
+            expected_reservations,
+            "capturing h1 should release its reservation without changing unrelated ones"
+        );
+        assert!(!cs.have_body(&block_hash));
+
+        // Repeated announcements while the external validator still holds
+        // the body must not bypass the pinned fetch scheduler or request it
+        // again through either headers-first or inv-driven paths.
+        testpipe::inject(&mut peer, MAGIC, &Message::Headers(vec![block.header]));
+        testpipe::inject(
+            &mut peer,
+            MAGIC,
+            &Message::Inv(vec![InvVector {
+                inv_type: crate::message::InvType::WitnessBlock,
+                hash: block_hash,
+            }]),
+        );
+        for _ in 0..3 {
+            mgr.tick(&mut cs, NOW);
+            let sent = testpipe::drain(&mut peer, MAGIC);
+            assert!(
+                !sent.iter().any(|message| matches!(message,
+                    Message::GetData(vectors)
+                        if vectors.iter().any(|vector| vector.hash == block_hash)
+                )),
+                "externally held body must not be requested again: {sent:?}"
+            );
+            assert!(
+                !mgr.peer_snapshots()[0]
+                    .in_flight_hashes
+                    .contains(&block_hash)
+            );
+        }
+        assert_eq!(cs.tip_hash(), cs.tree().params().genesis_header.hash());
+        assert!(!cs.have_body(&block_hash));
     }
 
     #[test]

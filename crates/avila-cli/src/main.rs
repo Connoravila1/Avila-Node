@@ -263,6 +263,26 @@ enum Command {
         /// --advice-dir — the supplying half of the paired-node flow.
         #[arg(long)]
         advice_collect: bool,
+        /// Opt into provisional full-check Swift IBD through this checkpoint.
+        /// Requires the draft BIP456 hints file, a BIP455-capable peer, and a
+        /// separate empty --swift-data-dir. Otherwise sync falls back to the
+        /// ordinary genesis-validation path.
+        #[arg(long)]
+        swift_checkpoint_height: Option<u32>,
+        /// Expected active-chain hash at --swift-checkpoint-height.
+        #[arg(long)]
+        swift_checkpoint_hash: Option<String>,
+        /// Locally acquired draft BIP456 v0 hints file.
+        #[arg(long)]
+        swift_hints: Option<PathBuf>,
+        /// Private Swift audit workspace (must be separate from
+        /// --swift-data-dir).
+        #[arg(long)]
+        swift_workspace: Option<PathBuf>,
+        /// New, empty conventional datadir for atomic promotion. This avoids
+        /// running the experiment against the configured live datadir.
+        #[arg(long)]
+        swift_data_dir: Option<PathBuf>,
     },
     /// Call a JSON-RPC method on a running daemon — the bitcoin-cli
     /// analog. Positional params are parsed as raw JSON values, falling
@@ -1105,6 +1125,11 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
             flat_utxo_mib,
             advice_dir,
             advice_collect,
+            swift_checkpoint_height,
+            swift_checkpoint_hash,
+            swift_hints,
+            swift_workspace,
+            swift_data_dir,
         } => {
             use avila_consensus::params::Network as ConsensusNet;
             let network = config.get().network;
@@ -1130,7 +1155,9 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 proxy: proxy.or(c.privacy.proxy),
                 asmap_path: asmap.or(c.net.asmap.clone()),
                 cell_bytes: cell_bytes.unwrap_or(c.privacy.cell_bytes),
-                data_dir: store.then(|| config.network_data_dir()),
+                data_dir: swift_data_dir
+                    .clone()
+                    .or_else(|| store.then(|| config.network_data_dir())),
                 dbcache: c
                     .storage
                     .dbcache_mb
@@ -1211,9 +1238,47 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                 "Syncing {network} (target height {blocks}, {} peers max)...",
                 cfg.max_peers
             );
+            let supplied = [
+                swift_checkpoint_height.is_some(),
+                swift_checkpoint_hash.is_some(),
+                swift_hints.is_some(),
+                swift_workspace.is_some(),
+            ];
+            let swift_options = if supplied.iter().any(|value| *value) {
+                if !supplied.iter().all(|value| *value) {
+                    return Err("Swift IBD requires --swift-checkpoint-height, --swift-checkpoint-hash, --swift-hints, and --swift-workspace together".into());
+                }
+                if swift_data_dir.is_none() {
+                    return Err("Swift IBD requires a separate --swift-data-dir; the configured live datadir is never used for promotion".into());
+                }
+                if !store {
+                    return Err(
+                        "Swift IBD requires persistent promotion; do not pass --no-store".into(),
+                    );
+                }
+                let checkpoint_hash = swift_checkpoint_hash
+                    .as_deref()
+                    .ok_or("missing Swift checkpoint hash")?
+                    .parse::<avila_consensus::hash::BlockHash>()
+                    .map_err(|error| format!("invalid Swift checkpoint hash: {error}"))?;
+                Some(avila_node::swift_ibd::SwiftIbdOptions {
+                    checkpoint_height: swift_checkpoint_height
+                        .ok_or("missing Swift checkpoint height")?,
+                    checkpoint_hash,
+                    hints_path: swift_hints.ok_or("missing Swift hints file")?,
+                    workspace: swift_workspace.ok_or("missing Swift workspace")?,
+                })
+            } else {
+                if swift_data_dir.is_some() {
+                    return Err(
+                        "--swift-data-dir requires all Swift checkpoint and hints options".into(),
+                    );
+                }
+                None
+            };
             let mut last = (u32::MAX, u32::MAX);
             let mut last_print = Instant::now() - Duration::from_secs(2);
-            let report = run_sync(&params, &cfg, move |p| {
+            let progress = move |p: &SyncProgress| {
                 let cur = (p.header_height, p.connected_height);
                 if cur != last && last_print.elapsed() >= Duration::from_secs(1) {
                     println!(
@@ -1228,7 +1293,13 @@ fn execute(args: Args) -> Result<(), Box<dyn Error>> {
                     last = cur;
                     last_print = Instant::now();
                 }
-            })?;
+            };
+            let report = match swift_options {
+                Some(options) => {
+                    avila_node::sync::run_with_swift(&params, &cfg, options, progress)?
+                }
+                None => run_sync(&params, &cfg, progress)?,
+            };
             println!(
                 "Done: connected {} blocks (headers {}), tip {}, {} peers established, {:.1}s{}",
                 report.connected_height,

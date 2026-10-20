@@ -741,6 +741,154 @@ pub enum SyncError {
     SnapshotValidation(#[from] avila_consensus::connect::ConnectError),
 }
 
+fn validate_swift_sync_options(
+    params: &Params,
+    cfg: &SyncConfig,
+    options: &crate::swift_ibd::SwiftIbdOptions,
+) -> Result<(), SyncError> {
+    let Some(data_dir) = cfg.data_dir.as_ref() else {
+        return Err(SyncError::Config(
+            "Swift IBD requires a new conventional --data-dir for final promotion".into(),
+        ));
+    };
+    if cfg.persist
+        || cfg.target_height < options.checkpoint_height
+        || options.checkpoint_height == 0
+        || options.checkpoint_hash == avila_consensus::hash::BlockHash::ZERO
+        || params.assume_valid.is_some()
+        || cfg.prune_bytes.is_some()
+        || cfg.txindex
+        || cfg.blockfilterindex
+        || cfg.electrum.is_some()
+        || cfg.utreexo
+        || cfg.utreexo_bridge
+        || cfg.flat_utxo_bytes.is_some()
+        || cfg.advice_dir.is_some()
+        || cfg.advice_collect
+    {
+        return Err(SyncError::Config(
+            "Swift IBD requires a bounded run, assumevalid=0, target at/after checkpoint, and no indexes, pruning, or Utreexo sidecar".into(),
+        ));
+    }
+    let workspace = options
+        .workspace
+        .canonicalize()
+        .or_else(|_| {
+            std::fs::create_dir_all(&options.workspace).map(|()| options.workspace.clone())
+        })
+        .map_err(SyncError::Store)?;
+    let target = if data_dir.exists() {
+        data_dir.canonicalize().map_err(SyncError::Store)?
+    } else {
+        data_dir
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .canonicalize()
+            .map_err(SyncError::Store)?
+            .join(data_dir.file_name().ok_or_else(|| {
+                SyncError::Config("Swift IBD data directory has no final path component".into())
+            })?)
+    };
+    if target == workspace || target.starts_with(&workspace) || workspace.starts_with(&target) {
+        return Err(SyncError::Config(
+            "Swift IBD workspace and promoted datadir must be separate trees".into(),
+        ));
+    }
+    if data_dir.exists()
+        && std::fs::read_dir(data_dir)
+            .map_err(SyncError::Store)?
+            .next()
+            .is_some()
+    {
+        return Err(SyncError::Config(
+            "Swift IBD promotion requires an empty, dedicated final datadir".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reopen_ordinary_from_swift_headers(
+    params: &Params,
+    cfg: &SyncConfig,
+    source: &Chainstate,
+    now: u32,
+) -> Result<Chainstate, SyncError> {
+    let mut ordinary = match &cfg.data_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).map_err(SyncError::Store)?;
+            Chainstate::with_store_coinsdb(
+                dir,
+                params,
+                now,
+                cfg.dbcache
+                    .unwrap_or(avila_consensus::connect::DEFAULT_CACHE_BUDGET),
+            )
+            .map_err(SyncError::Store)?
+        }
+        None => Chainstate::new(params),
+    };
+    for hash in source.tree().best_chain().iter().skip(1) {
+        let header = source
+            .tree()
+            .get(hash)
+            .ok_or_else(|| SyncError::Config("Swift header source lost active header".into()))?
+            .header;
+        ordinary.accept_header(&header, now).map_err(|error| {
+            SyncError::Config(format!("cannot replay Swift source headers: {error}"))
+        })?;
+    }
+    ordinary.enable_speculative_connect();
+    Ok(ordinary)
+}
+
+fn promote_swift_checkpoint(
+    source: &mut Chainstate,
+    driver: &mut Option<crate::swift_ibd::SwiftIbdDriver>,
+    params: &Params,
+    cfg: &SyncConfig,
+    now: u32,
+) -> Result<(), String> {
+    let snapshot = driver
+        .take()
+        .ok_or_else(|| "Swift driver missing at checkpoint".to_string())?
+        .into_snapshot()
+        .map_err(|error| error.to_string())?;
+    let target = cfg
+        .data_dir
+        .as_ref()
+        .ok_or_else(|| "Swift promotion requires a datadir".to_string())?;
+    avila_consensus::chainstate::Chainstate::promote_audited_swift_snapshot(
+        target,
+        params,
+        now,
+        cfg.dbcache
+            .unwrap_or(avila_consensus::connect::DEFAULT_CACHE_BUDGET),
+        &snapshot,
+    )
+    .map_err(|error| format!("Swift promotion failed: {error}"))?;
+    let mut promoted = Chainstate::with_store_coinsdb(
+        target,
+        params,
+        now,
+        cfg.dbcache
+            .unwrap_or(avila_consensus::connect::DEFAULT_CACHE_BUDGET),
+    )
+    .map_err(|error| format!("cannot reopen promoted Swift chainstate: {error}"))?;
+    let active = source.tree().best_chain();
+    for hash in active.iter().skip(snapshot.height() as usize + 1) {
+        let header = source
+            .tree()
+            .get(hash)
+            .ok_or_else(|| "Swift source lost a post-checkpoint header".to_string())?
+            .header;
+        promoted
+            .accept_header(&header, now)
+            .map_err(|error| format!("post-checkpoint header replay failed: {error}"))?;
+    }
+    *source = promoted;
+    Ok(())
+}
+
 fn unix_now() -> u32 {
     // `GetTime`: honors `setmocktime` so acceptance and scheduler
     // timestamps stay on the mocked clock, like Core.
@@ -791,6 +939,9 @@ const ECLIPSE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// this throttle is a UI cadence, not a consensus- or protocol-visible
 /// timestamp.
 const NEXT_BLOCK_REBUILD_INTERVAL: Duration = Duration::from_secs(10);
+/// Allow configured peers time to finish the BIP455 feature handshake before
+/// abandoning an explicitly requested Swift attempt for ordinary IBD.
+const SWIFT_PROVIDER_DISCOVERY_GRACE: Duration = Duration::from_secs(5);
 
 /// Re-verify `n` random connected blocks' internal proofs; returns the
 /// failure count. Heights are sampled by a seeded xorshift — the audit
@@ -825,6 +976,32 @@ pub fn run(
     cfg: &SyncConfig,
     progress: impl FnMut(&SyncProgress) + Send + 'static,
 ) -> Result<SyncReport, SyncError> {
+    run_inner(params, cfg, None, progress)
+}
+
+/// Runs an explicitly configured, pinned Swift full-check IBD attempt, falling
+/// back to ordinary genesis validation whenever no qualified BIP455 provider or
+/// local resource budget is available.
+pub fn run_with_swift(
+    params: &Params,
+    cfg: &SyncConfig,
+    options: crate::swift_ibd::SwiftIbdOptions,
+    progress: impl FnMut(&SyncProgress) + Send + 'static,
+) -> Result<SyncReport, SyncError> {
+    let mut full_check_params = *params;
+    full_check_params.assume_valid = None;
+    run_inner(&full_check_params, cfg, Some(options), progress)
+}
+
+fn run_inner(
+    params: &Params,
+    cfg: &SyncConfig,
+    swift_options: Option<crate::swift_ibd::SwiftIbdOptions>,
+    progress: impl FnMut(&SyncProgress) + Send + 'static,
+) -> Result<SyncReport, SyncError> {
+    if let Some(options) = &swift_options {
+        validate_swift_sync_options(params, cfg, options)?;
+    }
     // Process-level sandboxing (queue #11): `no_new_privs` before any
     // network work — a compromised process can never gain privileges
     // through execve of a setuid/file-capability binary. The node
@@ -889,16 +1066,34 @@ pub fn run(
             publish(phase);
         }) as Box<dyn FnMut(avila_consensus::chainstate::ProgressEvent) + Send>
     };
-    let mut cs = match &cfg.data_dir {
-        Some(dir) => {
-            std::fs::create_dir_all(dir).map_err(SyncError::Store)?;
-            let dbcache = cfg
-                .dbcache
-                .unwrap_or(avila_consensus::connect::DEFAULT_CACHE_BUDGET);
-            Chainstate::with_store_coinsdb_progress(dir, params, unix_now(), dbcache, Some(sink))
+    let swift_header_dir = swift_options
+        .as_ref()
+        .map(|options| options.workspace.join("header-source"));
+    let mut cs = if let Some(dir) = swift_header_dir.as_ref() {
+        std::fs::create_dir_all(dir).map_err(SyncError::Store)?;
+        let dbcache = cfg
+            .dbcache
+            .unwrap_or(avila_consensus::connect::DEFAULT_CACHE_BUDGET);
+        Chainstate::with_store_coinsdb(dir, params, unix_now(), dbcache)
+            .map_err(SyncError::Store)?
+    } else {
+        match &cfg.data_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir).map_err(SyncError::Store)?;
+                let dbcache = cfg
+                    .dbcache
+                    .unwrap_or(avila_consensus::connect::DEFAULT_CACHE_BUDGET);
+                Chainstate::with_store_coinsdb_progress(
+                    dir,
+                    params,
+                    unix_now(),
+                    dbcache,
+                    Some(sink),
+                )
                 .map_err(SyncError::Store)?
+            }
+            None => Chainstate::new(params),
         }
-        None => Chainstate::new(params),
     };
     if let Some(cap) = cfg.flat_utxo_bytes {
         if cs.enable_flat_utxo(cap) {
@@ -998,6 +1193,35 @@ pub fn run(
     // The index we just enabled is what makes BIP157 serving
     // legitimate — advertise NODE_COMPACT_FILTERS only then.
     mgr.set_serve_filters(cfg.blockfilterindex && cfg.peerblockfilters);
+    let mut swift_driver = None;
+    let mut swift_active = false;
+    let mut swift_provider_deadline = None;
+    if let Some(options) = swift_options.as_ref() {
+        mgr.set_swift_spent_requests(true);
+        mgr.set_swift_block_capture(true);
+        mgr.set_swift_fetch_window(
+            Some((options.checkpoint_height, options.checkpoint_hash)),
+            Some((0, params.genesis_header.hash())),
+        );
+        match crate::swift_ibd::SwiftIbdDriver::open(options, *params, &cs, unix_now()) {
+            Ok(driver) => {
+                swift_driver = Some(driver);
+                swift_active = true;
+                swift_provider_deadline = Some(Instant::now() + SWIFT_PROVIDER_DISCOVERY_GRACE);
+                eprintln!(
+                    "swift-ibd: provisional full-check enabled through height {} hash {}",
+                    options.checkpoint_height, options.checkpoint_hash
+                );
+            }
+            Err(error) => {
+                eprintln!("swift-ibd: {error}; falling back to ordinary full validation");
+                cs = reopen_ordinary_from_swift_headers(params, cfg, &cs, unix_now())?;
+                mgr.set_swift_block_capture(false);
+                mgr.set_swift_spent_requests(false);
+                mgr.set_swift_fetch_window(None, None);
+            }
+        }
+    }
     if let Some(b) = cfg.maxmempool_bytes {
         mgr.set_max_mempool_bytes(b);
     }
@@ -1081,8 +1305,17 @@ pub fn run(
     // network data dir; `avila-node events --follow` tails it. An
     // unwritable sink demotes events to stderr-only — diagnostics,
     // not a startup failure.
-    let mut stream = cfg
-        .data_dir
+    // Keep the final datadir empty until its audited Swift snapshot is
+    // atomically promoted. During the provisional attempt, diagnostics live
+    // under the private workspace instead.
+    let event_dir = swift_options
+        .as_ref()
+        .map(|options| options.workspace.clone())
+        .or_else(|| cfg.data_dir.clone());
+    // Peer and mempool caches also write files. Keep all provisional-run
+    // auxiliary state out of the empty directory reserved for promotion.
+    let runtime_dir = event_dir.clone();
+    let mut stream = event_dir
         .as_deref()
         .map(crate::events::EventStream::open)
         .transpose()
@@ -1746,7 +1979,7 @@ pub fn run(
 
     // peers.dat — restart keeps learned candidates; a corrupt file just
     // costs us gossip history, so load errors are ignored by design.
-    if let Some(dir) = &cfg.data_dir {
+    if let Some(dir) = &runtime_dir {
         let _ = mgr.addrbook().load(&dir.join("peers.dat"), unix_now());
         // banlist.json — Core's LoadBanlist: operator bans survive
         // restarts; a corrupt file just costs the list.
@@ -1981,6 +2214,7 @@ pub fn run(
             }
         }
         let mut tip_moved = false;
+        let mut swift_fallback_reason = None;
         for event in mgr.tick_net(&mut cs, unix_now(), params.message_start, 0) {
             {
                 let (kind, fields) = crate::events::net_event_json(&event);
@@ -1990,8 +2224,96 @@ pub fn run(
                 tip_moved = true;
             }
             match event {
-                NetEvent::Connected { .. } => established_total += 1,
+                NetEvent::Connected { .. } => {
+                    established_total += 1;
+                }
                 NetEvent::Disconnected { .. } => disconnects += 1,
+                NetEvent::SwiftBlock { peer, block } if swift_active => {
+                    let result = (|| -> Result<(), String> {
+                        let driver = swift_driver.as_mut().ok_or("Swift driver missing")?;
+                        driver
+                            .sync_headers(cs.tree(), unix_now())
+                            .map_err(|error| error.to_string())?;
+                        match driver
+                            .begin_block(peer, *block, unix_now())
+                            .map_err(|error| error.to_string())?
+                        {
+                            crate::swift_ibd::SwiftBlockStart::NeedsSpentCoins {
+                                request,
+                                input_indices,
+                            } => mgr
+                                .request_spent_coins(peer, request, &input_indices)
+                                .map_err(|error| error.to_string()),
+                            crate::swift_ibd::SwiftBlockStart::Processed(progress) => {
+                                mgr.complete_swift_block(progress.hash);
+                                let target =
+                                    swift_options.as_ref().ok_or("Swift options missing")?;
+                                mgr.set_swift_fetch_window(
+                                    Some((target.checkpoint_height, target.checkpoint_hash)),
+                                    Some(driver.tip()),
+                                );
+                                if progress.checkpoint_reached {
+                                    promote_swift_checkpoint(
+                                        &mut cs,
+                                        &mut swift_driver,
+                                        params,
+                                        cfg,
+                                        unix_now(),
+                                    )?;
+                                    swift_active = false;
+                                    mgr.set_swift_block_capture(false);
+                                    mgr.set_swift_spent_requests(false);
+                                    mgr.set_swift_fetch_window(None, None);
+                                }
+                                Ok(())
+                            }
+                        }
+                    })();
+                    if let Err(error) = result {
+                        swift_fallback_reason = Some(error);
+                    }
+                }
+                NetEvent::SpentCoins { peer, response } if swift_active => {
+                    let result = (|| -> Result<(), String> {
+                        let driver = swift_driver.as_mut().ok_or("Swift driver missing")?;
+                        let progress = driver
+                            .accept_spent_coins(peer, response, unix_now())
+                            .map_err(|error| error.to_string())?;
+                        mgr.complete_swift_block(progress.hash);
+                        let (height, hash) = driver.tip();
+                        let target = swift_options.as_ref().ok_or("Swift options missing")?;
+                        mgr.set_swift_fetch_window(
+                            Some((target.checkpoint_height, target.checkpoint_hash)),
+                            Some((height, hash)),
+                        );
+                        if progress.checkpoint_reached {
+                            promote_swift_checkpoint(
+                                &mut cs,
+                                &mut swift_driver,
+                                params,
+                                cfg,
+                                unix_now(),
+                            )?;
+                            swift_active = false;
+                            mgr.set_swift_block_capture(false);
+                            mgr.set_swift_spent_requests(false);
+                            mgr.set_swift_fetch_window(None, None);
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        swift_fallback_reason = Some(error);
+                    }
+                }
+                NetEvent::SpentCoinsFallback { block_hash, .. } if swift_active => {
+                    swift_fallback_reason =
+                        Some(format!("spent-coin acquisition failed for {block_hash}"));
+                }
+                NetEvent::SwiftCaptureLimit { block_hash, .. } if swift_active => {
+                    swift_fallback_reason = Some(format!(
+                        "external body queue reached its bound at {block_hash}"
+                    ));
+                }
                 NetEvent::EclipseSuspected(signals) => {
                     eprintln!(
                         "eclipse indicators: {signals:?} — advisory only, cross-check routes"
@@ -2011,6 +2333,27 @@ pub fn run(
                 }
                 _ => {}
             }
+        }
+        if swift_active
+            && swift_provider_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            && !mgr
+                .peer_snapshots()
+                .iter()
+                .any(|peer| peer.blockspentcoinsv1)
+        {
+            swift_fallback_reason = Some(
+                "no peer advertised draft BIP455 blockspentcoinsv1 during provider discovery"
+                    .into(),
+            );
+        }
+        if let Some(reason) = swift_fallback_reason.take() {
+            eprintln!("swift-ibd: {reason}; falling back to ordinary full validation");
+            swift_driver = None;
+            swift_active = false;
+            mgr.set_swift_block_capture(false);
+            mgr.set_swift_spent_requests(false);
+            mgr.set_swift_fetch_window(None, None);
+            cs = reopen_ordinary_from_swift_headers(params, cfg, &cs, unix_now())?;
         }
         // Hook verdicts queue on a channel (the verdict closure runs
         // inside drain_inbounds, not the loop) — drain them into the
@@ -2561,7 +2904,7 @@ pub fn run(
         waiters.shutdown();
     }
 
-    if let Some(dir) = &cfg.data_dir {
+    if let Some(dir) = &runtime_dir {
         cs.flush().map_err(SyncError::Store)?;
         if let Some(keep) = cfg.prune_bytes {
             cs.prune(keep).map_err(SyncError::Store)?;

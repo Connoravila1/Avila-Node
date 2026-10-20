@@ -94,6 +94,10 @@ fn main() -> Result<(), String> {
                 }
                 NetEvent::Announced { .. }
                 | NetEvent::TipAdvanced(_)
+                | NetEvent::SpentCoins { .. }
+                | NetEvent::SpentCoinsFallback { .. }
+                | NetEvent::SwiftBlock { .. }
+                | NetEvent::SwiftCaptureLimit { .. }
                 | NetEvent::ProxyUnreachable
                 | NetEvent::V2Downgraded { .. } => {}
             }

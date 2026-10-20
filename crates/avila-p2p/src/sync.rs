@@ -879,6 +879,58 @@ impl PeerSync {
         }
     }
 
+    /// Completes one block reservation for an external full-check engine
+    /// without passing the body to canonical Chainstate. The caller must
+    /// retain bounded ordering, validate the body, and fall back to ordinary
+    /// sync before exposing any checkpoint if acquisition fails.
+    pub fn on_block_for_external_validation(&mut self, block: &Block) -> BlockOutcome {
+        let hash = block.block_hash();
+        let was_in_flight = self.clear_in_flight(&hash);
+        self.wanted.remove(&hash);
+        // An `inv` burst can park a hash in the per-peer FIFO when this
+        // peer's request window is full. The captured body satisfies that
+        // announcement too; otherwise the manager's end-of-tick backlog
+        // drain immediately re-requests the just-captured block.
+        self.pending_set.remove(&hash);
+        self.pending_blocks.retain(|pending| *pending != hash);
+        self.blocks_received += 1;
+        BlockOutcome {
+            acceptance: None,
+            was_in_flight,
+        }
+    }
+
+    /// Accepts a worker-prepared body through the same reservation and
+    /// contextual chainstate path as [`Self::on_block`]. Only context-free
+    /// checks have already run; all chain-dependent checks remain ordered on
+    /// the manager thread.
+    pub fn on_prepared_block(
+        &mut self,
+        cs: &mut Chainstate,
+        prepared: &avila_consensus::chainstate::PreparedBlock,
+        now: u32,
+    ) -> Result<BlockOutcome, SyncError> {
+        let hash = prepared.block_hash();
+        let was_in_flight = self.clear_in_flight(&hash);
+        self.wanted.remove(&hash);
+        match cs.accept_prepared_block(prepared, now) {
+            Ok(acceptance) => {
+                self.blocks_received += 1;
+                Ok(BlockOutcome {
+                    acceptance: Some(acceptance),
+                    was_in_flight,
+                })
+            }
+            Err(avila_consensus::chainstate::BlockRejection::Header(
+                avila_consensus::chain::ChainError::UnknownParent(_),
+            )) => Ok(BlockOutcome {
+                acceptance: None,
+                was_in_flight,
+            }),
+            Err(rej) => Err(SyncError::InvalidBlock(rej.to_string())),
+        }
+    }
+
     /// A received `tx` releases its in-flight slot (the hash was
     /// requested as the txid via `MSG_WITNESS_TX`).
     pub fn on_tx(&mut self, txid: &avila_consensus::hash::Txid) {

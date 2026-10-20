@@ -26,6 +26,7 @@ pub mod addrman;
 pub mod asmap;
 pub mod banman;
 pub mod bip324;
+mod blockprep;
 pub mod codec;
 pub mod compact;
 pub mod headerssync;
@@ -35,6 +36,7 @@ pub mod proxy;
 pub mod recon;
 pub mod session;
 pub mod sketch;
+pub mod swift_spent;
 pub mod sync;
 
 #[cfg(test)]

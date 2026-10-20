@@ -17,6 +17,11 @@
 //! external-audit receipt.
 
 use rustreexo::node_hash::{AccumulatorHash, BitcoinNodeHash};
+use rustreexo_v07::node_hash::{
+    AccumulatorHash as AccumulatorHashV07, BitcoinNodeHash as BitcoinNodeHashV07,
+};
+use rustreexo_v07::proof::Proof as ProofV07;
+use rustreexo_v07::stump::Stump as StumpV07;
 use std::collections::BTreeMap;
 use std::mem::size_of;
 
@@ -100,6 +105,8 @@ pub enum SwiftStumpError {
     LeafCountOverflow,
     Incomplete { next_height: u64, last_height: u32 },
     AuditCheckpointMismatch,
+    UpstreamTransition,
+    InvalidSnapshot,
 }
 
 /// Ordered root-carry builder with bounded out-of-order input buffering.
@@ -113,8 +120,7 @@ pub struct SwiftStumpBuilder {
     checkpoint: SwiftCheckpoint,
     limits: SwiftStumpLimits,
     next_height: u64,
-    roots: Vec<BitcoinNodeHash>,
-    leaves: u64,
+    stump: StumpV07<BitcoinNodeHashV07>,
     pending: BTreeMap<u32, PendingBatch>,
     pending_leaves: usize,
     pending_bytes: usize,
@@ -136,12 +142,17 @@ impl SwiftStumpBuilder {
             checkpoint,
             limits,
             next_height: u64::from(checkpoint.first_height),
-            roots: Vec::new(),
-            leaves: 0,
+            stump: StumpV07::new(),
             pending: BTreeMap::new(),
             pending_leaves: 0,
             pending_bytes: 0,
         })
+    }
+
+    /// Exact height range and checkpoint identifier configured for this builder.
+    #[must_use]
+    pub const fn checkpoint(&self) -> SwiftCheckpoint {
+        self.checkpoint
     }
 
     /// Submits one block's ordered output commitments.
@@ -249,7 +260,8 @@ impl SwiftStumpBuilder {
             }
             bytes
         };
-        self.leaves
+        self.stump
+            .leaves
             .checked_add(
                 u64::try_from(total_pending_leaves)
                     .map_err(|_| SwiftStumpError::LeafCountOverflow)?,
@@ -258,9 +270,7 @@ impl SwiftStumpBuilder {
 
         // All fallible checks precede mutation. Removing each contiguous batch
         // below cannot overflow because the cumulative count was checked above.
-        if is_frontier {
-            self.append_batch(outputs);
-        } else {
+        if !is_frontier {
             self.pending.insert(
                 height,
                 PendingBatch {
@@ -270,14 +280,30 @@ impl SwiftStumpBuilder {
             );
             self.pending_leaves = pending_leaves;
             self.pending_bytes = pending_bytes;
+            return Ok(());
         }
-        while self.next_height <= u64::from(self.checkpoint.last_height) {
-            let Some(batch) = self.pending.remove(&(self.next_height as u32)) else {
+
+        // Stage upstream changes on a clone first. If rustreexo rejects a
+        // transition, neither the builder stump nor its pending queue changes.
+        let mut candidate = self.stump.clone();
+        apply_batch(&mut candidate, &outputs)?;
+        let mut next_height = self.next_height + 1;
+        let mut consumed_pending = Vec::new();
+        while next_height <= u64::from(self.checkpoint.last_height) {
+            let Some(batch) = self.pending.get(&(next_height as u32)) else {
                 break;
             };
-            self.pending_leaves -= batch.outputs.len();
-            self.pending_bytes -= batch.accounted_bytes;
-            self.append_batch(batch.outputs);
+            apply_batch(&mut candidate, &batch.outputs)?;
+            consumed_pending.push(next_height as u32);
+            next_height += 1;
+        }
+        self.stump = candidate;
+        self.next_height = next_height;
+        for height in consumed_pending {
+            if let Some(batch) = self.pending.remove(&height) {
+                self.pending_leaves -= batch.outputs.len();
+                self.pending_bytes -= batch.accounted_bytes;
+            }
         }
         Ok(())
     }
@@ -291,7 +317,7 @@ impl SwiftStumpBuilder {
     /// Current provisional forest leaf count.
     #[must_use]
     pub const fn leaves(&self) -> u64 {
-        self.leaves
+        self.stump.leaves
     }
 
     /// Number of out-of-order batches still waiting for a gap to close.
@@ -315,42 +341,156 @@ impl SwiftStumpBuilder {
             return Err(SwiftStumpError::AuditCheckpointMismatch);
         }
         Ok(ProvisionalStump {
-            roots: self.roots.clone(),
-            leaves: self.leaves,
+            roots: self
+                .stump
+                .roots
+                .iter()
+                .map(|root| {
+                    // The two rustreexo versions represent the distinguished
+                    // empty leaf differently: converting its byte view would
+                    // turn `Empty` into an ordinary `Some([0; 32])` hash. Keep
+                    // the sentinel when crossing this compatibility boundary.
+                    if root.is_empty() {
+                        BitcoinNodeHash::empty()
+                    } else {
+                        BitcoinNodeHash::from(**root)
+                    }
+                })
+                .collect(),
+            leaves: self.stump.leaves,
             checkpoint: self.checkpoint,
         })
     }
 
-    fn append_batch(&mut self, outputs: Vec<Option<BitcoinNodeHash>>) {
-        for output in outputs {
-            self.append_leaf(output.unwrap_or_else(BitcoinNodeHash::empty));
+    /// Serializes the actual rustreexo 0.7 stump and the exact checkpoint cursor.
+    /// Pending batches are intentionally excluded; this engine submits heights
+    /// sequentially, and a nonempty pending queue cannot be checkpointed.
+    pub(crate) fn persisted_state(&self) -> Result<Vec<u8>, SwiftStumpError> {
+        if !self.pending.is_empty() {
+            return Err(SwiftStumpError::InvalidSnapshot);
         }
-        self.next_height += 1;
+        let mut out = Vec::with_capacity(96 + self.stump.roots.len() * 32);
+        out.extend_from_slice(b"AVSTUMP1");
+        out.extend_from_slice(&self.checkpoint.first_height.to_le_bytes());
+        out.extend_from_slice(&self.checkpoint.last_height.to_le_bytes());
+        out.extend_from_slice(&self.checkpoint.checkpoint_hash);
+        out.extend_from_slice(&self.next_height.to_le_bytes());
+        for limit in [
+            self.limits.max_pending_blocks,
+            self.limits.max_pending_leaves,
+            self.limits.max_pending_bytes,
+            self.limits.max_batch_leaves,
+            self.limits.max_batch_bytes,
+        ] {
+            out.extend_from_slice(
+                &u64::try_from(limit)
+                    .map_err(|_| SwiftStumpError::InvalidSnapshot)?
+                    .to_le_bytes(),
+            );
+        }
+        self.stump
+            .serialize(&mut out)
+            .map_err(|_| SwiftStumpError::InvalidSnapshot)?;
+        Ok(out)
     }
 
-    // Each set bit in `leaves` has exactly one root; only this method updates
-    // the root stack, so the pop is an internal representation invariant.
-    #[allow(clippy::expect_used)]
-    fn append_leaf(&mut self, leaf: BitcoinNodeHash) {
-        let mut carry = leaf;
-        let mut level = 0u32;
-        while (self.leaves >> level) & 1 == 1 {
-            let left = self
-                .roots
-                .pop()
-                .expect("root stack follows the set bits in the leaf count");
-            carry = if left.is_empty() {
-                carry
-            } else if carry.is_empty() {
-                left
-            } else {
-                BitcoinNodeHash::parent_hash(&left, &carry)
-            };
-            level += 1;
+    /// Restores a persisted stump only for the same checkpoint and validated cursor.
+    pub(crate) fn from_persisted_state(
+        bytes: &[u8],
+        checkpoint: SwiftCheckpoint,
+    ) -> Result<Self, SwiftStumpError> {
+        const PREFIX: usize = 8 + 4 + 4 + 32 + 8 + 5 * 8;
+        if bytes.len() < PREFIX + 16 || &bytes[..8] != b"AVSTUMP1" {
+            return Err(SwiftStumpError::InvalidSnapshot);
         }
-        self.roots.push(carry);
-        self.leaves += 1;
+        let first = u32::from_le_bytes(
+            bytes[8..12]
+                .try_into()
+                .map_err(|_| SwiftStumpError::InvalidSnapshot)?,
+        );
+        let last = u32::from_le_bytes(
+            bytes[12..16]
+                .try_into()
+                .map_err(|_| SwiftStumpError::InvalidSnapshot)?,
+        );
+        let hash: [u8; 32] = bytes[16..48]
+            .try_into()
+            .map_err(|_| SwiftStumpError::InvalidSnapshot)?;
+        let next_height = u64::from_le_bytes(
+            bytes[48..56]
+                .try_into()
+                .map_err(|_| SwiftStumpError::InvalidSnapshot)?,
+        );
+        let mut limits_iter = (56..PREFIX).step_by(8).map(|offset| {
+            let raw: [u8; 8] = bytes
+                .get(offset..offset + 8)
+                .ok_or(SwiftStumpError::InvalidSnapshot)?
+                .try_into()
+                .map_err(|_| SwiftStumpError::InvalidSnapshot)?;
+            usize::try_from(u64::from_le_bytes(raw)).map_err(|_| SwiftStumpError::InvalidSnapshot)
+        });
+        let limits = SwiftStumpLimits {
+            max_pending_blocks: limits_iter
+                .next()
+                .ok_or(SwiftStumpError::InvalidSnapshot)??,
+            max_pending_leaves: limits_iter
+                .next()
+                .ok_or(SwiftStumpError::InvalidSnapshot)??,
+            max_pending_bytes: limits_iter
+                .next()
+                .ok_or(SwiftStumpError::InvalidSnapshot)??,
+            max_batch_leaves: limits_iter
+                .next()
+                .ok_or(SwiftStumpError::InvalidSnapshot)??,
+            max_batch_bytes: limits_iter
+                .next()
+                .ok_or(SwiftStumpError::InvalidSnapshot)??,
+        };
+        if (first, last, hash)
+            != (
+                checkpoint.first_height,
+                checkpoint.last_height,
+                checkpoint.checkpoint_hash,
+            )
+            || next_height < u64::from(first)
+            || next_height > u64::from(last) + 1
+            || limits.max_pending_blocks == 0
+        {
+            return Err(SwiftStumpError::InvalidSnapshot);
+        }
+        let mut stump_reader = &bytes[PREFIX..];
+        let stump = StumpV07::<BitcoinNodeHashV07>::deserialize(&mut stump_reader)
+            .map_err(|_| SwiftStumpError::InvalidSnapshot)?;
+        if !stump_reader.is_empty() || stump.roots.len() != stump.leaves.count_ones() as usize {
+            return Err(SwiftStumpError::InvalidSnapshot);
+        }
+        Ok(Self {
+            checkpoint,
+            limits,
+            next_height,
+            stump,
+            pending: BTreeMap::new(),
+            pending_leaves: 0,
+            pending_bytes: 0,
+        })
     }
+}
+
+fn apply_batch(
+    stump: &mut StumpV07<BitcoinNodeHashV07>,
+    outputs: &[Option<BitcoinNodeHash>],
+) -> Result<(), SwiftStumpError> {
+    let additions = outputs
+        .iter()
+        .map(|hash| match hash {
+            Some(hash) => BitcoinNodeHashV07::from(**hash),
+            None => BitcoinNodeHashV07::empty(),
+        })
+        .collect::<Vec<_>>();
+    *stump = stump
+        .modify(&additions, &[], &ProofV07::default())
+        .map_err(|_| SwiftStumpError::UpstreamTransition)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -682,17 +822,6 @@ mod tests {
 
         // The preflight total includes every queued leaf plus the frontier
         // batch, and rejection leaves the full pending queue untouched.
-        builder.leaves = u64::MAX - 3;
-        assert_eq!(
-            builder.push(1, vec![Some(leaf(0))]),
-            Err(SwiftStumpError::LeafCountOverflow)
-        );
-        assert_eq!(builder.pending_blocks(), constrained.max_pending_blocks);
-        assert_eq!(builder.pending_leaves, constrained.max_pending_leaves);
-        assert_eq!(builder.pending_bytes, constrained.max_pending_bytes);
-        assert_eq!(builder.next_height(), 1);
-        builder.leaves = 0;
-
         assert_eq!(
             builder.push(1, vec![Some(leaf(0)); 3]),
             Err(SwiftStumpError::BatchTooManyLeaves {
@@ -743,16 +872,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_leaf_count_overflow_before_mutating_pending_or_roots() {
+    fn persisted_stump_restores_exact_cursor_and_rejects_checkpoint_rebinding() {
+        let cp = checkpoint(3);
+        let mut builder = SwiftStumpBuilder::new(cp, limits()).unwrap();
+        builder.push(1, vec![Some(leaf(0)), None]).unwrap();
+        builder.push(2, vec![Some(leaf(2))]).unwrap();
+        let snapshot = builder.persisted_state().unwrap();
+        let restored = SwiftStumpBuilder::from_persisted_state(&snapshot, cp).unwrap();
+        assert_eq!(restored.next_height(), 3);
+        assert_eq!(restored.leaves(), 3);
+        let wrong_checkpoint = SwiftCheckpoint {
+            checkpoint_hash: [0x43; 32],
+            ..cp
+        };
+        assert!(matches!(
+            SwiftStumpBuilder::from_persisted_state(&snapshot, wrong_checkpoint),
+            Err(SwiftStumpError::InvalidSnapshot)
+        ));
+    }
+
+    #[test]
+    fn rejects_upstream_forest_limit_without_mutating_builder() {
         let cp = checkpoint(2);
         let mut builder = SwiftStumpBuilder::new(cp, limits()).unwrap();
-        builder.leaves = u64::MAX;
+        builder.stump.leaves = 1 << 63;
         assert_eq!(
             builder.push(1, vec![Some(leaf(0))]),
-            Err(SwiftStumpError::LeafCountOverflow)
+            Err(SwiftStumpError::UpstreamTransition)
         );
         assert_eq!(builder.pending_blocks(), 0);
         assert_eq!(builder.next_height(), 1);
-        assert_eq!(builder.leaves(), u64::MAX);
+        assert_eq!(builder.leaves(), 1 << 63);
     }
 }

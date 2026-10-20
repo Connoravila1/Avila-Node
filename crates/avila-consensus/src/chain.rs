@@ -543,7 +543,10 @@ impl HeaderTree {
     /// descendants (a children-index walk, mirroring [`HeaderTree::mark_invalid`]'s
     /// propagation instead of a full-tree scan), then on every ancestor (the `pprev`
     /// walk, unavoidably O(depth) — clearing ancestors is inherently a walk up).
-    /// Other descendants of a flagged ancestor stay failed, matching Core.
+    /// Other descendants of a flagged ancestor stay failed, matching Core. Finally
+    /// restore the best-header tip if clearing the marks made a higher-work branch valid
+    /// again; otherwise a persisted snapshot could name a lower-work tip than its header
+    /// index contains.
     pub(crate) fn clear_invalid_subtree(&mut self, hash: &BlockHash) {
         let Some(target) = self.nodes.get(hash) else {
             return;
@@ -563,6 +566,19 @@ impl HeaderTree {
         }
         for h in to_clear {
             self.invalid.remove(&h);
+        }
+        let mut best = (!self.invalid.contains(&self.tip)).then_some(self.tip);
+        let mut best_work = best
+            .and_then(|hash| self.nodes.get(&hash))
+            .map_or(Work::ZERO, |node| node.chainwork);
+        for (candidate, node) in &self.nodes {
+            if !self.invalid.contains(candidate) && node.chainwork > best_work {
+                best = Some(*candidate);
+                best_work = node.chainwork;
+            }
+        }
+        if let Some(best) = best {
+            self.tip = best;
         }
     }
 
@@ -1160,6 +1176,7 @@ mod tests {
         assert!(!tree.is_failed(&d1.hash()));
         assert!(!tree.is_failed(&d2.hash()));
         assert!(!tree.is_failed(&d3.hash()));
+        assert_eq!(tree.tip_hash(), d3.hash());
 
         // The same 4th header is now accepted.
         assert_eq!(

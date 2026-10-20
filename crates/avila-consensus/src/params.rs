@@ -12,6 +12,16 @@ use std::str::FromStr;
 use crate::arith::{CompactTarget, Target, U256, Work};
 use crate::hash::{BlockHash, MerkleRoot};
 use crate::header::BlockHeader;
+use sha2::{Digest, Sha256};
+
+fn append_count(out: &mut Vec<u8>, count: usize) {
+    out.extend_from_slice(&(count as u64).to_le_bytes());
+}
+
+fn append_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    append_count(out, bytes.len());
+    out.extend_from_slice(bytes);
+}
 
 /// The four Bitcoin networks this crate carries parameters for (Core's `CBaseChainParams`
 /// network names: `"main"`, `"testnet4"`, `"signet"`, `"regtest"`; obsolete testnet3 is
@@ -580,6 +590,123 @@ pub struct Params {
 }
 
 impl Params {
+    /// Stable commitment to every field in this parameter set.
+    ///
+    /// Swift full-check always normalizes `assume_valid` to `None` before calling this
+    /// method. The explicit field-by-field encoding is versioned and intentionally has no
+    /// wildcard destructure: adding a `Params` field requires updating this commitment.
+    #[must_use]
+    pub fn swift_validation_commitment(&self) -> [u8; 32] {
+        let Params {
+            network,
+            pow_limit,
+            pow_target_spacing,
+            pow_target_timespan,
+            allow_min_difficulty_blocks,
+            enforce_bip94,
+            no_retargeting,
+            signet_blocks,
+            signet_challenge,
+            minimum_chain_work,
+            assume_valid,
+            message_start,
+            default_port,
+            dns_seeds,
+            base58_pubkey_prefix,
+            base58_script_prefix,
+            base58_secret_prefix,
+            base58_ext_pubkey_prefix,
+            base58_ext_secret_prefix,
+            bech32_hrp,
+            bip34_height,
+            bip66_height,
+            bip65_height,
+            csv_height,
+            segwit_height,
+            taproot_height,
+            subsidy_halving_interval,
+            bip34_hash,
+            script_flag_exceptions,
+            rule_change_activation_threshold,
+            bip9_deployments,
+            assumeutxo_data,
+            genesis_header,
+        } = *self;
+
+        let mut encoded = Vec::with_capacity(512);
+        encoded.extend_from_slice(b"Avila Swift validation Params v1\0");
+        encoded.push(match network {
+            Network::Mainnet => 0,
+            Network::Testnet4 => 1,
+            Network::Signet => 2,
+            Network::Regtest => 3,
+        });
+        encoded.extend_from_slice(&pow_limit.0.to_be_bytes());
+        encoded.extend_from_slice(&pow_target_spacing.to_le_bytes());
+        encoded.extend_from_slice(&pow_target_timespan.to_le_bytes());
+        encoded.push(u8::from(allow_min_difficulty_blocks));
+        encoded.push(u8::from(enforce_bip94));
+        encoded.push(u8::from(no_retargeting));
+        encoded.push(u8::from(signet_blocks));
+        append_bytes(&mut encoded, signet_challenge);
+        encoded.extend_from_slice(&minimum_chain_work.0.to_be_bytes());
+        match assume_valid {
+            Some(hash) => {
+                encoded.push(1);
+                encoded.extend_from_slice(hash.as_bytes());
+            }
+            None => encoded.push(0),
+        }
+        encoded.extend_from_slice(&message_start);
+        encoded.extend_from_slice(&default_port.to_le_bytes());
+        append_count(&mut encoded, dns_seeds.len());
+        for seed in dns_seeds {
+            append_bytes(&mut encoded, seed.as_bytes());
+        }
+        encoded.push(base58_pubkey_prefix);
+        encoded.push(base58_script_prefix);
+        encoded.push(base58_secret_prefix);
+        encoded.extend_from_slice(&base58_ext_pubkey_prefix);
+        encoded.extend_from_slice(&base58_ext_secret_prefix);
+        append_bytes(&mut encoded, bech32_hrp.as_bytes());
+        encoded.extend_from_slice(&bip34_height.to_le_bytes());
+        encoded.extend_from_slice(&bip66_height.to_le_bytes());
+        encoded.extend_from_slice(&bip65_height.to_le_bytes());
+        encoded.extend_from_slice(&csv_height.to_le_bytes());
+        encoded.extend_from_slice(&segwit_height.to_le_bytes());
+        encoded.extend_from_slice(&taproot_height.to_le_bytes());
+        encoded.extend_from_slice(&subsidy_halving_interval.to_le_bytes());
+        match bip34_hash {
+            Some(hash) => {
+                encoded.push(1);
+                encoded.extend_from_slice(hash.as_bytes());
+            }
+            None => encoded.push(0),
+        }
+        append_count(&mut encoded, script_flag_exceptions.len());
+        for (hash, flags) in script_flag_exceptions {
+            encoded.extend_from_slice(hash.as_bytes());
+            encoded.extend_from_slice(&flags.to_le_bytes());
+        }
+        encoded.extend_from_slice(&rule_change_activation_threshold.to_le_bytes());
+        for deployment in bip9_deployments {
+            append_bytes(&mut encoded, deployment.name.as_bytes());
+            encoded.extend_from_slice(&deployment.bit.to_le_bytes());
+            encoded.extend_from_slice(&deployment.start_time.to_le_bytes());
+            encoded.extend_from_slice(&deployment.timeout.to_le_bytes());
+            encoded.extend_from_slice(&deployment.min_activation_height.to_le_bytes());
+        }
+        append_count(&mut encoded, assumeutxo_data.len());
+        for entry in assumeutxo_data {
+            encoded.extend_from_slice(&entry.height.to_le_bytes());
+            append_bytes(&mut encoded, entry.hash_serialized.as_bytes());
+            encoded.extend_from_slice(&entry.n_chain_tx.to_le_bytes());
+            append_bytes(&mut encoded, entry.blockhash.as_bytes());
+        }
+        encoded.extend_from_slice(&genesis_header.encode());
+        Sha256::digest(encoded).into()
+    }
+
     /// The genesis block — `genesis_header` over the single coinbase
     /// transaction Core's `CreateGenesisBlock` produces: every network
     /// shares the `push(486604799) << push(4) << push(msg)` scriptSig

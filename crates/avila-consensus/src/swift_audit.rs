@@ -15,13 +15,17 @@ use crate::params::Network;
 use crate::swiftsync::TagAgg;
 use crate::transaction::OutPoint;
 
-/// Maximum records accepted for one bounded checkpoint window, counting outputs and input
-/// coins together. Sessions cannot be merged independently.
-pub const MAX_AUDIT_RECORDS: u64 = 100_000_000;
+/// Maximum keyed-commitment operations accepted for one bounded checkpoint window. This
+/// includes output/input records plus separately committed survivors and BIP30 overwrites.
+/// Sessions cannot be merged independently.
+pub const MAX_AUDIT_RECORDS: u64 = u64::MAX;
 /// Maximum script length hashed in one record. This bounds work per call.
 pub const MAX_AUDIT_SCRIPT_BYTES: usize = 10_000;
 const HMAC_BLOCK_BYTES: usize = 64;
 const COIN_DOMAIN: &[u8] = b"Avila SwiftAudit coin commitment v1\0";
+const STATE_DOMAIN: &[u8] = b"Avila SwiftAudit persistent state v1\0";
+const STATE_MAGIC: &[u8; 8] = b"AVSAUD01";
+const STATE_VERSION: u32 = 1;
 
 /// Whether an output was claimed to be spent by the selected checkpoint.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,6 +52,8 @@ pub struct AuditReport {
     pub outputs: u64,
     /// Number of outputs claimed to survive the checkpoint.
     pub survivors: u64,
+    /// Number of locally recognized BIP30-overwritten output incarnations.
+    pub overwritten_outputs: u64,
     /// Number of observed input-coin records.
     pub input_coins: u64,
     /// Aggregate comparison result.
@@ -55,26 +61,35 @@ pub struct AuditReport {
 }
 
 /// A bounded failure from a shadow audit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AuditError {
     /// OS-provided entropy could not be read.
+    #[error("OS randomness unavailable for the Swift audit key")]
     RandomnessUnavailable,
     /// An output or input coin script exceeds the per-record work bound.
+    #[error("Swift audit coin script exceeds the per-record bound")]
     ScriptTooLarge,
     /// The session record cap was reached.
+    #[error("Swift audit record budget exhausted")]
     RecordLimitExceeded,
     /// Internal count arithmetic overflowed.
+    #[error("Swift audit counter overflow")]
     CounterOverflow,
+    /// A failed audit session cannot be serialized or resumed.
+    #[error("failed Swift audit session")]
+    FailedSession,
     /// The finish context differs from the session's checkpoint binding.
+    #[error("Swift audit checkpoint binding mismatch")]
     CheckpointMismatch,
     /// The claimed survivor count exceeds the number of output records.
+    #[error("Swift audit counts are inconsistent")]
     InvalidCounts,
 }
 
 /// One audit session. Its secret key and intermediate aggregates are never exposed.
 ///
 /// Create a session with [`Self::new`], feed all parsed output records and observed input
-/// coins, then consume it with [`Self::finish`]. This is an experimental shadow diagnostic
+/// coins, then compare it with [`Self::finish`]. This is an experimental shadow diagnostic
 /// only and is not a consensus validation result. Dropping the session attempts to wipe its
 /// owned key and aggregate storage; this is best-effort and cannot guarantee erasure of
 /// compiler, CPU, or cryptographic-library copies.
@@ -85,9 +100,13 @@ pub struct SwiftAudit {
     checkpoint_hash: BlockHash,
     output_tags: TagAgg,
     survivor_tags: TagAgg,
+    hint_survivor_tags: TagAgg,
+    overwritten_tags: TagAgg,
     input_tags: TagAgg,
     outputs: u64,
     survivors: u64,
+    hint_survivors: u64,
+    overwritten: u64,
     input_coins: u64,
     records: u64,
     failed: Option<AuditError>,
@@ -116,13 +135,114 @@ impl SwiftAudit {
             checkpoint_hash,
             output_tags: TagAgg::default(),
             survivor_tags: TagAgg::default(),
+            hint_survivor_tags: TagAgg::default(),
+            overwritten_tags: TagAgg::default(),
             input_tags: TagAgg::default(),
             outputs: 0,
             survivors: 0,
+            hint_survivors: 0,
+            overwritten: 0,
             input_coins: 0,
             records: 0,
             failed: None,
         }
+    }
+
+    /// Encodes the secret verifier state for storage in a private local database.
+    /// Callers must keep this blob local, protect its containing file, and commit it
+    /// atomically with the corresponding live-index block transition.
+    pub(crate) fn persisted_state(&self) -> Result<Vec<u8>, AuditError> {
+        if self.failed.is_some() {
+            return Err(AuditError::FailedSession);
+        }
+        let mut out = Vec::with_capacity(321);
+        out.extend_from_slice(STATE_MAGIC);
+        out.extend_from_slice(&STATE_VERSION.to_le_bytes());
+        out.push(network_tag(self.network));
+        out.extend_from_slice(&self.checkpoint_height.to_le_bytes());
+        out.extend_from_slice(self.checkpoint_hash.as_bytes());
+        out.extend_from_slice(&self.key);
+        out.extend_from_slice(&self.output_tags.to_bytes());
+        out.extend_from_slice(&self.survivor_tags.to_bytes());
+        out.extend_from_slice(&self.hint_survivor_tags.to_bytes());
+        out.extend_from_slice(&self.overwritten_tags.to_bytes());
+        out.extend_from_slice(&self.input_tags.to_bytes());
+        for count in [
+            self.outputs,
+            self.survivors,
+            self.hint_survivors,
+            self.overwritten,
+            self.input_coins,
+            self.records,
+        ] {
+            out.extend_from_slice(&count.to_le_bytes());
+        }
+        let checksum = state_checksum(&out);
+        out.extend_from_slice(&checksum);
+        Ok(out)
+    }
+
+    /// Restores a verifier session from private local storage after checking its
+    /// framing, checksum, checkpoint, and bounded counters.
+    pub(crate) fn from_persisted_state(
+        bytes: &[u8],
+        network: Network,
+        checkpoint_height: u32,
+        checkpoint_hash: BlockHash,
+    ) -> Result<Self, AuditError> {
+        const BODY: usize = 289;
+        if bytes.len() != BODY + 32
+            || &bytes[..8] != STATE_MAGIC
+            || u32::from_le_bytes(bytes[8..12].try_into().unwrap_or_default()) != STATE_VERSION
+            || network_from_tag(bytes[12]) != Some(network)
+            || u32::from_le_bytes(bytes[13..17].try_into().unwrap_or_default()) != checkpoint_height
+            || BlockHash::from_bytes(bytes[17..49].try_into().unwrap_or_default())
+                != checkpoint_hash
+            || !ct_eq(&state_checksum(&bytes[..BODY]), &bytes[BODY..])
+        {
+            return Err(AuditError::CheckpointMismatch);
+        }
+        let mut session = Self::empty(network, checkpoint_height, checkpoint_hash);
+        session.key.copy_from_slice(&bytes[49..81]);
+        session.output_tags = TagAgg::from_bytes(bytes[81..113].try_into().unwrap_or_default());
+        session.survivor_tags = TagAgg::from_bytes(bytes[113..145].try_into().unwrap_or_default());
+        session.hint_survivor_tags =
+            TagAgg::from_bytes(bytes[145..177].try_into().unwrap_or_default());
+        session.overwritten_tags =
+            TagAgg::from_bytes(bytes[177..209].try_into().unwrap_or_default());
+        session.input_tags = TagAgg::from_bytes(bytes[209..241].try_into().unwrap_or_default());
+        session.outputs = u64::from_le_bytes(bytes[241..249].try_into().unwrap_or_default());
+        session.survivors = u64::from_le_bytes(bytes[249..257].try_into().unwrap_or_default());
+        session.hint_survivors = u64::from_le_bytes(bytes[257..265].try_into().unwrap_or_default());
+        session.overwritten = u64::from_le_bytes(bytes[265..273].try_into().unwrap_or_default());
+        session.input_coins = u64::from_le_bytes(bytes[273..281].try_into().unwrap_or_default());
+        session.records = u64::from_le_bytes(bytes[281..289].try_into().unwrap_or_default());
+        if session.survivors > session.outputs
+            || session.hint_survivors > session.outputs
+            || session.overwritten > session.outputs
+            || session
+                .survivors
+                .checked_add(session.overwritten)
+                .is_none_or(|excluded| excluded > session.outputs)
+            || session.input_coins > session.records
+        {
+            session.key.zeroize();
+            return Err(AuditError::InvalidCounts);
+        }
+        Ok(session)
+    }
+
+    /// Whether this in-memory audit is bound to the requested checkpoint.
+    #[must_use]
+    pub fn matches_checkpoint(
+        &self,
+        network: Network,
+        checkpoint_height: u32,
+        checkpoint_hash: BlockHash,
+    ) -> bool {
+        self.network as u8 == network as u8
+            && self.checkpoint_height == checkpoint_height
+            && self.checkpoint_hash == checkpoint_hash
     }
 
     /// Injects a deterministic key only in unit tests. The source key is public test data.
@@ -157,11 +277,94 @@ impl SwiftAudit {
         self.output_tags.add(&tag);
         self.outputs += 1;
         if class == OutputClass::SurvivesCheckpoint {
+            self.hint_survivor_tags.add(&tag);
+            self.hint_survivors += 1;
             self.survivor_tags.add(&tag);
             self.survivors += 1;
         }
         tag.zeroize();
         self.records += 1;
+        Ok(())
+    }
+
+    /// Records a locally parsed output and the helper's untrusted checkpoint-survivor bit.
+    /// Finalization compares all such hints against the exact local live set.
+    pub fn record_output_with_hint(
+        &mut self,
+        outpoint: &OutPoint,
+        coin: &Coin,
+        claims_survivor: bool,
+    ) -> Result<(), AuditError> {
+        self.check_record(coin, false, false)?;
+        let mut tag = coin_commitment(
+            &self.key,
+            self.network,
+            self.checkpoint_height,
+            self.checkpoint_hash,
+            outpoint,
+            coin,
+        );
+        self.output_tags.add(&tag);
+        self.outputs += 1;
+        if claims_survivor {
+            self.hint_survivor_tags.add(&tag);
+            self.hint_survivors = self
+                .hint_survivors
+                .checked_add(1)
+                .ok_or(AuditError::CounterOverflow)?;
+        }
+        tag.zeroize();
+        self.records += 1;
+        Ok(())
+    }
+
+    /// Marks one locally parsed output coin as present at the exact checkpoint.
+    pub fn record_survivor(&mut self, outpoint: &OutPoint, coin: &Coin) -> Result<(), AuditError> {
+        self.check_tag_metadata(coin)?;
+        self.reserve_aux_record()?;
+        if self.survivors >= self.outputs || self.survivors.checked_add(1).is_none() {
+            self.failed = Some(AuditError::InvalidCounts);
+            return Err(AuditError::InvalidCounts);
+        }
+        let mut tag = coin_commitment(
+            &self.key,
+            self.network,
+            self.checkpoint_height,
+            self.checkpoint_hash,
+            outpoint,
+            coin,
+        );
+        self.survivor_tags.add(&tag);
+        self.survivors += 1;
+        tag.zeroize();
+        Ok(())
+    }
+
+    /// Excludes a locally observed output incarnation overwritten by a consensus-valid
+    /// BIP30 exception. This is distinct from a transaction input spend, so it is subtracted
+    /// from the output side of the checkpoint aggregate without adding an input record.
+    pub fn record_overwritten_output(
+        &mut self,
+        outpoint: &OutPoint,
+        coin: &Coin,
+    ) -> Result<(), AuditError> {
+        self.check_tag_metadata(coin)?;
+        self.reserve_aux_record()?;
+        if self.overwritten.checked_add(1).is_none() {
+            self.failed = Some(AuditError::CounterOverflow);
+            return Err(AuditError::CounterOverflow);
+        }
+        let mut tag = coin_commitment(
+            &self.key,
+            self.network,
+            self.checkpoint_height,
+            self.checkpoint_hash,
+            outpoint,
+            coin,
+        );
+        self.overwritten_tags.add(&tag);
+        self.overwritten += 1;
+        tag.zeroize();
         Ok(())
     }
 
@@ -189,7 +392,7 @@ impl SwiftAudit {
 
     /// Consumes this session and compares the supplied finish context and aggregate balance.
     pub fn finish(
-        self,
+        &self,
         network: Network,
         checkpoint_height: u32,
         checkpoint_hash: BlockHash,
@@ -206,9 +409,12 @@ impl SwiftAudit {
         let expected_spent = self
             .outputs
             .checked_sub(self.survivors)
+            .and_then(|count| count.checked_sub(self.overwritten))
             .ok_or(AuditError::InvalidCounts)?;
         let mut expected_bytes = self.output_tags.to_bytes();
         let mut survivor_bytes = self.survivor_tags.to_bytes();
+        let mut hint_survivor_bytes = self.hint_survivor_tags.to_bytes();
+        let mut overwritten_bytes = self.overwritten_tags.to_bytes();
         for offset in (0..32).step_by(8) {
             let expected = u64::from_le_bytes(
                 expected_bytes[offset..offset + 8]
@@ -220,11 +426,24 @@ impl SwiftAudit {
                     .try_into()
                     .unwrap_or_default(),
             );
-            expected_bytes[offset..offset + 8]
-                .copy_from_slice(&expected.wrapping_sub(survivor).to_le_bytes());
+            let overwritten = u64::from_le_bytes(
+                overwritten_bytes[offset..offset + 8]
+                    .try_into()
+                    .unwrap_or_default(),
+            );
+            expected_bytes[offset..offset + 8].copy_from_slice(
+                &expected
+                    .wrapping_sub(survivor)
+                    .wrapping_sub(overwritten)
+                    .to_le_bytes(),
+            );
         }
         let mut input_bytes = self.input_tags.to_bytes();
-        let verdict = if expected_spent == self.input_coins && expected_bytes == input_bytes {
+        let verdict = if expected_spent == self.input_coins
+            && expected_bytes == input_bytes
+            && self.hint_survivors == self.survivors
+            && hint_survivor_bytes == survivor_bytes
+        {
             AuditVerdict::Match
         } else {
             AuditVerdict::Mismatch
@@ -232,10 +451,13 @@ impl SwiftAudit {
         // Wipe stack copies of keyed intermediate aggregates before returning counters.
         expected_bytes.zeroize();
         survivor_bytes.zeroize();
+        hint_survivor_bytes.zeroize();
+        overwritten_bytes.zeroize();
         input_bytes.zeroize();
         Ok(AuditReport {
             outputs: self.outputs,
             survivors: self.survivors,
+            overwritten_outputs: self.overwritten,
             input_coins: self.input_coins,
             verdict,
         })
@@ -254,7 +476,7 @@ impl SwiftAudit {
             self.failed = Some(AuditError::ScriptTooLarge);
             return Err(AuditError::ScriptTooLarge);
         }
-        if self.records >= MAX_AUDIT_RECORDS {
+        if self.records == MAX_AUDIT_RECORDS {
             self.failed = Some(AuditError::RecordLimitExceeded);
             return Err(AuditError::RecordLimitExceeded);
         }
@@ -268,6 +490,29 @@ impl SwiftAudit {
         }
         Ok(())
     }
+
+    fn check_tag_metadata(&mut self, coin: &Coin) -> Result<(), AuditError> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        if coin.out.script_pubkey.len() > MAX_AUDIT_SCRIPT_BYTES {
+            self.failed = Some(AuditError::ScriptTooLarge);
+            return Err(AuditError::ScriptTooLarge);
+        }
+        Ok(())
+    }
+
+    fn reserve_aux_record(&mut self) -> Result<(), AuditError> {
+        if self.records == MAX_AUDIT_RECORDS {
+            self.failed = Some(AuditError::RecordLimitExceeded);
+            return Err(AuditError::RecordLimitExceeded);
+        }
+        self.records = self
+            .records
+            .checked_add(1)
+            .ok_or(AuditError::CounterOverflow)?;
+        Ok(())
+    }
 }
 
 impl Drop for SwiftAudit {
@@ -275,6 +520,8 @@ impl Drop for SwiftAudit {
         self.key.zeroize();
         self.output_tags = TagAgg::default();
         self.survivor_tags = TagAgg::default();
+        self.hint_survivor_tags = TagAgg::default();
+        self.overwritten_tags = TagAgg::default();
         self.input_tags = TagAgg::default();
     }
 }
@@ -286,6 +533,34 @@ fn network_tag(network: Network) -> u8 {
         Network::Signet => 2,
         Network::Regtest => 3,
     }
+}
+
+fn network_from_tag(tag: u8) -> Option<Network> {
+    match tag {
+        0 => Some(Network::Mainnet),
+        1 => Some(Network::Testnet4),
+        2 => Some(Network::Signet),
+        3 => Some(Network::Regtest),
+        _ => None,
+    }
+}
+
+fn state_checksum(bytes: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(STATE_DOMAIN);
+    hash.update(bytes);
+    hash.finalize().into()
+}
+
+fn ct_eq(expected: &[u8; 32], actual: &[u8]) -> bool {
+    if actual.len() != 32 {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (left, right) in expected.iter().zip(actual) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }
 
 /// Canonical full-coin keyed commitment, with every variable-length field framed.
@@ -502,6 +777,59 @@ mod tests {
             .unwrap();
         lying_survivor.record_input_coin(&op, &c).unwrap();
         assert_eq!(report(lying_survivor).verdict, AuditVerdict::Mismatch);
+    }
+
+    #[test]
+    fn exact_bip30_overwrite_is_not_counted_as_an_input_spend() {
+        let op = outpoint(0x2a, 0);
+        let old = coin(5_000, &[0x51], 10, true);
+        let new = coin(5_000, &[0x51], 20, true);
+        let mut session = audit();
+        // The helper survivor bit describes the final incarnation. The prior
+        // BIP30 incarnation is intentionally classified as non-surviving;
+        // audit it as an overwrite, not as an input spend.
+        session.record_output_with_hint(&op, &old, false).unwrap();
+        session.record_output_with_hint(&op, &new, true).unwrap();
+        session.record_overwritten_output(&op, &old).unwrap();
+        session.record_survivor(&op, &new).unwrap();
+        let report = report(session);
+        assert_eq!(report.verdict, AuditVerdict::Match);
+        assert_eq!(report.outputs, 2);
+        assert_eq!(report.overwritten_outputs, 1);
+        assert_eq!(report.input_coins, 0);
+    }
+
+    #[test]
+    fn helper_survivor_hints_must_match_exact_live_survivors() {
+        let op = outpoint(0x33, 2);
+        let c = coin(8_000, &[0x51], 19, false);
+        let mut honest = audit();
+        honest.record_output_with_hint(&op, &c, true).unwrap();
+        honest.record_survivor(&op, &c).unwrap();
+        assert_eq!(report(honest).verdict, AuditVerdict::Match);
+
+        let mut lying = audit();
+        lying.record_output_with_hint(&op, &c, false).unwrap();
+        lying.record_survivor(&op, &c).unwrap();
+        assert_eq!(report(lying).verdict, AuditVerdict::Mismatch);
+    }
+
+    #[test]
+    fn persistent_audit_roundtrips_and_rejects_tampering() {
+        let op = outpoint(0x44, 1);
+        let c = coin(9_000, &[0x51, 0x51], 21, false);
+        let mut session = audit();
+        session.record_output_with_hint(&op, &c, true).unwrap();
+        let mut encoded = session.persisted_state().unwrap();
+        let mut resumed =
+            SwiftAudit::from_persisted_state(&encoded, NETWORK, HEIGHT, CHECKPOINT).unwrap();
+        resumed.record_survivor(&op, &c).unwrap();
+        assert_eq!(report(resumed).verdict, AuditVerdict::Match);
+        encoded[90] ^= 1;
+        assert_eq!(
+            SwiftAudit::from_persisted_state(&encoded, NETWORK, HEIGHT, CHECKPOINT).err(),
+            Some(AuditError::CheckpointMismatch)
+        );
     }
 
     #[test]

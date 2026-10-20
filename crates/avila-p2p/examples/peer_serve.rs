@@ -76,6 +76,16 @@ fn pump<S: std::io::Read + std::io::Write>(
                 sync.on_block(cs, &block, now_secs())
                     .map_err(|e| e.to_string())?;
             }
+            SessionEvent::RawBlock(payload) => {
+                let block = avila_p2p::message::decode_block_payload(&payload)
+                    .map_err(|error| error.to_string())?;
+                sync.on_block(cs, &block, now_secs())
+                    .map_err(|error| error.to_string())?;
+            }
+            SessionEvent::PreparedBlock(prepared) => {
+                sync.on_block(cs, prepared.block(), now_secs())
+                    .map_err(|error| error.to_string())?;
+            }
             SessionEvent::Message(Message::GetHeaders(req)) => {
                 let reply = PeerSync::serve_getheaders(cs, &req);
                 session.send(&reply).map_err(|e| e.to_string())?;
@@ -197,6 +207,7 @@ fn main() {
                 for event in events {
                     match event {
                         SessionEvent::Established => println!("handshake complete"),
+                        SessionEvent::RawBlock(_) | SessionEvent::PreparedBlock(_) => {}
                         SessionEvent::Message(Message::GetHeaders(req)) => {
                             let reply = PeerSync::serve_getheaders(&cs, &req);
                             if let Message::Headers(h) = &reply {

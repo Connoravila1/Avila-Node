@@ -16,6 +16,9 @@ mod next_block;
 pub mod rpc;
 pub mod signerproc;
 pub mod sv2;
+#[cfg(test)]
+mod swift_e2e;
+pub mod swift_ibd;
 pub mod sync;
 pub mod time;
 pub mod txfp;

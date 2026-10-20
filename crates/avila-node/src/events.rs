@@ -256,6 +256,26 @@ pub fn net_event_json(event: &avila_p2p::manager::NetEvent) -> (&'static str, se
             serde_json::json!({"peer": peer, "reason": format!("{reason:?}")}),
         ),
         TipAdvanced(height) => ("tip_advanced", serde_json::json!({"height": height})),
+        SpentCoins { peer, response } => (
+            "spent_coins",
+            serde_json::json!({
+                "peer": peer,
+                "block": response.block_hash.to_string(),
+                "coins": response.coins.len(),
+            }),
+        ),
+        SpentCoinsFallback { peer, block_hash } => (
+            "spent_coins_fallback",
+            serde_json::json!({"peer": peer, "block": block_hash.to_string()}),
+        ),
+        SwiftBlock { peer, block } => (
+            "swift_block_body",
+            serde_json::json!({"peer": peer, "block": block.block_hash().to_string()}),
+        ),
+        SwiftCaptureLimit { peer, block_hash } => (
+            "swift_capture_limit",
+            serde_json::json!({"peer": peer, "block": block_hash.to_string()}),
+        ),
         EclipseSuspected(signals) => (
             "eclipse_suspected",
             serde_json::json!({"signals": signals.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>()}),
@@ -481,6 +501,7 @@ mod tests {
                 addrv2: true,
                 recon: None,
                 cmpct: None,
+                blockspentcoinsv1: false,
                 utxproof: false,
                 advice: false,
             }),

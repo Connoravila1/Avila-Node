@@ -505,6 +505,16 @@ impl CoinsBackend {
         Self::open_inner(dir, Some(format), Some(cache_bytes), None)
     }
 
+    /// Opens a redb backend with an explicit compact format and cache budget,
+    /// ignoring process-wide experimental engine selection.
+    pub fn open_redb_tuned(
+        dir: &Path,
+        format: CoinFormat,
+        cache_bytes: usize,
+    ) -> std::io::Result<Self> {
+        Self::open_inner(dir, Some(format), Some(cache_bytes), Some(Engine::Redb))
+    }
+
     /// Opens demanding a specific coins-table engine — the storage
     /// experiment's A/B path. Fresh databases are stamped with it;
     /// existing databases must already carry it.
@@ -1519,6 +1529,169 @@ impl CoinsBackend {
         })
         .collect()
     }
+
+    /// Streams every persisted coin while the redb read transaction is alive.
+    /// Unlike [`Self::iter_coins`], this keeps memory bounded to one decoded
+    /// coin and is suitable for verifying large staged imports.
+    pub fn for_each_coin(
+        &self,
+        mut visit: impl FnMut(OutPoint, Coin) -> std::io::Result<()>,
+    ) -> std::io::Result<u64> {
+        if self.engine != Engine::Redb {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "streaming coin iteration requires redb storage",
+            ));
+        }
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| std::io::Error::other(format!("coinsdb stream begin: {e}")))?;
+        let table = read
+            .open_table(COINS)
+            .map_err(|e| std::io::Error::other(format!("coinsdb stream table: {e}")))?;
+        let mut count = 0u64;
+        for row in table
+            .iter()
+            .map_err(|e| std::io::Error::other(format!("coinsdb stream iterate: {e}")))?
+        {
+            let (key, value) =
+                row.map_err(|e| std::io::Error::other(format!("coinsdb stream row: {e}")))?;
+            let key = key.value();
+            if key.len() != 36 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "coinsdb stream outpoint key has invalid length",
+                ));
+            }
+            let mut txid = [0; 32];
+            txid.copy_from_slice(&key[..32]);
+            let vout = u32::from_le_bytes(key[32..].try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "coinsdb stream outpoint index is invalid",
+                )
+            })?);
+            let coin = decode_coin(value.value(), self.format).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "coinsdb stream coin invalid",
+                )
+            })?;
+            visit(
+                OutPoint {
+                    txid: crate::hash::Txid::from_bytes(txid),
+                    vout,
+                },
+                coin,
+            )?;
+            count = count.checked_add(1).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "coinsdb stream count overflow",
+                )
+            })?;
+        }
+        Ok(count)
+    }
+
+    /// Stream Core's `hash_serialized_3` commitment from the ordered redb
+    /// table without materializing the full UTXO set. The table key stores
+    /// `vout` little-endian, so entries for one txid are contiguous but are
+    /// not necessarily in numeric-vout order; retain and sort only that
+    /// transaction's outputs before feeding `TxOutSer` to the hasher.
+    ///
+    /// This is intended for diagnostics and bounded replay qualification.
+    /// The hash-engine backend has no ordered cursor and is rejected rather
+    /// than silently allocating a full-set sort buffer.
+    pub fn hash_serialized_3(&self) -> std::io::Result<crate::hash::Hash256> {
+        const MAX_OUTPUTS_PER_TX: usize = 500_000;
+
+        if self.hash.is_some() || self.engine() != Engine::Redb {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "streaming hash_serialized_3 requires the redb coins engine",
+            ));
+        }
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| std::io::Error::other(format!("coinsdb hash read transaction: {e}")))?;
+        let table = read
+            .open_table(COINS)
+            .map_err(|e| std::io::Error::other(format!("coinsdb hash open coins table: {e}")))?;
+        let iter = table
+            .iter()
+            .map_err(|e| std::io::Error::other(format!("coinsdb hash scan: {e}")))?;
+
+        let mut sha = crate::hash::Sha256d::new();
+        let mut serial = Vec::with_capacity(128);
+        let mut current_txid: Option<[u8; 32]> = None;
+        let mut outputs: Vec<(u32, Coin)> = Vec::new();
+        let flush = |txid: [u8; 32],
+                     outputs: &mut Vec<(u32, Coin)>,
+                     sha: &mut crate::hash::Sha256d,
+                     serial: &mut Vec<u8>|
+         -> std::io::Result<()> {
+            outputs.sort_unstable_by_key(|(vout, _)| *vout);
+            let mut previous = None;
+            let txid = crate::hash::Txid::from_bytes(txid);
+            for (vout, coin) in outputs.drain(..) {
+                if previous == Some(vout) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "duplicate vout in coinsdb txid group",
+                    ));
+                }
+                previous = Some(vout);
+                serial.clear();
+                crate::coinstats::tx_out_ser(serial, &OutPoint { txid, vout }, &coin);
+                sha.update(serial);
+            }
+            Ok(())
+        };
+
+        for row in iter {
+            let (key, value) =
+                row.map_err(|e| std::io::Error::other(format!("coinsdb hash row: {e}")))?;
+            let key = key.value();
+            if key.len() != 36 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed coinsdb outpoint key while hashing",
+                ));
+            }
+            let txid: [u8; 32] = key[..32].try_into().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed coinsdb txid")
+            })?;
+            if let Some(previous) = current_txid
+                && previous != txid
+            {
+                flush(previous, &mut outputs, &mut sha, &mut serial)?;
+            }
+            current_txid = Some(txid);
+            if outputs.len() >= MAX_OUTPUTS_PER_TX {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "coinsdb txid group exceeds consensus-sized output bound",
+                ));
+            }
+            let vout = u32::from_le_bytes(key[32..].try_into().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed coinsdb vout")
+            })?);
+            let coin = decode_coin(value.value(), self.format).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed coinsdb coin while hashing",
+                )
+            })?;
+            outputs.push((vout, coin));
+        }
+        if let Some(txid) = current_txid {
+            flush(txid, &mut outputs, &mut sha, &mut serial)?;
+        }
+        Ok(crate::hash::Hash256::from_bytes(sha.finalize()))
+    }
 }
 
 #[cfg(test)]
@@ -2087,6 +2260,71 @@ mod tests {
         assert!(
             all.iter()
                 .any(|(o, c)| o.txid == Txid::from_bytes([7; 32]) && c.out.value == 7)
+        );
+    }
+
+    #[test]
+    fn streaming_hash_serialized_3_matches_canonical_order() {
+        let dir = test_dir("streaming-hash-serialized-3");
+        let be = CoinsBackend::open_with_engine(&dir, Engine::Redb).unwrap();
+        let tx_a = crate::hash::Txid::from_bytes([0x11; 32]);
+        let tx_b = crate::hash::Txid::from_bytes([0x22; 32]);
+        let mut dirty = HashMap::new();
+        // Little-endian key order puts vout 256 before vout 1. The
+        // streaming digest must restore numeric vout order per txid.
+        for (txid, vout, value) in [
+            (tx_a, 256, 4_000),
+            (tx_a, 1, 100),
+            (tx_a, 2, 200),
+            (tx_b, 0, 300),
+        ] {
+            dirty.insert(OutPoint { txid, vout }, Some(coin(value, 7)));
+        }
+        be.commit(&dirty, &[], 7).unwrap();
+
+        let mut memory = crate::connect::UtxoSet::new();
+        for (outpoint, coin) in be.iter_coins() {
+            memory.insert_synthetic(outpoint, coin);
+        }
+        let expected = crate::coinstats::compute(
+            &memory,
+            7,
+            hash(7),
+            crate::coinstats::CoinStatsHashType::HashSerialized,
+        )
+        .hash_serialized
+        .unwrap();
+        assert_eq!(be.hash_serialized_3().unwrap(), expected);
+        drop(be);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn streamed_coins_match_materialized_iteration_without_dropping_errors() {
+        let dir = test_dir("stream-iter");
+        let be = CoinsBackend::open(&dir).unwrap();
+        let mut dirty = HashMap::new();
+        for i in 0..10u8 {
+            dirty.insert(op(i, 0), Some(coin(i64::from(i), 1)));
+        }
+        be.commit(&dirty, &[], 1).unwrap();
+        let mut seen = Vec::new();
+        let count = be
+            .for_each_coin(|outpoint, coin| {
+                seen.push((outpoint, coin));
+                Ok(())
+            })
+            .unwrap();
+        let mut expected = be.iter_coins();
+        seen.sort_by_key(|(outpoint, _)| (outpoint.txid, outpoint.vout));
+        expected.sort_by_key(|(outpoint, _)| (outpoint.txid, outpoint.vout));
+        assert_eq!(count, 10);
+        assert_eq!(seen, expected);
+        assert_eq!(
+            be.for_each_coin(|_, _| Err(std::io::Error::other("stop")))
+                .unwrap_err()
+                .to_string(),
+            "stop"
         );
     }
 

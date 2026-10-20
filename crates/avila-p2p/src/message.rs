@@ -25,8 +25,10 @@ pub const NODE_NETWORK_LIMITED: u64 = 1 << 10;
 /// `NODE_P2P_V2` — the peer supports the BIP324 encrypted transport.
 pub const NODE_P2P_V2: u64 = 1 << 11;
 
-/// The protocol version we speak — Core v29's `PROTOCOL_VERSION` is 70016.
-pub const PROTOCOL_VERSION: i32 = 70016;
+/// Minimum protocol version for BIP434 feature negotiation.
+pub const BIP434_MIN_VERSION: i32 = 70017;
+/// Protocol version we speak.
+pub const PROTOCOL_VERSION: i32 = BIP434_MIN_VERSION;
 
 /// `MSG_WITNESS_FLAG` — OR'd into an inv type to request witness data.
 pub const MSG_WITNESS_FLAG: u32 = 0x4000_0000;
@@ -252,6 +254,8 @@ pub enum Message {
     WtxidRelay,
     /// `sendaddrv2` — peer understands BIP155 addresses.
     SendAddrV2,
+    /// `feature` — BIP434 feature id and feature-specific configuration.
+    Feature { id: String, data: Vec<u8> },
     /// `sendutxproof` — peer wants `utxproof` bundles appended to
     /// served blocks (Avila intra-net; ignored elsewhere).
     SendUtxProof,
@@ -395,6 +399,14 @@ fn payload_err(command: &str, detail: impl std::fmt::Display) -> PayloadError {
         command: command.to_string(),
         detail: detail.to_string(),
     }
+}
+
+/// Decodes exactly one serialized block payload, preserving the wire error
+/// category used by [`Message::decode`]. The session uses this helper on its
+/// bounded preparation workers so block parsing does not occupy the socket
+/// polling thread.
+pub fn decode_block_payload(payload: &[u8]) -> Result<Block, PayloadError> {
+    Block::decode(payload).map_err(|e| payload_err("block", e))
 }
 
 fn get_net_addr(d: &mut Decoder, command: &str) -> Result<NetAddr, PayloadError> {
@@ -612,6 +624,7 @@ impl Message {
             Self::SendHeaders => "sendheaders",
             Self::WtxidRelay => "wtxidrelay",
             Self::SendAddrV2 => "sendaddrv2",
+            Self::Feature { .. } => "feature",
             Self::SendUtxProof => "sendutxproof",
             Self::SendAdvice => "sendadvice",
             Self::FeeFilter(_) => "feefilter",
@@ -751,6 +764,10 @@ impl Message {
                 write_var_bytes(&mut out, r.reason.as_bytes());
                 out.extend_from_slice(&r.data);
             }
+            Self::Feature { id, data } => {
+                write_var_bytes(&mut out, id.as_bytes());
+                write_var_bytes(&mut out, data);
+            }
             Self::Unknown { payload, .. } => out.extend_from_slice(payload),
             Self::Verack
             | Self::SendHeaders
@@ -863,6 +880,28 @@ impl Message {
             "sendheaders" => Self::SendHeaders,
             "wtxidrelay" => Self::WtxidRelay,
             "sendaddrv2" => Self::SendAddrV2,
+            "feature" => {
+                let id_len = d.read_compact_size().map_err(|e| payload_err(name, e))?;
+                if !(4..=80).contains(&id_len) {
+                    return Err(payload_err(name, "feature id length outside 4..=80"));
+                }
+                let id_bytes = d
+                    .read_bytes(id_len as usize)
+                    .map_err(|e| payload_err(name, e))?;
+                // Printable ASCII is recommended by BIP434 but not required;
+                // retain arbitrary identifiers lossily so unknown features can
+                // still be ignored without rejecting an otherwise valid message.
+                let id = String::from_utf8_lossy(id_bytes).into_owned();
+                let data_len = d.read_compact_size().map_err(|e| payload_err(name, e))?;
+                if data_len > 512 {
+                    return Err(payload_err(name, "feature data exceeds 512 bytes"));
+                }
+                let data = d
+                    .read_bytes(data_len as usize)
+                    .map_err(|e| payload_err(name, e))?
+                    .to_vec();
+                Self::Feature { id, data }
+            }
             "sendutxproof" => Self::SendUtxProof,
             "sendadvice" => Self::SendAdvice,
             "getaddr" => Self::GetAddr,
@@ -1499,6 +1538,25 @@ mod tests {
             data: vec![0xaa; 32],
         });
         assert_eq!(round_trip(&msg), msg);
+    }
+
+    #[test]
+    fn bip434_feature_message_round_trip_and_bounds() {
+        let message = Message::Feature {
+            id: "blockspentcoinsv1".to_string(),
+            data: vec![0],
+        };
+        assert_eq!(round_trip(&message), message);
+
+        let mut too_short = vec![3, b'a', b'b', b'c', 0];
+        assert!(Message::decode(&cmd("feature"), &too_short).is_err());
+        assert!(Message::decode(&cmd("feature"), &[4, 0, 0, 0, 0, 0]).is_ok());
+        too_short.clear();
+        too_short.push(4);
+        too_short.extend_from_slice(b"BIP1");
+        too_short.extend_from_slice(&[0xfd, 0x01, 0x02]);
+        too_short.extend_from_slice(&[0; 513]);
+        assert!(Message::decode(&cmd("feature"), &too_short).is_err());
     }
 
     #[test]

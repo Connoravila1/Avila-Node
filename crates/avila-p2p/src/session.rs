@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+use avila_consensus::chainstate::PreparedBlock;
+
 use crate::codec::{Command, FrameDecoder, FrameError, encode_frame};
 use crate::message::{
     Message, NODE_NETWORK, NODE_WITNESS, NetAddr, PROTOCOL_VERSION, PayloadError, Version,
@@ -78,6 +80,8 @@ pub struct PeerInfo {
     pub wtxid_relay: bool,
     /// Whether the peer understands BIP155 addrv2.
     pub addrv2: bool,
+    /// Whether the peer advertised exact BIP455 version-zero support via BIP434.
+    pub blockspentcoinsv1: bool,
     /// The peer's BIP330 reconciliation negotiation, if it sent
     /// `sendrecon` during the handshake — `None` means the link runs
     /// ordinary inv/getdata tx relay only.
@@ -173,6 +177,12 @@ pub enum SessionEvent {
     Established,
     /// A non-handshake message arrived.
     Message(Message),
+    /// A checksum-authenticated block frame awaiting bounded off-thread
+    /// payload decoding and context-free validation.
+    RawBlock(Vec<u8>),
+    /// A block frame whose decode and context-free checks finished on a
+    /// preparation worker. Chainstate still performs contextual checks.
+    PreparedBlock(Box<PreparedBlock>),
 }
 
 /// Why the session is over — the peer's fault, an I/O failure, or a
@@ -662,7 +672,7 @@ impl<S: Read + Write> PeerSession<S> {
                                 *self.telemetry.recv_by_msg.entry(name).or_insert(0) +=
                                     payload.len() as u64;
                                 self.telemetry.last_recv = (self.clock)();
-                                if let Some(event) = self.dispatch(command, &payload)? {
+                                if let Some(event) = self.dispatch(command, payload)? {
                                     events.push(event);
                                 }
                             }
@@ -683,7 +693,7 @@ impl<S: Read + Write> PeerSession<S> {
                         payload.len() as u64 + 24,
                     );
                     self.telemetry.last_recv = (self.clock)();
-                    if let Some(event) = self.dispatch(command, &payload)? {
+                    if let Some(event) = self.dispatch(command, payload)? {
                         events.push(event);
                     }
                 }
@@ -698,12 +708,15 @@ impl<S: Read + Write> PeerSession<S> {
     fn dispatch(
         &mut self,
         command: Command,
-        payload: &[u8],
+        payload: Vec<u8>,
     ) -> Result<Option<SessionEvent>, SessionError> {
         if self.state == Handshake::AwaitVersion && command.name() != "version" {
             return Ok(None); // dropped, like Core's pre-version messages
         }
-        let message = Message::decode(&command, payload)?;
+        if command.name() == "block" {
+            return Ok(Some(SessionEvent::RawBlock(payload)));
+        }
+        let message = Message::decode(&command, &payload)?;
         match (&self.state, message) {
             (Handshake::AwaitVersion, Message::Version(v)) => {
                 self.peer = Some(PeerInfo {
@@ -714,6 +727,7 @@ impl<S: Read + Write> PeerSession<S> {
                     relay: v.relay,
                     wtxid_relay: false,
                     addrv2: false,
+                    blockspentcoinsv1: false,
                     recon: None,
                     utxproof: false,
                     advice: false,
@@ -758,6 +772,16 @@ impl<S: Read + Write> PeerSession<S> {
                 self.state = Handshake::Done;
                 Ok(Some(SessionEvent::Established))
             }
+            (Handshake::AwaitVerack, Message::Feature { id, data }) => {
+                if let Some(peer) = &mut self.peer
+                    && id == crate::swift_spent::FEATURE_NAME
+                {
+                    peer.blockspentcoinsv1 = peer.version >= crate::message::BIP434_MIN_VERSION
+                        && crate::swift_spent::supports_feature(&id, &data);
+                }
+                Ok(None)
+            }
+            (Handshake::Done, Message::Feature { .. }) => Ok(None),
             (_, Message::Verack) => Ok(None), // redundant or premature verack
             (_, Message::Ping(nonce)) => {
                 self.send(&Message::Pong(nonce))?;
@@ -1113,6 +1137,74 @@ mod tests {
         testpipe::inject(&mut peer_end, MAGIC, &Message::Verack);
         us.poll().unwrap();
         assert!(us.peer().is_some_and(|p| p.advice));
+    }
+
+    #[test]
+    fn bip455_feature_is_negotiated_before_verack_only() {
+        let (us_end, mut peer_end) = testpipe::pair();
+        let mut us = PeerSession::initiate(
+            us_end,
+            MAGIC,
+            build_version(80, 0, NetAddr::unspecified(), wall_epoch()),
+            BUDGET,
+        )
+        .unwrap();
+        us.poll().unwrap();
+        let mut peer_version = version(70017);
+        testpipe::inject(
+            &mut peer_end,
+            MAGIC,
+            &Message::Version(peer_version.clone()),
+        );
+        us.poll().unwrap();
+        testpipe::inject(
+            &mut peer_end,
+            MAGIC,
+            &Message::Feature {
+                id: crate::swift_spent::FEATURE_NAME.to_string(),
+                data: crate::swift_spent::FEATURE_DATA_V1.to_vec(),
+            },
+        );
+        us.poll().unwrap();
+        testpipe::inject(&mut peer_end, MAGIC, &Message::Verack);
+        us.poll().unwrap();
+        assert!(us.peer().is_some_and(|p| p.blockspentcoinsv1));
+
+        testpipe::inject(
+            &mut peer_end,
+            MAGIC,
+            &Message::Feature {
+                id: crate::swift_spent::FEATURE_NAME.to_string(),
+                data: vec![1],
+            },
+        );
+        us.poll().unwrap();
+        assert!(us.peer().is_some_and(|p| p.blockspentcoinsv1));
+
+        peer_version.version = 70016;
+        let (old_us, mut old_peer) = testpipe::pair();
+        let mut old = PeerSession::initiate(
+            old_us,
+            MAGIC,
+            build_version(81, 0, NetAddr::unspecified(), wall_epoch()),
+            BUDGET,
+        )
+        .unwrap();
+        old.poll().unwrap();
+        testpipe::inject(&mut old_peer, MAGIC, &Message::Version(peer_version));
+        old.poll().unwrap();
+        testpipe::inject(
+            &mut old_peer,
+            MAGIC,
+            &Message::Feature {
+                id: crate::swift_spent::FEATURE_NAME.to_string(),
+                data: crate::swift_spent::FEATURE_DATA_V1.to_vec(),
+            },
+        );
+        old.poll().unwrap();
+        testpipe::inject(&mut old_peer, MAGIC, &Message::Verack);
+        old.poll().unwrap();
+        assert!(!old.peer().is_some_and(|p| p.blockspentcoinsv1));
     }
 
     #[test]

@@ -94,6 +94,12 @@ fn main() -> Result<(), String> {
                 NetEvent::CompactFallback { peer, .. } => {
                     println!("peer {peer}: compact fallback to full block")
                 }
+                NetEvent::SpentCoins { .. }
+                | NetEvent::SpentCoinsFallback { .. }
+                | NetEvent::SwiftBlock { .. } => {}
+                NetEvent::SwiftCaptureLimit { peer, block_hash } => {
+                    println!("peer {peer}: Swift capture queue full at {block_hash}")
+                }
             }
         }
         let tip = cs.chain().len() as i64 - 1;

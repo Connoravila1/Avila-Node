@@ -8469,6 +8469,31 @@ pub(crate) fn dispatch(
                             "event": "tip_advanced",
                             "height": h,
                         }),
+                        avila_p2p::manager::NetEvent::SpentCoins { peer, response } => json!({
+                            "event": "spent_coins",
+                            "peer": peer,
+                            "block": response.block_hash.to_string(),
+                            "coins": response.coins.len(),
+                        }),
+                        avila_p2p::manager::NetEvent::SpentCoinsFallback { peer, block_hash } => {
+                            json!({
+                                "event": "spent_coins_fallback",
+                                "peer": peer,
+                                "block": block_hash.to_string(),
+                            })
+                        }
+                        avila_p2p::manager::NetEvent::SwiftBlock { peer, block } => json!({
+                            "event": "swift_block_body",
+                            "peer": peer,
+                            "block": block.block_hash().to_string(),
+                        }),
+                        avila_p2p::manager::NetEvent::SwiftCaptureLimit { peer, block_hash } => {
+                            json!({
+                                "event": "swift_capture_limit",
+                                "peer": peer,
+                                "block": block_hash.to_string(),
+                            })
+                        }
                         avila_p2p::manager::NetEvent::Announced { peer, missing } => json!({
                             "event": "announced",
                             "peer": peer,

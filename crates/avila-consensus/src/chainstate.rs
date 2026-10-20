@@ -104,6 +104,42 @@ pub enum BlockRejection {
     Store(std::io::ErrorKind),
 }
 
+/// An immutable block whose context-free `CheckBlock` rules already passed.
+///
+/// The payload and parameter snapshot are private: the only constructor runs
+/// the complete check, and acceptance rechecks if the active parameters differ.
+/// This lets the P2P layer overlap parsing and context-free validation with
+/// network polling without moving any contextual or UTXO-dependent rule out of
+/// the ordered chainstate acceptance path.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PreparedBlock {
+    block: Block,
+    params: Params,
+}
+
+impl PreparedBlock {
+    /// Runs all context-free block rules and retains the immutable body for
+    /// later acceptance.
+    pub fn check(block: Block, params: Params) -> Result<Self, (Block, BlockRuleError)> {
+        if let Err(error) = check::check_block(&block, &params) {
+            return Err((block, error));
+        }
+        Ok(Self { block, params })
+    }
+
+    /// The checked body, for attribution and size accounting by the caller.
+    #[must_use]
+    pub fn block(&self) -> &Block {
+        &self.block
+    }
+
+    /// The hash committed by the block header.
+    #[must_use]
+    pub fn block_hash(&self) -> BlockHash {
+        self.block.block_hash()
+    }
+}
+
 /// The result of [`Chainstate::chain_tx_stats`] — Core's
 /// `getchaintxstats` response, with `Option` fields marking the slots
 /// Core omits from the JSON object.
@@ -240,6 +276,9 @@ pub struct Chainstate {
     /// The durable body store when this chainstate was opened with
     /// [`Chainstate::with_store`]; `None` keeps everything in memory.
     store: Option<BlockStore>,
+    /// Persistent bounded disk-reader pool for stored branch replay. It is
+    /// created lazily and is unused by the already-decoded P2P tip path.
+    block_prefetcher: Option<crate::blockprefetch::BlockPrefetcher>,
     /// txid → containing block index, Core's `-txindex`. `None` unless
     /// [`Chainstate::enable_txindex`] ran; when present every body
     /// retained by `accept_block` records its transactions here.
@@ -280,6 +319,11 @@ pub struct Chainstate {
     /// into the fully validated one and `getchainstates` reports a
     /// single `validated: true` entry.
     snapshot_verified: bool,
+    /// Highest height whose block body may be absent because the full
+    /// ordinary validation path completed before a Swift checkpoint was
+    /// promoted. Unlike `snapshot_base`, this does not skip validation;
+    /// the marker is only a durable body-retention boundary.
+    fully_validated_pruned_through: u32,
     /// Hashes of blocks disconnected since the last
     /// [`Self::take_disconnected`] drain, in disconnect order — the
     /// most-recent tip first. Core's `DisconnectedBlockTransactions`
@@ -391,6 +435,195 @@ fn validate_snapshot_undo_floor(
             "state.dat is older than or mismatches the persisted undo floor",
         ));
     }
+    Ok(())
+}
+
+fn validate_fully_checked_pruned_floor(
+    state_height: u32,
+    state_chain: &[BlockHash],
+    pruned_through: u32,
+    floor: Option<(u32, BlockHash)>,
+) -> std::io::Result<()> {
+    if pruned_through == 0 {
+        return Ok(());
+    }
+    let Some((floor_height, floor_hash)) = floor else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "fully validated pruned history has no persisted undo floor",
+        ));
+    };
+    if pruned_through > state_height
+        || pruned_through > floor_height
+        || state_chain.get(pruned_through as usize).is_none()
+        || state_chain.get(floor_height as usize) != Some(&floor_hash)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "fully validated pruned-history boundary mismatches undo floor",
+        ));
+    }
+    Ok(())
+}
+
+struct SwiftPromotionStage {
+    stage_path: std::path::PathBuf,
+    lock_path: std::path::PathBuf,
+    published: bool,
+}
+
+impl Drop for SwiftPromotionStage {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_dir_all(&self.stage_path);
+        }
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+fn create_swift_promotion_stage(
+    target: &Path,
+) -> std::io::Result<(std::path::PathBuf, SwiftPromotionStage, bool)> {
+    use std::io::{Error, ErrorKind};
+
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !parent.is_dir() {
+        return Err(Error::new(
+            ErrorKind::NotFound,
+            "promotion parent directory is absent",
+        ));
+    }
+    let name = target.file_name().ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "promotion target needs a directory name",
+        )
+    })?;
+    let target_existed = match std::fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            if std::fs::read_dir(target)?.next().is_some() {
+                return Err(Error::new(
+                    ErrorKind::AlreadyExists,
+                    "Swift promotion target directory is not empty",
+                ));
+            }
+            true
+        }
+        Ok(_) => {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                "Swift promotion target exists and is not a directory",
+            ));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    let lock_path = parent.join(format!(".{}.swift-promotion.lock", name.to_string_lossy()));
+    let _lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    for attempt in 0..16u8 {
+        let stage_path = parent.join(format!(
+            ".{}.swift-stage-{}-{nonce}-{attempt}",
+            name.to_string_lossy(),
+            std::process::id(),
+        ));
+        match std::fs::create_dir(&stage_path) {
+            Ok(()) => {
+                return Ok((
+                    stage_path.clone(),
+                    SwiftPromotionStage {
+                        stage_path,
+                        lock_path,
+                        published: false,
+                    },
+                    target_existed,
+                ));
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                let _ = std::fs::remove_file(lock_path);
+                return Err(error);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(lock_path);
+    Err(Error::new(
+        ErrorKind::AlreadyExists,
+        "could not allocate a unique Swift staging directory",
+    ))
+}
+
+fn publish_swift_promotion_stage(
+    target: &Path,
+    stage_path: &Path,
+    stage: &mut SwiftPromotionStage,
+    target_existed: bool,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if target_existed {
+        if std::fs::read_dir(target)?.next().is_some() {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                "Swift promotion target changed and is no longer empty",
+            ));
+        }
+        let backup = stage_path.with_extension("empty-target-backup");
+        std::fs::rename(target, &backup)?;
+        if let Err(error) = std::fs::rename(stage_path, target) {
+            let restore = std::fs::rename(&backup, target);
+            return match restore {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(Error::other(format!(
+                    "promotion publish failed ({error}); empty target restore failed ({restore_error})"
+                ))),
+            };
+        }
+        if let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+            let rollback =
+                std::fs::rename(target, stage_path).and_then(|()| std::fs::rename(&backup, target));
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(Error::other(format!(
+                    "promotion directory sync failed ({error}); rollback failed ({rollback_error})"
+                ))),
+            };
+        }
+        if let Err(error) = std::fs::remove_dir(&backup) {
+            let rollback =
+                std::fs::rename(target, stage_path).and_then(|()| std::fs::rename(&backup, target));
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(Error::other(format!(
+                    "empty-target cleanup failed ({error}); rollback failed ({rollback_error})"
+                ))),
+            };
+        }
+    } else {
+        std::fs::rename(stage_path, target)?;
+        if let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+            let rollback = std::fs::rename(target, stage_path);
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(Error::other(format!(
+                    "promotion directory sync failed ({error}); staging rollback failed ({rollback_error})"
+                ))),
+            };
+        }
+    }
+    stage.published = true;
     Ok(())
 }
 
@@ -1038,6 +1271,7 @@ impl Chainstate {
             undos: Vec::new(),
             coins_backend: None,
             store: None,
+            block_prefetcher: None,
             txindex: None,
             scripthashindex: None,
             filterindex: None,
@@ -1046,6 +1280,7 @@ impl Chainstate {
             undo_floor: None,
             background: None,
             snapshot_verified: false,
+            fully_validated_pruned_through: 0,
             disconnected: Vec::new(),
             script_pool: None,
             advice_dir: None,
@@ -1863,6 +2098,379 @@ impl Chainstate {
         Self::with_store_coinsdb_progress(dir, params, now, cache_bytes, None)
     }
 
+    /// Promotes a locally full-checked Swift checkpoint into a conventional
+    /// redb-backed datadir. The opaque input can only be minted by a completed
+    /// Swift engine after its full-script audit, survivor comparison, stump
+    /// check, active-header check, and bounded body+undo window all succeed.
+    /// Promotion streams coins into a unique sibling staging directory, writes
+    /// the standard `state.dat`, reopens and verifies the complete result, and
+    /// only then publishes it at `dir`. Existing target directories must be
+    /// empty; any failure before publication removes only the staging tree.
+    ///
+    /// `cache_bytes` bounds the ordinary UTXO write-back cache during reopen;
+    /// the import uses a separate fixed 16 MiB coin batch. The historical body
+    /// prune marker is set only to the retained undo floor, so normal
+    /// reorg/disconnect remains available through the included full bodies.
+    pub fn promote_audited_swift_snapshot(
+        dir: &Path,
+        params: &Params,
+        now: u32,
+        cache_bytes: usize,
+        snapshot: &crate::swift_engine::AuditedSwiftSnapshot,
+    ) -> std::io::Result<()> {
+        Self::promote_audited_swift_snapshot_inner(dir, params, now, cache_bytes, snapshot, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn promote_audited_swift_snapshot_with_file_limit_for_test(
+        dir: &Path,
+        params: &Params,
+        now: u32,
+        cache_bytes: usize,
+        snapshot: &crate::swift_engine::AuditedSwiftSnapshot,
+        file_limit: u64,
+    ) -> std::io::Result<()> {
+        Self::promote_audited_swift_snapshot_inner(
+            dir,
+            params,
+            now,
+            cache_bytes,
+            snapshot,
+            Some(file_limit),
+        )
+    }
+
+    fn promote_audited_swift_snapshot_inner(
+        dir: &Path,
+        params: &Params,
+        now: u32,
+        cache_bytes: usize,
+        snapshot: &crate::swift_engine::AuditedSwiftSnapshot,
+        block_file_limit: Option<u64>,
+    ) -> std::io::Result<()> {
+        const MAX_PROMOTION_HEIGHT: u32 = 2_000_000;
+        const MAX_PROMOTION_SURVIVORS: u64 = 250_000_000;
+        const MAX_CACHE_BYTES: usize = 1024 * 1024 * 1024;
+        const IMPORT_BATCH_BYTES: usize = 16 * 1024 * 1024;
+        const IMPORT_BATCH_ENTRIES: usize = 32_768;
+
+        fn invalid(message: impl Into<String>) -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+        }
+
+        if params.assume_valid.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Swift promotion requires assumevalid=0",
+            ));
+        }
+        let mut normalized_params = *params;
+        normalized_params.assume_valid = None;
+        if snapshot.network() != params.network
+            || snapshot.params() != &normalized_params
+            || snapshot.seal().network() != params.network
+            || snapshot.seal().height() != snapshot.height()
+            || snapshot.seal().hash() != snapshot.hash()
+            || snapshot.seal().leaf_count() != snapshot.leaf_count()
+            || snapshot.height() == 0
+            || snapshot.height() > MAX_PROMOTION_HEIGHT
+            || snapshot.survivor_count() > MAX_PROMOTION_SURVIVORS
+            || snapshot.stump().checkpoint.last_height != snapshot.height()
+            || snapshot.stump().checkpoint.checkpoint_hash != *snapshot.hash().as_bytes()
+            || snapshot.stump().leaves != snapshot.leaf_count()
+            || cache_bytes == 0
+            || cache_bytes > MAX_CACHE_BYTES
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Swift checkpoint does not match promotion parameters or resource bounds",
+            ));
+        }
+
+        let (floor, floor_hash) = snapshot.undo_floor();
+        let target = snapshot.height();
+        let expected_window = target.min(crate::swift_live::DEFAULT_REORG_DEPTH);
+        if floor > target || target - floor != expected_window {
+            return Err(invalid("Swift checkpoint rollback floor is incomplete"));
+        }
+
+        let (stage_path, mut stage_guard, target_existed) = create_swift_promotion_stage(dir)?;
+
+        let result = (|| {
+            let entry_count = usize::try_from(target)
+                .ok()
+                .and_then(|height| height.checked_add(1))
+                .ok_or_else(|| invalid("Swift checkpoint height overflow"))?;
+            let mut headers = Vec::with_capacity(entry_count);
+            let mut chain = Vec::with_capacity(entry_count);
+            snapshot
+                .for_each_active_header(|height, header| {
+                    if height as usize != headers.len()
+                        || (height == 0 && header != params.genesis_header)
+                        || headers.last().is_some_and(|previous: &BlockHeader| {
+                            header.prev_block_hash != previous.hash()
+                        })
+                    {
+                        return Err(crate::swift_live::SwiftLiveError::Corrupt);
+                    }
+                    let hash = header.hash();
+                    headers.push(header);
+                    chain.push(hash);
+                    Ok(())
+                })
+                .map_err(std::io::Error::other)?;
+            if headers.len() != entry_count
+                || chain.first() != Some(&params.genesis_header.hash())
+                || chain.get(floor as usize) != Some(&floor_hash)
+                || chain.last() != Some(&snapshot.hash())
+            {
+                return Err(invalid(
+                    "Swift active header path is incomplete or mismatched",
+                ));
+            }
+
+            let mut tx_meta = Vec::with_capacity(entry_count);
+            snapshot
+                .for_each_active_tx_meta(|height, hash, n_tx, n_chain_tx| {
+                    let Some(active_hash) = chain.get(height as usize) else {
+                        return Err(crate::swift_live::SwiftLiveError::Corrupt);
+                    };
+                    let expected_total = tx_meta
+                        .last()
+                        .map_or(0, |(_, _, cumulative): &(BlockHash, u32, u64)| *cumulative)
+                        .checked_add(u64::from(n_tx));
+                    if height as usize != tx_meta.len()
+                        || *active_hash != hash
+                        || n_tx == 0
+                        || expected_total != Some(n_chain_tx)
+                        || (height == 0 && (n_tx != 1 || n_chain_tx != 1))
+                    {
+                        return Err(crate::swift_live::SwiftLiveError::Corrupt);
+                    }
+                    tx_meta.push((hash, n_tx, n_chain_tx));
+                    Ok(())
+                })
+                .map_err(std::io::Error::other)?;
+            if tx_meta.len() != entry_count {
+                return Err(invalid("Swift transaction metadata path is incomplete"));
+            }
+
+            let mut block_store = match block_file_limit {
+                Some(limit) => {
+                    BlockStore::open_with_limit(&stage_path, params.message_start, limit)?
+                }
+                None => BlockStore::open(&stage_path, params.message_start)?,
+            };
+            let expected_window_count = usize::try_from(expected_window)
+                .map_err(|_| invalid("Swift rollback window count overflow"))?;
+            let mut undo_rows = Vec::with_capacity(expected_window_count);
+            let mut next_height = floor
+                .checked_add(1)
+                .ok_or_else(|| invalid("Swift rollback floor height overflow"))?;
+            let body_count = snapshot
+                .for_each_block_undo(|height, parent, hash, block, undo| {
+                    let expected_hash = chain.get(height as usize).copied();
+                    let expected_parent = height
+                        .checked_sub(1)
+                        .and_then(|h| chain.get(h as usize))
+                        .copied();
+                    let expected_txs = tx_meta.get(height as usize).map(|m| m.1 as usize);
+                    if height != next_height
+                        || expected_hash != Some(hash)
+                        || expected_parent != Some(parent)
+                        || block.header.prev_block_hash != parent
+                        || block.header.hash() != hash
+                        || block.block_hash() != hash
+                        || headers.get(height as usize) != Some(&block.header)
+                        || Some(block.transactions.len()) != expected_txs
+                        || undo.txs.len() != block.transactions.len()
+                    {
+                        return Err(crate::swift_live::SwiftLiveError::Corrupt);
+                    }
+                    block_store
+                        .append(&block)
+                        .map_err(crate::swift_live::SwiftLiveError::Io)?;
+                    undo_rows.push((height, hash, undo));
+                    next_height = next_height
+                        .checked_add(1)
+                        .ok_or(crate::swift_live::SwiftLiveError::Corrupt)?;
+                    Ok(())
+                })
+                .map_err(std::io::Error::other)?;
+            if body_count != expected_window_count
+                || undo_rows.len() != expected_window_count
+                || next_height != target + 1
+            {
+                return Err(invalid("Swift rollback bodies and undos are incomplete"));
+            }
+            block_store.sync_all()?;
+
+            let backend = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open_tuned(
+                &stage_path,
+                crate::coinsdb::CoinFormat::Compact,
+                cache_bytes,
+            )?);
+            let expected_survivors = snapshot.survivor_count();
+            let mut imported = 0u64;
+            let mut batch_bytes = 0usize;
+            let mut batch: HashMap<crate::transaction::OutPoint, Option<Coin>> =
+                HashMap::with_capacity(IMPORT_BATCH_ENTRIES);
+            let mut expected_muhash = crate::muhash::MuHash3072::new();
+            let mut hash_bytes = Vec::with_capacity(128);
+            let mut previous_outpoint = None;
+            snapshot
+                .for_each_survivor(|outpoint, metadata, coin| {
+                    let order_key = (outpoint.txid, outpoint.vout);
+                    if previous_outpoint.is_some_and(|previous| previous >= order_key)
+                        || coin.height != metadata.height
+                        || coin.coinbase != metadata.coinbase
+                    {
+                        return Err(crate::swift_live::SwiftLiveError::Corrupt);
+                    }
+                    let item_bytes =
+                        64usize.saturating_add(coin.out.script_pubkey.as_bytes().len());
+                    if item_bytes > IMPORT_BATCH_BYTES {
+                        return Err(crate::swift_live::SwiftLiveError::ByteLimit);
+                    }
+                    if !batch.is_empty()
+                        && (batch.len() >= IMPORT_BATCH_ENTRIES
+                            || batch_bytes.saturating_add(item_bytes) > IMPORT_BATCH_BYTES)
+                    {
+                        if let Err(error) = backend.commit_partial(&batch) {
+                            return Err(crate::swift_live::SwiftLiveError::Io(error));
+                        }
+                        batch.clear();
+                        batch_bytes = 0;
+                    }
+                    hash_bytes.clear();
+                    crate::coinstats::tx_out_ser(&mut hash_bytes, &outpoint, &coin);
+                    expected_muhash.insert(&hash_bytes);
+                    if batch.insert(outpoint, Some(coin)).is_some() {
+                        return Err(crate::swift_live::SwiftLiveError::Corrupt);
+                    }
+                    batch_bytes += item_bytes;
+                    previous_outpoint = Some(order_key);
+                    imported = match imported.checked_add(1) {
+                        Some(count) => count,
+                        None => {
+                            return Err(crate::swift_live::SwiftLiveError::Overflow);
+                        }
+                    };
+                    Ok(())
+                })
+                .map_err(std::io::Error::other)?;
+            if imported != expected_survivors {
+                return Err(invalid(
+                    "Swift survivor count differs from the sealed audit",
+                ));
+            }
+            let expected_muhash = expected_muhash.finalize();
+
+            let undos: Vec<(u32, BlockHash, BlockUndo)> = undo_rows;
+            backend.commit(&batch, &undos, target)?;
+            if floor > 0 {
+                backend.advance_undo_floor_and_collect(floor, floor_hash)?;
+            }
+            if backend.coins_len() != expected_survivors
+                || backend.tip_height() != target
+                || backend.undo_floor()? != (floor > 0).then_some((floor, floor_hash))
+            {
+                return Err(invalid(
+                    "staged coins backend metadata mismatches checkpoint",
+                ));
+            }
+            drop(block_store);
+            drop(backend);
+
+            store::write_state(
+                &stage_path,
+                params.message_start,
+                &StateData {
+                    tip: snapshot.hash(),
+                    height: target,
+                    headers,
+                    best_header: snapshot.hash(),
+                    chain,
+                    undos: Vec::new(),
+                    utxo: Vec::new(),
+                    failed: Vec::new(),
+                    tx_meta,
+                    snapshot_base: 0,
+                    externalized: true,
+                    snapshot_verified: false,
+                    fully_validated_pruned_through: floor,
+                },
+            )?;
+
+            let reopened = Self::with_store_coinsdb_using_backend(
+                &stage_path,
+                params,
+                now,
+                cache_bytes,
+                std::sync::Arc::new(crate::coinsdb::CoinsBackend::open_tuned(
+                    &stage_path,
+                    crate::coinsdb::CoinFormat::Compact,
+                    cache_bytes,
+                )?),
+            )?;
+            if reopened.tip_hash() != snapshot.hash()
+                || reopened.chain.len() != entry_count
+                || reopened.fully_validated_pruned_through != floor
+                || reopened.undo_floor != (floor > 0).then_some((floor, floor_hash))
+                || (floor + 1..=target).any(|height| {
+                    !reopened.have_body(&reopened.chain[height as usize])
+                        || reopened.undo(height).is_none()
+                })
+            {
+                return Err(invalid(
+                    "staged ordinary chainstate did not reopen completely",
+                ));
+            }
+            let reopened_backend = reopened
+                .coins_backend
+                .as_ref()
+                .ok_or_else(|| invalid("staged chainstate has no coins backend"))?;
+            let mut actual_muhash = crate::muhash::MuHash3072::new();
+            let mut actual_bytes = Vec::with_capacity(128);
+            let actual_count = reopened_backend.for_each_coin(|outpoint, coin| {
+                actual_bytes.clear();
+                crate::coinstats::tx_out_ser(&mut actual_bytes, &outpoint, &coin);
+                actual_muhash.insert(&actual_bytes);
+                Ok(())
+            })?;
+            if actual_count != expected_survivors
+                || actual_count != reopened_backend.coins_len()
+                || actual_muhash.finalize() != expected_muhash
+            {
+                return Err(invalid(
+                    "reopened coins count or MuHash differs from streamed input",
+                ));
+            }
+            drop(reopened);
+            Ok(())
+        })();
+
+        result?;
+        publish_swift_promotion_stage(dir, &stage_path, &mut stage_guard, target_existed)
+    }
+
+    fn with_store_coinsdb_using_backend(
+        dir: &Path,
+        params: &Params,
+        now: u32,
+        cache_bytes: usize,
+        backend: std::sync::Arc<crate::coinsdb::CoinsBackend>,
+    ) -> std::io::Result<Self> {
+        let store = BlockStore::open(dir, params.message_start)?;
+        let mut chainstate = Self::new(params);
+        chainstate.store = Some(store);
+        chainstate.committed_coins_tip = backend.tip_height();
+        chainstate.utxo.attach_shared(backend.clone());
+        chainstate.utxo.set_budget(cache_bytes);
+        chainstate.coins_backend = Some(backend);
+        chainstate.resume(dir, now)
+    }
+
     /// [`Self::with_store_coinsdb`] with a startup progress sink — see
     /// [`ProgressEvent`] for the milestones it reports.
     pub fn with_store_coinsdb_progress(
@@ -1920,6 +2528,12 @@ impl Chainstate {
         let mut pending = match state_read {
             Ok(Some(state)) => {
                 validate_snapshot_undo_floor(state.height, &state.chain, persisted_floor)?;
+                validate_fully_checked_pruned_floor(
+                    state.height,
+                    &state.chain,
+                    state.fully_validated_pruned_through,
+                    persisted_floor,
+                )?;
                 match cs.restore(state, now) {
                     Ok(pending) => pending,
                     Err(err) => {
@@ -2217,12 +2831,18 @@ impl Chainstate {
             // base were never connected — both legitimately absent
             // from the store.
             let assumed = snapshot_base.is_some_and(|b| index <= b as usize);
+            let undo_floor_pruned = self
+                .undo_floor
+                .is_some_and(|(floor, _)| index > 0 && index <= floor as usize);
+            let fully_checked_pruned = index > 0
+                && (index <= state.fully_validated_pruned_through as usize || undo_floor_pruned);
             // A connected block with no stored body is corruption ONLY
             // when pruning has never run — `position` is rebuilt from
             // surviving blk files, so pruned bodies read as absent on
             // every later open, which is policy, not store damage.
             if index > 0
                 && !assumed
+                && !fully_checked_pruned
                 && self
                     .store
                     .as_ref()
@@ -2237,6 +2857,7 @@ impl Chainstate {
         self.state_tip_persisted = state.height;
         self.snapshot_base = snapshot_base;
         self.snapshot_verified = state.snapshot_verified;
+        self.fully_validated_pruned_through = state.fully_validated_pruned_through;
         // A resumed snapshot that never finished its background
         // validation re-replays it — the ibd chainstate is rebuilt at
         // height 1 (Core persists its progress; replay from scratch is
@@ -2352,6 +2973,80 @@ impl Chainstate {
             return self.tree.params().genesis_block();
         }
         None
+    }
+
+    /// Ordered body sequence consumed by `simulate_branch`: disconnect the
+    /// active tip down to the fork, then connect the candidate branch.
+    fn branch_read_hash_at(
+        &self,
+        fork_height: u32,
+        branch_hashes: &[BlockHash],
+        index: usize,
+    ) -> Option<BlockHash> {
+        let disconnect_count = self.chain.len().saturating_sub(fork_height as usize + 1);
+        if index < disconnect_count {
+            return self
+                .chain
+                .get(self.chain.len().checked_sub(index + 1)?)
+                .copied();
+        }
+        branch_hashes.get(index - disconnect_count).copied()
+    }
+
+    fn begin_branch_prefetch(&mut self, fork_height: u32, branch_hashes: &[BlockHash]) {
+        if !crate::blockprefetch::enabled() || self.store.is_none() {
+            return;
+        }
+        if self.block_prefetcher.is_none() {
+            self.block_prefetcher = crate::blockprefetch::BlockPrefetcher::new();
+        }
+        let Some(prefetcher) = &mut self.block_prefetcher else {
+            return;
+        };
+        if let Some(store) = &self.store {
+            prefetcher.begin(store);
+        }
+        for index in 0..crate::blockprefetch::WINDOW {
+            self.schedule_branch_prefetch_at(fork_height, branch_hashes, index);
+        }
+    }
+
+    fn schedule_branch_prefetch_at(
+        &mut self,
+        fork_height: u32,
+        branch_hashes: &[BlockHash],
+        index: usize,
+    ) {
+        let Some(hash) = self.branch_read_hash_at(fork_height, branch_hashes, index) else {
+            return;
+        };
+        let Some(pos) = self
+            .store
+            .as_ref()
+            .and_then(|store| store.position(&hash).filter(|pos| !store.is_pruned(*pos)))
+        else {
+            return;
+        };
+        if let Some(prefetcher) = &mut self.block_prefetcher {
+            let _ = prefetcher.schedule(hash, pos);
+        }
+    }
+
+    fn finish_branch_prefetch(&mut self) {
+        if let Some(prefetcher) = &mut self.block_prefetcher {
+            prefetcher.finish();
+        }
+    }
+
+    /// Stored branch read with a hash-checked prefetch hit and the ordinary
+    /// body accessor as the fallback for skipped, stale, or failed jobs.
+    fn branch_body(&mut self, hash: &BlockHash) -> Option<Block> {
+        let prefetched = self
+            .block_prefetcher
+            .as_mut()
+            .and_then(|prefetcher| prefetcher.take(*hash));
+        let block = prefetched.or_else(|| self.body(hash))?;
+        (block.block_hash() == *hash).then_some(block)
     }
 
     /// `true` when the body is actually on disk/in memory right now —
@@ -2529,6 +3224,7 @@ impl Chainstate {
             snapshot_base: self.snapshot_base.unwrap_or(0),
             snapshot_verified: self.snapshot_verified,
             externalized,
+            fully_validated_pruned_through: self.fully_validated_pruned_through,
         }
     }
 
@@ -2542,6 +3238,7 @@ impl Chainstate {
     ///
     /// `io::Error` on flush or snapshot-write failure.
     pub fn flush(&mut self) -> std::io::Result<()> {
+        self.finish_branch_prefetch();
         // Bodies first — the crash-rewind path disconnects blocks via
         // their blk-file bodies, so they must be durable before the
         // coins commit that could need them.
@@ -2569,15 +3266,18 @@ impl Chainstate {
     /// Deletes the oldest `blk*.dat` files while their total exceeds
     /// `keep` bytes — Core's `-prune` analog. Before deleting any body,
     /// checkpoints the current active chain and coins backend so crash
-    /// recovery does not need bodies from an older saved tip. Only files
-    /// below the append tail are eligible for deletion. A reorg reaching
-    /// a pruned body fails loudly at disconnect rather than silently
-    /// skipping; a resubmitted pruned block re-validates and re-stores.
+    /// recovery does not need bodies from an older saved tip. Every file
+    /// containing an active body in the rewind window is retained; a byte
+    /// budget may be exceeded when those bodies share files with older data.
+    /// A reorg below the persisted undo floor fails closed, while a resubmitted
+    /// pruned block re-validates and re-stores.
     ///
     /// # Errors
     ///
     /// `io::Error` on listing/removal failure. No-op without a store.
     pub fn prune(&mut self, keep_bytes: u64) -> std::io::Result<u32> {
+        self.finish_branch_prefetch();
+        let protected_file_floor = self.protected_reorg_file_floor();
         let Some(store) = &mut self.store else {
             return Ok(0);
         };
@@ -2614,10 +3314,9 @@ impl Chainstate {
         // no longer needs an undo/body rewind window. Normal prune semantics
         // may still require a pruned side-branch body to be downloaded again.
         self.flush()?;
-        let deleted = self
-            .store
-            .as_mut()
-            .map_or(Ok(0), |store| store.prune_to_bytes(keep_bytes, u32::MAX))?;
+        let deleted = self.store.as_mut().map_or(Ok(0), |store| {
+            store.prune_to_bytes(keep_bytes, protected_file_floor)
+        })?;
         if gc_allowed && (deleted > 0 || gc_needed) {
             let candidate = self.undo_gc_candidate();
             let target = match (self.undo_floor, candidate) {
@@ -2636,6 +3335,47 @@ impl Chainstate {
             }
         }
         Ok(deleted)
+    }
+
+    /// Earliest block-file number that must stay on disk to retain bodies for
+    /// every currently rewindable active height. Block files can contain
+    /// multiple bodies, and side branches make file order differ from height
+    /// order, so preserve the lowest file containing any required active body.
+    /// If the required suffix is already incomplete, stop pruning rather than
+    /// deleting more history and widening the inconsistency.
+    fn protected_reorg_file_floor(&self) -> u32 {
+        let Some(store) = &self.store else {
+            return 0;
+        };
+        let Some(tip) = self.chain.len().checked_sub(1).map(|height| height as u32) else {
+            return 0;
+        };
+        let floor = self
+            .undo_floor
+            .map_or(tip.saturating_sub(288), |(height, _)| {
+                height.max(tip.saturating_sub(288))
+            });
+        let Some(first_needed) = floor.checked_add(1) else {
+            return 0;
+        };
+        let mut earliest_file = u32::MAX;
+        for height in first_needed..=tip {
+            let Some(hash) = self.chain.get(height as usize) else {
+                return 0;
+            };
+            let Some(position) = store.position(hash) else {
+                return 0;
+            };
+            if store.is_pruned(position) {
+                return 0;
+            }
+            earliest_file = earliest_file.min(position.file);
+        }
+        if earliest_file == u32::MAX {
+            0
+        } else {
+            earliest_file
+        }
     }
 
     /// A conservative undo rollback boundary implied by the first active
@@ -2940,6 +3680,7 @@ impl Chainstate {
     /// # Errors
     /// `io::Error` on backend commit failure.
     fn flush_coins(&mut self) -> std::io::Result<()> {
+        self.finish_branch_prefetch();
         // A flush persists the tip + undo tail — every pending block
         // must be verified first. Empty unless speculative connect is
         // on; on failure the rewind path re-enters here with the
@@ -3523,6 +4264,33 @@ impl Chainstate {
         // malleability caution).
         check::check_block(block, &params).map_err(BlockRejection::Check)?;
 
+        self.accept_block_checked(block, now, params)
+    }
+
+    /// Accepts a block whose context-free checks were completed by
+    /// [`PreparedBlock::check`]. Contextual header, body, UTXO, and script
+    /// checks still run here in the normal ordered acceptance path. If the
+    /// consensus parameters changed since preparation, `CheckBlock` is run
+    /// again under the active parameters before any state is touched.
+    pub fn accept_prepared_block(
+        &mut self,
+        prepared: &PreparedBlock,
+        now: u32,
+    ) -> Result<Acceptance, BlockRejection> {
+        let _guard = ScopeTick::new(crate::connect::accept_tick);
+        let params = *self.tree.params();
+        if prepared.params != params {
+            check::check_block(&prepared.block, &params).map_err(BlockRejection::Check)?;
+        }
+        self.accept_block_checked(&prepared.block, now, params)
+    }
+
+    fn accept_block_checked(
+        &mut self,
+        block: &Block,
+        now: u32,
+        params: Params,
+    ) -> Result<Acceptance, BlockRejection> {
         // `AcceptBlock` → `AcceptBlockHeader` (duplicate check, PoW, parent
         // linkage, the `bad-prevblk` gates, contextual header checks).
         let hash = block.block_hash();
@@ -3570,9 +4338,9 @@ impl Chainstate {
             }
             Err(err) => return Err(BlockRejection::Header(err)),
         };
-        // `AcceptBlock` re-runs `CheckBlock` at this point, but it is
-        // deterministic and just passed — the only remaining gate before the
-        // body is stored is `ContextualCheckBlock`.
+        // The `CheckBlock` step ran above (or in `PreparedBlock::check`) —
+        // the only remaining body gate before retention is
+        // `ContextualCheckBlock`.
         let parent_mtp = self.tree.median_time_past(&block.header.prev_block_hash);
         let ctx = BlockContext {
             params: &params,
@@ -3855,15 +4623,19 @@ impl Chainstate {
         // base layer (an O(1) `mem::take`, not the old O(utxo) clone) —
         // every disconnect/connect writes only to the overlay's dirty
         // map. Any failure path restores `self.utxo` via `unoverlay`.
+        self.begin_branch_prefetch(fork_height, &branch_hashes);
         let mut sim = self.utxo.overlay();
-        let (new_undos, new_receipts) =
-            match self.simulate_branch(&mut sim, fork_height, &branch_hashes, params) {
-                Ok(parts) => parts,
-                Err(err) => {
-                    self.utxo.unoverlay(sim, false);
-                    return Err(err);
-                }
-            };
+        let simulated = self.simulate_branch(&mut sim, fork_height, &branch_hashes, params);
+        // Every prefetched read is either consumed or discarded and joined
+        // before the simulated state can be adopted, flushed, or pruned.
+        self.finish_branch_prefetch();
+        let (new_undos, new_receipts) = match simulated {
+            Ok(parts) => parts,
+            Err(err) => {
+                self.utxo.unoverlay(sim, false);
+                return Err(err);
+            }
+        };
         crate::connect::seg_tick(1, &mut t_seg);
         self.utxo.unoverlay(sim, true);
         crate::connect::seg_tick(2, &mut t_seg);
@@ -4089,11 +4861,19 @@ impl Chainstate {
         branch_hashes: &[BlockHash],
         params: &Params,
     ) -> Result<(Vec<BlockUndo>, Vec<BlockReceipt>), ConnectError> {
+        let disconnect_count = self.chain.len().saturating_sub(fork_height as usize + 1);
+        let mut sequence_index = 0usize;
         for height in (fork_height + 1..self.chain.len() as u32).rev() {
             let block_hash = self.chain[height as usize];
-            let Some(block) = self.body(&block_hash) else {
+            let Some(block) = self.branch_body(&block_hash) else {
                 return Err(ConnectError::Internal("missing connected block body"));
             };
+            sequence_index += 1;
+            self.schedule_branch_prefetch_at(
+                fork_height,
+                branch_hashes,
+                sequence_index + crate::blockprefetch::WINDOW - 1,
+            );
             let Some(undo) = self.undo(height) else {
                 return Err(ConnectError::Internal("missing connected undo"));
             };
@@ -4104,9 +4884,15 @@ impl Chainstate {
         let mut new_receipts = Vec::with_capacity(branch_hashes.len());
         for branch_hash in branch_hashes {
             let t_body = std::time::Instant::now();
-            let Some(block) = self.body(branch_hash) else {
+            let Some(block) = self.branch_body(branch_hash) else {
                 return Err(ConnectError::Internal("missing branch block body"));
             };
+            sequence_index += 1;
+            self.schedule_branch_prefetch_at(
+                fork_height,
+                branch_hashes,
+                sequence_index + crate::blockprefetch::WINDOW - 1,
+            );
             crate::connect::sim_tick(0, t_body);
             let t_checks = std::time::Instant::now();
             let checks = self.script_checks(branch_hash, params);
@@ -4151,6 +4937,7 @@ impl Chainstate {
         for branch_hash in branch_hashes {
             self.tree.note_connected(branch_hash);
         }
+        debug_assert_eq!(sequence_index, disconnect_count + branch_hashes.len());
         Ok((new_undos, new_receipts))
     }
 
@@ -4720,6 +5507,42 @@ mod tests {
     }
 
     #[test]
+    fn prepared_block_checks_context_free_rules_and_rechecks_changed_params() {
+        let regular_params = params();
+        let block = block_on(
+            &regular_params.genesis_header,
+            vec![coinbase_tx(1, subsidy(1))],
+            &regular_params,
+        );
+        let prepared = PreparedBlock::check(block.clone(), regular_params).unwrap();
+        let mut cs = Chainstate::new(&regular_params);
+        assert_eq!(
+            cs.accept_prepared_block(&prepared, NOW),
+            Ok(Acceptance::Connected {
+                height: 1,
+                reorged: false,
+            })
+        );
+
+        // The same body was prepared without Signet's context-free solution
+        // rule. A parameter mismatch must re-run CheckBlock before index
+        // insertion, even though it would be safe under the old snapshot.
+        let prepared = PreparedBlock::check(block, regular_params).unwrap();
+        let mut signet_params = regular_params;
+        signet_params.signet_blocks = true;
+        let mut signet_cs = Chainstate::new(&signet_params);
+        assert_eq!(
+            signet_cs.accept_prepared_block(&prepared, NOW),
+            Err(BlockRejection::Check(BlockRuleError::BadSignetBlkSig))
+        );
+        assert_eq!(
+            signet_cs.chain().len(),
+            1,
+            "check failure inserts no header"
+        );
+    }
+
+    #[test]
     fn verify_tip_revalidates_at_each_level() {
         let params = params();
         let mut cs = Chainstate::new(&params);
@@ -5065,6 +5888,96 @@ mod tests {
             txid: a2_txid,
             vout: 0
         }));
+    }
+
+    #[test]
+    fn stored_reorg_prefetches_disconnect_then_reconnect_bodies() {
+        let params = params();
+        let dir = store_dir("prefetch-reorg-order");
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        let a1 = block_on(&genesis_header(), vec![coinbase_tx(1, subsidy(1))], &params);
+        let a2 = block_on(&a1.header, vec![coinbase_tx(2, subsidy(2))], &params);
+        cs.accept_block(&a1, NOW).unwrap();
+        cs.accept_block(&a2, NOW).unwrap();
+
+        let b1 = block_on(
+            &genesis_header(),
+            vec![tagged_coinbase(1, subsidy(1), script::OP_EQUAL)],
+            &params,
+        );
+        let b2 = block_on(
+            &b1.header,
+            vec![tagged_coinbase(2, subsidy(2), script::OP_EQUAL)],
+            &params,
+        );
+        let b3 = block_on(
+            &b2.header,
+            vec![tagged_coinbase(3, subsidy(3), script::OP_EQUAL)],
+            &params,
+        );
+        cs.accept_block(&b1, NOW).unwrap();
+        cs.accept_block(&b2, NOW).unwrap();
+        assert!(matches!(
+            cs.accept_block(&b3, NOW),
+            Ok(Acceptance::Connected {
+                height: 3,
+                reorged: true
+            })
+        ));
+        assert_eq!(cs.tip_hash(), b3.block_hash());
+        if crate::blockprefetch::enabled() {
+            let prefetcher = cs.block_prefetcher.as_ref().unwrap();
+            assert_eq!(prefetcher.hits(), 5, "two disconnects and three reconnects");
+            assert_eq!(prefetcher.reserved(), (0, 0, 0));
+        }
+        drop(cs);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejected_prefetch_hash_falls_back_to_matching_store_body() {
+        let params = params();
+        let dir = store_dir("prefetch-hash-fallback");
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        let genesis = params.genesis_block().unwrap();
+        let genesis_pos = cs.store.as_mut().unwrap().append(&genesis).unwrap();
+        let candidate = block_on(&genesis_header(), vec![coinbase_tx(1, subsidy(1))], &params);
+        let expected_hash = candidate.block_hash();
+        cs.store.as_mut().unwrap().append(&candidate).unwrap();
+        let mut prefetcher = crate::blockprefetch::BlockPrefetcher::new().unwrap();
+        prefetcher.begin(cs.store.as_ref().unwrap());
+        assert!(prefetcher.schedule(expected_hash, genesis_pos));
+        cs.block_prefetcher = Some(prefetcher);
+        assert_eq!(cs.branch_body(&expected_hash), Some(candidate));
+        cs.finish_branch_prefetch();
+        drop(cs);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_prefetch_frame_falls_back_to_ordinary_store_error() {
+        let params = params();
+        let dir = store_dir("prefetch-corrupt-fallback");
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        let candidate = block_on(&genesis_header(), vec![coinbase_tx(1, subsidy(1))], &params);
+        let hash = candidate.block_hash();
+        let pos = cs.store.as_mut().unwrap().append(&candidate).unwrap();
+        cs.store.as_mut().unwrap().flush().unwrap();
+        let path = dir.join("blk00000.dat");
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+        file.seek(SeekFrom::Start(pos.offset - 8)).unwrap();
+        file.write_all(b"bad!").unwrap();
+        file.flush().unwrap();
+
+        let mut prefetcher = crate::blockprefetch::BlockPrefetcher::new().unwrap();
+        prefetcher.begin(cs.store.as_ref().unwrap());
+        assert!(prefetcher.schedule(hash, pos));
+        cs.block_prefetcher = Some(prefetcher);
+        assert!(cs.branch_body(&hash).is_none());
+        cs.finish_branch_prefetch();
+        drop(cs);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5811,6 +6724,35 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn swift_promotion_stage_is_private_until_publish_and_rejects_nonempty_target() {
+        let target = store_dir("swift-promotion-publish");
+        std::fs::create_dir_all(&target).unwrap();
+        let (stage_path, mut guard, existed) = create_swift_promotion_stage(&target).unwrap();
+        assert!(existed);
+        std::fs::write(stage_path.join("state.dat"), b"complete").unwrap();
+        assert!(!target.join("state.dat").exists());
+        publish_swift_promotion_stage(&target, &stage_path, &mut guard, existed).unwrap();
+        assert_eq!(
+            std::fs::read(target.join("state.dat")).unwrap(),
+            b"complete"
+        );
+        drop(guard);
+        std::fs::remove_dir_all(&target).unwrap();
+
+        let target = store_dir("swift-promotion-nonempty");
+        std::fs::create_dir_all(&target).unwrap();
+        let sentinel = target.join("keep");
+        std::fs::write(&sentinel, b"untouched").unwrap();
+        let error = match create_swift_promotion_stage(&target) {
+            Ok(_) => panic!("nonempty target must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"untouched");
+        std::fs::remove_dir_all(&target).unwrap();
+    }
+
     /// The coins view as a sorted vec — `UtxoSet` iteration order is
     /// unspecified, so equality checks go through this.
     fn sorted_utxo(cs: &Chainstate) -> Vec<(OutPoint, crate::connect::Coin)> {
@@ -6238,12 +7180,15 @@ mod tests {
         assert_eq!(cs.state_tip_persisted, 4);
         assert_eq!(cs.coins_backend.as_ref().unwrap().tip_height(), 4);
         assert!(cs.store.as_ref().unwrap().is_pruned(side_pos));
+        let retained = read_blk_files(&dir);
+        assert_eq!(retained.len(), 4, "active reorg-window bodies stay on disk");
         assert!(
-            read_blk_files(&dir)
+            retained
                 .iter()
                 .map(|(_, contents)| contents.len() as u64)
                 .sum::<u64>()
-                <= keep
+                > keep,
+            "prune may exceed its byte budget to retain active reorg-window bodies"
         );
         // The parked body is still above the newly checkpointed tip. Merely
         // checkpointing while retaining the old all-bodies floor would leave
@@ -7652,9 +8597,8 @@ mod tests {
         let tip6 = cs.tip_hash();
         drop(cs);
 
-        // Downgrade state.dat to v3: drop the trailing flags byte
-        // (v3's payload ends at snapshot_base), patch the version
-        // field, and re-cover the payload with a fresh checksum.
+        // Downgrade state.dat to v3: drop the v4 flags byte (v3 ends at
+        // snapshot_base), patch the version field, and re-cover checksum.
         let state_path = dir.join("state.dat");
         let mut bytes = std::fs::read(&state_path).unwrap();
         let payload_end = bytes.len() - 1; // strip the v4 flags byte
@@ -7750,6 +8694,7 @@ mod tests {
             snapshot_base: 0,
             externalized: false,
             snapshot_verified: true,
+            fully_validated_pruned_through: 0,
         };
 
         let result =
@@ -7851,7 +8796,8 @@ mod tests {
     #[test]
     fn invalidate_tip_rewinds_one_block() {
         let params = params();
-        let mut cs = Chainstate::new(&params);
+        let dir = store_dir("invalidate-reconsider-durable");
+        let mut cs = Chainstate::with_store(&dir, &params, NOW).unwrap();
         let genesis = genesis_header();
         let b1 = block_on(&genesis, vec![coinbase_tx(1, subsidy(1))], &params);
         let b2 = block_on(&b1.header, vec![coinbase_tx(2, subsidy(2))], &params);
@@ -7868,6 +8814,15 @@ mod tests {
         assert!(cs.reconsider_block(&b2.block_hash()).unwrap());
         assert_eq!(cs.tip_hash(), b2.block_hash());
         assert_eq!(cs.chain().len(), 3);
+        assert_eq!(cs.tree().tip_hash(), b2.block_hash());
+
+        cs.flush().unwrap();
+        drop(cs);
+        let reopened = Chainstate::with_store(&dir, &params, NOW).unwrap();
+        assert_eq!(reopened.tip_hash(), b2.block_hash());
+        assert_eq!(reopened.tree().tip_hash(), b2.block_hash());
+        assert_eq!(reopened.chain().len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `take_disconnected` drains evicted blocks in disconnect order

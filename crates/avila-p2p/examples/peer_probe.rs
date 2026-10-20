@@ -80,7 +80,25 @@ fn main() {
             }
         };
         for event in events {
+            let event = match event {
+                SessionEvent::RawBlock(payload) => {
+                    match avila_p2p::message::decode_block_payload(&payload) {
+                        Ok(block) => SessionEvent::Message(Message::Block(block)),
+                        Err(error) => {
+                            println!("bad block payload: {error}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                SessionEvent::PreparedBlock(prepared) => {
+                    SessionEvent::Message(Message::Block(prepared.block().clone()))
+                }
+                event => event,
+            };
             match event {
+                SessionEvent::RawBlock(_) | SessionEvent::PreparedBlock(_) => {
+                    unreachable!("block preparation events were normalized above")
+                }
                 SessionEvent::Established => {
                     target = session
                         .peer()

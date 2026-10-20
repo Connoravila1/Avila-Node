@@ -126,6 +126,15 @@ impl Hints {
     /// truncation, or out-of-order outpoints (the sorted order is part
     /// of the format — a producer that can't sort is malformed).
     pub fn decode(b: &[u8]) -> std::io::Result<Self> {
+        Self::decode_bounded(b, usize::MAX)
+    }
+
+    /// Parses a hints file while enforcing a caller-selected survivor ceiling.
+    ///
+    /// The count and total-length arithmetic are checked before allocating the
+    /// survivor vector. Callers processing untrusted network or disk data should
+    /// choose a bound from their configured UTXO/resource budget.
+    pub fn decode_bounded(b: &[u8], max_survivors: usize) -> std::io::Result<Self> {
         fn err(msg: &str) -> std::io::Error {
             std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
         }
@@ -134,8 +143,16 @@ impl Hints {
         }
         let height = u32::from_le_bytes(b[4..8].try_into().unwrap_or_default());
         let aggregate = TagAgg::from_bytes(b[8..40].try_into().unwrap_or_default());
-        let count = u64::from_le_bytes(b[40..48].try_into().unwrap_or_default()) as usize;
-        if b.len() != 48 + count * 36 {
+        let count_u64 = u64::from_le_bytes(b[40..48].try_into().unwrap_or_default());
+        let count = usize::try_from(count_u64).map_err(|_| err("survivor count is too large"))?;
+        if count > max_survivors {
+            return Err(err("survivor count exceeds configured limit"));
+        }
+        let expected_len = count
+            .checked_mul(36)
+            .and_then(|records_len| 48usize.checked_add(records_len))
+            .ok_or_else(|| err("hints length overflow"))?;
+        if b.len() != expected_len {
             return Err(err("hints length mismatch"));
         }
         let mut survivors = Vec::with_capacity(count);
