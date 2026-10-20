@@ -33,7 +33,8 @@ use avila_p2p::swift_spent::{
 const COIN: i64 = 100_000_000;
 const NOW: u32 = 2_000_000_000;
 const REGTEST_BITS: u32 = 0x207f_ffff;
-const CHECKPOINT_HEIGHT: u32 = 101;
+const SPEND_HEIGHT: u32 = 101;
+const CHECKPOINT_HEIGHT: u32 = 110;
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
 struct TempTree(PathBuf);
@@ -116,7 +117,7 @@ fn fixture_chain() -> Vec<Block> {
     let mut previous = params.genesis_header;
     for height in 1..=CHECKPOINT_HEIGHT {
         let mut transactions = vec![coinbase(height)];
-        if height == CHECKPOINT_HEIGHT {
+        if height == SPEND_HEIGHT {
             let first_coinbase = &blocks[0].transactions[0];
             transactions.push(Transaction {
                 version: 1,
@@ -166,8 +167,8 @@ fn hints_bytes() -> Vec<u8> {
     write_elias_fano_record(&mut out, &[]);
     for height in 1..=CHECKPOINT_HEIGHT {
         let survivors: &[u32] = match height {
-            1 => &[], // spent at height 101
-            101 => &[0, 1],
+            1 => &[], // spent at height 101, after coinbase maturity
+            SPEND_HEIGHT => &[0, 1],
             _ => &[0],
         };
         write_elias_fano_record(&mut out, survivors);
@@ -258,6 +259,8 @@ fn serve_peer(
     let mut accepted_bad_claim = false;
     let mut sent_our_version = false;
     let mut saw_spent_request = false;
+    let mut deferred_response: Option<Message> = None;
+    let mut sent_later_body = false;
 
     while Instant::now() < shutdown {
         let read_deadline = (Instant::now() + Duration::from_millis(100)).min(shutdown);
@@ -292,9 +295,31 @@ fn serve_peer(
                 sent_headers = true;
                 write_message(&mut stream, magic, &Message::Headers(headers.clone()))?;
             }
-            Message::GetData(vectors) => {
+            Message::GetData(mut vectors) => {
                 if accepted_bad_claim {
                     continue;
+                }
+                // Deliberately reverse batches. Captured bodies from separate peers and
+                // decode workers do not arrive in height order in production.
+                if matches!(mode, ProviderMode::Qualified) {
+                    let spend_hash = blocks[SPEND_HEIGHT as usize - 1].block_hash();
+                    vectors.sort_by(|left, right| {
+                        match (left.hash == spend_hash, right.hash == spend_hash) {
+                            (true, false) => std::cmp::Ordering::Less,
+                            (false, true) => std::cmp::Ordering::Greater,
+                            _ => {
+                                let left_height = blocks
+                                    .iter()
+                                    .position(|block| block.block_hash() == left.hash)
+                                    .unwrap_or(0);
+                                let right_height = blocks
+                                    .iter()
+                                    .position(|block| block.block_hash() == right.hash)
+                                    .unwrap_or(0);
+                                right_height.cmp(&left_height)
+                            }
+                        }
+                    });
                 }
                 for vector in vectors {
                     if let Some(block) = blocks
@@ -302,7 +327,15 @@ fn serve_peer(
                         .find(|block| block.block_hash() == vector.hash)
                     {
                         write_message(&mut stream, magic, &Message::Block(block.clone()))?;
+                        if block.block_hash()
+                            == blocks[(SPEND_HEIGHT + 3) as usize - 1].block_hash()
+                        {
+                            sent_later_body = true;
+                        }
                     }
+                }
+                if sent_later_body && let Some(response) = deferred_response.take() {
+                    write_message(&mut stream, magic, &response)?;
                 }
             }
             Message::Unknown { command, payload }
@@ -335,7 +368,11 @@ fn serve_peer(
                     payload: encode_response(&response)
                         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
                 };
-                write_message(&mut stream, magic, &response)?;
+                if matches!(mode, ProviderMode::Qualified) && !sent_later_body {
+                    deferred_response = Some(response);
+                } else {
+                    write_message(&mut stream, magic, &response)?;
+                }
                 if matches!(mode, ProviderMode::BadSpentClaim) {
                     accepted_bad_claim = true;
                 }
@@ -397,9 +434,8 @@ fn assert_promoted(root: &TempTree, blocks: &[Block]) {
         txid: first.txid(),
         vout: 0,
     }));
-    let last = blocks.last().unwrap();
     assert!(reopened.utxo().have(&OutPoint {
-        txid: last.transactions[1].txid(),
+        txid: blocks[SPEND_HEIGHT as usize - 1].transactions[1].txid(),
         vout: 0,
     }));
 

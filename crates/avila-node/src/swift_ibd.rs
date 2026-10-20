@@ -4,7 +4,7 @@
 //! pinned checkpoint has passed ordinary full validation and the local audit has
 //! matched. The caller owns peer scheduling and ordinary-sync fallback.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -64,6 +64,59 @@ pub enum SwiftBlockStart {
         /// Exact sorted non-coinbase input ordinals expected in the response.
         input_indices: Vec<u32>,
     },
+    /// Body retained in the bounded ordered queue while an earlier block waits
+    /// for its spent-coin response.
+    Queued,
+}
+
+const MAX_QUEUED_SWIFT_BODIES: usize = 4;
+// One body may be pending a claim response; four manager reservations in all
+// therefore remain within the protocol's 4,000,000-byte serialized body limit.
+const MAX_QUEUED_SWIFT_BODY_BYTES: usize = 16 * 1024 * 1024;
+// Conservatively mirrors the block decoder's 64x wire reservation plus its
+// per-block overhead. This is a retained decoded-memory budget, not a claim
+// that encoded bytes equal heap usage.
+const MAX_RETAINED_SWIFT_DECODED_BYTES: usize = 256 * 1024 * 1024;
+
+fn swift_body_queue_capacity(has_pending: bool) -> (usize, usize) {
+    if has_pending {
+        (
+            MAX_QUEUED_SWIFT_BODIES - 1,
+            MAX_QUEUED_SWIFT_BODY_BYTES - avila_consensus::block::MAX_BLOCK_SERIALIZED_SIZE,
+        )
+    } else {
+        (MAX_QUEUED_SWIFT_BODIES, MAX_QUEUED_SWIFT_BODY_BYTES)
+    }
+}
+
+fn swift_body_fits_queue(
+    queued_count: usize,
+    queued_bytes: usize,
+    retained_decoded_bytes: usize,
+    has_pending: bool,
+    encoded_bytes: usize,
+) -> bool {
+    let (max_count, max_bytes) = swift_body_queue_capacity(has_pending);
+    let decoded_reservation = encoded_bytes.saturating_mul(64).saturating_add(4096);
+    queued_count < max_count
+        && queued_bytes
+            .checked_add(encoded_bytes)
+            .is_some_and(|total| total <= max_bytes)
+        && retained_decoded_bytes
+            .checked_add(decoded_reservation)
+            .is_some_and(|total| total <= MAX_RETAINED_SWIFT_DECODED_BYTES)
+}
+
+fn next_swift_body_index(queued: &VecDeque<QueuedBody>, parent: BlockHash) -> Option<usize> {
+    queued
+        .iter()
+        .position(|body| body.block.header.prev_block_hash == parent)
+}
+
+struct QueuedBody {
+    peer_id: u64,
+    block: Block,
+    encoded_bytes: usize,
 }
 
 struct PendingBlock {
@@ -81,6 +134,9 @@ pub struct SwiftIbdDriver {
     completed: Option<AuditedSwiftSnapshot>,
     hints: Option<Bip456HintsReader<BufReader<File>>>,
     pending: Option<PendingBlock>,
+    queued: VecDeque<QueuedBody>,
+    queued_bytes: usize,
+    retained_decoded_bytes: usize,
 }
 
 /// Resource, protocol, or consensus failure that requires ordinary-sync fallback.
@@ -178,6 +234,9 @@ impl SwiftIbdDriver {
                 completed: Some(snapshot),
                 hints: None,
                 pending: None,
+                queued: VecDeque::new(),
+                queued_bytes: 0,
+                retained_decoded_bytes: 0,
             });
         }
 
@@ -227,6 +286,9 @@ impl SwiftIbdDriver {
             completed: None,
             hints: Some(hints),
             pending: None,
+            queued: VecDeque::new(),
+            queued_bytes: 0,
+            retained_decoded_bytes: 0,
         })
     }
 
@@ -255,11 +317,66 @@ impl SwiftIbdDriver {
         block: Block,
         now: u32,
     ) -> Result<SwiftBlockStart, SwiftIbdError> {
-        if self.pending.is_some() || self.completed.is_some() {
+        if self.completed.is_some() {
             return Err(SwiftIbdError::Fallback(
-                "driver already has a pending or completed block",
+                "driver already completed the checkpoint",
             ));
         }
+        let expected_parent = self
+            .engine
+            .as_ref()
+            .ok_or(SwiftIbdError::Fallback("driver is closed"))?
+            .tip()
+            .1;
+        if self.pending.is_some() || block.header.prev_block_hash != expected_parent {
+            let block_hash = block.block_hash();
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.block.block_hash() == block_hash)
+                || self
+                    .queued
+                    .iter()
+                    .any(|queued| queued.block.block_hash() == block_hash)
+            {
+                return Ok(SwiftBlockStart::Queued);
+            }
+            let encoded_bytes = block.size_with_witness();
+            let decoded_reservation = encoded_bytes.saturating_mul(64).saturating_add(4096);
+            if !swift_body_fits_queue(
+                self.queued.len(),
+                self.queued_bytes,
+                self.retained_decoded_bytes,
+                self.pending.is_some(),
+                encoded_bytes,
+            ) {
+                return Err(SwiftIbdError::Fallback(
+                    "ordered captured-body queue reached its bound",
+                ));
+            }
+            self.queued_bytes += encoded_bytes;
+            self.retained_decoded_bytes += decoded_reservation;
+            self.queued.push_back(QueuedBody {
+                peer_id,
+                block,
+                encoded_bytes,
+            });
+            return Ok(SwiftBlockStart::Queued);
+        }
+        let encoded_bytes = block.size_with_witness();
+        let decoded_reservation = encoded_bytes.saturating_mul(64).saturating_add(4096);
+        if decoded_reservation > MAX_RETAINED_SWIFT_DECODED_BYTES {
+            return Err(SwiftIbdError::Fallback(
+                "captured body exceeds the retained decode budget",
+            ));
+        }
+        self.retained_decoded_bytes = self
+            .retained_decoded_bytes
+            .checked_add(decoded_reservation)
+            .filter(|total| *total <= MAX_RETAINED_SWIFT_DECODED_BYTES)
+            .ok_or(SwiftIbdError::Fallback(
+                "captured bodies exceed the retained decode budget",
+            ))?;
         let engine = self
             .engine
             .as_mut()
@@ -287,17 +404,52 @@ impl SwiftIbdDriver {
                 .pending
                 .take()
                 .ok_or(SwiftIbdError::Fallback("pending block disappeared"))?;
-            Ok(SwiftBlockStart::Processed(self.process_block(
-                pending.block,
-                Vec::new(),
-                now,
-            )?))
+            let pending_bytes = pending
+                .block
+                .size_with_witness()
+                .saturating_mul(64)
+                .saturating_add(4096);
+            let result = self.process_block(pending.block, Vec::new(), now);
+            self.retained_decoded_bytes = self.retained_decoded_bytes.saturating_sub(pending_bytes);
+            Ok(SwiftBlockStart::Processed(result?))
         } else {
             Ok(SwiftBlockStart::NeedsSpentCoins {
                 request,
                 input_indices: indices,
             })
         }
+    }
+
+    /// Starts the next retained body after the preceding body was checked.
+    /// The caller owns peer scheduling and must send any returned request.
+    pub fn start_queued_block(
+        &mut self,
+        now: u32,
+    ) -> Result<Option<(u64, SwiftBlockStart)>, SwiftIbdError> {
+        if self.pending.is_some() || self.completed.is_some() {
+            return Ok(None);
+        }
+        let expected_parent = self
+            .engine
+            .as_ref()
+            .ok_or(SwiftIbdError::Fallback("driver is closed"))?
+            .tip()
+            .1;
+        let Some(index) = next_swift_body_index(&self.queued, expected_parent) else {
+            return Ok(None);
+        };
+        let queued = self
+            .queued
+            .remove(index)
+            .ok_or(SwiftIbdError::Fallback("queued body disappeared"))?;
+        self.queued_bytes = self.queued_bytes.saturating_sub(queued.encoded_bytes);
+        let peer_id = queued.peer_id;
+        let decoded_reservation = queued.encoded_bytes.saturating_mul(64).saturating_add(4096);
+        self.retained_decoded_bytes = self
+            .retained_decoded_bytes
+            .saturating_sub(decoded_reservation);
+        self.begin_block(peer_id, queued.block, now)
+            .map(|start| Some((peer_id, start)))
     }
 
     /// Binds the peer's response to the one pending locally parsed block and validates it.
@@ -311,11 +463,18 @@ impl SwiftIbdDriver {
             .pending
             .take()
             .ok_or(SwiftIbdError::Fallback("unsolicited spent-coin response"))?;
+        let pending_bytes = pending
+            .block
+            .size_with_witness()
+            .saturating_mul(64)
+            .saturating_add(4096);
         if pending.peer_id != peer_id {
             return Err(SwiftIbdError::Fallback("spent-coin provider changed"));
         }
         let claims = pending.plan.bind_response(peer_id, response)?;
-        self.process_block(pending.block, claims, now)
+        let result = self.process_block(pending.block, claims, now);
+        self.retained_decoded_bytes = self.retained_decoded_bytes.saturating_sub(pending_bytes);
+        result
     }
 
     fn process_block(
@@ -474,5 +633,124 @@ fn stump_limits() -> SwiftStumpLimits {
         max_pending_bytes: 256 * 1024 * 1024,
         max_batch_leaves: 4_000_000,
         max_batch_bytes: 256 * 1024 * 1024,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use avila_consensus::arith::CompactTarget;
+    use avila_consensus::hash::MerkleRoot;
+    use avila_consensus::header::BlockHeader;
+
+    fn queued_body(parent: u8) -> QueuedBody {
+        QueuedBody {
+            peer_id: u64::from(parent),
+            block: Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_block_hash: BlockHash::from_bytes([parent; 32]),
+                    merkle_root: MerkleRoot::from_bytes([0; 32]),
+                    time: 0,
+                    bits: CompactTarget(0),
+                    nonce: 0,
+                },
+                transactions: Vec::new(),
+            },
+            encoded_bytes: 80,
+        }
+    }
+
+    fn insert_queued(
+        queued: &mut VecDeque<QueuedBody>,
+        queued_bytes: &mut usize,
+        retained_decoded_bytes: &mut usize,
+        has_pending: bool,
+        body: QueuedBody,
+    ) -> bool {
+        let encoded = body.encoded_bytes;
+        let decoded = encoded * 64 + 4096;
+        if !swift_body_fits_queue(
+            queued.len(),
+            *queued_bytes,
+            *retained_decoded_bytes,
+            has_pending,
+            encoded,
+        ) {
+            return false;
+        }
+        *queued_bytes += encoded;
+        *retained_decoded_bytes += decoded;
+        queued.push_back(body);
+        true
+    }
+
+    #[test]
+    fn four_body_window_accepts_expected_parent_as_fourth_out_of_order_arrival() {
+        let mut queued = VecDeque::new();
+        let (mut bytes, mut decoded) = (0, 0);
+        for parent in [1, 2, 3] {
+            assert!(insert_queued(
+                &mut queued,
+                &mut bytes,
+                &mut decoded,
+                false,
+                queued_body(parent),
+            ));
+        }
+        // The three future bodies do not advance the provisional tip. The matching
+        // body may still arrive fourth and is selected once its parent is expected.
+        let provisional_tip = BlockHash::from_bytes([9; 32]);
+        assert!(insert_queued(
+            &mut queued,
+            &mut bytes,
+            &mut decoded,
+            false,
+            queued_body(9),
+        ));
+        assert_eq!(provisional_tip, BlockHash::from_bytes([9; 32]));
+        let expected_parent = provisional_tip;
+        assert_eq!(next_swift_body_index(&queued, expected_parent), Some(3));
+        let before_fifth = (queued.len(), bytes, decoded, provisional_tip);
+        assert!(!insert_queued(
+            &mut queued,
+            &mut bytes,
+            &mut decoded,
+            false,
+            queued_body(10),
+        ));
+        assert_eq!(
+            (queued.len(), bytes, decoded, provisional_tip),
+            before_fifth,
+            "a fifth body must fail without changing queue/accounting/tip"
+        );
+        queued.remove(3);
+        assert_eq!(queued.len(), 3);
+        assert_eq!(next_swift_body_index(&queued, expected_parent), None);
+    }
+
+    #[test]
+    fn pending_body_plus_three_queued_bodies_is_the_four_body_limit() {
+        let mut queued = VecDeque::new();
+        let (mut bytes, mut decoded) = (0, 80 * 64 + 4096); // active claim body
+        for parent in [1, 2, 3] {
+            assert!(insert_queued(
+                &mut queued,
+                &mut bytes,
+                &mut decoded,
+                true,
+                queued_body(parent),
+            ));
+        }
+        assert_eq!(queued.len(), 3);
+        let before_fifth = (queued.len(), bytes, decoded);
+        assert!(!insert_queued(
+            &mut queued,
+            &mut bytes,
+            &mut decoded,
+            true,
+            queued_body(4),
+        ));
+        assert_eq!((queued.len(), bytes, decoded), before_fifth);
     }
 }

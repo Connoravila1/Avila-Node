@@ -41,6 +41,10 @@ pub const MAX_BLOCKS_IN_TRANSIT_TOTAL: usize = 1024;
 /// independent of network reservations, which are released on capture.
 const MAX_SWIFT_PENDING_BLOCKS: usize = 4;
 
+fn swift_capture_slots(pending: usize, reserved: usize) -> usize {
+    MAX_SWIFT_PENDING_BLOCKS.saturating_sub(pending.saturating_add(reserved))
+}
+
 /// Seconds between initiated BIP330 reconciliation rounds per link —
 /// BIP-330 paces ~1/s per link on mainnet-scale pools; we start
 /// conservative (a round is cheap — one sketch each way).
@@ -2910,11 +2914,17 @@ impl<S: Read + Write> PeerManager<S> {
                 }
             }
         }
+        let swift_pending_blocks = &self.swift_pending_blocks;
+        let swift_window_free = if swift_capture {
+            swift_capture_slots(swift_pending_blocks.len(), reserved.len())
+        } else {
+            usize::MAX
+        };
         let want_total = self
             .max_in_flight_total
             .saturating_sub(reserved.len())
-            .min(if swift_capture { 1 } else { usize::MAX });
-        let swift_pending_blocks = &self.swift_pending_blocks;
+            .min(if swift_capture { 1 } else { usize::MAX })
+            .min(swift_window_free);
         let candidates: Vec<(u32, BlockHash)> = self.fetch_index[start..]
             .iter()
             .copied()
@@ -5284,6 +5294,15 @@ fn headers_download_deadline(cs: &Chainstate, now: u32) -> Instant {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swift_fetch_slots_bound_pending_bodies_and_network_reservations_together() {
+        assert_eq!(swift_capture_slots(0, 0), 4);
+        assert_eq!(swift_capture_slots(1, 0), 3);
+        assert_eq!(swift_capture_slots(1, 2), 1);
+        assert_eq!(swift_capture_slots(4, 0), 0);
+        assert_eq!(swift_capture_slots(3, 1), 0);
+    }
     use crate::message::{
         AddrEntry, GetHeaders, InvType, InvVector, NODE_NETWORK, PROTOCOL_VERSION, Version,
     };

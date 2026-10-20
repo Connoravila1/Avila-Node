@@ -889,6 +889,65 @@ fn promote_swift_checkpoint(
     Ok(())
 }
 
+/// Completes the manager reservation for a checked provisional block, advances the
+/// separate fetch frontier, and drains bodies retained while a prior BIP455 request
+/// was in flight. The driver enforces parent order and its own count/byte ceilings.
+struct SwiftAdvanceContext<'a> {
+    options: &'a crate::swift_ibd::SwiftIbdOptions,
+    params: &'a Params,
+    cfg: &'a SyncConfig,
+    now: u32,
+}
+
+fn continue_swift_after_progress<S: io::Read + io::Write>(
+    mut progress: crate::swift_ibd::SwiftBlockProgress,
+    mgr: &mut PeerManager<S>,
+    driver: &mut Option<crate::swift_ibd::SwiftIbdDriver>,
+    context: SwiftAdvanceContext<'_>,
+    cs: &mut Chainstate,
+) -> Result<bool, String> {
+    loop {
+        mgr.complete_swift_block(progress.hash);
+        let current = driver
+            .as_mut()
+            .ok_or_else(|| "Swift driver missing after block check".to_string())?;
+        mgr.set_swift_fetch_window(
+            Some((
+                context.options.checkpoint_height,
+                context.options.checkpoint_hash,
+            )),
+            Some(current.tip()),
+        );
+        if progress.checkpoint_reached {
+            promote_swift_checkpoint(cs, driver, context.params, context.cfg, context.now)?;
+            mgr.set_swift_block_capture(false);
+            mgr.set_swift_spent_requests(false);
+            mgr.set_swift_fetch_window(None, None);
+            return Ok(true);
+        }
+        let Some((peer, start)) = current
+            .start_queued_block(context.now)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        match start {
+            crate::swift_ibd::SwiftBlockStart::Queued => {
+                return Err("Swift driver requeued a body while draining".into());
+            }
+            crate::swift_ibd::SwiftBlockStart::NeedsSpentCoins {
+                request,
+                input_indices,
+            } => {
+                mgr.request_spent_coins(peer, request, &input_indices)
+                    .map_err(|error| error.to_string())?;
+                return Ok(false);
+            }
+            crate::swift_ibd::SwiftBlockStart::Processed(next) => progress = next,
+        }
+    }
+}
+
 fn unix_now() -> u32 {
     // `GetTime`: honors `setmocktime` so acceptance and scheduler
     // timestamps stay on the mocked clock, like Core.
@@ -2238,6 +2297,7 @@ fn run_inner(
                             .begin_block(peer, *block, unix_now())
                             .map_err(|error| error.to_string())?
                         {
+                            crate::swift_ibd::SwiftBlockStart::Queued => Ok(()),
                             crate::swift_ibd::SwiftBlockStart::NeedsSpentCoins {
                                 request,
                                 input_indices,
@@ -2245,26 +2305,20 @@ fn run_inner(
                                 .request_spent_coins(peer, request, &input_indices)
                                 .map_err(|error| error.to_string()),
                             crate::swift_ibd::SwiftBlockStart::Processed(progress) => {
-                                mgr.complete_swift_block(progress.hash);
                                 let target =
                                     swift_options.as_ref().ok_or("Swift options missing")?;
-                                mgr.set_swift_fetch_window(
-                                    Some((target.checkpoint_height, target.checkpoint_hash)),
-                                    Some(driver.tip()),
-                                );
-                                if progress.checkpoint_reached {
-                                    promote_swift_checkpoint(
-                                        &mut cs,
-                                        &mut swift_driver,
+                                swift_active = !continue_swift_after_progress(
+                                    progress,
+                                    &mut mgr,
+                                    &mut swift_driver,
+                                    SwiftAdvanceContext {
+                                        options: target,
                                         params,
                                         cfg,
-                                        unix_now(),
-                                    )?;
-                                    swift_active = false;
-                                    mgr.set_swift_block_capture(false);
-                                    mgr.set_swift_spent_requests(false);
-                                    mgr.set_swift_fetch_window(None, None);
-                                }
+                                        now: unix_now(),
+                                    },
+                                    &mut cs,
+                                )?;
                                 Ok(())
                             }
                         }
@@ -2279,26 +2333,19 @@ fn run_inner(
                         let progress = driver
                             .accept_spent_coins(peer, response, unix_now())
                             .map_err(|error| error.to_string())?;
-                        mgr.complete_swift_block(progress.hash);
-                        let (height, hash) = driver.tip();
                         let target = swift_options.as_ref().ok_or("Swift options missing")?;
-                        mgr.set_swift_fetch_window(
-                            Some((target.checkpoint_height, target.checkpoint_hash)),
-                            Some((height, hash)),
-                        );
-                        if progress.checkpoint_reached {
-                            promote_swift_checkpoint(
-                                &mut cs,
-                                &mut swift_driver,
+                        swift_active = !continue_swift_after_progress(
+                            progress,
+                            &mut mgr,
+                            &mut swift_driver,
+                            SwiftAdvanceContext {
+                                options: target,
                                 params,
                                 cfg,
-                                unix_now(),
-                            )?;
-                            swift_active = false;
-                            mgr.set_swift_block_capture(false);
-                            mgr.set_swift_spent_requests(false);
-                            mgr.set_swift_fetch_window(None, None);
-                        }
+                                now: unix_now(),
+                            },
+                            &mut cs,
+                        )?;
                         Ok(())
                     })();
                     if let Err(error) = result {
