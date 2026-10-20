@@ -272,3 +272,32 @@ cgroup bytes and 3,997,360,128 peak bytes under the 4,294,967,296-byte limit,
 with zero memory-max, OOM, and OOM-kill events. These are point-in-time runtime
 observations, not a performance claim. Mainnet-scale helper-backed Swift IBD
 and whole-IBD speedup remain unqualified.
+
+### Final source and runtime follow-up
+
+The exact published source `ba710e101cefc73ecdb6b89834631eda530a2869`
+(tree `9a6c8470443cc5ecbaac0393cee5a1fe9c3bb52c`) passed GitHub Actions run
+[39478010087](https://github.com/Connoravila1/Avila-Node/actions/runs/39478010087),
+including its Linux workspace and reproducible release jobs. Its qualified CLI
+SHA256 is `dc64cf2d9a684239b355c143bfdfec835423d50bba85a39a1508830081576570`;
+it is installed while the previous CLI/receipt remain preserved and the GUI
+binary remains unchanged. The exact CI response and source identity are private
+receipts alongside the install gate record.
+
+The node cleanly stopped at height 331,859 and the restarted process passed the
+automatic restart check at that height. Both saved checkpoint hashes matched:
+height 331,833 at
+`00000000000000000c6da2d95bd25cc0f9d4c2e4ab28bf1437a2e6099ec601cf`, and
+height 331,859 at
+`000000000000000019388bf5b12b0c100d570cf53d3b309e5b7052833e13440c`. The
+latest observed status at 2026-10-20 19:00:44 UTC was syncing at height 332,366,
+with full-validation coverage from genesis, no AssumeValid checkpoint, and
+historical scripts required; a fresh CLI RPC query succeeded at height 332,389.
+A transient `waiting_for_rpc` status had cleared by then. A PID-bound health
+trace and 14-day sampler for
+heights 600,000–600,127 are armed; the sampler result is pending. The first
+health sample recorded 3,809,837,056 current / 3,861,565,440 peak cgroup bytes
+under the 4,294,967,296-byte limit, with zero memory-max, OOM, and OOM-kill
+events. Ordinary IBD is active and Swift remains opt-in/off. These observations
+do not establish a whole-IBD speedup. The final private runtime receipt is
+`~/.local/state/avila-review/ibd-runtime-handoff-ba710e1-20261020.json`.

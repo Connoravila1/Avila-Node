@@ -2586,3 +2586,38 @@ so the test first pre-seeded only the headers through ordinary `submitheader`
 RPC with production parameters; it did not lower consensus or anti-DoS rules.
 The CLI hash, private result JSON hash, scoped gates, and reproduction command
 are in the [self-hosted Swift note](2026-10-20-self-hosted-swift-mainnet.md).
+
+## 2026-10-20 — final published Swift candidate resumed ordinary IBD
+
+The exact published source `ba710e101cefc73ecdb6b89834631eda530a2869`
+(tree `9a6c8470443cc5ecbaac0393cee5a1fe9c3bb52c`, public main
+`156e874d7e2dd3708d9916f3fd9f731043c3bd44`) passed GitHub Actions run
+[39478010087](https://github.com/Connoravila1/Avila-Node/actions/runs/39478010087)
+for the Linux workspace and reproducible release jobs. The installed CLI SHA256
+is `dc64cf2d9a684239b355c143bfdfec835423d50bba85a39a1508830081576570`; its
+previous CLI and validation receipt were preserved, and the GUI binary was left
+untouched. The remote CI response, exact-source identity, install gates, and
+artifact hashes are retained in the private validation directory.
+
+After a clean service stop at height 331,859, the managed service restarted
+with the new CLI and passed its automatic restart check at that same height.
+Direct checkpoint queries matched both the saved height 331,833 hash
+`00000000000000000c6da2d95bd25cc0f9d4c2e4ab28bf1437a2e6099ec601cf` and the
+stopped height 331,859 hash
+`000000000000000019388bf5b12b0c100d570cf53d3b309e5b7052833e13440c`. At
+2026-10-20 19:00:44 UTC, status reported height 332,366 with full-validation
+coverage from genesis, `assume_valid_checkpoint: null`, and historical scripts
+required; a fresh CLI RPC query also succeeded at height 332,389. A transient
+`waiting_for_rpc` supervisor status had cleared by this observation. The service
+is active; the health trace and 14-day height 600,000–600,127
+sampler are armed for the current node PID, with sampler result pending. The
+trace's first sample showed 3,809,837,056 current and 3,861,565,440 peak cgroup
+bytes under a 4,294,967,296-byte limit, with zero memory-max, OOM, or OOM-kill
+events. This is a point-in-time memory observation, not a speed claim. The
+separate Swift helper path remains off for ordinary IBD.
+
+The final runtime receipt is
+`~/.local/state/avila-review/ibd-runtime-handoff-ba710e1-20261020.json`; the
+saved checkpoint, stopped-state, resume, sampler, and health-trace receipts are
+also retained privately. Whole-IBD performance and helper-backed mainnet IBD
+remain unqualified.
