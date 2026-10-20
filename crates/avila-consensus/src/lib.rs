@@ -34,6 +34,7 @@ pub mod psbt;
 pub mod rules;
 pub mod runs;
 pub mod script;
+mod secp_fast;
 pub mod sigbatch;
 pub mod sigchecker;
 pub mod sign;

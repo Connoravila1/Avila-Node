@@ -263,6 +263,10 @@ impl PartialMerkleTree {
 /// `mutated` root the same as an invalid one.
 #[must_use]
 pub fn merkle_root(leaves: &[[u8; 32]]) -> ([u8; 32], bool) {
+    merkle_root_with_avx2(leaves, true)
+}
+
+fn merkle_root_with_avx2(leaves: &[[u8; 32]], use_avx2: bool) -> ([u8; 32], bool) {
     let mut hashes = leaves.to_vec();
     let mut mutated = false;
     while hashes.len() > 1 {
@@ -285,14 +289,7 @@ pub fn merkle_root(leaves: &[[u8; 32]]) -> ([u8; 32], bool) {
             remainder.is_empty(),
             "the odd-length duplication above evens the length"
         );
-        let mut next = Vec::with_capacity(pairs.len());
-        for pair in pairs {
-            let mut buf = [0u8; 64];
-            buf[..32].copy_from_slice(&pair[0]);
-            buf[32..].copy_from_slice(&pair[1]);
-            next.push(sha256d(&buf));
-        }
-        hashes = next;
+        hashes = hash_merkle_pairs(pairs, use_avx2);
     }
     match hashes.first() {
         Some(&root) => (root, mutated),
@@ -300,6 +297,38 @@ pub fn merkle_root(leaves: &[[u8; 32]]) -> ([u8; 32], bool) {
         // `mutated` is still its initial `false`.
         None => ([0u8; 32], mutated),
     }
+}
+
+fn hash_merkle_pairs(pairs: &[[[u8; 32]; 2]], use_avx2: bool) -> Vec<[u8; 32]> {
+    let mut next = Vec::with_capacity(pairs.len());
+    let (groups, remainder) = pairs.as_chunks::<8>();
+
+    if use_avx2 {
+        for group in groups {
+            if let Some(output) = avila_sha256d64::try_sha256d64_8(group) {
+                next.extend(output);
+            } else {
+                for pair in group {
+                    next.push(hash_merkle_pair(pair));
+                }
+            }
+        }
+        for pair in remainder {
+            next.push(hash_merkle_pair(pair));
+        }
+    } else {
+        for pair in pairs {
+            next.push(hash_merkle_pair(pair));
+        }
+    }
+    next
+}
+
+fn hash_merkle_pair(pair: &[[u8; 32]; 2]) -> [u8; 32] {
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(&pair[0]);
+    buf[32..].copy_from_slice(&pair[1]);
+    sha256d(&buf)
 }
 
 #[cfg(test)]
@@ -374,6 +403,44 @@ mod tests {
         let leaves = [[0x01; 32], [0x02; 32], [0x03; 32], [0x04; 32]];
         let (_root, mutated) = merkle_root(&leaves);
         assert!(!mutated);
+    }
+
+    #[test]
+    fn sha256d64_batch_matches_scalar_at_boundaries_and_in_merkle_trees() {
+        for pair_count in [1usize, 2, 7, 8, 9, 16, 513] {
+            let pairs: Vec<[[u8; 32]; 2]> = (0..pair_count)
+                .map(|i| {
+                    let left = sha256d(&(i as u64).to_le_bytes());
+                    let right = sha256d(&(!(i as u64)).to_le_bytes());
+                    [left, right]
+                })
+                .collect();
+            assert_eq!(
+                hash_merkle_pairs(&pairs, true),
+                hash_merkle_pairs(&pairs, false),
+                "pair count {pair_count}"
+            );
+        }
+
+        for leaf_count in [1usize, 2, 7, 8, 9, 16, 17, 2049] {
+            let leaves: Vec<[u8; 32]> = (0..leaf_count)
+                .map(|i| sha256d(&(i as u64).to_le_bytes()))
+                .collect();
+            assert_eq!(
+                merkle_root_with_avx2(&leaves, true),
+                merkle_root_with_avx2(&leaves, false),
+                "leaf count {leaf_count}"
+            );
+
+            if leaf_count >= 2 {
+                let mut mutated = leaves.clone();
+                mutated[1] = mutated[0];
+                let fast = merkle_root_with_avx2(&mutated, true);
+                let scalar = merkle_root_with_avx2(&mutated, false);
+                assert_eq!(fast, scalar, "mutated leaf count {leaf_count}");
+                assert!(fast.1, "expected duplicate-pair mutation at {leaf_count}");
+            }
+        }
     }
 
     #[test]

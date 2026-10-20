@@ -35,7 +35,8 @@
 //!
 //! [`HeaderTree`]: crate::chain::HeaderTree
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
@@ -121,6 +122,82 @@ pub struct Coin {
 /// since the last flush.
 type CacheMap = HashMap<OutPoint, Option<Coin>>;
 
+/// Bounded FIFO of clean backend hits retained across dirty flushes. Dirty
+/// values and tombstones remain in `map` and always shadow this read cache.
+#[derive(Debug, Clone, Default)]
+struct CleanCoinCache {
+    coins: HashMap<OutPoint, CleanCoinEntry>,
+    order: VecDeque<(OutPoint, u64)>,
+    bytes: usize,
+    next_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CleanCoinEntry {
+    coin: Coin,
+    generation: u64,
+    bytes: usize,
+}
+
+impl CleanCoinCache {
+    const BYTE_BUDGET: usize = 16 * 1024 * 1024;
+    const ENTRY_BUDGET: usize = 4096;
+    const QUEUE_BUDGET: usize = Self::ENTRY_BUDGET * 2;
+
+    fn get(&self, outpoint: &OutPoint) -> Option<Coin> {
+        self.coins.get(outpoint).map(|entry| entry.coin.clone())
+    }
+
+    fn insert(&mut self, outpoint: OutPoint, coin: Coin) {
+        if let Some(old) = self.coins.remove(&outpoint) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        }
+        let bytes = entry_bytes(Some(&coin));
+        // A single unusually large script must not flush every useful hot
+        // entry just to make room for a value that cannot fit the budget.
+        if bytes > Self::BYTE_BUDGET {
+            return;
+        }
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        let generation = self.next_generation;
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.coins.insert(
+            outpoint,
+            CleanCoinEntry {
+                coin,
+                generation,
+                bytes,
+            },
+        );
+        self.order.push_back((outpoint, generation));
+        while self.bytes > Self::BYTE_BUDGET
+            || self.coins.len() > Self::ENTRY_BUDGET
+            || self.order.len() > Self::QUEUE_BUDGET
+        {
+            if let Some((oldest, generation)) = self.order.pop_front()
+                && self
+                    .coins
+                    .get(&oldest)
+                    .is_some_and(|entry| entry.generation == generation)
+                && let Some(removed) = self.coins.remove(&oldest)
+            {
+                self.bytes = self.bytes.saturating_sub(removed.bytes);
+            }
+        }
+    }
+
+    fn invalidate(&mut self, outpoint: &OutPoint) {
+        if let Some(old) = self.coins.remove(outpoint) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        }
+    }
+}
+
+fn clean_cache_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("AVILA_CLEAN_CACHE").ok().as_deref() != Some("0"))
+}
+
 /// Rough in-memory size of one cache entry — key + `Coin` + map
 /// overhead. Used for the `-dbcache` budget signal only; precision to
 /// the byte isn't required, the order of magnitude is.
@@ -137,10 +214,10 @@ fn entry_bytes(coin: Option<&Coin>) -> usize {
 ///   2. `base` — a moved-in parent view (reorg simulation overlay)
 ///   3. `backend` — the persisted `redb` coins table
 ///
-/// The cache is *write-back only*: reads that miss `map` go straight
-/// to the backend's mmap index rather than being cached, so `map`
-/// holds only state that must eventually flush. When `map` exceeds
-/// `budget` bytes the caller flushes it — commits are atomic
+/// The write-back map holds only changes that must eventually flush;
+/// backend read hits live in a separate, byte-bounded clean cache and
+/// are never part of a commit. When `map` exceeds `budget` bytes the
+/// caller flushes it — commits are atomic
 /// coins+undo+tip transactions, so they may only happen at block
 /// boundaries; a single block's dirty set may transiently exceed the
 /// budget (Core's cache behaves the same way during `ConnectBlock`).
@@ -169,9 +246,9 @@ pub struct UtxoSet {
     /// tracks the map's net contribution so `len()` stays O(1).
     live_delta: i64,
     /// Outpoints created since the last flush with no lower-layer
-    /// presence — "born in memory". A tombstone on a born key is a
-    /// delete of a key the backend never saw: pure waste, elided at
-    /// commit. Cleared on flush.
+    /// presence — "born in memory". Spending or removing a born coin
+    /// drops the map entry immediately because no lower layer needs a
+    /// tombstone. Cleared on flush.
     born: std::collections::HashSet<OutPoint>,
     /// SwiftSync mode: `Some` keeps the running tag aggregate —
     /// `agg == Σ coin_tag(live)` across every mutation (experiment
@@ -217,6 +294,12 @@ pub struct UtxoSet {
     /// `coinsdb/runs/` — `Some` selects the sorted-run flush path
     /// (`AVILA_RUNS=1` at backend attach).
     runs_dir: Option<std::path::PathBuf>,
+    /// Clean backend hits survive bounded dirty flushes. The map above still
+    /// owns every uncommitted write and deletion.
+    clean: Mutex<CleanCoinCache>,
+    /// Bounded candidates for clean-cache promotion after the matching dirty
+    /// commit lands. It contains only currently live dirty values.
+    warm: CleanCoinCache,
 }
 
 /// In-flight commit state — see [`UtxoSet::flushing`]. Flushes
@@ -237,6 +320,10 @@ struct FlushLayer {
     /// `len()` stop counting `delta` the moment the backend's own
     /// `coins_len` includes it (the land-before-join window).
     tip: u32,
+    /// Bounded clean-cache candidates captured from this commit's dirty
+    /// values. Entries are promoted only after success and only if the new
+    /// dirty map does not shadow them.
+    warm: CleanCoinCache,
 }
 
 impl Default for UtxoSet {
@@ -258,6 +345,8 @@ impl Default for UtxoSet {
             runs: Vec::new(),
             runs_seq: 0,
             runs_dir: None,
+            clean: Mutex::new(CleanCoinCache::default()),
+            warm: CleanCoinCache::default(),
         }
     }
 }
@@ -281,6 +370,9 @@ impl UtxoSet {
     /// in-memory map.
     pub fn attach_backend(&mut self, backend: crate::coinsdb::CoinsBackend) {
         self.backend = Some(std::sync::Arc::new(backend));
+        let clean = self.clean.get_mut().unwrap_or_else(|e| e.into_inner());
+        clean.coins.clear();
+        clean.order.clear();
         if self.flat.is_some() {
             self.rebuild_flat(usize::MAX);
         }
@@ -291,6 +383,9 @@ impl UtxoSet {
     /// the same one here.
     pub fn attach_shared(&mut self, backend: std::sync::Arc<crate::coinsdb::CoinsBackend>) {
         self.backend = Some(backend);
+        let clean = self.clean.get_mut().unwrap_or_else(|e| e.into_inner());
+        clean.coins.clear();
+        clean.order.clear();
         if self.flat.is_some() {
             self.rebuild_flat(usize::MAX);
         }
@@ -613,11 +708,17 @@ impl UtxoSet {
     }
 
     /// The coin at `outpoint` — layered lookup: dirty map, then the
-    /// simulation base, then the disk backend. Backend reads are not
-    /// cached in `map` (the cache is write-back only); `redb`'s mmap
-    /// lookups are cheap enough that read-caching buys little.
+    /// simulation base, then clean read cache/backend.
     #[must_use]
     pub fn get(&self, outpoint: &OutPoint) -> Option<Coin> {
+        self.get_with_prefetched(outpoint, None)
+    }
+
+    fn get_with_prefetched(
+        &self,
+        outpoint: &OutPoint,
+        prefetched: Option<&HashMap<OutPoint, Option<Coin>>>,
+    ) -> Option<Coin> {
         if let Some(entry) = self.map.get(outpoint) {
             return entry.clone();
         }
@@ -641,12 +742,75 @@ impl UtxoSet {
             return f.get(outpoint);
         }
         if let Some(be) = &self.backend {
-            return be.get(outpoint);
+            if clean_cache_enabled()
+                && let Some(coin) = self
+                    .clean
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(outpoint)
+            {
+                return Some(coin);
+            }
+            let coin = prefetched
+                .and_then(|p| p.get(outpoint))
+                .cloned()
+                .unwrap_or_else(|| be.get(outpoint));
+            if clean_cache_enabled()
+                && let Some(c) = &coin
+            {
+                self.clean
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(*outpoint, c.clone());
+            }
+            return coin;
         }
         if let Some(snap) = &self.snapshot {
             return snap.get(outpoint);
         }
         None
+    }
+
+    fn prefetch_backend(
+        &self,
+        outpoints: &[OutPoint],
+        workers: usize,
+    ) -> HashMap<OutPoint, Option<Coin>> {
+        self.backend
+            .as_deref()
+            .map_or_else(HashMap::new, |backend| backend.get_many(outpoints, workers))
+    }
+
+    fn promote_warm(&mut self, warm: CleanCoinCache) {
+        if !clean_cache_enabled() {
+            return;
+        }
+        let clean = self.clean.get_mut().unwrap_or_else(|e| e.into_inner());
+        for (outpoint, entry) in warm.coins {
+            // A block may have changed the same outpoint while the commit
+            // worker ran. Keep its fresh dirty value/tombstone authoritative.
+            if !self.map.contains_key(&outpoint) {
+                clean.insert(outpoint, entry.coin);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn clean_cache_len(&self) -> usize {
+        self.clean
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .coins
+            .len()
+    }
+
+    #[cfg(test)]
+    fn clean_cache_contains(&self, outpoint: &OutPoint) -> bool {
+        self.clean
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .coins
+            .contains_key(outpoint)
     }
 
     /// Borrowing view of `get` — returns the cached coin by reference
@@ -915,6 +1079,17 @@ impl UtxoSet {
     /// both an existing live map entry and a coin in a lower layer that
     /// this entry now shadows.
     fn put_raw(&mut self, outpoint: OutPoint, entry: Option<Coin>) {
+        self.clean
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate(&outpoint);
+        self.warm.invalidate(&outpoint);
+        if self.backend.is_some()
+            && clean_cache_enabled()
+            && let Some(coin) = &entry
+        {
+            self.warm.insert(outpoint, coin.clone());
+        }
         let was_live = match self.map.get(&outpoint) {
             Some(old) => old.is_some(),
             None => self.lower_live(&outpoint),
@@ -925,8 +1100,8 @@ impl UtxoSet {
         self.map_bytes += entry_bytes(entry.as_ref());
         self.live_delta += i64::from(entry.is_some()) - i64::from(was_live);
         // "Born this epoch" tracking: a `Some` insert whose key has no
-        // lower-layer presence and no live map entry. Tombstones on
-        // born keys are elided at commit — the backend never saw them.
+        // lower-layer presence and no live map entry. A spent born key is
+        // removed immediately because the backend never saw it.
         // `Some`→`Some` overwrites leave `born` untouched (status
         // already correct); tombstone→`Some` re-checks `lower_live` —
         // a backend-resident key must NOT be born (its tombstone is
@@ -954,6 +1129,11 @@ impl UtxoSet {
     /// with `moveout`). Misses `map` fall through to base/backend and
     /// leave a tombstone.
     fn spend(&mut self, outpoint: &OutPoint) -> Option<Coin> {
+        self.clean
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate(outpoint);
+        self.warm.invalidate(outpoint);
         if let Some(entry) = self.map.get_mut(outpoint) {
             self.map_bytes = self.map_bytes.saturating_sub(entry_bytes(entry.as_ref()));
             let taken = entry.take();
@@ -961,6 +1141,12 @@ impl UtxoSet {
                 self.live_delta -= 1;
                 if let Some(agg) = &mut self.swift {
                     agg.sub(&crate::swiftsync::coin_tag(outpoint, c));
+                }
+                // A coin created in this unflushed epoch has no lower-layer
+                // value to delete. Remove its entry now so a later flush
+                // never scans the dirty map to elide a born-key tombstone.
+                if self.born.remove(outpoint) {
+                    self.map.remove(outpoint);
                 }
             }
             return taken;
@@ -985,6 +1171,11 @@ impl UtxoSet {
     ///   being disconnected during rewind) — shadow it with a
     ///   tombstone so the removal reaches the backend on commit.
     fn remove_entry(&mut self, outpoint: &OutPoint) {
+        self.clean
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate(outpoint);
+        self.warm.invalidate(outpoint);
         if self.swift.is_some() {
             // The set delta is "remove the visible coin once" — the
             // shadowed lower coin is not live, so it contributes
@@ -1000,6 +1191,7 @@ impl UtxoSet {
             self.map_bytes = self.map_bytes.saturating_sub(entry_bytes(old.as_ref()));
             self.live_delta -= i64::from(old.is_some()) - i64::from(self.lower_live(outpoint));
         }
+        self.born.remove(outpoint);
         if self.lower_live(outpoint) {
             self.put_raw(*outpoint, None);
         }
@@ -1079,6 +1271,8 @@ impl UtxoSet {
             runs: Vec::new(),
             runs_seq: 0,
             runs_dir: None,
+            clean: Mutex::new(CleanCoinCache::default()),
+            warm: CleanCoinCache::default(),
         }
     }
 
@@ -1160,26 +1354,23 @@ impl UtxoSet {
         // first lands (a snap-born key must be backend-resident before
         // the next epoch's deletes are interpreted against it).
         self.join_flush()?;
-        // Tombstone elision: a `None` entry over a born key deletes a
-        // coin the backend never saw — drop it before commit instead
-        // of issuing a useless backend delete.
-        if !self.born.is_empty() {
-            let born = &self.born;
-            self.map.retain(|op, e| e.is_some() || !born.contains(op));
-        }
         let snap: CacheMap = std::mem::take(&mut self.map);
-        let born = std::mem::take(&mut self.born);
+        let warm = std::mem::take(&mut self.warm);
+        // Born keys are always live here: spend/remove_entry elide their
+        // tombstones at mutation time, keeping flush independent of cache
+        // size. All remaining entries become lower-layer state after commit.
+        self.born.clear();
         let delta = self.live_delta;
         let bytes_taken = self.map_bytes;
         self.live_delta = 0;
         self.map_bytes = 0;
-        let _ = born; // elision already applied; the next epoch starts fresh
         let snap = std::sync::Arc::new(snap);
         self.flushing = Some(FlushLayer {
             snap: snap.clone(),
             delta,
             bytes: bytes_taken,
             tip,
+            warm,
         });
         if let Some(dir) = self.runs_dir.clone() {
             // LSM path: the worker writes the epoch as sorted-run
@@ -1231,6 +1422,7 @@ impl UtxoSet {
                 if let Some(f) = &mut self.flat {
                     f.apply_delta(&layer.snap);
                 }
+                self.promote_warm(layer.warm);
             }
             Err(e) => return Err(e),
         }
@@ -1275,14 +1467,12 @@ impl UtxoSet {
         // are already off the connect critical path, and a mid-import
         // flush must land before the next (interleaved ordering kept).
         self.join_flush()?;
-        if !self.born.is_empty() {
-            let born = &self.born;
-            self.map.retain(|op, e| e.is_some() || !born.contains(op));
-        }
         be.commit_partial(&self.map)?;
         if let Some(f) = &mut self.flat {
             f.apply_delta(&self.map);
         }
+        let warm = std::mem::take(&mut self.warm);
+        self.promote_warm(warm);
         self.map.clear();
         self.map_bytes = 0;
         self.live_delta = 0;
@@ -1310,6 +1500,7 @@ impl Clone for UtxoSet {
                 delta: l.delta,
                 bytes: l.bytes,
                 tip: l.tip,
+                warm: l.warm.clone(),
             }),
             // A clone never inherits the commit worker — joining is the
             // owning set's job (the snap layer carries the read state).
@@ -1319,6 +1510,8 @@ impl Clone for UtxoSet {
             runs: Vec::new(),
             runs_seq: self.runs_seq,
             runs_dir: self.runs_dir.clone(),
+            clean: Mutex::new(self.clean.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            warm: self.warm.clone(),
         }
     }
 }
@@ -1590,7 +1783,7 @@ pub fn block_subsidy(height: u32, params: &Params) -> i64 {
 
 /// Core's `IsBIP30Repeat`: `true` for the two historical blocks whose coinbases
 /// legitimately duplicated earlier ones.
-fn is_bip30_repeat(height: u32, hash: &BlockHash) -> bool {
+pub(crate) fn is_bip30_repeat(height: u32, hash: &BlockHash) -> bool {
     BIP30_REPEAT_BLOCKS
         .iter()
         .any(|(h, repeat_hash)| *h == height && repeat_hash == hash)
@@ -1607,7 +1800,7 @@ fn is_bip30_repeat(height: u32, hash: &BlockHash) -> bool {
 ///   already prevents future duplicate coinbases. A missing ancestor (chain
 ///   not yet that tall) or a missing configured hash (non-mainnet networks use
 ///   the null `uint256`, which matches nothing) keeps the scan on.
-fn enforce_bip30(height: u32, hash: &BlockHash, ctx: &ConnectContext<'_>) -> bool {
+pub(crate) fn enforce_bip30(height: u32, hash: &BlockHash, ctx: &ConnectContext<'_>) -> bool {
     if height >= BIP34_IMPLIES_BIP30_LIMIT {
         return true;
     }
@@ -1652,9 +1845,18 @@ pub fn check_tx_inputs(
     utxo: &UtxoSet,
     spend_height: u32,
 ) -> Result<(Vec<Coin>, i64), ConnectError> {
+    check_tx_inputs_using(tx, utxo, spend_height, None)
+}
+
+fn check_tx_inputs_using(
+    tx: &Transaction,
+    utxo: &UtxoSet,
+    spend_height: u32,
+    prefetched: Option<&HashMap<OutPoint, Option<Coin>>>,
+) -> Result<(Vec<Coin>, i64), ConnectError> {
     let mut spent = Vec::with_capacity(tx.inputs.len());
     for input in &tx.inputs {
-        match utxo.get(&input.previous_output) {
+        match utxo.get_with_prefetched(&input.previous_output, prefetched) {
             Some(coin) => spent.push(coin),
             None => return Err(ConnectError::InputsMissingOrSpent),
         }
@@ -1700,6 +1902,19 @@ pub fn check_tx_inputs(
         return Err(ConnectError::FeeOutOfRange);
     }
     Ok((spent, fee))
+}
+
+/// `AVILA_PREVOUT_WORKERS=0` disables block-wide prevout prefetch for an
+/// exact baseline; otherwise the default is two bounded read workers.
+fn prevout_prefetch_workers() -> usize {
+    static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        std::env::var("AVILA_PREVOUT_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(2)
+            .min(8)
+    })
 }
 
 /// Core's `CalculateSequenceLocks` + `EvaluateSequenceLocks`: whether `tx`'s
@@ -2383,13 +2598,41 @@ fn connect_block_inner(
     let mut created_coins = 0usize;
     let mut scripts_queued = 0usize;
 
+    // Resolve a bounded, deduplicated prefix of this block's disk prevouts
+    // before the serial state transition. The UTXO layers are checked again
+    // at consumption time, so same-block creations and earlier spends keep
+    // their ordinary precedence over this immutable read hint.
+    const MAX_PREFETCH_PREVOUTS: usize = 16_384;
+    let prefetch_workers = prevout_prefetch_workers();
+    let prefetched = if prefetch_workers == 0 || utxo.backend.is_none() {
+        HashMap::new()
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        let mut outpoints = Vec::with_capacity(MAX_PREFETCH_PREVOUTS);
+        'txs: for tx in &block.transactions {
+            if tx.is_coinbase() {
+                continue;
+            }
+            for input in &tx.inputs {
+                if seen.insert(input.previous_output) {
+                    outpoints.push(input.previous_output);
+                    if outpoints.len() == MAX_PREFETCH_PREVOUTS {
+                        break 'txs;
+                    }
+                }
+            }
+        }
+        utxo.prefetch_backend(&outpoints, prefetch_workers)
+    };
+
     let result = (|| -> Result<Option<std::sync::Arc<BlockCheck>>, ConnectError> {
         for (i, tx) in block.transactions.iter().enumerate() {
             let mut tx_undo = TxUndo::default();
             let mut spent = Vec::new();
             if !tx.is_coinbase() {
                 let t_read = std::time::Instant::now();
-                let (spent_coins, fee) = check_tx_inputs(tx, utxo, height)?;
+                let (spent_coins, fee) =
+                    check_tx_inputs_using(tx, utxo, height, Some(&prefetched))?;
                 tick(2, t_read);
                 spent = spent_coins;
                 fees = match fees.checked_add(fee) {
@@ -2829,6 +3072,232 @@ mod tests {
             value,
             script_pubkey: Script::new(script_pubkey),
         }
+    }
+
+    #[test]
+    fn prefetched_prevouts_preserve_dirty_layer_and_input_boundaries() {
+        let dir = std::env::temp_dir().join(format!("avila-prefetch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open(&dir).unwrap());
+        let persisted = OutPoint {
+            txid: Txid::from_bytes([0x71; 32]),
+            vout: 0,
+        };
+        let missing = OutPoint {
+            txid: Txid::from_bytes([0x72; 32]),
+            vout: 0,
+        };
+        let mut dirty = HashMap::new();
+        dirty.insert(
+            persisted,
+            Some(Coin {
+                out: txout(10, ANYONE.to_vec()),
+                height: 1,
+                coinbase: false,
+            }),
+        );
+        backend.commit_partial(&dirty).unwrap();
+
+        let mut set = UtxoSet::new();
+        set.attach_shared(backend);
+        let prefetched = set.prefetch_backend(&[persisted, missing], 2);
+        let tx = |inputs: Vec<OutPoint>| Transaction {
+            version: 1,
+            inputs: inputs
+                .into_iter()
+                .map(|op| txin(op, vec![], SEQUENCE_FINAL))
+                .collect(),
+            outputs: vec![txout(1, ANYONE.to_vec())],
+            lock_time: 0,
+        };
+
+        // A block mutation after prefetch shadows its stale disk read.
+        assert!(set.spend_coin(&persisted).is_some());
+        assert_eq!(
+            check_tx_inputs_using(&tx(vec![persisted]), &set, 2, Some(&prefetched)),
+            Err(ConnectError::InputsMissingOrSpent)
+        );
+        assert_eq!(
+            check_tx_inputs_using(&tx(vec![missing]), &set, 2, Some(&prefetched)),
+            Err(ConnectError::InputsMissingOrSpent)
+        );
+
+        // A same-block output takes precedence over the earlier disk miss.
+        let same_block = OutPoint {
+            txid: Txid::from_bytes([0x73; 32]),
+            vout: 0,
+        };
+        set.insert_synthetic(
+            same_block,
+            Coin {
+                out: txout(10, ANYONE.to_vec()),
+                height: 2,
+                coinbase: false,
+            },
+        );
+        assert!(check_tx_inputs_using(&tx(vec![same_block]), &set, 2, Some(&prefetched)).is_ok());
+
+        // Duplicate references preserve the old resolver result shape; the
+        // context-free duplicate-input rule remains responsible for rejecting
+        // an invalid transaction before block connection.
+        let duplicate_coin = OutPoint {
+            txid: Txid::from_bytes([0x74; 32]),
+            vout: 0,
+        };
+        set.insert_synthetic(
+            duplicate_coin,
+            Coin {
+                out: txout(10, ANYONE.to_vec()),
+                height: 2,
+                coinbase: false,
+            },
+        );
+        let (spent, _) = check_tx_inputs_using(
+            &tx(vec![duplicate_coin, duplicate_coin]),
+            &set,
+            2,
+            Some(&prefetched),
+        )
+        .unwrap();
+        assert_eq!(spent.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_backend_hits_survive_dirty_flush_and_mutations_invalidate_them() {
+        let dir = std::env::temp_dir().join(format!("avila-clean-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open(&dir).unwrap());
+        let changed = OutPoint {
+            txid: Txid::from_bytes([0x81; 32]),
+            vout: 0,
+        };
+        let hot = OutPoint {
+            txid: Txid::from_bytes([0x82; 32]),
+            vout: 0,
+        };
+        let mut dirty = HashMap::new();
+        dirty.insert(
+            hot,
+            Some(Coin {
+                out: txout(4, ANYONE.to_vec()),
+                height: 1,
+                coinbase: false,
+            }),
+        );
+        backend.commit_partial(&dirty).unwrap();
+
+        let mut set = UtxoSet::new();
+        set.attach_shared(backend);
+        let cache_enabled = clean_cache_enabled();
+        assert_eq!(set.get(&hot).unwrap().out.value, 4);
+        assert_eq!(set.clean_cache_len(), usize::from(cache_enabled));
+        // This outpoint is new to the backend: its cache entry must be
+        // promoted from the bounded warm set after the commit lands.
+        set.insert_synthetic(
+            changed,
+            Coin {
+                out: txout(5, ANYONE.to_vec()),
+                height: 2,
+                coinbase: false,
+            },
+        );
+        set.flush_to_backend_owned(Vec::new(), 1).unwrap();
+        set.join_flush().unwrap();
+        assert_eq!(
+            set.clean_cache_len(),
+            usize::from(cache_enabled) * 2,
+            "both the old hot hit and newly committed output remain cached when enabled"
+        );
+        assert_eq!(set.clean_cache_contains(&changed), cache_enabled);
+        assert_eq!(set.get(&changed).unwrap().out.value, 5);
+        assert_eq!(set.get(&hot).unwrap().out.value, 4);
+
+        // Discarding a reorg overlay preserves the cached live output.
+        let mut discarded = set.overlay();
+        assert!(discarded.spend_coin(&changed).is_some());
+        set.unoverlay(discarded, false);
+        assert_eq!(set.get(&changed).unwrap().out.value, 5);
+
+        // Adopting the reorg's spend invalidates the clean copy before the
+        // new tombstone becomes visible.
+        let mut adopted = set.overlay();
+        assert!(adopted.spend_coin(&changed).is_some());
+        set.unoverlay(adopted, true);
+        assert!(set.get(&changed).is_none());
+        assert!(!set.clean_cache_contains(&changed));
+
+        // A born output spent before commit leaves no dirty tombstone for a
+        // later full-map flush scan to prune.
+        let born = OutPoint {
+            txid: Txid::from_bytes([0x83; 32]),
+            vout: 0,
+        };
+        set.insert_synthetic(
+            born,
+            Coin {
+                out: txout(6, ANYONE.to_vec()),
+                height: 2,
+                coinbase: false,
+            },
+        );
+        assert!(set.spend_coin(&born).is_some());
+        assert!(!set.map.contains_key(&born));
+        assert!(!set.born.contains(&born));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_cache_byte_budget_and_generation_safe_fifo() {
+        let op = OutPoint {
+            txid: Txid::from_bytes([0x91; 32]),
+            vout: 0,
+        };
+        let small = Coin {
+            out: txout(1, ANYONE.to_vec()),
+            height: 1,
+            coinbase: false,
+        };
+        let mut cache = CleanCoinCache::default();
+        cache.insert(op, small.clone());
+        let stale_generation = cache.coins.get(&op).unwrap().generation;
+        cache.invalidate(&op);
+        cache.insert(op, small.clone());
+        assert_ne!(cache.coins.get(&op).unwrap().generation, stale_generation);
+
+        // Force the old generation to the queue head while preserving the
+        // reinserted generation behind it. Trimming stale metadata must not
+        // evict the newer entry with the same outpoint.
+        for _ in 0..CleanCoinCache::QUEUE_BUDGET - 2 {
+            cache.order.push_back((op, stale_generation));
+        }
+        let other = OutPoint {
+            txid: Txid::from_bytes([0x92; 32]),
+            vout: 0,
+        };
+        cache.insert(other, small);
+        assert!(cache.get(&op).is_some());
+        assert!(cache.order.len() <= CleanCoinCache::QUEUE_BUDGET);
+
+        let oversized = OutPoint {
+            txid: Txid::from_bytes([0x93; 32]),
+            vout: 0,
+        };
+        cache.insert(
+            oversized,
+            Coin {
+                out: txout(1, vec![0x51; CleanCoinCache::BYTE_BUDGET]),
+                height: 1,
+                coinbase: false,
+            },
+        );
+        assert!(cache.bytes <= CleanCoinCache::BYTE_BUDGET);
+        assert!(cache.coins.len() <= CleanCoinCache::ENTRY_BUDGET);
+        assert!(cache.get(&oversized).is_none());
+        assert!(
+            cache.get(&op).is_some(),
+            "oversized insert keeps useful hot entries"
+        );
     }
 
     const SEQUENCE_FINAL: u32 = 0xffff_ffff;

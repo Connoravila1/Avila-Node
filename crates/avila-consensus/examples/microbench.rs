@@ -84,7 +84,10 @@ fn main() {
         2_000,
     );
 
-    // secp256k1 signature verification — the per-input hot path.
+    // Matched legacy/new libsecp verification — the per-input hot path. The
+    // old path mirrors the prior production implementation (cached parsed
+    // pubkey, lax-DER parse, low-S normalization, then verification); the new
+    // path calls the byte-oriented production verifier including its cache.
     let secp = secp256k1::Secp256k1::new();
     let Ok(sk) = secp256k1::SecretKey::from_slice(&[7; 32]) else {
         return;
@@ -92,9 +95,27 @@ fn main() {
     let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
     let msg = secp256k1::Message::from_digest([9; 32]);
     let sig = secp.sign_ecdsa(&msg, &sk);
+    let der = sig.serialize_der().to_vec();
+    let pubkey = pk.serialize();
+    let digest = [9; 32];
+    let mut old_pk_cache = std::collections::HashMap::new();
+    old_pk_cache.insert(pubkey.to_vec(), pk);
+    let old_verify = || {
+        let cached_pk = old_pk_cache.get(pubkey.as_slice()).copied().unwrap_or(pk);
+        let Ok(mut parsed) = secp256k1::ecdsa::Signature::from_der_lax(&der) else {
+            return false;
+        };
+        parsed.normalize_s();
+        secp.verify_ecdsa(&msg, &parsed, &cached_pk).is_ok()
+    };
+    bench("secp256k1 0.29 ECDSA verify", old_verify, 10_000);
     bench(
-        "secp256k1 ecdsa verify",
-        || secp.verify_ecdsa(&msg, &sig, &pk).is_ok(),
+        "secp256k1 0.33 production ECDSA",
+        || {
+            avila_consensus::sigchecker::TransactionSignatureChecker::verify_ecdsa_signature(
+                &der, &pubkey, &digest,
+            )
+        },
         10_000,
     );
 

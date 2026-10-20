@@ -22,5 +22,9 @@
   exceed this machine's physical-memory budget: never rely on them.
   Pass explicit `--max` and `--reserve` values chosen from current
   `MemAvailable` and a deliberate desktop reserve, then record the cap.
-  The managed IBD service uses a 3072 MiB memory cap with swap disabled.
+  The managed IBD service now uses a 4096 MiB memory cap with swap
+  disabled, following the 2026-10-20 measured-headroom audit and the
+  user's authorization to make all machine resources available to IBD.
+  Treat this as the current audited setting, not a permanent laptop
+  requirement; remeasure available memory and desktop load before changing it.
   Never run two heavy jobs concurrently.

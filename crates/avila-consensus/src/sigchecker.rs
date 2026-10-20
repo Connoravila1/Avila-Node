@@ -544,7 +544,7 @@ impl<'a> TransactionSignatureChecker<'a> {
     /// so we do the same (pubkey.cpp:283).
     pub fn verify_ecdsa_signature(sig: &[u8], pubkey: &[u8], sighash: &[u8; 32]) -> bool {
         let pk = pk_cache_get(pubkey).unwrap_or_else(|| {
-            let p = secp256k1::PublicKey::from_slice(pubkey);
+            let p = crate::secp_fast::parse_public_key(pubkey);
             if let Ok(k) = p {
                 pk_cache_put(pubkey, k);
             }
@@ -553,30 +553,24 @@ impl<'a> TransactionSignatureChecker<'a> {
         let Ok(pk) = pk else {
             return false;
         };
-        let Ok(mut sig) = secp256k1::ecdsa::Signature::from_der_lax(sig) else {
+        let Ok(mut signature) = crate::secp_fast::parse_ecdsa_der(sig) else {
             return false;
         };
-        sig.normalize_s();
-        let Ok(msg) = secp256k1::Message::from_digest_slice(sighash) else {
-            return false;
-        };
+        signature.normalize_s();
         ECDSA_VERIFY_BACKEND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        secp().verify_ecdsa(&msg, &sig, &pk).is_ok()
+        crate::secp_fast::verify_ecdsa(&pk, &signature, sighash)
     }
 
     /// `VerifySchnorrSignature` — `XOnlyPubKey::VerifySchnorr`.
     fn verify_schnorr_signature(sig: &[u8], pubkey: &[u8], sighash: &[u8; 32]) -> bool {
-        let Ok(pk) = secp256k1::XOnlyPublicKey::from_slice(pubkey) else {
+        let Ok(pk) = crate::secp_fast::parse_xonly_public_key(pubkey) else {
             return false;
         };
-        let Ok(sig) = secp256k1::schnorr::Signature::from_slice(sig) else {
-            return false;
-        };
-        let Ok(msg) = secp256k1::Message::from_digest_slice(sighash) else {
+        let Ok(signature) = crate::secp_fast::parse_schnorr_signature(sig) else {
             return false;
         };
         SCHNORR_VERIFY_BACKEND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        secp().verify_schnorr(&sig, &msg, &pk).is_ok()
+        crate::secp_fast::verify_schnorr_parsed(&signature, &pk, sighash)
     }
 }
 
@@ -902,7 +896,7 @@ thread_local! {
 }
 
 struct ParsedPubkeyCache<'a> {
-    map: std::collections::HashMap<Box<[u8]>, secp256k1::PublicKey>,
+    map: std::collections::HashMap<Box<[u8]>, crate::secp_fast::PublicKey>,
     live_key_bytes: u64,
     metrics: &'a ParsedPubkeyCacheMetrics,
 }
@@ -927,7 +921,7 @@ impl<'a> ParsedPubkeyCache<'a> {
         self.metrics.live_key_bytes.fetch_sub(key_bytes, Relaxed);
     }
 
-    fn insert(&mut self, pubkey: &[u8], pk: secp256k1::PublicKey) {
+    fn insert(&mut self, pubkey: &[u8], pk: crate::secp_fast::PublicKey) {
         use std::sync::atomic::Ordering::Relaxed;
 
         let old_capacity = self.map.capacity();
@@ -966,7 +960,9 @@ impl Drop for ParsedPubkeyCache<'_> {
     }
 }
 
-fn pk_cache_get(pubkey: &[u8]) -> Option<Result<secp256k1::PublicKey, secp256k1::Error>> {
+fn pk_cache_get(
+    pubkey: &[u8],
+) -> Option<Result<crate::secp_fast::PublicKey, secp256k1_fast::Error>> {
     PK_CACHE.with(|c| {
         let hit = c.borrow().map.get(pubkey).copied();
         if hit.is_some() {
@@ -978,7 +974,7 @@ fn pk_cache_get(pubkey: &[u8]) -> Option<Result<secp256k1::PublicKey, secp256k1:
     })
 }
 
-fn pk_cache_put(pubkey: &[u8], pk: secp256k1::PublicKey) {
+fn pk_cache_put(pubkey: &[u8], pk: crate::secp_fast::PublicKey) {
     PK_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
         if cache.map.len() >= PK_CACHE_CAP {
@@ -1443,19 +1439,7 @@ pub fn resolve_sink(sink: &DeferredSink) -> Result<(), Vec<u32>> {
             for (i, r) in sink.records.iter().enumerate() {
                 // Ordinary verification of the exact same (z, r‖s, pub)
                 // — libsecp, per-signature, no advice in sight.
-                let Ok(pk) = secp256k1::PublicKey::from_slice(&r.pubkey) else {
-                    dirty.push(sink.job_of[i]);
-                    continue;
-                };
-                let Ok(sig) = secp256k1::ecdsa::Signature::from_compact(&r.sig) else {
-                    dirty.push(sink.job_of[i]);
-                    continue;
-                };
-                let Ok(msg) = secp256k1::Message::from_digest_slice(&r.z) else {
-                    dirty.push(sink.job_of[i]);
-                    continue;
-                };
-                if secp().verify_ecdsa(&msg, &sig, &pk).is_err() {
+                if !crate::secp_fast::verify_ecdsa_compact(&r.pubkey, &r.sig, &r.z) {
                     dirty.push(sink.job_of[i]);
                 }
             }

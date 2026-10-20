@@ -1,0 +1,8 @@
+[package]
+name = "avila-sha256d64"
+version = "0.1.0-dev"
+edition = "2024"
+publish = false
+
+[build-dependencies]
+cc = "1.2"

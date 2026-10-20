@@ -27,9 +27,10 @@ fn parsed_pubkey_cache_metrics_track_insert_replace_clear_and_drop() {
     let secret = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
     let public = secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &secret);
     let key = public.serialize();
+    let parsed = crate::secp_fast::parse_public_key(&key).unwrap();
     let mut cache = ParsedPubkeyCache::new(&metrics);
 
-    cache.insert(&key, public);
+    cache.insert(&key, parsed);
     let first_capacity = cache.map.capacity() as u64;
     assert_eq!(
         metrics
@@ -52,7 +53,7 @@ fn parsed_pubkey_cache_metrics_track_insert_replace_clear_and_drop() {
 
     // Replacing a parsed value for an existing key preserves the original
     // cache occupancy accounting.
-    cache.insert(&key, public);
+    cache.insert(&key, parsed);
     assert_eq!(
         metrics
             .live_entries
@@ -99,9 +100,10 @@ fn parsed_pubkey_cache_metrics_subtract_thread_local_cache_on_exit() {
     let handle = std::thread::spawn(|| {
         let secret = secp256k1::SecretKey::from_slice(&[9u8; 32]).unwrap();
         let public = secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &secret);
+        let parsed = crate::secp_fast::parse_public_key(&public.serialize()).unwrap();
         TEST_THREAD_PK_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            cache.insert(&public.serialize(), public);
+            cache.insert(&public.serialize(), parsed);
             assert_eq!(cache.map.len(), 1);
             assert!(cache.map.capacity() > 0);
             assert!(cache.live_key_bytes > 0);
@@ -677,4 +679,179 @@ fn high_s_signature_verifies_mainnet_h183() {
         .union(ScriptFlags::WITNESS)
         .union(ScriptFlags::TAPROOT);
     check_input_scripts(&tx, &spent, flags).unwrap();
+}
+
+/// The isolated libsecp256k1 0.8.0 verifier binding must preserve the lax DER
+/// reader used for pre-BIP66 blocks. Compare it with the workspace's prior
+/// pinned binding, including malformed and trailing-byte variants; the real
+/// high-S historical spend is covered separately above.
+#[test]
+fn fast_libsecp_lax_der_matches_workspace_binding() {
+    let secp = secp256k1::Secp256k1::new();
+    let secret = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
+    let message = secp256k1::Message::from_digest_slice(&[0x42; 32]).unwrap();
+    let signature = secp.sign_ecdsa(&message, &secret);
+    let public = secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let fast_public =
+        secp256k1_fast::PublicKey::from_byte_array_compressed(public.serialize()).unwrap();
+    let fast_signature =
+        secp256k1_fast::ecdsa::Signature::from_compact(&signature.serialize_compact()).unwrap();
+    let fast_message = secp256k1_fast::Message::from_digest([0x42; 32]);
+    assert_eq!(
+        secp.verify_ecdsa(&message, &signature, &public).is_ok(),
+        secp256k1_fast::ecdsa::verify(&fast_signature, fast_message, &fast_public).is_ok(),
+    );
+    let canonical = signature.serialize_der().to_vec();
+
+    let mut cases = vec![canonical.clone()];
+    let mut trailing_byte = canonical.clone();
+    trailing_byte.push(0);
+    cases.push(trailing_byte);
+    cases.push(canonical[1..].to_vec());
+    cases.push(vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]);
+    cases.push(vec![0x30, 0x00]);
+    cases.push(vec![0x30, 0x81, 0x01, 0x00]);
+
+    for der in cases {
+        let upgraded = secp256k1_fast::ecdsa::Signature::from_der_lax(&der)
+            .ok()
+            .map(|mut sig| {
+                sig.normalize_s();
+                sig.serialize_compact()
+            });
+        let previous = secp256k1::ecdsa::Signature::from_der_lax(&der)
+            .ok()
+            .map(|mut sig| {
+                sig.normalize_s();
+                sig.serialize_compact()
+            });
+        assert_eq!(upgraded, previous, "DER bytes: {der:02x?}");
+        let fast_verifies = secp256k1_fast::ecdsa::Signature::from_der_lax(&der)
+            .ok()
+            .map(|mut parsed| {
+                parsed.normalize_s();
+                crate::secp_fast::verify_ecdsa(&fast_public, &parsed, &[0x42; 32])
+            })
+            .unwrap_or(false);
+        assert_eq!(
+            fast_verifies,
+            previous.is_some_and(|compact| {
+                secp.verify_ecdsa(
+                    &message,
+                    &secp256k1::ecdsa::Signature::from_compact(&compact).unwrap(),
+                    &public,
+                )
+                .is_ok()
+            }),
+            "verification outcome for DER bytes: {der:02x?}",
+        );
+    }
+}
+
+#[test]
+fn fast_public_key_parser_matches_workspace_sec1_forms() {
+    let secret = secp256k1::SecretKey::from_slice(&[11; 32]).unwrap();
+    let public = secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &secret);
+    let compressed = public.serialize();
+    let uncompressed = public.serialize_uncompressed();
+    let mut hybrid = uncompressed;
+    let y_is_odd = uncompressed[64] & 1 == 1;
+    hybrid[0] = if y_is_odd { 0x07 } else { 0x06 };
+    let mut wrong_hybrid_parity = hybrid;
+    wrong_hybrid_parity[0] = if y_is_odd { 0x06 } else { 0x07 };
+    let mut invalid_point = [0xff; 65];
+    invalid_point[0] = 0x04;
+
+    let cases = [
+        ("compressed", compressed.to_vec()),
+        ("uncompressed", uncompressed.to_vec()),
+        ("hybrid", hybrid.to_vec()),
+        ("hybrid with wrong parity", wrong_hybrid_parity.to_vec()),
+        ("non-curve uncompressed", invalid_point.to_vec()),
+        ("truncated compressed", compressed[..32].to_vec()),
+        ("truncated uncompressed", uncompressed[..64].to_vec()),
+        ("oversized", [uncompressed.as_slice(), &[0]].concat()),
+    ];
+
+    for (name, encoded) in cases {
+        let old_accepts = secp256k1::PublicKey::from_slice(&encoded).is_ok();
+        let fast_accepts = crate::secp_fast::parse_public_key(&encoded).is_ok();
+        assert_eq!(fast_accepts, old_accepts, "SEC1 case: {name}");
+    }
+}
+
+#[test]
+fn fast_schnorr_verifier_matches_bip340_valid_and_invalid_vectors() {
+    // BIP340 test vector 0: x-only pubkey for secret 3, zero message and aux.
+    let pubkey =
+        crate::hex::decode("F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9")
+            .unwrap();
+    let signature = crate::hex::decode(
+        "E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA821525F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0",
+    )
+    .unwrap();
+    let digest = [0u8; 32];
+    let secp = secp256k1::Secp256k1::verification_only();
+
+    let old_verdict = |sig: &[u8], pk: &[u8], msg: &[u8; 32]| {
+        let Ok(sig) = secp256k1::schnorr::Signature::from_slice(sig) else {
+            return false;
+        };
+        let Ok(pk) = secp256k1::XOnlyPublicKey::from_slice(pk) else {
+            return false;
+        };
+        let Ok(msg) = secp256k1::Message::from_digest_slice(msg) else {
+            return false;
+        };
+        secp.verify_schnorr(&sig, &msg, &pk).is_ok()
+    };
+    let fast_verdict = |sig: &[u8], pk: &[u8], msg: &[u8; 32]| {
+        TransactionSignatureChecker::verify_schnorr_signature(sig, pk, msg)
+    };
+
+    let mut invalid_signature = signature.clone();
+    invalid_signature[0] ^= 1;
+    let invalid_pubkey = vec![0xff; 32];
+    let mut invalid_digest = digest;
+    invalid_digest[0] = 1;
+    let cases = [
+        (
+            "valid vector 0",
+            signature.as_slice(),
+            pubkey.as_slice(),
+            digest,
+        ),
+        (
+            "tampered signature",
+            invalid_signature.as_slice(),
+            pubkey.as_slice(),
+            digest,
+        ),
+        (
+            "invalid x-only point",
+            signature.as_slice(),
+            invalid_pubkey.as_slice(),
+            digest,
+        ),
+        (
+            "wrong message",
+            signature.as_slice(),
+            pubkey.as_slice(),
+            invalid_digest,
+        ),
+        (
+            "short signature",
+            &signature[..63],
+            pubkey.as_slice(),
+            digest,
+        ),
+        ("short pubkey", signature.as_slice(), &pubkey[..31], digest),
+    ];
+
+    for (name, sig, pk, msg) in cases {
+        let old = old_verdict(sig, pk, &msg);
+        let fast = fast_verdict(sig, pk, &msg);
+        assert_eq!(fast, old, "BIP340 case: {name}");
+    }
+    assert!(fast_verdict(&signature, &pubkey, &digest));
 }

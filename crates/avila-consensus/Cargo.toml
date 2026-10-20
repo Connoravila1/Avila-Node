@@ -10,6 +10,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+avila-sha256d64 = { path = "../avila-sha256d64" }
 # The only trusted third-party code in the validation path: the RustCrypto
 # hashes (SHA-2 for txids/sighash, SHA-1 and RIPEMD-160 for legacy opcodes)
 # and libsecp256k1 for ECDSA/Schnorr verification — the same library Bitcoin
@@ -18,6 +19,7 @@ sha2.workspace = true
 sha1.workspace = true
 ripemd.workspace = true
 secp256k1.workspace = true
+secp256k1-fast.workspace = true
 redb.workspace = true
 thiserror.workspace = true
 k256 = "0.14.0"

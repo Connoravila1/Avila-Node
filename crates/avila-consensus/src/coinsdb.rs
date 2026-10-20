@@ -750,6 +750,71 @@ impl CoinsBackend {
         decode_coin(g.value(), self.format)
     }
 
+    /// Fetches a bounded set of prevouts in parallel. Each worker owns one
+    /// read transaction, so redb amortizes transaction/table setup across its
+    /// share of the keys. Callers bound `outpoints`; `workers` is clamped to
+    /// the number of keys and eight to keep this read path laptop friendly.
+    /// As with [`Self::get`], backend read/decode errors are represented as
+    /// missing entries; consensus still rejects unresolved inputs.
+    #[must_use]
+    pub fn get_many(
+        &self,
+        outpoints: &[OutPoint],
+        workers: usize,
+    ) -> HashMap<OutPoint, Option<Coin>> {
+        if outpoints.is_empty() {
+            return HashMap::new();
+        }
+        let workers = workers.max(1).min(8).min(outpoints.len());
+        let chunk_size = outpoints.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for chunk in outpoints.chunks(chunk_size) {
+                let worker_chunk = chunk;
+                let handle = scope.spawn(move || {
+                    let mut found = HashMap::with_capacity(worker_chunk.len());
+                    if let Some(hash) = &self.hash {
+                        for op in worker_chunk {
+                            found.insert(*op, hash.get(&key_of(op)));
+                        }
+                        return found;
+                    }
+                    let Ok(read) = self.db.begin_read() else {
+                        found.extend(worker_chunk.iter().copied().map(|op| (op, None)));
+                        return found;
+                    };
+                    let Ok(table) = read.open_table(COINS) else {
+                        found.extend(worker_chunk.iter().copied().map(|op| (op, None)));
+                        return found;
+                    };
+                    for op in worker_chunk {
+                        let coin = table
+                            .get(&key_of(op)[..])
+                            .ok()
+                            .flatten()
+                            .and_then(|guard| decode_coin(guard.value(), self.format));
+                        found.insert(*op, coin);
+                    }
+                    found
+                });
+                handles.push((handle, chunk));
+            }
+            let mut all = HashMap::with_capacity(outpoints.len());
+            for (handle, chunk) in handles {
+                match handle.join() {
+                    Ok(found) => all.extend(found),
+                    Err(_) => {
+                        // Preserve ordinary single-read semantics if a
+                        // prefetch worker panics; the caller still gets an
+                        // authoritative result for every requested key.
+                        all.extend(chunk.iter().copied().map(|op| (op, self.get(&op))));
+                    }
+                }
+            }
+            all
+        })
+    }
+
     /// `true` if the backend holds a *decodable* coin at `outpoint`.
     ///
     /// This decodes the record rather than only checking key presence,
@@ -2180,6 +2245,26 @@ mod tests {
         }
         // A conflicting open must fail, not silently mix encodings.
         assert!(CoinsBackend::open_with_format(&dir, CoinFormat::Legacy).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parallel_prevout_fetch_returns_hits_and_missing_keys() {
+        let dir = test_dir("parallel-prevout-fetch");
+        let be = CoinsBackend::open(&dir).unwrap();
+        let present = op(1, 0);
+        let missing = op(2, 0);
+        let mut dirty = HashMap::new();
+        dirty.insert(present, Some(coin(42, 1)));
+        be.commit_partial(&dirty).unwrap();
+
+        let fetched = be.get_many(&[present, missing, present], 2);
+        assert_eq!(fetched.len(), 2, "duplicate requests collapse by outpoint");
+        assert_eq!(
+            fetched.get(&present).unwrap().as_ref().unwrap().out.value,
+            42
+        );
+        assert_eq!(fetched.get(&missing), Some(&None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
