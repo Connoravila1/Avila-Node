@@ -765,7 +765,7 @@ impl CoinsBackend {
         if outpoints.is_empty() {
             return HashMap::new();
         }
-        let workers = workers.max(1).min(8).min(outpoints.len());
+        let workers = workers.clamp(1, 8).min(outpoints.len());
         let chunk_size = outpoints.len().div_ceil(workers);
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);
