@@ -34,11 +34,14 @@ fn main() {
     });
     let raw = std::fs::read(&fixture).unwrap_or_else(|e| panic!("read {fixture}: {e}"));
     let magic = &raw[..4];
-    let params = match magic {
+    let mut params = match magic {
         [0xf9, 0xbe, 0xb4, 0xd9] => Network::Mainnet.params(),
         [0xfa, 0xbf, 0xb5, 0xda] => Network::Regtest.params(),
         other => panic!("unknown magic {other:02x?}"),
     };
+    // This harness is also used for full-validation comparisons. Do not let
+    // the mainnet checkpoint exception suppress historical script checks.
+    params.assume_valid = None;
 
     let dir = std::env::temp_dir().join(format!("avila-sync-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -161,5 +164,44 @@ fn main() {
     let miss =
         avila_consensus::sigchecker::VERIFIED_MISSES.load(std::sync::atomic::Ordering::Relaxed);
     println!("  verified-cache: {hits} hits, {miss} misses");
+    let tip = cs.tip_hash();
+    let height = cs.chain().len() as u32 - 1;
+    let coins = cs.utxo().len();
+    let utxo_hash = avila_consensus::coinstats::compute(
+        cs.utxo(),
+        height as i64,
+        tip,
+        avila_consensus::coinstats::CoinStatsHashType::HashSerialized,
+    )
+    .hash_serialized
+    .expect("full UTXO hash");
+    let checkpoint = Instant::now();
+    cs.flush().expect("durable chainstate checkpoint");
+    println!("checkpoint: {:.1?}", checkpoint.elapsed());
+    drop(cs);
+    let reopen = Instant::now();
+    let resumed = Chainstate::with_store_coinsdb(&dir, &params, now(), budget)
+        .expect("reopen durable chainstate");
+    println!("reopen: {:.1?}", reopen.elapsed());
+    assert_eq!(resumed.tip_hash(), tip, "durable fixture tip");
+    assert_eq!(
+        resumed.chain().len() as u32 - 1,
+        height,
+        "durable fixture height"
+    );
+    assert_eq!(resumed.utxo().len(), coins, "durable fixture coin count");
+    let reopened_utxo_hash = avila_consensus::coinstats::compute(
+        resumed.utxo(),
+        height as i64,
+        tip,
+        avila_consensus::coinstats::CoinStatsHashType::HashSerialized,
+    )
+    .hash_serialized
+    .expect("reopened full UTXO hash");
+    assert_eq!(reopened_utxo_hash, utxo_hash, "durable full UTXO set");
+    println!(
+        "durable state: height={height} tip={tip} coins={coins} hash_serialized_3={utxo_hash}"
+    );
+    drop(resumed);
     let _ = std::fs::remove_dir_all(&dir);
 }

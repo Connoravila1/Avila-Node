@@ -431,6 +431,10 @@ pub struct CoinsBackend {
     /// actually executed. Lets benchmarks measure how much churn the
     /// write-back cache absorbs vs what reaches disk.
     stats: std::sync::Mutex<(u64, u64, u64)>,
+    /// Test-only read count for asserting that prefetched/cache hits are not
+    /// immediately fetched from the backend a second time.
+    #[cfg(test)]
+    read_calls: AtomicU64,
 }
 
 impl CoinsBackend {
@@ -661,6 +665,8 @@ impl CoinsBackend {
             coins_len: AtomicU64::new(coins_len),
             tip: AtomicU32::new(stored_tip),
             stats: std::sync::Mutex::new((0, 0, 0)),
+            #[cfg(test)]
+            read_calls: AtomicU64::new(0),
         })
     }
 
@@ -669,6 +675,11 @@ impl CoinsBackend {
     #[must_use]
     pub fn write_stats(&self) -> (u64, u64, u64) {
         *self.stats.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_calls(&self) -> u64 {
+        self.read_calls.load(Ordering::Relaxed)
     }
 
     fn count_commit(&self, dirty: &HashMap<OutPoint, Option<Coin>>) {
@@ -741,6 +752,8 @@ impl CoinsBackend {
     /// disagree about a corrupt record's presence.
     #[must_use]
     pub fn get(&self, outpoint: &OutPoint) -> Option<Coin> {
+        #[cfg(test)]
+        self.read_calls.fetch_add(1, Ordering::Relaxed);
         if let Some(h) = &self.hash {
             return h.get(&key_of(outpoint));
         }
@@ -775,6 +788,8 @@ impl CoinsBackend {
                     let mut found = HashMap::with_capacity(worker_chunk.len());
                     if let Some(hash) = &self.hash {
                         for op in worker_chunk {
+                            #[cfg(test)]
+                            self.read_calls.fetch_add(1, Ordering::Relaxed);
                             found.insert(*op, hash.get(&key_of(op)));
                         }
                         return found;
@@ -788,6 +803,8 @@ impl CoinsBackend {
                         return found;
                     };
                     for op in worker_chunk {
+                        #[cfg(test)]
+                        self.read_calls.fetch_add(1, Ordering::Relaxed);
                         let coin = table
                             .get(&key_of(op)[..])
                             .ok()

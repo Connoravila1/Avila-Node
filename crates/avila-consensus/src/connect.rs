@@ -148,6 +148,12 @@ impl CleanCoinCache {
         self.coins.get(outpoint).map(|entry| entry.coin.clone())
     }
 
+    fn take(&mut self, outpoint: &OutPoint) -> Option<Coin> {
+        let entry = self.coins.remove(outpoint)?;
+        self.bytes = self.bytes.saturating_sub(entry.bytes);
+        Some(entry.coin)
+    }
+
     fn insert(&mut self, outpoint: OutPoint, coin: Coin) {
         if let Some(old) = self.coins.remove(&outpoint) {
             self.bytes = self.bytes.saturating_sub(old.bytes);
@@ -776,9 +782,45 @@ impl UtxoSet {
         outpoints: &[OutPoint],
         workers: usize,
     ) -> HashMap<OutPoint, Option<Coin>> {
-        self.backend
-            .as_deref()
-            .map_or_else(HashMap::new, |backend| backend.get_many(outpoints, workers))
+        let Some(backend) = self.backend.as_deref() else {
+            return HashMap::new();
+        };
+        let needed: Vec<_> = outpoints
+            .iter()
+            .copied()
+            .filter(|outpoint| self.backend_read_visible(outpoint) && !self.clean_has(outpoint))
+            .collect();
+        backend.get_many(&needed, workers)
+    }
+
+    /// Whether ordinary layered lookup would reach the backend for this key.
+    /// Kept in sync with `get_with_prefetched`: authoritative map/flush/base/
+    /// run/flat values (including tombstones) must never be replaced by a
+    /// speculative disk answer.
+    fn backend_read_visible(&self, outpoint: &OutPoint) -> bool {
+        if self.backend.is_none()
+            || self.map.contains_key(outpoint)
+            || self
+                .flushing
+                .as_ref()
+                .is_some_and(|layer| layer.snap.contains_key(outpoint))
+            || self.base.is_some()
+            || !self.runs.is_empty()
+            || self.flat.is_some()
+        {
+            return false;
+        }
+        true
+    }
+
+    fn clean_has(&self, outpoint: &OutPoint) -> bool {
+        clean_cache_enabled()
+            && self
+                .clean
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .coins
+                .contains_key(outpoint)
     }
 
     fn promote_warm(&mut self, warm: CleanCoinCache) {
@@ -1129,6 +1171,19 @@ impl UtxoSet {
     /// with `moveout`). Misses `map` fall through to base/backend and
     /// leave a tombstone.
     fn spend(&mut self, outpoint: &OutPoint) -> Option<Coin> {
+        // A checked input may have come from the prefetched map and been
+        // retained in the clean cache by `get_with_prefetched`. Consume that
+        // copy only if every higher layer still misses; mutations always
+        // invalidate the cache, while tombstones/flush snapshots remain
+        // authoritative.
+        let cached = if self.backend_read_visible(outpoint) {
+            self.clean
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(outpoint)
+        } else {
+            None
+        };
         self.clean
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
@@ -1151,7 +1206,7 @@ impl UtxoSet {
             }
             return taken;
         }
-        let coin = self.lower_get(outpoint)?;
+        let coin = cached.or_else(|| self.lower_get(outpoint))?;
         self.live_delta -= 1;
         if let Some(agg) = &mut self.swift {
             agg.sub(&crate::swiftsync::coin_tag(outpoint, &coin));
@@ -1917,6 +1972,37 @@ fn prevout_prefetch_workers() -> usize {
     })
 }
 
+/// Selects only external inputs whose normal layered read reaches the disk
+/// backend. The same-block txid set is an optimization hint only; ordered
+/// input validation still resolves every input through `UtxoSet`.
+fn block_prefetch_candidates(block: &Block, utxo: &UtxoSet, limit: usize) -> Vec<OutPoint> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let same_block_txids: std::collections::HashSet<_> =
+        block.transactions.iter().map(Transaction::txid).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut outpoints = Vec::with_capacity(limit);
+    'txs: for tx in &block.transactions {
+        if tx.is_coinbase() {
+            continue;
+        }
+        for input in &tx.inputs {
+            let outpoint = input.previous_output;
+            if same_block_txids.contains(&outpoint.txid) || !utxo.backend_read_visible(&outpoint) {
+                continue;
+            }
+            if seen.insert(outpoint) {
+                outpoints.push(outpoint);
+                if outpoints.len() == limit {
+                    break 'txs;
+                }
+            }
+        }
+    }
+    outpoints
+}
+
 /// Core's `CalculateSequenceLocks` + `EvaluateSequenceLocks`: whether `tx`'s
 /// BIP68 relative locks are satisfied at the candidate's position. `spent`
 /// holds each input's coin in input order (their `height` is Core's
@@ -2607,21 +2693,9 @@ fn connect_block_inner(
     let prefetched = if prefetch_workers == 0 || utxo.backend.is_none() {
         HashMap::new()
     } else {
-        let mut seen = std::collections::HashSet::new();
-        let mut outpoints = Vec::with_capacity(MAX_PREFETCH_PREVOUTS);
-        'txs: for tx in &block.transactions {
-            if tx.is_coinbase() {
-                continue;
-            }
-            for input in &tx.inputs {
-                if seen.insert(input.previous_output) {
-                    outpoints.push(input.previous_output);
-                    if outpoints.len() == MAX_PREFETCH_PREVOUTS {
-                        break 'txs;
-                    }
-                }
-            }
-        }
+        // Same-block outputs and all already-resolved UTXO layers are skipped;
+        // the ordered resolver still rechecks them at consumption time.
+        let outpoints = block_prefetch_candidates(block, utxo, MAX_PREFETCH_PREVOUTS);
         utxo.prefetch_backend(&outpoints, prefetch_workers)
     };
 
@@ -3160,6 +3234,112 @@ mod tests {
         )
         .unwrap();
         assert_eq!(spent.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefetched_input_read_is_reused_by_spend_when_clean_cache_is_enabled() {
+        let dir = std::env::temp_dir().join(format!("avila-prefetch-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open(&dir).unwrap());
+        let outpoint = OutPoint {
+            txid: Txid::from_bytes([0x75; 32]),
+            vout: 0,
+        };
+        let mut dirty = HashMap::new();
+        dirty.insert(
+            outpoint,
+            Some(Coin {
+                out: txout(10, ANYONE.to_vec()),
+                height: 1,
+                coinbase: false,
+            }),
+        );
+        backend.commit_partial(&dirty).unwrap();
+
+        let mut set = UtxoSet::new();
+        set.attach_shared(backend.clone());
+        let prefetched = set.prefetch_backend(&[outpoint], 1);
+        assert_eq!(backend.read_calls(), 1, "one backend fetch seeds the hint");
+        let spend_tx = Transaction {
+            version: 1,
+            inputs: vec![txin(outpoint, vec![], SEQUENCE_FINAL)],
+            outputs: vec![txout(1, ANYONE.to_vec())],
+            lock_time: 0,
+        };
+        let (spent, _) = check_tx_inputs_using(&spend_tx, &set, 2, Some(&prefetched)).unwrap();
+        assert_eq!(spent[0].out.value, 10);
+        if clean_cache_enabled() {
+            assert!(set.prefetch_backend(&[outpoint], 1).is_empty());
+            assert_eq!(
+                backend.read_calls(),
+                1,
+                "clean hits are filtered from prefetch"
+            );
+        }
+        assert_eq!(set.spend_coin(&outpoint).unwrap().out.value, 10);
+        assert_eq!(
+            backend.read_calls(),
+            if clean_cache_enabled() { 1 } else { 2 },
+            "the enabled clean cache supplies SpendCoin after prefetched input validation"
+        );
+        assert!(set.map.get(&outpoint).is_some_and(Option::is_none));
+        assert!(!set.clean.lock().unwrap().coins.contains_key(&outpoint));
+        assert!(set.prefetch_backend(&[outpoint], 1).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn block_prefetch_candidates_skip_same_block_txids_but_keep_external_inputs() {
+        let dir =
+            std::env::temp_dir().join(format!("avila-prefetch-same-block-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = std::sync::Arc::new(crate::coinsdb::CoinsBackend::open(&dir).unwrap());
+        let external = OutPoint {
+            txid: Txid::from_bytes([0x76; 32]),
+            vout: 1,
+        };
+        let mut dirty = HashMap::new();
+        dirty.insert(
+            external,
+            Some(Coin {
+                out: txout(10, ANYONE.to_vec()),
+                height: 1,
+                coinbase: false,
+            }),
+        );
+        backend.commit_partial(&dirty).unwrap();
+        let mut set = UtxoSet::new();
+        set.attach_shared(backend);
+
+        let source = Transaction {
+            version: 1,
+            inputs: vec![txin(OutPoint::NULL, vec![], SEQUENCE_FINAL)],
+            outputs: vec![txout(10, ANYONE.to_vec())],
+            lock_time: 0,
+        };
+        let same_block = OutPoint {
+            txid: source.txid(),
+            vout: 0,
+        };
+        let same_block_spender = Transaction {
+            version: 1,
+            inputs: vec![txin(same_block, vec![], SEQUENCE_FINAL)],
+            outputs: vec![txout(9, ANYONE.to_vec())],
+            lock_time: 0,
+        };
+        let external_spender = Transaction {
+            version: 1,
+            inputs: vec![txin(external, vec![], SEQUENCE_FINAL)],
+            outputs: vec![txout(9, ANYONE.to_vec())],
+            lock_time: 0,
+        };
+        let block = Block {
+            header: Network::Regtest.params().genesis_header,
+            transactions: vec![source, same_block_spender, external_spender],
+        };
+        assert_eq!(block_prefetch_candidates(&block, &set, 16), vec![external]);
+        assert!(block_prefetch_candidates(&block, &set, 0).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,8 +1,10 @@
 # Exact crypto backend and CPU hashing iteration
 
-Status: libsecp256k1 backend updated; performance awaits the root guarded gate.
-No validation check is skipped and `assumevalid=0` remains the required run
-profile. This change makes no IBD speedup claim.
+Status: implemented and gated on 2026-10-20. The exact backend microbench and
+fixed-message AVX2 microbench ran three times each under the guarded release
+profile. A 501-block mainnet fixture smoke also completed with full validation
+and matching durable UTXO commitments. These measurements do not establish a
+whole-IBD speedup.
 
 ## Exact ECDSA and Schnorr backend
 
@@ -33,11 +35,12 @@ exchange only encoded bytes.
 The 0.33 API changes do not reach BIP324 or other workspace APIs: those remain
 on the original binding.
 
-The root gate should run the focused parser differential, the existing
-`high_s_signature_verifies_mainnet_h183` test and consensus crate regression
-suite, then compare matched full-validation CPU/wall results and the existing
-real-fixture benchmark against the old binary. Compiler identity and release
-optimization flags matter because the upstream benefit is compiler-dependent.
+The guarded microbench compared the cached 0.29 ECDSA path with the production
+0.33 byte-oriented path, including its parser and cache lookup. Across three
+same-binary runs the median was 31,455 ns/op for 0.29 and 31,049 ns/op for 0.33
+(1.3% lower for the candidate in this small synthetic benchmark). This is
+directional microbenchmark evidence, not a whole-node result. The benchmark
+does not include a historical block fixture's mixed script workload.
 
 ## CPU hashing candidate review
 
@@ -64,9 +67,31 @@ boundary and exposes a checked safe function.
 
 Focused tests compare scalar and accelerated tree results for pair and leaf
 counts around the eight-way boundary, including a large odd tree, and check
-that duplicate-pair mutation results remain identical. `sha256d64` throughput
-and the real fixture remain unmeasured pending the root guarded gate; no win is
-claimed yet.
+that duplicate-pair mutation results remain identical. The guarded microbench
+compared the scalar 8-message implementation with the Core AVX2 wrapper on
+this AVX2-capable host. Across three runs, median time was 6,710 ns for eight
+scalar messages and 932 ns for the AVX2 wrapper (7.2x in this isolated
+fixed-message kernel benchmark). This is not a 7.2x Merkle-tree or IBD result;
+tree work also includes transaction hashes, odd-level shape, allocation, and
+small tails.
+
+The 0..500 mainnet fixture run used `assume_valid=None`, all regular block and
+script checks, synchronous script completion, and identical 512 MiB dbcache.
+Three alternating direct-binary trials per setting finished at height 500
+with 503 UTXOs and the same full `hash_serialized_3` digest. The measured block
+acceptance medians were 15.5 ms for `AVILA_PREVOUT_WORKERS=0
+AVILA_CLEAN_CACHE=0` and 12.0 ms for `AVILA_PREVOUT_WORKERS=2
+AVILA_CLEAN_CACHE=1`. The complete fixture contains only 501 blocks / 509
+transactions, and each run is shorter than 20 ms, so timing noise dominates;
+these values are a functional smoke test, not an IBD speed claim. The matched
+tip was `000000004ff664bfa7d217f6df64c1627089061429408e1da5ef903b8f3c77db`,
+and the complete-set digest was
+`9c3c4606df2ab3d7534227c3d39377382c438dda7c8dfe138ac7b1fcfbec0b23`.
+
+The existing `sync_bench` now disables `assume_valid`, drains script work,
+flushes and reopens the durable state, and checks the full UTXO commitment
+before reporting success. `accept_probe` likewise compares the complete
+canonical UTXO commitment before and after reopen.
 
 ## References
 

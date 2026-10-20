@@ -84,6 +84,42 @@ fn main() {
         2_000,
     );
 
+    // Matched Bitcoin-Core SHA256D64 kernel comparison: eight independent
+    // 64-byte Merkle child pairs, with the same exact bytes and output shape.
+    let merkle_pairs: [[[u8; 32]; 2]; 8] = std::array::from_fn(|i| {
+        let n = i as u64;
+        [
+            avila_consensus::hash::sha256d(&n.to_le_bytes()),
+            avila_consensus::hash::sha256d(&(!n).to_le_bytes()),
+        ]
+    });
+    bench(
+        "sha256d64 scalar (8 messages)",
+        || -> [[u8; 32]; 8] {
+            std::array::from_fn(|i| {
+                let mut message = [0u8; 64];
+                message[..32].copy_from_slice(&merkle_pairs[i][0]);
+                message[32..].copy_from_slice(&merkle_pairs[i][1]);
+                avila_consensus::hash::sha256d(&message)
+            })
+        },
+        100_000,
+    );
+    bench(
+        "sha256d64 Core AVX2 wrapper (8 messages)",
+        || {
+            avila_sha256d64::try_sha256d64_8(&merkle_pairs).unwrap_or_else(|| {
+                std::array::from_fn(|i| {
+                    let mut message = [0u8; 64];
+                    message[..32].copy_from_slice(&merkle_pairs[i][0]);
+                    message[32..].copy_from_slice(&merkle_pairs[i][1]);
+                    avila_consensus::hash::sha256d(&message)
+                })
+            })
+        },
+        100_000,
+    );
+
     // Matched legacy/new libsecp verification — the per-input hot path. The
     // old path mirrors the prior production implementation (cached parsed
     // pubkey, lax-DER parse, low-S normalization, then verification); the new

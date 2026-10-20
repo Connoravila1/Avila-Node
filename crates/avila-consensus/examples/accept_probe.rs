@@ -119,6 +119,14 @@ fn main() {
     let expected_tip = cs.tip_hash();
     let expected_height = cs.chain().len() as u32 - 1;
     let expected_coins = cs.utxo().len();
+    let expected_utxo_hash = avila_consensus::coinstats::compute(
+        cs.utxo(),
+        expected_height as i64,
+        expected_tip,
+        avila_consensus::coinstats::CoinStatsHashType::HashSerialized,
+    )
+    .hash_serialized
+    .expect("hash_serialized_3 UTXO commitment");
     let expected_tip_coin = cs.body(&expected_tip).and_then(|block| {
         let out = block.transactions.first()?.outputs.first()?;
         (!out.script_pubkey.is_unspendable()).then(|| {
@@ -148,6 +156,18 @@ fn main() {
         "reopened tip height"
     );
     assert_eq!(resumed.utxo().len(), expected_coins, "reopened UTXO count");
+    let reopened_utxo_hash = avila_consensus::coinstats::compute(
+        resumed.utxo(),
+        expected_height as i64,
+        expected_tip,
+        avila_consensus::coinstats::CoinStatsHashType::HashSerialized,
+    )
+    .hash_serialized
+    .expect("reopened hash_serialized_3 UTXO commitment");
+    assert_eq!(
+        reopened_utxo_hash, expected_utxo_hash,
+        "reopened complete UTXO commitment"
+    );
     assert_eq!(
         resumed.utxo().backend().map(|be| be.tip_height()),
         Some(expected_height),
@@ -163,7 +183,7 @@ fn main() {
         assert!(coin.coinbase, "reopened tip coinbase marker");
     }
     eprintln!(
-        "probe durable: height={expected_height} tip={expected_tip} coins={expected_coins} checkpoint={checkpoint_wall:?} reopen={reopen_wall:?} total={:?}",
+        "probe durable: height={expected_height} tip={expected_tip} coins={expected_coins} utxo_hash={expected_utxo_hash} checkpoint={checkpoint_wall:?} reopen={reopen_wall:?} total={:?}",
         wall.elapsed()
     );
     eprintln!("probe full-validation acceptance and script drain: {validation_wall:?}");
