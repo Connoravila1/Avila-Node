@@ -2552,3 +2552,37 @@ was 3,934,830,592 current bytes / 3,997,360,128 peak bytes under a
 not establish a whole-IBD performance gain. Details and qualification receipts
 are in the [Swift boundary note](2026-10-20-fullcheck-swift.md) and private
 validation directory.
+
+## 2026-10-20 — self-hosted mainnet Swift hint audit
+
+The published Swift source `ba710e101cefc73ecdb6b89834631eda530a2869`
+(tree `9a6c8470443cc5ecbaac0393cee5a1fe9c3bb52c`, public main commit
+`156e874d7e2dd3708d9916f3fd9f731043c3bd44`) passed scoped final release
+checks: node library 161 passed, P2P library 209 passed, strict workspace
+Clippy and rustdoc, formatting, and CLI smoke. A release CLI built from that
+source had SHA256
+`dc64cf2d9a684239b355c143bfdfec835423d50bba85a39a1508830081576570`.
+The Rust checks ran immediately before the source commit on the same tracked
+source blobs. The retained gate summary records observed outcomes, not raw
+stdout; raw local test, Clippy, and rustdoc output was not retained as files.
+Remote CI has its own raw evidence after that workflow completes.
+
+Using the checked-in 114,278-byte h0–500 mainnet fixture, the self-hosted
+tool generated its own survivor hints and ten spent-coin claim records and
+served them over loopback to that release CLI. A separate ordinary
+`--assumevalid 0` replay matched the Swift-promoted checkpoint at height 500:
+the same block hash, 503 live outputs, and MuHash
+`2c374ef3463616c9785085b1d2430cd743f7457433d0b3d992305253d0bc6a6f`. Both
+RPC reports showed full-validation coverage, a null AssumeValid checkpoint,
+and historical script checks required. The promoted state used the v5 fully
+validated pruned-history marker with floor 212 and snapshot base zero. A
+mutated survivor-hint run served all ten claims, hit the audit mismatch, and
+did not publish a Swift checkpoint. The operator datadir was untouched.
+
+This proves a bounded h0–500 self-supplied-helper path through the release
+CLI, not modern witness coverage, public helper availability, or first-time
+mainnet IBD speed. The prefix is below mainnet's anti-DoS minimum-work gate,
+so the test first pre-seeded only the headers through ordinary `submitheader`
+RPC with production parameters; it did not lower consensus or anti-DoS rules.
+The CLI hash, private result JSON hash, scoped gates, and reproduction command
+are in the [self-hosted Swift note](2026-10-20-self-hosted-swift-mainnet.md).
